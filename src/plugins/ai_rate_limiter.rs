@@ -54,8 +54,7 @@ use super::utils::rate_limit::{
     AiRateLimitOp, AiTokenRateAlgorithm, ENFORCEMENT_UNAVAILABLE_BODY,
     ENFORCEMENT_UNAVAILABLE_STATUS, LocalStateSemantics, RATE_LIMIT_REDIS_CONFIG_KEYS,
     RateLimitBackend, RateLimitOutcome, ReservationBackend, STANDALONE_RATE_LIMIT_CONFIG_ID,
-    apply_rate_limit_cleanup, debug_assert_closed_root_keys, debug_assert_rate_limit_redis_keys,
-    validate_window_seconds,
+    debug_assert_closed_root_keys, debug_assert_rate_limit_redis_keys, validate_window_seconds,
 };
 use super::{
     Plugin, PluginHttpClient, PluginResult, RequestContext, ResponseStreamAction,
@@ -447,7 +446,6 @@ pub struct AiRateLimiter {
 }
 
 impl AiRateLimiter {
-    #[allow(dead_code)] // direct/test construction; production factory supplies the config id
     pub fn new(config: &Value, http_client: PluginHttpClient) -> Result<Self, String> {
         Self::new_with_config_id(config, http_client, STANDALONE_RATE_LIMIT_CONFIG_ID)
     }
@@ -744,15 +742,10 @@ impl AiRateLimiter {
         self.evict_stale_entries_at(now);
     }
 
-    /// Exercise the shared prune/enforce branch with a testable cap. Test-only.
+    /// Run the shared idle-state prune at `now`. Test-only.
     #[allow(dead_code)] // used only by external tests; dead in binary test target
-    pub(crate) fn apply_cleanup_branch_for_test(
-        &self,
-        now: Instant,
-        over_capacity: bool,
-        max_entries: usize,
-    ) {
-        apply_rate_limit_cleanup(&self.limiter, max_entries, now, over_capacity);
+    pub(crate) fn prune_stale_for_test(&self, now: Instant) {
+        self.limiter.prune_stale_at(now);
     }
 
     #[allow(dead_code)] // used only by external tests; dead in binary test target
@@ -764,7 +757,6 @@ impl AiRateLimiter {
     /// API; external tests use it to assert that two instances never share a
     /// reservation-lifecycle metadata key.
     #[doc(hidden)]
-    #[allow(dead_code)] // used only by external tests; dead in binary test target
     pub fn instance_id_for_test(&self) -> u64 {
         self.instance_id
     }
@@ -772,7 +764,6 @@ impl AiRateLimiter {
     /// The instance-scoped `ctx.metadata` key for one reservation-lifecycle
     /// base name (see the [`meta`] module). Not a production API.
     #[doc(hidden)]
-    #[allow(dead_code)] // used only by external tests; dead in binary test target
     pub fn metadata_key_for_test(&self, base: &str) -> String {
         format!("{base}#{}", self.instance_id)
     }
@@ -940,7 +931,7 @@ impl AiRateLimiter {
         // atomic admission reservation. The below-cap cooldown must not
         // suppress this branch once pressure is seen on a sampled pass.
         if len > MAX_STATE_ENTRIES {
-            apply_rate_limit_cleanup(&self.limiter, MAX_STATE_ENTRIES, now, true);
+            self.limiter.prune_stale_at(now);
             self.last_periodic_sweep_secs
                 .store(now_secs, Ordering::Release);
             return;
@@ -961,7 +952,7 @@ impl AiRateLimiter {
             return;
         }
 
-        apply_rate_limit_cleanup(&self.limiter, MAX_STATE_ENTRIES, now, false);
+        self.limiter.prune_stale_at(now);
     }
 
     fn store_metadata(&self, ctx: &mut RequestContext, outcome: &RateLimitOutcome) {
@@ -4121,7 +4112,7 @@ impl StreamAccountingPermit {
     }
 
     /// Live inspector count. Test/diagnostic accessor.
-    #[allow(dead_code)] // used only by tests/, dead code in the bin target
+    #[allow(dead_code)] // used only by tests/
     fn active() -> usize {
         ACTIVE_STREAM_ACCOUNTING.load(Ordering::Relaxed)
     }
@@ -4136,14 +4127,12 @@ impl Drop for StreamAccountingPermit {
 /// Live inspector count backing the aggregate stream-accounting bound.
 /// Test-only observability; not a production API.
 #[doc(hidden)]
-#[allow(dead_code)] // used only by tests/, dead code in the bin target
 pub fn active_stream_accounting_for_test() -> usize {
     StreamAccountingPermit::active()
 }
 
 /// Process-wide ceiling on concurrent streaming token accounting. Test-only.
 #[doc(hidden)]
-#[allow(dead_code)] // used only by tests/, dead code in the bin target
 pub fn max_concurrent_stream_accounting_for_test() -> usize {
     MAX_CONCURRENT_STREAM_ACCOUNTING
 }
@@ -4173,9 +4162,9 @@ impl UsageStreamInspector {
 
 #[async_trait]
 impl ResponseStreamInspector for UsageStreamInspector {
-    async fn on_chunk(&mut self, chunk: &[u8]) -> ResponseStreamAction {
+    async fn on_chunk(&mut self, chunk: &bytes::Bytes) -> ResponseStreamAction {
         self.extractor.push(chunk);
-        ResponseStreamAction::Forward(bytes::Bytes::copy_from_slice(chunk))
+        ResponseStreamAction::Forward(chunk.clone())
     }
 
     async fn on_end(&mut self) -> ResponseStreamAction {

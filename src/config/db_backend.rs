@@ -1618,9 +1618,6 @@ pub fn is_mtls_dns_admission_unavailable(error: &anyhow::Error) -> bool {
     error.is::<MtlsDnsAdmissionUnavailable>()
 }
 
-// External tests reach this through the lib target's `_test_support` shim;
-// the bin target recompiles this module without that caller.
-#[allow(dead_code)]
 pub(crate) fn mark_mtls_dns_admission_unavailable(error: anyhow::Error) -> anyhow::Error {
     error.context(MtlsDnsAdmissionUnavailable)
 }
@@ -2064,7 +2061,6 @@ impl IncrementalFullReloadRequired {
 
     /// Read by external integration tests (which link the lib target); the bin
     /// target never inspects the reason, so it is dead code there.
-    #[allow(dead_code)]
     pub fn reason(&self) -> IncrementalFullReloadReason {
         self.reason
     }
@@ -2435,7 +2431,6 @@ impl std::error::Error for DbTlsReconnectError {}
 /// Connection lifecycle (connect, reconnect, failover) is NOT in the trait
 /// because construction is inherently backend-specific. The trait covers only
 /// operations on an already-connected store.
-#[allow(dead_code)] // Some methods are only used through dyn dispatch or by MongoDB backend
 #[allow(clippy::double_must_use)] // async-trait adds a bare #[must_use]
 #[async_trait]
 pub trait DatabaseBackend: NamespaceConfigAdmissionLeaseBackend + Send + Sync {
@@ -3019,11 +3014,6 @@ pub trait DatabaseBackend: NamespaceConfigAdmissionLeaseBackend + Send + Sync {
         mode: &BatchConfigWriteMode,
     ) -> Result<AtomicBatchCounts, anyhow::Error>;
 
-    async fn batch_create_proxies(
-        &self,
-        proxies: &[Proxy],
-        mode: &BatchConfigWriteMode,
-    ) -> Result<usize, anyhow::Error>;
     async fn batch_create_proxies_without_plugins(
         &self,
         proxies: &[Proxy],
@@ -3649,6 +3639,15 @@ pub trait DatabaseBackend: NamespaceConfigAdmissionLeaseBackend + Send + Sync {
     /// Namespace-scoped, bounded audit retention prune. No-op when retention
     /// policy is unset. Must never delete rows belonging to another namespace.
     async fn prune_audit_events(&self, namespace: &str) -> Result<u64, anyhow::Error>;
+
+    /// Periodic age-retention sweep: apply the `retention_days` half of the
+    /// policy to every namespace that holds audit rows, including namespaces
+    /// that no longer receive inserts (insert-path pruning never revisits
+    /// them). Each namespace is pruned separately with the same bounded,
+    /// chunked delete as [`Self::prune_audit_events`], so a larger backlog
+    /// drains over successive sweeps. The row cap is not evaluated: an idle
+    /// namespace cannot grow. No-op when age retention is unset.
+    async fn prune_expired_audit_events(&self) -> Result<u64, anyhow::Error>;
 }
 
 /// The poll path holds `Arc<dyn DatabaseBackend>`, so the narrow drift surface
@@ -3675,8 +3674,6 @@ impl crate::config::gateway_trust::GatewayTrustDriftSource for dyn DatabaseBacke
 /// Extract resource IDs from a full config.
 ///
 /// This is a pure function on `GatewayConfig`, independent of any backend.
-// Used by external test crates; the binary target otherwise flags it as dead code.
-#[allow(dead_code)]
 pub fn extract_known_ids(
     config: &GatewayConfig,
 ) -> (

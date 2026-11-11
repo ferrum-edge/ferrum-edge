@@ -131,20 +131,15 @@ fn child_mut<'a>(parent: &'a mut Value, segment: &str) -> Option<&'a mut Value> 
     }
 }
 
-// ── Public API ────────────────────────────────────────────────────────────
+// ── Path operations ────────────────────────────────────────────────────────────
 
-/// Navigate a dot-notation path and return a reference to the nested value.
+/// Navigate a compiled dot-notation path and return a reference to the nested
+/// value.
 ///
-/// Path segments are split on `.`. Numeric segments index into arrays; other
-/// segments are object keys. `\\.` is treated as a literal `.` in a key.
-/// Returns `None` if any segment along the path is missing or the parent node
-/// is not an object/array (or index is out of bounds).
-#[allow(dead_code)]
-pub fn get_nested_value<'a>(root: &'a Value, path: &str) -> Option<&'a Value> {
-    let path = CompiledPath::parse(path);
-    get_nested_value_compiled(root, &path)
-}
-
+/// Numeric segments index into arrays; other segments are object keys. `\\.`
+/// is a literal `.` in a key. Returns `None` if any segment along the path is
+/// missing or the parent node is not an object/array (or the index is out of
+/// bounds).
 fn get_nested_value_compiled<'a>(root: &'a Value, path: &CompiledPath) -> Option<&'a Value> {
     let mut current = root;
     for segment in &path.segments {
@@ -153,20 +148,11 @@ fn get_nested_value_compiled<'a>(root: &'a Value, path: &CompiledPath) -> Option
     Some(current)
 }
 
-/// Set a value at a dot-notation path, creating intermediate **objects** as
-/// needed (arrays are never auto-created — their size is user-controlled).
-///
-/// Returns `true` if the value was successfully set, `false` if an
-/// unreachable node was encountered (non-object intermediate, out-of-bounds
-/// array index, or array index that can't be parsed).
-#[allow(dead_code)]
-pub fn set_nested_value(root: &mut Value, path: &str, value: Value) -> bool {
-    let path = CompiledPath::parse(path);
-    set_nested_value_inner(root, &path, value).is_ok()
-}
-
-/// Internal: set_nested_value that returns the value back on failure so the
-/// caller can recover it without an upfront clone.
+/// Set a value at a compiled dot-notation path, creating intermediate
+/// **objects** as needed (arrays are never auto-created — their size is
+/// user-controlled). On failure (non-object intermediate, out-of-bounds or
+/// unparseable array index) the value is handed back so the caller can recover
+/// it without an upfront clone.
 fn set_nested_value_inner(
     root: &mut Value,
     path: &CompiledPath,
@@ -218,16 +204,8 @@ fn set_nested_value_inner(
     }
 }
 
-/// Remove a value at a dot-notation path.
-///
-/// Returns the removed value if it existed, `None` otherwise. For arrays,
-/// uses `Vec::remove` which shifts subsequent elements.
-#[allow(dead_code)]
-pub fn remove_nested_value(root: &mut Value, path: &str) -> Option<Value> {
-    let path = CompiledPath::parse(path);
-    remove_nested_value_compiled(root, &path)
-}
-
+/// Remove the value at a compiled dot-notation path, returning it if it
+/// existed. For arrays this uses `Vec::remove`, which shifts later elements.
 fn remove_nested_value_compiled(root: &mut Value, path: &CompiledPath) -> Option<Value> {
     let mut iter = path.segments.iter().peekable();
     iter.peek()?;
@@ -252,136 +230,13 @@ fn remove_nested_value_compiled(root: &mut Value, path: &CompiledPath) -> Option
     }
 }
 
-/// Captures how a value was removed so a failed rename can faithfully undo it.
+/// Rename a field: remove it at `old_path` and insert it at `new_path`,
+/// creating intermediate objects as needed.
 ///
-/// For object removals, restoration is a plain `map.insert(key, value)` at the
-/// same parent — identical to `set_nested_value_inner(old_path, value)`.
-///
-/// For array removals, restoration MUST use `Vec::insert(idx, value)` to
-/// reverse the leftward shift caused by `Vec::remove(idx)`. Using
-/// `set_nested_value_inner` here would write into whatever element currently
-/// occupies that index (the previously-shifted neighbor), overwriting it and
-/// losing data — the exact bug this enum fixes.
-enum RemovalContext {
-    /// Removed from an object. `old_path` suffices for restoration via
-    /// `set_nested_value_inner`, which performs `map.insert(last_segment, v)`.
-    Object,
-    /// Removed from an array at `parent_segments` index `idx`. Restoration must
-    /// call `Vec::insert(idx, v)` on the array at those segments to restore the
-    /// pre-removal ordering.
-    Array {
-        parent_segments: Vec<String>,
-        idx: usize,
-    },
-}
-
-/// Remove a value at `path` and return both the removed value AND the parent
-/// context needed to faithfully restore it.
-///
-/// This mirrors [`remove_nested_value`] but records whether the removal came
-/// from an object key or an array index, along with enough information to
-/// reverse the latter.
-fn remove_nested_value_with_context(
-    root: &mut Value,
-    path: &CompiledPath,
-) -> Option<(Value, RemovalContext)> {
-    // We need to know the parent path (everything up to the final segment) so
-    // that Array rollback can navigate to the same Vec and call insert.
-    if path.segments.is_empty() {
-        return None;
-    }
-    let (last_seg, parent_segs) = path.segments.split_last()?;
-
-    // Navigate to the parent node.
-    let mut current: &mut Value = root;
-    for seg in parent_segs {
-        current = child_mut(current, seg)?;
-    }
-
-    // Remove at the terminal, recording the context.
-    match current {
-        Value::Object(map) => {
-            let removed = map.remove(last_seg)?;
-            Some((removed, RemovalContext::Object))
-        }
-        Value::Array(arr) => {
-            let idx = last_seg.parse::<usize>().ok()?;
-            if idx >= arr.len() {
-                return None;
-            }
-            let removed = arr.remove(idx);
-            Some((
-                removed,
-                RemovalContext::Array {
-                    parent_segments: parent_segs.to_vec(),
-                    idx,
-                },
-            ))
-        }
-        _ => None,
-    }
-}
-
-/// Insert a value at an array index inside the `Vec` located at `parent_segments`.
-///
-/// Returns `Err(value)` if the parent cannot be reached or is not an array, so
-/// the caller can still recover the value. Used only by the rollback path.
-fn insert_into_array_at(
-    root: &mut Value,
-    parent_segments: &[String],
-    idx: usize,
-    value: Value,
-) -> Result<(), Value> {
-    // Navigate to parent. Empty segments mean the array IS the root.
-    let mut current: &mut Value = root;
-    for seg in parent_segments {
-        current = match child_mut(current, seg) {
-            Some(c) => c,
-            None => return Err(value),
-        };
-    }
-    match current {
-        Value::Array(arr) => {
-            // `idx` came from a successful prior `remove(idx)`, so it is at
-            // most the original length; clamp defensively.
-            let bounded = idx.min(arr.len());
-            arr.insert(bounded, value);
-            Ok(())
-        }
-        _ => Err(value),
-    }
-}
-
-/// Rename a field at a dot-notation path.
-///
-/// Both `old_path` and `new_path` use dot notation. The value is removed from
-/// `old_path` and inserted at `new_path`, creating intermediate objects as
-/// needed.
-///
-/// If inserting at `new_path` fails (e.g., the destination traverses a
-/// non-object node), the value is restored at `old_path` so no data is lost.
-/// For array sources, restoration uses `Vec::insert(idx, value)` to reverse
-/// the leftward shift caused by `Vec::remove(idx)` — restoring via
-/// `set_nested_value_inner` would overwrite the element that was shifted into
-/// the vacated slot.
-///
-/// If restoration itself fails, it means we could no longer reach the parent
-/// container (only possible when `new_path` is a strict prefix of `old_path`
-/// and the intermediate we depended on was replaced mid-operation — an
-/// API-misuse edge case). We log a warning and return `false`.
-#[allow(dead_code)]
-pub fn rename_nested_field(root: &mut Value, old_path: &str, new_path: &str) -> bool {
-    let old_path_compiled = CompiledPath::parse(old_path);
-    let new_path_compiled = CompiledPath::parse(new_path);
-    rename_nested_field_compiled(
-        root,
-        &old_path_compiled,
-        &new_path_compiled,
-        old_path,
-        new_path,
-    )
-}
-
+/// Rule admission rejects numeric segments in both rename paths, so a rename
+/// only ever removes an object key. If inserting at `new_path` fails (the
+/// destination traverses a non-object node), the value is put back at
+/// `old_path` so no data is lost.
 fn rename_nested_field_compiled(
     root: &mut Value,
     old_path: &CompiledPath,
@@ -389,32 +244,19 @@ fn rename_nested_field_compiled(
     old_path_label: &str,
     new_path_label: &str,
 ) -> bool {
-    let Some((value, ctx)) = remove_nested_value_with_context(root, old_path) else {
+    let Some(value) = remove_nested_value_compiled(root, old_path) else {
         return false;
     };
     match set_nested_value_inner(root, new_path, value) {
         Ok(()) => true,
         Err(recovered) => {
-            // Attempt to restore using the removal context so arrays are
-            // restored with insert (preserving ordering) rather than overwrite.
-            let restore_result = match &ctx {
-                RemovalContext::Object => set_nested_value_inner(root, old_path, recovered),
-                RemovalContext::Array {
-                    parent_segments,
-                    idx,
-                } => insert_into_array_at(root, parent_segments, *idx, recovered),
-            };
-            // The rollback path reaches this branch only when the failing
-            // `set_nested_value_inner(new_path)` was a no-op: it returns `Err`
-            // at the terminal step (non-object/non-array terminal, out-of-bounds
-            // array index, or empty path) without mutating the tree, or before
-            // the terminal at an intermediate non-object/array-miss (also no
-            // mutation). Since the tree between `remove_nested_value_with_context`
-            // and here is unchanged apart from the original removal, restoration
-            // should always succeed. The `warn!` below exists as a defensive
-            // log for any future refactor that breaks this invariant — if it
-            // ever fires, that is a bug, not a user error.
-            if restore_result.is_err() {
+            // A failing `set_nested_value_inner(new_path)` does not mutate the
+            // tree (it fails at the terminal, or at an intermediate
+            // non-object), so the parent object `old_path` was removed from is
+            // still reachable and restoration succeeds. The `warn!` is a
+            // defensive log for a future refactor that breaks this invariant:
+            // if it ever fires, that is a bug, not a user error.
+            if set_nested_value_inner(root, old_path, recovered).is_err() {
                 debug_assert!(
                     false,
                     "body_transform: rename rollback invariant violated for {old_path_label} -> {new_path_label}"
@@ -715,7 +557,7 @@ enum BodyRulesPass {
 pub fn apply_request_body_rules(body: &[u8], rules: &[BodyRule]) -> RequestBodyRulesOutcome {
     use crate::plugins::BoundedResponseBodyConstruction;
 
-    match run_body_rules(body, rules, usize::MAX, true) {
+    match run_body_rules(body, rules, usize::MAX) {
         BodyRulesPass::Construction(BoundedResponseBodyConstruction::Replaced(bytes)) => {
             RequestBodyRulesOutcome::Replaced(bytes)
         }
@@ -733,9 +575,11 @@ pub fn apply_request_body_rules(body: &[u8], rules: &[BodyRule]) -> RequestBodyR
 /// JSON input; an empty or unparseable body, or one no rule changed, returns
 /// [`crate::plugins::BoundedResponseBodyConstruction::Unchanged`].
 ///
-/// Unlike [`apply_request_body_rules`], this pass does not preserve number
-/// lexemes: a rewritten document re-serializes every number from
-/// `serde_json::Value` (issue #7149).
+/// Like [`apply_request_body_rules`], this pass preserves every backend number
+/// lexeme that is not an exactly representable 64-bit integer byte for byte,
+/// so a rewrite that only touched other fields cannot round or re-spell a
+/// backend value (issue #7149). The stand-in document is transient and the
+/// rewritten output still goes through the same bounded sink.
 ///
 /// The response side passes this response's retained ceiling so the rewritten
 /// JSON is serialized THROUGH a bounded sink: a rule set that amplifies a
@@ -752,18 +596,13 @@ pub(crate) fn apply_body_rules_bounded(
     rules: &[BodyRule],
     ceiling: usize,
 ) -> crate::plugins::BoundedResponseBodyConstruction {
-    match run_body_rules(body, rules, ceiling, false) {
+    match run_body_rules(body, rules, ceiling) {
         BodyRulesPass::Construction(construction) => construction,
         BodyRulesPass::Skipped(_) => crate::plugins::BoundedResponseBodyConstruction::Unchanged,
     }
 }
 
-fn run_body_rules(
-    body: &[u8],
-    rules: &[BodyRule],
-    ceiling: usize,
-    preserve_number_lexemes: bool,
-) -> BodyRulesPass {
+fn run_body_rules(body: &[u8], rules: &[BodyRule], ceiling: usize) -> BodyRulesPass {
     use crate::plugins::BoundedResponseBodyConstruction;
 
     if rules.is_empty() || body.is_empty() {
@@ -782,24 +621,22 @@ fn run_body_rules(
         return BodyRulesPass::Skipped(BodyRulesSkipReason::NoRuleApplied);
     }
 
-    if preserve_number_lexemes {
-        let mut scan = DocumentNumberScan::default();
-        scan_document_numbers(&json, &mut scan);
-        // Only a document that still holds an `f64` can have lost a lexeme:
-        // every integer serde_json kept as `u64` / `i64` re-serializes exactly.
-        // The stand-in generation is one no string in the document already
-        // uses, so a client string can never be mistaken for a stand-in and a
-        // stand-in-shaped client string never disables the preservation.
-        if scan.has_float {
-            let spans = lossy_number_spans(body);
-            if !spans.is_empty()
-                && let Some(generation) =
-                    (0u64..).find(|candidate| !scan.used_stand_in_generations.contains(candidate))
-                && let Some(construction) =
-                    rewrite_preserving_number_lexemes(body, &spans, rules, ceiling, generation)
-            {
-                return BodyRulesPass::Construction(construction);
-            }
+    let mut scan = DocumentNumberScan::default();
+    scan_document_numbers(&json, &mut scan);
+    // Only a document that still holds an `f64` can have lost a lexeme:
+    // every integer serde_json kept as `u64` / `i64` re-serializes exactly.
+    // The stand-in generation is one no string in the document already
+    // uses, so a client string can never be mistaken for a stand-in and a
+    // stand-in-shaped client string never disables the preservation.
+    if scan.has_float {
+        let spans = lossy_number_spans(body);
+        if !spans.is_empty()
+            && let Some(generation) =
+                (0u64..).find(|candidate| !scan.used_stand_in_generations.contains(candidate))
+            && let Some(construction) =
+                rewrite_preserving_number_lexemes(body, &spans, rules, ceiling, generation)
+        {
+            return BodyRulesPass::Construction(construction);
         }
     }
 

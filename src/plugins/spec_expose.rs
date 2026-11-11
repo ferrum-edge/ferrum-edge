@@ -248,27 +248,12 @@ impl SpecExpose {
         let config_object = config.as_object().ok_or_else(|| {
             "spec_expose: configuration must be an object with a `spec_url` field".to_string()
         })?;
-        let mut unknown_keys = config_object
-            .keys()
-            .filter(|key| !CONFIG_KEYS.contains(&key.as_str()))
-            .map(String::as_str)
-            .collect::<Vec<_>>();
-        if !unknown_keys.is_empty() {
-            unknown_keys.sort_unstable();
-            let unknown = unknown_keys
-                .into_iter()
-                .map(|key| format!("{key:?}"))
-                .collect::<Vec<_>>()
-                .join(", ");
-            return Err(format!(
-                "spec_expose: unsupported configuration key(s): {unknown}; supported keys are: {}",
-                CONFIG_KEYS
-                    .iter()
-                    .map(|key| format!("`{key}`"))
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            ));
-        }
+        crate::util::unknown_keys::reject_unknown_keys(
+            config_object,
+            "config",
+            &CONFIG_KEYS,
+            "spec_expose: `config`: ",
+        )?;
 
         let spec_url = config_object
             .get("spec_url")

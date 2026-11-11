@@ -221,8 +221,7 @@ admin:
     annotations: {}
 
 # CP/DP gRPC JWT secret (FERRUM_CP_DP_GRPC_JWT_SECRET). >=32 chars, and required
-# for cp and dp modes UNLESS cp.trustBundlePath (cp) or dp.cpGrpcTokenFile (dp)
-# is configured. NOTE: this secret is not a tenancy boundary — see
+# for dp mode and for cp mode UNLESS cp.trustBundlePath is configured. NOTE: this secret is not a tenancy boundary — see
 # cp.trustBundlePath and docs/cp_namespace_tenancy.md.
 grpc:
   jwtSecret:
@@ -233,8 +232,7 @@ grpc:
     valueFrom: {}
   # JWS `kid` stamped on tokens this DP mints (FERRUM_CP_DP_GRPC_JWT_KEY_ID). It
   # selects which of the CP trust bundle's namespace-bound credentials verifies
-  # them; a CP running a bundle rejects a token with no `kid`. Ignored when
-  # dp.cpGrpcTokenFile is set (the issuer stamps its own header).
+  # them; a CP running a bundle rejects a token with no `kid`.
   jwtKeyId: ""
   # Explicitly permit PLAINTEXT CP/DP config sync (FERRUM_CP_DP_GRPC_ALLOW_PLAINTEXT).
   # The binary hard-fails on a non-loopback plaintext CP gRPC bind (cp mode) or a
@@ -362,19 +360,6 @@ dp:
   # Accepted values: fail_closed (default) or readiness_only. "" (or null)
   # omits the env and takes the binary's fail_closed default.
   configStaleAction: ""
-  # In-container path to an externally issued CP/DP bearer token
-  # (FERRUM_DP_CP_GRPC_TOKEN_FILE). When set, this DP presents that token instead
-  # of minting one, so it holds no signing key and cannot forge an authorization
-  # for any namespace. The file is re-read on every connection attempt, so a
-  # short-lived token rotates without a restart. Setting this makes
-  # grpc.jwtSecret optional.
-  # NOT usable by a stock DP today: the DP sends a random per-process node_id
-  # and ConfigSync.Subscribe requires the token's sub to equal it, so the CP
-  # refuses the subscription with PERMISSION_DENIED and the DP never receives
-  # config. For chart-deployed DPs use a per-tenant grpc.jwtSecret plus
-  # grpc.jwtKeyId, bound to a tenant credential in the CP trust bundle. See
-  # docs/cp_namespace_tenancy.md#data-plane-side.
-  cpGrpcTokenFile: ""
 
 # -----------------------------------------------------------------------------
 # TLS material. Each enabled surface mounts a Secret (standard tls.crt/tls.key/

@@ -59,7 +59,6 @@ fn make_proxy(id: &str, listen_path: &str) -> Proxy {
         pool_http2_max_concurrent_streams: None,
         pool_http3_connections_per_backend: None,
         h2_upgrade_policy: None,
-        pool_max_requests_per_connection: None,
         pool_http1_max_pending_requests: None,
         pool_tcp_keepalive_seconds: None,
         upstream_id: None,
@@ -2122,26 +2121,6 @@ fn test_proxy_http2_max_concurrent_streams_valid() {
     proxy.pool_http2_max_concurrent_streams = Some(1000);
     assert!(proxy.validate_fields().is_ok());
     proxy.pool_http2_max_concurrent_streams = Some(MAX_POOL_SQL_INTEGER_VALUE as u32);
-    assert!(proxy.validate_fields().is_ok());
-}
-
-#[test]
-fn test_proxy_pool_max_requests_per_connection_above_sql_integer_limit() {
-    let mut proxy = make_proxy("test", "/api");
-    proxy.pool_max_requests_per_connection = Some(MAX_POOL_SQL_INTEGER_VALUE + 1);
-    let errs = proxy.validate_fields().unwrap_err();
-    assert!(
-        errs.iter()
-            .any(|e| e.contains("pool_max_requests_per_connection"))
-    );
-}
-
-#[test]
-fn test_proxy_pool_max_requests_per_connection_valid_bounds() {
-    let mut proxy = make_proxy("test", "/api");
-    proxy.pool_max_requests_per_connection = Some(0);
-    assert!(proxy.validate_fields().is_ok());
-    proxy.pool_max_requests_per_connection = Some(MAX_POOL_SQL_INTEGER_VALUE);
     assert!(proxy.validate_fields().is_ok());
 }
 

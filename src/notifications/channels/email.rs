@@ -44,7 +44,7 @@ use tokio_rustls::TlsConnector;
 
 use crate::config::BackendEgressPolicy;
 use crate::plugins::utils::http_client::PluginHttpClient;
-use crate::plugins::utils::{parse_socket_host, resolve_tcp_endpoint};
+use crate::plugins::utils::{parse_socket_host, resolve_socket_endpoint};
 
 use super::super::notification::{Notification, NotificationField};
 use super::super::templating::{render_template_bounded, validate_template};
@@ -108,7 +108,6 @@ const DEFAULT_BODY_TEMPLATE: &str = "${body}\n\n${fields}";
 
 /// Template variables this channel adds on top of the generic notification
 /// variables exported by [`super::NOTIFICATION_TEMPLATE_VARS`].
-#[allow(dead_code)] // Documented surface; consumed by docs/tests, not by main.rs.
 pub const EMAIL_TEMPLATE_VARS: &[&str] = &["fields"];
 
 /// Authoritative closed key set for a `type: email` channel definition.
@@ -700,7 +699,7 @@ impl EmailChannel {
 
         let addr = tokio::time::timeout(
             self.connect_timeout,
-            resolve_tcp_endpoint(
+            resolve_socket_endpoint(
                 &self.smtp_host,
                 self.smtp_port,
                 http.dns_cache(),

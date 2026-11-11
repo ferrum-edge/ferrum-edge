@@ -1,5 +1,5 @@
 //! `NetworkSimProxy` — a TCP middleman that applies a
-//! [`NetworkProfile`] (latency / bandwidth limit / truncate) to every
+//! [`NetworkProfile`] (latency / bandwidth limit) to every
 //! accepted connection, then relays bytes to a target backend.
 //!
 //! The proxy sits between the gateway under test and the scripted
@@ -26,8 +26,6 @@
 //!   bucket; for streams that interleave multiple requests on one
 //!   connection, the bandwidth wrapper limits the total traffic, not
 //!   per-request.
-//! - `TruncatedStream` close happens on either direction hitting the
-//!   threshold — same semantics as the standalone wrapper.
 
 use std::io;
 use std::sync::Arc;
@@ -39,7 +37,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::oneshot;
 use tokio::task::{AbortHandle, JoinHandle};
 
-use super::{BandwidthLimitedStream, DelayedStream, TruncatedStream};
+use super::{BandwidthLimitedStream, DelayedStream};
 
 /// Declarative description of the network transformations applied to
 /// each connection through the middleman.
@@ -49,16 +47,11 @@ pub struct NetworkProfile {
     pub latency: Option<Duration>,
     /// Bytes-per-second ceiling (applied to both directions).
     pub bandwidth_bps: Option<u64>,
-    /// Close the stream after this many total bytes have flowed in
-    /// either direction.
-    pub truncate_after: Option<usize>,
-    /// Delay inserted just before the truncate fires.
-    pub truncate_delay: Option<Duration>,
 }
 
 impl NetworkProfile {
     pub fn is_noop(&self) -> bool {
-        self.latency.is_none() && self.bandwidth_bps.is_none() && self.truncate_after.is_none()
+        self.latency.is_none() && self.bandwidth_bps.is_none()
     }
 }
 
@@ -94,18 +87,6 @@ impl NetworkSimProxyBuilder {
     /// Limit read+write bandwidth to `bps` bytes per second.
     pub fn with_bandwidth_limit(mut self, bps: u64) -> Self {
         self.profile.bandwidth_bps = Some(bps);
-        self
-    }
-
-    /// Close the stream after `bytes` total have flowed.
-    pub fn with_truncate_after(mut self, bytes: usize) -> Self {
-        self.profile.truncate_after = Some(bytes);
-        self
-    }
-
-    /// Delay before the truncate fires.
-    pub fn with_truncate_delay(mut self, delay: Duration) -> Self {
-        self.profile.truncate_delay = Some(delay);
         self
     }
 
@@ -215,10 +196,8 @@ impl ProxyState {
 /// Apply the profile to a newly accepted client stream, open a
 /// connection to the backend, and relay bytes bidirectionally.
 ///
-/// The wrapping is applied in the order
-/// `(latency → bandwidth → truncate)` — so the test's latency happens
-/// on the "wire" before rate-limiting, and the truncate fires after
-/// both.
+/// The wrapping is applied in the order `(latency → bandwidth)` — so
+/// the test's latency happens on the "wire" before rate-limiting.
 async fn relay_with_profile(
     client: TcpStream,
     target_host: &str,
@@ -284,10 +263,8 @@ async fn relay_with_profile(
 }
 
 /// Wrap `inner` in whatever `profile` wants. The order is
-/// `TruncatedStream(BandwidthLimitedStream(DelayedStream(inner)))`
-/// so the close fires on total bytes observed at the outermost layer
-/// (after bandwidth shaping and latency injection), which matches
-/// what a real slow + broken network would look like.
+/// `BandwidthLimitedStream(DelayedStream(inner))`, which matches what a
+/// real slow network would look like.
 fn wrap_stream(
     inner: TcpStream,
     profile: NetworkProfile,
@@ -298,13 +275,6 @@ fn wrap_stream(
     }
     if let Some(bps) = profile.bandwidth_bps {
         erased = Box::new(BandwidthLimitedStream::new(erased, bps));
-    }
-    if let Some(n) = profile.truncate_after {
-        let mut t = TruncatedStream::new(erased, n);
-        if let Some(d) = profile.truncate_delay {
-            t = t.with_pre_close_delay(d);
-        }
-        erased = Box::new(t);
     }
     erased
 }

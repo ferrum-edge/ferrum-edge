@@ -137,7 +137,6 @@ const NO_ADMISSION_WARN_NANOS: u64 = u64::MAX;
 /// Global chargeback registry (singleton per process).
 static CHARGEBACK_REGISTRY: OnceLock<Arc<ChargebackRegistry>> = OnceLock::new();
 
-#[allow(dead_code)] // Used by external tests; production uses try_global_registry / global_registry_with_shard_amount.
 pub fn global_registry() -> Arc<ChargebackRegistry> {
     global_registry_with_shard_amount(crate::util::sharding::pool_shard_amount(0))
 }
@@ -452,7 +451,6 @@ pub struct InstanceScope {
     /// Instance namespace. Direct registry calls use this as the proxy namespace;
     /// production hooks pass the matched proxy's namespace explicitly so a
     /// gateway-wide global instance cannot conflate same-id tenant proxies.
-    #[allow(dead_code)]
     // Read by external registry tests; production passes matched namespaces.
     pub namespace: Arc<str>,
 }
@@ -1664,14 +1662,12 @@ impl ChargebackRegistry {
     }
 
     #[doc(hidden)]
-    #[allow(dead_code)] // Used by external tests; dead in the separately compiled bin target.
     pub fn cleanup_interval_seconds_for_test(&self) -> u64 {
         self.cleanup_interval_seconds.load(Ordering::Acquire)
     }
 
     /// Record a chargeable HTTP-family transaction (HTTP/1.1, H2, H3, gRPC,
     /// WebSocket upgrade). Status code is the response status.
-    #[allow(dead_code)] // External-test convenience wrapper; production supplies proxy namespace.
     #[allow(clippy::too_many_arguments)]
     pub fn record_http(
         &self,
@@ -1745,7 +1741,6 @@ impl ChargebackRegistry {
     /// have no HTTP status code; entries are keyed by
     /// `(consumer, proxy_id, ProtocolFamily::Stream)` with the
     /// [`STREAM_STATUS_SENTINEL`].
-    #[allow(dead_code)] // External-test convenience wrapper; production supplies proxy namespace.
     #[allow(clippy::too_many_arguments)]
     pub fn record_stream(
         &self,
@@ -1805,7 +1800,6 @@ impl ChargebackRegistry {
         );
     }
 
-    #[allow(dead_code)] // External-test convenience wrapper; production supplies proxy namespace.
     #[allow(clippy::too_many_arguments)]
     pub fn record_websocket_bandwidth(
         &self,
@@ -2249,14 +2243,12 @@ impl ChargebackRegistry {
     /// Billing rows (complete registry entry keys) currently reserved against
     /// `max_entries`.
     #[doc(hidden)]
-    #[allow(dead_code)] // asserted by external adversarial tests
     pub fn reserved_entries_for_tests(&self) -> usize {
         self.reserved_entries.load(Ordering::Acquire)
     }
 
     /// Bytes currently reserved across ordinary and aggregate rows.
     #[doc(hidden)]
-    #[allow(dead_code)] // asserted by external adversarial tests
     pub fn retained_bytes_for_tests(&self) -> usize {
         self.retained_bytes.load(Ordering::Acquire)
     }
@@ -2264,35 +2256,30 @@ impl ChargebackRegistry {
     /// Configured retained-row ceiling. Lifecycle tests assert that construction
     /// leaves it untouched and only an accepted generation publishes it.
     #[doc(hidden)]
-    #[allow(dead_code)]
     pub fn max_entries_for_test(&self) -> usize {
         self.max_entries.load(Ordering::Acquire)
     }
 
     /// Configured retained-byte ceiling.
     #[doc(hidden)]
-    #[allow(dead_code)]
     pub fn max_retained_bytes_for_test(&self) -> usize {
         self.max_retained_bytes.load(Ordering::Acquire)
     }
 
     /// Shard count the entry map was built with.
     #[doc(hidden)]
-    #[allow(dead_code)]
     pub fn shard_amount_for_tests(&self) -> usize {
         self.shard_amount
     }
 
     /// Current proxy-metadata generation carried by render caches.
     #[doc(hidden)]
-    #[allow(dead_code)]
     pub fn proxy_metadata_generation_for_tests(&self) -> u64 {
         self.proxy_metadata_generation.load(Ordering::Acquire)
     }
 
     /// Current `/charges` projection generation carried by the JSON cache.
     #[doc(hidden)]
-    #[allow(dead_code)]
     pub fn render_schema_generation_for_tests(&self) -> u64 {
         self.render_schema_generation.load(Ordering::Acquire)
     }
@@ -2304,7 +2291,6 @@ impl ChargebackRegistry {
     /// tests can prove a render started under a prior schema cannot repopulate
     /// the cache after a schema transition without relying on timing sleeps.
     #[doc(hidden)]
-    #[allow(dead_code)]
     pub fn try_store_json_cache_for_tests(
         &self,
         metadata_generation: u64,
@@ -2456,7 +2442,6 @@ impl ChargebackRegistry {
     /// new ones, including unreserved aggregate rows: recording never acquires
     /// the retirement lock this pass holds.
     #[doc(hidden)]
-    #[allow(dead_code)]
     pub fn evict_stale_interleaved_for_tests(
         &self,
         ttl_nanos: u64,
@@ -2728,7 +2713,6 @@ impl ChargebackRegistry {
 
     /// Registry walks `/charges` render loops have performed.
     #[doc(hidden)]
-    #[allow(dead_code)]
     pub fn render_walks_for_tests(&self) -> usize {
         self.render_walks.load(Ordering::Relaxed)
     }
@@ -2736,7 +2720,6 @@ impl ChargebackRegistry {
     /// Make every subsequent render walk advance the proxy-metadata
     /// generation, as a reload that keeps racing the render would.
     #[doc(hidden)]
-    #[allow(dead_code)]
     pub fn invalidate_every_render_walk_for_tests(&self, enabled: bool) {
         self.invalidate_every_render_walk
             .store(enabled, Ordering::Relaxed);
@@ -3771,7 +3754,6 @@ fn optional_u64(config: &Value, key: &str, default: u64) -> Result<u64, String> 
 }
 
 impl ApiChargeback {
-    #[allow(dead_code)] // Used by external tests; production uses new_with_shard_amount.
     pub fn new(config: &Value, namespace: &str) -> Result<Self, String> {
         Self::new_with_shard_amount(
             config,
@@ -3791,6 +3773,58 @@ impl ApiChargeback {
         namespace: &str,
         shard_amount: usize,
     ) -> Result<Self, String> {
+        let parsed = ParsedApiChargebackConfig::from_config(config)?;
+
+        // Resolve (and, on first use, create) the process-global registry only
+        // once every currency, tunable, and pricing check has passed, so a
+        // config that fails validation never claims the singleton (issue
+        // #7109). Shared Admin / CP validation never reaches this point: it
+        // uses the shape-only [`Self::validate_config`], whose validation HTTP
+        // client does not carry the node's `FERRUM_POOL_SHARD_AMOUNT`.
+        let registry = global_registry_with_shard_amount(shard_amount);
+
+        // Construction stays side-effect free on the process-global registry.
+        // A staged plugin-cache generation builds an instance, and a candidate
+        // that is later rejected must not have repointed the shared budgets,
+        // render TTLs, or cleanup schedule that the live generation is still
+        // using. The resolved tunables are applied in
+        // `commit_background_tasks`, which runs only after the generation is
+        // atomically installed.
+        let scope = InstanceScope::new(parsed.currency, namespace);
+
+        Ok(Self {
+            registry,
+            pricing: parsed.pricing,
+            scope,
+            tunables: parsed.tunables,
+            render_schema: parsed.render_schema,
+        })
+    }
+
+    /// Shape-only validation for shared Admin / CP / config-load admission.
+    ///
+    /// Runs every check construction runs — unknown keys, `schema` /
+    /// `schema_ref`, currency, shared tunables, and pricing — without resolving
+    /// the process-global registry, so a validation sweep (whose HTTP client
+    /// reports auto sharding) can never claim the singleton before an accepted
+    /// generation sizes it with the node's configured shard count (issue
+    /// #7109).
+    pub fn validate_config(config: &Value) -> Result<(), String> {
+        ParsedApiChargebackConfig::from_config(config).map(|_| ())
+    }
+}
+
+/// Everything an `api_chargeback` config resolves to before the instance is
+/// bound to the process-global registry.
+struct ParsedApiChargebackConfig<'a> {
+    render_schema: Option<Arc<SummarySchema>>,
+    currency: &'a str,
+    tunables: SharedRegistryTunables,
+    pricing: PricingConfig,
+}
+
+impl<'a> ParsedApiChargebackConfig<'a> {
+    fn from_config(config: &'a Value) -> Result<Self, String> {
         let object = config
             .as_object()
             .ok_or_else(|| "api_chargeback: `config` must be an object".to_string())?;
@@ -3827,33 +3861,18 @@ impl ApiChargeback {
             );
         }
 
-        // Resolve (and, on first use, create) the process-global registry only
-        // once every currency, tunable, and pricing check has passed, so a
-        // config that fails validation never claims the singleton (issue
-        // #7109).
-        let registry = global_registry_with_shard_amount(shard_amount);
-
-        // Construction stays side-effect free on the process-global registry.
-        // Admin validation and a staged plugin-cache generation both build an
-        // instance, and a candidate that is later rejected must not have
-        // repointed the shared budgets, render TTLs, or cleanup schedule that
-        // the live generation is still using. The resolved tunables are applied
-        // in `commit_background_tasks`, which runs only after the generation is
-        // atomically installed.
-        let scope = InstanceScope::new(currency, namespace);
-
         Ok(Self {
-            registry,
-            pricing,
-            scope,
-            tunables,
             render_schema,
+            currency,
+            tunables,
+            pricing,
         })
     }
+}
 
+impl ApiChargeback {
     /// The compiled `/charges` render projection this instance resolved.
     #[doc(hidden)]
-    #[allow(dead_code)] // used only by external unit tests; dead in the production binary
     pub fn render_schema(&self) -> Option<&Arc<SummarySchema>> {
         self.render_schema.as_ref()
     }
@@ -3861,7 +3880,6 @@ impl ApiChargeback {
     /// Shard count the process-global entry map was built with when this
     /// instance resolved it (or the already-created singleton's fixed count).
     #[doc(hidden)]
-    #[allow(dead_code)]
     pub fn registry_shard_amount_for_tests(&self) -> usize {
         self.registry.shard_amount_for_tests()
     }

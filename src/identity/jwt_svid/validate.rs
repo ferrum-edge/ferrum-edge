@@ -106,6 +106,24 @@ pub fn validate_jwt_svid(
     for (trust_domain, authorities) in bundles {
         validate_published_authorities(trust_domain, authorities)?;
     }
+    validate_jwt_svid_against_admitted(token, audience, bundles)
+}
+
+/// [`validate_jwt_svid`] for bundles whose every authority set has ALREADY
+/// passed [`validate_published_authorities`] for its key. The Workload API
+/// service admits each set once (memoized per set) while collecting it, so
+/// this skips only that repeated admission; every token check is identical.
+pub(crate) fn validate_jwt_svid_against_admitted(
+    token: &str,
+    audience: &str,
+    bundles: &BTreeMap<TrustDomain, Vec<PublishedJwtAuthority>>,
+) -> Result<ValidatedJwtSvid, JwtSvidError> {
+    validate_audience_value(audience)?;
+    if bundles.is_empty() || bundles.values().all(|authorities| authorities.is_empty()) {
+        return Err(JwtSvidError::NoJwtAuthority(
+            "no JWT authority is available to validate against",
+        ));
+    }
 
     let (header_segment, claims_segment) = split_token(token)?;
     let header_bytes = decode_segment(header_segment)?;

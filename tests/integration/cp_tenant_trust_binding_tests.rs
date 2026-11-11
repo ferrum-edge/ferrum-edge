@@ -1850,6 +1850,37 @@ fn fleet_secret_backed_credentials_are_refused() {
         .expect("a per-tenant secret distinct from the fleet secret must load");
 }
 
+/// Startup and every accepted reload warn about served namespaces no
+/// credential binds (issue #7203); this is the shared computation.
+#[test]
+fn unbound_served_namespaces_lists_only_served_namespaces_without_a_credential() {
+    let document = json!({
+        "version": 1,
+        "keys": [
+            { "kid": TENANT_B, "algorithm": "HS256", "secret": TENANT_B_SECRET,
+              "namespaces": [TENANT_B] },
+        ]
+    })
+    .to_string();
+    let bundle = CpDpTrustBundle::from_document_str(&document, "tenant-b-only", None)
+        .expect("tenant B bundle must load");
+    let served = vec![
+        TENANT_A.to_string(),
+        TENANT_B.to_string(),
+        "tenant-c".to_string(),
+    ];
+    assert_eq!(
+        bundle.unbound_served_namespaces(&served),
+        vec![TENANT_A, "tenant-c"]
+    );
+    assert!(
+        bundle
+            .unbound_served_namespaces(&[TENANT_B.to_string()])
+            .is_empty()
+    );
+    assert!(bundle.unbound_served_namespaces(&[]).is_empty());
+}
+
 // ── Fail-closed startup ──────────────────────────────────────────────────
 
 /// A multi-namespace control plane must refuse the fleet-wide self-minting
@@ -3199,7 +3230,7 @@ mod projected_generation {
             mount.bundle_path(),
             None,
             store.clone(),
-            true,
+            Some(vec![TENANT_A.to_string(), TENANT_B.to_string()]),
             Duration::from_secs(1),
             Arc::new(CpDpTrustReloadStatus::disabled()),
             shutdown_rx,

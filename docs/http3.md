@@ -42,6 +42,12 @@ FERRUM_FRONTEND_TLS_CERT_PATH=/path/to/cert.pem
 FERRUM_FRONTEND_TLS_KEY_PATH=/path/to/key.pem
 ```
 
+HTTP/1.1 and HTTP/2 responses on the process-global proxy ports carry
+`Alt-Svc: h3=":<FERRUM_PROXY_HTTPS_PORT>"; ma=86400` only once that QUIC
+listener has actually started. `FERRUM_ENABLE_HTTP3=true` without frontend TLS
+material, or with `FERRUM_PROXY_HTTPS_PORT=0`, starts no listener and so
+advertises nothing.
+
 Under `FERRUM_FRONTEND_TLS_LIVE_RELOAD_ENABLED=true`, an mTLS H3 listener owns
 its own client-trust generation (`proxy_h3`). Because the QUIC endpoint applies a
 reload out of band, it adopts one whole accepted candidate — `ServerConfig`,
@@ -1491,7 +1497,14 @@ free.
 
 How the stream is closed depends on why:
 
-- An ordinary end of tunnel FINs the capsule stream.
+- An ordinary end of tunnel FINs the capsule stream. When the gateway ends it
+  (idle timeout, drain, route withdrawal or change) while the client's request
+  direction is still open, that direction is halted with
+  `STOP_SENDING(H3_NO_ERROR)`, never the `STOP_SENDING(0)` a dropped receive
+  half produces (issue #7188). Every supervisor-decided end halts the receive
+  half with the code its close kind resets the send half with, and the
+  receive-half task is joined within `CLOSE_GRACE`, aborted only as the
+  fallback.
 - A capsule protocol fault — a malformed capsule, a capsule over the ceiling, or
   a client FIN **in the middle of a capsule** — is a malformed HTTP message per
   RFC 9297 §3.3/§3.5 and RFC 9114 §4.1.2, so the receive half is halted with

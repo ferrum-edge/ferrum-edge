@@ -357,7 +357,8 @@ fn h3_accept_loop_reads_only_the_binary_keepalive_tier() {
         "the keepalive tier must be observed by parking on the watch, not by a per-connection timer"
     );
     assert!(
-        !accept_loop.contains("should_disable_keepalive_red"),
+        !accept_loop.contains("should_disable_keepalive_red")
+            && !accept_loop.contains("should_close_keepalive"),
         "RED sampling must never drive a terminal per-connection GOAWAY"
     );
     assert!(

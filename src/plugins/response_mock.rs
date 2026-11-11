@@ -290,7 +290,12 @@ impl ResponseMock {
                 RESPONSE_MOCK_CONFIG_KEYS.join("`, `")
             )
         })?;
-        reject_unknown_keys(config, "config", RESPONSE_MOCK_CONFIG_KEYS)?;
+        crate::util::unknown_keys::reject_unknown_keys(
+            config,
+            "config",
+            RESPONSE_MOCK_CONFIG_KEYS,
+            "response_mock: `config`: ",
+        )?;
 
         let passthrough_on_no_match =
             optional_bool(config, "passthrough_on_no_match")?.unwrap_or(false);
@@ -319,7 +324,12 @@ impl ResponseMock {
                 .as_object()
                 .ok_or_else(|| format!("response_mock: `rule[{i}]` must be an object"))?;
             let rule_path = format!("config.rules[{i}]");
-            reject_unknown_keys(rule_obj, &rule_path, RESPONSE_MOCK_RULE_KEYS)?;
+            crate::util::unknown_keys::reject_unknown_keys(
+                rule_obj,
+                &rule_path,
+                RESPONSE_MOCK_RULE_KEYS,
+                &format!("response_mock: `{rule_path}`: "),
+            )?;
 
             let method = match rule_obj.get("method") {
                 Some(Value::String(method)) if !method.is_empty() => {
@@ -564,7 +574,12 @@ fn parse_request_match(
         }
     };
     let match_path = format!("config.rules[{rule_idx}].match");
-    reject_unknown_keys(match_obj, &match_path, RESPONSE_MOCK_MATCH_KEYS)?;
+    crate::util::unknown_keys::reject_unknown_keys(
+        match_obj,
+        &match_path,
+        RESPONSE_MOCK_MATCH_KEYS,
+        &format!("response_mock: `{match_path}`: "),
+    )?;
     if match_obj.is_empty() {
         return Err(format!(
             "response_mock: `rule[{rule_idx}]` `match` must contain `headers` or `query_params`"
@@ -669,27 +684,6 @@ fn condition_value<'a>(value: &'a Value, rule_idx: usize, field: &str) -> Result
         ));
     }
     Ok(value.as_str())
-}
-
-fn reject_unknown_keys(
-    object: &Map<String, Value>,
-    path: &str,
-    allowed: &[&str],
-) -> Result<(), String> {
-    let mut unknown: Vec<&str> = object
-        .keys()
-        .map(String::as_str)
-        .filter(|key| !allowed.contains(key))
-        .collect();
-    if unknown.is_empty() {
-        return Ok(());
-    }
-    unknown.sort_unstable();
-    Err(format!(
-        "response_mock: unknown config key(s) under `{path}`: {:?}; allowed keys: `{}`",
-        unknown.join(", "),
-        allowed.join("`, `")
-    ))
 }
 
 fn optional_bool(config: &Map<String, Value>, key: &str) -> Result<Option<bool>, String> {

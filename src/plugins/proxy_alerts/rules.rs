@@ -175,7 +175,6 @@ impl Rule {
         self.common().id
     }
 
-    #[allow(dead_code)] // Used by external test crate.
     pub fn name(&self) -> &str {
         &self.common().name
     }

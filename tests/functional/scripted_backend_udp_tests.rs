@@ -479,7 +479,8 @@ plugin_configs: []
 // ────────────────────────────────────────────────────────────────────────────
 //
 // The gateway's `udp_max_response_amplification_factor` caps each
-// backend→client datagram's bytes to `factor × last_request_size`.
+// backend→client payload bytes to the budget its client datagrams earned
+// (`factor × request size`).
 // Oversized datagrams are dropped (see
 // `proxy/udp_proxy.rs::reply_amplification_factor`).
 //

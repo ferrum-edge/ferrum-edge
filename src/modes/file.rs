@@ -222,17 +222,14 @@ pub struct ServeHandles {
     /// Gateway API listener-port lifecycle. Exposed so in-process callers can
     /// read the ports actually bound and any refusal / bind failure, rather
     /// than inferring listener state from traffic.
-    #[allow(dead_code)] // The binary path never reads it back; tests do.
     pub gateway_listeners: Arc<GatewayListenerManager>,
     /// Bounded realization status those listeners publish (issue #3810). The
     /// same handle `AdminState` reads for authenticated `/health` detail, so an
     /// in-process caller observes exactly what an operator would.
-    #[allow(dead_code)] // The binary path never reads it back; tests do.
     pub gateway_listener_status: Arc<crate::proxy::gateway_listener_status::GatewayListenerStatus>,
     /// Local addresses each listener is bound to (resolved from the pre-bound
     /// listener, **not** read from `EnvConfig`). Tests use this to build
     /// canonical proxy/admin URLs.
-    #[allow(dead_code)] // The binary path drops this immediately; tests read it.
     pub bound: BoundAddresses,
     /// Listener task handles (proxy HTTP/HTTPS/H3 + admin HTTP/HTTPS).
     /// These exit cleanly when the shutdown signal fires, so [`Self::join`]
@@ -1219,7 +1216,6 @@ pub async fn serve(
             crate::admin::api_specs::DefaultExternalDocumentLoader {
                 egress: env_config.backend_allow_ips.clone(),
                 dns_cache: None,
-                fixtures: std::collections::HashMap::new(),
             },
         ),
         runtime_config_apply: None,
@@ -1736,7 +1732,7 @@ pub async fn serve(
         if env_config.pool_warmup_enabled {
             proxy_state.warmup_connection_pools().await;
         }
-        proxy_state.set_h3_websocket_listener_started(h3_listener_started);
+        proxy_state.set_h3_listener_started(h3_listener_started);
         startup_ready.store(true, Ordering::Release);
         info!("Gateway startup complete; /health now reports ready");
         Ok(())

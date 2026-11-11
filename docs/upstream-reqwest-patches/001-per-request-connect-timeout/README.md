@@ -57,6 +57,16 @@ patches 002–004 and later local corrections. Apply the complete
 see [the baseline record](../README.md). The historical PR artifact alone
 is not sufficient to reconstruct the shipped crate.
 
+Like the PR, the effective timeout (per-request override, else the client
+default) is applied twice: the outer connect deadline bounds the whole dial, and
+`ConnectorService::request_connect_timeout()` hands it to every
+`HttpConnector` the connector uses (`set_connect_timeout` on the direct, HTTPS
+tunnel and SOCKS arms), which spreads it across the resolved addresses. The
+0.13.3 rebase (e59281dc3) had dropped those connector calls and left the field
+always `None`; they were restored for issue #7308 and are pinned by
+`test_per_request_connect_timeout_bounds_each_resolved_address`
+(`tests/integration/connection_pool_tests.rs`).
+
 ## Files copied into `vendor/reqwest-0.13.4-ferrum-patched/`
 
 - `src/` — the entire crate source (with the patch applied)

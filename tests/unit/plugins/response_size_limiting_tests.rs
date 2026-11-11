@@ -1026,7 +1026,7 @@ struct DoublingInspector;
 
 #[async_trait::async_trait]
 impl ferrum_edge::plugins::ResponseStreamInspector for DoublingInspector {
-    async fn on_chunk(&mut self, chunk: &[u8]) -> ferrum_edge::plugins::ResponseStreamAction {
+    async fn on_chunk(&mut self, chunk: &Bytes) -> ferrum_edge::plugins::ResponseStreamAction {
         let mut out = Vec::with_capacity(chunk.len() * 2);
         out.extend_from_slice(chunk);
         out.extend_from_slice(chunk);
@@ -1039,7 +1039,7 @@ struct ExpandAtEnd(Vec<u8>);
 
 #[async_trait::async_trait]
 impl ferrum_edge::plugins::ResponseStreamInspector for ExpandAtEnd {
-    async fn on_chunk(&mut self, chunk: &[u8]) -> ferrum_edge::plugins::ResponseStreamAction {
+    async fn on_chunk(&mut self, chunk: &Bytes) -> ferrum_edge::plugins::ResponseStreamAction {
         self.0.extend_from_slice(chunk);
         ferrum_edge::plugins::ResponseStreamAction::Forward(Bytes::new())
     }
@@ -1057,7 +1057,7 @@ struct TerminateWithLargeEvent;
 
 #[async_trait::async_trait]
 impl ferrum_edge::plugins::ResponseStreamInspector for TerminateWithLargeEvent {
-    async fn on_chunk(&mut self, _chunk: &[u8]) -> ferrum_edge::plugins::ResponseStreamAction {
+    async fn on_chunk(&mut self, _chunk: &Bytes) -> ferrum_edge::plugins::ResponseStreamAction {
         ferrum_edge::plugins::ResponseStreamAction::Terminate(Some(Bytes::from_static(
             b"event: error\ndata: {\"error\":\"cut\"}\n\n",
         )))

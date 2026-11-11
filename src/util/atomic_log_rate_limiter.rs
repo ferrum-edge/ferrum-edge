@@ -131,7 +131,6 @@ impl AtomicLogRateLimiter {
 
     /// Clear state for isolated unit tests.
     #[doc(hidden)]
-    #[allow(dead_code)] // used only by external tests; dead in binary test target
     pub fn reset_for_test(&self) {
         self.last_emit_ms.store(UNSET_MS, Ordering::Relaxed);
         self.suppressed.store(0, Ordering::Relaxed);
@@ -139,14 +138,12 @@ impl AtomicLogRateLimiter {
 
     /// Observed suppressed-event accumulator. Test-only.
     #[doc(hidden)]
-    #[allow(dead_code)] // used only by external tests; dead in binary test target
     pub fn suppressed_count_for_test(&self) -> u64 {
         self.suppressed.load(Ordering::Relaxed)
     }
 
     /// Seed limiter state for external regressions. Test-only.
     #[doc(hidden)]
-    #[allow(dead_code)] // used only by external tests; dead in binary test target
     pub fn seed_for_test(&self, last_emit_ms: u64, suppressed: u64) {
         self.last_emit_ms.store(last_emit_ms, Ordering::Relaxed);
         self.suppressed.store(suppressed, Ordering::Relaxed);

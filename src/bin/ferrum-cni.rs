@@ -60,11 +60,23 @@ mod cni_main {
         // argv to a CNI plugin, so an argument-bearing invocation is
         // unambiguously the lifecycle CLI and never a plugin call.
         match std::env::args().nth(1).as_deref() {
-            Some("install") => return run_install(),
-            Some("uninstall") => return run_uninstall(),
+            Some("install") => {
+                init_lifecycle_logging();
+                return run_install();
+            }
+            Some("uninstall") => {
+                init_lifecycle_logging();
+                return run_uninstall();
+            }
             Some("uninstall-status") => return run_uninstall_status(),
-            Some("await-cleanup") => return run_await_cleanup(),
-            Some("rollback-watch") => return run_rollback_watch(),
+            Some("await-cleanup") => {
+                init_lifecycle_logging();
+                return run_await_cleanup();
+            }
+            Some("rollback-watch") => {
+                init_lifecycle_logging();
+                return run_rollback_watch();
+            }
             Some(_) => {
                 // The argument is not echoed: it is untrusted process input
                 // and the accepted set is fixed and short.
@@ -138,6 +150,23 @@ mod cni_main {
                 handle_verb(verb, &net_config, &invocation)
             }
         }
+    }
+
+    /// Route the shared `cni::install` / `cni::lifecycle` diagnostics (ignored
+    /// ownership manifests, skipped neighbour configs) to stderr for the
+    /// lifecycle verbs. Those modules log through `tracing` because the
+    /// node-agent, which has a subscriber, calls them too; without one here the
+    /// init container and hooks would drop them. Plugin invocations never
+    /// install it: their stdout is the CNI result and stays untouched either
+    /// way. `RUST_LOG` overrides the default `info` level.
+    fn init_lifecycle_logging() {
+        let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+            .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter(filter)
+            .with_writer(std::io::stderr)
+            .with_ansi(false)
+            .try_init();
     }
 
     /// `ferrum-cni install` — copy the binary and write the chained conflist.
@@ -429,7 +458,6 @@ mod cni_main {
             container_id: String::new(),
             ifname: None,
             netns_path: None,
-            args: Default::default(),
             valid_attachments: Vec::new(),
         };
 
@@ -504,7 +532,6 @@ mod cni_main {
             container_id: String::new(),
             ifname: None,
             netns_path: None,
-            args: Default::default(),
             valid_attachments,
         };
 
@@ -571,7 +598,6 @@ mod cni_main {
             container_id: invocation.container_id.clone(),
             ifname: invocation.ifname.clone(),
             netns_path: invocation.netns.clone(),
-            args: args_map,
             valid_attachments: Vec::new(),
         };
 

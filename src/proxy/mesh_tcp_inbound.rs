@@ -545,6 +545,14 @@ async fn relay_to_loopback(
                     client_ip = %client_ip,
                     "Sidecar raw-TCP inbound loopback connect timed out; closing captured connection"
                 );
+                // The same classes the plugin-chain path's summary carries,
+                // so the counters do not depend on a stream plugin being
+                // configured (issue #7183).
+                crate::runtime_metrics::global_ref().record_stream_end(
+                    &proxy.id,
+                    Some(crate::retry::ErrorClass::ConnectionTimeout),
+                    None,
+                );
                 return;
             }
         }
@@ -559,6 +567,11 @@ async fn relay_to_loopback(
                 client_ip = %client_ip,
                 error = %error,
                 "Sidecar raw-TCP inbound loopback connect failed; closing captured connection"
+            );
+            crate::runtime_metrics::global_ref().record_stream_end(
+                &proxy.id,
+                Some(crate::retry::ErrorClass::ConnectionRefused),
+                None,
             );
             return;
         }
@@ -602,6 +615,13 @@ async fn relay_to_loopback(
             bytes_in = result.bytes_client_to_backend,
             bytes_out = result.bytes_backend_to_client,
             "Sidecar raw-TCP inbound relay failed"
+        );
+        let end_reason =
+            tcp_proxy::RelayEndReason::from_first_failure(result.first_failure.as_ref());
+        crate::runtime_metrics::global_ref().record_stream_end(
+            &proxy.id,
+            end_reason.error_class(),
+            Some(*direction),
         );
     } else {
         debug!(
@@ -664,12 +684,11 @@ async fn emit_disconnect(
         sni_hostname: stream_ctx.sni_hostname.clone(),
         metadata: stream_ctx.take_metadata(),
     };
-    crate::runtime_metrics::global_ref().record_stream_transaction(&summary);
-    if summary.error_class == Some(crate::retry::ErrorClass::ConnectionReset)
-        && let Some(direction) = summary.disconnect_direction
-    {
-        crate::runtime_metrics::global_ref().record_tcp_rst(&summary.proxy_id, direction);
-    }
+    crate::runtime_metrics::global_ref().record_stream_end(
+        &summary.proxy_id,
+        summary.error_class,
+        summary.disconnect_direction,
+    );
     for plugin in plugins.iter() {
         plugin.on_stream_disconnect(&summary).await;
     }

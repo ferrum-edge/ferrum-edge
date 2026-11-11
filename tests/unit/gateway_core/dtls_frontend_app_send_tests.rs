@@ -934,14 +934,16 @@ fn refused_dtls_handshakes_never_commit_the_server_final_flight() {
 #[test]
 fn dtls_demux_opens_sessions_only_on_client_hello() {
     let dispatch = DTLS_SOURCE
-        .split("} else if dtls_datagram_opens_session(&data) {")
+        .split("} else if dtls_datagram_opens_session(data) {")
         .nth(1)
         .expect("ClientHello demux spawn arm")
         .split("fn spawn_session(")
         .next()
         .expect("spawn_session follows demux");
     assert!(
-        dispatch.contains("self.spawn_session(peer_addr, data, reply_local, forwarded_client);"),
+        dispatch.contains(
+            "self.spawn_session(peer_addr, data.to_vec(), reply_local, forwarded_client);"
+        ),
         "a ClientHello from an unknown peer must still spawn a session"
     );
     assert!(
@@ -954,7 +956,7 @@ fn dtls_demux_opens_sessions_only_on_client_hello() {
         .split("Err(mpsc::error::TrySendError::Closed(data)) => {")
         .nth(1)
         .expect("Closed-arm re-dispatch")
-        .split("} else if dtls_datagram_opens_session(&data) {")
+        .split("} else if dtls_datagram_opens_session(data) {")
         .next()
         .expect("Closed arm ends before unknown-peer spawn");
     assert!(

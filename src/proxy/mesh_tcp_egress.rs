@@ -311,6 +311,14 @@ pub(crate) async fn handle_mesh_tcp_egress(
                     error = %err,
                     "Raw-TCP mesh egress HBONE tunnel failed; closing captured connection"
                 );
+                // Captured egress runs no stream summary unless an observer
+                // plugin is configured, so record the stream-error counter
+                // here (issue #7183).
+                crate::runtime_metrics::global_ref().record_stream_end(
+                    &proxy.id,
+                    Some(err.error_class()),
+                    None,
+                );
                 return;
             }
         }
@@ -372,6 +380,11 @@ pub(crate) async fn handle_mesh_tcp_egress(
                     error = %err,
                     "Raw-TCP mesh egress sidecar mesh-mTLS CONNECT tunnel failed; closing \
                      captured connection"
+                );
+                crate::runtime_metrics::global_ref().record_stream_end(
+                    &proxy.id,
+                    Some(err.error_class()),
+                    None,
                 );
                 return;
             }
@@ -445,6 +458,15 @@ pub(crate) async fn handle_mesh_tcp_egress(
             bytes_in = result.bytes_client_to_backend,
             bytes_out = result.bytes_backend_to_client,
             "Raw-TCP mesh egress relay failed"
+        );
+        // Stream-error and RST counters, classified exactly as the generic
+        // TCP proxy and the observer summary classify them (issue #7183).
+        let end_reason =
+            tcp_proxy::RelayEndReason::from_first_failure(result.first_failure.as_ref());
+        crate::runtime_metrics::global_ref().record_stream_end(
+            &proxy.id,
+            end_reason.error_class(),
+            Some(*direction),
         );
     } else {
         debug!(

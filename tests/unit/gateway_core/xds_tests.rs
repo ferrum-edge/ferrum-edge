@@ -99,8 +99,9 @@ fn mesh_config() -> MeshConfig {
         peer_authentications: vec![PeerAuthentication {
             name: "default-mtls".to_string(),
             namespace: "default".to_string(),
-            scope: None,
-            selector: None,
+            scope: PolicyScope::Namespace {
+                namespace: "default".to_string(),
+            },
             mtls_mode: MtlsMode::Strict,
             port_overrides: HashMap::new(),
         }],
@@ -438,11 +439,6 @@ fn nonce_tracker_keeps_ack_state_per_node_and_type_url() {
         tracker.record_response("node-a", RDS_TYPE_URL, &rds_nonce, "v1", None),
         AckOutcome::Acked
     );
-    assert_eq!(
-        tracker.last_error("node-a", LDS_TYPE_URL),
-        Some("bad listener".to_string())
-    );
-    assert_eq!(tracker.last_error("node-a", RDS_TYPE_URL), None);
 }
 
 #[test]
@@ -527,7 +523,7 @@ fn nonce_tracker_bounds_hostile_megabyte_stale_nonce_and_drift_version() {
 }
 
 #[test]
-fn nonce_tracker_clears_error_on_new_issue_and_removes_one_node_only() {
+fn nonce_tracker_accepts_a_new_issue_after_a_nack_and_removes_one_node_only() {
     let tracker = XdsNonceTracker::new();
     let failed = tracker.issue_nonce("node-a", LDS_TYPE_URL, "v1");
     let node_b = tracker.issue_nonce("node-b", LDS_TYPE_URL, "v1");
@@ -538,13 +534,8 @@ fn nonce_tracker_clears_error_on_new_issue_and_removes_one_node_only() {
             message: "bad listener".to_string()
         }
     );
-    assert_eq!(
-        tracker.last_error("node-a", LDS_TYPE_URL),
-        Some("bad listener".to_string())
-    );
 
     let corrected = tracker.issue_nonce("node-a", LDS_TYPE_URL, "v2");
-    assert_eq!(tracker.last_error("node-a", LDS_TYPE_URL), None);
     assert_eq!(tracker.len(), 2);
     assert_eq!(
         tracker.record_response("node-a", LDS_TYPE_URL, &corrected, "v2", None),

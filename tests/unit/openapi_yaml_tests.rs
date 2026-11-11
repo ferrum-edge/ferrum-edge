@@ -149,6 +149,59 @@ fn assert_serde_component_field_parity<T>(
     );
 }
 
+/// The admin API is part of the crate's SemVer surface
+/// (`docs/support_policy.md`), so the spec document is versioned with the
+/// crate: a release that bumps `Cargo.toml` must bump `info.version` with it
+/// (issue #7304).
+#[test]
+fn openapi_info_version_matches_crate_version() {
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+    assert_eq!(
+        spec.pointer("/info/version")
+            .and_then(|value| value.as_str()),
+        Some(env!("CARGO_PKG_VERSION")),
+        "openapi.yaml info.version must equal the Cargo.toml package version"
+    );
+}
+
+/// Every runtime Redis key-prefix default is derived from `FERRUM_NAMESPACE`
+/// (and, for the limiters, the plugin-config id), which no static schema
+/// `default` can express. A client that fills in defaults would write the
+/// placeholder text literally, so no component may advertise one (issue
+/// #7304); the description carries the derived value instead.
+#[test]
+fn redis_key_prefix_properties_advertise_no_static_default() {
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+    let schemas = spec
+        .pointer("/components/schemas")
+        .and_then(|value| value.as_object())
+        .expect("components.schemas is an object");
+    let mut checked = 0;
+    for (name, schema) in schemas {
+        let Some(prefix) = schema.pointer("/properties/redis_key_prefix") else {
+            continue;
+        };
+        checked += 1;
+        assert!(
+            prefix.get("default").is_none(),
+            "{name}.redis_key_prefix must not advertise a static default"
+        );
+        assert!(
+            prefix
+                .get("description")
+                .and_then(|value| value.as_str())
+                .is_some_and(|description| description.contains("{FERRUM_NAMESPACE}")),
+            "{name}.redis_key_prefix must document its namespace-derived default"
+        );
+    }
+    assert!(
+        checked >= 8,
+        "expected the rate-limit, dedup and cache prefixes; found {checked}"
+    );
+}
+
 #[test]
 fn admin_pagination_schema_matches_runtime_bounds_and_coercion() {
     let spec: serde_json::Value =
@@ -739,6 +792,22 @@ fn circuit_breaker_config_documents_cooldown_seconds_input_alias() {
         alias_description.contains("alias for `timeout_seconds`"),
         "cooldown_seconds must point back at timeout_seconds: {alias_description}"
     );
+}
+
+/// Issue #7114: `error_truncate_chars` only ever narrows the compiled-in
+/// diagnostic ceiling, so its documented default is that ceiling rather than a
+/// larger value the runtime would silently clamp.
+#[test]
+fn openapi_validator_error_truncate_default_is_the_diagnostic_ceiling() {
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+    let field = &spec["components"]["schemas"]["OpenapiValidatorConfig"]["properties"]["error_truncate_chars"];
+    assert_eq!(
+        field["default"],
+        json!(ferrum_edge::plugins::utils::validation_diagnostics::MAX_DIAGNOSTIC_CHARS)
+    );
+    let docs = include_str!("../../docs/openapi_validator.md");
+    assert!(docs.contains("| `error_truncate_chars` | `256` |"));
 }
 
 #[test]
@@ -5875,8 +5944,7 @@ fn hmac_auth_config_root_is_closed_and_matches_openapi() {
 /// Issue #5001: key-set parity is not acceptance parity. `HmacAuthConfig` had
 /// no conditional constraints at all, so schema-based tooling approved
 /// deployments the gateway refuses to start with — an empty configuration,
-/// unsafe v1 without its acknowledgement, v2 without a replay scope, and every
-/// impossible Redis/scope pairing. This is the real schema-vs-runtime
+/// a profile without a replay scope, and every impossible Redis/scope pairing. This is the real schema-vs-runtime
 /// acceptance matrix.
 #[test]
 fn hmac_auth_schema_acceptance_matches_runtime_admission() {
@@ -5901,12 +5969,6 @@ fn hmac_auth_schema_acceptance_matches_runtime_admission() {
         json!({"replay_scope": "process", "sync_mode": "local"}),
         json!({"signing_profile": "ferrum-hmac-v2", "replay_scope": "process"}),
         json!({
-            "signing_profile": "ferrum-hmac-v2",
-            "replay_scope": "process",
-            "allow_unsafe_replayable_v1": false
-        }),
-        json!({"signing_profile": "ferrum-hmac-v1", "allow_unsafe_replayable_v1": true}),
-        json!({
             "replay_scope": "shared",
             "sync_mode": "redis",
             "redis_url": redis_url
@@ -5917,11 +5979,6 @@ fn hmac_auth_schema_acceptance_matches_runtime_admission() {
         json!({"replay_scope": "process", "signed_headers": ["x-tenant-id", "content-type"]}),
         json!({"replay_scope": "process", "signed_headers": []}),
         json!({"replay_scope": "process", "max_body_bytes": 268_435_456}),
-        json!({
-            "signing_profile": "ferrum-hmac-v1",
-            "allow_unsafe_replayable_v1": true,
-            "signed_headers": ["idempotency-key"]
-        }),
         json!({"signing_profile": "rfc9421", "replay_scope": "process"}),
         json!({
             "signing_profile": "rfc9421",
@@ -5942,26 +5999,22 @@ fn hmac_auth_schema_acceptance_matches_runtime_admission() {
     }
 
     let rejected = [
-        // Profile / acknowledgement / scope admission (the #5001 matrix).
+        // Profile / scope admission (the #5001 matrix). The replayable
+        // `ferrum-hmac-v1` profile and its acknowledgement are gone (#7114).
         json!({}),
         json!({"clock_skew_seconds": 60}),
         json!({"signing_profile": "ferrum-hmac-v1"}),
-        json!({"signing_profile": "ferrum-hmac-v1", "allow_unsafe_replayable_v1": false}),
+        json!({"signing_profile": "ferrum-hmac-v1", "replay_scope": "process"}),
         json!({
             "signing_profile": "ferrum-hmac-v1",
             "allow_unsafe_replayable_v1": true,
             "replay_scope": "process"
         }),
         json!({"replay_scope": "process", "allow_unsafe_replayable_v1": true}),
+        json!({"replay_scope": "process", "allow_unsafe_replayable_v1": false}),
         json!({"replay_scope": "shared"}),
         json!({"replay_scope": "shared", "sync_mode": "redis"}),
         json!({"replay_scope": "process", "sync_mode": "redis", "redis_url": redis_url}),
-        json!({
-            "signing_profile": "ferrum-hmac-v1",
-            "allow_unsafe_replayable_v1": true,
-            "sync_mode": "redis",
-            "redis_url": redis_url
-        }),
         // Scalar spellings: the enums are exact on both surfaces.
         json!({"replay_scope": " PROCESS "}),
         json!({"replay_scope": "Process"}),
@@ -5979,13 +6032,8 @@ fn hmac_auth_schema_acceptance_matches_runtime_admission() {
         json!({"replay_scope": true}),
         json!({"replay_scope": "process", "replay_scop": "shared"}),
         json!({"replay_scope": "process", "require_digest": true}),
-        // Replay capacity is bounded and meaningless without replay state.
+        // Replay capacity is bounded.
         json!({"replay_scope": "process", "replay_max_entries": 10_000_001}),
-        json!({
-            "signing_profile": "ferrum-hmac-v1",
-            "allow_unsafe_replayable_v1": true,
-            "replay_max_entries": 1000
-        }),
         // Signed headers, body ceiling, and RFC 9421 policy bounds.
         json!({"replay_scope": "process", "signed_headers": ["X-Tenant-Id"]}),
         json!({"replay_scope": "process", "signed_headers": ["authorization"]}),
@@ -9907,7 +9955,7 @@ fn request_mirror_schema_matches_strict_runtime_config_contract() {
         Err(err) => err,
     };
     assert!(err.contains("mirror_protcol"), "got: {err}");
-    assert!(err.contains("allowed keys"), "got: {err}");
+    assert!(err.contains("unknown configuration key(s)"), "got: {err}");
     validate_plugin_config("request_mirror", &typo).expect_err("shared admission must reject typo");
 
     // Issue #5152: the component schema is compared against ACTUAL constructor
@@ -10394,7 +10442,6 @@ async fn compression_schema_matches_strict_runtime_config_contract() {
     }
     assert!(compression_docs.contains("Strict config validation"));
     assert!(compression_docs.contains("KeepLastKnownGood"));
-    assert!(compression_docs.contains("disable_on_etag"));
     assert!(
         compression_docs.contains("**Multiple instances:**"),
         "compression docs must describe multi-instance first-wins ownership"
@@ -10576,7 +10623,7 @@ fn ip_restriction_schema_matches_the_strict_runtime_shape() {
     for config in [
         json!({"allow": ["10.0.0.0/8"]}),
         json!({"allow": [], "deny": ["192.0.2.0/24"]}),
-        json!({"allow": ["2001:db8::/32"], "deny": [], "mode": "deny_first"}),
+        json!({"allow": ["2001:db8::/32"], "deny": []}),
         json!({"allow": ["0.0.0.0/0", "255.255.255.255/32"]}),
         json!({"allow": ["::/0", "2001:db8::1/128"]}),
         json!({"allow": ["::ffff:127.0.0.1/96", "::ffff:127.0.0.1/128"]}),
@@ -10605,6 +10652,7 @@ fn ip_restriction_schema_matches_the_strict_runtime_shape() {
         json!({"allow": null, "deny": ["192.0.2.0/24"]}),
         json!({"allow": ["10.0.0.0/8"], "deny": null}),
         json!({"allow": ["10.0.0.0/8"], "mode": null}),
+        json!({"allow": ["10.0.0.0/8"], "mode": "deny_first"}),
         json!({"allow": ["10.0.0.0/8"], "mod": "deny_first"}),
         json!({"alow": ["10.0.0.0/8"], "deny": ["192.0.2.0/24"]}),
         json!({"allow": "10.0.0.0/8"}),
@@ -11190,7 +11238,6 @@ fn upstream_runtime_serialization_is_covered_by_openapi() {
                 "max_connections": 100,
                 "tcp_keepalive": {"time_seconds": 30, "interval_seconds": 10, "probes": 3},
                 "tcp_idle_timeout_seconds": 3600,
-                "http_max_requests_per_connection": 1000,
                 "http_idle_timeout_ms": 30000,
                 "http2_max_requests": 256,
                 "h2_max_concurrent_streams": 128,
@@ -11514,6 +11561,13 @@ fn mesh_and_overload_runtime_snapshots_are_covered_by_openapi() {
                     "last_success_unix": null,
                     "last_failure_unix": null,
                     "last_outcome": "none"
+                },
+                "mesh_node_waypoint_dtls_reload": {
+                    "generation": 2,
+                    "last_swapped_listeners": 1,
+                    "last_success_unix": 1700000000,
+                    "last_failure_unix": 1700000100,
+                    "last_outcome": "rejected"
                 },
                 "bind_failures_total": 0,
                 "bind_failures": []
@@ -16193,24 +16247,19 @@ fn tcp_connection_throttle_schema_docs_and_source_share_the_lifecycle_contract()
     let metrics_source = include_str!("../../src/admin/metrics.rs");
 
     assert_eq!(schema["additionalProperties"], false);
-    assert_component_validity(
-        &spec,
-        "TcpConnectionThrottleConfig",
-        &json!({"max_connections_per_key": 1, "cleanup_interval_seconds": 0}),
-        true,
-    );
-    assert_component_validity(
-        &spec,
-        "TcpConnectionThrottleConfig",
-        &json!({"max_connections_per_key": 1, "cleanup_intervl_seconds": 60}),
-        false,
-    );
-    assert_component_validity(
-        &spec,
-        "TcpConnectionThrottleConfig",
-        &json!({"max_connections_per_key": 1, "cleanup_interval_seconds": 86401}),
-        false,
-    );
+    // The residual sweep and its `cleanup_interval_seconds` knob were removed
+    // (issue #7152); schema and runtime both refuse the old key.
+    for removed in [
+        json!({"max_connections_per_key": 1, "cleanup_interval_seconds": 0}),
+        json!({"max_connections_per_key": 1, "cleanup_intervl_seconds": 60}),
+    ] {
+        assert_component_validity(&spec, "TcpConnectionThrottleConfig", &removed, false);
+        assert!(
+            ferrum_edge::plugins::validate_plugin_config("tcp_connection_throttle", &removed)
+                .is_err(),
+            "runtime must refuse {removed}"
+        );
+    }
     assert_eq!(
         schema["properties"]["max_connections_per_key"]["maximum"],
         json!(u64::MAX)
@@ -16238,12 +16287,13 @@ fn tcp_connection_throttle_schema_docs_and_source_share_the_lifecycle_contract()
             text.contains("process-local"),
             "missing process-local scope"
         );
-        assert!(
-            text.contains("residual"),
-            "missing residual sweep semantics"
-        );
         assert!(text.contains("inline"), "missing inline removal semantics");
+        assert!(
+            text.contains("no background sweep"),
+            "missing the no-sweep contract"
+        );
     }
+    assert!(!source.contains("cleanup_interval_seconds"));
     assert!(schema_text.contains("UDP/DTLS"));
     assert!(plugin_docs.contains("attachment to any other protocol is rejected"));
     assert!(source.contains("DashMap::with_shard_amount"));
@@ -17101,8 +17151,6 @@ fn response_caching_schema_matches_strict_runtime_contract() {
             "respect_cache_control": true,
             "respect_no_cache": false,
             "vary_by_headers": ["x-tenant"],
-            "cache_key_include_query": true,
-            "cache_key_include_consumer": true,
             "add_cache_status_header": true,
             "invalidate_on_unsafe_methods": false
         }),
@@ -17117,8 +17165,8 @@ fn response_caching_schema_matches_strict_runtime_contract() {
 
     for invalid in [
         json!({"vary_by_header": ["x-tenant"]}),
-        json!({"cache_key_include_consumr": true}),
-        json!({"cache_key_include_quer": false}),
+        json!({"cache_key_include_consumer": true}),
+        json!({"cache_key_include_query": false}),
         json!({"respect_cache_contro": true}),
         json!({"respect_no_cach": true}),
         json!({"cacheable_status_code": [200]}),
@@ -17219,8 +17267,6 @@ fn response_caching_schema_matches_strict_runtime_contract() {
         "max_total_size_bytes",
         "respect_cache_control",
         "respect_no_cache",
-        "cache_key_include_query",
-        "cache_key_include_consumer",
         "add_cache_status_header",
         "invalidate_on_unsafe_methods",
     ] {
@@ -20174,6 +20220,114 @@ fn mesh_authz_component_matches_runtime_admission() {
         ])),
     ] {
         assert_component_validity(&spec, "MeshAuthzConfig", &invalid, false);
+    }
+}
+
+/// `mesh_authz` and `workload_metrics` admit `trusted_hbone_assertors` through
+/// one parser (`parse_trusted_hbone_assertors`), so both components must
+/// reference one shared schema and agree with both constructors on every case,
+/// including `null` read as absent and Unicode whitespace trimmed like
+/// `str::trim` (issue #7304).
+#[test]
+fn trusted_hbone_assertor_schema_is_shared_and_matches_both_constructors() {
+    use ferrum_edge::plugins::mesh::authz::MeshAuthz;
+    use ferrum_edge::plugins::mesh::workload_metrics::WorkloadMetrics;
+
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+    let shared = json!("#/components/schemas/MeshTrustedHboneAssertors");
+    for pointer in [
+        "/components/schemas/MeshAuthzConfig/properties/trusted_hbone_assertors/$ref",
+        "/components/schemas/WorkloadMetricsConfig/properties/trusted_hbone_assertors/$ref",
+        "/components/schemas/WorkloadMetricsConfig/properties/_effective_mesh_authz_baggage_gates/items/properties/trusted_hbone_assertors/$ref",
+    ] {
+        assert_eq!(spec.pointer(pointer), Some(&shared), "{pointer}");
+    }
+
+    let spiffe = "spiffe://cluster.local/ns/istio-system/sa/ztunnel";
+    let cases = [
+        (json!(null), true),
+        (json!([]), true),
+        (json!(["ztunnel", "waypoint"]), true),
+        (json!([" waypoint "]), true),
+        (json!([spiffe]), true),
+        (json!([{"assertor": "waypoint"}]), true),
+        (json!([{"assertor": "waypoint", "scope": null}]), true),
+        (
+            json!([{"assertor": "waypoint", "scope": " same_namespace\t"}]),
+            true,
+        ),
+        // `str::trim` strips every Unicode White_Space code point.
+        (
+            json!([{"assertor": "waypoint", "scope": "\u{a0}same_namespace\u{3000}"}]),
+            true,
+        ),
+        (json!([{"assertor": spiffe, "scope": "mesh_wide"}]), true),
+        // A `null` grant field is absent, so it does not conflict.
+        (
+            json!([{"assertor": spiffe, "asserts": null, "scope": "mesh_wide"}]),
+            true,
+        ),
+        (json!([{"assertor": "waypoint", "asserts": []}]), true),
+        (
+            json!([{"assertor": "waypoint",
+                    "asserts": ["spiffe://cluster.local/ns/prod/sa/payments"],
+                    "scope": null}]),
+            true,
+        ),
+        (json!("waypoint"), false),
+        (json!([7]), false),
+        (json!([""]), false),
+        (json!(["   "]), false),
+        (json!(["\u{3000}\u{a0}"]), false),
+        (json!(["https://example.com/sa/waypoint"]), false),
+        (json!([{"assertor": " "}]), false),
+        (json!([{"scope": "same_namespace"}]), false),
+        (json!([{"assertor": "waypoint", "extra": true}]), false),
+        (
+            json!([{"assertor": "waypoint", "asserts": [], "scope": "same_namespace"}]),
+            false,
+        ),
+        (
+            json!([{"assertor": "waypoint", "scope": "mesh_wide"}]),
+            false,
+        ),
+        (
+            json!([{"assertor": "waypoint", "scope": "\u{a0}mesh_wide"}]),
+            false,
+        ),
+        (json!([{"assertor": "waypoint", "scope": "cluster"}]), false),
+        (
+            json!([{"assertor": "waypoint", "asserts": ["not-a-spiffe-id"]}]),
+            false,
+        ),
+        (json!([{"assertor": "waypoint", "asserts": ["  "]}]), false),
+    ];
+
+    for (assertors, expected_valid) in cases {
+        let config = json!({"trusted_hbone_assertors": assertors.clone()});
+        assert_component_validity(&spec, "MeshAuthzConfig", &config, expected_valid);
+        assert_component_validity(&spec, "WorkloadMetricsConfig", &config, expected_valid);
+        assert_eq!(
+            MeshAuthz::new(&config).is_ok(),
+            expected_valid,
+            "mesh_authz constructor disagrees with the schema for {config}"
+        );
+        assert_eq!(
+            WorkloadMetrics::new(&config).is_ok(),
+            expected_valid,
+            "workload_metrics constructor disagrees with the schema for {config}"
+        );
+
+        let gate = json!({"_effective_mesh_authz_baggage_gates": [
+            {"trusted_hbone_assertors": assertors}
+        ]});
+        assert_component_validity(&spec, "WorkloadMetricsConfig", &gate, expected_valid);
+        assert_eq!(
+            WorkloadMetrics::new(&gate).is_ok(),
+            expected_valid,
+            "workload_metrics baggage gate disagrees with the schema for {gate}"
+        );
     }
 }
 

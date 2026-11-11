@@ -35,7 +35,7 @@ use super::utils::summary_log_budget::serialize_under_byte_budget;
 use super::utils::{
     BatchConfig, BatchConfigDefaults, ByteBudget, DeferredBatchingLogger, PluginHttpClient,
     QueuedSummaryPayload, admit_byte_limits, admit_http_summary, admit_stream_summary,
-    assemble_ndjson, build_batch_config, parse_socket_host, resolve_tcp_endpoint,
+    assemble_ndjson, build_batch_config, parse_socket_host, resolve_socket_endpoint,
     validate_batch_config,
 };
 use super::{Plugin, StreamTransactionSummary, TransactionSummary};
@@ -371,7 +371,7 @@ async fn connect_tcp(cfg: &TcpFlushConfig) -> Result<TcpWriter, String> {
     let port = cfg.port;
     let establish = async {
         let socket_addr =
-            resolve_tcp_endpoint(&cfg.host, cfg.port, cfg.dns_cache.as_ref(), "tcp_logging")
+            resolve_socket_endpoint(&cfg.host, cfg.port, cfg.dns_cache.as_ref(), "tcp_logging")
                 .await?;
         let addr_log = format!("{host_log} ({socket_addr})");
         let stream = TcpStream::connect(socket_addr)

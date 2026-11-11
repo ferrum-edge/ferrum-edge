@@ -4,6 +4,9 @@ use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
+use super::config_values::{
+    optional_string, optional_string_vec, optional_u8, optional_u32, parse_severity,
+};
 use crate::plugins::RequestContext;
 use crate::util::unknown_keys::reject_unknown_keys;
 
@@ -1404,19 +1407,6 @@ pub(super) fn parse_custom_rule(
     })
 }
 
-fn parse_severity(raw: &str) -> Result<Severity, String> {
-    match raw {
-        "info" => Ok(Severity::Info),
-        "low" => Ok(Severity::Low),
-        "medium" => Ok(Severity::Medium),
-        "high" => Ok(Severity::High),
-        "critical" => Ok(Severity::Critical),
-        other => Err(format!(
-            "waf: severity must be one of info, low, medium, high, critical; got {other:?}"
-        )),
-    }
-}
-
 fn parse_match_kind(raw: &str) -> Result<MatchKind, String> {
     match raw {
         "regex" => Ok(MatchKind::Regex),
@@ -1531,77 +1521,6 @@ fn parse_conditions(value: &Value, path: &str) -> Result<Conditions, String> {
 
 fn required_string(object: &serde_json::Map<String, Value>, key: &str) -> Result<String, String> {
     optional_string(object, key)?.ok_or_else(|| format!("waf: missing required string `{key}`"))
-}
-
-fn optional_string(
-    object: &serde_json::Map<String, Value>,
-    key: &str,
-) -> Result<Option<String>, String> {
-    match object.get(key) {
-        None | Some(Value::Null) => Ok(None),
-        Some(Value::String(value)) if !value.is_empty() => Ok(Some(value.clone())),
-        Some(Value::String(_)) => Err(format!("waf: `{key}` must be non-empty")),
-        Some(other) => Err(format!(
-            "waf: `{key}` must be a string, got {other:?}",
-            other = other.to_string()
-        )),
-    }
-}
-
-fn optional_u8(object: &serde_json::Map<String, Value>, key: &str) -> Result<Option<u8>, String> {
-    match object.get(key) {
-        None | Some(Value::Null) => Ok(None),
-        Some(Value::Number(value)) => value
-            .as_u64()
-            .and_then(|v| u8::try_from(v).ok())
-            .map(Some)
-            .ok_or_else(|| format!("waf: `{key}` must be an integer from 0 to 255")),
-        Some(other) => Err(format!(
-            "waf: `{key}` must be an integer, got {other:?}",
-            other = other.to_string()
-        )),
-    }
-}
-
-fn optional_u32(object: &serde_json::Map<String, Value>, key: &str) -> Result<Option<u32>, String> {
-    match object.get(key) {
-        None | Some(Value::Null) => Ok(None),
-        Some(Value::Number(value)) => value
-            .as_u64()
-            .and_then(|v| u32::try_from(v).ok())
-            .map(Some)
-            .ok_or_else(|| format!("waf: `{key}` must be a non-negative integer")),
-        Some(other) => Err(format!(
-            "waf: `{key}` must be an integer, got {other:?}",
-            other = other.to_string()
-        )),
-    }
-}
-
-fn optional_string_vec(
-    object: &serde_json::Map<String, Value>,
-    key: &str,
-) -> Result<Option<Vec<String>>, String> {
-    match object.get(key) {
-        None | Some(Value::Null) => Ok(None),
-        Some(Value::Array(values)) => {
-            let mut parsed = Vec::with_capacity(values.len());
-            for value in values {
-                let Some(raw) = value.as_str() else {
-                    return Err(format!("waf: `{key}` entries must be strings"));
-                };
-                if raw.is_empty() {
-                    return Err(format!("waf: `{key}` entries must be non-empty"));
-                }
-                parsed.push(raw.to_string());
-            }
-            Ok(Some(parsed))
-        }
-        Some(other) => Err(format!(
-            "waf: `{key}` must be an array, got {other:?}",
-            other = other.to_string()
-        )),
-    }
 }
 
 impl fmt::Display for RuleAction {

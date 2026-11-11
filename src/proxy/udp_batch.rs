@@ -490,9 +490,7 @@ impl SendMmsgBatch {
 
     /// Maximum bytes accepted per slot by [`Self::push_with_local`].
     ///
-    /// The public library's external regression tests use this accessor; the
-    /// binary target compiles the same module without calling it.
-    #[allow(dead_code)]
+    /// The public library's external regression tests use this accessor.
     pub fn slot_size(&self) -> usize {
         self.slot_size
     }
@@ -501,7 +499,6 @@ impl SendMmsgBatch {
     ///
     /// Used by memory-footprint contract tests. Fresh batches report `0`
     /// because slot buffers are allocated lazily.
-    #[allow(dead_code)]
     pub fn datagram_buffer_capacity_bytes(&self) -> usize {
         self.bufs.iter().map(Vec::capacity).sum()
     }
@@ -838,64 +835,6 @@ pub(crate) fn std_to_sockaddr_storage(
     }
 }
 
-/// Stub for non-Linux platforms. Compile-time no-op. The UDP proxy drain loop
-/// is gated with `#[cfg(target_os = "linux")]` and falls back to `try_recv_from`.
-#[cfg(not(target_os = "linux"))]
-#[allow(dead_code)]
-pub struct RecvMmsgBatch;
-
-#[cfg(not(target_os = "linux"))]
-#[allow(dead_code)]
-impl RecvMmsgBatch {
-    pub fn new(_capacity: usize) -> Self {
-        Self
-    }
-}
-
-/// Non-Linux stub for SendMmsgBatch.
-#[cfg(not(target_os = "linux"))]
-#[allow(dead_code)]
-pub struct SendMmsgBatch;
-
-#[cfg(not(target_os = "linux"))]
-#[allow(dead_code)]
-pub const SEND_MMSG_SLOT_SIZE: usize = 2048;
-
-#[cfg(not(target_os = "linux"))]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)]
-pub enum SendMmsgPushResult {
-    Queued,
-    Full,
-    Oversized,
-}
-
-#[cfg(not(target_os = "linux"))]
-#[allow(dead_code)]
-impl SendMmsgBatch {
-    pub fn new(_capacity: usize) -> Self {
-        Self
-    }
-
-    pub fn with_slot_size(_capacity: usize, _slot_size: usize) -> Self {
-        Self
-    }
-
-    pub fn slot_size(&self) -> usize {
-        SEND_MMSG_SLOT_SIZE
-    }
-
-    pub fn datagram_buffer_capacity_bytes(&self) -> usize {
-        0
-    }
-
-    pub fn is_empty(&self) -> bool {
-        true
-    }
-
-    pub fn discard(&mut self) {}
-}
-
 /// GSO batch buffer for sending multiple same-size datagrams in a single `sendmsg()`
 /// with `UDP_SEGMENT` ancillary data (Linux 4.18+).
 ///
@@ -1128,23 +1067,4 @@ impl GsoBatchBuf {
         );
         Some(dgram)
     }
-}
-
-/// Non-Linux stub for GsoBatchBuf.
-#[cfg(not(target_os = "linux"))]
-#[allow(dead_code)]
-pub struct GsoBatchBuf;
-
-#[cfg(not(target_os = "linux"))]
-#[allow(dead_code)]
-impl GsoBatchBuf {
-    pub fn new(_max_bytes: usize) -> Self {
-        Self
-    }
-
-    pub fn is_empty(&self) -> bool {
-        true
-    }
-
-    pub fn discard(&mut self) {}
 }

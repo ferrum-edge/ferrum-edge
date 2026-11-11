@@ -2,45 +2,31 @@
 //!
 //! `AyaEbpfBackend` implements `EbpfBackend` using the `aya` crate to load
 //! BPF ELF bytes, attach programs to pod cgroups and veth interfaces, and
-//! manage BPF map contents. Available only on Linux with `--features ebpf`.
+//! manage BPF map contents. Available only on Linux with `--features ebpf`:
+//! `ebpf/mod.rs` gates the whole module on that cfg, so items here carry no
+//! per-item copy of it.
 
-#![allow(dead_code)]
-
-#[cfg(all(feature = "ebpf", target_os = "linux"))]
 use std::collections::HashMap;
 use std::ffi::CString;
-#[cfg(all(feature = "ebpf", target_os = "linux"))]
 use std::fs::{self, File};
-#[cfg(all(feature = "ebpf", target_os = "linux"))]
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
-#[cfg(all(feature = "ebpf", target_os = "linux"))]
 use std::os::fd::AsFd;
 
-#[cfg(all(feature = "ebpf", target_os = "linux"))]
 use aya::maps::SockHash;
-#[cfg(all(feature = "ebpf", target_os = "linux"))]
 use aya::programs::cgroup_sock_addr::CgroupSockAddrLink;
-#[cfg(all(feature = "ebpf", target_os = "linux"))]
 use aya::programs::sock_ops::SockOpsLinkId;
-#[cfg(all(feature = "ebpf", target_os = "linux"))]
 use aya::programs::tc::SchedClassifierLink;
-#[cfg(all(feature = "ebpf", target_os = "linux"))]
 // `Link` is the trait that owns `SchedClassifierLink::detach` and
 // `CgroupSockAddrLink::detach`; the ingress-redirect and per-pod teardowns own
 // their links rather than tracking link ids, so they call that method directly.
 use aya::programs::{
     CgroupAttachMode, CgroupSockAddr, Link, SchedClassifier, SkSkb, SockOps, TcAttachType,
 };
-#[cfg(all(feature = "ebpf", target_os = "linux"))]
 use aya::{Ebpf, EbpfLoader};
-#[cfg(all(feature = "ebpf", target_os = "linux"))]
 use tracing::{debug, info, warn};
 
-#[cfg(all(feature = "ebpf", target_os = "linux"))]
 use super::cgroup::{UnconfirmedCgroupDetaches, cgroup_path_may_exist};
-#[cfg(all(feature = "ebpf", target_os = "linux"))]
 use super::maps::BpfMaps;
-#[cfg(all(feature = "ebpf", target_os = "linux"))]
 use super::{
     BPF_ACCEPT_FIRST_BYTE_SOCKETS_PIN_PATH, BPF_MAP_ACCEPT_FIRST_BYTE_SOCKETS, BPF_MAP_ORIG_DST4,
     BPF_MAP_ORIG_DST6, BPF_MAP_SOCK_OPS_EVENTS, BPF_MAP_SOCK_OPS_STATS, BPF_ORIG_DST4_PIN_PATH,
@@ -48,16 +34,13 @@ use super::{
     BPF_PROGRAM_SOCK_OPS, BPF_SOCK_OPS_EVENTS_PIN_PATH, BPF_SOCK_OPS_STATS_PIN_PATH, EbpfBackend,
     IncludePortsPolicy, PodInfo, TcAttachDirection,
 };
-#[cfg(all(feature = "ebpf", target_os = "linux"))]
 use ferrum_ebpf_common::{BpfCaptureConfig, SOCK_OPS_RINGBUF_DEFAULT_BYTES};
 
-#[cfg(all(feature = "ebpf", target_os = "linux"))]
 const DEFAULT_BPF_ELF_PATH: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/ebpf/target/bpfel-unknown-none/release/ferrum-ebpf"
 );
 
-#[cfg(all(feature = "ebpf", target_os = "linux"))]
 const CGROUP_PROGRAMS: &[&str] = &[
     "ferrum_connect4",
     "ferrum_connect6",
@@ -65,10 +48,8 @@ const CGROUP_PROGRAMS: &[&str] = &[
     "ferrum_getpeername6",
 ];
 
-#[cfg(all(feature = "ebpf", target_os = "linux"))]
 const TC_PROGRAM: &str = super::BPF_PROGRAM_TC_INBOUND;
 
-#[cfg(all(feature = "ebpf", target_os = "linux"))]
 const INGRESS_REDIRECT_PROGRAM: &str = super::BPF_PROGRAM_TC_INGRESS_REDIRECT;
 
 /// Tracks per-pod attachment state for cleanup.
@@ -79,7 +60,6 @@ const INGRESS_REDIRECT_PROGRAM: &str = super::BPF_PROGRAM_TC_INGRESS_REDIRECT;
 /// whole `Ebpf` object is dropped, so a removed or un-meshed pod would stay
 /// captured and guarded. Owned links are detached explicitly by
 /// `detach_pod`, and their own `Drop` is the final best-effort detach.
-#[cfg(all(feature = "ebpf", target_os = "linux"))]
 #[derive(Default)]
 struct PodLinks {
     cgroup_links: Vec<PodCgroupLink>,
@@ -97,7 +77,6 @@ struct PodLinks {
 
 /// One per-pod cgroup program attachment, with the cgroup path it is bound to
 /// so a failed detach can be tracked until that cgroup is gone.
-#[cfg(all(feature = "ebpf", target_os = "linux"))]
 struct PodCgroupLink {
     cgroup_path: String,
     link: CgroupSockAddrLink,
@@ -106,7 +85,6 @@ struct PodCgroupLink {
 /// One per-pod tc classifier attachment, with the interface it is attached to
 /// so a failed detach can rebuild a retryable handle from its netlink filter
 /// identity, as [`IngressRedirectLink`] does.
-#[cfg(all(feature = "ebpf", target_os = "linux"))]
 struct PodTcLink {
     iface: String,
     link: SchedClassifierLink,
@@ -127,7 +105,6 @@ struct PodTcLink {
 /// Owning it also means the link is NOT torn down when the `Ebpf` object is
 /// dropped; this struct's own `Drop` (via `SchedClassifierLink`) is the final
 /// best-effort detach.
-#[cfg(all(feature = "ebpf", target_os = "linux"))]
 struct IngressRedirectLink {
     /// Interface the classifier is attached to, so failures are reported (and
     /// retried) per interface.
@@ -143,7 +120,6 @@ struct IngressRedirectLink {
 }
 
 /// Real aya-backed eBPF loader. Only available on Linux with `--features ebpf`.
-#[cfg(all(feature = "ebpf", target_os = "linux"))]
 pub struct AyaEbpfBackend {
     bpf: Option<Ebpf>,
     maps: Option<BpfMaps>,
@@ -170,7 +146,6 @@ pub struct AyaEbpfBackend {
     node_source_ipv6_present: bool,
 }
 
-#[cfg(all(feature = "ebpf", target_os = "linux"))]
 impl AyaEbpfBackend {
     pub fn new() -> Self {
         Self {
@@ -199,7 +174,6 @@ impl AyaEbpfBackend {
     }
 }
 
-#[cfg(all(feature = "ebpf", target_os = "linux"))]
 impl EbpfBackend for AyaEbpfBackend {
     fn load_programs(&mut self) -> Result<(), String> {
         let bpf_elf_path =
@@ -549,19 +523,6 @@ impl EbpfBackend for AyaEbpfBackend {
     }
 
     fn attach_ingress_redirect(&mut self, iface: &str) -> Result<(), String> {
-        // Without both scope maps the classifier could only match on pod IP and
-        // would capture every port of an enrolled pod, and every enrollment
-        // would then fail to scope it. Refuse to arm it instead.
-        if !self
-            .maps
-            .as_ref()
-            .is_some_and(BpfMaps::supports_inbound_redirect_scope)
-        {
-            return Err(format!(
-                "Refusing to attach '{INGRESS_REDIRECT_PROGRAM}': the loaded ELF lacks the \
-                 inbound redirect scope maps"
-            ));
-        }
         let bpf = self.bpf_mut()?;
         let prog: &mut SchedClassifier = bpf
             .program_mut(INGRESS_REDIRECT_PROGRAM)
@@ -870,10 +831,11 @@ impl EbpfBackend for AyaEbpfBackend {
         if self.bpf.is_none() {
             return Err("BPF programs are not loaded".to_string());
         }
-        let Some(maps) = self.maps.as_ref() else {
+        // `BpfMaps::from_ebpf` refuses an ELF missing any Ferrum map, so
+        // initialized maps are complete for every capture topology.
+        if self.maps.is_none() {
             return Err("BPF maps are not initialized".to_string());
-        };
-        maps.validate_required(require_sock_ops)?;
+        }
         if require_sock_ops && self.sock_ops_link_id.is_none() {
             return Err("SOCK_OPS identity bridge is not attached".to_string());
         }
@@ -891,7 +853,7 @@ impl EbpfBackend for AyaEbpfBackend {
         let reply_source_gate_error = self
             .maps
             .as_mut()
-            .and_then(|maps| maps.disable_udp_reply_sources_for_cleanup().err());
+            .and_then(|maps| maps.set_udp_reply_sources_enabled(false).err());
         // Detach the node-level ingress redirect explicitly and BEFORE dropping
         // `Ebpf`. This is the genuine retry the callers treat it as: the links
         // are owned by this backend (not by the program's link map, which
@@ -933,7 +895,6 @@ impl EbpfBackend for AyaEbpfBackend {
     }
 }
 
-#[cfg(all(feature = "ebpf", target_os = "linux"))]
 fn attach_first_byte_hooks(bpf: &mut Ebpf) -> Result<(), String> {
     for name in [
         BPF_PROGRAM_FIRST_BYTE_PARSER,
@@ -1001,7 +962,6 @@ fn attach_first_byte_hooks(bpf: &mut Ebpf) -> Result<(), String> {
 /// fallback. Invalid (non-numeric / zero / non-power-of-two) values are
 /// rejected with a `warn!` and silently fall back to the default so the
 /// gateway never refuses to start over an observability tuning knob.
-#[cfg(all(feature = "ebpf", target_os = "linux"))]
 fn resolve_sock_ops_ringbuf_bytes() -> u32 {
     let Some(raw) =
         crate::config::conf_file::resolve_ferrum_var("FERRUM_BPF_SOCK_OPS_RINGBUF_BYTES")
@@ -1048,7 +1008,6 @@ fn resolve_sock_ops_ringbuf_bytes() -> u32 {
 /// Pin the original-destination maps at their well-known paths so the
 /// node-waypoint mesh-proxy can open them by path (GAP-1b). Creates the
 /// `/sys/fs/bpf/ferrum` parent if needed; bpffs must already be mounted.
-#[cfg(all(feature = "ebpf", target_os = "linux"))]
 fn pin_orig_dst_maps(bpf: &mut Ebpf) -> Result<(), String> {
     if let Some(parent) = std::path::Path::new(BPF_ORIG_DST4_PIN_PATH).parent()
         && let Err(e) = fs::create_dir_all(parent)
@@ -1063,7 +1022,6 @@ fn pin_orig_dst_maps(bpf: &mut Ebpf) -> Result<(), String> {
     Ok(())
 }
 
-#[cfg(all(feature = "ebpf", target_os = "linux"))]
 fn pin_sock_ops_maps(bpf: &mut Ebpf) -> Result<(), String> {
     // Ensure the parent dir exists. /sys/fs/bpf must already be mounted
     // (bpffs); we only need to create the /ferrum subdirectory.
@@ -1092,7 +1050,6 @@ fn pin_sock_ops_maps(bpf: &mut Ebpf) -> Result<(), String> {
     Ok(())
 }
 
-#[cfg(all(feature = "ebpf", target_os = "linux"))]
 fn pin_map_at(bpf: &mut Ebpf, map_name: &str, pin_path: &str) -> Result<(), String> {
     // If a stale pin exists (e.g. previous run did not clean up), remove
     // it so the new map gets pinned fresh. Missing paths (including a
@@ -1105,7 +1062,6 @@ fn pin_map_at(bpf: &mut Ebpf, map_name: &str, pin_path: &str) -> Result<(), Stri
         .map_err(|e| format!("Failed to pin '{map_name}' at '{pin_path}': {e}"))
 }
 
-#[cfg(all(feature = "ebpf", target_os = "linux"))]
 fn remove_pin_if_present(pin_path: &str) -> Result<(), String> {
     match fs::remove_file(pin_path) {
         Ok(()) => Ok(()),
@@ -1132,7 +1088,6 @@ mod live_kernel_tests {
     use crate::ebpf::kernel_probe::probe_kernel;
     use crate::ebpf::{BPF_ORIG_DST4_PIN_PATH, EbpfBackend};
     use aya::maps::{HashMap as BpfHashMap, Map, MapData};
-    #[cfg(all(feature = "ebpf", target_os = "linux"))]
     use aya::programs::{SchedClassifier, TcAttachType};
     use ferrum_ebpf_common::{OrigDst4, OrigDstKey, WorkloadIdentity};
     use std::fs;
@@ -1265,7 +1220,6 @@ mod live_kernel_tests {
         // body that a pull request may not modify (the trusted Cross-build
         // policy freezes it by digest). Each phase reloads its own backend, so
         // they stay independent despite sharing a test function.
-        #[cfg(all(feature = "ebpf", target_os = "linux"))]
         {
             run_tc_ingress_redirect_lifecycle_phase();
             run_tc_ingress_redirect_datapath_phase();
@@ -1333,7 +1287,6 @@ mod live_kernel_tests {
     ///
     /// End-to-end packet steering is covered separately by
     /// [`run_tc_ingress_redirect_datapath_phase`].
-    #[cfg(all(feature = "ebpf", target_os = "linux"))]
     fn run_tc_ingress_redirect_lifecycle_phase() {
         use ferrum_ebpf_common::{
             BpfCaptureConfig, NODE_WAYPOINT_INGRESS_CAPTURE_PORT,
@@ -1448,7 +1401,6 @@ mod live_kernel_tests {
     /// `tc filter show dev <iface> ingress` output, or an empty string when the
     /// `tc` binary is unavailable (the assertions tolerate that by checking for
     /// absence after detach).
-    #[cfg(all(feature = "ebpf", target_os = "linux"))]
     fn tc_ingress_filters(iface: &str) -> String {
         std::process::Command::new("tc")
             .args(["filter", "show", "dev", iface, "ingress"])
@@ -1470,7 +1422,6 @@ mod live_kernel_tests {
     /// (BPF object names are also truncated to 16 bytes, so an exact
     /// `ferrum_tc_ingress_redirect` match against `ProgramInfo::name` is not
     /// reliable).
-    #[cfg(all(feature = "ebpf", target_os = "linux"))]
     fn ingress_redirect_classifier_visible(iface: &str) -> bool {
         let filters = tc_ingress_filters(iface);
         if filters.contains("ferrum_tc_ingress_redirect") || filters.contains("bpf") {
@@ -1490,13 +1441,11 @@ mod live_kernel_tests {
     /// lives in the namespace and routes through the host, so its packets
     /// arrive on the host veth's tc **ingress** hook exactly as off-node
     /// traffic to a pod arrives on a node uplink.
-    #[cfg(all(feature = "ebpf", target_os = "linux"))]
     struct ScratchClientNetns {
         netns: String,
         host_iface: String,
     }
 
-    #[cfg(all(feature = "ebpf", target_os = "linux"))]
     impl ScratchClientNetns {
         const HOST_ADDR: &'static str = "10.244.253.1";
         const CLIENT_ADDR: &'static str = "10.244.253.2";
@@ -1597,7 +1546,6 @@ mod live_kernel_tests {
         }
     }
 
-    #[cfg(all(feature = "ebpf", target_os = "linux"))]
     impl Drop for ScratchClientNetns {
         fn drop(&mut self) {
             let _ = ip(&["link", "del", &self.host_iface]);
@@ -1606,7 +1554,6 @@ mod live_kernel_tests {
     }
 
     /// Run one `ip` invocation, surfacing stderr on failure.
-    #[cfg(all(feature = "ebpf", target_os = "linux"))]
     fn ip(args: &[&str]) -> Result<(), String> {
         let output = std::process::Command::new("ip")
             .args(args)
@@ -1650,7 +1597,6 @@ mod live_kernel_tests {
     /// `FERRUM_LIVE_TESTS_REQUIRED=1` an environment that cannot run the
     /// mechanism fails the gate rather than silently reporting the feature
     /// ready.
-    #[cfg(all(feature = "ebpf", target_os = "linux"))]
     fn run_tc_ingress_redirect_datapath_phase() {
         use crate::ebpf::PodInfo;
         use ferrum_ebpf_common::{BpfCaptureConfig, NODE_WAYPOINT_INGRESS_REDIRECT_MARK};
@@ -1870,7 +1816,6 @@ mod live_kernel_tests {
     /// it reaches the real backend's map handles (the no-ebpf build has a stub);
     /// runs via the `ebpf-live` CI job, failing on unmet prerequisites when
     /// `FERRUM_LIVE_TESTS_REQUIRED=1` and self-skipping for local ad-hoc runs.
-    #[cfg(all(feature = "ebpf", target_os = "linux"))]
     #[test]
     #[ignore = "requires root + real Linux >= 5.7 kernel (cgroup v2 + bpffs); run via the ebpf-live CI job"]
     fn connect4_redirects_a_real_captured_connection_to_the_capture_port() {

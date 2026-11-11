@@ -149,7 +149,7 @@ impl Schema {
                 Self::Fields("time_seconds interval_seconds probes")
             }
             (Self::Fields(TRAFFIC_POLICY), "connection_pool_http") => Self::Fields(
-                "max_requests_per_connection idle_timeout_ms http2_max_requests max_concurrent_streams h2_upgrade_policy max_retries http1_max_pending_requests",
+                "idle_timeout_ms http2_max_requests max_concurrent_streams h2_upgrade_policy max_retries http1_max_pending_requests",
             ),
             (Self::Fields(TRAFFIC_POLICY), "load_balancer") => {
                 Self::Fields("simple consistent_hash")

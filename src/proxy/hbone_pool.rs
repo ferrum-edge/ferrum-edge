@@ -173,9 +173,14 @@ struct HboneConnectionLoadInner {
     /// CONNECT streams sent on this connection whose tunnel is still alive
     /// (including ones whose CONNECT response is still pending).
     active_streams: AtomicUsize,
-    /// Peer's `SETTINGS_MAX_CONCURRENT_STREAMS` as of the last CONNECT
-    /// response; `usize::MAX` until sampled or when the peer advertises none.
+    /// The connection's effective CONNECT stream cap: the peer's
+    /// `SETTINGS_MAX_CONCURRENT_STREAMS` as of the last CONNECT response,
+    /// bounded by `configured_max_streams`. Before the first sample it is
+    /// `configured_max_streams`.
     peer_max_streams: AtomicUsize,
+    /// The DestinationRule `maxConcurrentStreams` / global pool stream cap
+    /// this connection was dialed (and keyed) under; `usize::MAX` when none.
+    configured_max_streams: usize,
 }
 
 impl Default for HboneConnectionLoadInner {
@@ -183,11 +188,31 @@ impl Default for HboneConnectionLoadInner {
         Self {
             active_streams: AtomicUsize::new(0),
             peer_max_streams: AtomicUsize::new(usize::MAX),
+            configured_max_streams: usize::MAX,
         }
     }
 }
 
 impl HboneConnectionLoad {
+    /// A load bounded by the configured `maxConcurrentStreams` (issue #7181).
+    ///
+    /// The cap is part of the outer pool key, and `h2` cannot hold it on its
+    /// own: the dial seeds it as `initial_max_send_streams`, but the peer's
+    /// initial SETTINGS replace that (with "unlimited" when the peer
+    /// advertises nothing). The width decision therefore takes the smaller of
+    /// the peer's cap and this one, so a carrier at the operator's cap is
+    /// skipped and a sibling dialed while the key has room. `None` keeps the
+    /// peer's cap alone.
+    fn with_configured_stream_cap(cap: Option<u32>) -> Self {
+        let configured_max_streams =
+            cap.map_or(usize::MAX, |cap| usize::try_from(cap).unwrap_or(usize::MAX));
+        Self(Arc::new(HboneConnectionLoadInner {
+            active_streams: AtomicUsize::new(0),
+            peer_max_streams: AtomicUsize::new(configured_max_streams),
+            configured_max_streams,
+        }))
+    }
+
     #[inline]
     fn active_streams(&self) -> usize {
         self.0.active_streams.load(Ordering::Relaxed)
@@ -217,9 +242,10 @@ impl HboneConnectionLoad {
     /// lookup takes the connection's internal lock, which is why it runs here
     /// (outside every pool lock) rather than on the checkout scan.
     fn record_peer_max_streams(&self, sender: &SendRequest<Bytes>) {
-        self.0
-            .peer_max_streams
-            .store(sender.current_max_send_streams(), Ordering::Relaxed);
+        let effective = sender
+            .current_max_send_streams()
+            .min(self.0.configured_max_streams);
+        self.0.peer_max_streams.store(effective, Ordering::Relaxed);
     }
 }
 
@@ -907,6 +933,32 @@ struct HboneSvidIdentityCache {
     /// rotates out, so `force_drain_svid_generation(old_gen)` can resolve
     /// the passed generation to the fingerprint embedded in pool keys.
     svid_generation: u64,
+    /// The leaf's `notAfter` on the monotonic clock, parsed once when this
+    /// entry was built (issue #7166): see
+    /// [`HboneConnectionPool::source_credential_identity`]. Derived once, so a
+    /// later wall-clock step cannot move it.
+    leaf_deadline: Option<tokio::time::Instant>,
+}
+
+/// The leaf's credential deadline, as [`HboneSvidIdentityCache::leaf_deadline`]
+/// records it. A three-way result: a real `notAfter` bounds the lease; an
+/// unparseable or incoherent leaf (or a bundle with no leaf) yields an
+/// ALREADY-ELAPSED deadline, because a credential whose expiry the gateway
+/// cannot read must never hold a connection open across requests; and a
+/// `notAfter` beyond the representable monotonic range yields `None`
+/// (`CredentialDeadline::Unbounded`, "no representable bound", NOT "expired").
+fn svid_leaf_deadline(bundle: &SvidBundle) -> Option<tokio::time::Instant> {
+    use crate::plugins::utils::auth_flow::CredentialDeadline;
+    match bundle.cert_chain_der.first() {
+        Some(leaf) => {
+            match crate::proxy::hbone_admission_fence::parse_leaf_credential_deadline(leaf) {
+                CredentialDeadline::Bounded(deadline) => Some(deadline),
+                CredentialDeadline::Unbounded => None,
+                CredentialDeadline::Invalid => Some(tokio::time::Instant::now()),
+            }
+        }
+        None => Some(tokio::time::Instant::now()),
+    }
 }
 
 pub(crate) fn effective_connect_timeout_ms_for_policy_port(
@@ -922,7 +974,6 @@ pub(crate) fn effective_connect_timeout_ms_for_policy_port(
 }
 
 impl HboneConnectionPool {
-    #[allow(dead_code)] // Used by tests and external lib callers; binary wires the shared generation counter.
     pub fn new(
         pool_config: PoolConfig,
         dns_cache: DnsCache,
@@ -981,8 +1032,10 @@ impl HboneConnectionPool {
         shard_amount: usize,
         backend_svid_generation: BackendSvidGeneration,
     ) -> Self {
+        let entries = Arc::new(DashMap::with_shard_amount(shard_amount));
+        spawn_idle_entry_sweeper(&entries, &pool_config);
         Self {
-            entries: Arc::new(DashMap::with_shard_amount(shard_amount)),
+            entries,
             creation_locks: DashMap::with_shard_amount(shard_amount),
             growth_backoff_until: DashMap::new(),
             gateway_svid,
@@ -1075,42 +1128,15 @@ impl HboneConnectionPool {
     pub fn source_credential_identity(
         &self,
     ) -> Result<crate::proxy::hbone_inner_pool::HboneSourceCredential, HbonePoolError> {
-        let (identity, fingerprint) = self.current_svid_identity_cached()?;
         // The leaf's own `notAfter`, on the monotonic clock, parsed from the
         // same bundle the dial presents, by the SAME parser the receiver-side
         // fence bounds an inbound tunnel with — so the two halves of issue
-        // #5042 cannot disagree about when a credential ends.
-        //
-        // Its three-way result is preserved exactly: a real `notAfter` bounds
-        // the lease, an unparseable or incoherent leaf yields an ALREADY-ELAPSED
-        // deadline (a credential the gateway cannot read the expiry of must
-        // never be the basis for holding a connection open across requests),
-        // and a `notAfter` beyond the representable monotonic range yields
-        // `None` — `CredentialDeadline::Unbounded`, which is "no representable
-        // bound", NOT "expired". Collapsing that to elapsed would disable reuse
-        // outright for long-dated credentials; the idle timeout and the pool
-        // bounds still apply to it.
-        //
-        // A bundle with no leaf at all cannot dial in the first place
-        // (`current_svid_identity_cached` above already fingerprints it), so
-        // the arm exists only to fail closed rather than to be reached.
-        let leaf_deadline = match self
-            .gateway_svid
-            .load_full()
-            .as_ref()
-            .as_ref()
-            .and_then(|bundle| bundle.cert_chain_der.first().cloned())
-        {
-            Some(leaf) => {
-                use crate::plugins::utils::auth_flow::CredentialDeadline;
-                match crate::proxy::hbone_admission_fence::parse_leaf_credential_deadline(&leaf) {
-                    CredentialDeadline::Bounded(deadline) => Some(deadline),
-                    CredentialDeadline::Unbounded => None,
-                    CredentialDeadline::Invalid => Some(tokio::time::Instant::now()),
-                }
-            }
-            None => Some(tokio::time::Instant::now()),
-        };
+        // #5042 cannot disagree about when a credential ends. It is parsed once
+        // per SVID snapshot with the identity and fingerprint (issue #7166):
+        // no per-request leaf clone, X.509 parse, or wall-clock read. See
+        // `svid_leaf_deadline` for the three-way result; the idle timeout and
+        // the pool bounds still apply to an unbounded credential.
+        let (identity, fingerprint, leaf_deadline) = self.current_svid_credential_cached()?;
         Ok(crate::proxy::hbone_inner_pool::HboneSourceCredential {
             identity,
             fingerprint,
@@ -1274,17 +1300,38 @@ impl HboneConnectionPool {
     fn current_svid_identity_cached(
         &self,
     ) -> Result<(crate::identity::SpiffeId, Arc<str>), HbonePoolError> {
+        self.current_svid_credential_cached()
+            .map(|(identity, fingerprint, _)| (identity, fingerprint))
+    }
+
+    /// [`Self::current_svid_identity_cached`] plus the cached leaf deadline,
+    /// all from ONE identity-cache entry.
+    fn current_svid_credential_cached(
+        &self,
+    ) -> Result<
+        (
+            crate::identity::SpiffeId,
+            Arc<str>,
+            Option<tokio::time::Instant>,
+        ),
+        HbonePoolError,
+    > {
         let snapshot = self.gateway_svid.load_full();
         let cached = self.svid_identity_cache.load_full();
         if let Some(cache) = cached.as_ref()
             && Arc::ptr_eq(&cache.source, &snapshot)
         {
-            return Ok((cache.identity.clone(), cache.fingerprint.clone()));
+            return Ok((
+                cache.identity.clone(),
+                cache.fingerprint.clone(),
+                cache.leaf_deadline,
+            ));
         }
 
         let bundle = snapshot.as_ref().as_ref().ok_or(HbonePoolError::NoSvid)?;
         let identity = bundle.spiffe_id.clone();
         let fingerprint: Arc<str> = Arc::from(svid_fingerprint(bundle)?);
+        let leaf_deadline = svid_leaf_deadline(bundle);
         if let Some(previous) = cached.as_ref() {
             // The SVID slot rotated: file the outgoing fingerprint under the
             // generation it was current for, so the delayed drain task can
@@ -1304,8 +1351,9 @@ impl HboneConnectionPool {
                 identity: identity.clone(),
                 fingerprint: fingerprint.clone(),
                 svid_generation: self.backend_svid_generation.load(Ordering::Acquire),
+                leaf_deadline,
             })));
-        Ok((identity, fingerprint))
+        Ok((identity, fingerprint, leaf_deadline))
     }
 
     fn record_retired_fingerprint(&self, generation: u64, fingerprint: Arc<str>) {
@@ -2445,11 +2493,7 @@ impl HboneConnectionPool {
 
     fn maybe_prune_idle_entries(&self) {
         let now = unix_secs();
-        let interval = if self.pool_config.idle_timeout_seconds == 0 {
-            60
-        } else {
-            self.pool_config.idle_timeout_seconds.clamp(1, 60)
-        };
+        let interval = idle_prune_interval_secs(&self.pool_config);
         let last = self.last_idle_prune_unix_secs.load(Ordering::Relaxed);
         if now.saturating_sub(last) < interval {
             return;
@@ -2935,8 +2979,18 @@ pub(crate) async fn dial_h2_connect_sender(
                 .max_frame_size(pool_config.http2_max_frame_size)
                 .max_header_list_size(max_header_list_size)
                 .max_concurrent_reset_streams(4096);
+            // The DestinationRule `maxConcurrentStreams` / global stream cap,
+            // exactly as `pool::hyper_h2_client_builder` applies it (issue
+            // #7181): advertised to the peer as our own inbound cap, and our
+            // own outbound CONNECT bound until the peer's SETTINGS replace it.
+            // `max_concurrent_streams` alone caps only peer-initiated streams
+            // on a client, so the keyed cap bounded nothing. After SETTINGS
+            // the transport's `HboneConnectionLoad` keeps holding the cap
+            // for carrier selection.
             if let Some(max_streams) = pool_config.http2_max_concurrent_streams {
-                builder.max_concurrent_streams(max_streams);
+                builder
+                    .max_concurrent_streams(max_streams)
+                    .initial_max_send_streams(max_streams as usize);
             }
 
             let (sender, mut connection) =
@@ -3017,7 +3071,9 @@ pub(crate) async fn dial_h2_connect_sender(
             Ok(MeshH2Transport {
                 sender,
                 gate,
-                load: HboneConnectionLoad::default(),
+                load: HboneConnectionLoad::with_configured_stream_cap(
+                    pool_config.http2_max_concurrent_streams,
+                ),
             })
         }
     })
@@ -3731,6 +3787,50 @@ fn record_hbone_evictions(count: usize) {
         .record_pool_evictions(crate::runtime_metrics::PoolKind::Hbone, count as u64);
 }
 
+/// Seconds between idle sweeps: the global idle timeout clamped to `1..=60`,
+/// or 60 when idle expiry is off globally (a per-proxy timeout may still
+/// apply to individual entries).
+fn idle_prune_interval_secs(pool_config: &PoolConfig) -> u64 {
+    if pool_config.idle_timeout_seconds == 0 {
+        60
+    } else {
+        pool_config.idle_timeout_seconds.clamp(1, 60)
+    }
+}
+
+/// Periodic idle sweep for the HBONE / mesh CONNECT pool (issue #7182).
+///
+/// The rate-limited prune also runs on the cold create path, but a
+/// destination that stops receiving lookups never reaches it, so without this
+/// task its connections — sockets, DestinationRule `maxConnections` slots,
+/// trust-registry registrations — would outlive `idleTimeout` indefinitely.
+/// Holds only a `Weak` reference to the entry map, so the task ends with the
+/// pool, exactly like the direct pools' sweepers. Spawned only inside a Tokio
+/// runtime.
+fn spawn_idle_entry_sweeper(
+    entries: &Arc<DashMap<String, Vec<HbonePoolEntry>>>,
+    pool_config: &PoolConfig,
+) {
+    let Ok(handle) = tokio::runtime::Handle::try_current() else {
+        return;
+    };
+    let weak = Arc::downgrade(entries);
+    let interval = Duration::from_secs(idle_prune_interval_secs(pool_config));
+    handle.spawn(async move {
+        let mut ticker = tokio::time::interval(interval);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        ticker.tick().await;
+        loop {
+            ticker.tick().await;
+            let Some(entries) = weak.upgrade() else { break };
+            entries.retain(|_, entries| {
+                record_hbone_evictions(prune_pool_entries(entries));
+                !entries.is_empty()
+            });
+        }
+    });
+}
+
 /// Remove the pool entry whose gate is `gate`. Identity match (not key-only)
 /// so a concurrent checkout that replaced this transport under the same key
 /// is not evicted (issue #4162). Mirrors `DashMap::remove_if` + `Arc::ptr_eq`
@@ -4036,7 +4136,6 @@ mod tests {
             pool_http2_max_concurrent_streams: None,
             pool_http3_connections_per_backend: None,
             h2_upgrade_policy: None,
-            pool_max_requests_per_connection: None,
             pool_http1_max_pending_requests: None,
             upstream_id: None,
             upstream_subset: None,

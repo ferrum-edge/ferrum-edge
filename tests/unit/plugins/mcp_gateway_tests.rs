@@ -968,6 +968,41 @@ fn render_mcp_config_diagnostic(config: &Value) -> String {
     ferrum_edge::startup::render_startup_error(anyhow::anyhow!(error), &[])
 }
 
+/// Issue #7114: the alias spellings `allow_immediately` / `expose` (for
+/// `allow`) and `startup` (a lazy alias that only logged a warning) are
+/// refused; only the canonical values are accepted.
+#[test]
+fn alias_spellings_are_rejected() {
+    for overrides in [
+        json!({"discovery": {"on_new_tool": "allow_immediately"}}),
+        json!({"discovery": {"on_new_tool": "expose"}}),
+        json!({"discovery": {"on_schema_change": "allow_immediately"}}),
+        json!({"discovery": {"on_schema_change": "expose"}}),
+        json!({"sessions": {"initialize_upstreams": "startup"}}),
+        json!({"servers": {"demo": {
+            "upstream_url": "http://127.0.0.1:9/mcp",
+            "namespace": "demo",
+            "initialize_strategy": "startup"
+        }}}),
+    ] {
+        let config = schema_fixture(overrides.clone());
+        assert!(
+            create_plugin("mcp_gateway", &config).is_err(),
+            "alias must be rejected: {overrides}"
+        );
+    }
+    for overrides in [
+        json!({"discovery": {"on_new_tool": "allow", "on_schema_change": "allow"}}),
+        json!({"sessions": {"initialize_upstreams": "lazy"}}),
+    ] {
+        let config = schema_fixture(overrides.clone());
+        assert!(
+            create_plugin("mcp_gateway", &config).is_ok(),
+            "canonical value must be accepted: {overrides}"
+        );
+    }
+}
+
 #[test]
 fn configuration_diagnostics_preserve_schema_and_withhold_supplied_data() {
     let hostile = "'MCP_UNREGISTERED_SECRET\"\\\n`field`";
@@ -976,7 +1011,7 @@ fn configuration_diagnostics_preserve_schema_and_withhold_supplied_data() {
         (
             json!({"sessions": {"initialize_upstreams": hostile}}),
             "`sessions.initialize_upstreams`",
-            "`lazy`, `startup`, or `passthrough`",
+            "`lazy` or `passthrough`",
         ),
         (
             json!({"sessions": {"downstream_session_header": hostile}}),
@@ -1561,7 +1596,6 @@ async fn aggregate_lazy_initialize_sends_initialized_notification_upstream() {
 async fn aggregate_tools_list_keeps_discovery_hidden_tools_hidden_when_denied_tools_are_visible() {
     let server = start_mcp_catalog_server().await;
     let mut config = aggregate_config(&format!("{}/mcp", server.uri()));
-    config["discovery"]["hide_denied_items"] = json!(false);
     config["policy"]["hide_denied_tools"] = json!(false);
     let plugin = create_plugin("mcp_gateway", &config).unwrap().unwrap();
     let session_id = initialize(&plugin).await;
@@ -3078,6 +3112,109 @@ async fn aggregate_tools_list_accepts_upstream_sse_response() {
     assert_eq!(
         aggregate_tool_names(&plugin, &session_id, 32).await,
         vec!["github.sse_tool"]
+    );
+}
+
+/// Read one HTTP/1.1 request (head plus `Content-Length` body) and return it
+/// as lossy text.
+async fn read_one_http_request(socket: &mut tokio::net::TcpStream) -> String {
+    use tokio::io::AsyncReadExt;
+    let mut request = Vec::new();
+    let mut buf = [0u8; 4096];
+    let head_end = loop {
+        let read = socket.read(&mut buf).await.unwrap_or(0);
+        if read == 0 {
+            return String::from_utf8_lossy(&request).into_owned();
+        }
+        request.extend_from_slice(&buf[..read]);
+        if let Some(position) = request.windows(4).position(|window| window == b"\r\n\r\n") {
+            break position + 4;
+        }
+    };
+    let head = String::from_utf8_lossy(&request[..head_end]).to_ascii_lowercase();
+    let content_length = head
+        .lines()
+        .find_map(|line| line.strip_prefix("content-length:"))
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .unwrap_or(0);
+    while request.len() < head_end + content_length {
+        let read = socket.read(&mut buf).await.unwrap_or(0);
+        if read == 0 {
+            break;
+        }
+        request.extend_from_slice(&buf[..read]);
+    }
+    String::from_utf8_lossy(&request).into_owned()
+}
+
+/// An upstream that answers `tools/list` with an SSE body written three bytes
+/// per HTTP chunk, so every event delimiter straddles the chunks the gateway
+/// reads. Every other request gets an empty `202`. One request per connection.
+async fn start_chunked_sse_tools_server() -> String {
+    use tokio::io::AsyncWriteExt;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        while let Ok((mut socket, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                let request = read_one_http_request(&mut socket).await;
+                if !request.contains("tools/list") {
+                    let _ = socket
+                        .write_all(
+                            b"HTTP/1.1 202 Accepted\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+                        )
+                        .await;
+                    return;
+                }
+                let body = ": warming up\r\n\r\n\
+                            event: message\r\n\
+                            data: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\"}\r\n\r\n\
+                            event: message\r\n\
+                            data: {\"jsonrpc\":\"2.0\",\"id\":\"tools\",\"result\":{\"tools\":[{\"name\":\"chunked_tool\",\"inputSchema\":{\"type\":\"object\"}}]}}\r\n\r\n";
+                let _ = socket
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n\
+                          transfer-encoding: chunked\r\nconnection: close\r\n\r\n",
+                    )
+                    .await;
+                for piece in body.as_bytes().chunks(3) {
+                    let mut frame = format!("{:x}\r\n", piece.len()).into_bytes();
+                    frame.extend_from_slice(piece);
+                    frame.extend_from_slice(b"\r\n");
+                    if socket.write_all(&frame).await.is_err() {
+                        return;
+                    }
+                    let _ = socket.flush().await;
+                    tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                }
+                let _ = socket.write_all(b"0\r\n\r\n").await;
+            });
+        }
+    });
+    format!("http://{address}/mcp")
+}
+
+/// Issue #7137: the SSE reader resumes its delimiter search where the previous
+/// chunk left off. A response trickled in three-byte chunks, with CRLF
+/// delimiters split across chunks and non-response events before it, still
+/// yields the JSON-RPC response.
+#[tokio::test]
+async fn aggregate_tools_list_reads_an_upstream_sse_response_split_across_chunks() {
+    let upstream = start_chunked_sse_tools_server().await;
+    let mut config = aggregate_config(&upstream);
+    config["sessions"] = json!({"initialize_upstreams": "passthrough"});
+    config["discovery"]["aggregate_resources"] = json!(false);
+    config["discovery"]["aggregate_prompts"] = json!(false);
+    config["discovery"]["on_new_tool"] = json!("allow");
+    config["servers"]["github"]["expose_resources"] = json!(false);
+    config["servers"]["github"]["expose_prompts"] = json!(false);
+    config["policy"] = json!({"default_action": "allow"});
+    let plugin = create_plugin("mcp_gateway", &config).unwrap().unwrap();
+    let session_id = initialize(&plugin).await;
+
+    assert_eq!(
+        aggregate_tool_names(&plugin, &session_id, 32).await,
+        vec!["github.chunked_tool"]
     );
 }
 
@@ -12002,7 +12139,6 @@ fn transparent_catalog_policy_requires_aggregate_mode() {
         ("policy", "hide_denied_tools", json!(false)),
         ("discovery", "on_new_tool", json!("hide_until_configured")),
         ("discovery", "on_schema_change", json!("allow")),
-        ("discovery", "hide_denied_items", json!(true)),
         ("discovery", "aggregate_tools", json!(true)),
         ("discovery", "aggregate_resources", json!(false)),
         ("discovery", "aggregate_prompts", json!(true)),
@@ -12018,6 +12154,94 @@ fn transparent_catalog_policy_requires_aggregate_mode() {
         config["mode"] = json!("aggregate_router");
         assert!(create_plugin("mcp_gateway", &config).is_ok());
     }
+}
+
+/// Issue #7136: `observability.emit_metadata: false` suppresses every
+/// descriptive `mcp.*` key, including the route decision, the hashed session id
+/// and the protocol versions that synthetic and refused paths used to record
+/// unconditionally. With the flag on, the same paths record them.
+#[tokio::test]
+async fn emit_metadata_false_records_no_mcp_metadata_on_synthetic_and_refused_paths() {
+    fn mcp_keys(ctx: &ferrum_edge::plugins::RequestContext) -> Vec<String> {
+        let mut keys: Vec<String> = ctx
+            .metadata
+            .keys()
+            .filter(|key| key.starts_with("mcp."))
+            .cloned()
+            .collect();
+        keys.sort();
+        keys
+    }
+
+    for emit_metadata in [true, false] {
+        let mut config = aggregate_config("http://127.0.0.1:9/mcp");
+        config["observability"] = json!({ "emit_metadata": emit_metadata });
+        let plugin = create_plugin("mcp_gateway", &config).unwrap().unwrap();
+
+        let (mut init_ctx, mut init_headers) = mcp_ctx(json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-11-25",
+                "capabilities": {},
+                "clientInfo": { "name": "unit-test", "version": "1" }
+            }
+        }));
+        let (status, _, response_headers) =
+            reject_json(plugin.before_proxy(&mut init_ctx, &mut init_headers).await);
+        assert_eq!(status, 200);
+        let session_id = response_headers["mcp-session-id"].clone();
+
+        let (mut ping_ctx, mut ping_headers) =
+            mcp_ctx(json!({ "jsonrpc": "2.0", "id": 2, "method": "ping" }));
+        ping_headers.insert("mcp-session-id".to_string(), session_id.clone());
+        let _ = plugin.before_proxy(&mut ping_ctx, &mut ping_headers).await;
+
+        let (mut version_ctx, mut version_headers) =
+            mcp_ctx(json!({ "jsonrpc": "2.0", "id": 3, "method": "ping" }));
+        version_headers.insert("mcp-session-id".to_string(), session_id.clone());
+        version_headers.insert("mcp-protocol-version".to_string(), "1999-01-01".to_string());
+        let _ = plugin
+            .before_proxy(&mut version_ctx, &mut version_headers)
+            .await;
+
+        let (mut delete_ctx, mut delete_headers) = mcp_ctx(json!({}));
+        delete_ctx.method = "DELETE".to_string();
+        let _ = plugin
+            .before_proxy(&mut delete_ctx, &mut delete_headers)
+            .await;
+
+        for (label, ctx) in [
+            ("initialize", &init_ctx),
+            ("ping", &ping_ctx),
+            ("unsupported protocol version", &version_ctx),
+            ("DELETE without a session", &delete_ctx),
+        ] {
+            let keys = mcp_keys(ctx);
+            if emit_metadata {
+                assert!(
+                    keys.iter().any(|key| key == "mcp.route_decision"),
+                    "{label} records its route decision: {keys:?}"
+                );
+            } else {
+                assert!(keys.is_empty(), "{label} leaked mcp metadata: {keys:?}");
+            }
+        }
+    }
+}
+
+/// Issue #7136: `policy.hide_denied_tools` is the one knob for listing denied
+/// tools. The former `discovery.hide_denied_items` duplicated it (both had to
+/// be `false`) and is now an unknown key, so setting it fails loudly instead of
+/// silently changing nothing.
+#[test]
+fn the_retired_discovery_hide_denied_items_key_is_refused() {
+    let mut config = aggregate_config("http://127.0.0.1:9/mcp");
+    config["discovery"]["hide_denied_items"] = json!(false);
+    let error = create_plugin("mcp_gateway", &config).err().unwrap();
+    assert!(error.contains("unknown configuration key"), "{error}");
+    assert!(error.contains("hide_denied_items"), "{error}");
 }
 
 #[test]
@@ -15035,42 +15259,6 @@ async fn aggregate_admission_refuses_an_envelope_mixing_method_and_reply() {
     }
 }
 
-/// `jwks_auth`'s generic mechanism path cannot stage a provider realm, so it
-/// never yields an external identity that would commit under a realm shared
-/// by every provider.
-#[tokio::test]
-async fn jwks_mechanism_verify_path_never_yields_an_external_identity() {
-    use ferrum_edge::plugins::utils::auth_flow::{
-        AuthMechanism, ExtractedCredential, VerifyOutcome,
-    };
-    let auth = two_issuer_jwks_auth();
-    let claims = json!({ "iss": ISSUER_A, "sub": "alice" });
-    let token = super::jwks_auth_support::create_rs256_token_with_kid(
-        &claims,
-        include_bytes!("../../../tests/fixtures/test_rsa_private.pem"),
-        "issuer-a",
-    );
-    let outcome = auth
-        .verify(
-            ExtractedCredential::BearerToken(token),
-            &ferrum_edge::ConsumerIndex::new(&[]),
-        )
-        .await;
-    match outcome {
-        VerifyOutcome::Success {
-            consumer,
-            external_identity,
-            external_identity_header,
-            ..
-        } => {
-            assert!(consumer.is_none());
-            assert!(external_identity.is_none());
-            assert!(external_identity_header.is_none());
-        }
-        other => panic!("a valid token still verifies: {other:?}"),
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Per-consumer tool grants (`allowed_groups` / `denied_groups`)
 // ---------------------------------------------------------------------------
@@ -15256,7 +15444,6 @@ async fn tool_grants_filter_tools_list_per_consumer() {
 async fn ungranted_tools_are_omitted_even_when_denied_tools_are_listed() {
     let (_server, plugin) = grant_plugin_with(|config| {
         config["policy"]["hide_denied_tools"] = json!(false);
-        config["discovery"]["hide_denied_items"] = json!(false);
         config["policy"]["tools"]["github.merge_pr"] = json!({ "action": "deny" });
     })
     .await;
@@ -18003,7 +18190,7 @@ async fn configured_server_headers_authenticate_every_upstream_request_and_clien
     );
 
     let (mut ctx, mut headers) = mcp_ctx(create_pr_tools_call(991));
-    ferrum_edge::_test_support::set_replay_credential_headers_for_test(
+    ferrum_edge::_test_support::set_request_headers_to_redact_for_test(
         &mut ctx,
         vec!["x-api-key".to_string()],
     );
@@ -18661,7 +18848,7 @@ async fn final_backend_header_policy_reasserts_the_selected_servers_credential_b
     let _ = aggregate_tool_names(&plugin, &session_id, 1060).await;
 
     let (mut ctx, mut headers) = mcp_ctx(create_pr_tools_call(1061));
-    ferrum_edge::_test_support::set_replay_credential_headers_for_test(
+    ferrum_edge::_test_support::set_request_headers_to_redact_for_test(
         &mut ctx,
         vec!["x-api-key".to_string()],
     );

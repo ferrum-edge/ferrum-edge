@@ -941,14 +941,19 @@ pub(crate) fn concretize_wildcard_target_for_request(
 /// hands the admission to a `HalfOpenProbeGuard`, which settles the attempt's
 /// outcome and probe slot on exactly `admitted_breaker` (issue #6799) and only
 /// decrements the half-open in-flight counter for a request that holds a slot.
+///
+/// `cb_target_key` is `None` when the proxy configures no breaker: every
+/// consumer of the key (outcome recording, staleness checks, retry
+/// admission) is gated on the same captured `proxy.circuit_breaker`, so the
+/// per-request `host:port` key is built only when a breaker can use it
+/// (issues #7166, #7207).
 pub(crate) fn check_circuit_breaker(
     proxy: &Proxy,
     state: &ProxyState,
     upstream_target: Option<&UpstreamTarget>,
 ) -> Result<CircuitBreakerAdmission, ()> {
-    let cb_target_key = circuit_breaker_target_key(proxy, upstream_target);
-
     if let Some(cb_config) = &proxy.circuit_breaker {
+        let cb_target_key = circuit_breaker_target_key(proxy, upstream_target);
         // Capture the open generation at admission so a deferred streaming outcome
         // can detect that the breaker has since opened a new cycle (#1649 round-4 B)
         // and avoid healing/reopening a HALF_OPEN cycle it never probed. The epoch
@@ -956,14 +961,12 @@ pub(crate) fn check_circuit_breaker(
         // concurrent open racing this admission can only make the outcome look
         // stale, never too-new (#1649 R6 finding 3), and a probe guard bound to it
         // cannot release a later cycle's slot (#6177).
-        match state
-            .circuit_breaker_cache
-            .can_execute_with_admission_epoch(
-                &proxy.namespace,
-                &proxy.id,
-                cb_target_key.as_deref(),
-                cb_config,
-            ) {
+        match state.circuit_breaker_cache.can_execute(
+            &proxy.namespace,
+            &proxy.id,
+            cb_target_key.as_deref(),
+            cb_config,
+        ) {
             // Keep the admitting breaker: the attempt's outcome and probe slot
             // settle on exactly this instance (issue #6799), never on one
             // re-resolved later from the request's captured config.
@@ -977,12 +980,7 @@ pub(crate) fn check_circuit_breaker(
         }
     }
 
-    Ok((
-        cb_target_key,
-        None,
-        crate::circuit_breaker::ProbeTicket::NonProbe,
-        0,
-    ))
+    Ok((None, None, crate::circuit_breaker::ProbeTicket::NonProbe, 0))
 }
 
 /// What [`check_circuit_breaker`] admitted: the breaker key, the admitting
@@ -2773,6 +2771,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn check_circuit_breaker_builds_no_key_without_a_breaker() {
+        let mut config: crate::config::types::GatewayConfig =
+            serde_json::from_value(serde_json::json!({
+                "version": "1",
+                "consumers": [],
+                "plugin_configs": [],
+                "proxies": [{
+                    "id": "no-cb-proxy",
+                    "listen_path": "/",
+                    "backend_scheme": "http",
+                    "backend_host": "backend.local",
+                    "backend_port": 8080
+                }],
+                "upstreams": []
+            }))
+            .expect("test config should deserialize");
+        config.normalize_fields();
+        let dns_cache = crate::dns::DnsCache::new(crate::dns::DnsConfig::default());
+        let env_config = crate::config::env_config::EnvConfig::default();
+        let (state, _) = crate::proxy::ProxyState::new(config, dns_cache, env_config, None, None)
+            .expect("test proxy state should build");
+        let epoch = state.request_epoch.load();
+        let proxy = &epoch.config.proxies[0];
+        assert!(proxy.circuit_breaker.is_none());
+
+        let (key, admitted, probe_ticket, epoch_value) =
+            check_circuit_breaker(proxy, &state, None).expect("no breaker always admits");
+        assert_eq!(key, None, "no breaker means no per-request breaker key");
+        assert!(admitted.is_none());
+        assert!(!probe_ticket.is_probe());
+        assert_eq!(epoch_value, 0);
+    }
+
+    #[tokio::test]
     async fn request_body_too_large_outcome_releases_half_open_probe_neutrally() {
         // HBONE/native-H3 can detect an oversized Content-Length after
         // check_circuit_breaker() has reserved a HALF_OPEN probe but before any
@@ -2864,6 +2896,61 @@ mod tests {
             0,
             "neutral recording must release the reserved probe slot"
         );
+    }
+
+    #[tokio::test]
+    async fn breaker_key_is_built_only_for_a_proxy_with_a_breaker() {
+        // Issue #7166: every reader of the admitted key is breaker-gated, so a
+        // proxy without a breaker gets no key and pays no per-request format.
+        let mut config: crate::config::types::GatewayConfig =
+            serde_json::from_value(serde_json::json!({
+                "version": "1",
+                "consumers": [],
+                "plugin_configs": [],
+                "proxies": [
+                    {
+                        "id": "no-breaker",
+                        "listen_path": "/plain",
+                        "backend_scheme": "http",
+                        "backend_host": "backend.local",
+                        "backend_port": 8080
+                    },
+                    {
+                        "id": "with-breaker",
+                        "listen_path": "/guarded",
+                        "backend_scheme": "http",
+                        "backend_host": "backend.local",
+                        "backend_port": 8080,
+                        "circuit_breaker": {"failure_threshold": 5}
+                    }
+                ],
+                "upstreams": []
+            }))
+            .expect("test config should deserialize");
+        config.normalize_fields();
+        let dns_cache = crate::dns::DnsCache::new(crate::dns::DnsConfig::default());
+        let env_config = crate::config::env_config::EnvConfig::default();
+        let (state, _) = crate::proxy::ProxyState::new(config, dns_cache, env_config, None, None)
+            .expect("test proxy state should build");
+        let epoch = state.request_epoch.load();
+        let proxy = |id: &str| {
+            epoch
+                .config
+                .proxies
+                .iter()
+                .find(|proxy| proxy.id == id)
+                .expect("proxy fixture")
+        };
+
+        let (key, breaker, _, _) =
+            check_circuit_breaker(proxy("no-breaker"), &state, None).expect("admitted");
+        assert_eq!(key, None);
+        assert!(breaker.is_none());
+
+        let (key, breaker, _, _) =
+            check_circuit_breaker(proxy("with-breaker"), &state, None).expect("admitted");
+        assert_eq!(key.as_deref(), Some("backend.local:8080"));
+        assert!(breaker.is_some());
     }
 
     #[tokio::test]

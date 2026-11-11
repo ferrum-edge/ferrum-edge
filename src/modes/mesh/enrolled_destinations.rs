@@ -213,6 +213,13 @@ pub(crate) struct NodeLocalEnrolledDestinationOwner<'a> {
 
 impl NodeLocalEnrolledDestinationOwner<'_> {
     /// Whether this enrolled owner satisfies the slice record's evidence.
+    ///
+    /// `identity` and `pod_uid` bind the admission to the actual enrolled pod
+    /// when both sides carry the evidence: a mismatch is a refusal. The
+    /// node-agent publishes `spiffe_id=` optionally and the slice publishes
+    /// `pod_uid` only for per-pod Kubernetes workloads, so an ABSENT value on
+    /// either side leaves that particular comparison unmade instead of refusing
+    /// an enrollment the address already proves.
     pub(crate) fn terminates_for(self, identity: Option<&str>, pod_uid: Option<&str>) -> bool {
         if let Some(pod_uid) = pod_uid
             && self.owner.pod_uid != pod_uid
@@ -262,14 +269,14 @@ impl NodeLocalEnrolledDestinations {
         }
     }
 
-    /// Publish a complete new generation, returning its number.
+    /// Publish a complete new generation.
     ///
     /// An address claimed by more than one DISTINCT pod UID is dropped for
     /// every claimant: the registry cannot tell the guard which pod owns it,
     /// and guessing would let one pod be relayed to under another's
     /// enrollment. Two records repeating one pod UID (the same pod re-listed)
     /// collapse rather than contest.
-    pub fn publish(&self, entries: &[EnrolledPodEntry]) -> u64 {
+    pub fn publish(&self, entries: &[EnrolledPodEntry]) {
         let generation = self.next_generation.fetch_add(1, Ordering::Relaxed);
         let mut by_address: HashMap<IpAddr, Arc<EnrolledAddressOwner>> = HashMap::new();
         let mut contested: Vec<IpAddr> = Vec::new();
@@ -306,7 +313,6 @@ impl NodeLocalEnrolledDestinations {
             published: true,
             by_address,
         }));
-        generation
     }
 
     /// Retract every entry. The index then vouches for nothing, so every
@@ -316,38 +322,6 @@ impl NodeLocalEnrolledDestinations {
             published: false,
             by_address: HashMap::new(),
         }));
-    }
-
-    /// Whether this node currently enrolls the destination pod at `address`
-    /// (issue #4249). HOT PATH: one snapshot load, one hash lookup, no
-    /// allocation and no I/O.
-    ///
-    /// `address` is the EFFECTIVE DIAL DESTINATION, not a hint: the guard only
-    /// reaches this for an inventory entry matched by IP LITERAL, and an IP
-    /// authority is relayed to verbatim, so admitting the address here admits
-    /// exactly the socket the relay opens. A destination the terminator can
-    /// only NAME never gets here — the caller refuses it outright while this
-    /// index is authoritative, because a name is resolved AFTER the decision
-    /// and could select an off-node sibling or any other address DNS returns.
-    /// See `MeshConfig::destination_is_node_local_enrolled`.
-    ///
-    /// `identity` and `pod_uid` bind the admission to the actual enrolled pod
-    /// when both sides carry the evidence: a mismatch is a refusal. The
-    /// node-agent publishes `spiffe_id=` optionally and the slice publishes
-    /// `pod_uid` only for per-pod Kubernetes workloads, so an ABSENT value on
-    /// either side leaves that particular comparison unmade instead of refusing
-    /// an enrollment the address already proves.
-    pub fn terminates_for(
-        &self,
-        address: IpAddr,
-        identity: Option<&str>,
-        pod_uid: Option<&str>,
-    ) -> bool {
-        let snapshot = self.snapshot();
-        let Some(owner) = snapshot.owner_for(address) else {
-            return false;
-        };
-        owner.terminates_for(identity, pod_uid)
     }
 }
 
@@ -382,7 +356,6 @@ impl NodeLocalEnrolledDestinationsHandle {
     }
 
     /// Whether a node-local registry bounds this proxy's relay inventory.
-    #[allow(dead_code)] // Diagnostics + external test assertions; unread by the binary target.
     pub fn is_authoritative(&self) -> bool {
         self.0.is_some()
     }

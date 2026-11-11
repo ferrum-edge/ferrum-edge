@@ -806,7 +806,7 @@ fn test_admin_transaction_log_schema_rejects_unknown_closed_object_keys() {
         (
             "outer-key",
             json!({"schemas": {"audit": {}}, "strict": true}),
-            "unknown config key \"strict\" at `config`",
+            "`config`: unknown configuration key(s): \"config.strict\"",
         ),
         (
             "derived-key",

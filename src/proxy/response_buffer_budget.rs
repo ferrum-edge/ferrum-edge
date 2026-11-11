@@ -747,7 +747,6 @@ impl RequestBufferPermit {
     /// External tests bind an [`IsolatedBudget`] so a parallel test binary can
     /// observe admission and release deterministically; production collects
     /// through [`ChargedRequestCollector`], which charges as bytes arrive.
-    #[allow(dead_code)] // external-test seam; dead in the separately compiled binary unit
     pub(crate) fn reserve_in(budget: BudgetRef<'_>, retained_bytes: usize) -> Option<Self> {
         let mut permit = Self::unreserved_in(budget);
         if permit.grow_to(retained_bytes) {
@@ -826,7 +825,6 @@ impl RequestBufferPermit {
     }
 
     /// Bytes currently charged. Diagnostics and tests only.
-    #[allow(dead_code)] // external-test seam; dead in the separately compiled binary unit
     pub(crate) fn reserved_bytes(&self) -> usize {
         self.units * self.unit_bytes
     }
@@ -1059,13 +1057,11 @@ impl ChargedRequestCollector {
     }
 
     /// Bytes collected so far.
-    #[allow(dead_code)] // external-test seam; dead in the separately compiled binary unit
     pub(crate) fn len(&self) -> usize {
         self.data.len()
     }
 
     /// Capacity the charge currently covers. External-test seam.
-    #[allow(dead_code)] // external-test seam; dead in the separately compiled binary unit
     pub(crate) fn reserved_bytes(&self) -> usize {
         self.permit.reserved_bytes()
     }
@@ -1506,7 +1502,6 @@ fn charge_retained_copy_against(budget: &Budget, data: &[u8]) -> Option<Bytes> {
 /// [`ResponseTransformWindow`] exists to close: production reserves the window
 /// first and TRANSFERS blocks into the finished allocation with
 /// [`ResponseBufferReservation::split_charge`].
-#[allow(dead_code)] // used only by external tests via IsolatedBudget; dead in binary unit
 fn charge_owned_allocation_against(budget: &Budget, data: Vec<u8>) -> Option<Bytes> {
     if data.is_empty() {
         return Some(Bytes::new());
@@ -2067,8 +2062,7 @@ pub(crate) fn bounded_vec_from(bytes: &[u8], ceiling: usize) -> Option<Vec<u8>> 
 /// implementation of the rules.
 pub(crate) struct IsolatedBudget(Budget);
 
-/// External tests bind this through [`crate::_test_support::ResponseBufferBudgetProbe`];
-/// the separately compiled binary unit has no caller.
+/// External tests bind this through [`crate::_test_support::ResponseBufferBudgetProbe`].
 #[allow(dead_code)]
 impl IsolatedBudget {
     pub(crate) fn new(fallback_per_response_bytes: usize, total_bytes: usize) -> Self {
@@ -2180,7 +2174,6 @@ impl IsolatedBudget {
 /// Blocks a degenerate configuration would leave available, for external tests.
 /// Exercises the same clamp production uses without touching the process-global
 /// budget.
-#[allow(dead_code)]
 pub(crate) fn available_blocks_for_config(
     fallback_per_response_bytes: usize,
     total_bytes: usize,

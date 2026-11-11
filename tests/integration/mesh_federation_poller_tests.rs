@@ -1,8 +1,9 @@
 //! End-to-end coverage for the SPIFFE trust-bundle federation poller (GAP-3C).
 //!
 //! These tests stand up a tiny tokio HTTPS responder and point the poller at
-//! it. We use the polling task directly via `spawn_federation_poller` so the
-//! tests do not need a full mesh runtime. A `GET /mesh/federation` admin
+//! it. They drive the production `FederationPollerManager` (the same
+//! reconcile/withdraw lifecycle the mesh runtime runs on every slice apply) so
+//! the tests do not need a full mesh runtime. A `GET /mesh/federation` admin
 //! exercise verifies the snapshot lands in the AdminState surface, and a
 //! second mock-endpoint test verifies fail-open vs fail-closed semantics.
 
@@ -22,7 +23,7 @@ use ferrum_edge::dns::{DnsCache, DnsConfig};
 use ferrum_edge::identity::TrustDomain;
 use ferrum_edge::modes::mesh::config::{MultiClusterConfig, RemoteCluster};
 use ferrum_edge::modes::mesh::federation::{
-    FederationPollerConfig, FederationStore, spawn_federation_poller,
+    FederationPollerConfig, FederationPollerManager, FederationStore,
 };
 use ferrum_edge::modes::mesh::runtime::MeshRuntimeState;
 use ferrum_edge::plugins::PluginHttpClient;
@@ -183,8 +184,17 @@ async fn start_mock_federation_endpoint(
     }
 }
 
-fn poller_http_client() -> PluginHttpClient {
-    PluginHttpClient::from_pool_config(&ferrum_edge::config::PoolConfig::default())
+/// 30 s poll interval, 5 s request timeout, the default 3600 s max-stale.
+fn poller_config(fail_open: bool) -> Option<FederationPollerConfig> {
+    FederationPollerConfig::from_env_with_max_stale(30, 5, fail_open, 3600)
+}
+
+async fn wait_for_first_success(store: &FederationStore, attempts: usize) {
+    let mut waited = 0;
+    while !store.has_first_success() && waited < attempts {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        waited += 1;
+    }
 }
 
 fn remote_cluster(name: &str, endpoint: &str) -> RemoteCluster {
@@ -214,22 +224,14 @@ async fn federation_poller_populates_store_on_success() {
         east_west_gateways: Vec::new(),
     };
     let store = FederationStore::new();
-    let (shutdown_tx, shutdown_rx) = watch::channel(false);
-    let handles = spawn_federation_poller(
-        Some(&multi_cluster),
-        FederationPollerConfig::from_env(30, 5, false),
+    let mut manager = FederationPollerManager::new(
+        poller_config(false),
         mock.http_client.clone(),
         store.clone(),
-        shutdown_rx,
-    )
-    .expect("poller spawned");
+    );
+    manager.reconcile(Some(&multi_cluster));
 
-    // Wait for first success.
-    let mut waited = 0;
-    while !store.has_first_success() && waited < 50 {
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        waited += 1;
-    }
+    wait_for_first_success(&store, 50).await;
     assert!(
         store.has_first_success(),
         "poller never marked first success"
@@ -251,11 +253,8 @@ async fn federation_poller_populates_store_on_success() {
     assert_eq!(bundle.cluster_name, "remote");
     assert!(mock.request_count.load(Ordering::SeqCst) >= 1);
 
-    let _ = shutdown_tx.send(true);
+    manager.shutdown();
     let _ = mock.shutdown.send(true);
-    for h in handles.tasks {
-        let _ = tokio::time::timeout(Duration::from_secs(2), h).await;
-    }
 }
 
 #[tokio::test]
@@ -276,21 +275,11 @@ async fn federation_poller_keeps_last_good_after_transient_failure() {
         east_west_gateways: Vec::new(),
     };
     let store = FederationStore::new();
-    let (shutdown_tx, shutdown_rx) = watch::channel(false);
-    let handles = spawn_federation_poller(
-        Some(&multi_cluster),
-        FederationPollerConfig::from_env(30, 5, true),
-        mock.http_client.clone(),
-        store.clone(),
-        shutdown_rx,
-    )
-    .expect("poller spawned");
+    let mut manager =
+        FederationPollerManager::new(poller_config(true), mock.http_client.clone(), store.clone());
+    manager.reconcile(Some(&multi_cluster));
 
-    let mut waited = 0;
-    while !store.has_first_success() && waited < 200 {
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        waited += 1;
-    }
+    wait_for_first_success(&store, 200).await;
     assert!(
         store.has_first_success(),
         "poller never recovered from transient failures"
@@ -303,47 +292,86 @@ async fn federation_poller_keeps_last_good_after_transient_failure() {
         mock.request_count.load(Ordering::SeqCst)
     );
 
-    let _ = shutdown_tx.send(true);
+    manager.shutdown();
     let _ = mock.shutdown.send(true);
-    for h in handles.tasks {
-        let _ = tokio::time::timeout(Duration::from_secs(2), h).await;
-    }
 }
 
-#[tokio::test]
-async fn federation_poller_disabled_when_interval_zero() {
-    let handles = spawn_federation_poller(
-        Some(&MultiClusterConfig::default()),
-        FederationPollerConfig::from_env(0, 30, false),
-        poller_http_client(),
-        FederationStore::new(),
-        watch::channel(false).1,
-    );
+#[test]
+fn federation_poller_disabled_when_interval_zero() {
     assert!(
-        handles.is_none(),
-        "interval=0 should disable the poller and return None"
+        FederationPollerConfig::from_env_with_max_stale(0, 30, false, 3600).is_none(),
+        "interval=0 disables the poller"
     );
 }
 
+/// A slice that withdraws the remote cluster (or drops its federation
+/// endpoint) must stop the poller AND remove the once-fetched bundle, so a
+/// decommissioned trust anchor stops being overlaid onto slice applies without
+/// a gateway restart.
 #[tokio::test]
-async fn federation_poller_disabled_without_remote_clusters() {
-    let multi_cluster = MultiClusterConfig {
-        local_cluster: Some("local".to_string()),
+async fn federation_poller_manager_removes_bundle_when_cluster_is_withdrawn() {
+    let body = json!({
+        "trust_domain": TEST_TRUST_DOMAIN,
+        "x509_authorities": [sample_cert_base64()],
+    })
+    .to_string();
+    let mock = start_mock_federation_endpoint(body, 0).await;
+    let with_remote = MultiClusterConfig {
+        local_cluster: Some("local-cluster".to_string()),
         federation_endpoint: None,
-        remote_clusters: Vec::new(),
+        remote_clusters: vec![remote_cluster("remote", &mock.endpoint)],
         east_west_gateways: Vec::new(),
     };
-    let handles = spawn_federation_poller(
-        Some(&multi_cluster),
-        FederationPollerConfig::from_env(60, 30, false),
-        poller_http_client(),
-        FederationStore::new(),
-        watch::channel(false).1,
+    let store = FederationStore::new();
+    let mut manager = FederationPollerManager::new(
+        poller_config(false),
+        mock.http_client.clone(),
+        store.clone(),
+    );
+    manager.reconcile(Some(&with_remote));
+    wait_for_first_success(&store, 50).await;
+    assert!(
+        store
+            .snapshot()
+            .bundles
+            .contains_key(&td(TEST_TRUST_DOMAIN)),
+        "poller never installed the remote bundle"
+    );
+    let revision_before = *store.subscribe().borrow();
+
+    let without_remote = MultiClusterConfig {
+        remote_clusters: Vec::new(),
+        ..with_remote.clone()
+    };
+    manager.reconcile(Some(&without_remote));
+    assert!(
+        !store
+            .snapshot()
+            .bundles
+            .contains_key(&td(TEST_TRUST_DOMAIN)),
+        "withdrawn cluster's federated bundle must be removed"
     );
     assert!(
-        handles.is_none(),
-        "no remote clusters with federation_endpoint -> no poller"
+        *store.subscribe().borrow() > revision_before,
+        "withdrawal must bump the federation revision so slice apply re-runs"
     );
+
+    // The poller is stopped, so no later poll can reinstall the bundle.
+    let hits_after_withdrawal = mock.request_count.load(Ordering::SeqCst);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(
+        !store
+            .snapshot()
+            .bundles
+            .contains_key(&td(TEST_TRUST_DOMAIN))
+    );
+    assert_eq!(
+        mock.request_count.load(Ordering::SeqCst),
+        hits_after_withdrawal
+    );
+
+    manager.shutdown();
+    let _ = mock.shutdown.send(true);
 }
 
 // ── /mesh/federation admin endpoint coverage ───────────────────────────────
@@ -534,22 +562,15 @@ async fn mesh_federation_endpoint_returns_polled_bundles() {
         remote_clusters: vec![remote_cluster("remote", &credentialed_endpoint)],
         east_west_gateways: Vec::new(),
     };
-    let (shutdown_tx, shutdown_rx) = watch::channel(false);
-    let handles = spawn_federation_poller(
-        Some(&multi_cluster),
-        FederationPollerConfig::from_env(30, 5, false),
-        mock.http_client.clone(),
-        mesh_runtime.federation_store().clone(),
-        shutdown_rx,
-    )
-    .expect("poller spawned");
-
     let store = mesh_runtime.federation_store().clone();
-    let mut waited = 0;
-    while !store.has_first_success() && waited < 50 {
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        waited += 1;
-    }
+    let mut manager = FederationPollerManager::new(
+        poller_config(false),
+        mock.http_client.clone(),
+        store.clone(),
+    );
+    manager.reconcile(Some(&multi_cluster));
+
+    wait_for_first_success(&store, 50).await;
     assert!(store.has_first_success(), "poller never populated store");
 
     let state = build_admin_state(jwt_manager(&tc), Some(mesh_runtime));
@@ -582,11 +603,8 @@ async fn mesh_federation_endpoint_returns_polled_bundles() {
         );
     }
 
-    let _ = shutdown_tx.send(true);
+    manager.shutdown();
     let _ = mock.shutdown.send(true);
-    for h in handles.tasks {
-        let _ = tokio::time::timeout(Duration::from_secs(2), h).await;
-    }
 }
 
 #[tokio::test]

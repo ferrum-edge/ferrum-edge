@@ -276,19 +276,11 @@ pub(crate) struct LeaseRenewalCounters {
     /// Attempts abandoned on a datastore error or the per-attempt timeout and
     /// re-issued inside the same window.
     pub(crate) retries: u32,
-    /// Always zero: a keeper must never re-acquire a released or absent row.
-    /// Retained for the external renewal test observation.
-    pub(crate) reclaims: u32,
 }
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct LeaseRenewalReport {
-    // Read by the external lease-renewal tests through
-    // `run_namespace_config_admission_renewal_for_test`; the binary target
-    // never inspects the report, so both fields are dead there.
-    #[allow(dead_code)]
     pub(crate) outcome: LeaseRenewalOutcome,
-    #[allow(dead_code)]
     pub(crate) counters: LeaseRenewalCounters,
 }
 
@@ -412,7 +404,6 @@ where
                     namespace = %namespace,
                     renewals = counters.renewals,
                     retries = counters.retries,
-                    reclaims = counters.reclaims,
                     detail_withheld = true,
                     "Namespace config admission lease expired before any renewal attempt could complete; failing closed"
                 );
@@ -684,7 +675,6 @@ impl NamespaceConfigAdmissionGuard {
     /// Test-only: mark the lease invalid so [`Self::ensure_held`] and
     /// [`Self::run_to_completion_while_held`] observe loss without waiting for
     /// the production renewer / TTL.
-    #[allow(dead_code)]
     pub(crate) fn force_lose_for_test(&self) {
         self.valid.store(false, Ordering::Release);
         self.valid_until_millis.store(0, Ordering::Release);
@@ -1010,7 +1000,6 @@ async fn lock_namespace_config_admission_with_local(
 /// envelope exercises the identical arithmetic in milliseconds instead of
 /// minutes. Returns the renewer's report plus the guard-visible verdict
 /// [`NamespaceConfigAdmissionGuard::ensure_held`] would reach at that instant.
-#[allow(dead_code)] // Library integration tests exercise this seam; the binary target does not.
 pub(crate) async fn run_namespace_config_admission_renewal_for_test(
     db: Arc<dyn crate::config::db_backend::NamespaceConfigAdmissionLeaseBackend>,
     namespace: &str,
@@ -2590,54 +2579,68 @@ async fn consumer_candidate_config(
     Ok(config)
 }
 
-pub(crate) async fn mtls_consumer_candidate_errors(
-    db: &dyn DatabaseBackend,
-    namespace: &str,
-    consumer: &Consumer,
-) -> DbResult<Vec<String>> {
-    Ok(consumer_candidate_config(db, namespace, consumer)
-        .await?
-        .validate_unique_mtls_credentials()
-        .err()
-        .unwrap_or_default())
+/// Which consumer credential uniqueness checks one candidate snapshot runs.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct ConsumerCredentialChecks {
+    pub(crate) mtls: bool,
+    pub(crate) hmac: bool,
+    pub(crate) jwt: bool,
 }
 
-/// Reject an admin Consumer/credential write whose hmac_auth secret is
-/// already claimed by another consumer in the namespace. Snapshot-based like
-/// the mTLS candidate check (rather than a credential-index probe) so
-/// pre-existing rows written before hmac secrets were policed are still
-/// authoritative. `lock_namespace_config_admission` serializes same-process
-/// prechecks; namespace-scoped SQL/Mongo uniqueness constraints are the
-/// cross-process persistence backstop.
-pub(crate) async fn hmac_consumer_candidate_errors(
-    db: &dyn DatabaseBackend,
-    namespace: &str,
-    consumer: &Consumer,
-) -> DbResult<Vec<String>> {
-    Ok(consumer_candidate_config(db, namespace, consumer)
-        .await?
-        .validate_unique_hmac_credentials()
-        .err()
-        .unwrap_or_default())
+/// Per-kind uniqueness errors from one candidate snapshot.
+#[derive(Default)]
+pub(crate) struct ConsumerCredentialErrors {
+    pub(crate) mtls: Vec<String>,
+    pub(crate) hmac: Vec<String>,
+    pub(crate) jwt: Vec<String>,
 }
 
-/// Reject an admin Consumer/credential write whose `jwt` secret is already
-/// configured on another consumer in the namespace. `jwt_auth` picks the
-/// verifying Consumer from the signer-chosen identity claim, so a shared JWT
-/// secret lets each holder sign as the other. Snapshot-based like the HMAC
-/// check; only collisions involving this consumer are reported, so a
-/// pre-existing duplicate between two other Consumers (quarantined on load)
-/// does not block an unrelated write.
-pub(crate) async fn jwt_consumer_candidate_errors(
+/// Run the requested consumer credential uniqueness checks against ONE
+/// namespace snapshot with `consumer` applied (issue #7209: each check used to
+/// load its own snapshot). Nothing is loaded when no check is requested.
+///
+/// - mTLS: the candidate's certificate identities must be unique.
+/// - HMAC: an hmac_auth secret already claimed by another consumer is
+///   refused. Snapshot-based (rather than a credential-index probe) so
+///   pre-existing rows written before hmac secrets were policed are still
+///   authoritative. `lock_namespace_config_admission` serializes
+///   same-process prechecks; namespace-scoped SQL/Mongo uniqueness
+///   constraints are the cross-process persistence backstop.
+/// - JWT: `jwt_auth` picks the verifying Consumer from the signer-chosen
+///   identity claim, so a shared JWT secret lets each holder sign as the
+///   other. Only collisions involving this consumer are reported, so a
+///   pre-existing duplicate between two other Consumers (quarantined on
+///   load) does not block an unrelated write.
+pub(crate) async fn consumer_credential_candidate_errors(
     db: &dyn DatabaseBackend,
     namespace: &str,
     consumer: &Consumer,
-) -> DbResult<Vec<String>> {
-    Ok(consumer_candidate_config(db, namespace, consumer)
-        .await?
-        .validate_unique_jwt_credentials_for_consumers(&[consumer.id.as_str()])
-        .err()
-        .unwrap_or_default())
+    checks: ConsumerCredentialChecks,
+) -> DbResult<ConsumerCredentialErrors> {
+    let mut errors = ConsumerCredentialErrors::default();
+    if !(checks.mtls || checks.hmac || checks.jwt) {
+        return Ok(errors);
+    }
+    let config = consumer_candidate_config(db, namespace, consumer).await?;
+    if checks.mtls {
+        errors.mtls = config
+            .validate_unique_mtls_credentials()
+            .err()
+            .unwrap_or_default();
+    }
+    if checks.hmac {
+        errors.hmac = config
+            .validate_unique_hmac_credentials()
+            .err()
+            .unwrap_or_default();
+    }
+    if checks.jwt {
+        errors.jwt = config
+            .validate_unique_jwt_credentials_for_consumers(&[consumer.id.as_str()])
+            .err()
+            .unwrap_or_default();
+    }
+    Ok(errors)
 }
 
 impl ValidationError {
@@ -4296,7 +4299,7 @@ impl AdminResource for Upstream {
         _state: &AdminState,
         namespace: &str,
         resource: &Self,
-        _existing: Option<&Self>,
+        existing: Option<&Self>,
         _ctx: &ValidationCtx<'_>,
     ) -> Result<(), AfterValidateError> {
         let subset_names: HashSet<&str> = resource
@@ -4306,6 +4309,19 @@ impl AdminResource for Upstream {
             .iter()
             .map(|subset| subset.name.as_str())
             .collect();
+        // Only a REMOVED subset can strand a proxy reference. An update that
+        // keeps every stored subset skips paging every proxy of the namespace
+        // (issue #7209); creates still scan.
+        if let Some(existing) = existing
+            && existing
+                .subsets
+                .as_deref()
+                .unwrap_or(&[])
+                .iter()
+                .all(|subset| subset_names.contains(subset.name.as_str()))
+        {
+            return Ok(());
+        }
         let mut errors = Vec::new();
         let mut offset = 0_i64;
         const PAGE_SIZE: i64 = 1_000;
@@ -6135,28 +6151,17 @@ impl AdminResource for Consumer {
         _existing: Option<&Self>,
         _ctx: &ValidationCtx<'_>,
     ) -> Result<(), AfterValidateError> {
-        let mut errors = Vec::new();
-        if resource.has_credential("mtls_auth") {
-            errors.extend(
-                mtls_consumer_candidate_errors(db, namespace, resource)
-                    .await
-                    .map_err(AfterValidateError::Db)?,
-            );
-        }
-        if resource.has_credential("hmac_auth") {
-            errors.extend(
-                hmac_consumer_candidate_errors(db, namespace, resource)
-                    .await
-                    .map_err(AfterValidateError::Db)?,
-            );
-        }
-        if resource.has_credential("jwt") {
-            errors.extend(
-                jwt_consumer_candidate_errors(db, namespace, resource)
-                    .await
-                    .map_err(AfterValidateError::Db)?,
-            );
-        }
+        let checks = ConsumerCredentialChecks {
+            mtls: resource.has_credential("mtls_auth"),
+            hmac: resource.has_credential("hmac_auth"),
+            jwt: resource.has_credential("jwt"),
+        };
+        let found = consumer_credential_candidate_errors(db, namespace, resource, checks)
+            .await
+            .map_err(AfterValidateError::Db)?;
+        let mut errors = found.mtls;
+        errors.extend(found.hmac);
+        errors.extend(found.jwt);
         if errors.is_empty() {
             Ok(())
         } else {

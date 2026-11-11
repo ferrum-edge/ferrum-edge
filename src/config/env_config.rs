@@ -1011,8 +1011,6 @@ fn validate_discovery_body_limits(limits: DiscoveryBodyLimits) -> Result<(), Str
 /// TLS values are unresolved source references; use [`Self::connect_lazy`]
 /// rather than passing this URL directly to SQLx.
 #[derive(Clone, PartialEq, Eq)]
-// Public custom-plugin API; the binary test target may compile without opt-in plugins.
-#[allow(dead_code)]
 pub struct EffectiveSqlBackend {
     pub db_type: String,
     pub effective_url: String,
@@ -1022,7 +1020,6 @@ impl EffectiveSqlBackend {
     /// Build a lazy SQL pool with pool-owned TLS material, without dialing.
     /// Source reads use the shared detached-reader fence and the supplied
     /// timeout (seconds; zero disables the bound). Errors fail closed.
-    #[allow(dead_code)] // Public custom-plugin API; examples are opt-in.
     pub async fn connect_lazy(
         &self,
         options: sqlx::any::AnyPoolOptions,
@@ -1065,7 +1062,6 @@ pub enum OperatingMode {
 }
 
 impl OperatingMode {
-    #[allow(dead_code)] // Used by integration/unit tests via the lib crate
     pub fn from_env() -> Result<Self, String> {
         Self::resolve(&ConfFile::default())
     }
@@ -1913,7 +1909,6 @@ fn resolve_tls_source_override(
 /// conf-aware resolver for consumers that do not hold the `ConfFile` used by
 /// `EnvConfig::from_env_with_conf`.
 // Used by the public SQL-backend resolver when an opt-in plugin is compiled.
-#[allow(dead_code)]
 fn resolve_cached_tls_source_override(source_key: &str, path_key: &str) -> Option<String> {
     let path_value = crate::config::conf_file::resolve_ferrum_var(path_key);
     match crate::config::conf_file::resolve_ferrum_var(source_key) {
@@ -1928,24 +1923,6 @@ fn resolve_cached_tls_source_override(source_key: &str, path_key: &str) -> Optio
             Some(source_value)
         }
         None => path_value,
-    }
-}
-
-fn resolve_tls_key_exchange_groups(
-    configured: Option<String>,
-    legacy_curves: Option<String>,
-) -> Option<String> {
-    match (configured, legacy_curves) {
-        (Some(value), Some(legacy)) => {
-            if value != legacy {
-                tracing::warn!(
-                    "FERRUM_TLS_KEY_EXCHANGE_GROUPS is set; it overrides FERRUM_TLS_CURVES"
-                );
-            }
-            Some(value)
-        }
-        (Some(value), None) => Some(value),
-        (None, legacy) => legacy,
     }
 }
 
@@ -2136,7 +2113,6 @@ impl CompressionAdmissionPolicy {
 
 /// All environment-driven configuration.
 #[derive(Debug, Clone)]
-#[allow(dead_code)] // Some fields are used only in specific modes or feature paths.
 pub struct EnvConfig {
     pub mode: OperatingMode,
     /// Namespace this gateway instance loads and manages. Resources from other
@@ -2151,13 +2127,10 @@ pub struct EnvConfig {
     /// share one sink and stderr owns another. Default: 4096.
     /// Note: consumed in main() before EnvConfig is constructed (tracing must init
     /// first), but stored here for completeness alongside other FERRUM_* vars.
-    #[allow(dead_code)]
     pub log_buffer_capacity: usize,
     /// Per-sink aggregate reserved-byte budget. Default: 32 MiB.
-    #[allow(dead_code)]
     pub log_buffer_bytes: usize,
     /// Maximum serialized bytes in one process log record. Default: 64 KiB.
-    #[allow(dead_code)]
     pub log_max_record_bytes: usize,
     /// Shared observability lifecycle and per-process-sink drain timeout.
     /// Default: 2000 ms.
@@ -2333,7 +2306,6 @@ pub struct EnvConfig {
     /// are rejected during verification. Default: "ferrum-edge".
     /// Note: Also resolved via `resolve_ferrum_var()` in `jwt_auth.rs` for use sites
     /// that don't have `EnvConfig` in scope (e.g., `create_jwt_manager_from_env()`).
-    #[allow(dead_code)]
     pub admin_jwt_issuer: String,
     /// Maximum accepted TTL in seconds for externally minted Admin API JWT tokens.
     ///
@@ -2347,14 +2319,12 @@ pub struct EnvConfig {
     /// lifetime cap entirely; a value above `i64::MAX` is rejected as invalid
     /// rather than treated as unlimited. Default: 3600.
     /// Note: Also resolved via `resolve_ferrum_var()` in `jwt_auth.rs`.
-    #[allow(dead_code)]
     pub admin_jwt_max_ttl: u64,
     /// Optional required `aud` (audience) claim for externally minted Admin API
     /// JWT tokens. When set, verification requires the token to carry an `aud`
     /// claim matching this value; when unset (default), tokens that carry an
     /// `aud` claim are rejected.
     /// Note: Also resolved via `resolve_ferrum_var()` in `jwt_auth.rs`.
-    #[allow(dead_code)]
     pub admin_jwt_audience: Option<String>,
 
     // Database
@@ -2549,7 +2519,9 @@ pub struct EnvConfig {
     /// contents instead of minting its own token, so the signing key never
     /// exists on the data plane at all. The file is re-read on every connection
     /// attempt, so a rotating projected token is picked up without a restart.
-    /// DP / mesh / xDS client side.
+    /// Mesh (native / xDS) client side only: `validate()` refuses it in `dp`
+    /// mode, whose random per-process `node_id` can never match the token's
+    /// `sub` (issue #7273).
     pub dp_cp_grpc_token_file: Option<String>,
     /// Comma-separated, priority-ordered list of CP gRPC URLs for DP failover.
     /// The DP connects to the first URL and fails over to subsequent URLs when
@@ -2997,14 +2969,9 @@ pub struct EnvConfig {
     /// rather than black-holing. Only affects mesh upstreams. Sourced from
     /// `FERRUM_MESH_LOCALITY_LB_STRICT`.
     pub mesh_locality_lb_strict: bool,
-    /// Node-waypoint cgroup-inode lifecycle sweep interval (seconds).
-    /// Identities enrolled with a cgroup v2 path are evicted when the
-    /// cgroup is gone or its inode/fingerprint changes (pod restart,
-    /// including inode-reuse cases). Set to `0` to disable. Defaults to `30`.
-    pub mesh_node_waypoint_cgroup_sweep_interval_secs: u64,
-    /// Node-waypoint lazy identity GC interval (seconds). Identities enrolled
-    /// without a cgroup binding are evicted when no live cookie record and no
-    /// open connection still references the pod. Set to `0` to disable.
+    /// Node-waypoint lazy identity GC interval (seconds). Lazily enrolled
+    /// identities are evicted when no live cookie record and no open
+    /// connection still references the pod. Set to `0` to disable.
     /// Defaults to `30`.
     pub mesh_node_waypoint_idle_gc_interval_secs: u64,
     /// Directory where the node-agent publishes the enrolled-pod registry (one
@@ -4620,7 +4587,6 @@ impl Default for EnvConfig {
             mesh_remote_discovery_credentials: None,
             mesh_cluster_audience: None,
             mesh_locality_lb_strict: false,
-            mesh_node_waypoint_cgroup_sweep_interval_secs: 30,
             mesh_node_waypoint_idle_gc_interval_secs: 30,
             mesh_node_waypoint_pod_registry_dir: "/run/ferrum/node-waypoint-pods".to_string(),
             mesh_app_probe_max_connections:
@@ -5274,7 +5240,6 @@ impl EnvConfig {
             mesh_remote_discovery_credentials: Option<String> = "FERRUM_MESH_REMOTE_DISCOVERY_CREDENTIALS";
             mesh_cluster_audience: Option<String> = "FERRUM_MESH_CLUSTER_AUDIENCE";
             mesh_locality_lb_strict: bool = "FERRUM_MESH_LOCALITY_LB_STRICT" => false;
-            mesh_node_waypoint_cgroup_sweep_interval_secs: u64 = "FERRUM_MESH_NODE_WAYPOINT_CGROUP_SWEEP_INTERVAL_SECS" => 30u64;
             mesh_node_waypoint_idle_gc_interval_secs: u64 = "FERRUM_MESH_NODE_WAYPOINT_IDLE_GC_INTERVAL_SECS" => 30u64;
             mesh_node_waypoint_pod_registry_dir: String = "FERRUM_MESH_NODE_WAYPOINT_POD_REGISTRY_DIR" => "/run/ferrum/node-waypoint-pods".to_string();
             mesh_app_probe_max_connections: usize = "FERRUM_MESH_APP_PROBE_MAX_CONNECTIONS" => crate::modes::mesh::app_probe::DEFAULT_APP_PROBE_MAX_CONNECTIONS;
@@ -5463,7 +5428,6 @@ impl EnvConfig {
             tls_cipher_suites: Option<String> = "FERRUM_TLS_CIPHER_SUITES";
             tls_prefer_server_cipher_order: bool = "FERRUM_TLS_PREFER_SERVER_CIPHER_ORDER" => true;
             tls_key_exchange_groups: Option<String> = "FERRUM_TLS_KEY_EXCHANGE_GROUPS";
-            tls_curves_legacy: Option<String> = "FERRUM_TLS_CURVES";
             tls_session_cache_size: usize = "FERRUM_TLS_SESSION_CACHE_SIZE" => 4096usize;
             tls_cert_expiry_warning_days: u64 = "FERRUM_TLS_CERT_EXPIRY_WARNING_DAYS" => 30u64;
             tls_crl_expiry_warning_days: u64 = "FERRUM_TLS_CRL_EXPIRY_WARNING_DAYS" => 30u64;
@@ -5564,8 +5528,7 @@ impl EnvConfig {
             }
             None => None,
         };
-        let tls_curves =
-            resolve_tls_key_exchange_groups(tls_key_exchange_groups, tls_curves_legacy);
+        let tls_curves = tls_key_exchange_groups;
 
         env_config! {
             conf = conf, mode = &mode;
@@ -6190,7 +6153,6 @@ impl EnvConfig {
             mesh_remote_discovery_credentials,
             mesh_cluster_audience,
             mesh_locality_lb_strict,
-            mesh_node_waypoint_cgroup_sweep_interval_secs,
             mesh_node_waypoint_idle_gc_interval_secs,
             mesh_node_waypoint_pod_registry_dir,
             mesh_app_probe_max_connections,
@@ -6791,11 +6753,6 @@ impl EnvConfig {
         ))
     }
 
-    /// Returns the resolved list of CP gRPC URLs for DP failover, priority-ordered.
-    pub fn resolved_dp_cp_grpc_urls(&self) -> Vec<String> {
-        self.dp_cp_grpc_urls.clone()
-    }
-
     /// Seconds the shutdown signal handler holds the accept loops open after
     /// SIGTERM/SIGINT, after the process-wide draining verdict is published.
     ///
@@ -7225,8 +7182,6 @@ impl EnvConfig {
     ///
     /// MongoDB is rejected because callers need a SQL pool. Errors never include
     /// the raw database URL or credentials.
-    // Public custom-plugin API; not every binary artifact opts a SQL consumer in.
-    #[allow(dead_code)]
     pub fn resolve_effective_sql_backend() -> Result<EffectiveSqlBackend, String> {
         use env_config_macro::EnvValue;
 
@@ -7263,7 +7218,6 @@ impl EnvConfig {
     /// process environment / `ferrum.conf`. This method is useful for tests that
     /// construct a partial [`EnvConfig`] without opening a network connection.
     // Public custom-plugin API and external-test helper.
-    #[allow(dead_code)]
     pub fn effective_sql_backend(&self) -> Result<EffectiveSqlBackend, String> {
         let db_type = self
             .db_type
@@ -7501,6 +7455,12 @@ impl EnvConfig {
     }
 
     fn validate(&mut self) -> Result<(), String> {
+        // The identity guardrail flags are read from the process environment
+        // only (never `EnvConfig`), but a typo must still fail loudly — e.g.
+        // `FERRUM_MESH_PRODUCTION_MODE=yes` must not fall through to the
+        // non-production posture and let a dev opt-out re-open a gate
+        // (issue #7237). One strict parser covers all five flags.
+        crate::identity::validate_guardrail_env()?;
         // Reserved: the offload runtime exists but is not wired at startup.
         // A nonzero value used to parse and then do nothing; fail closed so
         // operators cannot tune a knob that is silently ignored.
@@ -7703,8 +7663,13 @@ impl EnvConfig {
         //
         // - CP with `FERRUM_CP_DP_GRPC_TRUST_BUNDLE_PATH`: the bundle carries
         //   the verification credentials, so the shared secret is optional.
-        // - DP/mesh with `FERRUM_DP_CP_GRPC_TOKEN_FILE`: the node presents an
+        // - Mesh with `FERRUM_DP_CP_GRPC_TOKEN_FILE`: the node presents an
         //   externally issued token and never mints one, so it needs no secret.
+        // - A stock DP cannot use a token file at all (issue #7273): it sends a
+        //   random per-process `node_id`, and `ConfigSync.Subscribe` requires
+        //   the token's `sub` to equal it, so the CP refuses every subscription.
+        //   Refuse the setting here instead of starting a DP that loops on
+        //   `PERMISSION_DENIED` and never receives config.
         //
         // Whenever a secret *is* configured it still has to clear the minimum
         // length, on every mode — the macro used to enforce that only where it
@@ -7735,14 +7700,20 @@ impl EnvConfig {
                     );
                 }
             }
-            OperatingMode::DataPlane
-                if !has_cp_dp_secret && self.dp_cp_grpc_token_file.is_none() =>
-            {
-                return Err(
-                    "FERRUM_CP_DP_GRPC_JWT_SECRET is required in dp mode unless \
-                            FERRUM_DP_CP_GRPC_TOKEN_FILE supplies an externally issued token"
-                        .into(),
-                );
+            OperatingMode::DataPlane => {
+                if self.dp_cp_grpc_token_file.is_some() {
+                    return Err(
+                        "FERRUM_DP_CP_GRPC_TOKEN_FILE is not supported in dp mode: a DP \
+                         sends a random per-process node_id and ConfigSync.Subscribe requires \
+                         the token's sub to equal it, so the CP would refuse the token. Use \
+                         FERRUM_CP_DP_GRPC_JWT_SECRET (plus FERRUM_CP_DP_GRPC_JWT_KEY_ID \
+                         against a trust-bundle CP) instead"
+                            .into(),
+                    );
+                }
+                if !has_cp_dp_secret {
+                    return Err("FERRUM_CP_DP_GRPC_JWT_SECRET is required in dp mode".into());
+                }
             }
             _ => {}
         }
@@ -8007,19 +7978,6 @@ impl EnvConfig {
                              FERRUM_MESH_ALLOW_STATIC_ID=true enables the proof-free static fallback"
                                 .into(),
                         );
-                    }
-                }
-                // Validate the production-mode flag value loudly — like
-                // `EnvConfig`'s bool parser — so a typo (e.g. `tru` / `yes`)
-                // can't silently fall through to the non-production posture and
-                // let the dev opt-out re-open the no-identity gate.
-                if let Ok(raw) = std::env::var("FERRUM_MESH_PRODUCTION_MODE") {
-                    let v = raw.trim().to_ascii_lowercase();
-                    if !matches!(v.as_str(), "" | "true" | "false" | "1" | "0") {
-                        return Err(format!(
-                            "Invalid FERRUM_MESH_PRODUCTION_MODE value {raw:?}. \
-                             Expected true, false, 1, or 0"
-                        ));
                     }
                 }
                 if crate::identity::production_mode() {
@@ -8729,6 +8687,9 @@ impl EnvConfig {
         // A TLS source must not select material of another kind (issue #5959).
         self.validate_tls_source_field_kinds()?;
 
+        // ACME auto-renewal in a mode that never runs the scheduler (#7251).
+        self.validate_acme_renewal_mode()?;
+
         // ACME auto-renewal that can never reach the listener (issue #4506).
         self.validate_acme_renewal_reachability()?;
 
@@ -8736,6 +8697,33 @@ impl EnvConfig {
         self.validate_acme_renewal_challenge_type()?;
 
         Ok(())
+    }
+
+    /// Refuse `FERRUM_ACME_AUTO_RENEW_ENABLED=true` in a mode that never runs
+    /// the ACME renewal scheduler (issue #7251).
+    ///
+    /// Only database, file and dp modes start the scheduler. Everywhere else the
+    /// flag used to validate clean and then never renew, so an `acme://`
+    /// certificate expired with no warning. Mesh mode in particular treats
+    /// operator frontend TLS (`FERRUM_FRONTEND_TLS_CERT_PATH` / `KEY_PATH`) as
+    /// static input with no live reload, so a renewal there could never reach
+    /// its listener even if a scheduler ran. The mode itself is not echoed:
+    /// `FERRUM_MODE` may be an externally resolved secret.
+    pub fn validate_acme_renewal_mode(&self) -> Result<(), String> {
+        if !self.acme_auto_renew_enabled
+            || matches!(
+                self.mode,
+                OperatingMode::Database | OperatingMode::File | OperatingMode::DataPlane
+            )
+        {
+            return Ok(());
+        }
+        Err(
+            "FERRUM_ACME_AUTO_RENEW_ENABLED=true is supported only in `database`, `file`, and \
+             `dp` modes; this mode never runs the ACME renewal scheduler, so certificates would \
+             silently stop renewing"
+                .to_string(),
+        )
     }
 
     /// Reject `FERRUM_ACME_RENEW_CHALLENGE_TYPE` values the renewal scheduler
@@ -9723,25 +9711,6 @@ pub(crate) fn resolve_real_ip_header() -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn tls_key_exchange_groups_prefer_canonical_env_name() {
-        assert_eq!(
-            resolve_tls_key_exchange_groups(
-                Some("X25519,secp384r1".to_string()),
-                Some("secp256r1".to_string()),
-            ),
-            Some("X25519,secp384r1".to_string())
-        );
-    }
-
-    #[test]
-    fn tls_key_exchange_groups_accept_legacy_curves_alias() {
-        assert_eq!(
-            resolve_tls_key_exchange_groups(None, Some("X25519,secp256r1".to_string())),
-            Some("X25519,secp256r1".to_string())
-        );
-    }
 
     #[test]
     fn existing_db_tls_url_params_detects_sql_tls_options_case_insensitively() {

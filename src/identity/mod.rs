@@ -48,6 +48,56 @@ pub use ca::{CaBackend, CertificateAuthority, SharedCa};
 #[allow(unused_imports)]
 pub use spiffe::{SpiffeId, SpiffeIdError, TrustDomain, TrustDomainError};
 
+/// Every identity guardrail flag, all read only from the process environment.
+/// [`validate_guardrail_env`] checks each one, so a value the strict parser
+/// refuses fails startup instead of being read as a different posture.
+pub const IDENTITY_GUARDRAIL_ENV_KEYS: [&str; 5] = [
+    "FERRUM_MESH_PRODUCTION_MODE",
+    "FERRUM_MESH_ALLOW_NO_CA",
+    "FERRUM_MESH_ALLOW_STATIC_ID",
+    "FERRUM_MESH_ALLOW_EPHEMERAL_JWT_KEY",
+    "FERRUM_MESH_CA_BOOTSTRAP_DEV",
+];
+
+/// The one truthy rule for the identity guardrail flags (issue #7237): the
+/// repo-wide strict boolean parser (`true`/`false`/`1`/`0`, trimmed,
+/// case-insensitive). Unset or blank is `None`. A non-UTF-8 value or any other
+/// spelling is an error, never a silent `false`, because a typo in
+/// `FERRUM_MESH_PRODUCTION_MODE` would otherwise switch production off.
+///
+/// Each caller passes its own `std::env::var(KEY)` read, so every flag keeps
+/// exactly one literal reader.
+pub fn parse_guardrail_flag(
+    key: &str,
+    read: Result<String, std::env::VarError>,
+) -> Result<Option<bool>, String> {
+    use crate::config::env_config::EnvValue;
+    match read {
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(std::env::VarError::NotUnicode(_)) => Err(format!(
+            "Invalid {key} value: not valid UTF-8. Expected true, false, 1, or 0"
+        )),
+        Ok(raw) if raw.trim().is_empty() => Ok(None),
+        Ok(raw) => bool::parse_env(&raw, key).map(Some),
+    }
+}
+
+/// Refuse any identity guardrail flag the strict parser rejects. Called from
+/// `EnvConfig` validation, so `run` and `validate` fail before a typo can be
+/// read as a different posture.
+pub fn validate_guardrail_env() -> Result<(), String> {
+    for key in IDENTITY_GUARDRAIL_ENV_KEYS {
+        parse_guardrail_flag(key, std::env::var(key))?;
+    }
+    Ok(())
+}
+
+/// Read a dev opt-in: only an explicit truthy value opts in. An invalid value
+/// (refused at startup by [`validate_guardrail_env`]) stays opted out.
+pub(crate) fn guardrail_opt_in(key: &str, read: Result<String, std::env::VarError>) -> bool {
+    matches!(parse_guardrail_flag(key, read), Ok(Some(true)))
+}
+
 /// Canonical read of the master mesh production guardrail
 /// (`FERRUM_MESH_PRODUCTION_MODE`).
 ///
@@ -60,16 +110,17 @@ pub use spiffe::{SpiffeId, SpiffeIdError, TrustDomain, TrustDomainError};
 /// per-posture dev opt-ins (`FERRUM_MESH_CA_BOOTSTRAP_DEV`,
 /// `FERRUM_MESH_ALLOW_STATIC_ID`, `FERRUM_MESH_ALLOW_NO_CA`) stay separate and
 /// must not be collapsed (see `.claude/rules/tls-security.md`).
+///
+/// Parsed with [`parse_guardrail_flag`]. An invalid value reads as `true`
+/// (fail closed); `EnvConfig` validation refuses it before startup anyway.
 pub fn production_mode() -> bool {
-    std::env::var("FERRUM_MESH_PRODUCTION_MODE")
-        .map(|v| {
-            // Accept the same truthy spellings as `EnvConfig`'s bool parser
-            // (`true` / `1`, case-insensitive) so a guardrail can't be bypassed
-            // by a common boolean form.
-            let v = v.trim();
-            v.eq_ignore_ascii_case("true") || v == "1"
-        })
-        .unwrap_or(false)
+    match parse_guardrail_flag(
+        "FERRUM_MESH_PRODUCTION_MODE",
+        std::env::var("FERRUM_MESH_PRODUCTION_MODE"),
+    ) {
+        Ok(flag) => flag.unwrap_or(false),
+        Err(_) => true,
+    }
 }
 
 /// Canonical read of the `FERRUM_MESH_ALLOW_NO_CA` dev opt-in — the per-posture
@@ -90,16 +141,13 @@ pub fn production_mode() -> bool {
 /// can never re-open the posture. The config-time gate checks [`production_mode`]
 /// first: this opt-out is ignored unconditionally under
 /// `FERRUM_MESH_PRODUCTION_MODE=true` (see `.claude/rules/tls-security.md`; do not
-/// collapse the per-posture opt-ins into one flag).
+/// collapse the per-posture opt-ins into one flag). Parsed with
+/// [`parse_guardrail_flag`].
 pub fn allow_no_ca() -> bool {
-    std::env::var("FERRUM_MESH_ALLOW_NO_CA")
-        .map(|v| {
-            // Match `production_mode`'s truthy spellings (`true` / `1`,
-            // case-insensitive) so the two reads stay symmetric.
-            let v = v.trim();
-            v.eq_ignore_ascii_case("true") || v == "1"
-        })
-        .unwrap_or(false)
+    guardrail_opt_in(
+        "FERRUM_MESH_ALLOW_NO_CA",
+        std::env::var("FERRUM_MESH_ALLOW_NO_CA"),
+    )
 }
 
 /// Canonical read of the `FERRUM_MESH_ALLOW_STATIC_ID` dev opt-in.
@@ -107,14 +155,16 @@ pub fn allow_no_ca() -> bool {
 /// This remains a direct environment-only guardrail and is always disabled in
 /// production. Keeping the read here lets configuration validation and the
 /// runtime [`attestation::static_id::StaticAttestor`] agree about whether the
-/// fallback attestor is actually available.
+/// fallback attestor is actually available. Parsed with
+/// [`parse_guardrail_flag`].
 pub fn allow_static_id() -> bool {
     if production_mode() {
         return false;
     }
-    std::env::var("FERRUM_MESH_ALLOW_STATIC_ID")
-        .map(|v| v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false)
+    guardrail_opt_in(
+        "FERRUM_MESH_ALLOW_STATIC_ID",
+        std::env::var("FERRUM_MESH_ALLOW_STATIC_ID"),
+    )
 }
 
 /// Canonical read of the `FERRUM_MESH_ALLOW_EPHEMERAL_JWT_KEY` dev opt-in — the
@@ -133,17 +183,16 @@ pub fn allow_static_id() -> bool {
 /// let a config-file-only value re-open the posture and put the setting on
 /// surfaces `EnvConfig` values are re-rendered on. It is refused unconditionally
 /// under `FERRUM_MESH_PRODUCTION_MODE=true` (see `.claude/rules/tls-security.md`;
-/// do not collapse the per-posture opt-ins into one flag).
+/// do not collapse the per-posture opt-ins into one flag). Parsed with
+/// [`parse_guardrail_flag`].
 pub fn allow_ephemeral_jwt_key() -> bool {
     if production_mode() {
         return false;
     }
-    std::env::var("FERRUM_MESH_ALLOW_EPHEMERAL_JWT_KEY")
-        .map(|v| {
-            let v = v.trim();
-            v.eq_ignore_ascii_case("true") || v == "1"
-        })
-        .unwrap_or(false)
+    guardrail_opt_in(
+        "FERRUM_MESH_ALLOW_EPHEMERAL_JWT_KEY",
+        std::env::var("FERRUM_MESH_ALLOW_EPHEMERAL_JWT_KEY"),
+    )
 }
 
 /// The configured JWT signing key PEM for the local trust domain, if any.

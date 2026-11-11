@@ -195,8 +195,9 @@ fn mesh_ports_reject_zero_on_core_resources() {
     let mut peer_auth = PeerAuthentication {
         name: "pa".into(),
         namespace: "default".into(),
-        scope: None,
-        selector: None,
+        scope: PolicyScope::Namespace {
+            namespace: "default".into(),
+        },
         mtls_mode: MtlsMode::Strict,
         port_overrides: HashMap::from([(0, MtlsMode::Permissive)]),
     };
@@ -984,8 +985,9 @@ fn peer_authentication_requires_namespace() {
     let pa = PeerAuthentication {
         name: "pa".into(),
         namespace: String::new(),
-        scope: None,
-        selector: None,
+        scope: PolicyScope::Namespace {
+            namespace: String::new(),
+        },
         mtls_mode: ferrum_edge::modes::mesh::config::MtlsMode::Strict,
         port_overrides: HashMap::new(),
     };
@@ -1002,8 +1004,9 @@ fn peer_authentication_rejects_client_side_mtls_mode() {
     let pa = PeerAuthentication {
         name: "pa".into(),
         namespace: "default".into(),
-        scope: None,
-        selector: None,
+        scope: PolicyScope::Namespace {
+            namespace: "default".into(),
+        },
         mtls_mode: ferrum_edge::modes::mesh::config::MtlsMode::Simple,
         port_overrides: HashMap::new(),
     };
@@ -1024,8 +1027,9 @@ fn peer_authentication_accepts_unset_inherit_mode() {
     let pa = PeerAuthentication {
         name: "pa".into(),
         namespace: "default".into(),
-        scope: None,
-        selector: None,
+        scope: PolicyScope::Namespace {
+            namespace: "default".into(),
+        },
         mtls_mode: MtlsMode::Unset,
         port_overrides: HashMap::from([(8080, MtlsMode::Unset)]),
     };
@@ -1046,8 +1050,9 @@ fn peer_authentication_rejects_client_side_port_override_mtls_mode() {
     let pa = PeerAuthentication {
         name: "pa".into(),
         namespace: "default".into(),
-        scope: None,
-        selector: None,
+        scope: PolicyScope::Namespace {
+            namespace: "default".into(),
+        },
         mtls_mode: ferrum_edge::modes::mesh::config::MtlsMode::Strict,
         port_overrides,
     };

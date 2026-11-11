@@ -6,7 +6,8 @@ use ferrum_edge::config::types::{
 };
 use ferrum_edge::health_check::ActiveUnhealthyTargets;
 use ferrum_edge::load_balancer::{
-    HealthContext, LoadBalancer, LoadBalancerCache, target_host_port_key, target_key,
+    HealthContext, LoadBalancer, LoadBalancerCache, RetryCandidateFilter, target_host_port_key,
+    target_key,
 };
 use std::collections::HashMap;
 use std::net::IpAddr;
@@ -255,10 +256,10 @@ fn test_load_balancer_cache() {
     };
 
     let cache = LoadBalancerCache::new(&config);
-    let t = cache.select_target("ferrum", "us1", "", None);
+    let t = LoadBalancerCache::select_target_from(&cache.load(), "ferrum", "us1", "", None);
     assert!(t.is_some());
 
-    let t = cache.select_target("ferrum", "nonexistent", "", None);
+    let t = LoadBalancerCache::select_target_from(&cache.load(), "ferrum", "nonexistent", "", None);
     assert!(t.is_none());
 }
 
@@ -642,7 +643,8 @@ fn test_least_latency_cache_record_and_select() {
     }
 
     // Should prefer host1 (lower latency)
-    let sel = cache.select_target("ferrum", "us1", "", None).unwrap();
+    let sel =
+        LoadBalancerCache::select_target_from(&cache.load(), "ferrum", "us1", "", None).unwrap();
     assert_eq!(
         sel.target.host, "host1",
         "Cache should route to lowest-latency target"
@@ -682,9 +684,9 @@ fn cache_record_failed_attempt_is_scoped_to_its_namespace() {
     let host1_hits = |namespace: &str| {
         let mut hits = 0usize;
         for _ in 0..200 {
-            let selection = cache
-                .select_target(namespace, "u1", "", None)
-                .expect("a target must be selectable");
+            let selection =
+                LoadBalancerCache::select_target_from(&cache.load(), namespace, "u1", "", None)
+                    .expect("a target must be selectable");
             if selection.target.host == "host1" {
                 hits += 1;
             }
@@ -1271,12 +1273,12 @@ fn test_load_balancer_cache_get_hash_on_strategy() {
 
     let cache = LoadBalancerCache::new(&config);
     assert_eq!(
-        cache.get_hash_on_strategy("ferrum", "us1"),
+        LoadBalancerCache::get_hash_on_strategy_from(&cache.load(), "ferrum", "us1"),
         HashOnStrategy::Cookie("srv".to_string())
     );
     // Non-existent upstream returns Ip default
     assert_eq!(
-        cache.get_hash_on_strategy("ferrum", "nonexistent"),
+        LoadBalancerCache::get_hash_on_strategy_from(&cache.load(), "ferrum", "nonexistent"),
         HashOnStrategy::Ip
     );
 }
@@ -1595,7 +1597,9 @@ fn test_apply_delta_add_upstream() {
     let cache = LoadBalancerCache::new(&config);
 
     // Initially no upstreams
-    assert!(cache.select_target("ferrum", "u1", "", None).is_none());
+    assert!(
+        LoadBalancerCache::select_target_from(&cache.load(), "ferrum", "u1", "", None).is_none()
+    );
 
     let added = vec![make_upstream("u1", make_targets(2))];
     let new_config = GatewayConfig {
@@ -1605,7 +1609,7 @@ fn test_apply_delta_add_upstream() {
     cache.apply_delta(&new_config, &added, &[], &[]);
 
     // Now u1 should be available
-    let sel = cache.select_target("ferrum", "u1", "", None);
+    let sel = LoadBalancerCache::select_target_from(&cache.load(), "ferrum", "u1", "", None);
     assert!(sel.is_some(), "Upstream u1 should be selectable after add");
 }
 
@@ -1619,7 +1623,9 @@ fn test_apply_delta_remove_upstream() {
     let cache = LoadBalancerCache::new(&config);
 
     // u1 exists
-    assert!(cache.select_target("ferrum", "u1", "", None).is_some());
+    assert!(
+        LoadBalancerCache::select_target_from(&cache.load(), "ferrum", "u1", "", None).is_some()
+    );
 
     let new_config = GatewayConfig::default();
     cache.apply_delta(
@@ -1631,7 +1637,7 @@ fn test_apply_delta_remove_upstream() {
 
     // u1 should be gone
     assert!(
-        cache.select_target("ferrum", "u1", "", None).is_none(),
+        LoadBalancerCache::select_target_from(&cache.load(), "ferrum", "u1", "", None).is_none(),
         "Upstream u1 should be gone after removal"
     );
 }
@@ -1662,7 +1668,8 @@ fn test_apply_delta_modify_upstream_targets() {
     };
     cache.apply_delta(&new_config, &[], &[], &[modified_u1]);
 
-    let sel = cache.select_target("ferrum", "u1", "", None).unwrap();
+    let sel =
+        LoadBalancerCache::select_target_from(&cache.load(), "ferrum", "u1", "", None).unwrap();
     assert_eq!(sel.target.host, "new-backend");
     assert_eq!(sel.target.port, 9999);
 }
@@ -1678,8 +1685,12 @@ fn test_apply_delta_mixed_add_remove_modify() {
     let cache = LoadBalancerCache::new(&config);
 
     // Verify both exist
-    assert!(cache.select_target("ferrum", "u1", "", None).is_some());
-    assert!(cache.select_target("ferrum", "u2", "", None).is_some());
+    assert!(
+        LoadBalancerCache::select_target_from(&cache.load(), "ferrum", "u1", "", None).is_some()
+    );
+    assert!(
+        LoadBalancerCache::select_target_from(&cache.load(), "ferrum", "u2", "", None).is_some()
+    );
 
     // Add u3, remove u1, modify u2
     let u3 = make_upstream("u3", make_targets(3));
@@ -1699,15 +1710,15 @@ fn test_apply_delta_mixed_add_remove_modify() {
     );
 
     assert!(
-        cache.select_target("ferrum", "u1", "", None).is_none(),
+        LoadBalancerCache::select_target_from(&cache.load(), "ferrum", "u1", "", None).is_none(),
         "u1 should be removed"
     );
     assert!(
-        cache.select_target("ferrum", "u2", "", None).is_some(),
+        LoadBalancerCache::select_target_from(&cache.load(), "ferrum", "u2", "", None).is_some(),
         "u2 should still exist (modified)"
     );
     assert!(
-        cache.select_target("ferrum", "u3", "", None).is_some(),
+        LoadBalancerCache::select_target_from(&cache.load(), "ferrum", "u3", "", None).is_some(),
         "u3 should be added"
     );
 }
@@ -1725,7 +1736,7 @@ fn test_apply_delta_empty_is_noop() {
     cache.apply_delta(&config, &[], &[], &[]);
 
     assert!(
-        cache.select_target("ferrum", "u1", "", None).is_some(),
+        LoadBalancerCache::select_target_from(&cache.load(), "ferrum", "u1", "", None).is_some(),
         "u1 should still exist after empty delta"
     );
 }
@@ -1752,9 +1763,15 @@ fn test_apply_delta_preserves_unaffected_upstreams() {
     };
     cache.apply_delta(&new_config, &[u3], &[], &[]);
 
-    assert!(cache.select_target("ferrum", "u1", "", None).is_some());
-    assert!(cache.select_target("ferrum", "u2", "", None).is_some());
-    assert!(cache.select_target("ferrum", "u3", "", None).is_some());
+    assert!(
+        LoadBalancerCache::select_target_from(&cache.load(), "ferrum", "u1", "", None).is_some()
+    );
+    assert!(
+        LoadBalancerCache::select_target_from(&cache.load(), "ferrum", "u2", "", None).is_some()
+    );
+    assert!(
+        LoadBalancerCache::select_target_from(&cache.load(), "ferrum", "u3", "", None).is_some()
+    );
 }
 
 // ─── Random Algorithm Tests ─────────────────────────────────────────────────
@@ -2930,8 +2947,13 @@ fn subset_retry_does_not_fall_back_to_parent_upstream() {
     assert_eq!(selected.target.host, "v2-b");
 
     assert!(
-        lb.select_excluding_from_subset("", "v2-east", &selected.target, None)
-            .is_none(),
+        lb.select_filtered_from_subset(
+            "",
+            "v2-east",
+            RetryCandidateFilter::excluding(&selected.target),
+            None,
+        )
+        .is_none(),
         "Retry must stay inside the configured subset instead of falling back to parent"
     );
 }
@@ -3154,11 +3176,9 @@ fn least_latency_passive_recovery_does_not_restore_warmup_bias() {
     checker.set_load_balancer_cache(Arc::clone(&lb_cache));
 
     // Warm A; leave B unsampled, then eject+recover B via passive timer path.
-    let inner = lb_cache.load();
-    // Balancers are keyed by the namespace-qualified runtime key, not the bare id.
-    let balancer = inner
-        .balancers()
-        .get(&format!("ferrum|{TEST_UPSTREAM}"))
+    let balancer = lb_cache
+        .load()
+        .get_balancer("ferrum", TEST_UPSTREAM)
         .unwrap();
     for _ in 0..5 {
         balancer.record_latency(&targets[0], 10_000);

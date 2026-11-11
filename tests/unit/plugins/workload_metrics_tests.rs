@@ -79,10 +79,32 @@ fn explicit_default_contracts_remain_accepted() {
         json!({"trusted_hbone_assertors": null, "trust_domain_aliases": null}),
         json!({"node_id": "", "workload_spiffe_id": " ", "labels": {}}),
         json!({"span_reporting_disabled": true}),
-        json!({"disable_span_reporting": true}),
-        json!({"disableSpanReporting": true}),
     ] {
         assert!(WorkloadMetrics::new(&config).is_ok(), "{config}");
+    }
+}
+
+/// Issue #7114: the plugin config takes only `span_reporting_disabled` and the
+/// Lightstep `access_token_env`; the alternate spellings are unknown keys
+/// (mesh injection writes only the snake_case names).
+#[test]
+fn alternate_spellings_are_rejected() {
+    for config in [
+        json!({"disable_span_reporting": true}),
+        json!({"disableSpanReporting": true}),
+        json!({
+            "tracing_provider": {"kind": "lightstep", "config": {
+                "collector_url": "https://example.com/v1/traces",
+                "accessTokenEnv": "FERRUM_PLUGIN_SECRET_LIGHTSTEP_TOKEN"
+            }},
+            "span_reporting_disabled": true
+        }),
+    ] {
+        assert!(WorkloadMetrics::new(&config).is_err(), "{config}");
+        assert!(
+            validate_plugin_config("workload_metrics", &config).is_err(),
+            "{config}"
+        );
     }
 }
 
@@ -587,14 +609,14 @@ fn provider_operation_and_default_schema_matches_constructor_admission() {
             false,
         ));
         cases.push((json!({field: maximum + 1}), true));
-        for alias in [
-            "span_reporting_disabled",
-            "disable_span_reporting",
-            "disableSpanReporting",
-        ] {
+        cases.push((
+            json!({"tracing_provider": provider, "span_reporting_disabled": true, field: maximum + 1}),
+            true,
+        ));
+        for alias in ["disable_span_reporting", "disableSpanReporting"] {
             cases.push((
                 json!({"tracing_provider": provider, alias: true, field: maximum + 1}),
-                true,
+                false,
             ));
         }
     }
@@ -605,7 +627,7 @@ fn provider_operation_and_default_schema_matches_constructor_admission() {
         }}),
         json!({"kind": "lightstep", "config": {
             "collector_url": "https://example.com/v1/traces",
-            "accessTokenEnv": "FERRUM_PLUGIN_SECRET_LIGHTSTEP_TOKEN"
+            "access_token_env": "FERRUM_PLUGIN_SECRET_LIGHTSTEP_TOKEN"
         }}),
     ] {
         cases.push((
@@ -867,6 +889,38 @@ fn immutable_metric_plans_are_not_recopied_on_every_stamp() {
     assert!(
         !stamp.contains("plan.clone()") && !stamp.contains("marker.clone()"),
         "no unconditional clone of the marker or plans"
+    );
+}
+
+/// Issue #7146: the backend-side reconciliation and stamp share ONE
+/// trace-header scan; the map is re-scanned only on the branch that stripped
+/// headers, and the repeat stamp writes `trace_sampled` only when it changed.
+#[test]
+fn backend_trace_reconciliation_shares_one_header_scan() {
+    let source = workload_metrics_production_source();
+    let reconcile = source_between(
+        source,
+        "fn reconcile_captured_trace_headers(",
+        "fn resolve_peer_source_identity(",
+    );
+    assert!(
+        !reconcile.contains("TraceHeaderProbe::scan(") && !reconcile.contains("header_value("),
+        "reconciliation must read the caller's probe, not rescan the headers"
+    );
+    let before_proxy = source_between(source, "async fn before_proxy(", "async fn after_proxy(");
+    assert_eq!(
+        before_proxy.matches("TraceHeaderProbe::scan(").count(),
+        2,
+        "one shared scan plus one rescan after a header strip"
+    );
+    let stamp = source_between(
+        source,
+        "fn apply_telemetry_metadata_with_probe<",
+        "fn should_export_metadata<",
+    );
+    assert!(
+        !stamp.contains("\"trace_sampled\".to_string()"),
+        "trace_sampled must be written through insert_metadata_if_changed"
     );
 }
 

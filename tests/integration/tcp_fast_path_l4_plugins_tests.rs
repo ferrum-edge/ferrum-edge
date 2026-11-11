@@ -128,7 +128,6 @@ fn fast_path_tcp_proxy(listen_port: u16, backend_port: u16, plugin_config_ids: &
         pool_http2_max_concurrent_streams: None,
         pool_http3_connections_per_backend: None,
         h2_upgrade_policy: None,
-        pool_max_requests_per_connection: None,
         pool_http1_max_pending_requests: None,
         upstream_id: None,
         upstream_subset: None,
@@ -169,10 +168,7 @@ fn throttle_plugin_config() -> PluginConfig {
         plugin_name: "tcp_connection_throttle".to_string(),
         namespace: ferrum_edge::config::types::default_namespace(),
         config: json!({
-            "max_connections_per_key": 1,
-            // Disable the background sweep so the test isn't racing
-            // against periodic cleanup of zero-count entries.
-            "cleanup_interval_seconds": 0
+            "max_connections_per_key": 1
         }),
         scope: PluginScope::Proxy,
         proxy_id: Some(PROXY_ID.to_string()),

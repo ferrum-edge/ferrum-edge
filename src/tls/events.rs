@@ -178,7 +178,6 @@ impl TlsEventLog {
     }
 
     /// Open with an explicit document ceiling (tests).
-    #[allow(dead_code)] // External unit tests; production uses open.
     pub fn open_with_document_limit(
         capacity: usize,
         path: Option<PathBuf>,

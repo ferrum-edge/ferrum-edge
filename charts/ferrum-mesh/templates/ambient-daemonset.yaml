@@ -555,12 +555,12 @@ spec:
                 - {{ $cap }}
                 {{- end }}
           ports:
-            - name: outbound
-              containerPort: {{ .Values.ambient.outboundPort }}
-            - name: inbound
-              containerPort: {{ .Values.ambient.inboundPort }}
-            - name: hbone
-              containerPort: {{ .Values.ambient.hbonePort }}
+            {{- range $listener := list (list "outbound" "FERRUM_MESH_OUTBOUND_LISTEN_ADDR" "127.0.0.1:15001") (list "inbound" "FERRUM_MESH_INBOUND_LISTEN_ADDR" "0.0.0.0:15006") (list "hbone" "FERRUM_MESH_HBONE_LISTEN_ADDR" "0.0.0.0:15008") }}
+            {{- with (include "ferrum-mesh.ambientListenPort" (dict "env" $ambientEnv "name" (index $listener 1) "default" (index $listener 2))) }}
+            - name: {{ index $listener 0 }}
+              containerPort: {{ . }}
+            {{- end }}
+            {{- end }}
             {{- if ne $ambientAdminPort "0" }}
             - name: admin-http
               containerPort: {{ $ambientAdminPort }}

@@ -89,7 +89,6 @@ fn create_test_proxy() -> Proxy {
         pool_http2_max_concurrent_streams: None,
         pool_http3_connections_per_backend: None,
         h2_upgrade_policy: None,
-        pool_max_requests_per_connection: None,
         pool_http1_max_pending_requests: None,
         upstream_id: None,
         upstream_subset: None,
@@ -1416,6 +1415,69 @@ async fn test_grpc_h2c_pool_max_connections_bounds_physical_connections() {
         "multiplexed streams must not be counted as physical connections"
     );
     drop(first);
+}
+
+/// h2c backend that serves only the FIRST connection it accepts. Every later
+/// connection is held for `fail_after` without a byte of HTTP/2 and then
+/// dropped, so its pool create fails only once the first one is established.
+async fn start_first_connection_only_h2c_backend(fail_after: Duration) -> (u16, Arc<AtomicUsize>) {
+    let listener = tokio::net::TcpListener::bind_test("127.0.0.1:0")
+        .await
+        .expect("bind h2c backend");
+    let port = listener.local_addr().expect("backend addr").port();
+    let accepted = Arc::new(AtomicUsize::new(0));
+    let task_accepted = Arc::clone(&accepted);
+    tokio::spawn(async move {
+        while let Ok((socket, _)) = listener.accept().await {
+            if task_accepted.fetch_add(1, Ordering::Relaxed) > 0 {
+                tokio::spawn(async move {
+                    tokio::time::sleep(fail_after).await;
+                    drop(socket);
+                });
+                continue;
+            }
+            tokio::spawn(async move {
+                let service = service_fn(|_req: Request<Incoming>| async move {
+                    Ok::<_, hyper::Error>(Response::new(Full::new(Bytes::from_static(b"ok"))))
+                });
+                let _ = hyper::server::conn::http2::Builder::new(TokioExecutor::new())
+                    .serve_connection(TokioIo::new(socket), service)
+                    .await;
+            });
+        }
+    });
+    (port, accepted)
+}
+
+/// Issue #7181: only a `maxConnections` refusal may fall back to an
+/// already-established shard. A shard whose create fails for any other reason
+/// surfaces that failure instead of being masked by a live sibling.
+#[tokio::test]
+async fn test_grpc_pool_failed_shard_create_is_not_masked_by_a_live_sibling() {
+    let (port, accepted) =
+        start_first_connection_only_h2c_backend(Duration::from_millis(300)).await;
+    let pool = GrpcConnectionPool::new(
+        PoolConfig {
+            http2_connections_per_host: 2,
+            ..PoolConfig::default()
+        },
+        ferrum_edge::config::EnvConfig::default(),
+        create_dns_cache(),
+        None,
+        Arc::new(Vec::new()),
+    );
+    let proxy = h2c_proxy_with_max_connections(port, None);
+
+    // Two concurrent cold calls start on the two shards. The backend serves
+    // whichever connection it accepts first and fails the other after that one
+    // is pooled.
+    let (first, second) = tokio::join!(pool.get_sender(&proxy), pool.get_sender(&proxy));
+    assert_eq!(accepted.load(Ordering::Relaxed), 2, "one dial per shard");
+    assert_eq!(
+        usize::from(first.is_ok()) + usize::from(second.is_ok()),
+        1,
+        "the shard whose create failed must report the failure, not borrow its sibling"
+    );
 }
 
 #[tokio::test]

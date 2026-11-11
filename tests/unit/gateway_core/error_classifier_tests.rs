@@ -486,6 +486,77 @@ fn test_h3_fallback_stream_protocol_markers_still_match() {
     }
 }
 
+// Fallback-string cases the H3 pool's anyhow-wrapped quinn/h3 errors reach,
+// with the pre-wire/post-wire boundary each class implies. Moved from the
+// proxy-core inline tests, which reached this classifier through a thin
+// wrapper.
+#[test]
+fn test_h3_fallback_classes_and_wire_boundary() {
+    for (msg, expected, reached_wire) in [
+        // Stream-level aborts are protocol errors, never a connection reset.
+        (
+            "h3 stream RESET_STREAM (code=H3_REQUEST_REJECTED)",
+            ErrorClass::ProtocolError,
+            true,
+        ),
+        ("stream reset by backend", ErrorClass::ProtocolError, true),
+        ("reset_stream", ErrorClass::ProtocolError, true),
+        // "upstream" must not steer a refused connect toward ProtocolError.
+        (
+            "upstream target unreachable: connection refused",
+            ErrorClass::ConnectionRefused,
+            false,
+        ),
+        // h3 0.0.8 renders quinn's ApplicationClose as a bare token.
+        (
+            "h3 connection closed: ApplicationClose code=0x100",
+            ErrorClass::ConnectionClosed,
+            true,
+        ),
+        (
+            "LocalError::Application { code: H3_FRAME_UNEXPECTED }",
+            ErrorClass::ProtocolError,
+            true,
+        ),
+        (
+            "h3::Error: GoAway received",
+            ErrorClass::ProtocolError,
+            true,
+        ),
+        ("h3_frame_error: GOAWAY", ErrorClass::ProtocolError, true),
+        (
+            "QUIC connect timeout after 5s",
+            ErrorClass::ConnectionTimeout,
+            false,
+        ),
+        ("recv_data timed out", ErrorClass::ReadWriteTimeout, true),
+        (
+            "DNS resolution failed: no record found",
+            ErrorClass::DnsLookupError,
+            false,
+        ),
+        (
+            "TLS handshake failed: certificate invalid",
+            ErrorClass::TlsError,
+            false,
+        ),
+        (
+            "Connection refused: ECONNREFUSED",
+            ErrorClass::ConnectionRefused,
+            false,
+        ),
+    ] {
+        let err: Box<dyn std::error::Error + Send + Sync> = msg.into();
+        let class = classify_http3_error(err.as_ref());
+        assert_eq!(class, expected, "class for {msg:?}");
+        assert_eq!(
+            request_reached_wire(class),
+            reached_wire,
+            "wire boundary for {msg:?}"
+        );
+    }
+}
+
 // ── Mesh-transport (HBONE / mesh-mTLS) boxed setup-error classification ──
 //
 // The WebSocket-over-mesh egress dial returns `HbonePoolError` BOXED to the

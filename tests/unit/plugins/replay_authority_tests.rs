@@ -1813,7 +1813,6 @@ fn the_counter_snapshot_carries_no_labels() {
             "admitted_shared",
             "authority_unavailable",
             "capacity_refused",
-            "legacy_unsafe_profile_accepted",
             "process_lanes",
             "replay_rejected",
             "shared_authorities",

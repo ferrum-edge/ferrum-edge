@@ -29,8 +29,8 @@ fn registered_spec_expose_validation_reports_every_unknown_key() {
     )
     .expect_err("registered plugin validation must reject unknown keys");
 
-    assert!(error.contains("\"cache_ttl_second\""), "{error}");
-    assert!(error.contains("\"tls_no_verfy\""), "{error}");
+    assert!(error.contains("\"config.cache_ttl_second\""), "{error}");
+    assert!(error.contains("\"config.tls_no_verfy\""), "{error}");
 }
 
 #[test]

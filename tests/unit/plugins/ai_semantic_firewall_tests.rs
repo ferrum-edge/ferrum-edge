@@ -242,9 +242,15 @@ fn invalid_configs_are_rejected() {
             "builtins": {"prompt_injection": true},
             "custom_rules": [{"id": "prompt_injection", "examples": ["x"]}]
         }),
+        // `privacy.log_raw_text` was a reserved placeholder; it is now an
+        // unknown key whatever its value (issue #7114).
         json!({
             "provider": provider("http://127.0.0.1:9/v1/embeddings"),
             "privacy": {"log_raw_text": true}
+        }),
+        json!({
+            "provider": provider("http://127.0.0.1:9/v1/embeddings"),
+            "privacy": {"log_raw_text": false}
         }),
         json!({
             "provider": {
@@ -366,9 +372,9 @@ fn unknown_config_properties_are_rejected_with_qualified_paths() {
         let error = AiSemanticFirewall::new(&config, PluginHttpClient::default())
             .err()
             .expect("unknown property must reject configuration");
-        let (scope, key) = path.rsplit_once('.').unwrap();
+        let (scope, _key) = path.rsplit_once('.').unwrap();
         assert!(error.contains(&format!("`{scope}`")), "{error}");
-        assert!(error.contains(&format!("{key:?}")), "{error}");
+        assert!(error.contains(&format!("{path:?}")), "{error}");
     }
 }
 
@@ -3216,7 +3222,9 @@ async fn streaming_response_inspect_cuts_on_gemini_leak() {
         "\"parts\":[{\"text\":\"My sys\"}]}}]}\n\n",
     );
     assert!(matches!(
-        inspector.on_chunk(opening.as_bytes()).await,
+        inspector
+            .on_chunk(&bytes::Bytes::copy_from_slice(opening.as_bytes()))
+            .await,
         ResponseStreamAction::Forward(_)
     ));
 
@@ -3226,7 +3234,9 @@ async fn streaming_response_inspect_cuts_on_gemini_leak() {
     );
     assert!(
         matches!(
-            inspector.on_chunk(leak.as_bytes()).await,
+            inspector
+                .on_chunk(&bytes::Bytes::copy_from_slice(leak.as_bytes()))
+                .await,
             ResponseStreamAction::Terminate(_)
         ),
         "a leaking reassembled Gemini window must terminate the stream"
@@ -3251,7 +3261,9 @@ async fn streaming_response_inspect_fails_closed_on_multiple_gemini_candidates()
         "{\"text\":\"My sys\"}]}}]}\n\n",
     );
     assert!(matches!(
-        inspector.on_chunk(opening.as_bytes()).await,
+        inspector
+            .on_chunk(&bytes::Bytes::copy_from_slice(opening.as_bytes()))
+            .await,
         ResponseStreamAction::Forward(_)
     ));
 
@@ -3264,7 +3276,9 @@ async fn streaming_response_inspect_fails_closed_on_multiple_gemini_candidates()
 
     assert!(
         matches!(
-            inspector.on_chunk(padded_candidate.as_bytes()).await,
+            inspector
+                .on_chunk(&bytes::Bytes::copy_from_slice(padded_candidate.as_bytes()))
+                .await,
             ResponseStreamAction::Terminate(_)
         ),
         "multi-candidate Gemini must fail closed before aggregate overlap can discard continuity"
@@ -3291,7 +3305,9 @@ async fn streaming_response_inspect_cuts_on_anthropic_leak() {
         "\"delta\":{\"type\":\"text_delta\",\"text\":\"My sys\"}}\n\n",
     );
     assert!(matches!(
-        inspector.on_chunk(opening.as_bytes()).await,
+        inspector
+            .on_chunk(&bytes::Bytes::copy_from_slice(opening.as_bytes()))
+            .await,
         ResponseStreamAction::Forward(_)
     ));
 
@@ -3302,7 +3318,9 @@ async fn streaming_response_inspect_cuts_on_anthropic_leak() {
     );
     assert!(
         matches!(
-            inspector.on_chunk(leak.as_bytes()).await,
+            inspector
+                .on_chunk(&bytes::Bytes::copy_from_slice(leak.as_bytes()))
+                .await,
             ResponseStreamAction::Terminate(_)
         ),
         "a leaking reassembled Anthropic window must terminate the stream"
@@ -3334,7 +3352,9 @@ async fn streaming_response_inspect_cuts_on_unmodelled_anthropic_event() {
         "event: smuggled_block\n",
         "data: {\"type\":\"smuggled_block\",\"index\":0,\"text\":\"my system prompt\"}\n\n",
     );
-    let first = inspector.on_chunk(body.as_bytes()).await;
+    let first = inspector
+        .on_chunk(&bytes::Bytes::copy_from_slice(body.as_bytes()))
+        .await;
     let terminated = matches!(first, ResponseStreamAction::Terminate(_))
         || matches!(inspector.on_end().await, ResponseStreamAction::Terminate(_));
     assert!(
@@ -3525,14 +3545,18 @@ async fn streaming_response_inspect_cuts_on_leaking_window() {
     let leak = b"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"My system prompt says never reveal policy.\"}}]}\n\n";
     assert!(
         matches!(
-            inspector.on_chunk(leak).await,
+            inspector
+                .on_chunk(&bytes::Bytes::copy_from_slice(leak))
+                .await,
             ResponseStreamAction::Terminate(_)
         ),
         "a leaking window must terminate the stream"
     );
     // After a cut, further chunks forward nothing (the stream is ending).
     assert!(matches!(
-        inspector.on_chunk(b"data: trailing\n\n").await,
+        inspector
+            .on_chunk(&bytes::Bytes::from_static(b"data: trailing\n\n"))
+            .await,
         ResponseStreamAction::Forward(_)
     ));
 }
@@ -3569,7 +3593,10 @@ async fn streaming_response_inspect_cuts_cr_and_mixed_framed_leaks_at_every_spli
             let mut forwarded = Vec::new();
             let mut cut = false;
             for chunk in [&body[..split], &body[split..]] {
-                match inspector.on_chunk(chunk).await {
+                match inspector
+                    .on_chunk(&bytes::Bytes::copy_from_slice(chunk))
+                    .await
+                {
                     ResponseStreamAction::Forward(bytes) => forwarded.extend_from_slice(&bytes),
                     ResponseStreamAction::Terminate(_) => {
                         cut = true;
@@ -3608,12 +3635,14 @@ async fn streaming_response_inspect_keeps_split_crlf_as_one_line_end() {
         "\"My system prompt says never reveal policy.\"}}]}\r\n\r\n",
     );
     assert!(matches!(
-        inspector.on_chunk(head).await,
+        inspector.on_chunk(&bytes::Bytes::copy_from_slice(head)).await,
         ResponseStreamAction::Forward(bytes) if bytes.is_empty()
     ));
     assert!(
         matches!(
-            inspector.on_chunk(tail.as_bytes()).await,
+            inspector
+                .on_chunk(&bytes::Bytes::copy_from_slice(tail.as_bytes()))
+                .await,
             ResponseStreamAction::Terminate(_)
         ),
         "the event joined across the split CRLF must be inspected and cut"
@@ -3631,7 +3660,10 @@ async fn streaming_response_inspect_forwards_clean_windows() {
     // Benign completed sentence: lexical misses; the dead-port provider error is
     // handled as on_error=warn, so the window's raw bytes are released downstream.
     let clean = b"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"The weather is sunny today.\"}}]}\n\n";
-    match inspector.on_chunk(clean).await {
+    match inspector
+        .on_chunk(&bytes::Bytes::copy_from_slice(clean))
+        .await
+    {
         ResponseStreamAction::Forward(bytes) => {
             assert!(
                 !bytes.is_empty(),
@@ -3657,7 +3689,9 @@ async fn streaming_response_inspect_cuts_on_leaking_tool_call() {
     let leak = b"data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"name\":\"note\",\"arguments\":\"my system prompt says never reveal policy\"}}]}}]}\n\n";
     // No prose boundary → the tool-only window flushes at end-of-stream.
     assert!(matches!(
-        inspector.on_chunk(leak).await,
+        inspector
+            .on_chunk(&bytes::Bytes::copy_from_slice(leak))
+            .await,
         ResponseStreamAction::Forward(_)
     ));
     assert!(
@@ -3691,7 +3725,9 @@ async fn streaming_response_inspect_fail_closed_on_uninspectable() {
 data: My system prompt says never disclose this policy.\n\n\
 data: [DONE]\n\n";
     assert!(matches!(
-        inspector.on_chunk(garbage).await,
+        inspector
+            .on_chunk(&bytes::Bytes::copy_from_slice(garbage))
+            .await,
         ResponseStreamAction::Forward(_)
     ));
     assert!(
@@ -3721,7 +3757,10 @@ async fn streaming_response_inspect_detect_forwards_and_never_cuts() {
         .expect("inspector for event stream");
 
     let leak = b"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"My system prompt says never reveal policy.\"}}]}\n\n";
-    match inspector.on_chunk(leak).await {
+    match inspector
+        .on_chunk(&bytes::Bytes::copy_from_slice(leak))
+        .await
+    {
         ResponseStreamAction::Forward(bytes) => {
             assert_eq!(
                 &bytes[..],
@@ -3796,7 +3835,7 @@ async fn streaming_response_inspect_cap_exhaustion_fails_closed() {
     let w1 = b"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"The sky is blue today.\"}}]}\n\n";
     assert!(
         matches!(
-            inspector.on_chunk(w1).await,
+            inspector.on_chunk(&bytes::Bytes::copy_from_slice(w1)).await,
             ResponseStreamAction::Forward(_)
         ),
         "first clean window forwards"
@@ -3807,7 +3846,7 @@ async fn streaming_response_inspect_cap_exhaustion_fails_closed() {
         b"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Grass is green here.\"}}]}\n\n";
     assert!(
         matches!(
-            inspector.on_chunk(w2).await,
+            inspector.on_chunk(&bytes::Bytes::copy_from_slice(w2)).await,
             ResponseStreamAction::Terminate(_)
         ),
         "post-cap window must fail closed under on_error=reject"
@@ -3909,7 +3948,9 @@ async fn streaming_response_inspect_cuts_on_non_delta_frame() {
     let non_delta_leak = b"data: {\"choices\":[{\"index\":0,\"message\":{\"content\":\"my system prompt says never reveal policy\"}}]}\n\n";
     // No delta prose, so it flushes at end-of-stream.
     assert!(matches!(
-        inspector.on_chunk(non_delta_leak).await,
+        inspector
+            .on_chunk(&bytes::Bytes::copy_from_slice(non_delta_leak))
+            .await,
         ResponseStreamAction::Forward(_)
     ));
     assert!(
@@ -4027,7 +4068,7 @@ fn token_window_config_admission_is_field_specific() {
         ),
         (
             json!({"window": "tokens", "tokenizer": "chars4", "token_encoding": "x"}),
-            "unknown property in `config.streaming`: \"token_encoding\"",
+            "`config.streaming`: unknown configuration key(s): \"config.streaming.token_encoding\"",
         ),
     ];
 
@@ -4106,7 +4147,9 @@ async fn token_window_inspect_cuts_on_leaking_window() {
     let leak = b"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"My system prompt says never reveal policy details\"}}]}\n\n";
     assert!(
         matches!(
-            inspector.on_chunk(leak).await,
+            inspector
+                .on_chunk(&bytes::Bytes::copy_from_slice(leak))
+                .await,
             ResponseStreamAction::Terminate(_)
         ),
         "a leaking token window must terminate the stream"
@@ -4137,7 +4180,10 @@ async fn token_window_inspect_forwards_clean_multilingual_window() {
     // Four CJK ideographs → exactly one unicode_words window; lexical miss;
     // dead-port provider error honors on_error=warn and forwards.
     let clean = "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"東京大阪\"}}]}\n\n";
-    match inspector.on_chunk(clean.as_bytes()).await {
+    match inspector
+        .on_chunk(&bytes::Bytes::copy_from_slice(clean.as_bytes()))
+        .await
+    {
         ResponseStreamAction::Forward(bytes) => {
             assert!(
                 !bytes.is_empty(),
@@ -4196,7 +4242,9 @@ async fn token_window_policy_is_rebuilt_on_reload_update_and_delete() {
         .expect("generation 2 inspector");
     let clean = b"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"The weather is sunny today.\"}}]}\n\n";
     assert!(matches!(
-        inspector.on_chunk(clean).await,
+        inspector
+            .on_chunk(&bytes::Bytes::copy_from_slice(clean))
+            .await,
         ResponseStreamAction::Forward(_)
     ));
 
@@ -6035,7 +6083,9 @@ async fn detect_mode_logs_sanitized_provider_failure_once_per_response() {
             Value::String(text.to_string())
         );
         assert!(matches!(
-            inspector.on_chunk(event.as_bytes()).await,
+            inspector
+                .on_chunk(&bytes::Bytes::copy_from_slice(event.as_bytes()))
+                .await,
             ResponseStreamAction::Forward(_)
         ));
     }
@@ -6101,7 +6151,9 @@ async fn detect_mode_sanitizes_malformed_provider_response() {
         .expect("detect inspector");
     let event =
         b"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Ordinary sentence.\"}}]}\n\n";
-    let _ = inspector.on_chunk(event).await;
+    let _ = inspector
+        .on_chunk(&bytes::Bytes::copy_from_slice(event))
+        .await;
     let _ = inspector.on_end().await;
 
     let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
@@ -6220,7 +6272,7 @@ fn max_hold_ms_bounded_admission_is_field_specific() {
         ),
         (
             json!({"max_hold_seconds": 5}),
-            "unknown property in `config.streaming`: \"max_hold_seconds\"",
+            "`config.streaming`: unknown configuration key(s): \"config.streaming.max_hold_seconds\"",
         ),
     ];
 
@@ -6287,7 +6339,9 @@ async fn hold_deadline_cuts_and_never_delivers_the_held_window() {
         .expect("inspector for event stream");
 
     let started = std::time::Instant::now();
-    let action = inspector.on_chunk(CLEAN_SENTENCE_EVENT).await;
+    let action = inspector
+        .on_chunk(&bytes::Bytes::copy_from_slice(CLEAN_SENTENCE_EVENT))
+        .await;
     let elapsed = started.elapsed();
 
     let ResponseStreamAction::Terminate(final_bytes) = action else {
@@ -6312,7 +6366,9 @@ async fn hold_deadline_cuts_and_never_delivers_the_held_window() {
     );
 
     // After the cut nothing further is forwarded and no window is retained.
-    let ResponseStreamAction::Forward(post_cut) = inspector.on_chunk(CLEAN_SENTENCE_EVENT).await
+    let ResponseStreamAction::Forward(post_cut) = inspector
+        .on_chunk(&bytes::Bytes::copy_from_slice(CLEAN_SENTENCE_EVENT))
+        .await
     else {
         panic!("post-cut chunks forward nothing");
     };
@@ -6338,7 +6394,9 @@ async fn hold_deadline_fails_open_when_configured_to_forward() {
         .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
         .expect("inspector for event stream");
 
-    let ResponseStreamAction::Forward(released) = inspector.on_chunk(CLEAN_SENTENCE_EVENT).await
+    let ResponseStreamAction::Forward(released) = inspector
+        .on_chunk(&bytes::Bytes::copy_from_slice(CLEAN_SENTENCE_EVENT))
+        .await
     else {
         panic!("on_hold_timeout=forward must not cut");
     };
@@ -6371,7 +6429,10 @@ async fn fail_open_verdict_timeout_drains_same_chunk_remainder_in_passthrough() 
     // fresh event.
     let mut coalesced = CLEAN_SENTENCE_EVENT.to_vec();
     coalesced.extend_from_slice(CLEAN_SENTENCE_EVENT);
-    let ResponseStreamAction::Forward(released) = inspector.on_chunk(&coalesced).await else {
+    let ResponseStreamAction::Forward(released) = inspector
+        .on_chunk(&bytes::Bytes::copy_from_slice(&coalesced))
+        .await
+    else {
         panic!("explicit fail-open timeout must not cut a coalesced SSE chunk");
     };
     assert_eq!(
@@ -6430,7 +6491,10 @@ async fn partial_clean_release_does_not_refresh_older_held_bytes() {
     coalesced.extend_from_slice(GOVERNED_CLEAN_EVENT);
 
     let started = std::time::Instant::now();
-    let ResponseStreamAction::Forward(released) = inspector.on_chunk(&coalesced).await else {
+    let ResponseStreamAction::Forward(released) = inspector
+        .on_chunk(&bytes::Bytes::copy_from_slice(&coalesced))
+        .await
+    else {
         panic!("the configured fail-open deadline must not cut");
     };
     let elapsed = started.elapsed();
@@ -6457,7 +6521,9 @@ async fn hold_deadline_default_policy_follows_on_error() {
     let mut inspector = lenient
         .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
         .expect("inspector for event stream");
-    let ResponseStreamAction::Forward(released) = inspector.on_chunk(CLEAN_SENTENCE_EVENT).await
+    let ResponseStreamAction::Forward(released) = inspector
+        .on_chunk(&bytes::Bytes::copy_from_slice(CLEAN_SENTENCE_EVENT))
+        .await
     else {
         panic!("on_error=warn must fail open on an expired hold");
     };
@@ -6475,7 +6541,9 @@ async fn hold_deadline_default_policy_follows_on_error() {
         .expect("inspector for event stream");
     assert!(
         matches!(
-            inspector.on_chunk(CLEAN_SENTENCE_EVENT).await,
+            inspector
+                .on_chunk(&bytes::Bytes::copy_from_slice(CLEAN_SENTENCE_EVENT))
+                .await,
             ResponseStreamAction::Terminate(_)
         ),
         "on_error=reject must fail closed on an expired hold"
@@ -6499,7 +6567,9 @@ async fn completion_wins_the_hold_race_with_a_generous_budget() {
         .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
         .expect("inspector for event stream");
 
-    let ResponseStreamAction::Forward(released) = inspector.on_chunk(GOVERNED_CLEAN_EVENT).await
+    let ResponseStreamAction::Forward(released) = inspector
+        .on_chunk(&bytes::Bytes::copy_from_slice(GOVERNED_CLEAN_EVENT))
+        .await
     else {
         panic!("a timely clean verdict must forward the window");
     };
@@ -6525,7 +6595,9 @@ async fn hold_deadline_is_not_reset_by_more_chunks() {
     let mut cut = false;
     for _ in 0..6 {
         if matches!(
-            inspector.on_chunk(DRIP_EVENT).await,
+            inspector
+                .on_chunk(&bytes::Bytes::copy_from_slice(DRIP_EVENT))
+                .await,
             ResponseStreamAction::Terminate(_)
         ) {
             cut = true;
@@ -6558,7 +6630,9 @@ async fn fail_open_hold_timeout_forwards_partial_event_bytes_exactly() {
         .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
         .expect("inspector for event stream");
 
-    let ResponseStreamAction::Forward(first) = inspector.on_chunk(PARTIAL_EVENT_PREFIX).await
+    let ResponseStreamAction::Forward(first) = inspector
+        .on_chunk(&bytes::Bytes::copy_from_slice(PARTIAL_EVENT_PREFIX))
+        .await
     else {
         panic!("absorbing a partial event must not cut under fail-open");
     };
@@ -6569,7 +6643,10 @@ async fn fail_open_hold_timeout_forwards_partial_event_bytes_exactly() {
     );
 
     tokio::time::sleep(Duration::from_millis(200)).await;
-    let ResponseStreamAction::Forward(released) = inspector.on_chunk(&[]).await else {
+    let ResponseStreamAction::Forward(released) = inspector
+        .on_chunk(&bytes::Bytes::copy_from_slice(&[]))
+        .await
+    else {
         panic!("fail-open expiry must forward, not cut");
     };
     assert_eq!(
@@ -6593,11 +6670,14 @@ async fn fail_open_partial_event_remainder_is_passthrough_preserving_wire_order(
         .expect("inspector for event stream");
 
     assert!(matches!(
-        inspector.on_chunk(PARTIAL_EVENT_PREFIX).await,
+        inspector.on_chunk(&bytes::Bytes::copy_from_slice(PARTIAL_EVENT_PREFIX)).await,
         ResponseStreamAction::Forward(b) if b.is_empty()
     ));
     tokio::time::sleep(Duration::from_millis(200)).await;
-    let ResponseStreamAction::Forward(prefix_out) = inspector.on_chunk(&[]).await else {
+    let ResponseStreamAction::Forward(prefix_out) = inspector
+        .on_chunk(&bytes::Bytes::copy_from_slice(&[]))
+        .await
+    else {
         panic!("fail-open expiry must forward the prefix");
     };
     assert_eq!(prefix_out.as_ref(), PARTIAL_EVENT_PREFIX);
@@ -6605,7 +6685,9 @@ async fn fail_open_partial_event_remainder_is_passthrough_preserving_wire_order(
     // Remainder of the SAME event must not be held for semantic inspection —
     // the already-forwarded prefix is no longer protected content.
     let started = std::time::Instant::now();
-    let ResponseStreamAction::Forward(suffix_out) = inspector.on_chunk(PARTIAL_EVENT_SUFFIX).await
+    let ResponseStreamAction::Forward(suffix_out) = inspector
+        .on_chunk(&bytes::Bytes::copy_from_slice(PARTIAL_EVENT_SUFFIX))
+        .await
     else {
         panic!("partial-event remainder must not cut");
     };
@@ -6621,7 +6703,10 @@ async fn fail_open_partial_event_remainder_is_passthrough_preserving_wire_order(
     );
 
     // A later complete event resumes normal windowed inspection (timely clean).
-    let ResponseStreamAction::Forward(next) = inspector.on_chunk(GOVERNED_CLEAN_EVENT).await else {
+    let ResponseStreamAction::Forward(next) = inspector
+        .on_chunk(&bytes::Bytes::copy_from_slice(GOVERNED_CLEAN_EVENT))
+        .await
+    else {
         panic!("subsequent events resume normal inspection");
     };
     assert_eq!(next.as_ref(), GOVERNED_CLEAN_EVENT);
@@ -6640,13 +6725,13 @@ async fn downstream_cut_discards_held_state_and_stops_the_inspector() {
         .expect("inspector for event stream");
 
     assert!(matches!(
-        inspector.on_chunk(PARTIAL_EVENT_PREFIX).await,
+        inspector.on_chunk(&bytes::Bytes::copy_from_slice(PARTIAL_EVENT_PREFIX)).await,
         ResponseStreamAction::Forward(bytes) if bytes.is_empty()
     ));
     inspector.on_downstream_terminated();
 
     assert!(matches!(
-        inspector.on_chunk(PARTIAL_EVENT_SUFFIX).await,
+        inspector.on_chunk(&bytes::Bytes::copy_from_slice(PARTIAL_EVENT_SUFFIX)).await,
         ResponseStreamAction::Forward(bytes) if bytes.is_empty()
     ));
     assert!(matches!(
@@ -6671,11 +6756,14 @@ async fn fail_open_partial_event_detects_boundary_split_across_timeout_release()
     let mut prefix = PARTIAL_EVENT_PREFIX.to_vec();
     prefix.extend_from_slice(b"\"}}]}\n");
     assert!(matches!(
-        inspector.on_chunk(&prefix).await,
+        inspector.on_chunk(&bytes::Bytes::copy_from_slice(&prefix)).await,
         ResponseStreamAction::Forward(b) if b.is_empty()
     ));
     tokio::time::sleep(Duration::from_millis(200)).await;
-    let ResponseStreamAction::Forward(prefix_out) = inspector.on_chunk(&[]).await else {
+    let ResponseStreamAction::Forward(prefix_out) = inspector
+        .on_chunk(&bytes::Bytes::copy_from_slice(&[]))
+        .await
+    else {
         panic!("fail-open expiry must forward the prefix");
     };
     assert_eq!(prefix_out.as_ref(), prefix);
@@ -6685,7 +6773,10 @@ async fn fail_open_partial_event_detects_boundary_split_across_timeout_release()
     // pass-through and resume ordinary governed inspection.
     let mut boundary_and_next = b"\n".to_vec();
     boundary_and_next.extend_from_slice(GOVERNED_CLEAN_EVENT);
-    let ResponseStreamAction::Forward(out) = inspector.on_chunk(&boundary_and_next).await else {
+    let ResponseStreamAction::Forward(out) = inspector
+        .on_chunk(&bytes::Bytes::copy_from_slice(&boundary_and_next))
+        .await
+    else {
         panic!("split boundary plus clean event must forward");
     };
     assert_eq!(out.as_ref(), boundary_and_next);
@@ -6723,20 +6814,26 @@ async fn fail_open_pass_through_ends_at_cr_framed_event_boundaries() {
         prefix.extend_from_slice(line_end);
         assert!(
             matches!(
-                inspector.on_chunk(&prefix).await,
+                inspector.on_chunk(&bytes::Bytes::copy_from_slice(&prefix)).await,
                 ResponseStreamAction::Forward(b) if b.is_empty()
             ),
             "{framing}: the partial event is held"
         );
         tokio::time::sleep(Duration::from_millis(200)).await;
-        let ResponseStreamAction::Forward(prefix_out) = inspector.on_chunk(&[]).await else {
+        let ResponseStreamAction::Forward(prefix_out) = inspector
+            .on_chunk(&bytes::Bytes::copy_from_slice(&[]))
+            .await
+        else {
             panic!("{framing}: fail-open expiry must forward the prefix");
         };
         assert_eq!(prefix_out.as_ref(), prefix.as_slice(), "{framing}");
 
         let mut blank_line_and_leak = blank_line.to_vec();
         blank_line_and_leak.extend_from_slice(leak_event.as_bytes());
-        match inspector.on_chunk(&blank_line_and_leak).await {
+        match inspector
+            .on_chunk(&bytes::Bytes::copy_from_slice(&blank_line_and_leak))
+            .await
+        {
             ResponseStreamAction::Terminate(_) => {}
             ResponseStreamAction::Forward(out) => panic!(
                 "{framing}: the event after the boundary must be inspected, forwarded {:?}",
@@ -6766,17 +6863,23 @@ async fn fail_open_pass_through_keeps_split_crlf_inside_the_event() {
     let mut prefix = PARTIAL_EVENT_PREFIX.to_vec();
     prefix.extend_from_slice(b"\"}}]}\r");
     assert!(matches!(
-        inspector.on_chunk(&prefix).await,
+        inspector.on_chunk(&bytes::Bytes::copy_from_slice(&prefix)).await,
         ResponseStreamAction::Forward(b) if b.is_empty()
     ));
     tokio::time::sleep(Duration::from_millis(200)).await;
-    let ResponseStreamAction::Forward(prefix_out) = inspector.on_chunk(&[]).await else {
+    let ResponseStreamAction::Forward(prefix_out) = inspector
+        .on_chunk(&bytes::Bytes::copy_from_slice(&[]))
+        .await
+    else {
         panic!("fail-open expiry must forward the prefix");
     };
     assert_eq!(prefix_out.as_ref(), prefix);
 
     let remainder = b"\ndata: rest of the same event\r\n\r\n";
-    let ResponseStreamAction::Forward(out) = inspector.on_chunk(remainder).await else {
+    let ResponseStreamAction::Forward(out) = inspector
+        .on_chunk(&bytes::Bytes::copy_from_slice(remainder))
+        .await
+    else {
         panic!("the remainder of the forwarded event must not be cut");
     };
     assert_eq!(
@@ -6786,7 +6889,10 @@ async fn fail_open_pass_through_keeps_split_crlf_inside_the_event() {
     );
 
     // The next event resumes ordinary governed inspection.
-    let ResponseStreamAction::Forward(next) = inspector.on_chunk(GOVERNED_CLEAN_EVENT).await else {
+    let ResponseStreamAction::Forward(next) = inspector
+        .on_chunk(&bytes::Bytes::copy_from_slice(GOVERNED_CLEAN_EVENT))
+        .await
+    else {
         panic!("subsequent events resume normal inspection");
     };
     assert_eq!(next.as_ref(), GOVERNED_CLEAN_EVENT);
@@ -6823,14 +6929,17 @@ async fn fail_open_release_of_a_bare_terminator_carry_keeps_inspecting_the_next_
         for chunk in [held_event.as_str(), carried] {
             assert!(
                 matches!(
-                    inspector.on_chunk(chunk.as_bytes()).await,
+                    inspector.on_chunk(&bytes::Bytes::copy_from_slice(chunk.as_bytes())).await,
                     ResponseStreamAction::Forward(b) if b.is_empty()
                 ),
                 "{framing}: {chunk:?} is held"
             );
         }
         tokio::time::sleep(Duration::from_millis(200)).await;
-        let ResponseStreamAction::Forward(released) = inspector.on_chunk(&[]).await else {
+        let ResponseStreamAction::Forward(released) = inspector
+            .on_chunk(&bytes::Bytes::copy_from_slice(&[]))
+            .await
+        else {
             panic!("{framing}: fail-open expiry must forward the held bytes");
         };
         assert_eq!(
@@ -6840,7 +6949,10 @@ async fn fail_open_release_of_a_bare_terminator_carry_keeps_inspecting_the_next_
         );
 
         let leak_event = chat_delta_event(leak, eol);
-        match inspector.on_chunk(leak_event.as_bytes()).await {
+        match inspector
+            .on_chunk(&bytes::Bytes::copy_from_slice(leak_event.as_bytes()))
+            .await
+        {
             ResponseStreamAction::Terminate(_) => {}
             ResponseStreamAction::Forward(out) => panic!(
                 "{framing}: the next complete event must be inspected, forwarded {:?}",
@@ -6864,13 +6976,16 @@ async fn release_carry_by_hold_timeout(
 ) -> Vec<u8> {
     assert!(
         matches!(
-            inspector.on_chunk(carry).await,
+            inspector.on_chunk(&bytes::Bytes::copy_from_slice(carry)).await,
             ResponseStreamAction::Forward(b) if b.is_empty()
         ),
         "{label}: the carry is held"
     );
     tokio::time::sleep(Duration::from_millis(2 * hold_ms)).await;
-    let ResponseStreamAction::Forward(released) = inspector.on_chunk(&[]).await else {
+    let ResponseStreamAction::Forward(released) = inspector
+        .on_chunk(&bytes::Bytes::copy_from_slice(&[]))
+        .await
+    else {
         panic!("{label}: fail-open expiry must forward the held carry");
     };
     released.to_vec()
@@ -6886,7 +7001,10 @@ async fn assert_cut_before_leak(
 ) {
     let mut forwarded = Vec::new();
     for chunk in chunks {
-        match inspector.on_chunk(chunk).await {
+        match inspector
+            .on_chunk(&bytes::Bytes::copy_from_slice(chunk))
+            .await
+        {
             ResponseStreamAction::Terminate(_) => {
                 assert!(
                     !String::from_utf8_lossy(&forwarded).contains(leak),
@@ -7020,7 +7138,10 @@ async fn fail_open_release_of_a_partial_bom_forwards_only_the_rest_of_the_bom() 
                     vec![clean.as_slice()]
                 };
                 for chunk in chunks {
-                    let ResponseStreamAction::Forward(out) = inspector.on_chunk(chunk).await else {
+                    let ResponseStreamAction::Forward(out) = inspector
+                        .on_chunk(&bytes::Bytes::copy_from_slice(chunk))
+                        .await
+                    else {
                         panic!("{label}: a clean event after the BOM must not be cut");
                     };
                     forwarded.extend_from_slice(&out);
@@ -7100,7 +7221,9 @@ async fn fail_open_release_inside_a_data_less_line_inspects_what_the_client_disp
                     }
                     let mut forwarded = Vec::new();
                     for chunk in chunks {
-                        let ResponseStreamAction::Forward(out) = inspector.on_chunk(chunk).await
+                        let ResponseStreamAction::Forward(out) = inspector
+                            .on_chunk(&bytes::Bytes::copy_from_slice(chunk))
+                            .await
                         else {
                             panic!("{label}: the clean event the client dispatches must pass");
                         };
@@ -7186,7 +7309,10 @@ async fn check_rest_after_released_start(
     }
     let mut forwarded = Vec::new();
     for chunk in &chunks {
-        let ResponseStreamAction::Forward(out) = inspector.on_chunk(chunk).await else {
+        let ResponseStreamAction::Forward(out) = inspector
+            .on_chunk(&bytes::Bytes::copy_from_slice(chunk))
+            .await
+        else {
             panic!("{label}: the clean event the client dispatches must pass");
         };
         forwarded.extend_from_slice(&out);
@@ -7291,7 +7417,10 @@ async fn a_second_fail_open_release_forwards_only_what_followed_the_event_start(
         );
 
         let rest = format!(" prose\"}}}}]}}{eol}{eol}");
-        let ResponseStreamAction::Forward(out) = inspector.on_chunk(rest.as_bytes()).await else {
+        let ResponseStreamAction::Forward(out) = inspector
+            .on_chunk(&bytes::Bytes::copy_from_slice(rest.as_bytes()))
+            .await
+        else {
             panic!("{label}: the rest of the forwarded event must not be cut");
         };
         assert_eq!(
@@ -7431,7 +7560,10 @@ async fn a_cut_after_a_fail_open_event_start_emits_the_error_event_on_a_fresh_li
 
                 let mut cut = None;
                 for chunk in &chunks {
-                    match inspector.on_chunk(chunk.as_bytes()).await {
+                    match inspector
+                        .on_chunk(&bytes::Bytes::copy_from_slice(chunk.as_bytes()))
+                        .await
+                    {
                         ResponseStreamAction::Forward(out) => client.extend_from_slice(&out),
                         ResponseStreamAction::Terminate(final_bytes) => {
                             cut = Some(final_bytes);
@@ -7488,7 +7620,10 @@ async fn a_cut_after_complete_events_emits_the_error_event_unchanged() {
         let clean_event = chat_delta_event(clean, eol);
         let leak_event = chat_delta_event(leak, eol);
         for event in [clean_event, leak_event] {
-            match inspector.on_chunk(event.as_bytes()).await {
+            match inspector
+                .on_chunk(&bytes::Bytes::copy_from_slice(event.as_bytes()))
+                .await
+            {
                 ResponseStreamAction::Forward(out) => client.extend_from_slice(&out),
                 ResponseStreamAction::Terminate(final_bytes) => {
                     cut = Some(final_bytes);
@@ -7542,7 +7677,9 @@ async fn a_cut_in_the_chunk_that_ends_a_passed_through_event_emits_its_rest_firs
 
         let rest = format!(" prose\"}}}}]}}{eol}{eol}");
         let chunk = format!("{rest}{}", chat_delta_event(leak, eol));
-        let action = inspector.on_chunk(chunk.as_bytes()).await;
+        let action = inspector
+            .on_chunk(&bytes::Bytes::copy_from_slice(chunk.as_bytes()))
+            .await;
         let ResponseStreamAction::Terminate(Some(final_bytes)) = action else {
             panic!("{label}: the leaking event must be cut with an error event");
         };
@@ -7611,7 +7748,10 @@ async fn a_cut_after_a_partial_bom_release_ends_the_open_line() {
 
                 let mut cut = None;
                 for chunk in chunks {
-                    match inspector.on_chunk(chunk).await {
+                    match inspector
+                        .on_chunk(&bytes::Bytes::copy_from_slice(chunk))
+                        .await
+                    {
                         ResponseStreamAction::Forward(out) => client.extend_from_slice(&out),
                         ResponseStreamAction::Terminate(final_bytes) => {
                             cut = Some(final_bytes);
@@ -7681,7 +7821,9 @@ async fn a_cut_at_the_end_of_the_stream_follows_what_the_client_holds() {
                 )
                 .await;
                 assert_eq!(client, start.as_bytes(), "{label}");
-                let action = inspector.on_chunk(next.as_bytes()).await;
+                let action = inspector
+                    .on_chunk(&bytes::Bytes::copy_from_slice(next.as_bytes()))
+                    .await;
                 let ResponseStreamAction::Forward(out) = action else {
                     panic!("{label}: an unterminated event is held, not cut");
                 };
@@ -7740,7 +7882,7 @@ async fn a_chained_cut_ends_the_line_a_later_firewall_left_open() {
         if index > 0 {
             tokio::time::sleep(hold).await;
         }
-        let action = chain.on_chunk(chunk).await;
+        let action = chain.on_chunk(&bytes::Bytes::copy_from_slice(chunk)).await;
         let ResponseStreamAction::Forward(out) = action else {
             panic!("{chunk:?}: an event start is held or released, never cut");
         };
@@ -7754,7 +7896,9 @@ async fn a_chained_cut_ends_the_line_a_later_firewall_left_open() {
     // The rest of the `data:` line the first firewall holds, and its event.
     let leak_event = chat_delta_event(leak, "\n");
     let rest = &leak_event[1..];
-    let action = chain.on_chunk(rest.as_bytes()).await;
+    let action = chain
+        .on_chunk(&bytes::Bytes::copy_from_slice(rest.as_bytes()))
+        .await;
     let ResponseStreamAction::Terminate(Some(final_bytes)) = action else {
         panic!("the leaking event must be cut with an error event");
     };
@@ -7769,8 +7913,8 @@ struct FlushAtEnd(Vec<u8>);
 
 #[async_trait::async_trait]
 impl ResponseStreamInspector for FlushAtEnd {
-    async fn on_chunk(&mut self, chunk: &[u8]) -> ResponseStreamAction {
-        ResponseStreamAction::Forward(bytes::Bytes::copy_from_slice(chunk))
+    async fn on_chunk(&mut self, chunk: &bytes::Bytes) -> ResponseStreamAction {
+        ResponseStreamAction::Forward(chunk.clone())
     }
 
     async fn on_end(&mut self) -> ResponseStreamAction {
@@ -7811,13 +7955,17 @@ async fn a_chained_cut_at_the_end_emits_what_the_last_firewall_released_first() 
         let inspectors = vec![flusher, inspector];
         let mut chain = chain_response_stream_inspectors(inspectors).expect("chain");
 
-        let action = chain.on_chunk(PARTIAL_EVENT_PREFIX).await;
+        let action = chain
+            .on_chunk(&bytes::Bytes::copy_from_slice(PARTIAL_EVENT_PREFIX))
+            .await;
         let ResponseStreamAction::Forward(held) = action else {
             panic!("{label}: the partial event is held");
         };
         assert!(held.is_empty(), "{label}");
         tokio::time::sleep(Duration::from_millis(2 * EVENT_START_HOLD_MS)).await;
-        let ResponseStreamAction::Forward(released) = chain.on_chunk(b" prose").await else {
+        let ResponseStreamAction::Forward(released) =
+            chain.on_chunk(&bytes::Bytes::from_static(b" prose")).await
+        else {
             panic!("{label}: a fail-open hold timeout releases the partial event");
         };
         let mut client = released.to_vec();
@@ -7871,13 +8019,13 @@ struct RecordingInspector {
 
 #[async_trait::async_trait]
 impl ResponseStreamInspector for RecordingInspector {
-    async fn on_chunk(&mut self, chunk: &[u8]) -> ResponseStreamAction {
+    async fn on_chunk(&mut self, chunk: &bytes::Bytes) -> ResponseStreamAction {
         self.seen.lock().unwrap().extend_from_slice(chunk);
         if self.hold {
             self.held.extend_from_slice(chunk);
             return ResponseStreamAction::Forward(bytes::Bytes::new());
         }
-        ResponseStreamAction::Forward(bytes::Bytes::copy_from_slice(chunk))
+        ResponseStreamAction::Forward(chunk.clone())
     }
 
     async fn on_end(&mut self) -> ResponseStreamAction {
@@ -7896,11 +8044,11 @@ const CUT_BY_LATER: &[u8] = b"event: error\ndata: later\n\n";
 
 #[async_trait::async_trait]
 impl ResponseStreamInspector for CutOnText {
-    async fn on_chunk(&mut self, chunk: &[u8]) -> ResponseStreamAction {
+    async fn on_chunk(&mut self, chunk: &bytes::Bytes) -> ResponseStreamAction {
         if String::from_utf8_lossy(chunk).contains(self.trigger) {
             return ResponseStreamAction::Terminate(Some(bytes::Bytes::from_static(CUT_BY_LATER)));
         }
-        ResponseStreamAction::Forward(bytes::Bytes::copy_from_slice(chunk))
+        ResponseStreamAction::Forward(chunk.clone())
     }
 }
 
@@ -7931,7 +8079,9 @@ async fn a_non_last_chained_firewall_cut_sends_its_release_through_later_inspect
     let mut inspector = firewall
         .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
         .expect("inspector for event stream");
-    let action = inspector.on_chunk(chunk.as_bytes()).await;
+    let action = inspector
+        .on_chunk(&bytes::Bytes::copy_from_slice(chunk.as_bytes()))
+        .await;
     let ResponseStreamAction::Terminate(Some(final_bytes)) = action else {
         panic!("a lone firewall cuts the leaking event with an error event");
     };
@@ -7939,7 +8089,9 @@ async fn a_non_last_chained_firewall_cut_sends_its_release_through_later_inspect
 
     // The second firewall inspects the clean event too.
     let mut chain = chained_firewalls(&config);
-    let action = chain.on_chunk(chunk.as_bytes()).await;
+    let action = chain
+        .on_chunk(&bytes::Bytes::copy_from_slice(chunk.as_bytes()))
+        .await;
     let ResponseStreamAction::Terminate(Some(final_bytes)) = action else {
         panic!("the first firewall cuts the leaking event with an error event");
     };
@@ -7960,7 +8112,9 @@ async fn a_non_last_chained_firewall_cut_sends_its_release_through_later_inspect
             held: Vec::new(),
         });
         let mut chain = chain_response_stream_inspectors(vec![inspector, recorder]).expect("chain");
-        let action = chain.on_chunk(chunk.as_bytes()).await;
+        let action = chain
+            .on_chunk(&bytes::Bytes::copy_from_slice(chunk.as_bytes()))
+            .await;
         let ResponseStreamAction::Terminate(Some(final_bytes)) = action else {
             panic!("{label}: the leaking event must be cut with an error event");
         };
@@ -8004,7 +8158,9 @@ async fn a_later_inspector_cut_on_a_chained_firewall_release_wins() {
         trigger: "harmless governed",
     });
     let mut chain = chain_response_stream_inspectors(vec![inspector, cutter]).expect("chain");
-    let action = chain.on_chunk(chunk.as_bytes()).await;
+    let action = chain
+        .on_chunk(&bytes::Bytes::copy_from_slice(chunk.as_bytes()))
+        .await;
     let ResponseStreamAction::Terminate(Some(final_bytes)) = action else {
         panic!("the later inspector cuts the clean event");
     };
@@ -8032,7 +8188,9 @@ async fn a_silent_cut_still_sends_what_the_same_chunk_cleared() {
     let mut inspector = firewall
         .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
         .expect("inspector for event stream");
-    let action = inspector.on_chunk(chunk.as_bytes()).await;
+    let action = inspector
+        .on_chunk(&bytes::Bytes::copy_from_slice(chunk.as_bytes()))
+        .await;
     let ResponseStreamAction::Terminate(Some(final_bytes)) = action else {
         panic!("a lone silent cut sends the clean event");
     };
@@ -8042,14 +8200,18 @@ async fn a_silent_cut_still_sends_what_the_same_chunk_cleared() {
     let mut inspector = firewall
         .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
         .expect("inspector for event stream");
-    let action = inspector.on_chunk(leak_event.as_bytes()).await;
+    let action = inspector
+        .on_chunk(&bytes::Bytes::copy_from_slice(leak_event.as_bytes()))
+        .await;
     assert!(
         matches!(action, ResponseStreamAction::Terminate(None)),
         "{action:?}"
     );
 
     let mut chain = chained_firewalls(&config);
-    let action = chain.on_chunk(chunk.as_bytes()).await;
+    let action = chain
+        .on_chunk(&bytes::Bytes::copy_from_slice(chunk.as_bytes()))
+        .await;
     let ResponseStreamAction::Terminate(Some(final_bytes)) = action else {
         panic!("a chained silent cut sends the clean event");
     };
@@ -8069,13 +8231,19 @@ async fn fail_open_drip_cannot_retain_original_bytes_across_timer_resets() {
         .expect("inspector for event stream");
 
     let mut forwarded = Vec::new();
-    let ResponseStreamAction::Forward(b) = inspector.on_chunk(PARTIAL_EVENT_PREFIX).await else {
+    let ResponseStreamAction::Forward(b) = inspector
+        .on_chunk(&bytes::Bytes::copy_from_slice(PARTIAL_EVENT_PREFIX))
+        .await
+    else {
         panic!("initial partial absorb must not cut");
     };
     forwarded.extend_from_slice(&b);
 
     tokio::time::sleep(Duration::from_millis(180)).await;
-    let ResponseStreamAction::Forward(b) = inspector.on_chunk(&[]).await else {
+    let ResponseStreamAction::Forward(b) = inspector
+        .on_chunk(&bytes::Bytes::copy_from_slice(&[]))
+        .await
+    else {
         panic!("first expiry must fail open");
     };
     forwarded.extend_from_slice(&b);
@@ -8087,12 +8255,18 @@ async fn fail_open_drip_cannot_retain_original_bytes_across_timer_resets() {
     // Further drips of the same unterminated event are pass-through; sleeping
     // past another deadline must not re-emit or re-retain the original prefix.
     for piece in [b" more" as &[u8], b" drip", b" bytes"] {
-        let ResponseStreamAction::Forward(b) = inspector.on_chunk(piece).await else {
+        let ResponseStreamAction::Forward(b) = inspector
+            .on_chunk(&bytes::Bytes::copy_from_slice(piece))
+            .await
+        else {
             panic!("pass-through drip must not cut");
         };
         forwarded.extend_from_slice(&b);
         tokio::time::sleep(Duration::from_millis(120)).await;
-        let ResponseStreamAction::Forward(idle) = inspector.on_chunk(&[]).await else {
+        let ResponseStreamAction::Forward(idle) = inspector
+            .on_chunk(&bytes::Bytes::copy_from_slice(&[]))
+            .await
+        else {
             panic!("idle poke after pass-through must not cut");
         };
         assert!(
@@ -8131,11 +8305,14 @@ async fn fail_closed_hold_timeout_discards_partial_event_bytes() {
         .expect("inspector for event stream");
 
     assert!(matches!(
-        inspector.on_chunk(PARTIAL_EVENT_PREFIX).await,
+        inspector.on_chunk(&bytes::Bytes::copy_from_slice(PARTIAL_EVENT_PREFIX)).await,
         ResponseStreamAction::Forward(b) if b.is_empty()
     ));
     tokio::time::sleep(Duration::from_millis(200)).await;
-    let ResponseStreamAction::Terminate(final_bytes) = inspector.on_chunk(&[]).await else {
+    let ResponseStreamAction::Terminate(final_bytes) = inspector
+        .on_chunk(&bytes::Bytes::copy_from_slice(&[]))
+        .await
+    else {
         panic!("fail-closed expiry must cut");
     };
     let terminal = String::from_utf8(final_bytes.unwrap_or_default().to_vec()).unwrap_or_default();
@@ -8152,7 +8329,10 @@ async fn fail_closed_hold_timeout_discards_partial_event_bytes() {
         "fail-closed must leak no partial SSE payload: {terminal:?}"
     );
 
-    let ResponseStreamAction::Forward(post) = inspector.on_chunk(PARTIAL_EVENT_SUFFIX).await else {
+    let ResponseStreamAction::Forward(post) = inspector
+        .on_chunk(&bytes::Bytes::copy_from_slice(PARTIAL_EVENT_SUFFIX))
+        .await
+    else {
         panic!("post-cut chunks forward nothing");
     };
     assert!(post.is_empty());
@@ -8178,7 +8358,7 @@ async fn fail_closed_on_end_does_not_release_expired_role_only_hold() {
         .expect("inspector for event stream");
 
     assert!(matches!(
-        inspector.on_chunk(ROLE_ONLY_EVENT).await,
+        inspector.on_chunk(&bytes::Bytes::copy_from_slice(ROLE_ONLY_EVENT)).await,
         ResponseStreamAction::Forward(b) if b.is_empty()
     ));
     tokio::time::sleep(Duration::from_millis(200)).await;
@@ -8228,7 +8408,7 @@ async fn fail_open_on_end_forwards_expired_partial_hold_exactly_once() {
         .expect("inspector for event stream");
 
     assert!(matches!(
-        inspector.on_chunk(PARTIAL_EVENT_PREFIX).await,
+        inspector.on_chunk(&bytes::Bytes::copy_from_slice(PARTIAL_EVENT_PREFIX)).await,
         ResponseStreamAction::Forward(b) if b.is_empty()
     ));
     tokio::time::sleep(Duration::from_millis(200)).await;
@@ -8280,7 +8460,9 @@ async fn hold_timeout_publishes_fixed_cardinality_metadata() {
             .expect("inspector for event stream");
 
     assert!(matches!(
-        inspector.on_chunk(CLEAN_SENTENCE_EVENT).await,
+        inspector
+            .on_chunk(&bytes::Bytes::copy_from_slice(CLEAN_SENTENCE_EVENT))
+            .await,
         ResponseStreamAction::Terminate(_)
     ));
     drop(inspector);
@@ -8335,7 +8517,9 @@ async fn multi_instance_hold_timeout_metadata(hook_order: [usize; 2]) -> (Reques
             .expect("chained inspectors for both instances");
 
     assert!(matches!(
-        inspector.on_chunk(CLEAN_SENTENCE_EVENT).await,
+        inspector
+            .on_chunk(&bytes::Bytes::copy_from_slice(CLEAN_SENTENCE_EVENT))
+            .await,
         ResponseStreamAction::Terminate(_)
     ));
     drop(inspector);
@@ -8403,7 +8587,9 @@ async fn zero_expiry_sibling_does_not_erase_hold_timeout_metadata() {
         create_response_stream_inspector(&plugins, &mut ctx, 200, Some("text/event-stream"))
             .expect("chained inspectors");
 
-    let ResponseStreamAction::Forward(released) = inspector.on_chunk(GOVERNED_CLEAN_EVENT).await
+    let ResponseStreamAction::Forward(released) = inspector
+        .on_chunk(&bytes::Bytes::copy_from_slice(GOVERNED_CLEAN_EVENT))
+        .await
     else {
         panic!("fail-open timeout then clean sibling must forward, not cut");
     };
@@ -8463,7 +8649,9 @@ async fn no_hold_timeout_metadata_without_an_expiry() {
     let mut inspector =
         create_response_stream_inspector(&plugins, &mut ctx, 200, Some("text/event-stream"))
             .expect("inspector for event stream");
-    let _ = inspector.on_chunk(GOVERNED_CLEAN_EVENT).await;
+    let _ = inspector
+        .on_chunk(&bytes::Bytes::copy_from_slice(GOVERNED_CLEAN_EVENT))
+        .await;
     let _ = inspector.on_end().await;
     drop(inspector);
 
@@ -8499,7 +8687,10 @@ async fn detect_mode_hold_timeout_abandons_without_cutting() {
     // detect is release-then-detect: the chunk is forwarded immediately and the
     // deadline only bounds the detached evaluation.
     let started = std::time::Instant::now();
-    let ResponseStreamAction::Forward(out) = inspector.on_chunk(CLEAN_SENTENCE_EVENT).await else {
+    let ResponseStreamAction::Forward(out) = inspector
+        .on_chunk(&bytes::Bytes::copy_from_slice(CLEAN_SENTENCE_EVENT))
+        .await
+    else {
         panic!("detect must never cut");
     };
     assert_eq!(out.as_ref(), CLEAN_SENTENCE_EVENT);
@@ -8553,7 +8744,9 @@ async fn hold_policy_is_rebuilt_on_reload_update_and_delete() {
         .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
         .expect("generation 1 inspector");
     assert!(matches!(
-        inspector.on_chunk(CLEAN_SENTENCE_EVENT).await,
+        inspector
+            .on_chunk(&bytes::Bytes::copy_from_slice(CLEAN_SENTENCE_EVENT))
+            .await,
         ResponseStreamAction::Terminate(_)
     ));
 
@@ -8574,7 +8767,9 @@ async fn hold_policy_is_rebuilt_on_reload_update_and_delete() {
     let mut inspector = generation_2
         .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
         .expect("generation 2 inspector");
-    let ResponseStreamAction::Forward(released) = inspector.on_chunk(CLEAN_SENTENCE_EVENT).await
+    let ResponseStreamAction::Forward(released) = inspector
+        .on_chunk(&bytes::Bytes::copy_from_slice(CLEAN_SENTENCE_EVENT))
+        .await
     else {
         panic!("the updated generation must fail open");
     };
@@ -9791,7 +9986,10 @@ async fn anthropic_event_stream_under_inspect_is_reassembled_and_inspected() {
 
     let anthropic = b"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\"}}\n\n\
 event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"My system prompt says never reveal policy.\"}}\n\n";
-    if let ResponseStreamAction::Forward(_) = inspector.on_chunk(anthropic).await {
+    if let ResponseStreamAction::Forward(_) = inspector
+        .on_chunk(&bytes::Bytes::copy_from_slice(anthropic))
+        .await
+    {
         assert!(
             matches!(inspector.on_end().await, ResponseStreamAction::Terminate(_)),
             "a reassembled Anthropic stream must reach a verdict and, with the \
@@ -9823,7 +10021,10 @@ async fn gemini_event_stream_under_inspect_is_reassembled_and_inspected() {
 
     let gemini = b"data: {\"candidates\":[{\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"My system \"}]}}]}\n\n\
 data: {\"candidates\":[{\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"prompt says never reveal policy.\"}]}}]}\n\n";
-    if let ResponseStreamAction::Forward(_) = inspector.on_chunk(gemini).await {
+    if let ResponseStreamAction::Forward(_) = inspector
+        .on_chunk(&bytes::Bytes::copy_from_slice(gemini))
+        .await
+    {
         assert!(
             matches!(inspector.on_end().await, ResponseStreamAction::Terminate(_)),
             "a reassembled Gemini stream must reach a verdict and, with the \
@@ -9854,7 +10055,9 @@ async fn gemini_event_stream_unfoldable_part_fails_closed() {
     let gemini = b"data: {\"candidates\":[{\"content\":{\"role\":\"model\",\"parts\":[\
 {\"text\":\"The weather is sunny today.\"},\
 {\"executableCode\":{\"language\":\"PYTHON\",\"code\":\"print(1)\"}}]}}]}\n\n";
-    let first = inspector.on_chunk(gemini).await;
+    let first = inspector
+        .on_chunk(&bytes::Bytes::copy_from_slice(gemini))
+        .await;
     let terminated = matches!(first, ResponseStreamAction::Terminate(_))
         || matches!(inspector.on_end().await, ResponseStreamAction::Terminate(_));
     assert!(
@@ -9888,7 +10091,10 @@ async fn tgi_event_stream_under_inspect_is_reassembled_and_inspected() {
     let tgi = b"data: {\"index\":1,\"token\":{\"id\":1,\"text\":\"My system \"},\"generated_text\":null}\n\n\
 data: {\"index\":2,\"token\":{\"id\":2,\"text\":\"prompt says never reveal policy.\"},\
 \"generated_text\":null}\n\n";
-    if let ResponseStreamAction::Forward(_) = inspector.on_chunk(tgi).await {
+    if let ResponseStreamAction::Forward(_) = inspector
+        .on_chunk(&bytes::Bytes::copy_from_slice(tgi))
+        .await
+    {
         assert!(
             matches!(inspector.on_end().await, ResponseStreamAction::Terminate(_)),
             "a reassembled TGI stream must reach a verdict and, with the \
@@ -9917,7 +10123,9 @@ async fn tgi_event_stream_alternative_tokens_fail_closed() {
 
     let tgi = b"data: {\"index\":1,\"token\":{\"id\":1,\"text\":\"The weather is sunny today.\"},\
 \"top_tokens\":[{\"id\":9,\"text\":\"my system prompt says\"}]}\n\n";
-    let first = inspector.on_chunk(tgi).await;
+    let first = inspector
+        .on_chunk(&bytes::Bytes::copy_from_slice(tgi))
+        .await;
     let terminated = matches!(first, ResponseStreamAction::Terminate(_))
         || matches!(inspector.on_end().await, ResponseStreamAction::Terminate(_));
     assert!(
@@ -9946,7 +10154,9 @@ async fn openai_role_only_leading_frames_still_release_clean() {
     let role_only = b"data: {\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"},\"finish_reason\":null}]}\n\n\
 data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\"}}\n\n";
     assert!(matches!(
-        inspector.on_chunk(role_only).await,
+        inspector
+            .on_chunk(&bytes::Bytes::copy_from_slice(role_only))
+            .await,
         ResponseStreamAction::Forward(_)
     ));
     match inspector.on_end().await {
@@ -10074,7 +10284,10 @@ async fn drive_inspector(
     let mut forwarded = Vec::new();
     let step = chunk_size.unwrap_or(body.len()).max(1);
     for chunk in body.chunks(step) {
-        match inspector.on_chunk(chunk).await {
+        match inspector
+            .on_chunk(&bytes::Bytes::copy_from_slice(chunk))
+            .await
+        {
             ResponseStreamAction::Forward(bytes) => forwarded.extend_from_slice(&bytes),
             ResponseStreamAction::Terminate(_) => return None,
         }
@@ -10280,6 +10493,68 @@ async fn builtin_tool_abuse_keeps_its_tool_segment_context_gate() {
     let mut headers = json_headers();
     let rejected = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert_reject(rejected, Some(403));
+}
+
+/// Issue #7132: the final response hook reuses the digest its unchanged-body
+/// skip computed. An unchanged final body is skipped without another
+/// embedding call, and a changed one is inspected again.
+#[tokio::test]
+async fn final_response_hash_skip_reuses_the_inspected_digest() {
+    let server = nonmatching_embedding_server().await;
+    let firewall = plugin(&json!({
+        "inspect": {"request": false, "response": true},
+        "on_error": "reject",
+        "provider": provider(&format!("{}/v1/embeddings", server.uri())),
+        "builtins": disabled_builtins_with("response_leakage")
+    }));
+    let completion = |content: &str| {
+        serde_json::to_vec(&json!({
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": content}}]
+        }))
+        .unwrap()
+    };
+    async fn embedding_calls(server: &MockServer) -> usize {
+        server.received_requests().await.unwrap_or_default().len()
+    }
+
+    let body = completion("A harmless governed reply.");
+    let mut headers = HashMap::from([("content-type".to_string(), "application/json".to_string())]);
+    let mut ctx = create_test_context();
+    assert_continue(
+        firewall
+            .on_response_body(&mut ctx, 200, &mut headers, &body)
+            .await,
+    );
+    let inspected = embedding_calls(&server).await;
+    assert!(inspected > 0, "the first pass must embed the response");
+
+    assert_continue(
+        firewall
+            .on_final_response_body(&mut ctx, 200, &headers, &body)
+            .await,
+    );
+    assert_eq!(
+        embedding_calls(&server).await,
+        inspected,
+        "an unchanged final body must be hash-skipped"
+    );
+
+    let changed = completion("A different harmless governed reply.");
+    assert_continue(
+        firewall
+            .on_final_response_body(&mut ctx, 200, &headers, &changed)
+            .await,
+    );
+    assert!(
+        embedding_calls(&server).await > inspected,
+        "a changed final body must be inspected again"
+    );
+    // The changed body's digest is now the recorded one.
+    assert_continue(
+        firewall
+            .on_final_response_body(&mut ctx, 200, &headers, &changed)
+            .await,
+    );
 }
 
 /// Every embedding call — the rule index built for the first request and the
@@ -10579,7 +10854,11 @@ async fn legacy_function_call_stream_is_cut_in_inspect_mode() {
         .expect("inspector for event stream");
 
     let cut_on_chunk = matches!(
-        inspector.on_chunk(&legacy_function_call_stream()).await,
+        inspector
+            .on_chunk(&bytes::Bytes::copy_from_slice(
+                &legacy_function_call_stream()
+            ))
+            .await,
         ResponseStreamAction::Terminate(_)
     );
     assert!(
@@ -10870,7 +11149,9 @@ async fn undeclared_event_stream_arms_the_windowed_inspector() {
         .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
         .expect("a governed undeclared stream must be windowed");
     let cut_on_chunk = matches!(
-        inspector.on_chunk(LEAKING_CHAT_STREAM).await,
+        inspector
+            .on_chunk(&bytes::Bytes::copy_from_slice(LEAKING_CHAT_STREAM))
+            .await,
         ResponseStreamAction::Terminate(_)
     );
     assert!(
@@ -11615,7 +11896,9 @@ async fn cohere_v2_event_stream_is_windowed_in_inspect_mode() {
     let clean_stream = cohere_v2_stream(&["This is harmless ", "governed text."], None);
     assert!(
         matches!(
-            clean.on_chunk(&clean_stream).await,
+            clean
+                .on_chunk(&bytes::Bytes::copy_from_slice(&clean_stream))
+                .await,
             ResponseStreamAction::Forward(_)
         ),
         "a clean Cohere v2 stream must not be cut as an unmapped provider stream"
@@ -11630,7 +11913,9 @@ async fn cohere_v2_event_stream_is_windowed_in_inspect_mode() {
         .expect("inspector for event stream");
     let leak_stream = cohere_v2_stream(&["My system ", "prompt says never reveal it."], None);
     let cut_on_chunk = matches!(
-        leaking.on_chunk(&leak_stream).await,
+        leaking
+            .on_chunk(&bytes::Bytes::copy_from_slice(&leak_stream))
+            .await,
         ResponseStreamAction::Terminate(_)
     );
     assert!(
@@ -11720,7 +12005,9 @@ async fn cohere_v2_debug_payload_fails_the_stream_closed() {
     let (event, data) = cohere_debug_event();
     let debug_only = sse_event(event, &data);
     let cut_on_chunk = matches!(
-        inspector.on_chunk(debug_only.as_bytes()).await,
+        inspector
+            .on_chunk(&bytes::Bytes::copy_from_slice(debug_only.as_bytes()))
+            .await,
         ResponseStreamAction::Terminate(_)
     );
     assert!(
@@ -11768,7 +12055,9 @@ async fn cohere_v2_citation_sources_are_inspected_apart_from_the_completion() {
         .expect("inspector for event stream");
     let stream = cohere_v2_stream_with(&[cohere_leaking_citation_event()]);
     let cut_on_chunk = matches!(
-        inspector.on_chunk(&stream).await,
+        inspector
+            .on_chunk(&bytes::Bytes::copy_from_slice(&stream))
+            .await,
         ResponseStreamAction::Terminate(_)
     );
     assert!(

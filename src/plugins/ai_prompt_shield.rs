@@ -657,8 +657,6 @@ pub struct AiPromptShield {
     max_scan_bytes: usize,
     /// True when action is Redact — enables transform_request_body.
     needs_body_transform: bool,
-    /// True when the plugin has valid patterns and may need to inspect bodies.
-    requires_request_body: bool,
     /// Instance-specific metadata marker for compressed-body deferral.
     deferred_compressed_marker: String,
 }
@@ -849,15 +847,12 @@ impl AiPromptShield {
             return Err("ai_prompt_shield: config must be an object".to_string());
         };
 
-        if let Some(unknown) = config_object
-            .keys()
-            .find(|key| !ALLOWED_CONFIG_KEYS.contains(&key.as_str()))
-        {
-            return Err(format!(
-                "ai_prompt_shield: unknown config field {unknown:?}; allowed fields: `{}`",
-                ALLOWED_CONFIG_KEYS.join("`, `")
-            ));
-        }
+        crate::util::unknown_keys::reject_unknown_keys(
+            config_object,
+            "config",
+            ALLOWED_CONFIG_KEYS,
+            "ai_prompt_shield: `config`: ",
+        )?;
 
         let action = match optional_string(config, "action")?.unwrap_or("reject") {
             "reject" => ShieldAction::Reject,
@@ -961,15 +956,12 @@ impl AiPromptShield {
                         "ai_prompt_shield: `custom_patterns[{index}]` must be an object"
                     ));
                 };
-                if let Some(unknown) = entry_object
-                    .keys()
-                    .find(|key| !ALLOWED_CUSTOM_PATTERN_KEYS.contains(&key.as_str()))
-                {
-                    return Err(format!(
-                        "ai_prompt_shield: unknown config field `custom_patterns[{index}]` key {unknown:?}; allowed fields: `{}`",
-                        ALLOWED_CUSTOM_PATTERN_KEYS.join("`, `")
-                    ));
-                }
+                crate::util::unknown_keys::reject_unknown_keys(
+                    entry_object,
+                    &format!("custom_patterns[{index}]"),
+                    ALLOWED_CUSTOM_PATTERN_KEYS,
+                    &format!("ai_prompt_shield: `custom_patterns[{index}]`: "),
+                )?;
                 let name = entry_object
                     .get("name")
                     .and_then(Value::as_str)
@@ -1019,7 +1011,6 @@ impl AiPromptShield {
         }
 
         let needs_body_transform = action == ShieldAction::Redact;
-        let requires_request_body = !patterns.is_empty();
 
         // Build a single combined RegexSet for O(text_len) detection.
         // Each pattern was already validated above (compiled as a Regex), so
@@ -1041,7 +1032,6 @@ impl AiPromptShield {
             exclude_roles,
             max_scan_bytes,
             needs_body_transform,
-            requires_request_body,
             deferred_compressed_marker,
         })
     }
@@ -1140,9 +1130,6 @@ impl AiPromptShield {
     /// (`ScanMode::Content`) or owned/`Cow` text (`ScanMode::All`, which must
     /// collect stringified JSON numbers that have no backing `&str`).
     fn detect_pii<S: AsRef<str>>(&self, texts: &[S]) -> Vec<String> {
-        if self.patterns.is_empty() {
-            return Vec::new();
-        }
         let mut hit = vec![false; self.patterns.len()];
         for text in texts {
             for idx in self.detection_set.matches(text.as_ref()).into_iter() {
@@ -1171,10 +1158,6 @@ impl AiPromptShield {
     /// strings, and text runs separated by an image/non-text part are never
     /// joined.
     fn detect_pii_content_mode(&self, json: &Value) -> Vec<String> {
-        if self.patterns.is_empty() {
-            return Vec::new();
-        }
-
         let mut hit = vec![false; self.patterns.len()];
         let texts = self.extract_scan_text(json);
         for text in texts {
@@ -1429,9 +1412,6 @@ impl AiPromptShield {
     /// rewrite cannot remove fails closed rather than forwarding PII while
     /// claiming redaction succeeded.
     fn detect_pii_all_mode(&self, json: &Value, raw: &str) -> Vec<String> {
-        if self.patterns.is_empty() {
-            return Vec::new();
-        }
         let mut hit = vec![false; self.patterns.len()];
         // Pass 1: decoded tokens.
         let mut texts: Vec<Cow<'_, str>> = Vec::new();
@@ -1502,9 +1482,6 @@ impl AiPromptShield {
     /// every argument is caller-supplied tool input. Other members, other
     /// methods, and the rest of the envelope are not scanned.
     fn detect_pii_mcp_arguments(&self, json: &Value) -> Vec<String> {
-        if self.patterns.is_empty() {
-            return Vec::new();
-        }
         let mut hit = vec![false; self.patterns.len()];
         for call in mcp_jsonrpc::tool_calls_in_value(json) {
             let Some(arguments) = call.arguments else {
@@ -1748,9 +1725,6 @@ impl AiPromptShield {
     /// survives minification unchanged — so it does not need to drive this
     /// contextual verdict as well.
     fn original_has_unredactable_contextual_match(&self, raw: &str) -> bool {
-        if self.patterns.is_empty() {
-            return false;
-        }
         // Cheap DFA pre-check: nothing fired on the raw body at all.
         if !self.detection_set.is_match(raw) {
             return false;
@@ -1972,9 +1946,6 @@ impl AiPromptShield {
     /// patterns that have no single rewritable token — all genuine
     /// "detected but not removed" cases.
     fn redacted_body_has_residual_pii(&self, json: &Value) -> bool {
-        if self.patterns.is_empty() {
-            return false;
-        }
         let mut check = json.clone();
         if let Value::Object(map) = &mut check {
             for (key, value) in map.iter_mut() {
@@ -2369,7 +2340,9 @@ impl Plugin for AiPromptShield {
     }
 
     fn requires_request_body_before_before_proxy(&self) -> bool {
-        self.requires_request_body
+        // The constructor refuses an instance without patterns, so every
+        // instance may need to inspect bodies.
+        true
     }
 
     fn should_buffer_request_body(&self, ctx: &RequestContext) -> bool {
@@ -2377,8 +2350,7 @@ impl Plugin for AiPromptShield {
         // ordinary modes that is every `POST` / `PUT` / `PATCH` that is not
         // framed gRPC, whatever its `Content-Type` says, so omitting or
         // relabelling the header cannot keep a JSON body away from the shield.
-        self.requires_request_body
-            && self.method_in_scope(&ctx.method)
+        self.method_in_scope(&ctx.method)
             && self.body_scope(ctx.headers.get("content-type").map(String::as_str))
                 != BodyScope::Out
     }
@@ -2747,7 +2719,7 @@ impl Plugin for AiPromptShield {
     }
 
     fn needs_final_request_body_context(&self) -> bool {
-        self.requires_request_body
+        true
     }
 
     /// Claim the finalized backend-visible representation for an enforcing
@@ -2769,7 +2741,7 @@ impl Plugin for AiPromptShield {
         headers: &HashMap<String, String>,
         _body: &[u8],
     ) -> bool {
-        if !self.requires_request_body || self.action == ShieldAction::Warn {
+        if self.action == ShieldAction::Warn {
             return false;
         }
         if !self.method_in_scope(&ctx.method) {

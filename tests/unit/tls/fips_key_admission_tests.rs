@@ -938,8 +938,9 @@ fn gated_wrappers_are_inert_without_bootstrap() {
     let der = self_signed_der(&rcgen::PKCS_ED25519);
     keys::check_certificate_public_key(&der, "frontend TLS certificate")
         .expect("inert when FIPS mode is off");
-    keys::check_jwk_rsa_modulus(&[0xFFu8; 64]).expect("inert when FIPS mode is off");
-    keys::check_jwk_ec_curve("secp256k1").expect("inert when FIPS mode is off");
+    keys::check_jwk_rsa_public_key(&[0xFFu8; 64], &[0x03]).expect("inert when FIPS mode is off");
+    keys::check_jwk_ec_public_key(Some("secp256k1"), &[], &[])
+        .expect("inert when FIPS mode is off");
     keys::check_jwk_okp_public_key().expect("inert when FIPS mode is off");
     policy::check_external_secret_sources().expect("inert when FIPS mode is off");
 

@@ -21,8 +21,8 @@ use super::utils::rate_limit::{
     DynamicHttpRateLimitAlgorithm, DynamicRateLimitOp, ENFORCEMENT_UNAVAILABLE_BODY,
     ENFORCEMENT_UNAVAILABLE_STATUS, LocalStateSemantics, RATE_LIMIT_REDIS_CONFIG_KEYS,
     RateLimitBackend, RateLimitOutcome, RateLimitWindowSpec, STANDALONE_RATE_LIMIT_CONFIG_ID,
-    apply_rate_limit_cleanup, debug_assert_closed_root_keys, debug_assert_rate_limit_redis_keys,
-    validate_max_requests, validate_window_seconds,
+    debug_assert_closed_root_keys, debug_assert_rate_limit_redis_keys, validate_max_requests,
+    validate_window_seconds,
 };
 use super::{Plugin, PluginHttpClient, PluginResult, RequestContext};
 use crate::util::unknown_keys::reject_unknown_keys;
@@ -355,7 +355,6 @@ pub struct RateLimiting {
 }
 
 impl RateLimiting {
-    #[allow(dead_code)] // direct/test construction; production factory supplies the config id
     pub fn new(config: &Value, http_client: PluginHttpClient) -> Result<Self, String> {
         Self::new_with_config_id(config, http_client, STANDALONE_RATE_LIMIT_CONFIG_ID)
     }
@@ -400,9 +399,6 @@ impl RateLimiting {
                 config = config.to_string()
             )
         })?;
-        // Legacy root window fields get their own actionable diagnostic before
-        // the closed-key sweep would report them as merely "unknown".
-        reject_legacy_window_fields(object)?;
         // Keeps the documented key groups aligned with the closed root
         // allowlist used for admission and OpenAPI parity.
         debug_assert_rate_limit_redis_keys();
@@ -554,7 +550,6 @@ impl RateLimiting {
     /// Lets composition tests drive a real `503` through `on_request_received`
     /// with a live `RequestContext`, instead of only through the key-level
     /// helper below. Not a production API.
-    #[allow(dead_code)] // used only by external tests; dead in binary test target
     pub(crate) fn mark_redis_unavailable_for_test(&self) -> bool {
         match self.limiter.redis_client_arc_for_test() {
             Some(client) => {
@@ -571,7 +566,6 @@ impl RateLimiting {
     ///
     /// Exercises the production [`Self::reject`] mapping so the fail-closed
     /// status/body cannot drift from the outage path. Not a production API.
-    #[allow(dead_code)] // used only by external tests; dead in binary test target
     pub(crate) async fn refusal_under_redis_outage_for_test(
         &self,
         key: &str,
@@ -651,20 +645,14 @@ impl RateLimiting {
     }
 
     /// Invoke the production cleanup wrapper at `now`. Test-only.
-    #[allow(dead_code)] // used only by external tests; dead in binary test target
     pub(crate) fn maybe_evict_stale_entries_at_for_test(&self, now: Instant) {
         self.maybe_evict_stale_entries_at(now);
     }
 
-    /// Exercise the shared prune/enforce branch with a testable cap. Test-only.
+    /// Run the shared idle-state prune at `now`. Test-only.
     #[allow(dead_code)] // used only by external tests; dead in binary test target
-    pub(crate) fn apply_cleanup_branch_for_test(
-        &self,
-        now: Instant,
-        over_capacity: bool,
-        max_entries: usize,
-    ) {
-        apply_rate_limit_cleanup(&self.limiter, max_entries, now, over_capacity);
+    pub(crate) fn prune_stale_for_test(&self, now: Instant) {
+        self.limiter.prune_stale_at(now);
     }
 
     #[allow(dead_code)] // used only by external tests; dead in binary test target
@@ -696,7 +684,7 @@ impl RateLimiting {
         // atomic admission reservation. The below-cap cooldown must not
         // suppress this branch once pressure is seen on a sampled pass.
         if len > self.max_state_entries {
-            apply_rate_limit_cleanup(&self.limiter, self.max_state_entries, now, true);
+            self.limiter.prune_stale_at(now);
             self.last_periodic_sweep_secs
                 .store(now_secs, Ordering::Release);
             return;
@@ -717,7 +705,7 @@ impl RateLimiting {
             return;
         }
 
-        apply_rate_limit_cleanup(&self.limiter, self.max_state_entries, now, false);
+        self.limiter.prune_stale_at(now);
     }
 
     fn request_key(&self, ctx: &RequestContext) -> String {
@@ -1960,27 +1948,6 @@ fn parse_limit_scope(
             "{label}: `scope` must be `default` or `consumers`, got: {other:?}"
         )),
     }
-}
-
-fn reject_legacy_window_fields(object: &serde_json::Map<String, Value>) -> Result<(), String> {
-    static LEGACY_FIELDS: &[&str] = &[
-        "requests_per_second",
-        "requests_per_minute",
-        "requests_per_hour",
-        "window_seconds",
-        "max_requests",
-        "consumer_limits",
-    ];
-
-    for field in LEGACY_FIELDS {
-        if object.contains_key(*field) {
-            return Err(format!(
-                "rate_limiting: `{field}` must be configured inside `limits` rules"
-            ));
-        }
-    }
-
-    Ok(())
 }
 
 fn validate_limit_rule_fields(

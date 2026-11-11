@@ -610,8 +610,8 @@ the `ai_model` / `ai_provider` keys `ai_token_metrics` publishes under its
 default `metadata_prefix`; with another prefix that fallback is empty.
 Request correlation prefers private canonical state from the built-in
 `correlation_id` plugin. On custom-only chains it falls back to transaction
-metadata `request_id`, then legacy `correlation_id`; canonical state always wins
-over either plugin-writable compatibility key.
+metadata `request_id` (the only metadata key read; a custom plugin must write
+that key); canonical state always wins over that plugin-writable key.
 `approval.timeout_ms` defaults to 1500 and may not exceed 30000. A single
 governed batch resolves its approvals with at most **8 webhook calls in
 flight** (parallel tool calls cost about one round trip, not one per call),

@@ -2138,9 +2138,9 @@ fn rejects_unknown_fields_at_every_config_boundary() {
         let error = OidcRelyingParty::new(&config, PluginHttpClient::default())
             .err()
             .expect("unknown field must be rejected");
-        let (path, field) = scope.rsplit_once('.').expect("field path");
+        let (path, _field) = scope.rsplit_once('.').expect("field path");
         assert!(error.contains(&format!("`{path}`")), "{error}");
-        assert!(error.contains(&format!("{field:?}")), "{error}");
+        assert!(error.contains(&format!("{scope:?}")), "{error}");
     }
 }
 
@@ -2152,7 +2152,7 @@ fn shared_validation_entrypoint_rejects_authorization_policy_typo() {
     let error = validate_plugin_config("oidc_relying_party", &config)
         .expect_err("validation must reject unknown authorization fields");
     assert!(error.contains("`provider[0]`"));
-    assert!(error.contains("\"required_role\""));
+    assert!(error.contains("\"provider[0].required_role\""), "{error}");
 }
 
 #[test]
@@ -4669,9 +4669,9 @@ fn the_documented_minimal_examples_pass_admission() {
     ] {
         let example = first_oidc_yaml_example(doc)
             .unwrap_or_else(|| panic!("{source} must document an oidc_relying_party example"));
-        // Plugin config is never environment-expanded, and admission does not
-        // screen `client_secret`, so a `${NAME}` value there would be sent to
-        // the provider verbatim (issue #7275).
+        // Plugin config is never environment-expanded, and admission refuses a
+        // `${NAME}` value in `client_secret` (issue #7275), so an
+        // environment-style example would not be admissible as written.
         assert!(
             !example.contains("client_secret: \"${"),
             "{source} example must not show an environment-style client_secret"
@@ -5070,6 +5070,36 @@ fn published_or_placeholder_session_secrets_are_rejected_for_both_fields() {
     }
 }
 
+/// Issue #7275: plugin config is never environment-expanded, so a
+/// `client_auth.client_secret` written as `${NAME}` would be sent to the IdP
+/// verbatim and every token exchange would fail. Admission refuses it for both
+/// secret methods, as it already does for the session secrets, without echoing
+/// the value.
+#[test]
+fn env_placeholder_client_secret_is_rejected_for_both_secret_methods() {
+    for method in ["client_secret_basic", "client_secret_post"] {
+        for secret in ["${OIDC_CLIENT_SECRET}", "prefix-${CLIENT_SECRET}-suffix"] {
+            let mut config = base_config();
+            config["providers"][0]["client_auth"] =
+                json!({"method": method, "client_secret": secret});
+            let error = validate_plugin_config("oidc_relying_party", &config)
+                .expect_err("an env placeholder client_secret must be refused");
+            assert_eq!(
+                error,
+                "oidc_relying_party: `client_auth.client_secret` contains an unresolved \
+                 `${NAME}` placeholder; plugin config values are literal",
+                "method {method} produced an unexpected error"
+            );
+        }
+    }
+    for secret in ["literal-${-secret", "${9NOT_A_NAME}-secret"] {
+        let mut config = base_config();
+        config["providers"][0]["client_auth"]["client_secret"] = json!(secret);
+        validate_plugin_config("oidc_relying_party", &config)
+            .expect("ordinary client_secret text containing `${` must be admitted");
+    }
+}
+
 #[test]
 fn ordinary_secret_text_is_not_rejected_as_a_template_or_sample() {
     for secret in [
@@ -5185,7 +5215,10 @@ fn configuration_diagnostics_keep_schema_and_withhold_supplied_values() {
         "private_key_pem": canary
     });
     let cases: &[(serde_json::Value, &[&str])] = &[
-        (unknown_session, &["`session`", "unknown field"]),
+        (
+            unknown_session,
+            &["`session`", "unknown configuration key(s)"],
+        ),
         (invalid_store, &["`session.store`", "must be a string"]),
         (
             invalid_key,
@@ -6038,7 +6071,15 @@ async fn post_login_redirects_require_a_trusted_origin() {
             "https://app.example.com:8443/admin",
             "https://app.example.com:8443/admin",
         ),
-        (OTHER_PORT, "https://app.example.com/admin", "/"),
+        // The `redirect_uri`'s own origin (`app.example.com:443`) is always
+        // trusted, whatever the explicit list names (issue #7147).
+        (
+            OTHER_PORT,
+            "https://app.example.com/admin",
+            "https://app.example.com/admin",
+        ),
+        (OTHER_PORT, "https://other.example.com/admin", "/"),
+        (HOST_ONLY, "https://other.example.com/admin", "/"),
     ] {
         let server = MockServer::start().await;
         let plugin = callback_plugin_with(&server, |config| {
@@ -6061,6 +6102,52 @@ async fn post_login_redirects_require_a_trusted_origin() {
             headers.get("location").map(String::as_str),
             Some(expected),
             "trusted={trusted:?} rd={target}"
+        );
+    }
+}
+
+/// Issue #7147: under the minimal config (no `trusted_redirect_hosts`, no
+/// redirect parameter) the deep link sealed at the challenge survives login,
+/// because the `redirect_uri`'s own origin is implicitly trusted. A sealed
+/// target on another port of the same host is a different origin and still
+/// lands on `post_login_default_path`.
+#[serial_test::serial(jwks_remote_global_cache)]
+#[tokio::test]
+async fn deep_links_on_the_callback_origin_survive_login_without_an_allowlist() {
+    for (host, expected) in [
+        ("app.example.com", "https://app.example.com/app/orders?id=7"),
+        ("app.example.com:8443", "/home"),
+    ] {
+        let server = MockServer::start().await;
+        let plugin = callback_plugin_with(&server, |config| {
+            let behavior = config["behavior"].as_object_mut().expect("behavior object");
+            behavior.remove("trusted_redirect_hosts");
+            behavior.remove("post_login_redirect_param");
+            behavior.insert("post_login_default_path".to_string(), json!("/home"));
+        })
+        .await;
+        let mut ctx = RequestContext::new("127.0.0.1".into(), "GET".into(), "/app/orders".into());
+        ctx.request_is_secure = true;
+        ctx.headers
+            .insert("accept".to_string(), "text/html".to_string());
+        ctx.headers.insert("host".to_string(), host.to_string());
+        ctx.metadata
+            .insert("ferrum.frontend_scheme".to_string(), "https".to_string());
+        ctx.set_raw_query_string("id=7".to_string());
+        ctx.materialize_query_params();
+        let challenge = issue_browser_challenge_for_context(&plugin, ctx).await;
+        let id_token = create_rs256_token(
+            &oidc_id_token_claims(&challenge),
+            include_bytes!("../../../tests/fixtures/test_rsa_private.pem"),
+        );
+        mount_token_and_jwks(&server, &id_token).await;
+        let headers = assert_callback_redirect(
+            complete_callback(&plugin, &challenge, "authorization-code").await,
+        );
+        assert_eq!(
+            headers.get("location").map(String::as_str),
+            Some(expected),
+            "host={host}"
         );
     }
 }

@@ -933,7 +933,7 @@ fn h3_grpc_web_accept_rejection_keeps_http_406_contract() {
     );
 
     let committed_start = source
-        .find("async fn run_h3_deadline_bounded_reject_committed_hooks_with_policy(")
+        .find("async fn run_h3_deadline_bounded_reject_committed_hooks(")
         .expect("bounded committed-hook helper must remain present");
     let committed = &source[committed_start..];
     let committed_end = committed
@@ -991,7 +991,7 @@ fn h3_plugin_reject_commit_is_not_deferred_to_send_helpers() {
     );
 
     assert!(
-        source.contains("run_h3_deadline_bounded_reject_committed_hooks_with_policy("),
+        source.contains("run_h3_deadline_bounded_reject_committed_hooks("),
         "every public and policy-aware H3 rejection helper must share one bounded contract"
     );
     let committed_boundaries = source
@@ -1072,8 +1072,9 @@ fn h3_plugin_reject_commit_is_not_deferred_to_send_helpers() {
         committed_boundaries - shared_terminal_commit_definitions + shared_terminal_reject_sends;
     assert_eq!(
         effective_plugin_committed_boundaries,
-        plugin_reject_sends + direct_recv_halt_plugin_rejects + 1,
-        "every plugin-aware reject send needs one direct or shared committed boundary; the extra count is the second helper definition"
+        plugin_reject_sends + direct_recv_halt_plugin_rejects + 2,
+        "every plugin-aware reject send needs one direct or shared committed boundary; the two \
+         extra counts are the bounded helper's definition and the public helper's call into it"
     );
 
     for (start_marker, end_marker, phase) in [

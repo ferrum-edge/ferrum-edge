@@ -51,7 +51,7 @@ impl HttpBatchDrainOutcome {
 
 /// Discard a sink response body under the shared hard cap and drain timeout.
 ///
-/// Used by [`handle_http_batch_response`] and by Loki's delivery classifier so
+/// Used by [`handle_http_batch_response_redacted`] and by Loki's delivery classifier so
 /// every HTTP log sink shares one keep-alive-safe drain contract.
 ///
 /// After a complete EOF drain the reqwest/hyper client returns the socket to
@@ -475,7 +475,7 @@ fn has_non_empty_authority(endpoint_url: &str) -> bool {
 /// plugin so operators see terminal collector rejection in the published loss
 /// metric. Tests that should not publish loss pass an empty string.
 ///
-/// Status semantics are unchanged from the historical helper:
+/// Status semantics:
 /// - 2xx succeeds (drain is best-effort so a committed ACK is never retried)
 /// - non-408/429 4xx discards without retry
 /// - 408/429/5xx (and other non-success statuses) remain retryable
@@ -485,41 +485,12 @@ fn has_non_empty_authority(endpoint_url: &str) -> bool {
 /// [`HTTP_BATCH_RESPONSE_DRAIN_TIMEOUT`] so HTTP/1.1 keep-alive connections can
 /// be reused. Peer-controlled body bytes are never logged or retained.
 ///
-/// A transport error is rendered without its request URL, so the result never
-/// echoes an endpoint credential. The observability sinks covered by advisory
-/// GHSA-8594-2xhc-8g38 use [`handle_http_batch_response_redacted`], which
-/// takes an already-redacted error string.
-#[allow(dead_code)] // No in-binary caller remains; used by tests/unit/plugins/
-pub async fn handle_http_batch_response(
-    plugin_label: &str,
-    plugin_name: &'static str,
-    entry_count: usize,
-    result: Result<reqwest::Response, reqwest::Error>,
-) -> Result<(), String> {
-    match result {
-        Ok(response) => {
-            let status = response.status();
-            let drain = drain_http_batch_response_body(response).await;
-            classify_http_batch_response(plugin_label, plugin_name, entry_count, status, drain)
-        }
-        // `reqwest::Error`'s `Display` includes the request URL, which can
-        // carry a credential in its path or query. Strip it so this helper is
-        // safe for any sink, not only credential-free endpoints.
-        Err(error) => Err(format!(
-            "{plugin_label} batch failed: {}",
-            error.without_url()
-        )),
-    }
-}
-
-/// [`handle_http_batch_response`] for sinks whose endpoint may embed a
-/// credential in its path or query.
-///
-/// Takes the already-sanitized `Err` string produced by
+/// The endpoint may embed a credential in its path or query (advisory
+/// GHSA-8594-2xhc-8g38), so the `Err` side is the already-sanitized string
+/// produced by
 /// [`PluginHttpClient::execute_redacted`](super::PluginHttpClient::execute_redacted)
-/// — an error class plus a structurally redacted URL — instead of a
-/// `reqwest::Error`, whose `Display` prints the complete request URL. Success
-/// classification is byte-identical to the unredacted helper.
+/// — an error class plus a structurally redacted URL — never a
+/// `reqwest::Error`, whose `Display` prints the complete request URL.
 pub async fn handle_http_batch_response_redacted(
     plugin_label: &str,
     plugin_name: &'static str,

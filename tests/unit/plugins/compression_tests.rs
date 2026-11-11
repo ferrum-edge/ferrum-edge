@@ -231,24 +231,16 @@ fn test_invalid_bool_config_rejected() {
     assert!(err.contains("decompress_request"), "got: {}", err);
 }
 
+/// `disable_on_etag` is an ordinary unknown key (no dedicated removed-key
+/// diagnostic, issue #7113); `weaken_strong_etag` is the current ETag knob.
 #[test]
-fn test_removed_disable_on_etag_config_rejected() {
+fn test_disable_on_etag_is_an_unknown_key() {
     let err = CompressionPlugin::new(&json!({"disable_on_etag": false}))
         .err()
-        .expect("removed ETag config must be rejected");
+        .expect("disable_on_etag must be rejected");
     assert!(
-        err.contains("disable_on_etag") && err.contains("removed"),
-        "got: {err}"
-    );
-    // Strong validators are preserved only by default; `weaken_strong_etag`
-    // opts into compressing them (issue #7113).
-    assert!(
-        err.contains("weaken_strong_etag") && !err.contains("always preserved"),
-        "the migration hint must point at the current ETag knob: {err}"
-    );
-    assert!(
-        !err.contains("unknown configuration key"),
-        "removed-key diagnostic must win over the generic unknown-key gate: {err}"
+        err.contains("unknown configuration key"),
+        "the generic unknown-key gate reports it: {err}"
     );
 }
 

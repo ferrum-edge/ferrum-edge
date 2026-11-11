@@ -11,8 +11,6 @@
 //! mesh subsystem will share the same `FERRUM_NAMESPACE` mechanism so a
 //! single gateway instance only loads its own namespace's mesh resources.
 
-#![allow(dead_code)]
-
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
 use std::collections::{BTreeSet, HashMap, HashSet};
@@ -3146,30 +3144,33 @@ pub fn destination_rule_lookup_tier(
     }
 }
 
-pub fn service_entry_applies_to_workload<L: WorkloadLabels + ?Sized>(
-    entry: &ServiceEntry,
-    workload_namespace: &str,
-    _workload_labels: &L,
-) -> bool {
+/// Whether `entry` applies to a workload in `workload_namespace`: export
+/// visibility only. `ServiceEntry.workload_selector` is carried but not
+/// consumed (no endpoint selection from selected workloads), and Kubernetes
+/// status reports it as a deferred field.
+pub fn service_entry_applies_to_workload(entry: &ServiceEntry, workload_namespace: &str) -> bool {
     service_entry_exported_to_namespace(entry, workload_namespace)
 }
 
 // ── PeerAuthentication ────────────────────────────────────────────────────
 
+/// A PeerAuthentication. `scope` is its only applicability shape, the same
+/// [`PolicyScope`] every other mesh policy resource carries (issue #7243);
+/// `namespace` is the declaring namespace, as on [`MeshPolicy`].
+///
 /// Closed (`deny_unknown_fields`, issue #6616) like the authorization grammar
 /// and `MeshRequestAuthentication`: a misspelled `mtls_mode` would otherwise
 /// default the policy to `PERMISSIVE`, admitting plaintext the operator meant
-/// to refuse.
+/// to refuse. The earlier scope-less `selector` form is therefore refused like
+/// any other unknown member, and a document without `scope` is refused as
+/// missing a required field; the ConfigSync revision that carries this shape
+/// is `CONFIG_SYNC_PROTOCOL_REVISION` 4.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PeerAuthentication {
     pub name: String,
     pub namespace: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub scope: Option<PolicyScope>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[serde(deserialize_with = "crate::util::json_object::deserialize_optional_object")]
-    pub selector: Option<WorkloadSelector>,
+    pub scope: PolicyScope,
     #[serde(default)]
     pub mtls_mode: MtlsMode,
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
@@ -3181,18 +3182,10 @@ impl PeerAuthentication {
     /// canonical predicate for PeerAuthentication scope classification and
     /// `portLevelMtls` applicability across translated and native slices.
     pub fn has_workload_selector(&self) -> bool {
-        match self.scope.as_ref() {
-            Some(PolicyScope::WorkloadSelector { selector }) => selector.has_labels(),
-            Some(
-                PolicyScope::MeshWide
-                | PolicyScope::Namespace { .. }
-                | PolicyScope::TargetRefs { .. },
-            ) => false,
-            None => self
-                .selector
-                .as_ref()
-                .is_some_and(WorkloadSelector::has_labels),
-        }
+        matches!(
+            &self.scope,
+            PolicyScope::WorkloadSelector { selector } if selector.has_labels()
+        )
     }
 }
 
@@ -4402,12 +4395,6 @@ pub struct MeshTrafficPolicy {
 /// resolved slots and dispatch wiring.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MeshConnectionPoolHttp {
-    /// Deprecated carrier for `maxRequestsPerConnection`. New K8s translation
-    /// validates and warns on the field, reports it as deferred, and does not
-    /// populate this slot because Ferrum has no backend close-after-N-requests
-    /// behavior.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub max_requests_per_connection: Option<u32>,
     /// Mapped from `idleTimeout` (parsed as an Istio duration, persisted
     /// as milliseconds). Translator rejects sub-second durations because
     /// the proxy-level `pool_idle_timeout_seconds` field is whole-second
@@ -7570,14 +7557,12 @@ fn validate_mesh_config_internal(
             &pa.namespace,
             &mut errors,
         );
-        if let Some(scope) = pa.scope.as_ref() {
-            reject_unsupported_target_refs_scope(
-                "PeerAuthentication",
-                &pa.name,
-                scope,
-                &mut errors,
-            );
-        }
+        reject_unsupported_target_refs_scope(
+            "PeerAuthentication",
+            &pa.name,
+            &pa.scope,
+            &mut errors,
+        );
         for port in pa.port_overrides.keys() {
             validate_non_zero_port(
                 format!(
@@ -9513,9 +9498,8 @@ pub(crate) fn normalize_mesh_policy_header_map(headers: &mut HashMap<String, Str
 /// ([`crate::plugins::fault_injection::runtime_overlay`]). Accepted slices also
 /// fan the remaining process-wide knobs out through
 /// [`crate::modes::mesh::runtime_overlay_consumers::apply_overlay`]:
-/// request/response transformer gates
-/// ([`crate::plugins::request_transformer::runtime_overlay`],
-/// [`crate::plugins::response_transformer::runtime_overlay`]), and the
+/// the response transformer gate map
+/// ([`crate::plugins::response_transformer::runtime_overlay`]) and the
 /// gateway-wide tracing filter ([`crate::logging::runtime_overlay`]).
 ///
 /// Wire compatibility: the type is an optional field on `MeshSlice` with

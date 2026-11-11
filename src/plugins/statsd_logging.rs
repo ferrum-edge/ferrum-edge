@@ -31,7 +31,7 @@ use super::utils::sink_loss::SinkLossReason;
 use super::utils::{
     BatchConfig, BatchConfigDefaults, BatchingLoggerPermit, ByteBudget, ByteLease,
     DeferredBatchingLogger, PluginHttpClient, UDP_RE_RESOLVE_INTERVAL, admit_byte_limits,
-    bind_connected_udp_socket, build_batch_config, parse_socket_host, resolve_udp_endpoint,
+    bind_connected_udp_socket, build_batch_config, parse_socket_host, resolve_socket_endpoint,
     validate_batch_config,
 };
 use super::{Plugin, StreamTransactionSummary, TransactionSummary, WsDisconnectContext};
@@ -121,22 +121,6 @@ const STREAM_TAG_NATIVE: &[(&str, &str)] = &[
 ];
 
 const WS_TAG_NATIVE: &[(&str, &str)] = &[("proxy", "proxy_id")];
-
-fn reject_unknown_config_keys(config: &serde_json::Map<String, Value>) -> Result<(), String> {
-    let mut unknown: Vec<&str> = config
-        .keys()
-        .filter(|key| !STATSD_LOGGING_CONFIG_KEYS.contains(&key.as_str()))
-        .map(String::as_str)
-        .collect();
-    if unknown.is_empty() {
-        return Ok(());
-    }
-    unknown.sort_unstable();
-    Err(format!(
-        "statsd_logging: `config`: unknown configuration key(s): {unknown:?}; allowed keys: `{}`",
-        STATSD_LOGGING_CONFIG_KEYS.join("`, `")
-    ))
-}
 
 /// Emit a `warn!` for any inline `schema:` keys that the statsd
 /// emitter does not honor. Only `rename`, `omit`, and `summary_type`
@@ -589,7 +573,12 @@ impl StatsdLogging {
                 STATSD_LOGGING_CONFIG_KEYS.join(", ")
             ));
         };
-        reject_unknown_config_keys(config_object)?;
+        crate::util::unknown_keys::reject_unknown_keys(
+            config_object,
+            "config",
+            STATSD_LOGGING_CONFIG_KEYS,
+            "statsd_logging: `config`: ",
+        )?;
 
         let raw_host = config
             .get("host")
@@ -694,25 +683,21 @@ impl StatsdLogging {
     }
 
     /// Test-only: aggregate retained-byte usage for the sink instance.
-    #[allow(dead_code)]
     pub fn byte_budget_used_for_test(&self) -> usize {
         self.byte_budget.used()
     }
 
     /// Test-only: cumulative byte-budget / queue saturation drops.
-    #[allow(dead_code)]
     pub fn byte_budget_drops_for_test(&self) -> u64 {
         self.byte_budget.drops_total()
     }
 
     /// Test-only: configured per-entry retained-byte ceiling.
-    #[allow(dead_code)]
     pub fn max_entry_bytes_for_test(&self) -> usize {
         self.max_entry_bytes
     }
 
     /// Test-only: hold `bytes` against the aggregate budget until the guard drops.
-    #[allow(dead_code)]
     pub fn hold_byte_budget_for_test(&self, bytes: usize) -> Option<StatsdByteLeaseGuardForTest> {
         self.byte_budget
             .try_acquire(bytes)
@@ -762,7 +747,6 @@ impl StatsdAdmittedPayloadForTest {
 }
 
 /// Test-only: render HTTP metrics under a budget without enqueueing.
-#[allow(dead_code)]
 pub fn render_http_under_budget_for_test(
     budget: &ByteBudget,
     max_entry_bytes: usize,
@@ -1288,60 +1272,63 @@ fn minimum_ordinary_record_bytes(
     http.min(grpc).min(stream).min(ws)
 }
 
-/// Pack newline-delimited StatsD lines into UDP datagrams that each stay at
-/// or below `max_payload`. Individual lines larger than the ceiling are
-/// dropped (never fragmented mid-line) and counted in the returned drop tally.
+/// Packs newline-delimited StatsD lines into UDP datagrams that each stay at
+/// or below `max_payload`. A line larger than the ceiling is dropped (never
+/// fragmented mid-line) and counted.
 ///
-/// Collects every datagram into a `Vec` for inspection. Production delivery
-/// packs one MTU-bounded buffer at a time via [`send_packed_entries`] so
-/// sibling datagram copies are not retained together.
-#[allow(dead_code)]
-pub fn pack_udp_datagrams(payload: &str, max_payload: usize) -> (Vec<String>, usize) {
-    let mut datagrams = Vec::new();
-    let dropped = for_each_udp_datagram(payload, max_payload, |datagram| {
-        datagrams.push(datagram.to_string());
-    });
-    (datagrams, dropped)
+/// Production delivery ([`send_packed_entries`]) sends each finished datagram
+/// before offering the next line, so sibling datagram copies are never
+/// retained together.
+pub struct UdpDatagramPacker {
+    chunk: String,
+    max_payload: usize,
+    dropped: usize,
 }
 
-/// Visit each packed UDP datagram without retaining sibling copies.
-///
-/// `visit` receives borrowed bytes for one datagram at a time (never larger
-/// than `max_payload`). Returns the number of oversized lines dropped.
-#[allow(dead_code)]
-pub fn for_each_udp_datagram(
-    payload: &str,
-    max_payload: usize,
-    mut visit: impl FnMut(&str),
-) -> usize {
-    let mut chunk = String::with_capacity(max_payload.min(payload.len()));
-    let mut dropped = 0usize;
-
-    for line in payload.lines() {
-        if line.is_empty() {
-            continue;
+impl UdpDatagramPacker {
+    pub fn new(max_payload: usize) -> Self {
+        Self {
+            chunk: String::with_capacity(max_payload),
+            max_payload,
+            dropped: 0,
         }
-        if line.len() > max_payload {
-            dropped = dropped.saturating_add(1);
+    }
+
+    /// Offer one line. Returns the finished datagram that `line` did not fit
+    /// into; the caller sends it before offering the next line.
+    pub fn push_line(&mut self, line: &str) -> Option<String> {
+        if line.is_empty() {
+            return None;
+        }
+        if line.len() > self.max_payload {
+            self.dropped = self.dropped.saturating_add(1);
             warn!(
                 line_len = line.len(),
-                max_payload, "statsd_logging: dropping metric line exceeding UDP payload ceiling"
+                max_payload = self.max_payload,
+                "statsd_logging: dropping metric line exceeding UDP payload ceiling"
             );
-            continue;
+            return None;
         }
-        if !chunk.is_empty() && chunk.len() + line.len() + 1 > max_payload {
-            visit(&chunk);
-            chunk.clear();
+        let mut finished = None;
+        if !self.chunk.is_empty() && self.chunk.len() + line.len() + 1 > self.max_payload {
+            finished = Some(std::mem::replace(
+                &mut self.chunk,
+                String::with_capacity(self.max_payload),
+            ));
         }
-        if !chunk.is_empty() {
-            chunk.push('\n');
+        if !self.chunk.is_empty() {
+            self.chunk.push('\n');
         }
-        chunk.push_str(line);
+        self.chunk.push_str(line);
+        finished
     }
-    if !chunk.is_empty() {
-        visit(&chunk);
+
+    /// The last, partly filled datagram (if any) and the number of oversized
+    /// lines dropped.
+    pub fn finish(self) -> (Option<String>, usize) {
+        let last = (!self.chunk.is_empty()).then_some(self.chunk);
+        (last, self.dropped)
     }
-    dropped
 }
 
 /// Pack already-rendered queue entries into MTU-bounded datagrams and send
@@ -1350,41 +1337,27 @@ async fn send_packed_entries(
     socket: &tokio::net::UdpSocket,
     entries: &[QueuedStatsdPayload],
 ) -> Result<(), String> {
-    let mut chunk = String::with_capacity(MAX_UDP_PAYLOAD);
-
+    let mut packer = UdpDatagramPacker::new(MAX_UDP_PAYLOAD);
     for entry in entries {
         for line in entry.as_str().lines() {
-            if line.is_empty() {
-                continue;
+            if let Some(datagram) = packer.push_line(line) {
+                send_datagram(socket, &datagram).await?;
             }
-            if line.len() > MAX_UDP_PAYLOAD {
-                warn!(
-                    line_len = line.len(),
-                    max_payload = MAX_UDP_PAYLOAD,
-                    "statsd_logging: dropping metric line exceeding UDP payload ceiling"
-                );
-                continue;
-            }
-            if !chunk.is_empty() && chunk.len() + line.len() + 1 > MAX_UDP_PAYLOAD {
-                debug_assert!(chunk.len() <= MAX_UDP_PAYLOAD);
-                if let Err(error) = socket.send(chunk.as_bytes()).await {
-                    return Err(format!("statsd_logging: failed to send metrics: {error}"));
-                }
-                chunk.clear();
-            }
-            if !chunk.is_empty() {
-                chunk.push('\n');
-            }
-            chunk.push_str(line);
         }
     }
-    if !chunk.is_empty() {
-        debug_assert!(chunk.len() <= MAX_UDP_PAYLOAD);
-        if let Err(error) = socket.send(chunk.as_bytes()).await {
-            return Err(format!("statsd_logging: failed to send metrics: {error}"));
-        }
+    if let (Some(datagram), _) = packer.finish() {
+        send_datagram(socket, &datagram).await?;
     }
     Ok(())
+}
+
+async fn send_datagram(socket: &tokio::net::UdpSocket, datagram: &str) -> Result<(), String> {
+    debug_assert!(datagram.len() <= MAX_UDP_PAYLOAD);
+    socket
+        .send(datagram.as_bytes())
+        .await
+        .map(drop)
+        .map_err(|error| format!("statsd_logging: failed to send metrics: {error}"))
 }
 
 /// Single-allocation builder for the trailing `|#k:v,k:v,…` block.
@@ -1447,7 +1420,7 @@ async fn send_batch(
     };
 
     if socket.is_none() {
-        let resolved_addr = resolve_udp_endpoint(
+        let resolved_addr = resolve_socket_endpoint(
             &cfg.hostname,
             cfg.port,
             cfg.dns_cache.as_ref(),
@@ -1462,7 +1435,7 @@ async fn send_batch(
 
     if last_resolve.elapsed() >= UDP_RE_RESOLVE_INTERVAL {
         last_resolve = Instant::now();
-        if let Ok(new_addr) = resolve_udp_endpoint(
+        if let Ok(new_addr) = resolve_socket_endpoint(
             &cfg.hostname,
             cfg.port,
             cfg.dns_cache.as_ref(),
@@ -1588,29 +1561,40 @@ mod tests {
         assert!(validate_tag_key("ok_tag").is_ok());
     }
 
+    fn pack(payload: &str) -> (Vec<String>, usize) {
+        let mut packer = UdpDatagramPacker::new(MAX_UDP_PAYLOAD);
+        let mut datagrams: Vec<String> = payload
+            .lines()
+            .filter_map(|line| packer.push_line(line))
+            .collect();
+        let (last, dropped) = packer.finish();
+        datagrams.extend(last);
+        (datagrams, dropped)
+    }
+
     #[test]
-    fn pack_udp_datagrams_enforces_ceiling() {
+    fn packer_enforces_ceiling() {
         let ok = "a".repeat(MAX_UDP_PAYLOAD);
-        let (dgrams, dropped) = pack_udp_datagrams(&ok, MAX_UDP_PAYLOAD);
+        let (dgrams, dropped) = pack(&ok);
         assert_eq!(dropped, 0);
         assert_eq!(dgrams.len(), 1);
         assert_eq!(dgrams[0].len(), MAX_UDP_PAYLOAD);
 
         let over = "b".repeat(MAX_UDP_PAYLOAD + 1);
-        let (dgrams, dropped) = pack_udp_datagrams(&over, MAX_UDP_PAYLOAD);
+        let (dgrams, dropped) = pack(&over);
         assert_eq!(dropped, 1);
         assert!(dgrams.is_empty());
 
         let under = "c".repeat(MAX_UDP_PAYLOAD - 1);
-        let (dgrams, dropped) = pack_udp_datagrams(&under, MAX_UDP_PAYLOAD);
+        let (dgrams, dropped) = pack(&under);
         assert_eq!(dropped, 0);
         assert_eq!(dgrams[0].len(), MAX_UDP_PAYLOAD - 1);
     }
 
     #[test]
-    fn pack_udp_datagrams_keeps_valid_siblings_when_one_line_is_oversized() {
+    fn packer_keeps_valid_siblings_when_one_line_is_oversized() {
         let payload = format!("short:1|c\n{}\nother:1|c", "x".repeat(MAX_UDP_PAYLOAD + 8));
-        let (dgrams, dropped) = pack_udp_datagrams(&payload, MAX_UDP_PAYLOAD);
+        let (dgrams, dropped) = pack(&payload);
         assert_eq!(dropped, 1);
         let joined = dgrams.join("\n");
         assert!(joined.contains("short:1|c"));

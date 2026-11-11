@@ -370,7 +370,6 @@ impl Default for MeshTransportGate {
 /// connection; the class is carried for diagnostics only.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MeshTrustAdmissionRefused {
-    #[allow(dead_code)] // Diagnostic-only; the refusal itself is what callers act on.
     pub kind: MeshTransportKind,
 }
 
@@ -381,7 +380,6 @@ pub struct MeshAdmissionTicket {
 }
 
 impl MeshAdmissionTicket {
-    #[allow(dead_code)] // Observability/test accessor; production compares inside the registry.
     pub fn generation(&self) -> u64 {
         self.generation
     }
@@ -400,17 +398,14 @@ pub struct MeshTransportRegistration {
 }
 
 impl MeshTransportRegistration {
-    #[allow(dead_code)] // Test/diagnostic accessors; holders carry the gate directly.
     pub fn gate(&self) -> &MeshTransportGate {
         &self.gate
     }
 
-    #[allow(dead_code)]
     pub fn generation(&self) -> u64 {
         self.generation
     }
 
-    #[allow(dead_code)]
     pub fn kind(&self) -> MeshTransportKind {
         self.kind
     }
@@ -441,7 +436,6 @@ pub struct MeshTrustRetirementOutcome {
 }
 
 impl MeshTrustRetirementOutcome {
-    #[allow(dead_code)] // Test/diagnostic helper; the publication path logs the split counts.
     pub fn retired_total(&self) -> u64 {
         self.retired_hbone.saturating_add(self.retired_mesh_mtls)
     }
@@ -483,13 +477,11 @@ impl MeshTrustRegistry {
         self.accepted_generation.load(Ordering::Acquire)
     }
 
-    #[allow(dead_code)] // Test/diagnostic accessor; admission compares the atomic directly.
     pub fn retired_through(&self) -> u64 {
         self.retired_through.load(Ordering::Acquire)
     }
 
     /// Number of live registered transports. Test/observability helper.
-    #[allow(dead_code)]
     pub fn registered_len(&self) -> usize {
         self.transports.len()
     }

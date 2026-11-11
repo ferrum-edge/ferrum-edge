@@ -4,8 +4,8 @@
 use std::collections::HashMap;
 
 use ferrum_edge::modes::mesh::metric_tag_cel::{
-    MAX_METRIC_TAG_CEL_EXPR_LEN, MetricTagCelAttr, MetricTagCelContext, MetricTagCelExpr,
-    evaluate_metric_tag_cel, parse_metric_tag_cel_expression, sanitize_metric_tag_value,
+    MAX_METRIC_TAG_CEL_EXPR_LEN, MetricTagCelAttr, MetricTagCelExpr,
+    parse_metric_tag_cel_expression, sanitize_metric_tag_value,
     validate_metric_tag_cel_for_families,
 };
 use ferrum_edge::plugins::mesh::workload_metrics::WorkloadMetrics;
@@ -288,6 +288,64 @@ async fn missing_cel_attribute_emits_empty_label_not_invented_data() {
     assert!(counter.contains(r#"source_workload="""#), "{counter}");
 }
 
+fn render_request_count_with_metadata(metadata: HashMap<String, String>) -> String {
+    let registry = MetricsRegistry::new();
+    let summary = TransactionSummary {
+        http_method: "GET".into(),
+        response_status_code: 200,
+        metadata: mesh_identity_metadata(metadata).into_iter().collect(),
+        ..TransactionSummary::default()
+    };
+    registry.record(&summary);
+    registry
+        .render_uncached()
+        .lines()
+        .find(|line| line.starts_with("ferrum_mesh_requests_total{"))
+        .expect("mesh request counter")
+        .to_string()
+}
+
+/// The `has(attr) ? attr : "literal"` form and label sanitization are pinned on
+/// the live emission path (the reload-time compact plan), not on a separate
+/// evaluator production never runs.
+#[tokio::test]
+async fn cel_ternary_fallback_and_sanitization_on_live_request_count_path() {
+    let workload_metrics = WorkloadMetrics::new(&json!({
+        "metrics": {
+            "tag_overrides": [{
+                "metric": "REQUEST_COUNT",
+                "name": "source_workload",
+                "operation": {
+                    "type": "set_expr",
+                    "cel": r#"has(request.host) ? request.host : "unknown""#
+                }
+            }]
+        }
+    }))
+    .expect("cel override");
+    let mut ctx = RequestContext::new("10.0.0.2".into(), "GET".into(), "/".into());
+    let mut headers = HashMap::new();
+    workload_metrics.before_proxy(&mut ctx, &mut headers).await;
+    let mut metadata: HashMap<String, String> = ctx.metadata.into_iter().collect();
+    metadata.remove("mesh.metrics.cel.request_host");
+    assert!(
+        metadata.contains_key("mesh.metrics.request_count.tag_overrides"),
+        "the override plan must be stamped for the live path"
+    );
+
+    // Missing attribute selects the literal else-branch.
+    let counter = render_request_count_with_metadata(metadata.clone());
+    assert!(
+        counter.contains(r#"source_workload="unknown""#),
+        "{counter}"
+    );
+
+    // Present attribute selects the then-branch, sanitized for Prometheus.
+    metadata.insert("mesh.metrics.cel.request_host".into(), "a\nb\"c".into());
+    let counter = render_request_count_with_metadata(metadata);
+    assert!(counter.contains(r#"source_workload="a_b_c""#), "{counter}");
+}
+
 #[test]
 fn rejects_unsupported_malformed_and_costly_cel() {
     let err = WorkloadMetrics::new(&json!({
@@ -335,7 +393,7 @@ fn rejects_unsupported_malformed_and_costly_cel() {
 }
 
 #[test]
-fn compiled_cel_forms_evaluate_with_missing_attribute_semantics() {
+fn compiled_cel_forms_parse_to_their_bounded_shapes() {
     let host = parse_metric_tag_cel_expression("request.host").expect("request.host");
     assert_eq!(
         host,
@@ -355,29 +413,6 @@ fn compiled_cel_forms_evaluate_with_missing_attribute_semantics() {
         parse_metric_tag_cel_expression(r#"has(request.host) ? request.host : "unknown""#)
             .expect("bounded ternary");
     assert!(matches!(fallback, MetricTagCelExpr::HasThenElse { .. }));
-
-    let ctx = MetricTagCelContext {
-        source_workload: "frontend",
-        source_namespace: "default",
-        source_principal: "spiffe://cluster.local/ns/default/sa/frontend",
-        source_app: "frontend",
-        source_service: "frontend",
-        destination_workload: "backend",
-        destination_namespace: "default",
-        destination_principal: "spiffe://cluster.local/ns/default/sa/backend",
-        destination_app: "backend",
-        destination_service: "backend",
-        request_protocol: "http",
-        response_flags: "-",
-        connection_security_policy: "mutual_tls",
-        request_method: Some("GET"),
-        request_host: None,
-        response_code: Some(200),
-        destination_port: Some(8080),
-    };
-    assert_eq!(evaluate_metric_tag_cel(&host, ctx), "");
-    assert_eq!(evaluate_metric_tag_cel(&port, ctx), "8080");
-    assert_eq!(evaluate_metric_tag_cel(&fallback, ctx), "unknown");
     assert_eq!(sanitize_metric_tag_value("a\nb\"c"), "a_b_c");
 }
 

@@ -768,7 +768,7 @@ fn test_infer_file_mode_yields_to_conf_file_mode() {
         || {
             unsafe { std::env::set_var("FERRUM_FILE_CONFIG_PATH", "/tmp/spec.yaml") };
 
-            ferrum_edge::cli::infer_file_mode_from_conf_mode(Some("database"));
+            ferrum_edge::cli::infer_file_mode_from_conf(Some("database"), None);
 
             assert!(
                 std::env::var("FERRUM_MODE").is_err(),
@@ -793,9 +793,27 @@ fn test_infer_file_mode_treats_blank_conf_mode_as_unset() {
                 std::env::set_var("FERRUM_FILE_CONFIG_PATH", "/tmp/spec.yaml");
             }
 
-            ferrum_edge::cli::infer_file_mode_from_conf_mode(Some(""));
+            ferrum_edge::cli::infer_file_mode_from_conf(Some(""), None);
 
             assert_eq!(std::env::var("FERRUM_MODE").unwrap(), "file");
+        },
+    );
+}
+
+/// A `FERRUM_FILE_CONFIG_PATH` set only in the settings file selects file mode
+/// too: the seam the tests drive is the implementation `infer_file_mode()` runs.
+#[test]
+fn test_infer_file_mode_honors_conf_file_spec_path() {
+    without_env_vars(
+        &["FERRUM_MODE", "FERRUM_CONF_PATH", "FERRUM_FILE_CONFIG_PATH"],
+        || {
+            ferrum_edge::cli::infer_file_mode_from_conf(None, Some("/tmp/spec.yaml"));
+
+            assert_eq!(std::env::var("FERRUM_MODE").unwrap(), "file");
+            assert!(
+                std::env::var("FERRUM_FILE_CONFIG_PATH").is_err(),
+                "a settings-file spec path must not be replaced by discovery"
+            );
         },
     );
 }
@@ -832,7 +850,7 @@ fn test_run_explicit_spec_does_not_override_conf_file_mode() {
                 "overrides must not synthesize a mode before inference"
             );
 
-            ferrum_edge::cli::infer_file_mode_from_conf_mode(Some("database"));
+            ferrum_edge::cli::infer_file_mode_from_conf(Some("database"), None);
 
             assert!(
                 std::env::var("FERRUM_MODE").is_err(),
@@ -863,7 +881,7 @@ fn test_validate_explicit_spec_does_not_override_conf_file_mode() {
                 allow_empty_namespace: false,
             };
             ferrum_edge::cli::apply_validate_overrides(&args);
-            ferrum_edge::cli::infer_file_mode_from_conf_mode(Some("cp"));
+            ferrum_edge::cli::infer_file_mode_from_conf(Some("cp"), None);
 
             assert!(
                 std::env::var("FERRUM_MODE").is_err(),

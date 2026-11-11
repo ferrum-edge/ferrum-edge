@@ -54,7 +54,7 @@ Two helpers live with the enum:
 
 Case (3) also covers a request queued at the moment its pooled HTTP/1 connection is reset or closed (issue #5714). tokio's channel send checks for closure and publishes the request in two separate steps. If the connection closes between them, the request misses hyper's drain and is never dequeued. The vendored hyper-util ([patch 001](upstream-hyper-util-patches/001-release-h1-sender-on-dispatch-close/README.md)) then releases the connection's only sender, so the request fails with hyper `is_canceled()`: hyper-util retries it on a new connection when the old one was reused, and otherwise it reaches the gateway as `ConnectionPoolError` rather than waiting out `backend_read_timeout_ms` as a spurious `ReadWriteTimeout` (504).
 
-Every pre-wire io verdict in `classify_typed_chain` is gated the same way (issue #4536): `ConnectionRefused`, `ConnectionReset` → `ConnectionRefused`, `TimedOut` → `ConnectionTimeout`, and `EADDRNOTAVAIL` → `PortExhaustion` are issued only when `phase_is_connect` is true; after the connect phase the same signals classify post-wire. `classify_reqwest_error` runs its `is_port_exhaustion` walk **inside** the `is_connect()` branch for the same reason — only a dial can exhaust ephemeral ports.
+Every pre-wire io verdict in `classify_typed_chain` is gated the same way (issue #4536): `ConnectionRefused`, `ConnectionReset` → `ConnectionRefused`, `TimedOut` → `ConnectionTimeout`, and `EADDRNOTAVAIL` → `PortExhaustion` are issued only when `phase_is_connect` is true; after the connect phase the same signals classify post-wire. `classify_reqwest_error` runs its `is_port_exhaustion` walk **inside** the `is_connect()` branch for the same reason — only a dial can exhaust ephemeral ports. The boxed-error substring fallback follows the same gate (issue #7213): error text is not phase evidence either, so after the connect phase `"timed out"` / `"connect timeout"` is `ReadWriteTimeout`, `"refused"` and the TLS tokens are `ConnectionReset`, and port-exhaustion wording is not claimed; DNS wording and the gateway-side dispatch refusals keep their class in both phases. The `tungstenite::Error::Io` arm keeps `ECONNREFUSED` and `EADDRNOTAVAIL` pre-wire only for the WebSocket dial (`classify_boxed_setup_error`), not on a live session, and `classify_body_error` charges `EADDRNOTAVAIL` on a response body as post-wire `ConnectionReset`. UDP session receive/send failures are classified from the typed `io::Error`, not its Display string.
 
 **Partial reversal of #4406 / #4476.** Those issues made handshake-named rustls variants `TlsError` regardless of phase, because reqwest reports a missing-client-certificate rejection with `is_connect() = false`. That inference is withdrawn: the alert kind never proves the phase. Setup-phase mTLS rejections keep `TlsError` by *context* on every path that dials for itself — the direct H2 pool (`BackendUnavailableSource::Tls`), the gRPC pool (`GrpcBackendUnavailableKind::TlsHandshake`), the native H3 pool, the HBONE / mesh-mTLS pools (`HbonePoolError::TlsHandshake`), the WebSocket backend dial and `GenericPool` (`classify_boxed_setup_error`), and reqwest's own `is_connect()` branch. The one path that loses it is a rustls alert surfaced through reqwest's shared HTTP/1 pool after connect: it is now `ConnectionReset` (post-wire, `X-Gateway-Error: backend_error`) instead of `TlsError`. Restoring a pre-wire verdict there would require a handshake-completion signal threaded out of reqwest's connector (a new vendored-reqwest hook), not another error-shape heuristic.
 
@@ -104,6 +104,8 @@ pub enum StreamSetupKind {
     AuthorizationExpired,   // admitting credential expired during post-admission setup (client-side, health-neutral)
     ClientTrustWithdrawn,   // frontend client-cert trust withdrawn during setup (client-side, health-neutral)
     SniAdmissionRefused,    // opaque-TLS SNI listener refused before any backend dial (gateway-local)
+    L4RouteRefused,         // L4 `stream_match` admission refused before any backend dial (gateway-local)
+    BackendFirstBytesForward, // backend failed the inspected-prefix write after the dial (backend-side, post-wire)
 }
 ```
 
@@ -131,6 +133,23 @@ unchanged (`SNI-routed stream listener on port … refused connection (…)` /
 typed kind so the word `refused` in that Display cannot match the substring
 fallback's `ConnectionRefused` token. The client still sees RST. No backend is
 selected, so the circuit breaker and passive health are not charged.
+
+L4 `stream_match` admission refusals (no `__l4_{port}` candidate matched, or a
+single-listener proxy's matcher denied or is uncompiled) are the same decision
+on an L4 listener and are typed as `StreamSetupKind::L4RouteRefused` with the
+same mapping: `DispatchPolicyRejected`, `gateway_policy`, `unknown` direction,
+no breaker or passive-health charge (issue #7185). Display wording is unchanged
+(`No matching L4 stream_match proxy on port …` / `Stream proxy … stream_match
+denied connection on port …`).
+
+When a first-bytes plugin inspected a prefix on a TLS-terminating TCP
+listener, a backend that accepts the dial and then fails the prefix write is
+typed as `StreamSetupKind::BackendFirstBytesForward`: `backend_error`,
+`backend_to_client`, and a breaker failure. Bytes may already have reached the
+backend, so its class comes from the retained io error classified as post-wire
+(a reset is `ConnectionReset`, never the pre-wire `ConnectionRefused`), with
+`RequestError` when the io error is not typed. Display wording is unchanged
+(`failed forwarding inspected first bytes to backend: …`).
 
 ### UDP setup failures that never publish a session
 

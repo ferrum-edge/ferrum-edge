@@ -2,7 +2,7 @@
 //!
 //! Uses the complete sorted inventory in
 //! [`ferrum_edge::config::public_env_inventory::PUBLIC_FERRUM_ENV_SETTINGS`],
-//! then fails closed when any non-exempt setting lacks a canonical docs table
+//! then fails closed when any setting lacks a canonical docs table
 //! row or a `ferrum.conf` template assignment. A separate guard requires every
 //! production `EnvConfig` acceptance key to appear in that inventory.
 //! Membership checks are order-independent.
@@ -10,8 +10,7 @@
 use std::collections::BTreeSet;
 
 use ferrum_edge::config::public_env_inventory::{
-    PLUGIN_SECRET_EXAMPLE_ENV, PUBLIC_FERRUM_ENV_COVERAGE_EXEMPTIONS, PUBLIC_FERRUM_ENV_SETTINGS,
-    TRANSCRIPT_SINK_SECRET_EXAMPLE_ENV, is_public_ferrum_env_coverage_exempt,
+    PLUGIN_SECRET_EXAMPLE_ENV, PUBLIC_FERRUM_ENV_SETTINGS, TRANSCRIPT_SINK_SECRET_EXAMPLE_ENV,
     is_recognized_ferrum_setting,
 };
 use ferrum_edge::plugins::utils::plugin_secret_env::{
@@ -140,18 +139,12 @@ fn ferrum_conf_assignment_keys(conf: &str) -> BTreeSet<&str> {
 }
 
 #[test]
-fn public_inventory_and_exemptions_are_sorted_and_unique() {
+fn public_inventory_is_sorted_and_unique() {
     assert!(
         PUBLIC_FERRUM_ENV_SETTINGS
             .windows(2)
             .all(|pair| pair[0] < pair[1]),
         "PUBLIC_FERRUM_ENV_SETTINGS must be strictly sorted unique keys"
-    );
-    assert!(
-        PUBLIC_FERRUM_ENV_COVERAGE_EXEMPTIONS
-            .windows(2)
-            .all(|pair| pair[0] < pair[1]),
-        "PUBLIC_FERRUM_ENV_COVERAGE_EXEMPTIONS must be strictly sorted unique keys"
     );
 }
 
@@ -175,11 +168,6 @@ fn transcript_sink_secret_namespace_has_canonical_inventory_surface() {
         public_inventory().contains(TRANSCRIPT_SINK_SECRET_EXAMPLE_ENV),
         "`{TRANSCRIPT_SINK_SECRET_EXAMPLE_ENV}` must stay in PUBLIC_FERRUM_ENV_SETTINGS as the \
          canonical representative of the `{TRANSCRIPT_SINK_SECRET_ENV_PREFIX}<NAME>` namespace"
-    );
-    assert!(
-        !is_public_ferrum_env_coverage_exempt(TRANSCRIPT_SINK_SECRET_EXAMPLE_ENV),
-        "the transcript sink-secret namespace must keep real docs/template coverage, \
-         not a coverage exemption"
     );
     assert!(
         docs_table_keys(CONFIGURATION_MD).contains(TRANSCRIPT_SINK_SECRET_EXAMPLE_ENV),
@@ -217,10 +205,6 @@ fn plugin_secret_namespace_has_canonical_inventory_surface() {
     assert!(
         public_inventory().contains(PLUGIN_SECRET_EXAMPLE_ENV),
         "`{PLUGIN_SECRET_EXAMPLE_ENV}` must stay in PUBLIC_FERRUM_ENV_SETTINGS"
-    );
-    assert!(
-        !is_public_ferrum_env_coverage_exempt(PLUGIN_SECRET_EXAMPLE_ENV),
-        "the plugin-secret namespace must keep real docs/template coverage"
     );
     assert!(
         docs_table_keys(CONFIGURATION_MD).contains(PLUGIN_SECRET_EXAMPLE_ENV),
@@ -275,23 +259,12 @@ fn public_ferrum_env_settings_have_docs_table_and_ferrum_conf_coverage() {
         inventory.len()
     );
 
-    // Exemptions must themselves be inventory members (stale allowlist guard).
-    for key in PUBLIC_FERRUM_ENV_COVERAGE_EXEMPTIONS {
-        assert!(
-            inventory.contains(*key),
-            "exemption `{key}` is not part of the public inventory; remove it or add the setting"
-        );
-    }
-
     let docs_keys = docs_table_keys(CONFIGURATION_MD);
     let conf_keys = ferrum_conf_assignment_keys(FERRUM_CONF);
 
     let mut missing_docs = Vec::new();
     let mut missing_conf = Vec::new();
     for key in &inventory {
-        if is_public_ferrum_env_coverage_exempt(key) {
-            continue;
-        }
         if !docs_keys.contains(key.as_str()) {
             missing_docs.push(key.clone());
         }

@@ -212,7 +212,7 @@ fn test_key_auth_rejects_unknown_config_fields() {
         let err = KeyAuth::new(&config)
             .err()
             .expect("unknown key_auth fields must fail closed");
-        assert!(err.contains("unknown configuration field"), "{err}");
+        assert!(err.contains("unknown configuration key"), "{err}");
     }
 }
 
@@ -806,11 +806,7 @@ fn configuration_diagnostics_keep_schema_and_withhold_supplied_values() {
     let cases: &[(serde_json::Value, &[&str])] = &[
         (
             json!({(canary): true}),
-            &[
-                "unknown configuration field",
-                "`key_location`",
-                "`hide_credentials`",
-            ],
+            &["unknown configuration key(s)", "`config`"],
         ),
         (
             json!({"key_location": 8675309}),

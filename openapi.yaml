@@ -192,7 +192,7 @@ info:
     unbounded header block per stream. A connection that neither delivers a new
     request nor holds one in flight for a whole
     `FERRUM_HTTP_HEADER_READ_TIMEOUT_SECONDS` window is closed.
-  version: 0.2.0
+  version: 0.9.20
   license:
     name: PolyForm Noncommercial 1.0.0
     url: https://polyformproject.org/licenses/noncommercial/1.0.0
@@ -2700,8 +2700,10 @@ paths:
         all_connected_public_only_guaranteed. A DP that sent no recognised
         report is unknown and makes weakest_policy_complete and
         all_connected_public_only_guaranteed false; so does an empty set.
-        Disconnected DPs that still serve cached config are not listed, so
-        compare connected_data_planes against the expected DP inventory.
+        Disconnected DPs that still serve cached config are not listed,
+        so compare the number of distinct node_id values in data_planes
+        with the expected number of DP processes; connected_data_planes
+        counts streams, and a reconnect overlap can count one DP twice.
         The object is additive within schema_version 2 and is absent on
         non-CP responses.
 
@@ -11277,18 +11279,6 @@ components:
             Number of QUIC connections per HTTP/3 backend (overrides global
             FERRUM_HTTP3_CONNECTIONS_PER_BACKEND). Multiple connections distribute
             QUIC frame processing across driver tasks. Range: 1–256. Default: 4.
-        pool_max_requests_per_connection:
-          type: [integer, "null"]
-          format: uint64
-          minimum: 0
-          maximum: 2147483647
-          description: |
-            Reserved for Istio DestinationRule
-            `connectionPool.http.maxRequestsPerConnection`. The field is
-            validated and persisted for schema compatibility, but currently has
-            no runtime effect because reqwest/hyper do not expose a stable
-            per-connection request cap for the shared client pool. Range:
-            0–2147483647, where 0 preserves Istio's explicit unlimited value.
         upstream_id:
           type: [string, "null"]
           description: |
@@ -14423,7 +14413,6 @@ components:
         redis_key_prefix:
           type: string
           minLength: 1
-          default: "{FERRUM_NAMESPACE}:ws_rate_limiting:{plugin-config-id}"
           description: >-
             Key prefix for all Redis keys. Defaults to
             `{FERRUM_NAMESPACE}:{plugin_name}:{plugin-config-id}` so two
@@ -14586,7 +14575,6 @@ components:
         redis_key_prefix:
           type: string
           minLength: 1
-          default: "{FERRUM_NAMESPACE}:udp_rate_limiting:{plugin-config-id}"
           description: >-
             Key prefix for all Redis keys. Defaults to
             `{FERRUM_NAMESPACE}:{plugin_name}:{plugin-config-id}` so two
@@ -15835,11 +15823,6 @@ components:
             `connectionPool.tcp.idleTimeout`) for this port. `0` disables the
             idle watchdog. Distinct from `http_idle_timeout_ms` (HTTP pool
             idle).
-        http_max_requests_per_connection:
-          type: [integer, "null"]
-          format: uint32
-          deprecated: true
-          description: Legacy mesh carrier; not applied by runtime dispatch.
         http_idle_timeout_ms:
           type: [integer, "null"]
           format: uint64
@@ -17434,7 +17417,6 @@ components:
               reader_unavailable,
               reload_reader_failed,
               reload_read_timed_out,
-              scope_validation_failed,
               worker_exited,
             ]
           description: Closed-set reason currently blocking rotation.
@@ -18620,7 +18602,7 @@ components:
           description: |
             Stream-listener (TCP/UDP/DTLS) diagnostics. Present only when the
             gateway has a proxy state (absent in control-plane mode).
-          required: [dtls_demux_sessions_total, dtls_demux_sessions, frontend_dtls_reload, bind_failures_total, bind_failures]
+          required: [dtls_demux_sessions_total, dtls_demux_sessions, frontend_dtls_reload, mesh_node_waypoint_dtls_reload, bind_failures_total, bind_failures]
           properties:
             dtls_demux_sessions_total:
               type: integer
@@ -18654,6 +18636,34 @@ components:
                   type: integer
                   format: uint64
                   description: Active DTLS listeners live-swapped during the last accepted publish.
+                last_success_unix:
+                  type: [integer, "null"]
+                  format: uint64
+                last_failure_unix:
+                  type: [integer, "null"]
+                  format: uint64
+                last_outcome:
+                  type: string
+                  enum: [none, accepted, rejected]
+            mesh_node_waypoint_dtls_reload:
+              type: object
+              description: |
+                The same bounded, redacted status for the owner-scoped mesh
+                NodeWaypoint DTLS slot (mesh PeerAuthentication generations
+                published to Ferrum-generated `MeshNodeWaypoint` listeners).
+                Separate from `frontend_dtls_reload`, the ordinary operator
+                slot, which a mesh generation never changes. A rejected mesh
+                candidate sets `last_outcome: rejected` and `last_failure_unix`.
+              required: [generation, last_swapped_listeners, last_success_unix, last_failure_unix, last_outcome]
+              properties:
+                generation:
+                  type: integer
+                  format: uint64
+                  description: Last accepted mesh NodeWaypoint DTLS generation; 0 means none has been published.
+                last_swapped_listeners:
+                  type: integer
+                  format: uint64
+                  description: NodeWaypoint DTLS listeners live-swapped during the last accepted publish.
                 last_success_unix:
                   type: [integer, "null"]
                   format: uint64
@@ -18883,7 +18893,6 @@ components:
         - authority_unavailable
         - admitted_process
         - admitted_shared
-        - legacy_unsafe_profile_accepted
         - shared_authorities_unavailable
         - shared_authorities
         - process_lanes
@@ -18918,14 +18927,6 @@ components:
           type: integer
           format: uint64
           description: Markers admitted against the shared (cross-replica) authority.
-        legacy_unsafe_profile_accepted:
-          type: integer
-          format: uint64
-          description: |
-            Requests accepted under an explicitly unsafe legacy freshness-only
-            signing profile (`hmac_auth` `signing_profile: ferrum-hmac-v1` with
-            `allow_unsafe_replayable_v1: true`), which provides no single-use
-            guarantee. A nonzero value means a deployment still depends on it.
         shared_authorities_unavailable:
           type: integer
           format: uint64
@@ -20323,7 +20324,7 @@ components:
               type: boolean
               description: |
                 Denied tools are left out of `tools/list`
-                (`discovery.hide_denied_items` or `policy.hide_denied_tools`).
+                (`policy.hide_denied_tools`).
         limits:
           type: object
           required: [max_catalog_items_per_list, max_catalog_bytes_per_list]
@@ -20970,9 +20971,8 @@ components:
         section_version:
           type: string
           description: |
-            Section contract version. Current exports use `"2"` (optional
-            external-`$ref` snapshot fields). Restore also accepts `"1"`
-            (no snapshot fields).
+            Section contract version. Exports and restore use `"2"` (optional
+            external-`$ref` snapshot fields); any other value is rejected.
           example: "2"
         items:
           type: array
@@ -21052,8 +21052,8 @@ components:
           type: integer
         resource_hash:
           type: string
-          pattern: "^$|^[0-9a-f]{64}$"
-          description: Empty for legacy records or lowercase hex SHA-256 of the generated resource bundle
+          pattern: "^[0-9a-f]{64}$"
+          description: Lowercase hex SHA-256 of the generated resource bundle
         external_ref_snapshot_base64:
           type: string
           description: |
@@ -21529,7 +21529,7 @@ components:
           properties:
             op:
               type: string
-              const: min_latency_ms
+              enum: [min_latency_ms, latency_above_ms]
             value:
               type: integer
               minimum: 0
@@ -24669,11 +24669,6 @@ components:
                   must also agree on dpop_replay_scope and, for process scope,
                   dpop_replay_max_entries. A non-DPoP sibling for the same
                   issuer is refused as a bearer-only bypass.
-              audience:
-                type: string
-                minLength: 1
-                pattern: "\\S"
-                description: Expected JWT aud claim; presence is required when set (same contract as audiences). Must not be blank.
               audiences:
                 type: array
                 items:
@@ -25268,6 +25263,9 @@ components:
                   client_secret:
                     type: string
                     format: password
+                    description: >-
+                      Literal client secret. Plugin config is never environment-expanded;
+                      a value containing a `${NAME}` placeholder is refused at admission.
                   private_key_pem:
                     type: string
                     format: password
@@ -25645,6 +25643,9 @@ components:
                     type: string
                     minLength: 1
                     format: password
+                    description: >-
+                      Literal client secret. Plugin config is never environment-expanded;
+                      a value containing a `${NAME}` placeholder is refused at admission.
                   private_key_pem:
                     type: string
                     minLength: 1
@@ -25929,7 +25930,7 @@ components:
               items:
                 type: string
                 minLength: 1
-              description: Origins a post-login redirect may target, as `host` (the redirect_uri scheme's default port only) or `host:port`; an explicit default port (`host:443` for https) names the same origin as `host`. Hosts compare case-insensitively; an entry that is not a bare authority (path, query, fragment, or userinfo) is rejected. A target must also use redirect_uri's scheme and carry no userinfo; anything else lands on post_login_default_path.
+              description: Origins a post-login redirect may target, as `host` (the redirect_uri scheme's default port only) or `host:port`; an explicit default port (`host:443` for https) names the same origin as `host`. Hosts compare case-insensitively; an entry that is not a bare authority (path, query, fragment, or userinfo) is rejected. A target must also use redirect_uri's scheme and carry no userinfo. The redirect_uri's own origin is always trusted; anything else lands on post_login_default_path.
             refresh_skew_secs:
               type: integer
               format: uint64
@@ -26435,8 +26436,8 @@ components:
       description: >-
         Plugin: hmac_auth — versioned HMAC request authentication with
         mandatory request-body integrity protection. The Ferrum profiles
-        (`ferrum-hmac-v2`, `ferrum-hmac-v1`) use `Authorization: hmac` and a
-        Ferrum signing base; the `rfc9421` profile verifies RFC 9421 HTTP
+        (`ferrum-hmac-v2`) uses `Authorization: hmac` and a Ferrum signing
+        base; the `rfc9421` profile verifies RFC 9421 HTTP
         Message Signatures (`Signature-Input` / `Signature`, `hmac-sha256`,
         key looked up by `keyid` among the Consumers' `hmac_auth` secrets).
         RFC 9530 defines Content-Digest. Requests must include exactly one of
@@ -26470,12 +26471,10 @@ components:
             Maximum allowed clock skew in seconds for the Date header freshness
             window. Bounded because the fixed replay retention horizon (601s) is
             derived from twice this ceiling, so no reload can shorten an
-            already-admitted request's protection. Under the legacy
-            ferrum-hmac-v1 profile this window is also exactly how long a
-            captured valid request stays replayable.
+            already-admitted request's protection.
         signing_profile:
           type: string
-          enum: [ferrum-hmac-v2, rfc9421, ferrum-hmac-v1]
+          enum: [ferrum-hmac-v2, rfc9421]
           default: ferrum-hmac-v2
           description: >-
             Versioned signing profile. 'ferrum-hmac-v2' requires a client nonce
@@ -26493,27 +26492,12 @@ components:
             Supported derived components are @method (the wire method:
             CONNECT for an HTTP/2 or HTTP/3 WebSocket Extended CONNECT),
             @authority, @path, @query, and @request-target (the target as
-            sent, including HTTP/1.1 absolute form and an empty query). 'ferrum-hmac-v1' is
-            freshness-only — a captured valid request can be replayed verbatim
-            for the whole clock_skew_seconds window — and additionally requires
-            allow_unsafe_replayable_v1 true. v1 rejects a nonce parameter
-            outright rather than ignoring one.
-        allow_unsafe_replayable_v1:
-          type: boolean
-          default: false
-          description: >-
-            Explicit acknowledgement that ferrum-hmac-v1 provides no replay
-            protection and is unsuitable for non-idempotent routes. Required
-            with signing_profile 'ferrum-hmac-v1' and rejected otherwise, so the
-            unsafe profile can never be reached by a copied snippet or a typo.
-            Every acceptance under it increments the unlabeled
-            legacy_unsafe_profile_accepted runtime counter.
+            sent, including HTTP/1.1 absolute form and an empty query).
         replay_scope:
           type: string
           enum: [process, shared]
           description: >-
-            Required for ferrum-hmac-v2 and rfc9421 and rejected for
-            ferrum-hmac-v1; there is no default. Use 'shared' together with sync_mode 'redis' for any
+            Required for every profile; there is no default. Use 'shared' together with sync_mode 'redis' for any
             deployment running more than one gateway replica: every replica then
             claims each nonce through one atomic Redis SET NX EX. Use 'process'
             to declare a single-process deployment whose replay protection is
@@ -26535,8 +26519,7 @@ components:
             Repeated full-live refusals are O(1) until an expiry is actually
             due, and a due reclamation pops only markers whose expiry has
             passed from an ordered expiry index, never rescanning live markers. An equivalent reload applies the
-            new cap without forgetting live markers. Ignored for 'shared';
-            rejected with ferrum-hmac-v1, which has no replay state.
+            new cap without forgetting live markers. Ignored for 'shared'.
         signed_headers:
           type: array
           maxItems: 32
@@ -26552,7 +26535,7 @@ components:
             Lowercase request header names every accepted signature must cover,
             for all profiles. Under the Ferrum profiles each is appended to the
             signing base, in this order, as one '\n{name}:{value}' line after
-            the nonce (v2) or digest (v1), where value is the RFC 9421 section
+            the nonce, where value is the RFC 9421 section
             2.1 canonical value (each field line trimmed, joined by ', '). Under
             rfc9421 each must appear in the covered components. A configured
             header missing from the request is refused (401). Signature
@@ -26631,35 +26614,9 @@ components:
         redis_password:
           type: string
           description: Redis password
+      # Every profile has a mandatory, default-free replay scope.
+      required: [replay_scope]
       allOf:
-        # The constructor's profile/scope/backend admission, expressed exactly.
-        # An omitted `signing_profile` means `ferrum-hmac-v2`, so the v2 rules
-        # live in the `else` branch rather than in a second `if`.
-        - if:
-            required: [signing_profile]
-            properties:
-              signing_profile:
-                const: ferrum-hmac-v1
-          then:
-            # v1 has no replay state at all: it demands the unsafe
-            # acknowledgement and refuses every replay knob.
-            required: [allow_unsafe_replayable_v1]
-            properties:
-              allow_unsafe_replayable_v1:
-                const: true
-              sync_mode:
-                const: local
-            not:
-              anyOf:
-                - required: [replay_scope]
-                - required: [replay_max_entries]
-          else:
-            # ferrum-hmac-v2 (the default) and rfc9421 have no default replay
-            # scope, and the unsafe acknowledgement is only meaningful with v1.
-            required: [replay_scope]
-            properties:
-              allow_unsafe_replayable_v1:
-                const: false
         # `required_components` is an RFC 9421 policy.
         - if:
             required: [required_components]
@@ -27441,67 +27398,7 @@ components:
                       minimum: 0
                       maximum: 65535
         trusted_hbone_assertors:
-          type: [array, "null"]
-          items:
-            oneOf:
-              - type: string
-                minLength: 1
-              - type: object
-                required: [assertor]
-                properties:
-                  assertor:
-                    type: string
-                    minLength: 1
-                    description: |
-                      Bare service-account name or full `spiffe://` SPIFFE ID
-                      identifying the peer this entry admits. Surrounding
-                      whitespace is trimmed before matching.
-                  asserts:
-                    type: [array, "null"]
-                    items:
-                      type: string
-                      minLength: 1
-                    description: |
-                      Exact SPIFFE IDs this assertor may assert and nothing
-                      else — the inventory of workloads it actually fronts. An
-                      empty array authorizes nothing. `null` is treated as
-                      absent. Mutually exclusive with `scope`.
-                  scope:
-                    type: [string, "null"]
-                    pattern: "^[ \t]*(same_namespace|mesh_wide)[ \t]*$"
-                    description: |
-                      Explicit grant contract. `same_namespace` (the default
-                      for every entry) permits only identities in the
-                      assertor's own Kubernetes namespace; `mesh_wide` requires
-                      `assertor` to be a full, exactly matched `spiffe://` ID,
-                      permits any identity that clears the trust-domain gate,
-                      and logs a warning at construction. Mutually exclusive
-                      with `asserts`. `null` is treated as absent. Surrounding
-                      spaces and tabs are trimmed before the value is compared,
-                      matching the `assertor` field's normalization; the
-                      pattern rather than an `enum` is what expresses that.
-                additionalProperties: false
-                allOf:
-                  # `asserts` and `scope` are mutually exclusive: the
-                  # constructor refuses an entry that sets both rather than
-                  # letting one silently win.
-                  - not:
-                      required: [asserts, scope]
-                  # `scope: mesh_wide` demands an exact `spiffe://` assertor.
-                  # A bare service-account matcher is namespace-blind, so
-                  # pairing it with a mesh-wide grant would admit any peer
-                  # whose SPIFFE path ends with that service-account name,
-                  # in any namespace, asserting any identity.
-                  - if:
-                      required: [scope]
-                      properties:
-                        scope:
-                          type: string
-                          pattern: "^[ \t]*mesh_wide[ \t]*$"
-                    then:
-                      properties:
-                        assertor:
-                          pattern: "^[ \t]*spiffe://"
+          $ref: '#/components/schemas/MeshTrustedHboneAssertors'
           default: ["ztunnel", "waypoint"]
           description: |
             Allow-list of identity-asserting infrastructure components whose
@@ -27519,6 +27416,94 @@ components:
             `ns/prod/sa/payments`. Baggage refused by the grant is dropped, the
             peer-cert identity is used instead, and the request is stamped
             `mesh_authz.ignored_baggage.assertion_out_of_scope=true`.
+    MeshTrustedHboneAssertors:
+      type: [array, "null"]
+      description: |
+        Trusted HBONE assertor allow-list shared by `mesh_authz`,
+        `workload_metrics`, and the injected
+        `_effective_mesh_authz_baggage_gates`. Both plugins admit it through one
+        parser, so this one schema is the contract for every copy. `null` (or
+        omission) selects the default `["ztunnel", "waypoint"]`; `[]` disables
+        baggage-derived identity entirely.
+
+        Whitespace is trimmed with Rust `str::trim` (Unicode `White_Space`)
+        before any comparison; the patterns spell that class out explicitly so
+        every JSON Schema regex dialect reads it the same way. A value that is
+        empty after trimming is refused.
+      items:
+        oneOf:
+          - $ref: '#/components/schemas/MeshTrustedHboneAssertors/$defs/assertor'
+          - type: object
+            required: [assertor]
+            additionalProperties: false
+            properties:
+              assertor:
+                $ref: '#/components/schemas/MeshTrustedHboneAssertors/$defs/assertor'
+              asserts:
+                type: [array, "null"]
+                items:
+                  type: string
+                  pattern: '^[\u0009-\u000D\u0020\u0085\u00A0\u1680\u2000-\u200A\u2028\u2029\u202F\u205F\u3000]*spiffe://'
+                description: |
+                  Exact SPIFFE IDs this assertor may assert and nothing
+                  else — the inventory of workloads it actually fronts. An
+                  empty array authorizes nothing. `null` is treated as
+                  absent. Mutually exclusive with `scope`.
+              scope:
+                type: [string, "null"]
+                pattern: '^[\u0009-\u000D\u0020\u0085\u00A0\u1680\u2000-\u200A\u2028\u2029\u202F\u205F\u3000]*(same_namespace|mesh_wide)[\u0009-\u000D\u0020\u0085\u00A0\u1680\u2000-\u200A\u2028\u2029\u202F\u205F\u3000]*$'
+                description: |
+                  Explicit grant contract. `same_namespace` (the default
+                  for every entry) permits only identities in the
+                  assertor's own Kubernetes namespace; `mesh_wide` requires
+                  `assertor` to be a full, exactly matched `spiffe://` ID,
+                  permits any identity that clears the trust-domain gate,
+                  and logs a warning at construction. Mutually exclusive
+                  with `asserts`. `null` is treated as absent. Surrounding
+                  whitespace is trimmed before the value is compared,
+                  matching the `assertor` field's normalization; the
+                  pattern rather than an `enum` is what expresses that.
+            allOf:
+              # `asserts` and `scope` are mutually exclusive: the constructor
+              # refuses an entry that sets both rather than letting one
+              # silently win. A `null` value counts as absent, so only two
+              # non-null values conflict.
+              - not:
+                  required: [asserts, scope]
+                  properties:
+                    asserts: {type: array}
+                    scope: {type: string}
+              # `scope: mesh_wide` demands an exact `spiffe://` assertor. A
+              # bare service-account matcher is namespace-blind, so pairing it
+              # with a mesh-wide grant would admit any peer whose SPIFFE path
+              # ends with that service-account name, in any namespace,
+              # asserting any identity.
+              - if:
+                  required: [scope]
+                  properties:
+                    scope:
+                      type: string
+                      pattern: '^[\u0009-\u000D\u0020\u0085\u00A0\u1680\u2000-\u200A\u2028\u2029\u202F\u205F\u3000]*mesh_wide[\u0009-\u000D\u0020\u0085\u00A0\u1680\u2000-\u200A\u2028\u2029\u202F\u205F\u3000]*$'
+                then:
+                  properties:
+                    assertor:
+                      pattern: '^[\u0009-\u000D\u0020\u0085\u00A0\u1680\u2000-\u200A\u2028\u2029\u202F\u205F\u3000]*spiffe://'
+      $defs:
+        assertor:
+          type: string
+          # Non-blank after trimming, and either a `spiffe://` ID or a bare
+          # service-account name: anything else carrying `://` is a mistyped
+          # URI the constructor refuses rather than reading as a name.
+          pattern: '[^\u0009-\u000D\u0020\u0085\u00A0\u1680\u2000-\u200A\u2028\u2029\u202F\u205F\u3000]'
+          anyOf:
+            - pattern: '^[\u0009-\u000D\u0020\u0085\u00A0\u1680\u2000-\u200A\u2028\u2029\u202F\u205F\u3000]*spiffe://'
+            - not:
+                pattern: '://'
+          description: |
+            Bare service-account name (matches any peer whose SPIFFE path ends
+            with `/sa/<name>`) or full `spiffe://` SPIFFE ID (matches exactly)
+            identifying the peer this entry admits. Surrounding whitespace is
+            trimmed before matching.
     MeshOutboundRegistryConfig:
       type: object
       description: |
@@ -28610,21 +28595,9 @@ components:
         - if:
             allOf:
               - not:
-                  anyOf:
-                    - required: [span_reporting_disabled]
-                      properties:
-                        span_reporting_disabled: {const: true}
-                    - required: [disable_span_reporting]
-                      not: {required: [span_reporting_disabled]}
-                      properties:
-                        disable_span_reporting: {const: true}
-                    - required: [disableSpanReporting]
-                      not:
-                        anyOf:
-                          - required: [span_reporting_disabled]
-                          - required: [disable_span_reporting]
-                      properties:
-                        disableSpanReporting: {const: true}
+                  required: [span_reporting_disabled]
+                  properties:
+                    span_reporting_disabled: {const: true}
               - anyOf:
                   - required: [tracing_providers]
                     properties:
@@ -28694,33 +28667,7 @@ components:
             type: string
           description: Additional SPIFFE trust domains accepted as equivalent to the workload's trust domain.
         trusted_hbone_assertors:
-          type: [array, "null"]
-          items:
-            oneOf:
-              - type: string
-              - type: object
-                required: [assertor]
-                properties:
-                  assertor:
-                    type: string
-                  asserts:
-                    type: [array, "null"]
-                    items:
-                      type: string
-                  scope:
-                    type: [string, "null"]
-                    pattern: '^\s*(same_namespace|mesh_wide)\s*$'
-                    description: |
-                      `mesh_wide` requires `assertor` to be a full, exactly
-                      matched `spiffe://` ID; bare service-account matchers are
-                      rejected.
-                additionalProperties: false
-                allOf:
-                  - not:
-                      required: [asserts, scope]
-                      properties:
-                        asserts: {type: array}
-                        scope: {type: string}
+          $ref: '#/components/schemas/MeshTrustedHboneAssertors'
           default: ["ztunnel", "waypoint"]
           description: |
             Allow-list of identity-asserting infrastructure components whose
@@ -28731,8 +28678,9 @@ components:
             empty array disables baggage-derived source attribution. Null
             selects the default, as does omission.
 
-            Identical schema and identical semantics to the `mesh_authz` field
-            of the same name — the two plugins share ONE relation, so telemetry
+            The same `MeshTrustedHboneAssertors` schema and the same semantics
+            as the `mesh_authz` field of the same name — the two plugins share
+            ONE parser and ONE relation, so telemetry
             attribution can never grant what authorization refused (issue
             #4274). Refused baggage is stamped
             `mesh.ignored_baggage=assertion_out_of_scope`.
@@ -29093,18 +29041,6 @@ components:
           description: |
             Delay between span export retries, in milliseconds. Read by the
             shared OTel exporter options off this same root config object.
-        disable_span_reporting:
-          type: boolean
-          description: |
-            Alias for `span_reporting_disabled`, accepted for parity with the
-            Istio Telemetry CRD field name. Ignored when
-            `span_reporting_disabled` is present.
-        disableSpanReporting:
-          type: boolean
-          description: |
-            camelCase alias for `span_reporting_disabled`, accepted for parity
-            with the Istio Telemetry CRD field name. Ignored when either
-            snake_case spelling is present.
         direction_emit:
           type: [object, "null"]
           additionalProperties: false
@@ -29128,7 +29064,7 @@ components:
             additionalProperties: false
             properties:
               trusted_hbone_assertors:
-                $ref: '#/components/schemas/WorkloadMetricsConfig/properties/trusted_hbone_assertors'
+                $ref: '#/components/schemas/MeshTrustedHboneAssertors'
               trust_domain_aliases:
                 $ref: '#/components/schemas/WorkloadMetricsConfig/properties/trust_domain_aliases'
           description: |
@@ -29187,17 +29123,10 @@ components:
                 config:
                   type: object
                   additionalProperties: false
-                  anyOf:
-                    - required: [collector_url, access_token_env]
-                    - required: [collector_url, accessTokenEnv]
-                  not: {required: [access_token_env, accessTokenEnv]}
+                  required: [collector_url, access_token_env]
                   properties:
                     collector_url: {type: string}
                     access_token_env:
-                      type: string
-                      maxLength: 256
-                      pattern: '^(?!.*_(?:FILE|VAULT|AWS|AZURE|GCP)$)FERRUM_PLUGIN_SECRET_[A-Z_][A-Z0-9_]*$'
-                    accessTokenEnv:
                       type: string
                       maxLength: 256
                       pattern: '^(?!.*_(?:FILE|VAULT|AWS|AZURE|GCP)$)FERRUM_PLUGIN_SECRET_[A-Z_][A-Z0-9_]*$'
@@ -31098,6 +31027,8 @@ components:
         Enforcement is process-local, so each replica independently permits up
         to the configured limit and the deployment-wide allowance can be the
         limit multiplied by the number of replicas receiving the same identity.
+        A counter entry is removed inline by the permit release that takes it
+        to zero, so there is no background sweep.
         IP keys use the canonical client IP: IPv4 (including IPv4-mapped IPv6)
         is keyed per address, while native IPv6 sources are grouped to
         ipv6_prefix (default /64), so hosts in one /64 share a budget
@@ -31133,19 +31064,6 @@ components:
             clients are always keyed per address, and Consumer keys are
             unaffected. Independent of FERRUM_PER_IP_IPV6_PREFIX, which only
             groups the gateway-wide FERRUM_*_PER_IP caps.
-        cleanup_interval_seconds:
-          type: integer
-          format: uint64
-          default: 60
-          minimum: 0
-          maximum: 86400
-          description: >-
-            Interval in seconds between defensive background sweeps that remove
-            residual zero-count entries. Normal connection completion and
-            plugin-chain rejection release the exact admission permit and remove
-            its zero-count entry inline. The sweep never repairs a missed
-            positive decrement. `0` disables only the residual sweep; inline
-            permit release and removal remain enabled.
 
     AdaptiveConcurrencyConfig:
       type: object
@@ -31318,19 +31236,6 @@ components:
             Denied IP addresses or CIDR ranges (IPv4 or IPv6). Always takes
             precedence over an `allow` match. Each entry must match
             `IpRestrictionRule`.
-        mode:
-          type: string
-          enum: [allow_first, deny_first]
-          default: allow_first
-          deprecated: true
-          description: >-
-            Deprecated and decision-neutral: `mode` never changes whether a
-            request is admitted. A deny match always rejects, and a non-empty
-            allow list always rejects addresses outside it, in either mode. The
-            only effect is which rejection an address that is both outside the
-            allow list and on the deny list receives: `allow_first` (default)
-            reports "IP address not allowed", `deny_first` reports "IP address
-            denied". An allow entry never overrides a deny entry.
 
     BotDetectionConfig:
       type: object
@@ -32207,7 +32112,7 @@ components:
     CompressionConfig:
       type: [object, "null"]
       additionalProperties: false
-      description: "Plugin: compression — Null or an empty object uses defaults. On-the-fly HTTP/1.1, HTTP/2, and HTTP/3 response compression (gzip, Brotli, and opt-in zstd) and optional request decompression. Process-wide FERRUM_COMPRESSION_GZIP_ENABLED and FERRUM_COMPRESSION_BROTLI_ENABLED gates intersect with every instance and default to true; an instance with no remaining usable algorithm after those gates fails admission. Gzip/Brotli codec CPU is offloaded via a bounded spawn_blocking admission pool acquired only immediately before the blocking worker, while response buffering for compression is admitted by an independent bounded response-buffer semaphore reserved in before_proxy and held across the encode (with ineligible owners leaving the slot on the context for sibling handoff), so a slow backend cannot starve request decompression; authenticated /metrics exports ferrum_compression_codec_{admitted,saturated,join_failures,worker_failures}_total and ferrum_compression_response_buffer_{admitted,saturated}_total. Encode abort after a committed Content-Encoding restores identity headers on shared buffered H1/H2/H3 paths when identity remains acceptable, or replaces the response with 406 when the client excluded identity, rather than emitting mislabeled or explicitly refused plaintext. Optional request decompression parses Content-Encoding as an ordered coding list (OWS-tolerant), decodes supported chains in reverse order under hard-capped size/amplification limits, and fails closed on malformed/unsupported members. That decode runs on the shared strict, budget-charged decoder: br refuses Large Window Brotli, and the decoder's own heap plus every output growth (and, on a stacked chain, the previous pass's still-resident buffer) is reserved against FERRUM_REQUEST_DECODE_MAX_TOTAL_BYTES before allocation, so an aggregate-budget refusal is a gateway 503 rather than a client 400. Normalization happens exactly once per request on every frontend: H1/H2 dispatch now receives the ownership context the native H3 path always had, so an already-normalized upload is never decoded a second time. Content negotiation follows RFC 9110 §12.5.3, treats x-gzip as the gzip compatibility token, strictly parses qvalues, and includes the identity coding: an uncoded response is acceptable by default at q=1 unless refused with `identity;q=0` or `*;q=0` without a more-specific identity entry (a nonzero wildcard does not lower identity quality), the most preferred acceptable representation wins (server preference order breaks ties toward compression), and the response is rejected with 406 when identity is unacceptable and no acceptable coded representation can be produced — including size/content-type ineligibility, identity range/delta responses (206/226, Content-Range, or the internal range marker), and `response_caching` HIT paths. That refusal is taken only after every effective instance in the chain has declined, so an earlier instance whose algorithms or content_types cannot serve this response never pre-empts a later sibling that can, and a committed coding is never turned back into a 406. Identity range/delta responses are non-transformable (forwarded unchanged when identity is acceptable); no-body statuses and already-encoded upstream responses remain protocol hard skips. Reject-path 406 replacement is scoped to cache HITs so auth/policy rejection statuses are not masked. Negotiation reads the client's own Accept-Encoding captured at request init, so a request_transformer rule that rewrites or removes the backend-facing header cannot select a coding the client refused or erase an identity;q=0. Honors request/response Cache-Control: no-transform and strong ETag validators by skipping compression (still 406 when that leaves no acceptable representation), unless weaken_strong_etag opts into compressing with a weak validator. When FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES (or the route ceiling) is unlimited or above 32 MiB, compression is length-gated: only a response whose backend declares a Content-Length within min(32 MiB, the buffered-response fallback) is buffered and encoded, other responses stream identity (406 when identity is refused), and plugin construction logs a warning. A later hook relabeling a committed Content-Encoding to a coding the instance cannot produce aborts the encode to identity (or 406). Unknown top-level keys are rejected at construction (for example `min_content_lenght` or `gzip_leveel`); the removed `disable_on_etag` key still reports an explicit migration error. Invalid generations fail file/admin/database/CP-DP admission while KeepLastKnownGood retains the prior published instance. Response buffering is only forced for responses this instance could actually encode: already-encoded origin responses and responses whose known Content-Length is below min_content_length stream instead of being collected. Multiple effective instances compose with first-wins ownership: the first instance that claims a supported request Content-Encoding owns strip+decode exactly once; the first instance that commits a gateway response Content-Encoding owns the single coding layer. Siblings must not delete the owner's request marker or compress again. An earlier identity/Vary-only decision does not block a later compress. H1/H2 and native H3 share the same sequential transform loops; reload snapshots remain atomic. WebSocket, gRPC message compression, and raw stream compression are separate protocol mechanisms."
+      description: "Plugin: compression — Null or an empty object uses defaults. On-the-fly HTTP/1.1, HTTP/2, and HTTP/3 response compression (gzip, Brotli, and opt-in zstd) and optional request decompression. Process-wide FERRUM_COMPRESSION_GZIP_ENABLED and FERRUM_COMPRESSION_BROTLI_ENABLED gates intersect with every instance and default to true; an instance with no remaining usable algorithm after those gates fails admission. Gzip/Brotli codec CPU is offloaded via a bounded spawn_blocking admission pool acquired only immediately before the blocking worker, while response buffering for compression is admitted by an independent bounded response-buffer semaphore reserved in before_proxy and held across the encode (with ineligible owners leaving the slot on the context for sibling handoff), so a slow backend cannot starve request decompression; authenticated /metrics exports ferrum_compression_codec_{admitted,saturated,join_failures,worker_failures}_total and ferrum_compression_response_buffer_{admitted,saturated}_total. Encode abort after a committed Content-Encoding restores identity headers on shared buffered H1/H2/H3 paths when identity remains acceptable, or replaces the response with 406 when the client excluded identity, rather than emitting mislabeled or explicitly refused plaintext. Optional request decompression parses Content-Encoding as an ordered coding list (OWS-tolerant), decodes supported chains in reverse order under hard-capped size/amplification limits, and fails closed on malformed/unsupported members. That decode runs on the shared strict, budget-charged decoder: br refuses Large Window Brotli, and the decoder's own heap plus every output growth (and, on a stacked chain, the previous pass's still-resident buffer) is reserved against FERRUM_REQUEST_DECODE_MAX_TOTAL_BYTES before allocation, so an aggregate-budget refusal is a gateway 503 rather than a client 400. Normalization happens exactly once per request on every frontend: H1/H2 dispatch now receives the ownership context the native H3 path always had, so an already-normalized upload is never decoded a second time. Content negotiation follows RFC 9110 §12.5.3, treats x-gzip as the gzip compatibility token, strictly parses qvalues, and includes the identity coding: an uncoded response is acceptable by default at q=1 unless refused with `identity;q=0` or `*;q=0` without a more-specific identity entry (a nonzero wildcard does not lower identity quality), the most preferred acceptable representation wins (server preference order breaks ties toward compression), and the response is rejected with 406 when identity is unacceptable and no acceptable coded representation can be produced — including size/content-type ineligibility, identity range/delta responses (206/226, Content-Range, or the internal range marker), and `response_caching` HIT paths. That refusal is taken only after every effective instance in the chain has declined, so an earlier instance whose algorithms or content_types cannot serve this response never pre-empts a later sibling that can, and a committed coding is never turned back into a 406. Identity range/delta responses are non-transformable (forwarded unchanged when identity is acceptable); no-body statuses and already-encoded upstream responses remain protocol hard skips. Reject-path 406 replacement is scoped to cache HITs so auth/policy rejection statuses are not masked. Negotiation reads the client's own Accept-Encoding captured at request init, so a request_transformer rule that rewrites or removes the backend-facing header cannot select a coding the client refused or erase an identity;q=0. Honors request/response Cache-Control: no-transform and strong ETag validators by skipping compression (still 406 when that leaves no acceptable representation), unless weaken_strong_etag opts into compressing with a weak validator. When FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES (or the route ceiling) is unlimited or above 32 MiB, compression is length-gated: only a response whose backend declares a Content-Length within min(32 MiB, the buffered-response fallback) is buffered and encoded, other responses stream identity (406 when identity is refused), and plugin construction logs a warning. A later hook relabeling a committed Content-Encoding to a coding the instance cannot produce aborts the encode to identity (or 406). Unknown top-level keys are rejected at construction (for example `min_content_lenght` or `gzip_leveel`). Invalid generations fail file/admin/database/CP-DP admission while KeepLastKnownGood retains the prior published instance. Response buffering is only forced for responses this instance could actually encode: already-encoded origin responses and responses whose known Content-Length is below min_content_length stream instead of being collected. Multiple effective instances compose with first-wins ownership: the first instance that claims a supported request Content-Encoding owns strip+decode exactly once; the first instance that commits a gateway response Content-Encoding owns the single coding layer. Siblings must not delete the owner's request marker or compress again. An earlier identity/Vary-only decision does not block a later compress. H1/H2 and native H3 share the same sequential transform loops; reload snapshots remain atomic. WebSocket, gRPC message compression, and raw stream compression are separate protocol mechanisms."
       properties:
         algorithms:
           type: [array, "null"]
@@ -32567,7 +32472,6 @@ components:
         redis_key_prefix:
           type: string
           minLength: 1
-          default: "{FERRUM_NAMESPACE}:rate_limiting:{plugin-config-id}"
           description: >-
             Key prefix for all Redis keys. Defaults to
             `{FERRUM_NAMESPACE}:{plugin_name}:{plugin-config-id}` so two
@@ -34424,7 +34328,7 @@ components:
           format: uint64
           minimum: 0
           maximum: 18446744073709551615
-          default: 1024
+          default: 256
           description: >
             Size bound on the validation diagnostic written to
             openapi_validator.request_error / openapi_validator.response_error
@@ -36392,7 +36296,7 @@ components:
 
     ResponseCachingConfig:
       type: object
-      description: "Plugin: response_caching — In-memory HTTP response caching. Cache keys are opaque SHA-256 digests over typed, length-framed fields: the effective post-routing destination (proxy, listen path, upstream or direct host/port/scheme, authority, rewritten path), the matched proxy's backend_path, strip_listen_path, and preserve_host_header (so a proxy-only reload that changes the assembled origin path or outbound Host cannot keep replaying the previous route through a retained global instance), the effective frontend scheme from private connection provenance (the proxy regenerates X-Forwarded-Proto from it, so an HTTPS representation is never replayed to plaintext or vice versa), the original authority, method, path, backend-effective outbound query, a mandatory caller-authorization partition (authentication mechanism, resolved identity/consumer, peer SPIFFE identity, and digests of every credential header presented — taken over both the pristine inbound wire header view and the live backend-visible one, so an earlier ai_stream_router credential rewrite cannot erase the original caller distinction; every caller also binds its canonical peer address, and only an anonymous caller's binding is relaxable per anonymous_caller_scope), and a digest of the complete configured/origin-selected Vary tuple including every name, presence flag, and value. Authorization, Proxy-Authorization, and Cookie are mandatory dimensions on every retained response, including anonymous responses, and are emitted in Vary so downstream shared caches cannot cross Ferrum's private caller partition. That Vary list is published on the MISS response itself, and on an honored request Cache-Control: no-cache refresh (X-Cache-Status: BYPASS, which stores its replacement under the same partition), as well as on later hits, so every freshly fetched publicly cacheable response a downstream cache stores already carries the same selection; an origin Vary: * is left untouched. No raw delimiter concatenation is used anywhere in key construction, so an attacker-supplied header or query value cannot forge a field boundary and collide two distinct requests onto one key. Keys are never logged. GET/HEAD lookup requires a private transport-owned proof that the complete H1/H2/H3 upload is empty; non-empty or unproven bodies bypass, and admission rejects deferred request-body transforms that could synthesize bytes after lookup. Honors Cache-Control freshness, upstream Age/Date (a comma-folded repeated Age uses its first member rather than resetting to zero), current Age generation on hits, ETag/Last-Modified revalidation (304, tolerating a bounded number of empty entity-tag list members), Vary, and never caches responses with Set-Cookie (matched case-insensitively, as is Content-Range). Retained entries are sanitized: connection-scoped and proxy-authentication fields (Connection and everything it nominates, Keep-Alive, Proxy-Authenticate, Proxy-Authorization, Proxy-Connection, TE, Trailer, Transfer-Encoding, Upgrade), every field the origin qualified with private=\"…\" or no-cache=\"…\", and every field the shared replay-sanitation policy also applied by ai_semantic_cache and request_deduplication classifies as per-response state (Set-Cookie/Set-Cookie2, WWW-Authenticate, response credentials, per-request trace and correlation identifiers such as traceparent, b3, x-b3-*, X-Request-Id, X-Correlation-Id, Retry-After, and every RateLimit/X-RateLimit/X-AI-RateLimit/Anthropic-RateLimit field) are dropped before storage, so no replay can emit them; the response that produced the miss is delivered untouched. Responses to requests carrying Authorization in either the pristine inbound or live backend-visible view are stored only with an explicit origin shared-cache opt-in (public, must-revalidate, or s-maxage); cache_key_include_consumer changes key partitioning only and cannot override that requirement. Partial (206) and validator-only (304) responses, and any response carrying Content-Range, are never stored as reusable representations. Gateway-generated transport failures are refused from typed backend-dispatch provenance on every HTTP version, so listing 502/504 in cacheable_status_codes retains genuine origin error pages without pinning a local connect/read failure over a recovered origin. Includes a bounded FIFO cacheability predictor (amortized O(1) admission, no full-map sort at capacity) that suppresses repeat cache lookups for variants known to be uncacheable. Unsafe-method invalidation is deferred until a non-error origin response (private provenance recorded before after_proxy hooks), is classified independently of cacheable_methods storage eligibility, skips served cache HITs that never contacted the origin, is confined to the same normalized/transformed Host/authority partition as lookup, and treats a slash-terminated mutated path (including the root) as its own descendant boundary so its children are invalidated too. Store-side staging (header delta, reduced snapshot, timing, lookup path, keys) is written only once a request is known to reach the origin (MISS or no-cache refresh), never on a HIT, REVALIDATED, PREDICTED-BYPASS, or request no-store. Lookup outcomes are exported as the bounded ferrum_response_cache_lookups_total{status} counter (hit, miss, bypass, revalidated, predicted_bypass; never a key, path, host, or caller label). Multiple instances on one proxy namespace request staging metadata under response_caching.<instance_id>.* so differing query/consumer/Vary/method/SSE/status policies remain independent across priority order and reload generations. Unknown top-level keys are rejected with path-qualified diagnostics and spelling suggestions so misspelled Vary, consumer, query, Cache-Control, status/method, capacity, or invalidation fields cannot silently weaken isolation or retention. HTTP only."
+      description: "Plugin: response_caching — In-memory HTTP response caching. Cache keys are opaque SHA-256 digests over typed, length-framed fields: the effective post-routing destination (proxy, listen path, upstream or direct host/port/scheme, authority, rewritten path), the matched proxy's backend_path, strip_listen_path, and preserve_host_header (so a proxy-only reload that changes the assembled origin path or outbound Host cannot keep replaying the previous route through a retained global instance), the effective frontend scheme from private connection provenance (the proxy regenerates X-Forwarded-Proto from it, so an HTTPS representation is never replayed to plaintext or vice versa), the original authority, method, path, backend-effective outbound query, a mandatory caller-authorization partition (authentication mechanism, resolved identity/consumer, peer SPIFFE identity, and digests of every credential header presented — taken over both the pristine inbound wire header view and the live backend-visible one, so an earlier ai_stream_router credential rewrite cannot erase the original caller distinction; every caller also binds its canonical peer address, and only an anonymous caller's binding is relaxable per anonymous_caller_scope), and a digest of the complete configured/origin-selected Vary tuple including every name, presence flag, and value. Authorization, Proxy-Authorization, and Cookie are mandatory dimensions on every retained response, including anonymous responses, and are emitted in Vary so downstream shared caches cannot cross Ferrum's private caller partition. That Vary list is published on the MISS response itself, and on an honored request Cache-Control: no-cache refresh (X-Cache-Status: BYPASS, which stores its replacement under the same partition), as well as on later hits, so every freshly fetched publicly cacheable response a downstream cache stores already carries the same selection; an origin Vary: * is left untouched. No raw delimiter concatenation is used anywhere in key construction, so an attacker-supplied header or query value cannot forge a field boundary and collide two distinct requests onto one key. Keys are never logged. GET/HEAD lookup requires a private transport-owned proof that the complete H1/H2/H3 upload is empty; non-empty or unproven bodies bypass, and admission rejects deferred request-body transforms that could synthesize bytes after lookup. Honors Cache-Control freshness, upstream Age/Date (a comma-folded repeated Age uses its first member rather than resetting to zero), current Age generation on hits, ETag/Last-Modified revalidation (304, tolerating a bounded number of empty entity-tag list members), Vary, and never caches responses with Set-Cookie (matched case-insensitively, as is Content-Range). Retained entries are sanitized: connection-scoped and proxy-authentication fields (Connection and everything it nominates, Keep-Alive, Proxy-Authenticate, Proxy-Authorization, Proxy-Connection, TE, Trailer, Transfer-Encoding, Upgrade), every field the origin qualified with private=\"…\" or no-cache=\"…\", and every field the shared replay-sanitation policy also applied by ai_semantic_cache and request_deduplication classifies as per-response state (Set-Cookie/Set-Cookie2, WWW-Authenticate, response credentials, per-request trace and correlation identifiers such as traceparent, b3, x-b3-*, X-Request-Id, X-Correlation-Id, Retry-After, and every RateLimit/X-RateLimit/X-AI-RateLimit/Anthropic-RateLimit field) are dropped before storage, so no replay can emit them; the response that produced the miss is delivered untouched. Responses to requests carrying Authorization in either the pristine inbound or live backend-visible view are stored only with an explicit origin shared-cache opt-in (public, must-revalidate, or s-maxage). Partial (206) and validator-only (304) responses, and any response carrying Content-Range, are never stored as reusable representations. Gateway-generated transport failures are refused from typed backend-dispatch provenance on every HTTP version, so listing 502/504 in cacheable_status_codes retains genuine origin error pages without pinning a local connect/read failure over a recovered origin. Includes a bounded FIFO cacheability predictor (amortized O(1) admission, no full-map sort at capacity) that suppresses repeat cache lookups for variants known to be uncacheable. Unsafe-method invalidation is deferred until a non-error origin response (private provenance recorded before after_proxy hooks), is classified independently of cacheable_methods storage eligibility, skips served cache HITs that never contacted the origin, is confined to the same normalized/transformed Host/authority partition as lookup, and treats a slash-terminated mutated path (including the root) as its own descendant boundary so its children are invalidated too. Store-side staging (header delta, reduced snapshot, timing, lookup path, keys) is written only once a request is known to reach the origin (MISS or no-cache refresh), never on a HIT, REVALIDATED, PREDICTED-BYPASS, or request no-store. Lookup outcomes are exported as the bounded ferrum_response_cache_lookups_total{status} counter (hit, miss, bypass, revalidated, predicted_bypass; never a key, path, host, or caller label). Multiple instances on one proxy namespace request staging metadata under response_caching.<instance_id>.* so differing query/consumer/Vary/method/SSE/status policies remain independent across priority order and reload generations. Unknown top-level keys are rejected with path-qualified diagnostics and spelling suggestions so misspelled Vary, consumer, query, Cache-Control, status/method, capacity, or invalidation fields cannot silently weaken isolation or retention. HTTP only."
       additionalProperties: false
       properties:
         ttl_seconds:
@@ -36465,14 +36369,6 @@ components:
             pattern: "^[!#$%&'*+.^_`|~0-9A-Za-z-]+$"
           default: []
           description: "Operator attestation that these request headers never select the origin's response (for example a per-request X-Request-Id stamped by an upstream CDN or load balancer), so they must not fragment the cache. Each named header is removed from the request in before_proxy, before the cache key is derived, and is therefore never sent to the origin either — the key still binds every header the origin actually receives, so this relaxes hit rate without opening an unbound dimension. Matching is case-insensitive and applies to every request this instance handles. Names are rejected at admission when they are not valid RFC 9110 field-name tokens, when they are also listed in vary_by_headers, when they name a credential or session header (Authorization, Proxy-Authorization, Cookie, the built-in credential headers, or anything the log-redaction rules classify as sensitive), a gateway-owned header the proxy re-asserts on the backend request after lookup (X-Ferrum-Hops and the rest of the X-Ferrum-* namespace, X-Consumer-*, X-Authenticated-Identity, X-Geo-Country, X-Path-Param-*), Host or a hop-by-hop field, Cache-Control, Pragma, Range, Max-Forwards, any If-* precondition, any Content-* field, Expect, Accept, Accept-Encoding, or proxy-owned forwarding identity (any X-Forwarded-* field, Forwarded, X-Real-IP, Via). Family refusals are prefix matches, and these admission refusals are ASCII case-insensitive with _ treated as - (for example, keep_alive, proxy_connection, and transfer_encoding are refused). Stripping a named header and the vary_by_headers overlap check use exact field-name matching (ASCII case-insensitive only), so x_cdn_hop does not remove X-Cdn-Hop. A non-empty list makes this instance a request-header mutator at its priority, so it cannot share a proxy with request_deduplication, which refuses any later header mutator. The operator must also ensure no later plugin derives the response from an ignored header."
-        cache_key_include_query:
-          type: [boolean, "null"]
-          default: true
-          description: "Legacy keyspace toggle. The backend-effective outbound query is always bound as a length-framed field because the origin may vary on it; it is not parsed, sorted, percent-decoded, or normalized. This flag remains in the digest so changing it rotates the keyspace, but false no longer authorizes cross-query replay."
-        cache_key_include_consumer:
-          type: [boolean, "null"]
-          default: false
-          description: "Legacy key-partition toggle. Caller isolation no longer depends on it: every cache key binds a mandatory caller-authorization partition (authentication mechanism, resolved identity/consumer, peer SPIFFE identity, and SHA-256 digests of every credential header presented), so two credentials that resolve to one display subject with different scopes can never share an entry. The flag is still bound into the key digest so flipping it yields a disjoint keyspace rather than reusing entries minted under the other setting. It does not authorize shared storage of a response to an Authorization-bearing request: the origin must still send Cache-Control public, must-revalidate, or s-maxage, so backend-side revocation, expiry, and scope changes remain authoritative."
         anonymous_caller_scope:
           type: [string, "null"]
           pattern: '^\s*([Cc][Aa][Ll][Ll][Ee][Rr][_-][Aa][Dd][Dd][Rr][Ee][Ss][Ss]|[Ss][Hh][Aa][Rr][Ee][Dd])\s*$'
@@ -36614,7 +36510,6 @@ components:
         redis_key_prefix:
           type: string
           minLength: 1
-          default: "{FERRUM_NAMESPACE}:graphql:{plugin-config-id}"
           description: >-
             Key prefix for all Redis keys. Defaults to
             `{FERRUM_NAMESPACE}:{plugin_name}:{plugin-config-id}` so two
@@ -36797,7 +36692,6 @@ components:
         redis_key_prefix:
           type: string
           minLength: 1
-          default: "{FERRUM_NAMESPACE}:grpc_method_router:{plugin-config-id}"
           description: >-
             Key prefix for all Redis keys. Defaults to
             `{FERRUM_NAMESPACE}:{plugin_name}:{plugin-config-id}` so two
@@ -38351,11 +38245,6 @@ components:
           type: object
           additionalProperties: false
           properties:
-            log_raw_text:
-              type: boolean
-              enum: [false]
-              default: false
-              description: Reserved for future explicit raw-text logging. true is rejected in this release.
             include_snippet_hash:
               type: boolean
               default: true
@@ -39103,7 +38992,6 @@ components:
         redis_key_prefix:
           type: string
           minLength: 1
-          default: "{FERRUM_NAMESPACE}:ai_rate_limiter:{plugin-config-id}"
           description: >-
             Key prefix for all Redis keys. Defaults to
             `{FERRUM_NAMESPACE}:{plugin_name}:{plugin-config-id}` so two
@@ -40735,7 +40623,6 @@ components:
                     - required: [aggregate_prompts]
                     - required: [namespace_separator]
                     - required: [cache_ttl_seconds]
-                    - required: [hide_denied_items]
                     - required: [on_new_tool]
                     - required: [on_schema_change]
               # transparent_proxy has no mediated tool catalog, so result
@@ -40821,7 +40708,7 @@ components:
         discovery:
           type: [object, "null"]
           additionalProperties: false
-          description: Catalog discovery requires aggregate_router. Explicit aggregate_tools, aggregate_resources, aggregate_prompts, namespace_separator, cache_ttl_seconds, hide_denied_items, on_new_tool, and on_schema_change fields are rejected in transparent_proxy, including explicit defaults, because every one of them is inert without a mediated catalog. An explicit null block, and an explicit null on any field below, selects the defaults exactly as omission does.
+          description: Catalog discovery requires aggregate_router. Explicit aggregate_tools, aggregate_resources, aggregate_prompts, namespace_separator, cache_ttl_seconds, on_new_tool, and on_schema_change fields are rejected in transparent_proxy, including explicit defaults, because every one of them is inert without a mediated catalog. An explicit null block, and an explicit null on any field below, selects the defaults exactly as omission does.
           properties:
             aggregate_tools:
               type: [boolean, "null"]
@@ -40842,16 +40729,13 @@ components:
               minimum: 1
               default: 300
               description: Also bounds recovery from a wholly unavailable catalog family — that outage is cached for this long before the family is retried.
-            hide_denied_items:
-              type: [boolean, "null"]
-              default: true
             on_new_tool:
               type: [string, "null"]
-              enum: [allow, allow_immediately, expose, hide_until_configured, null]
+              enum: [allow, hide_until_configured, null]
               default: hide_until_configured
             on_schema_change:
               type: [string, "null"]
-              enum: [allow, allow_immediately, expose, hide_until_configured, null]
+              enum: [allow, hide_until_configured, null]
               default: hide_until_configured
         sessions:
           type: [object, "null"]
@@ -40895,9 +40779,8 @@ components:
                 partitions).
             initialize_upstreams:
               type: [string, "null"]
-              enum: [lazy, startup, passthrough, null]
+              enum: [lazy, passthrough, null]
               default: lazy
-              description: startup is accepted as a V1 alias for lazy because upstream MCP initialize requires a downstream client session.
             session_ttl_seconds:
               type: [integer, "null"]
               format: uint64
@@ -41143,8 +41026,8 @@ components:
                 default: false
               initialize_strategy:
                 type: [string, "null"]
-                enum: [lazy, startup, passthrough, null]
-                description: Overrides sessions.initialize_upstreams for this server; startup is accepted as a V1 alias for lazy.
+                enum: [lazy, passthrough, null]
+                description: Overrides sessions.initialize_upstreams for this server.
               headers:
                 type: [object, "null"]
                 maxProperties: 32
@@ -44978,6 +44861,7 @@ components:
             - SchemaTooDeep
             - SchemaReferenceCycle
             - SchemaTooLarge
+            - UnsupportedOperationField
           description: |
             Machine-readable error discriminant.
 
@@ -45009,6 +44893,8 @@ components:
             - `SchemaTooLarge` — reference expansion exceeded the per-expansion or cumulative
               per-document materialized-node / byte budget, or the generated operation table
               exceeded the generated-config byte ceiling
+            - `UnsupportedOperationField` — a Path Item declares an OpenAPI 3.2 `query`
+              operation or `additionalOperations`, which the importer does not support
         details:
           type: string
           description: |

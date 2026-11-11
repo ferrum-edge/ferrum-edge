@@ -11,7 +11,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::{mpsc, oneshot, watch};
 
-use crate::common::{empty_digest_header, generate_hmac_signature};
+use crate::common::{empty_digest_header, hmac_v2_authorization};
 
 use super::mesh_test_support::{
     DEFAULT_NAMESPACE, DEFAULT_TRUST_DOMAIN, default_mesh_runtime, service_for, workload_for,
@@ -19,7 +19,7 @@ use super::mesh_test_support::{
 
 use ferrum_edge::config::types::{
     AuthMode, BackendScheme, CircuitBreakerConfig, Consumer, DispatchKind, GatewayConfig,
-    PluginAssociation, PluginConfig, PluginScope, Proxy,
+    PluginAssociation, PluginConfig, PluginScope, Proxy, Upstream,
 };
 use ferrum_edge::config::{EnvConfig, OperatingMode};
 use ferrum_edge::dns::{DnsCache, DnsConfig};
@@ -91,7 +91,6 @@ pub(super) fn create_mesh_proxy(backend_port: u16) -> Proxy {
         pool_http2_max_concurrent_streams: None,
         pool_http3_connections_per_backend: None,
         h2_upgrade_policy: None,
-        pool_max_requests_per_connection: None,
         pool_http1_max_pending_requests: None,
         upstream_id: None,
         upstream_subset: None,
@@ -152,6 +151,16 @@ fn create_mesh_proxy_state_with_env(
     plugin_configs: Vec<PluginConfig>,
     env_config: EnvConfig,
 ) -> ProxyState {
+    create_mesh_proxy_state_with_upstreams(proxy, consumers, plugin_configs, env_config, vec![])
+}
+
+fn create_mesh_proxy_state_with_upstreams(
+    proxy: Proxy,
+    consumers: Vec<Consumer>,
+    plugin_configs: Vec<PluginConfig>,
+    env_config: EnvConfig,
+    upstreams: Vec<Upstream>,
+) -> ProxyState {
     let config = GatewayConfig {
         quarantined_plugin_configs: Vec::new(),
         quarantined_jwt_shared_secrets: Default::default(),
@@ -159,7 +168,7 @@ fn create_mesh_proxy_state_with_env(
         proxies: vec![proxy],
         consumers,
         plugin_configs,
-        upstreams: vec![],
+        upstreams,
         loaded_at: Utc::now(),
         known_namespaces: Vec::new(),
         frontend_tls_cert_path: None,
@@ -214,8 +223,7 @@ fn hmac_auth_plugin_config() -> PluginConfig {
         plugin_name: "hmac_auth".to_string(),
         namespace: ferrum_edge::config::types::default_namespace(),
         config: json!({
-            "signing_profile": "ferrum-hmac-v1",
-            "allow_unsafe_replayable_v1": true
+            "replay_scope": "process"
         }),
         scope: PluginScope::Global,
         proxy_id: None,
@@ -669,6 +677,71 @@ async fn hbone_connect_relays_data_frames_to_tcp_backend() {
     conn_task.abort();
 }
 
+/// Issue #7183: a failed backend dial on the inbound byte-stream relay feeds
+/// passive health (DestinationRule `outlierDetection`), symmetric with the
+/// success it already reported, so a dead target can be ejected through this
+/// path.
+#[tokio::test(flavor = "multi_thread")]
+async fn hbone_backend_connect_failure_ejects_the_target_by_passive_health() {
+    let certs = generate_hbone_mtls_certs("spiffe://cluster.local/ns/default/sa/client");
+    let refused = crate::scaffolding::ports::reserve_refused_tcp_port().expect("refused port");
+    let mut proxy = create_mesh_proxy(refused.port);
+    proxy.backend_connect_timeout_ms = 1_000;
+    proxy.upstream_id = Some("mesh-hbone-upstream".to_string());
+    let upstream: Upstream = serde_json::from_value(json!({
+        "id": "mesh-hbone-upstream",
+        "targets": [{ "host": "127.0.0.1", "port": refused.port }],
+        "health_checks": { "passive": { "unhealthy_threshold": 1 } },
+    }))
+    .expect("upstream");
+    let spiffe_plugin = spiffe_identity_plugin_config(&proxy.id);
+    proxy.plugins.push(PluginAssociation {
+        plugin_config_id: spiffe_plugin.id.clone(),
+    });
+    let namespace = proxy.namespace.clone();
+    let state = create_mesh_proxy_state_with_upstreams(
+        proxy,
+        vec![],
+        vec![spiffe_plugin],
+        mesh_env_config(),
+        vec![upstream],
+    );
+    let health_checker = state.health_checker.clone();
+    let (gateway_addr, shutdown_tx) = start_gateway_mtls(state, hbone_server_config(&certs)).await;
+    let (mut sender, conn_task) =
+        connect_hbone_h2_mtls(gateway_addr, hbone_client_config(&certs)).await;
+
+    let req = Request::builder()
+        .method(Method::CONNECT)
+        .uri("orders.default.svc.cluster.local:8080")
+        .body(())
+        .expect("connect request");
+    let (response_fut, _request_body) = sender.send_request(req, false).expect("send CONNECT");
+    let resp = tokio::time::timeout(std::time::Duration::from_secs(10), response_fut)
+        .await
+        .expect("timely CONNECT response")
+        .expect("CONNECT response");
+    assert!(
+        resp.status().is_server_error(),
+        "a failed backend dial answers 5xx, got {}",
+        resp.status()
+    );
+
+    let target = format!("127.0.0.1:{}", refused.port);
+    let runtime_key =
+        ferrum_edge::config::db_backend::namespaced_runtime_key(&namespace, "mesh-hbone");
+    assert!(
+        health_checker
+            .passive_health
+            .get(&runtime_key)
+            .is_some_and(|state| state.unhealthy.contains_key(&target)),
+        "the failed relay dial must passively eject its target"
+    );
+
+    shutdown_tx.send(true).expect("shutdown gateway");
+    conn_task.abort();
+}
+
 /// Security regression (mesh audit finding #2): a bare HTTP/2 CONNECT with no
 /// authenticated mesh peer must NOT be relayed as a transparent HBONE tunnel.
 /// Here the gateway listens in plaintext (no mTLS), so `ctx.peer_spiffe_id` is
@@ -729,23 +802,19 @@ async fn hbone_connect_with_body_auth_plugin_is_rejected() {
     let method = "CONNECT";
     let path = "/";
     let date = Utc::now().format("%a, %d %b %Y %H:%M:%S GMT").to_string();
-    let signature = generate_hmac_signature(
+    let authorization = hmac_v2_authorization(
         method,
         path,
         &date,
         "hmacuser",
         "orders.default.svc.cluster.local:8080",
         HMAC_SECRET,
+        &empty_digest_header(),
     );
     let req = Request::builder()
         .method(Method::CONNECT)
         .uri("orders.default.svc.cluster.local:8080")
-        .header(
-            "authorization",
-            format!(
-                r#"hmac username="hmacuser", algorithm="hmac-sha256", signature="{signature}""#
-            ),
-        )
+        .header("authorization", authorization)
         .header("date", date)
         .header("digest", empty_digest_header())
         .body(())
@@ -4023,18 +4092,6 @@ fn inbound_relay_registry_strict_parse_retracts_malformed_evidence_then_recovers
         Err(InboundRelayDenial::AddressNotTerminated),
         "a malformed sibling must retract the whole last-good index"
     );
-    assert!(
-        !index.terminates_for(ip("10.244.5.5"), None, Some(LOCAL_POD_UID)),
-        "malformed identity must not still admit the address on address/pod-UID alone"
-    );
-    assert!(
-        !index.terminates_for(
-            ip("10.244.5.5"),
-            Some(own_spiffe.as_str()),
-            Some(LOCAL_POD_UID),
-        ),
-        "malformed identity must not skip the identity comparison by becoming None"
-    );
 
     write_strict_registry_entry(dir.path(), LOCAL_POD_UID, "10.244.5.5", &own_spiffe);
     assert_eq!(manager.reconcile_once().len(), 2);
@@ -4189,14 +4246,6 @@ fn inbound_relay_registry_strict_parse_retracts_spiffe_on_non_uuid_leaf() {
         mesh.inbound_relay_destination_decision("10.244.5.5", 8080, node),
         Err(InboundRelayDenial::AddressNotTerminated),
         "a sibling with spiffe_id= on a non-UUID leaf must retract the whole last-good index"
-    );
-    assert!(
-        !index.terminates_for(
-            ip("10.244.5.7"),
-            Some(own_spiffe.as_str()),
-            Some(safe_non_uuid),
-        ),
-        "the non-UUID identity binding must not still admit on address/pod-UID alone"
     );
 
     std::fs::remove_file(dir.path().join(safe_non_uuid)).expect("remove non-UUID leaf");
@@ -4403,6 +4452,13 @@ fn registry_missing_directory_warns_with_path_and_node_agent_and_repeats() {
     let registry = root.path().join("node-waypoint-pods");
     let rendered_path = registry.display().to_string();
     let index = Arc::new(NodeLocalEnrolledDestinations::new());
+    let own_spiffe = reviews_spiffe();
+    let (slice, runtime) =
+        ambient_relay_fixture(vec![reviews_replica("10.244.5.5", LOCAL_POD_UID)]);
+    let mut mesh = prepared_mesh(&slice, &runtime);
+    let node = Some(ip("10.244.0.1"));
+    mesh.inbound_relay_node_local_registry =
+        NodeLocalEnrolledDestinationsHandle::new(index.clone());
     let poll = std::time::Duration::from_secs(2);
     let manager = NodeLocalEnrolledDestinationsManager::new(
         Arc::new(DirectoryCaptureSource::new(&registry)),
@@ -4429,8 +4485,9 @@ fn registry_missing_directory_warns_with_path_and_node_agent_and_repeats() {
         "the warning names the opt-out: {}",
         first[0]
     );
-    assert!(
-        !index.terminates_for(ip("10.244.5.5"), None, None),
+    assert_eq!(
+        mesh.inbound_relay_destination_decision("10.244.5.5", 8080, node),
+        Err(InboundRelayDenial::AddressNotTerminated),
         "fail closed stays the default"
     );
 
@@ -4454,12 +4511,14 @@ fn registry_missing_directory_warns_with_path_and_node_agent_and_repeats() {
     // A node agent publishes the directory: the index publishes and recovery
     // is announced once.
     std::fs::create_dir(&registry).expect("node agent publishes the registry");
-    let own_spiffe = reviews_spiffe();
     write_strict_registry_entry(&registry, LOCAL_POD_UID, "10.244.5.5", &own_spiffe);
     assert_eq!(manager.reconcile_once().len(), 1);
     assert_eq!(manager.consecutive_unavailable_polls(), 0);
     assert_eq!(logs.warn_lines("registry recovered").len(), 1);
-    assert!(index.terminates_for(ip("10.244.5.5"), None, None));
+    assert_eq!(
+        mesh.inbound_relay_destination_decision("10.244.5.5", 8080, node),
+        Ok(())
+    );
 
     // A present-but-malformed registry is a different failure and says so,
     // without claiming the node agent is missing.
@@ -4469,7 +4528,11 @@ fn registry_missing_directory_warns_with_path_and_node_agent_and_repeats() {
     assert_eq!(malformed.len(), 1, "{malformed:?}");
     assert!(malformed[0].contains(&rendered_path), "{}", malformed[0]);
     assert_eq!(logs.warn_lines(missing).len(), 2);
-    assert!(!index.terminates_for(ip("10.244.5.5"), None, None));
+    assert_eq!(
+        mesh.inbound_relay_destination_decision("10.244.5.5", 8080, node),
+        Err(InboundRelayDenial::AddressNotTerminated),
+        "a malformed registry retracts the published index"
+    );
 }
 
 /// Issue #4249, the `Sidecar` half. A Sidecar shares the application pod's

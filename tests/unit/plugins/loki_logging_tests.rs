@@ -1276,8 +1276,10 @@ async fn test_loki_logging_include_proxy_id_label_new_key() {
     // coverage lives in the build_http_labels tests below.
 }
 
+/// `include_listen_path_label` is an ordinary unknown key (no dedicated
+/// removed-key diagnostic, issue #7113).
 #[tokio::test]
-async fn test_loki_logging_removed_listen_path_key_rejected() {
+async fn test_loki_logging_listen_path_key_is_unknown() {
     let result = LokiLogging::new(
         &json!({
             "endpoint_url": "http://127.0.0.1:1/unreachable",
@@ -1286,8 +1288,11 @@ async fn test_loki_logging_removed_listen_path_key_rejected() {
         }),
         default_client(),
     );
-    let err = result.err().expect("removed key should be rejected");
-    assert!(err.contains("include_listen_path_label"), "got: {err}");
+    let err = result.err().expect("unknown key should be rejected");
+    assert!(
+        err.contains("unknown configuration key") && err.contains("include_listen_path_label"),
+        "got: {err}"
+    );
 }
 
 async fn spawn_loki_keepalive_server(
@@ -1667,7 +1672,10 @@ async fn test_loki_terminal_and_exhausted_delivery_counts_batch_discard() {
 fn startup_diagnostics_withhold_loki_config_keys_and_label_names() {
     let secret = "'diagnostic-secret-5594`\"\\\n";
     for (extra, context) in [
-        (json!({secret: true}), "at `config`"),
+        (
+            json!({secret: true}),
+            "`config`: unknown configuration key(s)",
+        ),
         (json!({"labels": {secret: "safe"}}), "label name"),
         (
             json!({"labels": {"diagnostic_secret_5594": 987654321}}),

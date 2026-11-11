@@ -337,6 +337,39 @@ impl HboneUdpRelayEnd {
 /// refusal is not evidence about the backend. Real DNS and connection failures
 /// record a failure with their `status`. This is the ONE settlement site for a
 /// failed connect; callers invoke it exactly once per connect attempt.
+/// Report the inbound byte-stream relay's backend connect outcome to passive
+/// health for the selected upstream target: success once the relay socket is
+/// connected, and a connection failure when the dial failed (issue #7183), so
+/// DestinationRule `outlierDetection` can eject a dead target through this
+/// path. No-op for a relay with no upstream target.
+fn report_hbone_backend_connect_to_passive_health(
+    state: &ProxyState,
+    epoch: &RequestEpoch,
+    proxy: &Proxy,
+    target: Option<&UpstreamTarget>,
+    status: StatusCode,
+    connection_error: bool,
+) {
+    if let (Some(upstream_id), Some(target)) = (&proxy.upstream_id, target)
+        && let Some(upstream) = LoadBalancerCache::get_upstream_from(
+            &epoch.load_balancer,
+            &proxy.namespace,
+            upstream_id,
+        )
+    {
+        let passive = backend_dispatch::passive_health_for_target(proxy, &upstream, target);
+        state.health_checker.report_response(
+            &proxy.namespace,
+            &proxy.id,
+            upstream_id,
+            target,
+            status.as_u16(),
+            connection_error,
+            passive,
+        );
+    }
+}
+
 pub(crate) fn settle_hbone_backend_connect_circuit_breaker_outcome(
     cb: &crate::circuit_breaker::CircuitBreaker,
     status: StatusCode,
@@ -728,8 +761,12 @@ async fn connect_backend(
             Ok(candidates) => candidates,
             Err(denial) => return Err(HboneConnectFailure::RelayDenied(denial.as_str())),
         };
+    // The NodeWaypoint topology, resolved once at startup: the mesh runtime
+    // installs the identity resolver for exactly that topology, so its
+    // presence is the topology bit without a per-CONNECT environment read and
+    // re-parse (issue #7166).
     let socket_mark = (proxy.id == MESH_INBOUND_HBONE_RELAY_PROXY_ID
-        && node_waypoint_inbound_relay_mark_enabled())
+        && state.node_waypoint_identity_resolver.is_some())
     .then_some(NODE_WAYPOINT_INBOUND_AUTH_MARK);
     let timeout = Duration::from_millis(effective_connect_timeout_ms);
     let (stream, addr) = match crate::dns::connect_candidates(&candidates, port, timeout, |addr| {
@@ -923,15 +960,6 @@ pub(super) fn inbound_ingress_relay_effective_destination_allowed(
     };
     let (app_host, app_port) = effective_hbone_backend_target(proxy, upstream_target);
     mesh.sidecar_ingress_connect_relay_endpoint_matches(listener_port, app_host, app_port)
-}
-
-fn node_waypoint_inbound_relay_mark_enabled() -> bool {
-    crate::config::conf_file::resolve_ferrum_var("FERRUM_MESH_TOPOLOGY").is_some_and(|topology| {
-        matches!(
-            topology.trim().to_ascii_lowercase().as_str(),
-            "node_waypoint" | "node-waypoint"
-        )
-    })
 }
 
 /// What the request path resolved the admitting plugin view with, plus the
@@ -1165,6 +1193,7 @@ pub(super) async fn handle_hbone_request(
             mismatch,
             is_tls,
             false,
+            None,
             start_time,
             plugin_execution_ns,
             "hbone_peer_auth_transport_mismatch",
@@ -1416,6 +1445,20 @@ pub(super) async fn handle_hbone_request(
                     cb_probe.take_slot(),
                 );
             }
+            // Passive health / DestinationRule `outlierDetection` sees the
+            // backend connect failure, symmetric with the success report below
+            // (issue #7183). A relay-destination refusal never dialed, and a
+            // gateway-side class says nothing about the target.
+            if !policy_refusal && !backend_dispatch::client_side_no_backend_signal(Some(class)) {
+                report_hbone_backend_connect_to_passive_health(
+                    state,
+                    epoch,
+                    proxy,
+                    upstream_target.as_deref(),
+                    status,
+                    true,
+                );
+            }
             ctx.metadata
                 .insert("error_class".to_string(), class.to_string());
             let reject = finalize_reject_response_with_after_proxy_hooks(
@@ -1453,24 +1496,14 @@ pub(super) async fn handle_hbone_request(
             crate::circuit_breaker::BreakerOutcome::Success,
         );
     }
-    if let (Some(upstream_id), Some(target)) = (&proxy.upstream_id, upstream_target.as_deref())
-        && let Some(upstream) = LoadBalancerCache::get_upstream_from(
-            &epoch.load_balancer,
-            &proxy.namespace,
-            upstream_id,
-        )
-    {
-        let passive = backend_dispatch::passive_health_for_target(proxy, &upstream, target);
-        state.health_checker.report_response(
-            &proxy.namespace,
-            &proxy.id,
-            upstream_id,
-            target,
-            StatusCode::OK.as_u16(),
-            false,
-            passive,
-        );
-    }
+    report_hbone_backend_connect_to_passive_health(
+        state,
+        epoch,
+        proxy,
+        upstream_target.as_deref(),
+        StatusCode::OK,
+        false,
+    );
 
     let backend_target = backend.target_url.clone();
     let backend_resolved_ip = backend.resolved_ip.clone();
@@ -1918,6 +1951,7 @@ pub(super) async fn handle_hbone_udp_request(
             mismatch,
             is_tls,
             false,
+            None,
             start_time,
             plugin_execution_ns,
             "hbone_udp_peer_auth_transport_mismatch",
@@ -2480,7 +2514,21 @@ async fn open_hbone_udp_relay_socket(
     state: &ProxyState,
     dest_addr: SocketAddr,
 ) -> Result<tokio::net::UdpSocket, HboneUdpSocketOpenError> {
-    if let Some(std_socket) = maybe_bind_pod_netns_udp_relay_socket(state, dest_addr)? {
+    // Finding the destination pod reads every registry entry, and binding
+    // inside its netns spawns and joins a `setns` thread: both block, so they
+    // run on the blocking pool rather than this request's runtime worker
+    // (issue #7170).
+    let registry_dir = state.env_config.mesh_node_waypoint_pod_registry_dir.clone();
+    let pod_netns_socket = tokio::task::spawn_blocking(move || {
+        maybe_bind_pod_netns_udp_relay_socket(&registry_dir, dest_addr)
+    })
+    .await
+    .map_err(|e| HboneUdpSocketOpenError {
+        phase: "hbone_udp_bind",
+        body: br#"{"error":"HBONE UDP pod-netns local socket failed"}"#,
+        message: e.to_string(),
+    })??;
+    if let Some(std_socket) = pod_netns_socket {
         return tokio::net::UdpSocket::from_std(std_socket).map_err(|e| HboneUdpSocketOpenError {
             phase: "hbone_udp_bind",
             body: br#"{"error":"HBONE UDP pod-netns socket adoption failed"}"#,
@@ -2513,13 +2561,11 @@ async fn open_hbone_udp_relay_socket(
 
 #[cfg(target_os = "linux")]
 fn maybe_bind_pod_netns_udp_relay_socket(
-    state: &ProxyState,
+    registry_dir: &str,
     dest_addr: SocketAddr,
 ) -> Result<Option<std::net::UdpSocket>, HboneUdpSocketOpenError> {
-    let Some(target) = registered_pod_target_for_udp_destination(
-        &state.env_config.mesh_node_waypoint_pod_registry_dir,
-        dest_addr.ip(),
-    ) else {
+    let Some(target) = registered_pod_target_for_udp_destination(registry_dir, dest_addr.ip())
+    else {
         return Ok(None);
     };
 
@@ -2534,7 +2580,7 @@ fn maybe_bind_pod_netns_udp_relay_socket(
 
 #[cfg(not(target_os = "linux"))]
 fn maybe_bind_pod_netns_udp_relay_socket(
-    _state: &ProxyState,
+    _registry_dir: &str,
     _dest_addr: SocketAddr,
 ) -> Result<Option<std::net::UdpSocket>, HboneUdpSocketOpenError> {
     Ok(None)

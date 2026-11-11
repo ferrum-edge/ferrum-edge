@@ -259,12 +259,12 @@ fn test_pricing_constructor_diagnostics_render_without_document_content() {
         (
             json!({"bandwidth_pricing": {(hostile): true}}),
             "`bandwidth_pricing`",
-            "unknown key",
+            "unknown configuration key(s)",
         ),
         (
             json!({"stream_connection_pricing": {(hostile): 918273641}}),
             "`stream_connection_pricing`",
-            "unknown key",
+            "unknown configuration key(s)",
         ),
         (
             json!({"pricing_tiers": [hostile]}),
@@ -584,7 +584,7 @@ fn test_bandwidth_pricing_rejects_unknown_key() {
         }
     });
     let err = ApiChargeback::new(&config, "ferrum").err().unwrap();
-    assert!(err.contains("unknown key"));
+    assert!(err.contains("unknown configuration key"));
 }
 
 /// GHSA-8478: misspelled top-level pricing dimensions and unknown
@@ -4550,39 +4550,68 @@ fn test_request_before_plugin_then_reload_honors_configured_shard_amount() {
     );
 }
 
-/// Issue #7109: a config that fails construction-time validation must not
-/// claim the process-global registry. The singleton is shared by every test in
-/// this binary, so the ordering is pinned over the constructor source: every
-/// currency, tunable, and pricing check precedes the owning resolve.
+/// Issue #7109: shared Admin / CP / config-load validation must never claim
+/// the process-global registry — neither for a config it rejects nor for one
+/// it accepts — so the first accepted generation sizes the hot map with the
+/// node's configured shard count. The `OnceLock` is shared by every test in
+/// this binary, so the assertions run in a fresh child process.
 #[test]
-fn construction_validates_config_before_claiming_the_global_registry() {
-    let source = include_str!("../../../src/plugins/api_chargeback.rs");
-    let start = source
-        .find("pub fn new_with_shard_amount(")
-        .expect("new_with_shard_amount exists");
-    let end = start
-        + source[start..]
-            .find("Ok(Self {")
-            .expect("constructor returns Self");
-    let body = &source[start..end];
-    let claim = body
-        .find("global_registry_with_shard_amount(shard_amount)")
-        .expect("constructor resolves the registry with the configured shard count");
-    for check in [
-        "reject_unknown_keys(",
-        "instance_currency(config)?",
-        "SharedRegistryTunables::from_config(config)?",
-        "PricingConfig::from_config(config, \"api_chargeback\")?",
-        "!pricing.has_any_pricing()",
-    ] {
-        let at = body
-            .find(check)
-            .unwrap_or_else(|| panic!("constructor runs {check}"));
+fn validation_never_claims_the_global_registry() {
+    const CHILD: &str = "FERRUM_TEST_CHARGEBACK_REGISTRY_CHILD";
+    const CONFIGURED_SHARDS: usize = 64;
+    if std::env::var_os(CHILD).is_some() {
         assert!(
-            at < claim,
-            "{check} must run before the registry is claimed (issue #7109)"
+            try_global_registry().is_none(),
+            "a fresh process starts with the registry unclaimed"
         );
+        let valid = json!({
+            "pricing_tiers": [{ "status_codes": [200], "price_per_call": 0.001 }],
+        });
+        ferrum_edge::plugins::validate_plugin_config("api_chargeback", &valid)
+            .expect("valid config passes validation");
+        for invalid in [
+            json!({ "currency": "" }),
+            json!({ "pricing_tiers": [{ "status_codes": [200], "price_per_call": -1.0 }] }),
+            json!({}),
+            json!({ "unknown_key": true, "pricing_tiers": [] }),
+        ] {
+            ferrum_edge::plugins::validate_plugin_config("api_chargeback", &invalid)
+                .expect_err("invalid config is rejected");
+            assert!(
+                ApiChargeback::new_with_shard_amount(&invalid, "ferrum", CONFIGURED_SHARDS)
+                    .is_err(),
+                "invalid config fails construction"
+            );
+        }
+        assert!(
+            try_global_registry().is_none(),
+            "validation and failed construction must leave the registry unclaimed"
+        );
+
+        let plugin = ApiChargeback::new_with_shard_amount(&valid, "ferrum", CONFIGURED_SHARDS)
+            .expect("accepted construction");
+        assert_eq!(
+            plugin.registry_shard_amount_for_tests(),
+            CONFIGURED_SHARDS,
+            "the first accepted construction sizes the registry"
+        );
+        assert!(try_global_registry().is_some());
+        return;
     }
+
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .arg("--exact")
+        .arg("unit::plugins::api_chargeback_tests::validation_never_claims_the_global_registry")
+        .env(CHILD, "1")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "child failed:\n{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
 }
 
 /// Admin `GET /charges` must use the non-owning try path, not claim the

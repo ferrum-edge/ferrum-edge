@@ -1637,7 +1637,6 @@ fn process_replay_state(scope_key: Option<&str>) -> Result<Arc<Mutex<NonceReplay
 }
 
 /// Whether `scope_key` is still present in the process-global registry.
-#[allow(dead_code)]
 pub(crate) fn nonce_replay_registry_contains_for_tests(scope_key: &str) -> Result<bool, String> {
     let Ok(registry) = NONCE_REPLAY_REGISTRY.lock() else {
         return Err("soap_ws_security: replay-scope registry is unavailable".to_string());
@@ -1654,7 +1653,6 @@ pub(crate) fn nonce_replay_registry_contains_for_tests(scope_key: &str) -> Resul
 /// suite siblings cannot exhaust [`MAX_NONCE_REPLAY_SCOPES`].
 ///
 /// Returns `Ok(true)` when an entry was removed, `Ok(false)` when absent.
-#[allow(dead_code)]
 pub(crate) fn remove_nonce_replay_scope_for_tests(scope_key: &str) -> Result<bool, String> {
     let Ok(mut registry) = NONCE_REPLAY_REGISTRY.lock() else {
         return Err("soap_ws_security: replay-scope registry is unavailable".to_string());
@@ -1694,8 +1692,8 @@ fn default_nonce_redis_key_prefix(namespace: &str, plugin_config_id: Option<&str
     prefix
 }
 
-// The binary target compiles this module without the library's `_test_support`
-// facade, so this external-test observation type is intentionally unused there.
+// External-test observation type, built only for the library's `_test_support`
+// facade.
 #[allow(dead_code)]
 pub(crate) struct NonceReplayObservationForTests {
     pub(crate) entry_count: usize,
@@ -1807,10 +1805,6 @@ impl SoapWsSecurity {
     /// replay history to survive a reload. Production construction goes through
     /// [`Self::new_with_http_client_and_config_id`]. See [`Self::build`] for why
     /// a `replay_scope: shared` config is still safe to construct here.
-    // Called through `lib::_test_support` and external tests; the binary target
-    // compiles this module without that facade and uses
-    // `new_with_http_client_and_config_id` for production wiring.
-    #[allow(dead_code)]
     pub fn new(config: &Value) -> Result<Self, String> {
         Self::build(config, None, None)
     }
@@ -3508,9 +3502,6 @@ impl SoapWsSecurity {
         Ok(state.has_capacity(incoming_bytes, max_entries, max_bytes))
     }
 
-    // These seams are consumed through `lib::_test_support`; the binary target
-    // compiles the shared plugin module without that facade.
-    #[allow(dead_code)]
     pub(crate) fn check_nonce_replay_at_for_tests(
         &self,
         nonce: &str,
@@ -3519,7 +3510,6 @@ impl SoapWsSecurity {
         self.check_nonce_replay_at(nonce, nonce, now)
     }
 
-    #[allow(dead_code)]
     pub(crate) fn check_nonce_replay_for_principal_for_tests(
         &self,
         nonce: &str,
@@ -3528,7 +3518,6 @@ impl SoapWsSecurity {
         self.check_nonce_replay_for_principal(nonce, principal)
     }
 
-    #[allow(dead_code)]
     pub(crate) fn check_nonce_replay_for_principal_at_for_tests(
         &self,
         nonce: &str,
@@ -3540,7 +3529,6 @@ impl SoapWsSecurity {
 
     /// Retained claims charged to `principal`, including expired ones
     /// maintenance has not yet reclaimed (test support).
-    #[allow(dead_code)]
     pub(crate) fn nonce_principal_entries_for_tests(
         &self,
         principal: &str,
@@ -3554,7 +3542,6 @@ impl SoapWsSecurity {
         Ok(state.principal_count(&sha256_array(principal.as_bytes())))
     }
 
-    #[allow(dead_code)]
     pub(crate) fn nonce_replay_observation_for_tests(
         &self,
     ) -> Result<NonceReplayObservationForTests, String> {
@@ -3601,7 +3588,6 @@ impl SoapWsSecurity {
     /// The inner-`Created` admission decision at an explicit instant, so the
     /// exact endpoints of the acceptance interval can be pinned without a
     /// wall-clock race.
-    #[allow(dead_code)]
     pub(crate) fn username_token_created_outcome_for_tests(
         &self,
         security_block: &str,
@@ -3621,7 +3607,6 @@ impl SoapWsSecurity {
     /// Media-type classification outcome for external tests as a stable string:
     /// `"xml"` / `"xop"` / `"mtom"` for a governed representation,
     /// `"pass_through"`, or `"reject:<status>:<class>"`.
-    #[allow(dead_code)]
     pub(crate) fn classify_request_for_tests(&self, content_type: Option<&str>) -> String {
         match self.classify_request(content_type) {
             SoapRequestDisposition::Governed(SoapMediaClass::Mtom { .. }) => "mtom".to_string(),
@@ -3637,7 +3622,6 @@ impl SoapWsSecurity {
 
     /// One SAML assertion single-use claim, so replay across generations and
     /// instances can be pinned without a live message.
-    #[allow(dead_code)]
     pub(crate) async fn claim_saml_assertion_for_tests(
         &self,
         issuer: &str,
@@ -3649,7 +3633,6 @@ impl SoapWsSecurity {
 
     /// The TTL a shared (Redis) claim is written with, without needing a live
     /// server. Same value `claim_nonce_shared` passes to `SET NX EX`.
-    #[allow(dead_code)]
     pub(crate) fn shared_claim_retention_seconds_for_tests(&self) -> Result<u64, String> {
         match &self.nonce_backend {
             NonceReplayBackend::Shared(_) => Ok(self.shared_claim_retention_seconds()),
@@ -3662,7 +3645,6 @@ impl SoapWsSecurity {
     /// Whether a `replay_scope: shared` instance's Redis client demands the
     /// no-eviction retention proof, or `None` for process scope. The screen
     /// itself needs a live server, so this pins what the constructor asked for.
-    #[allow(dead_code)]
     pub(crate) fn shared_replay_requires_no_eviction_for_tests(&self) -> Option<bool> {
         match &self.nonce_backend {
             NonceReplayBackend::Shared(client) => {
@@ -3672,7 +3654,6 @@ impl SoapWsSecurity {
         }
     }
 
-    #[allow(dead_code)]
     pub(crate) fn corrupt_nonce_age_index_for_tests(&self) -> Result<(), String> {
         let NonceReplayBackend::Process(replay_state) = &self.nonce_backend else {
             return Err("soap_ws_security: replay test state is process-scope only".to_string());
@@ -3694,7 +3675,6 @@ impl SoapWsSecurity {
     /// Preserve index cardinality while breaking its cache mapping (test
     /// support). This distinguishes full reclamation validation from the O(1)
     /// request-path cardinality guard.
-    #[allow(dead_code)]
     pub(crate) fn corrupt_nonce_age_index_value_for_tests(&self) -> Result<(), String> {
         let NonceReplayBackend::Process(replay_state) = &self.nonce_backend else {
             return Err("soap_ws_security: replay test state is process-scope only".to_string());
@@ -3715,7 +3695,6 @@ impl SoapWsSecurity {
 
     /// Exhaust the age-key sequence so the next age-key allocation fails
     /// (test support). Reaching this for real takes 2^64 claims.
-    #[allow(dead_code)]
     pub(crate) fn exhaust_nonce_age_sequence_for_tests(&self) -> Result<(), String> {
         let NonceReplayBackend::Process(replay_state) = &self.nonce_backend else {
             return Err("soap_ws_security: replay test state is process-scope only".to_string());
@@ -3728,7 +3707,6 @@ impl SoapWsSecurity {
     }
 
     /// Poison this instance's process replay-scope mutex (test support).
-    #[allow(dead_code)]
     pub(crate) fn poison_nonce_replay_state_for_tests(&self) -> Result<(), String> {
         let NonceReplayBackend::Process(replay_state) = &self.nonce_backend else {
             return Err("soap_ws_security: replay test state is process-scope only".to_string());
@@ -4408,9 +4386,10 @@ impl SoapWsSecurity {
         // Claimed after every semantic check so a rejected assertion cannot
         // burn a legitimate one's id, and before the identity is returned so no
         // caller can act on an assertion whose claim was refused.
+        // Only SAML 2.0 assertions are accepted, and SAML 2.0 identifies an
+        // assertion by `ID`; the SAML 1.x `AssertionID` is not an alias.
         let assertion_id = assertion_node
             .unqualified_attribute("ID")
-            .or_else(|| assertion_node.unqualified_attribute("AssertionID"))
             .ok_or_else(|| "WS-Security: SAML Assertion missing ID attribute".to_string())?;
         self.claim_saml_assertion(&issuer, assertion_id, &name_id)
             .await?;
@@ -4723,7 +4702,6 @@ impl SoapWsSecurity {
     ) -> Result<(), String> {
         let assertion_id = assertion
             .unqualified_attribute("ID")
-            .or_else(|| assertion.unqualified_attribute("AssertionID"))
             .ok_or_else(|| "WS-Security: SAML Assertion missing ID attribute".to_string())?;
         let expected_uri = format!("#{}", assertion_id);
 
@@ -7008,9 +6986,6 @@ fn exclusive_canonicalize<'a>(
 /// (GHSA-hfpm-3pv7-h3jh): a writer that charged the finished string would leave
 /// the whole output allowance untouched on a refusal, while one that charges as
 /// it writes stops at the ceiling with that allowance spent.
-// Reached only via the lib target's `_test_support` shim; the bin target
-// duplicates the module tree with no caller.
-#[allow(dead_code)]
 pub(crate) fn exclusive_canonicalize_with_budget_for_test(
     xml: &str,
     local_name: &str,
@@ -7039,7 +7014,6 @@ pub(crate) fn exclusive_canonicalize_with_budget_for_test(
 /// Source-subtree byte length of the element `local_name`, i.e. the amount
 /// `exclusive_canonicalize` charges before it walks anything.
 // Same `_test_support`-only reachability as above.
-#[allow(dead_code)]
 pub(crate) fn canonicalization_source_len_for_test(xml: &str, local_name: &str) -> Option<usize> {
     let document = parse_bounded_xml(xml, "test fixture").ok()?;
     let root = document
@@ -7409,8 +7383,7 @@ where
 ///
 /// Single-id convenience wrapper over [`count_raw_id_occurrences`], reached only
 /// through `lib::_test_support`; the request path scans the whole `SignedInfo` in
-/// one pass. The binary target compiles this module without that facade.
-#[allow(dead_code)]
+/// one pass.
 pub(crate) fn count_wsu_id_occurrences(xml: &str, id: &str) -> Result<usize, String> {
     Ok(count_raw_id_occurrences(xml, &[id])?[0])
 }
@@ -8559,7 +8532,6 @@ fn content_id_has_decoding_ambiguity(id: &str) -> bool {
 /// The strict MTOM package parser, reached through the lib target's
 /// `_test_support` shim so hostile-package regressions live in the external
 /// unit suite rather than inline in this module.
-#[allow(dead_code)]
 pub(crate) fn extract_mtom_root_part_for_test(
     bytes: &[u8],
     boundary: &str,
@@ -9007,7 +8979,6 @@ fn extract_xml_decl_encoding(decl: &str) -> Result<Option<String>, SoapBodyDecod
 }
 
 // Reached only via the lib target's `_test_support` shim (external unit tests).
-#[allow(dead_code)]
 pub(crate) fn decode_soap_xml_body_for_test(
     bytes: &[u8],
     content_type: &str,

@@ -14,7 +14,7 @@
 use crate::scaffolding::port_registry::TestSocket;
 
 use crate::common::{
-    TestGateway, empty_digest_header, generate_hmac_signature, hmac_authority_from_url,
+    TestGateway, empty_digest_header, hmac_authority_from_url, hmac_v2_authorization,
 };
 use chrono::Utc;
 use jsonwebtoken::{EncodingKey, Header, encode};
@@ -727,8 +727,7 @@ async fn test_credential_rotation_hmac() {
             "enabled": true,
             "config": {
                 "clock_skew_seconds": 300,
-                "signing_profile": "ferrum-hmac-v1",
-                "allow_unsafe_replayable_v1": true
+                "replay_scope": "process"
             }
         }),
     )
@@ -758,10 +757,14 @@ async fn test_credential_rotation_hmac() {
     ) -> reqwest::Response {
         let date = Utc::now().to_rfc2822();
         let authority = hmac_authority_from_url(url);
-        let sig = generate_hmac_signature("GET", "/rot-hmac", &date, username, &authority, secret);
-        let header = format!(
-            "hmac username=\"{}\", algorithm=\"hmac-sha256\", signature=\"{}\"",
-            username, sig
+        let header = hmac_v2_authorization(
+            "GET",
+            "/rot-hmac",
+            &date,
+            username,
+            &authority,
+            secret,
+            &empty_digest_header(),
         );
         client
             .get(url)

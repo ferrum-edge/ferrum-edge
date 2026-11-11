@@ -150,18 +150,12 @@ impl AiTokenMetrics {
         let object = config
             .as_object()
             .ok_or_else(|| "ai_token_metrics: config must be an object".to_string())?;
-        let unknown = object
-            .keys()
-            .filter(|key| !ALLOWED_CONFIG_KEYS.contains(&key.as_str()))
-            .cloned()
-            .collect::<Vec<_>>();
-        if !unknown.is_empty() {
-            return Err(format!(
-                "ai_token_metrics: unknown config key(s): {:?}; allowed keys: `{}`",
-                unknown.join(", "),
-                ALLOWED_CONFIG_KEYS.join("`, `")
-            ));
-        }
+        crate::util::unknown_keys::reject_unknown_keys(
+            object,
+            "config",
+            ALLOWED_CONFIG_KEYS,
+            "ai_token_metrics: `config`: ",
+        )?;
 
         let provider = match optional_string(config, "provider")? {
             Some(raw) => {
@@ -657,15 +651,12 @@ fn parse_model_pricing(config: &Value) -> Result<Vec<ModelPrice>, String> {
         let object = entry.as_object().ok_or_else(|| {
             format!("ai_token_metrics: `model_pricing[{index}]` must be an object")
         })?;
-        if let Some(unknown) = object
-            .keys()
-            .find(|key| !ALLOWED_MODEL_PRICE_KEYS.contains(&key.as_str()))
-        {
-            return Err(format!(
-                "ai_token_metrics: unknown key {unknown:?} in `model_pricing[{index}]`; allowed keys: `{}`",
-                ALLOWED_MODEL_PRICE_KEYS.join("`, `")
-            ));
-        }
+        crate::util::unknown_keys::reject_unknown_keys(
+            object,
+            &format!("model_pricing[{index}]"),
+            ALLOWED_MODEL_PRICE_KEYS,
+            &format!("ai_token_metrics: `model_pricing[{index}]`: "),
+        )?;
         let model = object
             .get("model")
             .and_then(Value::as_str)
@@ -1149,9 +1140,9 @@ impl UsageObserver {
 
 #[async_trait]
 impl ResponseStreamInspector for UsageObserver {
-    async fn on_chunk(&mut self, chunk: &[u8]) -> ResponseStreamAction {
+    async fn on_chunk(&mut self, chunk: &bytes::Bytes) -> ResponseStreamAction {
         self.extractor.push(chunk);
-        ResponseStreamAction::Forward(bytes::Bytes::copy_from_slice(chunk))
+        ResponseStreamAction::Forward(chunk.clone())
     }
 
     async fn on_end(&mut self) -> ResponseStreamAction {

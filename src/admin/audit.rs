@@ -338,6 +338,80 @@ pub fn audit_retention_hit_prune_batch_budget(deleted: u64) -> bool {
             .saturating_mul(u64::from(AUDIT_RETENTION_PRUNE_MAX_BATCHES))
 }
 
+/// Mean interval between periodic audit age-retention sweeps. Each wait is
+/// jittered by ±25% ([`crate::util::backoff::jittered_backoff`]) so replicas
+/// started together do not sweep in lockstep.
+pub const AUDIT_RETENTION_SWEEP_INTERVAL: Duration = Duration::from_secs(60 * 60);
+
+/// Start the periodic age-retention sweep for `FERRUM_AUDIT_RETENTION_DAYS`.
+///
+/// Insert-path pruning reaches a namespace only when that namespace receives
+/// a new audit event, so without this sweep a namespace that goes idle would
+/// keep rows past the configured age forever. Returns `None` (no task) when
+/// age retention is unset. Called by the modes that own the configuration
+/// database (database and CP); the task exits when `shutdown_rx` fires.
+pub fn start_retention_sweep(
+    retention_days: Option<u64>,
+    db: Arc<dyn DatabaseBackend>,
+    shutdown_rx: tokio::sync::watch::Receiver<bool>,
+) -> Option<JoinHandle<()>> {
+    let retention_days = retention_days?;
+    info!(
+        retention_days,
+        interval_secs = AUDIT_RETENTION_SWEEP_INTERVAL.as_secs(),
+        "Audit retention sweep started"
+    );
+    Some(spawn_retention_sweep(
+        db,
+        AUDIT_RETENTION_SWEEP_INTERVAL,
+        shutdown_rx,
+    ))
+}
+
+/// Run [`DatabaseBackend::prune_expired_audit_events`] after every jittered
+/// `interval` until `shutdown_rx` fires; shutdown also cancels a sweep in
+/// progress. A failed sweep is logged and retried on the next interval.
+pub fn spawn_retention_sweep(
+    db: Arc<dyn DatabaseBackend>,
+    interval: Duration,
+    mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            if *shutdown_rx.borrow() {
+                return;
+            }
+            let delay = crate::util::backoff::jittered_backoff(interval.as_secs());
+            tokio::select! {
+                _ = tokio::time::sleep(delay) => {}
+                _ = shutdown_rx.changed() => {
+                    info!("Audit retention sweep shutting down");
+                    return;
+                }
+            }
+            tokio::select! {
+                result = db.prune_expired_audit_events() => match result {
+                    Ok(deleted) => {
+                        if deleted > 0 {
+                            info!(deleted, "Audit retention sweep pruned expired audit events");
+                        }
+                    }
+                    Err(_error) => {
+                        warn!(
+                            error = "database error (details withheld)",
+                            "Audit retention sweep failed; retrying on the next interval"
+                        );
+                    }
+                },
+                _ = shutdown_rx.changed() => {
+                    info!("Audit retention sweep shutting down");
+                    return;
+                }
+            }
+        }
+    })
+}
+
 /// Per-namespace audit-event retention policy from env/config.
 ///
 /// Distinct from delivery-loss hardening (#2421): this only bounds durable
@@ -1176,19 +1250,16 @@ impl AuditPipeline {
 
     /// Raw counters. Used by external tests; the binary target otherwise flags
     /// it as dead code.
-    #[allow(dead_code)]
     pub fn metrics(&self) -> &Arc<AuditPipelineMetrics> {
         &self.metrics
     }
 
     /// This process generation's spool ownership identity.
-    #[allow(dead_code)]
     pub fn generation(&self) -> &str {
         &self.generation
     }
 
     /// Non-secret audit destination identity bound to every durable record.
-    #[allow(dead_code)]
     pub fn destination(&self) -> &str {
         &self.config.destination
     }
@@ -1198,7 +1269,6 @@ impl AuditPipeline {
     /// Callers must not perform filesystem work through it on an admin request
     /// path: the observability surfaces read [`Self::status`] instead, which is
     /// O(1). Used by the delivery worker and by external tests.
-    #[allow(dead_code)]
     pub fn spool(&self) -> Option<&Arc<AuditSpool>> {
         self.spool.as_ref()
     }
@@ -1567,6 +1637,27 @@ impl AuditPipeline {
             reason = AuditUnavailableReason::NoDurableSpool.as_str(),
             "Admin audit shutdown interrupted delivery of a memory-only event; the event \
              cannot survive process exit"
+        );
+    }
+
+    /// Account for an event recorded in a mode with no configuration database
+    /// (for example a mesh operational action) and no durable spool: there is
+    /// no sink at all, so the event is lost. Distinct from
+    /// [`Self::note_shutdown_memory_loss`] so operators are not told a
+    /// shutdown interrupted delivery when none happened (issue #7200).
+    fn note_no_database_memory_loss(&self, record: &SpooledAuditRecord) {
+        self.metrics
+            .dropped_no_spool
+            .fetch_add(1, Ordering::Relaxed);
+        self.mark_unavailable(AuditUnavailableReason::NoDurableSpool);
+        self.evidence_lost.store(true, Ordering::Relaxed);
+        self.mark_degraded(AuditUnavailableReason::NoDurableSpool);
+        error!(
+            audit_event_id = %record.id(),
+            surface = "audit_no_database",
+            reason = AuditUnavailableReason::NoDurableSpool.as_str(),
+            "Admin audit event recorded in a mode with no configuration database, and no \
+             durable audit spool is configured; the event was not retained"
         );
     }
 
@@ -2346,7 +2437,6 @@ impl AuditWorker {
     /// External tests drive queue saturation, backend failure/recovery, replay,
     /// idempotency, and shutdown through this entry point; the binary target
     /// otherwise flags it as dead code.
-    #[allow(dead_code)]
     pub fn spawn_for_delivery(
         pipeline: Arc<AuditPipeline>,
         delivery: Arc<dyn AuditEventDelivery>,
@@ -3035,9 +3125,10 @@ pub async fn record_without_database(
         if pipeline.spool.is_some() {
             Ok(())
         } else {
-            pipeline.note_shutdown_memory_loss(&record);
+            pipeline.note_no_database_memory_loss(&record);
             Err(anyhow!(
-                "admin audit event {} could not be retained after delivery admission closed",
+                "admin audit event {} could not be retained: no configuration database and no \
+                 durable spool in this mode",
                 event_id
             ))
         }
@@ -3365,9 +3456,6 @@ pub fn append_local_fallback_event(dir: &Path, event: &AuditEvent) -> Result<(),
 /// Uses the same bounded process and cross-process lock acquisition as
 /// [`append_local_fallback_event`]; contention past the shared deadline fails
 /// closed.
-// This public library surface is exercised by integration tests but is unused
-// when the same module is compiled directly into the `ferrum-edge` binary.
-#[allow(dead_code)]
 pub fn list_local_fallback_events(dir: &Path) -> Result<Vec<AuditEvent>, anyhow::Error> {
     let deadline = local_fallback_lock_deadline();
     let _process_guard = acquire_local_fallback_process_lock(deadline)?;
@@ -3417,9 +3505,6 @@ fn acquire_local_fallback_process_lock(
 }
 
 /// Test seam: hold the in-process fallback mutex without waiting.
-// The library test harness calls this through `src/lib.rs`; the binary target
-// compiles the shared module without that harness.
-#[allow(dead_code)]
 pub(crate) fn hold_local_fallback_process_lock_for_test()
 -> Result<MutexGuard<'static, ()>, anyhow::Error> {
     match LOCAL_FALLBACK_LOCK.try_lock() {

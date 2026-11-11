@@ -99,7 +99,7 @@ fn remote_snapshot(endpoints: RemoteClusterEndpoints) -> RemoteEndpointSnapshot 
     let mut clusters = HashMap::new();
     clusters.insert(
         "west".to_string(),
-        RemoteClusterEntry::new(
+        Arc::new(RemoteClusterEntry::new(
             "west".to_string(),
             td("remote.local"),
             Some("net2".to_string()),
@@ -109,7 +109,7 @@ fn remote_snapshot(endpoints: RemoteClusterEndpoints) -> RemoteEndpointSnapshot 
             None,
             endpoints,
             1,
-        ),
+        )),
     );
     RemoteEndpointSnapshot { clusters }
 }
@@ -375,9 +375,14 @@ async fn mesh_multicluster_load_balancer_fails_over_local_to_remote() {
 
     // All healthy: every selection lands on the local (same-region) endpoint.
     for i in 0..20 {
-        let selection = lb
-            .select_target("default", upstream_id, &i.to_string(), None)
-            .expect("target");
+        let selection = LoadBalancerCache::select_target_from(
+            &lb.load(),
+            "default",
+            upstream_id,
+            &i.to_string(),
+            None,
+        )
+        .expect("target");
         assert_eq!(
             selection.target.host, "10.1.0.1",
             "healthy local endpoint must win the same-region tier"
@@ -401,9 +406,14 @@ async fn mesh_multicluster_load_balancer_fails_over_local_to_remote() {
     // Failover: with the local endpoint ejected, the LB falls through to the
     // remote endpoint tier.
     for i in 0..20 {
-        let selection = lb
-            .select_target("default", upstream_id, &i.to_string(), Some(&health))
-            .expect("failover target");
+        let selection = LoadBalancerCache::select_target_from(
+            &lb.load(),
+            "default",
+            upstream_id,
+            &i.to_string(),
+            Some(&health),
+        )
+        .expect("failover target");
         assert_eq!(
             selection.target.host, "10.2.0.1",
             "remote endpoint must receive traffic once local is unhealthy"
@@ -439,7 +449,7 @@ mod audience_binding {
     use ferrum_edge::identity::spiffe::TrustDomain;
     use ferrum_edge::modes::mesh::multicluster::{
         NativeRemoteSource, RemoteClusterPollContext, RemoteDiscoveryConfig,
-        RemoteDiscoveryTlsConfig, RemoteServiceSource,
+        RemoteDiscoveryFailure, RemoteDiscoveryTlsConfig, RemoteServiceSource,
     };
     use ferrum_edge::modes::mesh::revision::{
         DEFAULT_FOREIGN_AUTHORITY_ADOPT_SECS, MeshRevisionGate,
@@ -625,9 +635,10 @@ mod audience_binding {
             .fetch()
             .await
             .expect_err("cluster C must refuse a token minted for cluster B");
-        assert!(
-            err.contains("MeshSubscribe failed"),
-            "the poll must fail at subscribe time, before any endpoint import: {err}"
+        assert_eq!(
+            err,
+            RemoteDiscoveryFailure::SubscribeFailed,
+            "the poll must fail at subscribe time, before any endpoint import"
         );
 
         // Control: C accepts a poll actually declared for C, proving the
@@ -820,7 +831,8 @@ mod remove_fences_first_sight_install {
     use ferrum_edge::modes::mesh::config::{MultiClusterConfig, RemoteCluster};
     use ferrum_edge::modes::mesh::multicluster::{
         RemoteClusterPollContext, RemoteDiscoveryCandidate, RemoteDiscoveryConfig,
-        RemoteDiscoveryManager, RemoteDiscoveryTlsConfig, RemoteEndpointStore, RemoteServiceSource,
+        RemoteDiscoveryFailure, RemoteDiscoveryManager, RemoteDiscoveryTlsConfig,
+        RemoteEndpointStore, RemoteServiceSource,
     };
     use ferrum_edge::modes::mesh::revision::DEFAULT_FOREIGN_AUTHORITY_ADOPT_SECS;
 
@@ -832,7 +844,7 @@ mod remove_fences_first_sight_install {
 
     #[async_trait::async_trait]
     impl RemoteServiceSource for NeverCompletes {
-        async fn fetch(&self) -> Result<RemoteDiscoveryCandidate, String> {
+        async fn fetch(&self) -> Result<RemoteDiscoveryCandidate, RemoteDiscoveryFailure> {
             std::future::pending().await
         }
     }

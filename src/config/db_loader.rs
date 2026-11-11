@@ -2319,6 +2319,36 @@ impl DatabaseStore {
         Ok(associations)
     }
 
+    /// One proxy's junction rows inside an open transaction. Deployment
+    /// preservation needs a single proxy's associations; loading the whole
+    /// namespace's junction while holding the admission row, change lock and
+    /// lease was redundant work (issue #7209).
+    async fn load_proxy_plugin_associations_for_proxy_tx(
+        &self,
+        namespace: &str,
+        proxy_id: &str,
+        operation: &str,
+        tx: &mut sqlx::Transaction<'_, sqlx::Any>,
+    ) -> Result<Vec<PluginAssociation>, anyhow::Error> {
+        let sql = self.q(
+            "SELECT proxy_id, plugin_config_id FROM proxy_plugins WHERE namespace = ? AND proxy_id = ?",
+        );
+        let rows: Vec<AnyRow> = sqlx::query(&sql)
+            .bind(namespace)
+            .bind(proxy_id)
+            .fetch_all(&mut **tx)
+            .await
+            .map_err(|e| {
+                Self::proxy_plugin_association_query_error(operation, Some(namespace), e)
+            })?;
+
+        let mut associations = HashMap::with_capacity(1);
+        for row in &rows {
+            Self::push_proxy_plugin_association_row(&mut associations, row, operation)?;
+        }
+        Ok(associations.remove(proxy_id).unwrap_or_default())
+    }
+
     async fn load_proxy_plugin_associations_for_proxy_ids(
         &self,
         namespace: &str,
@@ -3761,7 +3791,7 @@ impl DatabaseStore {
     //
     // ── Drift-prevention contract for proxy write call sites ─────────────────
     //
-    // The 54-column proxy column list is canonical. When you add a new column
+    // The 53-column proxy column list is canonical. When you add a new column
     // to the `proxies` table, it must be added — in the same position — to ALL
     // of:
     //
@@ -3788,20 +3818,20 @@ impl DatabaseStore {
     // such helpers verbose without meaningful runtime benefit.
 
     /// Number of `?` placeholders in `PROXY_INSERT_SQL` (no api_spec_id).
-    /// 54 resource columns + `created_at` + `updated_at` = 56.
+    /// 53 resource columns + `created_at` + `updated_at` = 55.
     ///
     /// Used only by the drift-catcher tests in `proxy_insert_sql_drift_tests`;
     /// kept available outside `#[cfg(test)]` so it remains a visible
     /// drift-prevention anchor when reading the SQL definition.
     #[allow(dead_code)]
-    pub(crate) const PROXY_INSERT_PLACEHOLDER_COUNT: usize = 56;
+    pub(crate) const PROXY_INSERT_PLACEHOLDER_COUNT: usize = 55;
 
     /// Number of `?` placeholders in the `submit_api_spec_bundle` proxy
     /// INSERT statement (which adds `api_spec_id` between
     /// `stream_match` and `created_at`).
-    /// 56 base + 1 (api_spec_id) = 57.
+    /// 55 base + 1 (api_spec_id) = 56.
     #[allow(dead_code)]
-    pub(crate) const PROXY_INSERT_WITH_API_SPEC_ID_PLACEHOLDER_COUNT: usize = 57;
+    pub(crate) const PROXY_INSERT_WITH_API_SPEC_ID_PLACEHOLDER_COUNT: usize = 56;
 
     /// Proxy INSERT SQL without `api_spec_id` (direct admin path and bulk import).
     ///
@@ -3822,7 +3852,7 @@ impl DatabaseStore {
          pool_http2_keep_alive_timeout_seconds, pool_http2_initial_stream_window_size, \
          pool_http2_initial_connection_window_size, pool_http2_adaptive_window, \
          pool_http2_max_frame_size, pool_http2_max_concurrent_streams, \
-         pool_http3_connections_per_backend, pool_max_requests_per_connection, \
+         pool_http3_connections_per_backend, \
          listen_port, frontend_tls, passthrough, \
          udp_idle_timeout_seconds, tcp_idle_timeout_seconds, websocket_idle_timeout_seconds, \
          websocket_permessage_deflate, allow_path_parameters, \
@@ -3832,7 +3862,7 @@ impl DatabaseStore {
          created_at, updated_at) \
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, \
                 ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, \
-                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
+                ?, ?, ?, ?, ?, ?, ?, ?, ?)";
 
     /// Spec-owned proxy INSERT used by `restore_api_spec_bundle_inner`: the
     /// `PROXY_INSERT_SQL` columns plus `api_spec_id` before `created_at`.
@@ -3851,7 +3881,7 @@ impl DatabaseStore {
         pool_http2_keep_alive_timeout_seconds, pool_http2_initial_stream_window_size, \
         pool_http2_initial_connection_window_size, pool_http2_adaptive_window, \
         pool_http2_max_frame_size, pool_http2_max_concurrent_streams, \
-        pool_http3_connections_per_backend, pool_max_requests_per_connection, \
+        pool_http3_connections_per_backend, \
         listen_port, frontend_tls, passthrough, \
         udp_idle_timeout_seconds, tcp_idle_timeout_seconds, websocket_idle_timeout_seconds, \
         websocket_permessage_deflate, allow_path_parameters, \
@@ -3860,7 +3890,7 @@ impl DatabaseStore {
         api_spec_id, created_at, updated_at) \
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, \
                 ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, \
-                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
+                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
 
     // ---- CRUD for Admin API ----
 
@@ -3960,7 +3990,6 @@ impl DatabaseStore {
             .bind(proxy.pool_http2_max_frame_size.map(|v| v as i64))
             .bind(proxy.pool_http2_max_concurrent_streams.map(|v| v as i64))
             .bind(proxy.pool_http3_connections_per_backend.map(|v| v as i64))
-            .bind(proxy.pool_max_requests_per_connection.map(|v| v as i64))
             .bind(proxy.listen_port.map(|v| v as i32))
             .bind(if proxy.frontend_tls { 1i32 } else { 0 })
             .bind(if proxy.passthrough { 1i32 } else { 0 })
@@ -4072,7 +4101,7 @@ impl DatabaseStore {
         let stream_match_json = serialize_stream_match(proxy)?;
 
         sqlx::query(
-            &self.q("UPDATE proxies SET labels=?, name=?, hosts=?, listen_path=?, backend_scheme=?, backend_host=?, backend_port=?, backend_path=?, strip_listen_path=?, preserve_host_header=?, backend_connect_timeout_ms=?, backend_read_timeout_ms=?, backend_write_timeout_ms=?, backend_tls_client_cert_path=?, backend_tls_client_key_path=?, backend_tls_verify_server_cert=?, backend_tls_server_ca_cert_path=?, dns_override=?, dns_cache_ttl_seconds=?, auth_mode=?, upstream_id=?, upstream_subset=?, circuit_breaker=?, retry=?, response_body_mode=?, pool_idle_timeout_seconds=?, pool_enable_http_keep_alive=?, pool_enable_http2=?, pool_tcp_keepalive_seconds=?, pool_http2_keep_alive_interval_seconds=?, pool_http2_keep_alive_timeout_seconds=?, pool_http2_initial_stream_window_size=?, pool_http2_initial_connection_window_size=?, pool_http2_adaptive_window=?, pool_http2_max_frame_size=?, pool_http2_max_concurrent_streams=?, pool_http3_connections_per_backend=?, pool_max_requests_per_connection=?, listen_port=?, frontend_tls=?, passthrough=?, udp_idle_timeout_seconds=?, tcp_idle_timeout_seconds=?, websocket_idle_timeout_seconds=?, websocket_permessage_deflate=?, allow_path_parameters=?, allowed_methods=?, allowed_ws_origins=?, udp_max_response_amplification_factor=?, stream_proxy_protocol=?, backend_proxy_protocol=?, stream_match=?, updated_at=? WHERE id=? AND namespace=?")
+            &self.q("UPDATE proxies SET labels=?, name=?, hosts=?, listen_path=?, backend_scheme=?, backend_host=?, backend_port=?, backend_path=?, strip_listen_path=?, preserve_host_header=?, backend_connect_timeout_ms=?, backend_read_timeout_ms=?, backend_write_timeout_ms=?, backend_tls_client_cert_path=?, backend_tls_client_key_path=?, backend_tls_verify_server_cert=?, backend_tls_server_ca_cert_path=?, dns_override=?, dns_cache_ttl_seconds=?, auth_mode=?, upstream_id=?, upstream_subset=?, circuit_breaker=?, retry=?, response_body_mode=?, pool_idle_timeout_seconds=?, pool_enable_http_keep_alive=?, pool_enable_http2=?, pool_tcp_keepalive_seconds=?, pool_http2_keep_alive_interval_seconds=?, pool_http2_keep_alive_timeout_seconds=?, pool_http2_initial_stream_window_size=?, pool_http2_initial_connection_window_size=?, pool_http2_adaptive_window=?, pool_http2_max_frame_size=?, pool_http2_max_concurrent_streams=?, pool_http3_connections_per_backend=?, listen_port=?, frontend_tls=?, passthrough=?, udp_idle_timeout_seconds=?, tcp_idle_timeout_seconds=?, websocket_idle_timeout_seconds=?, websocket_permessage_deflate=?, allow_path_parameters=?, allowed_methods=?, allowed_ws_origins=?, udp_max_response_amplification_factor=?, stream_proxy_protocol=?, backend_proxy_protocol=?, stream_match=?, updated_at=? WHERE id=? AND namespace=?")
         )
         .bind(serde_json::to_string(&proxy.labels)?)
         .bind(&proxy.name)
@@ -4111,7 +4140,6 @@ impl DatabaseStore {
         .bind(proxy.pool_http2_max_frame_size.map(|v| v as i64))
         .bind(proxy.pool_http2_max_concurrent_streams.map(|v| v as i64))
         .bind(proxy.pool_http3_connections_per_backend.map(|v| v as i64))
-        .bind(proxy.pool_max_requests_per_connection.map(|v| v as i64))
         .bind(proxy.listen_port.map(|v| v as i32))
         .bind(if proxy.frontend_tls { 1i32 } else { 0 })
         .bind(if proxy.passthrough { 1i32 } else { 0 })
@@ -4316,6 +4344,10 @@ impl DatabaseStore {
         .await?;
         self.record_config_change_tx(&mut tx, namespace, "proxy", id, "delete")
             .await?;
+        // Compact once per touched namespace after every change row is
+        // written, not once per plugin (issue #7209).
+        let mut compact_namespaces: BTreeSet<String> = BTreeSet::new();
+        compact_namespaces.insert(namespace.to_string());
         for (plugin_id, plugin_namespace) in proxy_scoped_plugins {
             self.record_config_change_tx(
                 &mut tx,
@@ -4325,10 +4357,12 @@ impl DatabaseStore {
                 "delete",
             )
             .await?;
-            self.compact_config_changes_tx(&mut tx, &plugin_namespace)
+            compact_namespaces.insert(plugin_namespace);
+        }
+        for compact_namespace in &compact_namespaces {
+            self.compact_config_changes_tx(&mut tx, compact_namespace)
                 .await?;
         }
-        self.compact_config_changes_tx(&mut tx, namespace).await?;
         tx.commit().await?;
 
         self.check_slow_query("delete_proxy", start);
@@ -7195,6 +7229,27 @@ impl DatabaseStore {
         operation: &str,
     ) -> Result<(), anyhow::Error> {
         self.lock_config_change_sequence_tx(tx, namespace).await?;
+        self.insert_config_change_row_tx(tx, namespace, resource_type, resource_id, operation)
+            .await
+    }
+
+    /// Insert one change row WITHOUT taking the namespace change-sequence
+    /// lock.
+    ///
+    /// Only for callers that already hold [`Self::lock_config_change_sequences_tx`]
+    /// for `namespace` in this transaction (the batch insert helpers, whose
+    /// callers lock every item's namespace in sorted order first). Re-taking
+    /// the lock per row cost an upsert plus `SELECT ... FOR UPDATE` (or an
+    /// SQLite `UPDATE`) for every one of up to thousands of rows (issue
+    /// #7209). Everyone else uses [`Self::record_config_change_tx`].
+    async fn insert_config_change_row_tx(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Any>,
+        namespace: &str,
+        resource_type: &str,
+        resource_id: &str,
+        operation: &str,
+    ) -> Result<(), anyhow::Error> {
         sqlx::query(&self.q("INSERT INTO config_changes \
              (namespace, resource_type, resource_id, operation, created_at) \
              VALUES (?, ?, ?, ?, ?)"))
@@ -7397,31 +7452,14 @@ impl DatabaseStore {
     /// `FERRUM_DB_FULL_LOAD_PAGE_SIZE`.
     const DEFAULT_FULL_LOAD_PAGE_SIZE: i64 = 10_000;
 
-    /// Batch-create multiple proxies, chunked into transactions of
-    /// [`BATCH_CHUNK_SIZE`] for large-scale imports.
-    #[allow(dead_code)]
-    pub async fn batch_create_proxies(
-        &self,
-        proxies: &[Proxy],
-        mode: &BatchConfigWriteMode,
-    ) -> Result<usize, anyhow::Error> {
-        self.batch_create_proxies_internal(proxies, true, mode)
-            .await
-    }
-
+    /// Batch-create multiple proxies without their plugin associations,
+    /// chunked into transactions of [`BATCH_CHUNK_SIZE`] for large-scale
+    /// imports. Associations are written afterwards by
+    /// [`Self::batch_attach_proxy_plugins`], once the referenced plugin
+    /// configs exist.
     pub async fn batch_create_proxies_without_plugins(
         &self,
         proxies: &[Proxy],
-        mode: &BatchConfigWriteMode,
-    ) -> Result<usize, anyhow::Error> {
-        self.batch_create_proxies_internal(proxies, false, mode)
-            .await
-    }
-
-    async fn batch_create_proxies_internal(
-        &self,
-        proxies: &[Proxy],
-        attach_plugins: bool,
         mode: &BatchConfigWriteMode,
     ) -> Result<usize, anyhow::Error> {
         let start = Instant::now();
@@ -7430,11 +7468,9 @@ impl DatabaseStore {
         }
         let mut total = 0usize;
         for chunk in proxies.chunks(Self::BATCH_CHUNK_SIZE) {
-            total += self
-                .batch_create_proxies_chunk(chunk, attach_plugins, mode)
-                .await?;
+            total += self.batch_create_proxies_chunk(chunk, mode).await?;
         }
-        self.check_slow_query("batch_create_proxies", start);
+        self.check_slow_query("batch_create_proxies_without_plugins", start);
         Ok(total)
     }
 
@@ -7442,7 +7478,6 @@ impl DatabaseStore {
     async fn batch_create_proxies_chunk(
         &self,
         proxies: &[Proxy],
-        attach_plugins: bool,
         mode: &BatchConfigWriteMode,
     ) -> Result<usize, anyhow::Error> {
         let mut tx = self.begin_write_tx().await?;
@@ -7459,7 +7494,7 @@ impl DatabaseStore {
         self.lock_config_change_sequences_tx(&mut tx, &admission_namespaces)
             .await?;
         let mut touched_namespaces = HashSet::new();
-        self.insert_proxies_in_tx(&mut tx, proxies, attach_plugins, &mut touched_namespaces)
+        self.insert_proxies_in_tx(&mut tx, proxies, &mut touched_namespaces)
             .await?;
 
         if mode.validates_mtls_dns() {
@@ -7476,24 +7511,22 @@ impl DatabaseStore {
         Ok(count)
     }
 
-    /// Insert one chunk of proxies into a caller-owned transaction.
+    /// Insert one chunk of proxies into a caller-owned transaction, without
+    /// their plugin associations.
     ///
     /// Shared by the chunk-per-transaction import path and the
     /// single-transaction atomic batch graph write so both write identical rows
-    /// and change records. The caller owns the namespace admission lock, the
-    /// post-write admission re-validation, change-log compaction, and the
-    /// commit.
+    /// and change records. Associations are attached in a later phase, once
+    /// the referenced plugin configs exist. The caller owns the namespace
+    /// admission lock, the post-write admission re-validation, change-log
+    /// compaction, and the commit.
     async fn insert_proxies_in_tx(
         &self,
         tx: &mut sqlx::Transaction<'_, sqlx::Any>,
         proxies: &[Proxy],
-        attach_plugins: bool,
         touched_namespaces: &mut HashSet<String>,
     ) -> Result<(), anyhow::Error> {
         let insert_sql = self.q(Self::PROXY_INSERT_SQL);
-        let assoc_sql = self.q(
-            "INSERT INTO proxy_plugins (namespace, proxy_id, plugin_config_id) VALUES (?, ?, ?)",
-        );
 
         for proxy in proxies {
             self.ensure_proxy_route_unique_tx(&mut *tx, proxy, None)
@@ -7586,7 +7619,6 @@ impl DatabaseStore {
                 .bind(proxy.pool_http2_max_frame_size.map(|v| v as i64))
                 .bind(proxy.pool_http2_max_concurrent_streams.map(|v| v as i64))
                 .bind(proxy.pool_http3_connections_per_backend.map(|v| v as i64))
-                .bind(proxy.pool_max_requests_per_connection.map(|v| v as i64))
                 .bind(proxy.listen_port.map(|v| v as i32))
                 .bind(if proxy.frontend_tls { 1i32 } else { 0 })
                 .bind(if proxy.passthrough { 1i32 } else { 0 })
@@ -7625,18 +7657,14 @@ impl DatabaseStore {
                 .execute(&mut **tx)
                 .await?;
 
-            if attach_plugins {
-                for assoc in &proxy.plugins {
-                    sqlx::query(&assoc_sql)
-                        .bind(&proxy.namespace)
-                        .bind(&proxy.id)
-                        .bind(&assoc.plugin_config_id)
-                        .execute(&mut **tx)
-                        .await?;
-                }
-            }
-            self.record_config_change_tx(&mut *tx, &proxy.namespace, "proxy", &proxy.id, "upsert")
-                .await?;
+            self.insert_config_change_row_tx(
+                &mut *tx,
+                &proxy.namespace,
+                "proxy",
+                &proxy.id,
+                "upsert",
+            )
+            .await?;
             touched_namespaces.insert(proxy.namespace.clone());
         }
 
@@ -7742,7 +7770,7 @@ impl DatabaseStore {
                     .bind(namespace)
                     .execute(&mut **tx)
                     .await?;
-                self.record_config_change_tx(&mut *tx, namespace, "proxy", proxy_id, "upsert")
+                self.insert_config_change_row_tx(&mut *tx, namespace, "proxy", proxy_id, "upsert")
                     .await?;
             }
         }
@@ -7835,7 +7863,7 @@ impl DatabaseStore {
                 .await?;
             self.insert_consumer_identity_index_tx(&mut *tx, consumer)
                 .await?;
-            self.record_config_change_tx(
+            self.insert_config_change_row_tx(
                 &mut *tx,
                 &consumer.namespace,
                 "consumer",
@@ -7958,10 +7986,16 @@ impl DatabaseStore {
                     .bind(&pc.id)
                     .execute(&mut **tx)
                     .await?;
-                self.record_config_change_tx(&mut *tx, &pc.namespace, "proxy", proxy_id, "upsert")
-                    .await?;
+                self.insert_config_change_row_tx(
+                    &mut *tx,
+                    &pc.namespace,
+                    "proxy",
+                    proxy_id,
+                    "upsert",
+                )
+                .await?;
             }
-            self.record_config_change_tx(
+            self.insert_config_change_row_tx(
                 &mut *tx,
                 &pc.namespace,
                 "plugin_config",
@@ -8082,7 +8116,7 @@ impl DatabaseStore {
                 .bind(upstream.updated_at.to_rfc3339())
                 .execute(&mut **tx)
                 .await?;
-            self.record_config_change_tx(
+            self.insert_config_change_row_tx(
                 &mut *tx,
                 &upstream.namespace,
                 "upstream",
@@ -8199,7 +8233,7 @@ impl DatabaseStore {
         for (index, chunk) in graph.proxies.chunks(chunk_size).enumerate() {
             // Associations are attached in their own phase below so a plugin
             // config submitted in the same graph is already present.
-            self.insert_proxies_in_tx(&mut tx, chunk, false, &mut touched_namespaces)
+            self.insert_proxies_in_tx(&mut tx, chunk, &mut touched_namespaces)
                 .await?;
             Self::check_atomic_batch_fault(fault, AtomicBatchPhase::Proxies, index + 1)?;
         }
@@ -8539,20 +8573,23 @@ impl DatabaseStore {
         if mode.validates_mtls_dns() {
             self.validate_mtls_dns_admission_tx(tx, namespace).await?;
         }
+        // Every row below is in this one namespace: take its change-sequence
+        // lock once instead of once per deleted resource (issue #7209).
+        self.lock_config_change_sequence_tx(tx, namespace).await?;
         for id in proxy_ids {
-            self.record_config_change_tx(tx, namespace, "proxy", &id, "delete")
+            self.insert_config_change_row_tx(tx, namespace, "proxy", &id, "delete")
                 .await?;
         }
         for id in plugin_config_ids {
-            self.record_config_change_tx(tx, namespace, "plugin_config", &id, "delete")
+            self.insert_config_change_row_tx(tx, namespace, "plugin_config", &id, "delete")
                 .await?;
         }
         for id in consumer_ids {
-            self.record_config_change_tx(tx, namespace, "consumer", &id, "delete")
+            self.insert_config_change_row_tx(tx, namespace, "consumer", &id, "delete")
                 .await?;
         }
         for id in upstream_ids {
-            self.record_config_change_tx(tx, namespace, "upstream", &id, "delete")
+            self.insert_config_change_row_tx(tx, namespace, "upstream", &id, "delete")
                 .await?;
         }
         self.compact_config_changes_tx(tx, namespace).await?;
@@ -8576,7 +8613,6 @@ impl DatabaseStore {
         self.failover_topology.handle()
     }
 
-    #[allow(dead_code)]
     pub fn db_type_str(&self) -> &str {
         &self.db_type
     }
@@ -8634,7 +8670,6 @@ impl DatabaseStore {
 
     /// Install (or clear) async test hooks around the reconnect transition
     /// write lock. Production leaves this unset.
-    #[allow(dead_code)] // exercised via external unit tests through the lib target
     pub fn set_reconnect_transition_hooks_for_test(
         &self,
         hooks: Option<SqlReconnectTransitionTestHooks>,
@@ -8647,7 +8682,6 @@ impl DatabaseStore {
     }
 
     /// Fail the next [`Self::latest_change_sequence`] reads (issue #3926 tests).
-    #[allow(dead_code)] // exercised via external unit tests through the lib target
     pub fn set_latest_change_sequence_fault_for_test(&self, fail: bool) {
         self.latest_change_sequence_test_fault
             .store(fail, Ordering::Release);
@@ -8874,7 +8908,6 @@ impl DatabaseStore {
     /// Extract the hostname from a database URL, if it contains one.
     ///
     /// Delegates to [`crate::config::db_backend::extract_db_hostname`].
-    #[allow(dead_code)]
     pub fn extract_db_hostname(db_url: &str) -> Option<String> {
         crate::config::db_backend::extract_db_hostname(db_url)
     }
@@ -9268,7 +9301,6 @@ impl DatabaseStore {
     }
 
     /// Returns true if a read replica URL is configured.
-    #[allow(dead_code)] // Public API for tests and future consumers
     pub fn has_read_replica_pool(&self) -> bool {
         self.read_replica_url.is_some()
     }
@@ -10408,7 +10440,6 @@ impl DatabaseStore {
                 .bind(p.pool_http2_max_frame_size.map(|v| v as i64))
                 .bind(p.pool_http2_max_concurrent_streams.map(|v| v as i64))
                 .bind(p.pool_http3_connections_per_backend.map(|v| v as i64))
-                .bind(p.pool_max_requests_per_connection.map(|v| v as i64))
                 .bind(p.listen_port.map(|v| v as i32))
                 .bind(if p.frontend_tls { 1i32 } else { 0 })
                 .bind(if p.passthrough { 1i32 } else { 0 })
@@ -10929,7 +10960,6 @@ impl DatabaseStore {
                  pool_http2_adaptive_window = ?, pool_http2_max_frame_size = ?, \
                  pool_http2_max_concurrent_streams = ?, \
                  pool_http3_connections_per_backend = ?, \
-                 pool_max_requests_per_connection = ?, \
                  listen_port = ?, frontend_tls = ?, passthrough = ?, \
                  udp_idle_timeout_seconds = ?, tcp_idle_timeout_seconds = ?, \
                  websocket_idle_timeout_seconds = ?, websocket_permessage_deflate = ?, \
@@ -10993,7 +11023,6 @@ impl DatabaseStore {
             .bind(p.pool_http2_max_frame_size.map(|v| v as i64))
             .bind(p.pool_http2_max_concurrent_streams.map(|v| v as i64))
             .bind(p.pool_http3_connections_per_backend.map(|v| v as i64))
-            .bind(p.pool_max_requests_per_connection.map(|v| v as i64))
             .bind(p.listen_port.map(|v| v as i32))
             .bind(if p.frontend_tls { 1i32 } else { 0 })
             .bind(if p.passthrough { 1i32 } else { 0 })
@@ -11239,17 +11268,15 @@ impl DatabaseStore {
         // rebuilt and hand-added links have survived the replacement.
         let (old_plugins, new_plugins) = if table == "proxies" {
             let previous = previous_proxy.ok_or(DeploymentGraphInvalid)?;
-            let mut associations = self
-                .load_proxy_plugin_associations_for_namespace_tx(
+            let associations = self
+                .load_proxy_plugin_associations_for_proxy_tx(
                     &previous.namespace,
+                    &previous.id,
                     "deployment preservation",
                     tx,
                 )
                 .await?;
-            (
-                previous.plugins.clone(),
-                associations.remove(&previous.id).unwrap_or_default(),
-            )
+            (previous.plugins.clone(), associations)
         } else {
             (Vec::new(), Vec::new())
         };
@@ -12068,6 +12095,42 @@ impl DatabaseStore {
     pub async fn prune_audit_events(&self, namespace: &str) -> Result<u64, anyhow::Error> {
         self.prune_audit_events_with_mode(namespace, /* force_max_rows */ true)
             .await
+    }
+
+    /// Periodic age-retention sweep across every namespace that holds audit
+    /// rows (see [`DatabaseBackend::prune_expired_audit_events`]). Namespaces
+    /// are walked one index seek at a time on
+    /// `idx_audit_events_namespace_ts_id`, never with a full `DISTINCT` scan.
+    pub async fn prune_expired_audit_events(&self) -> Result<u64, anyhow::Error> {
+        let Some(days) = self.audit_retention.retention_days else {
+            return Ok(0);
+        };
+        let start = std::time::Instant::now();
+        let first_sql = self.q("SELECT namespace FROM audit_events ORDER BY namespace LIMIT 1");
+        let next_sql = self
+            .q("SELECT namespace FROM audit_events WHERE namespace > ? ORDER BY namespace LIMIT 1");
+        let mut deleted = 0u64;
+        let mut previous: Option<String> = None;
+        loop {
+            let row = match previous.as_deref() {
+                None => sqlx::query(&first_sql).fetch_optional(&self.pool()).await?,
+                Some(after) => {
+                    sqlx::query(&next_sql)
+                        .bind(after)
+                        .fetch_optional(&self.pool())
+                        .await?
+                }
+            };
+            let Some(row) = row else {
+                break;
+            };
+            let namespace: String = row.try_get("namespace")?;
+            deleted =
+                deleted.saturating_add(self.prune_audit_events_by_age(&namespace, days).await?);
+            previous = Some(namespace);
+        }
+        self.check_slow_query("prune_expired_audit_events", start);
+        Ok(deleted)
     }
 
     async fn prune_audit_events_with_mode(
@@ -12993,14 +13056,6 @@ impl DatabaseBackend for DatabaseStore {
         DatabaseStore::batch_create_config_graph_atomically(self, graph, mode).await
     }
 
-    async fn batch_create_proxies(
-        &self,
-        proxies: &[Proxy],
-        mode: &BatchConfigWriteMode,
-    ) -> Result<usize, anyhow::Error> {
-        DatabaseStore::batch_create_proxies(self, proxies, mode).await
-    }
-
     async fn batch_create_proxies_without_plugins(
         &self,
         proxies: &[Proxy],
@@ -13322,6 +13377,10 @@ impl DatabaseBackend for DatabaseStore {
     async fn prune_audit_events(&self, namespace: &str) -> Result<u64, anyhow::Error> {
         DatabaseStore::prune_audit_events(self, namespace).await
     }
+
+    async fn prune_expired_audit_events(&self) -> Result<u64, anyhow::Error> {
+        DatabaseStore::prune_expired_audit_events(self).await
+    }
 }
 
 /// Parse a stored backend scheme string into the canonical 6-variant
@@ -13355,11 +13414,48 @@ pub(crate) fn parse_plugin_scope(s: &str) -> Result<PluginScope, String> {
     }
 }
 
-pub(crate) fn parse_auth_mode(s: &str) -> AuthMode {
+/// Strict `proxies.auth_mode` decode (issue #7192): an unknown value rejects
+/// the row instead of silently becoming `single`, matching MongoDB's strict
+/// serde enum. The raw column is never echoed.
+pub(crate) fn parse_auth_mode(s: &str) -> Result<AuthMode, String> {
     match s.to_lowercase().as_str() {
-        "multi" => AuthMode::Multi,
-        _ => AuthMode::Single,
+        "single" => Ok(AuthMode::Single),
+        "multi" => Ok(AuthMode::Multi),
+        _ => Err("unsupported auth_mode (expected one of: single, multi)".to_string()),
     }
+}
+
+/// Strict `proxies.response_body_mode` decode (issue #7192).
+fn parse_response_body_mode(s: &str) -> Result<ResponseBodyMode, String> {
+    match s {
+        "stream" => Ok(ResponseBodyMode::Stream),
+        "buffer" => Ok(ResponseBodyMode::Buffer),
+        _ => Err("unsupported response_body_mode (expected one of: stream, buffer)".to_string()),
+    }
+}
+
+/// Decode a NOT NULL integer flag column (`0`/non-zero). A decode failure
+/// rejects the row instead of inventing the schema default (issue #7192).
+fn required_flag_column(row: &AnyRow, column: &str) -> Result<bool, anyhow::Error> {
+    Ok(row.try_get::<i32, _>(column)? != 0)
+}
+
+/// Decode a nullable integer flag column; SQL NULL is `None`, a decode
+/// failure rejects the row (issue #7192).
+fn optional_flag_column(row: &AnyRow, column: &str) -> Result<Option<bool>, anyhow::Error> {
+    Ok(row.try_get::<Option<i32>, _>(column)?.map(|v| v != 0))
+}
+
+/// Decode a nullable integer column; SQL NULL is `None`, a decode failure
+/// rejects the row (issue #7192).
+fn optional_i64_column(row: &AnyRow, column: &str) -> Result<Option<i64>, anyhow::Error> {
+    Ok(row.try_get::<Option<i64>, _>(column)?)
+}
+
+/// Decode a port column, rejecting a value outside `0..=65535` instead of
+/// clamping it to a different port (issue #7192).
+fn port_from_column(value: i32, column: &str) -> Result<u16, anyhow::Error> {
+    u16::try_from(value).map_err(|_| anyhow::anyhow!("{column} is out of range"))
 }
 
 fn serialize_stream_match(proxy: &Proxy) -> Result<Option<String>, anyhow::Error> {
@@ -13416,7 +13512,7 @@ fn row_to_proxy_inner(
         labels: config_decode::from_json_str(&required_utf8_text_column(row, "labels")?)?,
         id,
         namespace: row_namespace_or_default(row),
-        name: row.try_get("name").ok(),
+        name: optional_utf8_text_column(row, "name")?,
         hosts,
         // Propagate decode errors — silently defaulting to None would turn a
         // malformed listen_path into a host-only proxy and change routing
@@ -13430,25 +13526,19 @@ fn row_to_proxy_inner(
         // even when no normalization pass runs.
         dispatch_kind: DispatchKind::from(backend_scheme),
         backend_host: row.try_get("backend_host")?,
-        backend_port: row
-            .try_get::<i32, _>("backend_port")
-            .map(|v| v.clamp(0, 65535) as u16)
-            .unwrap_or(80),
+        // Every NOT NULL column below is decoded with `?`: inventing the
+        // schema default on a decode failure would send traffic to port 80,
+        // drop a frontend-TLS listener to plaintext, and so on (issue #7192).
+        // The row is rejected and the last good config stays live.
+        backend_port: port_from_column(row.try_get::<i32, _>("backend_port")?, "backend_port")
+            .map_err(|e| anyhow::anyhow!("Proxy {:?}: {}", pid, e))?,
         backend_path: optional_utf8_text_column(row, "backend_path")?,
-        strip_listen_path: row.try_get::<i32, _>("strip_listen_path").unwrap_or(1) != 0,
-        preserve_host_header: row.try_get::<i32, _>("preserve_host_header").unwrap_or(0) != 0,
-        backend_connect_timeout_ms: row
-            .try_get::<i64, _>("backend_connect_timeout_ms")
-            .map(|v| v.max(0) as u64)
-            .unwrap_or(5000),
-        backend_read_timeout_ms: row
-            .try_get::<i64, _>("backend_read_timeout_ms")
-            .map(|v| v.max(0) as u64)
-            .unwrap_or(30000),
-        backend_write_timeout_ms: row
-            .try_get::<i64, _>("backend_write_timeout_ms")
-            .map(|v| v.max(0) as u64)
-            .unwrap_or(30000),
+        strip_listen_path: required_flag_column(row, "strip_listen_path")?,
+        preserve_host_header: required_flag_column(row, "preserve_host_header")?,
+        backend_connect_timeout_ms: row.try_get::<i64, _>("backend_connect_timeout_ms")?.max(0)
+            as u64,
+        backend_read_timeout_ms: row.try_get::<i64, _>("backend_read_timeout_ms")?.max(0) as u64,
+        backend_write_timeout_ms: row.try_get::<i64, _>("backend_write_timeout_ms")?.max(0) as u64,
         // Propagate decode errors — silently defaulting to None would disable
         // backend mTLS (client cert/key) or swap the trust anchor from a custom
         // CA to the global bundle/webpki. `Option<String>` already represents
@@ -13459,10 +13549,10 @@ fn row_to_proxy_inner(
             "backend_tls_client_cert_path",
         )?,
         backend_tls_client_key_path: optional_utf8_text_column(row, "backend_tls_client_key_path")?,
-        backend_tls_verify_server_cert: row
-            .try_get::<i32, _>("backend_tls_verify_server_cert")
-            .unwrap_or(1)
-            != 0,
+        backend_tls_verify_server_cert: required_flag_column(
+            row,
+            "backend_tls_verify_server_cert",
+        )?,
         backend_tls_server_ca_cert_path: optional_utf8_text_column(
             row,
             "backend_tls_server_ca_cert_path",
@@ -13470,11 +13560,9 @@ fn row_to_proxy_inner(
         // DNS override redirects egress; silently dropping it can send traffic
         // to an unintended resolved address.
         dns_override: optional_utf8_text_column(row, "dns_override")?,
-        dns_cache_ttl_seconds: row
-            .try_get::<i64, _>("dns_cache_ttl_seconds")
-            .ok()
-            .map(|v| v as u64),
-        auth_mode: parse_auth_mode(&auth_mode_str),
+        dns_cache_ttl_seconds: optional_i64_column(row, "dns_cache_ttl_seconds")?.map(|v| v as u64),
+        auth_mode: parse_auth_mode(&auth_mode_str)
+            .map_err(|e| anyhow::anyhow!("Proxy {:?}: {}", pid, e))?,
         plugins,
         // Propagate decode errors — silently defaulting to None would detach
         // the proxy from its load-balanced upstream and fall back to
@@ -13500,70 +13588,54 @@ fn row_to_proxy_inner(
             ),
             None => None,
         },
-        response_body_mode: row
-            .try_get::<String, _>("response_body_mode")
-            .ok()
-            .map(|s| match s.as_str() {
-                "buffer" => ResponseBodyMode::Buffer,
-                _ => ResponseBodyMode::Stream,
-            })
-            .unwrap_or_default(),
-        pool_idle_timeout_seconds: row
-            .try_get::<i64, _>("pool_idle_timeout_seconds")
-            .ok()
+        response_body_mode: parse_response_body_mode(&required_utf8_text_column(
+            row,
+            "response_body_mode",
+        )?)
+        .map_err(|e| anyhow::anyhow!("Proxy {:?}: {}", pid, e))?,
+        pool_idle_timeout_seconds: optional_i64_column(row, "pool_idle_timeout_seconds")?
             .map(|v| v as u64),
-        pool_enable_http_keep_alive: row
-            .try_get::<i32, _>("pool_enable_http_keep_alive")
-            .ok()
-            .map(|v| v != 0),
-        pool_enable_http2: row
-            .try_get::<i32, _>("pool_enable_http2")
-            .ok()
-            .map(|v| v != 0),
-        pool_tcp_keepalive_seconds: row
-            .try_get::<i64, _>("pool_tcp_keepalive_seconds")
-            .ok()
+        pool_enable_http_keep_alive: optional_flag_column(row, "pool_enable_http_keep_alive")?,
+        pool_enable_http2: optional_flag_column(row, "pool_enable_http2")?,
+        pool_tcp_keepalive_seconds: optional_i64_column(row, "pool_tcp_keepalive_seconds")?
             .map(|v| v as u64),
-        pool_http2_keep_alive_interval_seconds: row
-            .try_get::<i64, _>("pool_http2_keep_alive_interval_seconds")
-            .ok()
-            .map(|v| v as u64),
-        pool_http2_keep_alive_timeout_seconds: row
-            .try_get::<i64, _>("pool_http2_keep_alive_timeout_seconds")
-            .ok()
-            .map(|v| v as u64),
-        pool_http2_initial_stream_window_size: row
-            .try_get::<i64, _>("pool_http2_initial_stream_window_size")
-            .ok()
+        pool_http2_keep_alive_interval_seconds: optional_i64_column(
+            row,
+            "pool_http2_keep_alive_interval_seconds",
+        )?
+        .map(|v| v as u64),
+        pool_http2_keep_alive_timeout_seconds: optional_i64_column(
+            row,
+            "pool_http2_keep_alive_timeout_seconds",
+        )?
+        .map(|v| v as u64),
+        pool_http2_initial_stream_window_size: optional_i64_column(
+            row,
+            "pool_http2_initial_stream_window_size",
+        )?
+        .map(|v| v as u32),
+        pool_http2_initial_connection_window_size: optional_i64_column(
+            row,
+            "pool_http2_initial_connection_window_size",
+        )?
+        .map(|v| v as u32),
+        pool_http2_adaptive_window: optional_flag_column(row, "pool_http2_adaptive_window")?,
+        pool_http2_max_frame_size: optional_i64_column(row, "pool_http2_max_frame_size")?
             .map(|v| v as u32),
-        pool_http2_initial_connection_window_size: row
-            .try_get::<i64, _>("pool_http2_initial_connection_window_size")
-            .ok()
-            .map(|v| v as u32),
-        pool_http2_adaptive_window: row
-            .try_get::<i32, _>("pool_http2_adaptive_window")
-            .ok()
-            .map(|v| v != 0),
-        pool_http2_max_frame_size: row
-            .try_get::<i64, _>("pool_http2_max_frame_size")
-            .ok()
-            .map(|v| v as u32),
-        pool_http2_max_concurrent_streams: row
-            .try_get::<i64, _>("pool_http2_max_concurrent_streams")
-            .ok()
-            .map(|v| v as u32),
-        pool_http3_connections_per_backend: row
-            .try_get::<i64, _>("pool_http3_connections_per_backend")
-            .ok()
-            .map(|v| v.max(1) as usize),
+        pool_http2_max_concurrent_streams: optional_i64_column(
+            row,
+            "pool_http2_max_concurrent_streams",
+        )?
+        .map(|v| v as u32),
+        pool_http3_connections_per_backend: optional_i64_column(
+            row,
+            "pool_http3_connections_per_backend",
+        )?
+        .map(|v| v.max(1) as usize),
         // Derived-only: `h2_upgrade_policy` is projected from the mesh
         // DestinationRule port overrides at dispatch time, never persisted as a
         // proxy column, so a DB-loaded proxy always starts at `None`.
         h2_upgrade_policy: None,
-        pool_max_requests_per_connection: row
-            .try_get::<i64, _>("pool_max_requests_per_connection")
-            .ok()
-            .map(|v| v.max(0) as u64),
         // Derived-only: `pool_http1_max_pending_requests` is projected from the
         // mesh DestinationRule port overrides at dispatch time, never persisted
         // as a proxy column, so a DB-loaded proxy always starts at `None`.
@@ -13572,25 +13644,19 @@ fn row_to_proxy_inner(
         // failure to None would broaden traffic across all upstream targets.
         upstream_subset: optional_utf8_text_column(row, "upstream_subset")?,
         listen_port: row
-            .try_get::<i32, _>("listen_port")
-            .ok()
-            .map(|v| v.clamp(0, 65535) as u16),
-        frontend_tls: row.try_get::<i32, _>("frontend_tls").unwrap_or(0) != 0,
-        passthrough: row.try_get::<i32, _>("passthrough").unwrap_or(0) != 0,
-        udp_idle_timeout_seconds: row
-            .try_get::<i64, _>("udp_idle_timeout_seconds")
-            .map(|v| v.max(0) as u64)
-            .unwrap_or(60),
-        tcp_idle_timeout_seconds: row
-            .try_get::<i64, _>("tcp_idle_timeout_seconds")
-            .ok()
+            .try_get::<Option<i32>, _>("listen_port")?
+            .map(|v| port_from_column(v, "listen_port"))
+            .transpose()
+            .map_err(|e| anyhow::anyhow!("Proxy {:?}: {}", pid, e))?,
+        frontend_tls: required_flag_column(row, "frontend_tls")?,
+        passthrough: required_flag_column(row, "passthrough")?,
+        udp_idle_timeout_seconds: row.try_get::<i64, _>("udp_idle_timeout_seconds")?.max(0) as u64,
+        tcp_idle_timeout_seconds: optional_i64_column(row, "tcp_idle_timeout_seconds")?
             .map(|v| v.max(0) as u64),
-        websocket_idle_timeout_seconds: row
-            .try_get::<i64, _>("websocket_idle_timeout_seconds")
-            .ok()
+        websocket_idle_timeout_seconds: optional_i64_column(row, "websocket_idle_timeout_seconds")?
             .map(|v| v.max(0) as u64),
         websocket_permessage_deflate: decode_websocket_permessage_deflate(row, &pid)?,
-        allow_path_parameters: row.try_get::<i32, _>("allow_path_parameters").unwrap_or(0) != 0,
+        allow_path_parameters: required_flag_column(row, "allow_path_parameters")?,
         allowed_methods: match optional_utf8_text_column(row, "allowed_methods")? {
             Some(s) => Some(
                 config_decode::from_json_str::<Vec<String>>(&s).map_err(|e| {
@@ -13614,8 +13680,7 @@ fn row_to_proxy_inner(
             None => Vec::new(),
         },
         udp_max_response_amplification_factor: row
-            .try_get::<f64, _>("udp_max_response_amplification_factor")
-            .ok()
+            .try_get::<Option<f64>, _>("udp_max_response_amplification_factor")?
             .map(|v| v as f32),
         // Written as an i32 0/1 (like the other proxy booleans); decode with
         // the same width. `Option<i32>` represents SQL NULL, so `?` fails only
@@ -13661,10 +13726,7 @@ fn row_to_proxy_inner(
         // `load_full_config` / `load_incremental_config` strip it
         // explicitly via `strip_api_spec_id_from_runtime_config(&mut cfg)`
         // before returning — see Wave 1A's hot-path isolation invariant.
-        api_spec_id: row
-            .try_get::<Option<String>, _>("api_spec_id")
-            .ok()
-            .flatten(),
+        api_spec_id: optional_utf8_text_column(row, "api_spec_id")?,
         resolved_tls: Default::default(),
         // Populated by `GatewayConfig::resolve_dispatch_port_overrides()` after
         // upstreams are loaded and any mesh DR overrides applied.
@@ -13801,7 +13863,8 @@ fn row_to_consumer_inner(row: &AnyRow, id_preview: &str) -> Result<Consumer, any
         id: row.try_get("id")?,
         namespace: row_namespace_or_default(row),
         username: row.try_get("username")?,
-        custom_id: row.try_get("custom_id").ok(),
+        // An identity column: a decode failure must not silently drop it.
+        custom_id: optional_utf8_text_column(row, "custom_id")?,
         credentials,
         acl_groups,
         created_at: parse_datetime_column(row, "created_at"),
@@ -13893,19 +13956,16 @@ fn row_to_plugin_config_inner(
             .map_err(|reason| anyhow::anyhow!("PluginConfig {:?}: {}", id_preview, reason))?,
         proxy_id: optional_utf8_text_column(row, "proxy_id")?,
         enabled: row.try_get::<i32, _>("enabled")? != 0,
+        // A decode failure must not silently drop the override and change
+        // plugin execution order (issue #7192).
         priority_override: row
-            .try_get::<Option<i32>, _>("priority_override")
-            .ok()
-            .flatten()
+            .try_get::<Option<i32>, _>("priority_override")?
             .map(|v| v.clamp(0, 10_000) as u16),
         trigger,
         // See row_to_proxy for the rationale: preserve here so admin reads
         // get the real owning spec id; runtime callers strip via
         // strip_api_spec_id_from_runtime_config.
-        api_spec_id: row
-            .try_get::<Option<String>, _>("api_spec_id")
-            .ok()
-            .flatten(),
+        api_spec_id: optional_utf8_text_column(row, "api_spec_id")?,
         created_at: parse_datetime_column(row, "created_at"),
         updated_at: parse_datetime_column(row, "updated_at"),
     })
@@ -14100,10 +14160,8 @@ fn row_to_upstream_inner(row: &AnyRow, id_preview: &str) -> Result<Upstream, any
         };
 
     // Parse backend TLS fields
-    let backend_tls_verify_server_cert: bool = row
-        .try_get::<i32, _>("backend_tls_verify_server_cert")
-        .map(|v| v != 0)
-        .unwrap_or(true);
+    let backend_tls_verify_server_cert =
+        required_flag_column(row, "backend_tls_verify_server_cert")?;
 
     let subsets = match optional_utf8_text_column(row, "subsets")? {
         Some(s) => Some(config_decode::from_json_str(&s).map_err(|e| {
@@ -14133,7 +14191,7 @@ fn row_to_upstream_inner(row: &AnyRow, id_preview: &str) -> Result<Upstream, any
         labels: config_decode::from_json_str(&required_utf8_text_column(row, "labels")?)?,
         id: row.try_get("id")?,
         namespace: row_namespace_or_default(row),
-        name: row.try_get("name").ok(),
+        name: optional_utf8_text_column(row, "name")?,
         targets,
         algorithm,
         hash_on: optional_utf8_text_column(row, "hash_on")?,
@@ -14245,9 +14303,11 @@ fn row_to_api_spec_with_content(
     use crate::config::types::{ApiSpec, SpecFormat};
 
     let spec_format_str: String = row.try_get("spec_format")?;
+    // Strict (issue #7192): an unknown stored format is not silently YAML.
     let spec_format = match spec_format_str.as_str() {
         "json" => SpecFormat::Json,
-        _ => SpecFormat::Yaml,
+        "yaml" => SpecFormat::Yaml,
+        _ => anyhow::bail!("unsupported api_specs.spec_format (expected one of: json, yaml)"),
     };
     let uncompressed_size: i64 = row.try_get("uncompressed_size")?;
 

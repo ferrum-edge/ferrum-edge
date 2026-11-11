@@ -302,7 +302,7 @@ fn live_status_resource_version(live: &DynamicObject) -> Option<&str> {
 
 fn missing_status_resource_version_error(update: &GatewayApiStatusUpdate) -> kube::Error {
     let message = format!(
-        "Ferrum refused Gateway API status apply for {} {}/{}: live status had no resourceVersion",
+        "Ferrum refused Gateway API status write for {} {}/{}: live status had no resourceVersion",
         update.kind, update.namespace, update.name
     );
     let mut status = kube::core::Status::failure(&message, "Invalid");
@@ -337,15 +337,20 @@ async fn patch_route_status_with_retry(
             api.get_status(&update.name),
         )
         .await?;
-        let Some(resource_version) = live.metadata.resource_version.as_deref() else {
+        // Same fail-closed rule as the SSA path: an empty token would send an
+        // unguarded merge patch over a concurrent third-party write, and a
+        // missing one is not a success — returning an error keeps the object
+        // in the status plan so it retries.
+        let Some(resource_version) = live_status_resource_version(&live) else {
             warn!(
                 api_version = %update.api_version,
                 kind = %update.kind,
                 namespace = %update.namespace,
                 name = %update.name,
-                "Gateway API route status read returned no resourceVersion; leaving resource for the next reconcile"
+                "Gateway API route status read returned no resourceVersion; refusing unguarded \
+                 merge-patch write"
             );
-            return Ok(());
+            return Err(missing_status_resource_version_error(update));
         };
         let patch = if policy_status_kind(&update.kind) {
             policy_status_merge_patch_for_update(update, live.data.get("status"), resource_version)
@@ -6203,7 +6208,7 @@ mod tests {
                     "backendRefs": [{
                         "name": "api",
                         "port": 8080,
-                        "weight": 65536
+                        "weight": 1_000_001
                     }]
                 }]
             }),
@@ -6577,7 +6582,7 @@ mod tests {
                 "parentRefs": [{"name": "edge"}],
                 "rules": [{
                     "matches": [{"path": {"type": "PathPrefix", "value": "/api"}}],
-                    "backendRefs": [{"name": "api", "port": 8080, "weight": 65536}]
+                    "backendRefs": [{"name": "api", "port": 8080, "weight": 1_000_001}]
                 }]
             }),
         );

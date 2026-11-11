@@ -62,8 +62,11 @@ use super::{Plugin, PluginResult, RequestContext};
 static NEXT_RESPONSE_GUARD_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
 
 /// JSON object keys that are structural metadata (IDs, timestamps, model
-/// names, roles, etc.) and must never be redacted, even in `ScanMode::All`.
-/// This protects timestamps and IDs that may incidentally match PII regexes.
+/// names, roles, etc.). In `ScanMode::All` a scalar held directly by one of
+/// them at the root of a response body or SSE event is neither redacted nor
+/// detected (issue #7129): detection, redaction, and the residual re-scan all
+/// see the same view, so a Unix-seconds `created` that happens to match
+/// `phone_us` cannot make `reject` / `warn` fire on every completion.
 const STRUCTURAL_KEY_COUNT: usize = 17;
 const STRUCTURAL_KEYS: [&str; STRUCTURAL_KEY_COUNT] = [
     "id",
@@ -284,7 +287,14 @@ fn parse_allowlist(config: &Value) -> Result<PiiAllowlist, String> {
     if !block.is_object() {
         return Err("ai_response_guard: `allowlist` must be an object".to_string());
     }
-    reject_unknown_keys(block, ALLOWLIST_CONFIG_KEYS, "allowlist")?;
+    block.as_object().map_or(Ok(()), |object| {
+        crate::util::unknown_keys::reject_unknown_keys(
+            object,
+            "allowlist",
+            ALLOWLIST_CONFIG_KEYS,
+            "ai_response_guard: `allowlist`: ",
+        )
+    })?;
     let mut allowlist = PiiAllowlist::default();
     if let Some(values) = block.get("values") {
         let Some(values) = values.as_array() else {
@@ -673,10 +683,6 @@ pub struct AiResponseGuard {
     max_scan_bytes: usize,
     /// True when action is Redact — enables transform_response_body.
     needs_body_transform: bool,
-    /// True when the plugin has any active validation rule (patterns, phrases,
-    /// `require_json`, `required_fields`, or `max_completion_length`). Drives
-    /// response-body buffering — when no rule applies, the plugin is a no-op.
-    has_validation_rules: bool,
     /// Optional: require response to be valid JSON.
     require_json: bool,
     /// Optional: required top-level JSON fields.
@@ -780,7 +786,14 @@ impl AiResponseGuard {
         if !config.is_object() {
             return Err("ai_response_guard: config must be an object".to_string());
         }
-        reject_unknown_keys(config, CONFIG_KEYS, "config")?;
+        config.as_object().map_or(Ok(()), |object| {
+            crate::util::unknown_keys::reject_unknown_keys(
+                object,
+                "config",
+                CONFIG_KEYS,
+                "ai_response_guard: `config`: ",
+            )
+        })?;
 
         let action = match optional_string(config, "action")?.unwrap_or("reject") {
             "reject" => GuardAction::Reject,
@@ -870,11 +883,14 @@ impl AiResponseGuard {
                         "ai_response_guard: `custom_pii_patterns[{idx}]` must be an object"
                     ));
                 }
-                reject_unknown_keys(
-                    entry,
-                    &["name", "regex"],
-                    &format!("custom_pii_patterns[{idx}]"),
-                )?;
+                entry.as_object().map_or(Ok(()), |object| {
+                    crate::util::unknown_keys::reject_unknown_keys(
+                        object,
+                        &format!("custom_pii_patterns[{idx}]"),
+                        &["name", "regex"],
+                        &format!("ai_response_guard: `custom_pii_patterns[{idx}]`: "),
+                    )
+                })?;
                 let name = required_non_empty_string(entry, "custom_pii_patterns", idx, "name")?;
                 check_custom_pattern_name("custom_pii_patterns", idx, name)?;
                 let regex_str =
@@ -964,11 +980,14 @@ impl AiResponseGuard {
                         "ai_response_guard: `blocked_patterns[{idx}]` must be an object"
                     ));
                 }
-                reject_unknown_keys(
-                    entry,
-                    &["name", "regex"],
-                    &format!("blocked_patterns[{idx}]"),
-                )?;
+                entry.as_object().map_or(Ok(()), |object| {
+                    crate::util::unknown_keys::reject_unknown_keys(
+                        object,
+                        &format!("blocked_patterns[{idx}]"),
+                        &["name", "regex"],
+                        &format!("ai_response_guard: `blocked_patterns[{idx}]`: "),
+                    )
+                })?;
                 let name = required_non_empty_string(entry, "blocked_patterns", idx, "name")?;
                 check_custom_pattern_name("blocked_patterns", idx, name)?;
                 let regex_str = required_non_empty_string(entry, "blocked_patterns", idx, "regex")?;
@@ -1085,7 +1104,6 @@ impl AiResponseGuard {
             scan_mode,
             max_scan_bytes,
             needs_body_transform,
-            has_validation_rules,
             require_json,
             required_fields,
             max_completion_length,
@@ -1371,6 +1389,14 @@ impl AiResponseGuard {
     /// valid UTF-8 (the body still parsed via `from_slice`), in which case only
     /// the decoded pass runs.
     ///
+    /// Both passes exclude top-level structural scalar values, the carve-out
+    /// redaction and the residual re-scan apply (issue #7129): the decoded
+    /// pass skips them (their keys are still scanned) and the raw pass runs
+    /// over the body with those value bytes masked. The masked copy is built
+    /// only when the unmasked raw pass hit something, so a clean body pays no
+    /// copy; a body whose root cannot be walked keeps the unmasked hits (fail
+    /// closed).
+    ///
     /// Accepted trade-off: because pass 1 evaluates each decoded value in
     /// isolation, an *anchored* custom `blocked_pattern` (e.g. `^done$`) that an
     /// operator authored against the whole serialized body will additionally fire
@@ -1390,14 +1416,16 @@ impl AiResponseGuard {
         // Pass 1: decoded tokens, plus decoded tool/function-argument tokens
         // so scan-all keeps parity with content mode on nested JSON escapes.
         let mut texts: Vec<Cow<'_, str>> = Vec::new();
-        collect_decoded_json_strings(json, &mut texts);
+        collect_decoded_json_strings_outside_structural(json, &mut texts);
         collect_decoded_argument_tokens(json, &mut texts);
         for text in &texts {
             self.mark_hits(text.as_ref(), &mut hit);
         }
         // Pass 2: raw serialized body (cross-token / contextual / duplicate-key).
         if let Some(raw) = raw {
-            self.mark_hits(raw, &mut hit);
+            self.mark_raw_hits_outside_structural(raw, &mut hit, |raw| {
+                mask_json_top_level_structural_scalars(raw, json)
+            });
         }
         let mut detected = Vec::new();
         for (idx, &h) in hit.iter().enumerate() {
@@ -1406,6 +1434,30 @@ impl AiResponseGuard {
             }
         }
         detected
+    }
+
+    /// Raw/contextual detection pass over `raw` with top-level structural
+    /// scalar values masked by `mask` (the residual re-scan's view). The
+    /// unmasked body is scanned first; only when it hit a pattern is the
+    /// masked copy built and scanned instead, so the common clean body costs
+    /// no copy. When `mask` cannot walk the body the unmasked hits stand.
+    fn mark_raw_hits_outside_structural(
+        &self,
+        raw: &str,
+        hit: &mut [bool],
+        mask: impl FnOnce(&str) -> Option<String>,
+    ) {
+        let mut raw_hit = vec![false; hit.len()];
+        self.mark_hits(raw, &mut raw_hit);
+        if raw_hit.iter().any(|&h| h)
+            && let Some(masked) = mask(raw)
+        {
+            raw_hit.fill(false);
+            self.mark_hits(&masked, &mut raw_hit);
+        }
+        for (slot, raw_slot) in hit.iter_mut().zip(raw_hit) {
+            *slot |= raw_slot;
+        }
     }
 
     /// `ScanMode::All` SSE detection: the union of decoded parsed frames and a
@@ -1437,7 +1489,7 @@ impl AiResponseGuard {
         let mut hit = vec![false; self.detection_pattern_count];
         let mut texts: Vec<Cow<'_, str>> = Vec::new();
         for frame in frames {
-            collect_decoded_json_strings(frame, &mut texts);
+            collect_decoded_json_strings_outside_structural(frame, &mut texts);
             collect_decoded_argument_tokens(frame, &mut texts);
         }
         for text in &texts {
@@ -1452,7 +1504,11 @@ impl AiResponseGuard {
             self.mark_hits(text, &mut hit);
         }
         if let Some(raw) = raw {
-            self.mark_hits(raw, &mut hit);
+            self.mark_raw_hits_outside_structural(
+                raw,
+                &mut hit,
+                mask_sse_top_level_structural_scalars,
+            );
         }
         let mut detected = Vec::new();
         for (idx, &h) in hit.iter().enumerate() {
@@ -2272,7 +2328,8 @@ impl AiResponseGuard {
                 // address — cannot silently become "unchanged" and forward the
                 // original detected body (GHSA-pwcm-6rh8-f2gh). The instance
                 // discharges its own entry when it installs bytes;
-                // `on_final_response_body` rejects anything still outstanding.
+                // `finalize_client_visible_response_body` rejects anything
+                // still outstanding.
                 let replay = ctx.finalized_response_replay;
                 let state = ctx.plugin_state_mut();
                 state
@@ -3972,7 +4029,14 @@ fn parse_grpc_shape(config: &Value) -> Result<Option<GrpcShape>, String> {
     if !grpc.is_object() {
         return Err("ai_response_guard: `grpc` must be an object".to_string());
     }
-    reject_unknown_keys(grpc, AI_RESPONSE_GUARD_GRPC_CONFIG_KEYS, "grpc")?;
+    grpc.as_object().map_or(Ok(()), |object| {
+        crate::util::unknown_keys::reject_unknown_keys(
+            object,
+            "grpc",
+            AI_RESPONSE_GUARD_GRPC_CONFIG_KEYS,
+            "ai_response_guard: `grpc`: ",
+        )
+    })?;
 
     let descriptor_path = optional_string(grpc, "descriptor_path")?
         .map(str::trim)
@@ -4018,11 +4082,14 @@ fn parse_grpc_shape(config: &Value) -> Result<Option<GrpcShape>, String> {
         if !method_config.is_object() {
             return Err("ai_response_guard: a `grpc.methods` entry must be an object".to_string());
         }
-        reject_unknown_keys(
-            method_config,
-            AI_RESPONSE_GUARD_GRPC_METHOD_KEYS,
-            "grpc.methods",
-        )?;
+        method_config.as_object().map_or(Ok(()), |object| {
+            crate::util::unknown_keys::reject_unknown_keys(
+                object,
+                "grpc.methods",
+                AI_RESPONSE_GUARD_GRPC_METHOD_KEYS,
+                "ai_response_guard: `grpc.methods`: ",
+            )
+        })?;
         let response_type = optional_string(method_config, "response_type")?
             .map(str::trim)
             .filter(|value| !value.is_empty())
@@ -4339,7 +4406,8 @@ impl Plugin for AiResponseGuard {
     }
 
     fn requires_response_body_buffering(&self) -> bool {
-        self.has_validation_rules
+        // The constructor refuses an instance without a validation rule.
+        true
     }
 
     /// A `grpc`-enrolled instance joins the backend-path boundary so the proxy
@@ -4376,11 +4444,11 @@ impl Plugin for AiResponseGuard {
         // enrolled: an un-enrolled method has no decodable contract, so pinning
         // it to the buffered path would cost streaming for no enforcement.
         if ctx.is_native_grpc_request() {
-            return self.has_validation_rules && self.grpc_inspection_applies(ctx);
+            return self.grpc_inspection_applies(ctx);
         }
         // Client-controlled streaming intent is not response evidence. Buffer
         // conservatively until the pristine backend Content-Type is known.
-        self.has_validation_rules
+        true
     }
 
     fn may_release_response_body_under_retries(&self, ctx: &RequestContext) -> bool {
@@ -4546,25 +4614,6 @@ impl Plugin for AiResponseGuard {
         self.discharge_pending_redaction(ctx, replacement)
     }
 
-    /// Context-free entry point. Without a request context there is no
-    /// route-effective ceiling, so it falls back to the process fail-closed
-    /// retained ceiling — still finite, just looser than the per-response one
-    /// production uses through the hook above.
-    async fn transform_response_body(
-        &self,
-        body: &[u8],
-        content_type: Option<&str>,
-        _response_headers: &HashMap<String, String>,
-    ) -> Option<Vec<u8>> {
-        self.redacted_response_body(
-            body,
-            content_type,
-            crate::proxy::response_buffer_budget::buffered_response_body_ceiling(0),
-            &mut Vec::new(),
-            &mut false,
-        )
-    }
-
     fn requires_replay_response_body_transform(&self, ctx: &RequestContext) -> bool {
         ctx.plugin_state().is_some_and(|state| {
             state
@@ -4594,8 +4643,7 @@ impl Plugin for AiResponseGuard {
         response_content_type: Option<&str>,
         _response_body: &[u8],
     ) -> bool {
-        self.has_validation_rules
-            && self.has_enforcing_disposition()
+        self.has_enforcing_disposition()
             && !ctx.is_native_grpc_request()
             && !response_content_type
                 .is_some_and(crate::plugins::utils::body_transform::is_framed_grpc_content_type)
@@ -4607,9 +4655,7 @@ impl Plugin for AiResponseGuard {
     /// Configuration- and request-only over-approximation, consulted before the
     /// response `Content-Type` is known.
     fn may_enforce_response_body_policy(&self, ctx: &RequestContext) -> bool {
-        self.has_validation_rules
-            && self.has_enforcing_disposition()
-            && !ctx.is_native_grpc_request()
+        self.has_enforcing_disposition() && !ctx.is_native_grpc_request()
     }
 
     fn enforces_final_client_visible_response_body(&self, ctx: &RequestContext) -> bool {
@@ -4713,20 +4759,6 @@ impl Plugin for AiResponseGuard {
             detected
         );
         self.undelivered_redaction_reject(ctx, detected)
-    }
-
-    /// Preserve the established final-body hook contract for direct callers.
-    /// The proxy skips this compatibility hook after it has invoked the
-    /// authoritative client-visible phase, so production performs one decision.
-    async fn on_final_response_body(
-        &self,
-        ctx: &mut RequestContext,
-        response_status: u16,
-        response_headers: &HashMap<String, String>,
-        body: &[u8],
-    ) -> PluginResult {
-        self.finalize_client_visible_response_body(ctx, response_status, response_headers, body)
-            .await
     }
 
     fn on_response_body_transformed(
@@ -5334,8 +5366,8 @@ impl AiResponseGuard {
     /// Clear this instance's promised-redaction marker when — and only when — a
     /// replacement was actually produced.
     ///
-    /// `None` leaves the marker outstanding, so `on_final_response_body` turns
-    /// it into a rejection instead of letting the original detected body be
+    /// `None` leaves the marker outstanding, so
+    /// `finalize_client_visible_response_body` turns it into a rejection instead of letting the original detected body be
     /// forwarded as "unchanged".
     fn discharge_pending_redaction(
         &self,
@@ -5581,9 +5613,36 @@ fn write_pattern_replaced(
 fn blank_top_level_structural_scalars(value: &mut Value) {
     if let Value::Object(map) = value {
         for (key, value) in map.iter_mut() {
-            if STRUCTURAL_KEYS.contains(&key.as_str()) && (value.is_string() || value.is_number()) {
+            if is_top_level_structural_scalar(key, value) {
                 *value = Value::String(String::new());
             }
+        }
+    }
+}
+
+/// Whether `value`, held by `key` directly in a root response/event object, is
+/// a structural scalar (`STRUCTURAL_KEYS`) that scan-all detection, redaction,
+/// and the residual re-scan all leave alone.
+fn is_top_level_structural_scalar(key: &str, value: &Value) -> bool {
+    STRUCTURAL_KEYS.contains(&key) && (value.is_string() || value.is_number())
+}
+
+/// [`collect_decoded_json_strings`] over the residual scan's view of one
+/// response body or SSE event: a top-level structural scalar value is skipped
+/// (exactly what [`blank_top_level_structural_scalars`] blanks), while its key
+/// and every nested occurrence of a structural key name are still collected.
+fn collect_decoded_json_strings_outside_structural<'a>(
+    value: &'a Value,
+    texts: &mut Vec<Cow<'a, str>>,
+) {
+    let Value::Object(map) = value else {
+        collect_decoded_json_strings(value, texts);
+        return;
+    };
+    for (key, value) in map {
+        texts.push(Cow::Borrowed(key.as_str()));
+        if !is_top_level_structural_scalar(key, value) {
+            collect_decoded_json_strings(value, texts);
         }
     }
 }
@@ -5994,16 +6053,8 @@ fn mask_sse_event_structural_scalars(lines: &[&str]) -> Result<Option<String>, (
     // for attacker-controlled events with many data lines or root members.
     let mut mask = vec![false; joined.len()];
     for span in spans.into_iter().flatten() {
-        let bytes = joined.as_bytes();
-        let (start, end) = if span.end > span.start + 1
-            && bytes.get(span.start) == Some(&b'"')
-            && bytes.get(span.end - 1) == Some(&b'"')
-        {
-            (span.start + 1, span.end - 1)
-        } else {
-            (span.start, span.end)
-        };
-        mask.get_mut(start..end).ok_or(())?.fill(true);
+        let range = structural_mask_range(joined.as_bytes(), span);
+        mask.get_mut(range).ok_or(())?.fill(true);
     }
 
     let mut output = String::with_capacity(lines.iter().map(|line| line.len()).sum());
@@ -6021,6 +6072,39 @@ fn mask_sse_event_structural_scalars(lines: &[&str]) -> Result<Option<String>, (
         output.push_str(std::str::from_utf8(&bytes).map_err(|_| ())?);
     }
     Ok(Some(output))
+}
+
+/// The bytes of one structural scalar span to mask: a string keeps its quotes
+/// (so the surrounding JSON stays well-formed), a number is masked whole.
+fn structural_mask_range(bytes: &[u8], span: std::ops::Range<usize>) -> std::ops::Range<usize> {
+    if span.end > span.start + 1
+        && bytes.get(span.start) == Some(&b'"')
+        && bytes.get(span.end - 1) == Some(&b'"')
+    {
+        span.start + 1..span.end - 1
+    } else {
+        span
+    }
+}
+
+/// Mask top-level structural scalar values in a buffered JSON body with
+/// spaces, the raw-pass view scan-all detection shares with the SSE residual
+/// scan. Duplicate members, whitespace, and every other byte are unchanged.
+/// `None` when the root object cannot be walked, so the caller keeps the
+/// unmasked result (fail closed).
+fn mask_json_top_level_structural_scalars(raw: &str, json: &Value) -> Option<String> {
+    let spans = top_level_structural_scalar_spans(raw, json)?;
+    if spans.iter().all(Option::is_none) {
+        return None;
+    }
+    let mut bytes = raw.as_bytes().to_vec();
+    for span in spans.into_iter().flatten() {
+        let range = structural_mask_range(raw.as_bytes(), span);
+        bytes.get_mut(range)?.fill(b' ');
+    }
+    // Every byte of a masked span is replaced, so a multi-byte character is
+    // never split.
+    String::from_utf8(bytes).ok()
 }
 
 /// Mask structural scalar spans across a complete buffered SSE body. Any
@@ -6413,18 +6497,6 @@ fn collect_function_value<'a>(value: Option<&'a Value>, texts: &mut Vec<Cow<'a, 
     };
     collect_string_value(value.get("name"), texts);
     collect_argument_value(value.get("arguments"), texts);
-}
-
-fn reject_unknown_keys(value: &Value, allowed: &[&str], path: &str) -> Result<(), String> {
-    let Some(object) = value.as_object() else {
-        return Ok(());
-    };
-    if let Some(key) = object.keys().find(|key| !allowed.contains(&key.as_str())) {
-        return Err(format!(
-            "ai_response_guard: unknown field `{path}` key {key:?}"
-        ));
-    }
-    Ok(())
 }
 
 fn optional_string<'a>(config: &'a Value, field: &'static str) -> Result<Option<&'a str>, String> {

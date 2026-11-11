@@ -10,11 +10,18 @@
 //!
 //! Envoy's `http1MaxPendingRequests` bounds the depth of the *pending queue*:
 //! requests admitted but not yet assigned a connection slot. Ferrum dispatches
-//! HTTP/1.1 over reqwest, whose `send().await` resolves when **response
-//! headers** arrive — reqwest exposes **no connection-acquisition hook**, so a
-//! slot held acquire-before-send / release-after-send unavoidably spans
-//! connection-wait + request-upload + backend-TTFB, not the pending phase alone.
-//! True pending-queue depth is therefore not implementable over reqwest.
+//! HTTP/1.1 either on its own exclusive-checkout hyper pool
+//! (`proxy_to_backend_direct_h1`, `FERRUM_POOL_HTTP1_DIRECT`, default on, issue
+//! #5588) or over reqwest. Neither dispatch reports the moment a request is
+//! assigned a connection: reqwest's `send().await` resolves when **response
+//! headers** arrive, and the vendored reqwest's patch-003
+//! `ConnectionAdmission` hook fires when a *physical* connection is
+//! established (it carries the `maxConnections` cap through
+//! [`crate::backend_conn_limit::ReqwestConnectionAdmission`]), not when a
+//! request checks a pooled connection out. Both paths therefore hold the slot
+//! acquire-before-dispatch / release-after-response-headers, which spans
+//! connection-wait + request-upload + backend-TTFB rather than the pending
+//! phase alone.
 //!
 //! Mirroring how this repo honestly reinterprets DR `maxRetries` as a
 //! per-request cap (see `docs/mesh.md`), this limiter reframes the knob as a
@@ -62,19 +69,28 @@
 //!
 //! This scope is intentionally reusable by later cross-protocol active-request
 //! work (#3775 / `http2MaxRequests`) but is **not** that breaker: this module
-//! remains the H1 reqwest in-flight approximation only.
+//! remains the HTTP/1.1 in-flight approximation only.
 //!
-//! # Scope — HTTP/1.1 reqwest dispatch only
+//! # Scope — HTTP/1.1 dispatch only
 //!
 //! The field is named `http1MaxPendingRequests`, so this limiter is consumed
-//! **only on the reqwest/HTTP-1.1 backend-dispatch path** in
-//! `proxy_to_backend` (`src/proxy/mod.rs`), the path Ferrum uses for plain
-//! HTTP/1.1 upstreams (and the H1 fallback when a backend does not negotiate
-//! HTTP/2 — including a backend the capability registry has classified
-//! H2/TLS-unsupported), plus the H3→plain reqwest bridge that enforces the
-//! same gate. It is acquired immediately before the request is dispatched onto
-//! the shared reqwest client and released by its RAII guard the moment
-//! dispatch returns (response headers arrived, or the dial failed). Under the
+//! **only where a dispatch is determined to be HTTP/1.1** (`src/proxy/mod.rs`
+//! unless noted):
+//!
+//! - `proxy_to_backend_direct_h1` — the direct hyper HTTP/1.1 pool, which
+//!   carries plain `http` upstreams and HTTP/1.1-only `https` upstreams by
+//!   default;
+//! - `proxy_to_backend` — the reqwest dispatch, gated on
+//!   `reqwest_dispatch_is_http1_only` (direct H1 disabled or not eligible, and
+//!   the H1 fallback when a backend does not negotiate HTTP/2 — including a
+//!   backend the capability registry has classified H2/TLS-unsupported);
+//! - `proxy_to_backend_retry` — each connection-failure retry attempt
+//!   re-enters the same gate;
+//! - the H3→plain HTTP/1.1 bridge in `src/http3/cross_protocol.rs`.
+//!
+//! On each path the slot is acquired immediately before the request is
+//! dispatched and released by its RAII guard the moment dispatch returns
+//! (response headers arrived, or the dial failed). Under the
 //! in-flight reinterpretation that release point is correct by definition:
 //! the slot counts a request as in-flight from dispatch to response-headers,
 //! not for the lifetime of the response stream. Because every H1-determined
@@ -386,9 +402,6 @@ impl BackendPendingLimiter {
 
     /// Current in-flight count for a logical scope + policy port.
     /// Test/metrics only — the hot path uses `try_acquire` directly.
-    // The binary target re-declares library modules, so this public inspection
-    // seam is used by external tests but appears dead in that compilation.
-    #[allow(dead_code)]
     pub fn current(&self, scope: &BackendPendingScopeBase, port: u16) -> u64 {
         PENDING_KEY_BUF.with(|buf| {
             let mut buf = buf.borrow_mut();

@@ -7749,6 +7749,94 @@ async fn exact_key_omits_a_gateway_generated_correlation_id() {
     );
 }
 
+/// `otel_tracing` forwards its gateway SERVER span's `traceparent`, whose span
+/// id is fresh on every request (a new root, or a trusted caller's trace id
+/// under a new gateway span), so binding it stored one entry per request and
+/// never served one (issue #7130). The forwarded value is omitted while it
+/// still equals the value the trace owner minted; a rewritten value stays
+/// bound.
+#[tokio::test]
+async fn exact_key_omits_the_gateway_minted_traceparent() {
+    use ferrum_edge::plugins::otel_tracing::OtelTracing;
+
+    const CLIENT_TRACEPARENT: &str = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01";
+    async fn traced(
+        tracing: &OtelTracing,
+        namespace: &str,
+        client_traceparent: Option<&str>,
+    ) -> RequestContext {
+        let extra: Vec<(&str, &str)> = client_traceparent
+            .map(|value| vec![("traceparent", value)])
+            .unwrap_or_default();
+        let mut ctx = partition_ctx(
+            Some(proxy_in_namespace(namespace)),
+            "127.0.0.1",
+            None,
+            &extra,
+        );
+        assert!(matches!(
+            tracing.on_request_received(&mut ctx).await,
+            PluginResult::Continue
+        ));
+        let mut headers = ctx.headers.clone();
+        assert!(matches!(
+            tracing.before_proxy(&mut ctx, &mut headers).await,
+            PluginResult::Continue
+        ));
+        ctx.headers = headers;
+        ctx
+    }
+
+    let plugin = make_plugin(json!({ "ttl_seconds": 300, "scope_by_consumer": false }));
+    for (trust, client_traceparent) in [
+        ("untrusted", None),
+        ("untrusted", Some(CLIENT_TRACEPARENT)),
+        ("trusted", Some(CLIENT_TRACEPARENT)),
+    ] {
+        let namespace = format!("trace-{trust}-{}", client_traceparent.is_some());
+        let tracing = OtelTracing::new_with_http_client(
+            &json!({
+                "endpoint": "http://127.0.0.1:4318/v1/traces",
+                "trace_context_trust": trust
+            }),
+            PluginHttpClient::default(),
+        )
+        .unwrap();
+
+        let mut first = traced(&tracing, &namespace, client_traceparent).await;
+        let first_forwarded = first
+            .headers
+            .get("traceparent")
+            .cloned()
+            .expect("otel_tracing forwards its SERVER span");
+        assert_ne!(Some(first_forwarded.as_str()), client_traceparent);
+        partition_store(&plugin, &mut first).await;
+
+        let mut second = traced(&tracing, &namespace, client_traceparent).await;
+        assert_ne!(
+            second.headers.get("traceparent"),
+            Some(&first_forwarded),
+            "{trust}: every request forwards a fresh gateway span"
+        );
+        assert!(
+            partition_is_hit(&plugin, &mut second).await,
+            "{trust}: only the gateway-minted traceparent differs, so the completion must replay"
+        );
+
+        // A value rewritten after the trace owner minted it is no longer the
+        // gateway's own, so it stays a backend-visible dimension.
+        let mut rewritten = traced(&tracing, &namespace, client_traceparent).await;
+        rewritten.headers.insert(
+            "traceparent".to_string(),
+            "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01".to_string(),
+        );
+        assert!(
+            !partition_is_hit(&plugin, &mut rewritten).await,
+            "{trust}: a traceparent the gateway did not mint must partition"
+        );
+    }
+}
+
 /// `rate_limiting` with `expose_headers: true` forwards the caller's current
 /// budget to the backend. `x-ratelimit-remaining` changes on every admitted
 /// request, so binding the limiter's own value made every completion

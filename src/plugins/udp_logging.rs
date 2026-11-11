@@ -48,7 +48,7 @@ use super::utils::{
     BatchConfig, BatchConfigDefaults, ByteBudget, DeferredBatchingLogger, JSON_ARRAY_FRAMING_BYTES,
     PluginHttpClient, QueuedSummaryPayload, UDP_RE_RESOLVE_INTERVAL, admit_byte_limits,
     admit_http_summary, admit_stream_summary, assemble_json_array, bind_connected_udp_socket,
-    build_batch_config, json_array_len, parse_socket_host, resolve_udp_endpoint,
+    build_batch_config, json_array_len, parse_socket_host, resolve_socket_endpoint,
     validate_batch_config,
 };
 use super::{Plugin, StreamTransactionSummary, TransactionSummary};
@@ -144,15 +144,15 @@ pub struct UdpLogging {
     max_entry_bytes: usize,
     /// Shared with the flush worker; retained here so external unit tests can
     /// inspect/age DNS state. Binary target sees no readers.
-    #[allow(dead_code)] // used only by tests/, dead code in the bin target
+    #[allow(dead_code)] // used only by tests/
     flush_state: Arc<Mutex<UdpFlushState>>,
     /// One-shot resolve override shared with the flush worker; written by
     /// external unit tests. Binary target sees no readers on this field.
-    #[allow(dead_code)] // used only by tests/, dead code in the bin target
+    #[allow(dead_code)] // used only by tests/
     next_resolve_addr: Arc<Mutex<Option<SocketAddr>>>,
     /// Shared DTLS handshake budget; tests may shorten it. Binary target sees
     /// no readers on this field.
-    #[allow(dead_code)] // used only by tests/, dead code in the bin target
+    #[allow(dead_code)] // used only by tests/
     dtls_connect_timeout_ms: Arc<AtomicU64>,
 }
 
@@ -485,7 +485,6 @@ pub(crate) fn dtls_file_dependency_cache_key(
 
 /// Validate enabled `udp_logging` DTLS file/provider sources for the shared
 /// plugin file-dependency phase (file-mode fatal, DB warning, DP skip).
-#[allow(dead_code)] // used via library `_test_support`; dead in the bin target
 pub(crate) fn validate_dtls_file_dependencies(config: &Map<String, Value>) -> Result<(), String> {
     let Some(key) = dtls_file_dependency_cache_key(config)? else {
         return Ok(());
@@ -544,7 +543,6 @@ where
 
 /// Deterministic duplicate-input probe for external tests. The counter is
 /// scoped to this call, so parallel plugin tests cannot perturb it.
-#[allow(dead_code)] // used via library `_test_support`; dead in the bin target
 pub(crate) fn duplicate_dtls_materialization_probe_for_test(
     config: &Map<String, Value>,
 ) -> (Result<(), String>, Result<(), String>, usize, usize) {
@@ -750,7 +748,6 @@ impl UdpDeliveryError {
 ///
 /// Lets external tests prove that an undeliverable record was rejected on its
 /// own rather than silently taking its co-batched siblings with it.
-#[allow(dead_code)] // used via library `_test_support`; dead in the bin target
 pub(crate) fn local_record_drops_for_test() -> u64 {
     LOCAL_RECORD_DROPS.load(Ordering::Relaxed)
 }
@@ -822,21 +819,18 @@ fn dtls_send_timeout_error() -> UdpDeliveryError {
 }
 
 /// Test helper: timeout classification must reset the sender.
-#[allow(dead_code)] // used via library `_test_support`; dead in the bin target
 pub(crate) fn dtls_send_timeout_requires_sender_reset_for_test() -> bool {
     let error = dtls_send_timeout_error();
     error.requires_sender_reset() && error.message().contains("DTLS send timed out after")
 }
 
 /// Test helper: local deterministic rejection must not reset the sender.
-#[allow(dead_code)] // used via library `_test_support`; dead in the bin target
 pub(crate) fn local_size_rejection_preserves_sender_for_test() -> bool {
     let error = UdpDeliveryError::record_too_large(oversized_batch_error(16_384, 16_385));
     !error.requires_sender_reset()
 }
 
 /// Test helper: transport/driver failure must reset the sender.
-#[allow(dead_code)] // used via library `_test_support`; dead in the bin target
 pub(crate) fn transport_dtls_failure_requires_sender_reset_for_test() -> bool {
     UdpDeliveryError::transport("DTLS send error: connection closed".to_string())
         .requires_sender_reset()
@@ -851,7 +845,7 @@ async fn resolve_endpoint(
     {
         return Ok(addr);
     }
-    resolve_udp_endpoint(&cfg.host, cfg.port, dns_cache, "udp_logging").await
+    resolve_socket_endpoint(&cfg.host, cfg.port, dns_cache, "udp_logging").await
 }
 
 async fn create_sender(
@@ -1089,12 +1083,11 @@ fn serialize_batch_payload(batch: &[QueuedSummaryPayload]) -> Vec<u8> {
 ///
 /// Documentation helper: a record above this cannot be carried by that
 /// transport at all and is dropped alone rather than with its siblings.
-#[allow(dead_code)] // used via library `_test_support`; dead in the bin target
+#[allow(dead_code)] // used via library `_test_support`
 pub(crate) const fn max_deliverable_entry_bytes(max_datagram_bytes: usize) -> usize {
     max_datagram_bytes.saturating_sub(JSON_ARRAY_FRAMING_BYTES)
 }
 
-#[allow(dead_code)] // used via library `_test_support`; dead in the bin target
 pub(crate) fn classify_serialized_batch_for_test(
     batch: &[QueuedSummaryPayload],
     max_datagram_bytes: usize,
@@ -1162,7 +1155,7 @@ fn finish_split_attempt(
 }
 
 /// Injected per-entry outcome for split-batch retry accounting tests.
-#[allow(dead_code)] // used via library `_test_support`; dead in the bin target
+#[allow(dead_code)] // used via library `_test_support`
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum SplitEntryOutcome {
     LocalReject,
@@ -1176,7 +1169,6 @@ pub(crate) enum SplitEntryOutcome {
 /// without a transport error. Exhausting retries then counts the original
 /// batch once as `batch_discard`, matching [`finish_split_attempt`] plus the
 /// shared worker's terminal path.
-#[allow(dead_code)] // used via library `_test_support`; dead in the bin target
 pub(crate) fn split_retry_lost_record_count(attempts: &[&[SplitEntryOutcome]]) -> u64 {
     let batch_len = attempts
         .first()
@@ -1233,7 +1225,6 @@ async fn deliver_one_entry(
 impl UdpLogging {
     /// Age the flush worker's last DNS resolve so the next batch exercises the
     /// periodic re-resolve path. Production code never calls this.
-    #[allow(dead_code)] // used only by tests/, dead code in the bin target
     pub fn age_last_resolve_for_test(&self, elapsed: Duration) {
         if let Ok(mut state) = self.flush_state.lock() {
             state.last_resolve = Instant::now()
@@ -1244,7 +1235,6 @@ impl UdpLogging {
 
     /// Publish a one-shot resolve override consumed by the next DNS lookup in
     /// the flush worker. Production code never calls this.
-    #[allow(dead_code)] // used only by tests/, dead code in the bin target
     pub fn set_next_resolve_addr_for_test(&self, addr: SocketAddr) {
         if let Ok(mut slot) = self.next_resolve_addr.lock() {
             *slot = Some(addr);
@@ -1253,14 +1243,12 @@ impl UdpLogging {
 
     /// Shorten the DTLS handshake budget for deterministic retain-on-failure
     /// coverage. Production code never calls this.
-    #[allow(dead_code)] // used only by tests/, dead code in the bin target
     pub fn set_dtls_connect_timeout_ms_for_test(&self, timeout_ms: u64) {
         self.dtls_connect_timeout_ms
             .store(timeout_ms.max(1), Ordering::Relaxed);
     }
 
     /// Snapshot of the flush worker's currently pinned destination, if any.
-    #[allow(dead_code)] // used only by tests/, dead code in the bin target
     pub fn current_addr_for_test(&self) -> Option<SocketAddr> {
         self.flush_state
             .lock()
@@ -1270,7 +1258,6 @@ impl UdpLogging {
 
     /// Snapshot of how many times a sender has been installed. Production code
     /// never calls this.
-    #[allow(dead_code)] // used only by tests/, dead code in the bin target
     pub fn sender_generation_for_test(&self) -> u64 {
         self.flush_state
             .lock()

@@ -443,8 +443,7 @@ are listed at the end of this section.
   `nextUpdate` — rolling deploy, node drain, OOM kill — does not come back, and
   a forgotten CRL refresh job is therefore a fleet-wide outage rather than a
   single-pod incident. This is deliberate (see
-  [PRODUCTION_READINESS.md](../PRODUCTION_READINESS.md) → "Deliberate
-  decisions"): booting with an expired CRL would serve without revocation
+  [deliberate_decisions.md](deliberate_decisions.md)): booting with an expired CRL would serve without revocation
   enforcement for that issuer, which is fail-open. Refresh the CRL before
   `nextUpdate`, and set `FERRUM_FRONTEND_TLS_LIVE_RELOAD_ENABLED=true` (backend
   surfaces use `FERRUM_BACKEND_TLS_LIVE_RELOAD_ENABLED`, which defaults to
@@ -1356,7 +1355,7 @@ The gateway supports fine-grained control over TLS protocol versions, cipher sui
 | `FERRUM_TLS_MIN_VERSION` | `1.2` | Minimum TLS version (inbound + outbound). Allowed: `1.2`, `1.3` |
 | `FERRUM_TLS_MAX_VERSION` | `1.3` | Maximum TLS version (inbound + outbound). Allowed: `1.2`, `1.3` |
 | `FERRUM_TLS_CIPHER_SUITES` | *(see defaults below)* | Comma-separated cipher suites (inbound + outbound) |
-| `FERRUM_TLS_KEY_EXCHANGE_GROUPS` | *(see defaults below)* | Comma-separated key exchange groups (inbound + outbound). `FERRUM_TLS_CURVES` is accepted as an alias |
+| `FERRUM_TLS_KEY_EXCHANGE_GROUPS` | *(see defaults below)* | Comma-separated key exchange groups (inbound + outbound) |
 | `FERRUM_TLS_PREFER_SERVER_CIPHER_ORDER` | `true` | Server cipher-suite preference (inbound only; TLS 1.2 and 1.3) |
 | `FERRUM_TLS_SESSION_CACHE_SIZE` | `4096` | Inbound stateful session cache for TLS 1.2 session IDs and HTTP/3 server 0-RTT sessions |
 
@@ -1410,7 +1409,7 @@ export FERRUM_TLS_CIPHER_SUITES="TLS_AES_256_GCM_SHA384,ECDHE-ECDSA-AES256-GCM-S
 
 ### Supported Key Exchange Groups (Curves)
 
-When `FERRUM_TLS_KEY_EXCHANGE_GROUPS` is not set, the gateway uses `X25519` and `secp256r1`. `FERRUM_TLS_CURVES` is accepted as an alias for existing deployments; the canonical variable wins if both are set.
+When `FERRUM_TLS_KEY_EXCHANGE_GROUPS` is not set, the gateway uses `X25519` and `secp256r1`.
 
 | Name | Aliases | Description |
 |------|---------|-------------|
@@ -1499,8 +1498,12 @@ Enabled by default. TLS 1.3 normally uses stateless auto-rotating tickets; HTTP/
 ## ACME Auto-Renewal Requires Frontend TLS Live Reload
 
 `FERRUM_ACME_AUTO_RENEW_ENABLED=true` renews certificates **into the ACME
-certificate store**. Getting the renewed leaf in front of clients is a separate
-step, and it is not automatic:
+certificate store**. Only `database`, `file`, and `dp` modes run the renewal
+scheduler; every other mode (`mesh`, `cp`, `injector`, `node_agent`, `migrate`)
+refuses the flag at startup and in `ferrum-edge validate` rather than accepting
+it and never renewing. Mesh mode treats operator frontend TLS as static input
+with no live reload, so it renews out of band. Getting the renewed leaf in
+front of clients is a separate step, and it is not automatic:
 
 1. A successful renewal commits the new material under the lease fence and then
    asks every TLS surface that registered a *force-reload sender* to rebuild.
@@ -1624,7 +1627,13 @@ order with the CA while the original remains active:
     `valid` is left alone (a crashed holder can leave the order pending with a
     challenge already in flight), an `invalid` challenge fails closed, and the
     order is polled to `ready` under `FERRUM_ACME_RENEW_POLL_TIMEOUT_SECONDS`,
-    then finalized once;
+    then finalized once. An authorization that is already `valid` (the CA
+    reused it, RFC 8555 §7.1.3, possibly validated with a different challenge
+    type) needs no challenge and is skipped, at preparation and at completion;
+    an `invalid`, `expired`, `revoked` or `deactivated` authorization fails
+    closed. An order whose authorizations were all valid when it was prepared
+    records no challenge and resumes without one; meeting a pending
+    authorization on such an order fails closed;
   - `ready` — exactly one finalize request is sent, carrying the persisted CSR;
     no key or CSR is ever generated at this point;
   - `processing` — the crashed renewer's finalize already landed, so **no second

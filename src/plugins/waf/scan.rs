@@ -1529,7 +1529,18 @@ impl Waf {
                     None => Cow::Borrowed(raw_query),
                 };
                 if self.special_hit_allowed(rule_index, &judged, subject) {
-                    self.push_special(outcome, rule_index, &judged, subject, Field::Whole);
+                    // Already judged above: record the hit directly rather
+                    // than through `push_special`, which would repeat the
+                    // scope, exemption, and false-positive checks.
+                    let target_name = self.compiled.rules[rule_index].target.log_target();
+                    self.push_hit(
+                        outcome,
+                        RuleHit {
+                            rule_index,
+                            target_name,
+                        },
+                        Field::Whole,
+                    );
                     return;
                 }
             }

@@ -1380,7 +1380,6 @@ pub enum UdpDatagramDirection {
 /// on the proxy opts in via `requires_udp_datagram_hooks()`. Fired in both
 /// directions: client→backend (before forwarding) and backend→client (before
 /// relaying the response to the client).
-#[allow(dead_code)]
 pub struct UdpDatagramContext<'a> {
     /// Canonical client IP identity. IPv4-mapped IPv6 is normalized once when
     /// the UDP/DTLS session is created so per-datagram hooks only clone this Arc.
@@ -2656,10 +2655,6 @@ pub struct RequestContext {
     /// Monotonic receipt instant captured with the request context. Effective
     /// budgets are added to this exact anchor, independent of wall-clock jumps.
     pub(crate) grpc_deadline_received_at: tokio::time::Instant,
-    /// Whether the gateway's full ordered deadline-policy preflight completed.
-    /// Direct plugin callers that skip the preflight still apply each instance
-    /// from `before_proxy` for backward-compatible composition.
-    pub(crate) grpc_deadline_preflight_complete: bool,
     /// Effective receipt-anchored gRPC budget after every `grpc_deadline`
     /// policy has applied its default/cap decision. Kept separate from the
     /// relative header forwarded upstream so retries never re-arm the budget.
@@ -3950,6 +3945,17 @@ pub(crate) struct PluginRequestState {
     /// omitting it loses no backend-visible distinction. Typed and outside
     /// `metadata` so plugin-writable state cannot move the comparison target.
     pub(crate) published_rate_limit_headers: Vec<(&'static str, String)>,
+    /// The exact W3C `traceparent` the gateway trace owner (`otel_tracing`, or
+    /// a trace-enabled `workload_metrics`) minted for this request: a fresh
+    /// root, or the trusted caller's trace id under a fresh gateway span id.
+    /// Either way its span id is new on every request, so a retained-result
+    /// partition (`response_caching`, `ai_semantic_cache`) that bound it would
+    /// never hit (issue #7130). Same private-provenance rule as
+    /// `published_rate_limit_headers`: the forwarded field is omitted only
+    /// while its live value equals this, and a caller's `traceparent`
+    /// forwarded unchanged stays bound. Typed and outside `metadata` so a
+    /// plugin-writable `traceparent` metadata value cannot move the target.
+    pub(crate) gateway_minted_traceparent: Option<String>,
     /// Per-`ai_semantic_cache`-instance embedding vectors staged between
     /// `before_proxy` and `on_final_response_body`. Kept out of `metadata` so
     /// high-dimensional vectors cannot enter transaction logs. The outer key is
@@ -4734,7 +4740,6 @@ impl RequestContext {
             grpc_deadline_had_valid_client_timeout: false,
             request_body_integrity_retirement: false,
             grpc_deadline_received_at: tokio::time::Instant::now(),
-            grpc_deadline_preflight_complete: false,
             grpc_deadline_budget_ms: None,
             grpc_deadline_policy_budget_ms: None,
             grpc_deadline_ceiling_ms: None,
@@ -5005,9 +5010,49 @@ impl RequestContext {
         lines == 1
     }
 
+    /// Record the exact `traceparent` the gateway trace owner minted for this
+    /// request (see `PluginRequestState::gateway_minted_traceparent`). A later
+    /// mint (a sibling re-deriving the span) replaces it.
+    pub(crate) fn stage_gateway_minted_traceparent(&mut self, traceparent: String) {
+        self.plugin_state_mut().gateway_minted_traceparent = Some(traceparent);
+    }
+
+    /// Whether `name` is the request's single `traceparent` field and its
+    /// live value is exactly the one the gateway trace owner minted.
+    ///
+    /// Same shape as [`Self::is_gateway_published_rate_limit_header`]: the
+    /// name must be the exact lowercase key, and a case-variant duplicate
+    /// (which folds into one combined field on egress) keeps every line
+    /// bound. A caller's own `traceparent` forwarded unchanged never matches,
+    /// because the gateway always mints a fresh span id.
+    pub(crate) fn is_gateway_minted_traceparent_header(
+        &self,
+        headers: &HashMap<String, String>,
+        name: &str,
+        value: &str,
+    ) -> bool {
+        const TRACEPARENT: &str = "traceparent";
+        if name != TRACEPARENT {
+            return false;
+        }
+        let Some(staged) = self
+            .plugin_state()
+            .and_then(|state| state.gateway_minted_traceparent.as_deref())
+        else {
+            return false;
+        };
+        staged == value
+            && headers
+                .keys()
+                .filter(|key| key.eq_ignore_ascii_case(TRACEPARENT))
+                .count()
+                == 1
+    }
+
     /// Whether `name`/`value` in `headers` is gateway-minted per-request state
     /// that a retained-result partition must not bind: a generated correlation
-    /// id or published rate-limit telemetry, each proven by private provenance.
+    /// id, published rate-limit telemetry, or the gateway trace owner's minted
+    /// `traceparent`, each proven by private provenance.
     pub(crate) fn is_gateway_minted_request_header(
         &self,
         headers: &HashMap<String, String>,
@@ -5016,6 +5061,7 @@ impl RequestContext {
     ) -> bool {
         self.is_gateway_generated_correlation_header(name, value)
             || self.is_gateway_published_rate_limit_header(headers, name, value)
+            || self.is_gateway_minted_traceparent_header(headers, name, value)
     }
 
     pub(crate) fn correlation_id(&self, instance_key: &str) -> Option<&str> {
@@ -5562,9 +5608,11 @@ impl RequestContext {
     }
 
     /// Correlation id for the concrete response-stream inspector chain, when
-    /// one attached to this request. Streaming plugins can key bounded shared
-    /// state by this id in `response_stream_inspector`, then remove and fold it
-    /// into `ctx.metadata` from `on_response_stream_terminated`.
+    /// one attached to this request. To pass inspector state to
+    /// `on_response_stream_terminated`, use [`Self::response_stream_handoff`]
+    /// with a per-instance key rather than a plugin-owned map keyed by this
+    /// id: the handoff drops with the request even when the terminal hook is
+    /// cancelled.
     pub fn response_stream_id(&self) -> Option<u64> {
         self.response_stream_id
     }
@@ -5799,7 +5847,6 @@ impl RequestContext {
         let _ = self.compression_response_buffer_permit.take();
     }
 
-    #[allow(dead_code)] // Used by external tests; dead code in the separately compiled bin target.
     pub(crate) fn compression_ownership_for_test(&self) -> (Option<u64>, Option<u64>) {
         (
             self.compression_request_decode_owner,
@@ -6251,12 +6298,9 @@ impl RequestContext {
     /// Whether the final request-body representation was decoded from a content
     /// coding rather than received as plaintext.
     ///
-    /// `#[allow(dead_code)]`: claiming plugins now take the owned handle above
-    /// (which answers the same question by returning `None`), so the only
-    /// remaining callers are external tests (through `_test_support`), and a
-    /// `pub` item reachable solely from `tests/` is dead in the separately
-    /// compiled binary unit.
-    #[allow(dead_code)]
+    /// Claiming plugins now take the owned handle above (which answers the
+    /// same question by returning `None`), so the only remaining callers are
+    /// external tests (through `_test_support`).
     pub fn final_request_body_was_decoded(&self) -> bool {
         self.governed_request_body_plaintext.is_some()
     }
@@ -6383,7 +6427,6 @@ impl RequestContext {
             grpc_deadline_had_valid_client_timeout: self.grpc_deadline_had_valid_client_timeout,
             request_body_integrity_retirement: self.request_body_integrity_retirement,
             grpc_deadline_received_at: self.grpc_deadline_received_at,
-            grpc_deadline_preflight_complete: self.grpc_deadline_preflight_complete,
             grpc_deadline_budget_ms: self.grpc_deadline_budget_ms,
             grpc_deadline_policy_budget_ms: self.grpc_deadline_policy_budget_ms,
             grpc_deadline_ceiling_ms: self.grpc_deadline_ceiling_ms,
@@ -8569,7 +8612,10 @@ pub trait ResponseStreamInspector: Send {
     }
 
     /// Inspect the next decoded chunk of the response body.
-    async fn on_chunk(&mut self, chunk: &[u8]) -> ResponseStreamAction;
+    ///
+    /// The chunk is a shared buffer: an inspector that forwards it unchanged
+    /// returns `Forward(chunk.clone())`, a reference-count bump, not a copy.
+    async fn on_chunk(&mut self, chunk: &bytes::Bytes) -> ResponseStreamAction;
 
     /// Flush / inspect the trailing partial window at end of stream. The default
     /// forwards nothing.
@@ -8771,7 +8817,7 @@ impl ResponseStreamInspector for CompletionNotifyingInspector {
         self.inner.stage()
     }
 
-    async fn on_chunk(&mut self, chunk: &[u8]) -> ResponseStreamAction {
+    async fn on_chunk(&mut self, chunk: &bytes::Bytes) -> ResponseStreamAction {
         self.inner.on_chunk(chunk).await
     }
 
@@ -8823,10 +8869,7 @@ impl Drop for CompletionNotifyingInspector {
 /// scan) is now used only by external test crates; every gateway hot path resolves
 /// the capability through the `PluginCache` and calls
 /// [`create_response_stream_inspector_for_enabled_plugins`] directly.
-/// `#[allow(dead_code)]` because the binary target recompiles the source without
-/// those test crates, so it sees no caller.
 #[doc(hidden)]
-#[allow(dead_code)] // used only by tests/, dead code in the bin target
 pub fn create_response_stream_inspector(
     plugins: &[Arc<dyn Plugin>],
     ctx: &mut RequestContext,
@@ -9246,7 +9289,7 @@ impl ChainFlushEnd {
 
 #[async_trait]
 impl ResponseStreamInspector for ChainedResponseStreamInspector {
-    async fn on_chunk(&mut self, chunk: &[u8]) -> ResponseStreamAction {
+    async fn on_chunk(&mut self, chunk: &bytes::Bytes) -> ResponseStreamAction {
         let action = self.chunk_through(chunk).await;
         self.note_sent(&action);
         action
@@ -9270,17 +9313,21 @@ impl ResponseStreamInspector for ChainedResponseStreamInspector {
 }
 
 impl ChainedResponseStreamInspector {
-    async fn chunk_through(&mut self, chunk: &[u8]) -> ResponseStreamAction {
-        let mut buf = bytes::Bytes::copy_from_slice(chunk);
+    async fn chunk_through(&mut self, chunk: &bytes::Bytes) -> ResponseStreamAction {
+        // The first inspector reads the caller's chunk; each later one reads
+        // what the previous inspector released. Both are shared buffers, so
+        // handing them on never copies bytes.
+        let mut released: Option<bytes::Bytes> = None;
         for index in 0..self.inspectors.len() {
-            if buf.is_empty() {
+            let input: &bytes::Bytes = released.as_ref().unwrap_or(chunk);
+            if input.is_empty() {
                 // An upstream inspector is holding this window; nothing yet for
                 // the rest of the chain to see.
                 return ResponseStreamAction::Forward(bytes::Bytes::new());
             }
             self.prime(index);
-            match self.inspectors[index].on_chunk(&buf).await {
-                ResponseStreamAction::Forward(out) => buf = out,
+            match self.inspectors[index].on_chunk(input).await {
+                ResponseStreamAction::Forward(out) => released = Some(out),
                 ResponseStreamAction::Terminate(final_bytes)
                     if self.inspectors[index].stage()
                         == ResponseStreamInspectorStage::Normalize =>
@@ -9298,12 +9345,14 @@ impl ChainedResponseStreamInspector {
             }
             if self.inspectors[index].has_deferred_cut() {
                 self.notify_prior_downstream_terminated(index);
+                let carry = released.take().unwrap_or_default();
                 return self
-                    .flush_from(index + 1, buf, ChainFlushEnd::Cut(index))
+                    .flush_from(index + 1, carry, ChainFlushEnd::Cut(index))
                     .await;
             }
         }
-        ResponseStreamAction::Forward(buf)
+        // A chain always holds at least one inspector, so `released` is set.
+        ResponseStreamAction::Forward(released.unwrap_or_else(|| chunk.clone()))
     }
 
     /// Flush inspectors `from..` as the end of the stream: each receives
@@ -9472,8 +9521,8 @@ mod chained_inspector_tests {
     }
     #[async_trait]
     impl ResponseStreamInspector for TagAtEnd {
-        async fn on_chunk(&mut self, chunk: &[u8]) -> ResponseStreamAction {
-            ResponseStreamAction::Forward(bytes::Bytes::copy_from_slice(chunk))
+        async fn on_chunk(&mut self, chunk: &bytes::Bytes) -> ResponseStreamAction {
+            ResponseStreamAction::Forward(chunk.clone())
         }
         async fn on_end(&mut self) -> ResponseStreamAction {
             ResponseStreamAction::Forward(bytes::Bytes::copy_from_slice(self.tag.as_bytes()))
@@ -9484,7 +9533,7 @@ mod chained_inspector_tests {
     struct CutNow;
     #[async_trait]
     impl ResponseStreamInspector for CutNow {
-        async fn on_chunk(&mut self, _chunk: &[u8]) -> ResponseStreamAction {
+        async fn on_chunk(&mut self, _chunk: &bytes::Bytes) -> ResponseStreamAction {
             ResponseStreamAction::Terminate(Some(bytes::Bytes::from_static(b"CUT")))
         }
     }
@@ -9497,7 +9546,7 @@ mod chained_inspector_tests {
             ResponseStreamInspectorStage::Normalize
         }
 
-        async fn on_chunk(&mut self, _chunk: &[u8]) -> ResponseStreamAction {
+        async fn on_chunk(&mut self, _chunk: &bytes::Bytes) -> ResponseStreamAction {
             ResponseStreamAction::Terminate(Some(bytes::Bytes::from_static(b"FINAL")))
         }
     }
@@ -9508,8 +9557,8 @@ mod chained_inspector_tests {
     }
     #[async_trait]
     impl ResponseStreamInspector for CutAtEnd {
-        async fn on_chunk(&mut self, chunk: &[u8]) -> ResponseStreamAction {
-            ResponseStreamAction::Forward(bytes::Bytes::copy_from_slice(chunk))
+        async fn on_chunk(&mut self, chunk: &bytes::Bytes) -> ResponseStreamAction {
+            ResponseStreamAction::Forward(chunk.clone())
         }
         async fn on_end(&mut self) -> ResponseStreamAction {
             ResponseStreamAction::Terminate(self.payload.map(bytes::Bytes::from_static))
@@ -9520,7 +9569,7 @@ mod chained_inspector_tests {
     struct HoldAll;
     #[async_trait]
     impl ResponseStreamInspector for HoldAll {
-        async fn on_chunk(&mut self, _chunk: &[u8]) -> ResponseStreamAction {
+        async fn on_chunk(&mut self, _chunk: &bytes::Bytes) -> ResponseStreamAction {
             ResponseStreamAction::Forward(bytes::Bytes::new())
         }
     }
@@ -9548,7 +9597,10 @@ mod chained_inspector_tests {
         ])
         .expect("two inspectors chain");
         // A chunk passes through both unchanged.
-        assert_eq!(&forwarded(chain.on_chunk(b"hi").await)[..], b"hi");
+        assert_eq!(
+            &forwarded(chain.on_chunk(&bytes::Bytes::from_static(b"hi")).await)[..],
+            b"hi"
+        );
         // on_end: A flushes "A" -> fed through B.on_chunk ("A") -> then B flushes
         // "B"; result is "A" ++ "B".
         assert_eq!(&forwarded(chain.on_end().await)[..], b"AB");
@@ -9562,7 +9614,7 @@ mod chained_inspector_tests {
         ])
         .expect("chain");
         assert!(matches!(
-            chain.on_chunk(b"x").await,
+            chain.on_chunk(&bytes::Bytes::from_static(b"x")).await,
             ResponseStreamAction::Terminate(Some(_))
         ));
     }
@@ -9574,7 +9626,10 @@ mod chained_inspector_tests {
             Box::new(NormalizeAndCut),
         ])
         .expect("chain");
-        match chain.on_chunk(b"provider-native").await {
+        match chain
+            .on_chunk(&bytes::Bytes::from_static(b"provider-native"))
+            .await
+        {
             ResponseStreamAction::Terminate(Some(bytes)) => {
                 assert_eq!(bytes.as_ref(), b"FINALB");
             }
@@ -9631,7 +9686,7 @@ mod chained_inspector_tests {
         ])
         .expect("chain");
         // First inspector holds → nothing reaches the second this chunk.
-        assert!(forwarded(chain.on_chunk(b"x").await).is_empty());
+        assert!(forwarded(chain.on_chunk(&bytes::Bytes::from_static(b"x")).await).is_empty());
     }
 }
 
@@ -10361,9 +10416,7 @@ async fn log_with_mirror_inner(
     {
         crate::diagnostic_ref::record_request_detail(slot, summary, ctx);
     }
-    let precompute_mesh_key = plugins
-        .iter()
-        .any(|plugin| matches!(plugin.name(), "workload_metrics" | "prometheus_metrics"));
+    let precompute_mesh_key = plugins.iter().any(|plugin| plugin.uses_mesh_request_key());
     // Built from the request's typed mesh label projection when it is
     // authoritative for this summary (issue #6793); parsed from the metadata
     // strings otherwise.
@@ -10485,9 +10538,7 @@ impl Drop for TerminalDeliveryGuard<'_> {
         let summary = self.summary.clone();
         let ctx = self.ctx.clone();
         let _ = crate::observability_delivery::spawn_terminal(async move {
-            let precompute_mesh_key = plugins
-                .iter()
-                .any(|plugin| matches!(plugin.name(), "workload_metrics" | "prometheus_metrics"));
+            let precompute_mesh_key = plugins.iter().any(|plugin| plugin.uses_mesh_request_key());
             let mesh_key = if precompute_mesh_key {
                 crate::plugins::mesh::prometheus_helpers::mesh_request_key_for_request(
                     &summary, &ctx,
@@ -11685,6 +11736,14 @@ pub trait Plugin: Any + Send + Sync {
     /// Whether this transaction contributes to the shared mesh service graph.
     /// Wrappers must honor the same memoized decision as terminal logging.
     fn records_mesh_service_graph(&self, _summary: &TransactionSummary) -> bool {
+        false
+    }
+
+    /// Whether this plugin's terminal logging reads the precomputed mesh RED
+    /// key that [`Self::log_with_mesh_key`] receives. Terminal delivery builds
+    /// the key once per transaction only when a plugin in the chain says so,
+    /// instead of discovering consumers by name. Wrappers must forward it.
+    fn uses_mesh_request_key(&self) -> bool {
         false
     }
 
@@ -14460,7 +14519,6 @@ pub trait Plugin: Any + Send + Sync {
 /// [`create_plugin_with_http_client_and_config_id`] with the stable plugin-config
 /// resource id. Direct construction here uses a validation-only default
 /// identity.
-#[allow(dead_code)]
 pub fn create_plugin(name: &str, config: &Value) -> Result<Option<Arc<dyn Plugin>>, String> {
     let compression_policy = crate::config::CompressionAdmissionPolicy::from_process_env()?;
     create_plugin_with_http_client(
@@ -14855,12 +14913,7 @@ pub fn create_plugin_with_http_client_and_config_id(
             config,
             http_client.clone(),
         )?))),
-        "a2a_gateway" => Ok(Some(Arc::new(
-            a2a_gateway::A2aGateway::new_with_shard_amount(
-                config,
-                http_client.pool_shard_amount(),
-            )?,
-        ))),
+        "a2a_gateway" => Ok(Some(Arc::new(a2a_gateway::A2aGateway::new(config)?))),
         "ws_message_size_limiting" => Ok(Some(Arc::new(
             ws_message_size_limiting::WsMessageSizeLimiting::new(config)?,
         ))),
@@ -14948,11 +15001,9 @@ pub fn create_plugin_with_http_client_and_config_id(
 /// are screened against the configured backend egress policy. This bare
 /// variant remains a `pub` entrypoint for external test crates that only need
 /// shape validation of endpoint-less plugins (e.g. `cors`,
-/// `transaction_log_schema`). `#[allow(dead_code)]` because the binary target
-/// recompiles the source without those test crates, so it sees no caller.
+/// `transaction_log_schema`).
 ///
 /// Returns `Ok(())` if the config is valid, `Err(msg)` if validation fails.
-#[allow(dead_code)]
 pub fn validate_plugin_config(name: &str, config: &Value) -> Result<(), String> {
     let compression_policy = crate::config::CompressionAdmissionPolicy::from_process_env()?;
     validate_plugin_config_with_http_client(
@@ -15009,6 +15060,14 @@ pub(crate) fn validate_plugin_config_with_http_client(
         // process-wide reload map. Graph validation and cache reloads construct
         // explicitly inside an open reload bracket.
         return transaction_log_schema::TransactionLogSchema::validate_config(config);
+    }
+    if name == "api_chargeback" {
+        // Shape-only: construction resolves the process-global `/charges`
+        // registry, and the validation client's auto shard count must never
+        // be the one that sizes it. Every config check still runs here; an
+        // accepted generation constructs with the node's configured shard
+        // count (issue #7109).
+        return api_chargeback::ApiChargeback::validate_config(config);
     }
     if name == "serverless_function" {
         // Shape-only: CP/admin admission must not require the AWS / Azure / GCP
@@ -15406,9 +15465,8 @@ pub const BUILTIN_PLUGIN_REGISTRATIONS: &[PluginRegistration] = &[
     builtin_plugin("fault_injection", PluginFailurePolicy::KeepLastKnownGood),
 ];
 
-// Keep documentation/parity inventory linked in both the library crate (consumed
-// by integration tests) and the binary crate (same sources, separate compilation).
-// Length equality is a cheap compile-time guard; name set-equality remains in tests.
+// Keep documentation/parity inventory linked in the library crate (consumed by
+// integration tests). Length equality is a cheap compile-time guard; name set-equality remains in tests.
 const _: () = {
     assert!(BUILTIN_PLUGIN_PARITY_META.len() == BUILTIN_PLUGIN_REGISTRATIONS.len());
     let _: fn(&str) -> Option<&'static BuiltinPluginParityMeta> = builtin_plugin_parity_meta;

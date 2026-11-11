@@ -29,6 +29,7 @@ use crate::config::types::{
 };
 use crate::tls::source::SYSTEM_TRUST_ROOTS_SOURCE;
 
+use super::gateway_api::compare_creation_timestamps;
 use super::{
     FERRUM_GATEWAY_CONTROLLER_NAME, GatewayApiBackendTlsPolicyStatus, K8sAccumulator, K8sObject,
     K8sResourceKey, K8sTranslateError, MAX_INDEXED_SERVICE_PORTS, RouteBackend, ServicePortIndex,
@@ -1247,18 +1248,6 @@ pub(super) enum BackendTlsPolicyLookup {
     /// A policy targets this Service/port but is invalid, conflicting, or
     /// covers only part of the rule's backend set.
     Fault { reason: String },
-}
-
-fn compare_creation_timestamps(
-    left: &Option<DateTime<Utc>>,
-    right: &Option<DateTime<Utc>>,
-) -> Ordering {
-    match (left, right) {
-        (Some(left_ts), Some(right_ts)) => left_ts.cmp(right_ts),
-        (Some(_), None) => Ordering::Less,
-        (None, Some(_)) => Ordering::Greater,
-        (None, None) => Ordering::Equal,
-    }
 }
 
 fn compare_policy_precedence(

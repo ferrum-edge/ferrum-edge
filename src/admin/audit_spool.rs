@@ -38,6 +38,14 @@
 //! therefore never classify or replay its own in-flight prepared record, and two
 //! live processes can never race for the same record.
 //!
+//! Ownership precedes visibility (issue #7200). On Unix a new generation builds
+//! and locks its tree under `instances/.staging-<generation>` — a name the
+//! claimer never treats as an instance — and only then renames it into place,
+//! re-checking that `owner.lock` still names the locked inode. A sibling
+//! starting at the same moment therefore never sees an unlocked instance
+//! directory it could mistake for an abandoned one. A staging tree left by a
+//! crash before the rename holds no records and is removed once it is old.
+//!
 //! Every record also carries a **non-secret destination identity** (database
 //! type, namespace, and a salt-free digest of the redacted connection URL). A
 //! claimed record whose destination does not match the claiming process is
@@ -329,22 +337,13 @@ impl AuditSpool {
         if !is_valid_record_id(&generation) {
             return Err(SpoolError::new(SpoolErrorKind::InvalidRecord));
         }
-        let instance_dir = root.join(INSTANCES_DIR).join(&generation);
+        let instances_dir = root.join(INSTANCES_DIR);
+        let instance_dir = instances_dir.join(&generation);
 
         prepare_directory(&root)?;
         prepare_directory(&root.join(FAILED_DIR))?;
-        prepare_directory(&root.join(INSTANCES_DIR))?;
-        prepare_directory(&instance_dir)?;
-        for sub in [PREPARED_DIR, PENDING_DIR, TMP_DIR] {
-            prepare_directory(&instance_dir.join(sub))?;
-        }
-
-        let owner = match acquire_owner_lock(&instance_dir.join(OWNER_LOCK_FILE))? {
-            Some(owner) => owner,
-            // Our generation id is a fresh UUID, so a contended lock means the
-            // directory is not ours to use. Fail closed rather than sharing.
-            None => return Err(SpoolError::new(SpoolErrorKind::Unavailable)),
-        };
+        prepare_directory(&instances_dir)?;
+        let owner = establish_owned_instance(&instances_dir, &generation, &instance_dir)?;
 
         let spool = Self {
             root,
@@ -371,12 +370,10 @@ impl AuditSpool {
         self.max_record_bytes
     }
 
-    #[allow(dead_code)] // External audit pipeline tests inspect the owned generation; the bin does not.
     pub fn generation(&self) -> &str {
         &self.generation
     }
 
-    #[allow(dead_code)] // External audit pipeline tests inspect destination isolation; the bin does not.
     pub fn destination(&self) -> &str {
         &self.destination
     }
@@ -768,6 +765,12 @@ impl AuditSpool {
             let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
                 continue;
             };
+            if let Some(staged) = name.strip_prefix(STAGING_PREFIX) {
+                if staged != self.generation && is_valid_record_id(staged) {
+                    remove_stale_staging(&path);
+                }
+                continue;
+            }
             if name == self.generation || !is_valid_record_id(name) {
                 continue;
             }
@@ -1111,6 +1114,92 @@ fn sync_dir(dir: &Path) -> Result<(), SpoolError> {
         let _ = dir;
         Ok(())
     }
+}
+
+/// Prefix of a generation's not-yet-visible instance tree. Not a valid record
+/// id (it contains `.`), so `claim_abandoned` never adopts it as an instance.
+const STAGING_PREFIX: &str = ".staging-";
+
+/// A staging tree older than this was left by a crash before its rename; it
+/// holds no records (none are written before `open` returns) and is removed.
+const STALE_STAGING_AGE: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// Create `instance_dir` with its subdirectories and take its ownership lock
+/// so that no other process can ever observe it unlocked (issue #7200).
+#[cfg(unix)]
+fn establish_owned_instance(
+    instances_dir: &Path,
+    generation: &str,
+    instance_dir: &Path,
+) -> Result<OwnerLock, SpoolError> {
+    use std::os::unix::fs::MetadataExt;
+
+    let staging = instances_dir.join(format!("{STAGING_PREFIX}{generation}"));
+    prepare_directory(&staging)?;
+    for sub in [PREPARED_DIR, PENDING_DIR, TMP_DIR] {
+        prepare_directory(&staging.join(sub))?;
+    }
+    let owner = match acquire_owner_lock(&staging.join(OWNER_LOCK_FILE))? {
+        Some(owner) => owner,
+        // Our generation id is a fresh UUID, so a contended lock means the
+        // directory is not ours to use. Fail closed rather than sharing.
+        None => return Err(SpoolError::new(SpoolErrorKind::Unavailable)),
+    };
+    // The flock follows the inode through the rename.
+    fs::rename(&staging, instance_dir).map_err(|_| SpoolError::new(SpoolErrorKind::Io))?;
+    sync_dir(instances_dir)?;
+    // Re-check, as the fallback-file lock in `audit.rs` does, that the visible
+    // lock path still names the inode we hold.
+    let held = owner
+        ._file
+        .metadata()
+        .map_err(|_| SpoolError::new(SpoolErrorKind::Unavailable))?;
+    let visible = fs::symlink_metadata(instance_dir.join(OWNER_LOCK_FILE))
+        .map_err(|_| SpoolError::new(SpoolErrorKind::Unavailable))?;
+    if held.dev() != visible.dev() || held.ino() != visible.ino() {
+        return Err(SpoolError::new(SpoolErrorKind::Unavailable));
+    }
+    Ok(owner)
+}
+
+/// Non-Unix hosts cannot rename a directory that holds an open lock handle,
+/// so the tree is created in place and then locked, as before.
+#[cfg(not(unix))]
+fn establish_owned_instance(
+    _instances_dir: &Path,
+    _generation: &str,
+    instance_dir: &Path,
+) -> Result<OwnerLock, SpoolError> {
+    prepare_directory(instance_dir)?;
+    for sub in [PREPARED_DIR, PENDING_DIR, TMP_DIR] {
+        prepare_directory(&instance_dir.join(sub))?;
+    }
+    match acquire_owner_lock(&instance_dir.join(OWNER_LOCK_FILE))? {
+        Some(owner) => Ok(owner),
+        // Our generation id is a fresh UUID, so a contended lock means the
+        // directory is not ours to use. Fail closed rather than sharing.
+        None => Err(SpoolError::new(SpoolErrorKind::Unavailable)),
+    }
+}
+
+/// Remove a staging tree left by a crash before its rename. Only trees older
+/// than [`STALE_STAGING_AGE`] are touched, so a sibling that is establishing
+/// its own tree right now is never disturbed; such a tree can hold no records.
+fn remove_stale_staging(path: &Path) {
+    let old_enough = fs::symlink_metadata(path)
+        .ok()
+        .filter(|meta| meta.is_dir())
+        .and_then(|meta| meta.modified().ok())
+        .and_then(|modified| modified.elapsed().ok())
+        .is_some_and(|age| age >= STALE_STAGING_AGE);
+    if !old_enough {
+        return;
+    }
+    let _ = fs::remove_file(path.join(OWNER_LOCK_FILE));
+    for sub in [PREPARED_DIR, PENDING_DIR, TMP_DIR] {
+        let _ = fs::remove_dir(path.join(sub));
+    }
+    let _ = fs::remove_dir(path);
 }
 
 /// Take an exclusive, non-blocking ownership lock over an instance directory.

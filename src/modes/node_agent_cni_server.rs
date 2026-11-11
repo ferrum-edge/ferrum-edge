@@ -23,8 +23,11 @@
 //! this listener. Once the chained conflist is installed the CNI hook is a
 //! node-wide pod-creation dependency: `ferrum-cni` fails ADD closed when this
 //! socket is missing or unreachable, so a listener that never comes up (or
-//! exits) blocks every new pod sandbox on the node until the node-agent is
-//! restarted (see `docs/node_agent.md`).
+//! exits) blocks every new pod sandbox on the node. The node-agent therefore
+//! exits nonzero when the listener stops serving outside shutdown
+//! ([`CniListenerExit`], #7253) so its supervisor restarts it, and a listener
+//! that finds another live generation holding the socket waits for that owner
+//! to exit instead of giving up (see `docs/node_agent.md`).
 //!
 //! Trust model: the UDS lives at a host-path mount that only the node-
 //! agent and the `ferrum-cni` binary (running as root from the kubelet)
@@ -108,6 +111,31 @@ const MAIN_LOOP_REPLY_TIMEOUT: Duration = Duration::from_secs(3);
 const MAX_CONCURRENT_CNI_CONNECTIONS: usize = 64;
 #[cfg(unix)]
 const REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(2);
+/// How often a listener whose socket another live node-agent owns retries the
+/// ownership lock while it waits for that owner to exit.
+#[cfg(unix)]
+const SOCKET_OWNERSHIP_RETRY_INTERVAL: Duration = Duration::from_secs(1);
+
+/// Why the CNI listener task ended (issue #7253).
+///
+/// With the chained conflist installed, a node whose listener is not serving
+/// fails every pod creation, so the node-agent main loop treats every exit but
+/// a requested shutdown as fatal and exits nonzero for a supervisor restart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CniListenerExit {
+    /// The node-agent asked the listener to stop.
+    Shutdown,
+    /// The listener could not establish or keep its socket (parent directory,
+    /// lock I/O, stale-socket removal, bind, chmod, or publication failure).
+    Failed,
+    /// After publication, the well-known socket path named another
+    /// generation's socket. Its owner is live, so this agent must exit
+    /// WITHOUT tearing down capture state that owner may rely on.
+    ReplacedByAnotherOwner,
+    /// This target has no Unix-socket transport; the watcher is the only
+    /// enrollment path (non-Unix builds).
+    Unsupported,
+}
 
 /// Spawn the CNI Unix-socket listener.
 ///
@@ -116,8 +144,11 @@ const REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(2);
 /// node-agent loop and pipes the answer back to the client.
 ///
 /// A sibling advisory-lock file is held for the listener's entire lifetime.
-/// Startup refuses to evict a live owner; only after acquiring the lock does it
-/// remove a stale socket left by a crashed generation. Shutdown compares the
+/// Startup refuses to evict a live owner: while another live generation holds
+/// the lock (a rolling-restart overlap), this listener keeps retrying it every
+/// [`SOCKET_OWNERSHIP_RETRY_INTERVAL`] and takes over once that owner exits.
+/// Only after acquiring the lock does it remove a stale socket left by a
+/// crashed generation. Shutdown compares the
 /// published socket's device/inode identity before unlinking, so an older
 /// generation can never remove a replacement published at the same pathname.
 /// Parent directories are created when missing; installs that pre-create the
@@ -128,7 +159,7 @@ pub fn spawn_cni_listener(
     work_sender: CniWorkSender,
     metrics: Arc<NodeAgentMetrics>,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
-) -> tokio::task::JoinHandle<()> {
+) -> tokio::task::JoinHandle<CniListenerExit> {
     tokio::spawn(async move {
         if let Err(err) = prepare_socket_parent(&socket_path).await {
             error!(
@@ -140,44 +171,68 @@ pub fn spawn_cni_listener(
             metrics.record_cni_socket_lifecycle(
                 crate::ebpf::CniSocketLifecycleReason::OwnershipIoError,
             );
-            return;
+            return CniListenerExit::Failed;
         }
 
         // The lock file is deliberately retained on disk. Deleting it would
         // let two processes lock different inodes for the same socket path.
         // Closing `_ownership_lock` at task exit releases the kernel lock.
-        let _ownership_lock = match acquire_socket_ownership(&socket_path) {
-            Ok(Some(lock)) => lock,
-            Ok(None) => {
-                metrics.record_cni_socket_lifecycle(
-                    crate::ebpf::CniSocketLifecycleReason::OwnershipConflict,
-                );
-                error!(
-                    socket_path = %sanitize_startup_cause(format!("{socket_path:?}"), &[]),
-                    lock_path = %sanitize_startup_cause(
-                        format!("{:?}", socket_ownership_lock_path(&socket_path)),
-                        &[]
-                    ),
-                    reason = "ownership_conflict",
-                    "Another live node-agent owns the CNI socket; refusing to replace it. This node-agent serves no CNI calls until restarted after the owner exits"
-                );
-                return;
-            }
-            Err(err) => {
-                metrics.record_cni_socket_lifecycle(
-                    crate::ebpf::CniSocketLifecycleReason::OwnershipIoError,
-                );
-                error!(
-                    socket_path = %sanitize_startup_cause(format!("{socket_path:?}"), &[]),
-                    lock_path = %sanitize_startup_cause(
-                        format!("{:?}", socket_ownership_lock_path(&socket_path)),
-                        &[]
-                    ),
-                    error = %sanitize_startup_cause(err, &[]),
-                    reason = "ownership_io_error",
-                    "Failed to acquire node-agent CNI socket ownership; CNI ADD on this node fails closed until a node-agent restart restores the listener"
-                );
-                return;
+        let mut waited_for_owner = false;
+        let _ownership_lock = loop {
+            match acquire_socket_ownership(&socket_path) {
+                Ok(Some(lock)) => {
+                    if waited_for_owner {
+                        info!(
+                            socket_path = %sanitize_startup_cause(format!("{socket_path:?}"), &[]),
+                            "Previous CNI socket owner exited; this node-agent took over the CNI socket"
+                        );
+                    }
+                    break lock;
+                }
+                Ok(None) => {
+                    // The live owner keeps serving CNI calls on the socket, so
+                    // waiting here costs nothing; giving up would leave the node
+                    // without a listener once that owner exits.
+                    if !waited_for_owner {
+                        waited_for_owner = true;
+                        metrics.record_cni_socket_lifecycle(
+                            crate::ebpf::CniSocketLifecycleReason::OwnershipConflict,
+                        );
+                        warn!(
+                            socket_path = %sanitize_startup_cause(format!("{socket_path:?}"), &[]),
+                            lock_path = %sanitize_startup_cause(
+                                format!("{:?}", socket_ownership_lock_path(&socket_path)),
+                                &[]
+                            ),
+                            reason = "ownership_conflict",
+                            "Another live node-agent owns the CNI socket; refusing to replace it and waiting to take over when it exits"
+                        );
+                    }
+                    tokio::select! {
+                        changed = shutdown.changed() => {
+                            if changed.is_err() || *shutdown.borrow() {
+                                return CniListenerExit::Shutdown;
+                            }
+                        }
+                        _ = tokio::time::sleep(SOCKET_OWNERSHIP_RETRY_INTERVAL) => {}
+                    }
+                }
+                Err(err) => {
+                    metrics.record_cni_socket_lifecycle(
+                        crate::ebpf::CniSocketLifecycleReason::OwnershipIoError,
+                    );
+                    error!(
+                        socket_path = %sanitize_startup_cause(format!("{socket_path:?}"), &[]),
+                        lock_path = %sanitize_startup_cause(
+                            format!("{:?}", socket_ownership_lock_path(&socket_path)),
+                            &[]
+                        ),
+                        error = %sanitize_startup_cause(err, &[]),
+                        reason = "ownership_io_error",
+                        "Failed to acquire node-agent CNI socket ownership; CNI ADD on this node fails closed until a node-agent restart restores the listener"
+                    );
+                    return CniListenerExit::Failed;
+                }
             }
         };
 
@@ -191,7 +246,7 @@ pub fn spawn_cni_listener(
             metrics.record_cni_socket_lifecycle(
                 crate::ebpf::CniSocketLifecycleReason::StaleSocketCleanupError,
             );
-            return;
+            return CniListenerExit::Failed;
         }
 
         // bind() creates the socket inode world-reachable (mode 0777 & ~umask)
@@ -210,7 +265,7 @@ pub fn spawn_cni_listener(
                     error = %sanitize_startup_cause(err, &[]),
                     "Failed to create private staging directory for node-agent CNI socket; CNI ADD on this node fails closed until a node-agent restart restores the listener"
                 );
-                return;
+                return CniListenerExit::Failed;
             }
         };
         let listener = match UnixListener::bind(&stage.socket_path) {
@@ -222,7 +277,7 @@ pub fn spawn_cni_listener(
                     "Failed to bind node-agent CNI socket; CNI ADD on this node fails closed until a node-agent restart restores the listener"
                 );
                 cleanup_private_socket_stage(&stage);
-                return;
+                return CniListenerExit::Failed;
             }
         };
         // Narrow to 0660 BEFORE publishing under the well-known name. If this
@@ -234,7 +289,7 @@ pub fn spawn_cni_listener(
                 "Failed to chmod node-agent CNI socket to 0660 before publish; aborting CNI listener; CNI ADD on this node fails closed until a node-agent restart restores the listener"
             );
             cleanup_private_socket_stage(&stage);
-            return;
+            return CniListenerExit::Failed;
         }
         let published_identity = match SocketIdentity::from_path(&stage.socket_path) {
             Ok(identity) => identity,
@@ -249,7 +304,7 @@ pub fn spawn_cni_listener(
                     "Failed to identify staged node-agent CNI socket; refusing publication"
                 );
                 cleanup_private_socket_stage(&stage);
-                return;
+                return CniListenerExit::Failed;
             }
         };
         if let Err(err) = std::fs::rename(&stage.socket_path, &socket_path) {
@@ -263,7 +318,7 @@ pub fn spawn_cni_listener(
                 "Failed to publish node-agent CNI socket; CNI ADD on this node fails closed until a node-agent restart restores the listener"
             );
             cleanup_private_socket_stage(&stage);
-            return;
+            return CniListenerExit::Failed;
         }
         cleanup_private_socket_stage(&stage);
         match SocketIdentity::from_path(&socket_path) {
@@ -281,7 +336,7 @@ pub fn spawn_cni_listener(
                     reason = "handoff_identity_error",
                     "Published CNI socket identity changed before verification; dropping the unnamed listener without unlinking the replacement"
                 );
-                return;
+                return CniListenerExit::ReplacedByAnotherOwner;
             }
             Err(err) => {
                 metrics.record_cni_socket_lifecycle(
@@ -293,7 +348,7 @@ pub fn spawn_cni_listener(
                     reason = "handoff_identity_error",
                     "Published CNI socket could not be verified; dropping the listener"
                 );
-                return;
+                return CniListenerExit::Failed;
             }
         }
         info!(
@@ -380,6 +435,7 @@ pub fn spawn_cni_listener(
                 );
             }
         }
+        CniListenerExit::Shutdown
     })
 }
 
@@ -394,12 +450,13 @@ pub fn spawn_cni_listener(
     _work_sender: CniWorkSender,
     _metrics: Arc<NodeAgentMetrics>,
     _shutdown: tokio::sync::watch::Receiver<bool>,
-) -> tokio::task::JoinHandle<()> {
+) -> tokio::task::JoinHandle<CniListenerExit> {
     tokio::spawn(async move {
         warn!(
             socket_path = %sanitize_startup_cause(format!("{socket_path:?}"), &[]),
             "Node-agent CNI listener requested on non-Unix target; listener disabled"
         );
+        CniListenerExit::Unsupported
     })
 }
 
@@ -878,13 +935,14 @@ mod tests {
     #[cfg(unix)]
     async fn stop_listener(
         shutdown: tokio::sync::watch::Sender<bool>,
-        handle: tokio::task::JoinHandle<()>,
+        handle: tokio::task::JoinHandle<CniListenerExit>,
     ) {
         let _ = shutdown.send(true);
-        tokio::time::timeout(std::time::Duration::from_secs(2), handle)
+        let exit = tokio::time::timeout(std::time::Duration::from_secs(2), handle)
             .await
             .expect("listener should stop promptly")
             .expect("listener task should not panic");
+        assert_eq!(exit, CniListenerExit::Shutdown);
     }
 
     #[test]
@@ -898,7 +956,6 @@ mod tests {
             container_id: "ctr-1".to_string(),
             ifname: None,
             netns_path: Some("/var/run/netns/cni-1".to_string()),
-            args: HashMap::new(),
             valid_attachments: Vec::new(),
         };
         let labels = HashMap::new();
@@ -925,7 +982,6 @@ mod tests {
             container_id: "ctr-1".to_string(),
             ifname: None,
             netns_path: None,
-            args: HashMap::new(),
             valid_attachments: Vec::new(),
         };
         let labels = HashMap::new();
@@ -988,7 +1044,7 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn live_owner_conflict_is_refused_without_replacing_socket() {
+    async fn live_owner_conflict_waits_then_takes_over_when_the_owner_exits() {
         let dir = tempfile::tempdir().unwrap();
         let socket_path = dir.path().join("node-agent-cni.sock");
         let socket_path_str = socket_path.to_string_lossy().to_string();
@@ -1006,18 +1062,18 @@ mod tests {
 
         let (contender_work, _contender_rx) = cni_work_channel();
         let contender_metrics = Arc::new(NodeAgentMetrics::default());
-        let (_contender_shutdown, contender_shutdown_rx) = tokio::sync::watch::channel(false);
+        let (contender_shutdown, contender_shutdown_rx) = tokio::sync::watch::channel(false);
         let contender = spawn_cni_listener(
             socket_path_str,
             contender_work,
             contender_metrics.clone(),
             contender_shutdown_rx,
         );
-        tokio::time::timeout(std::time::Duration::from_secs(2), contender)
-            .await
-            .expect("conflicting listener must fail promptly")
-            .expect("conflicting listener task should not panic");
 
+        // While the owner lives, the contender neither replaces its socket nor
+        // gives up: it keeps retrying the lock (and counts the conflict once).
+        tokio::time::sleep(SOCKET_OWNERSHIP_RETRY_INTERVAL * 2).await;
+        assert!(!contender.is_finished(), "the contender must keep waiting");
         assert_eq!(
             SocketIdentity::from_path(&socket_path).unwrap(),
             owner_identity
@@ -1028,6 +1084,51 @@ mod tests {
             1
         );
 
+        // Once the owner exits (unlinking its socket), the contender takes the
+        // socket over and publishes its own.
+        stop_listener(owner_shutdown, owner).await;
+        let deadline = tokio::time::Instant::now() + SOCKET_OWNERSHIP_RETRY_INTERVAL * 5;
+        while SocketIdentity::from_path(&socket_path).is_err() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the contender never published its socket after the owner exited"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(
+            !contender.is_finished(),
+            "the contender must now be serving"
+        );
+
+        stop_listener(contender_shutdown, contender).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn listener_waiting_on_a_live_owner_stops_on_shutdown() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket_path = dir.path().join("node-agent-cni.sock");
+        let socket_path_str = socket_path.to_string_lossy().to_string();
+
+        let (owner_work, _owner_rx) = cni_work_channel();
+        let (owner_shutdown, owner_shutdown_rx) = tokio::sync::watch::channel(false);
+        let owner = spawn_cni_listener(
+            socket_path_str.clone(),
+            owner_work,
+            Arc::new(NodeAgentMetrics::default()),
+            owner_shutdown_rx,
+        );
+        wait_for_socket(&socket_path).await;
+
+        let (contender_work, _contender_rx) = cni_work_channel();
+        let (contender_shutdown, contender_shutdown_rx) = tokio::sync::watch::channel(false);
+        let contender = spawn_cni_listener(
+            socket_path_str,
+            contender_work,
+            Arc::new(NodeAgentMetrics::default()),
+            contender_shutdown_rx,
+        );
+        stop_listener(contender_shutdown, contender).await;
         stop_listener(owner_shutdown, owner).await;
     }
 
@@ -1159,7 +1260,6 @@ mod tests {
                     container_id: "c".to_string(),
                     ifname: None,
                     netns_path: None,
-                    args: HashMap::new(),
                     valid_attachments: Vec::new(),
                 },
                 respond: _resp,
@@ -1177,7 +1277,6 @@ mod tests {
                 container_id: "c".to_string(),
                 ifname: None,
                 netns_path: None,
-                args: HashMap::new(),
                 valid_attachments: Vec::new(),
             },
             respond: resp_tx,

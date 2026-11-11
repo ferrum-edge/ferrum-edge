@@ -750,7 +750,10 @@ async fn drive_guard(
 ) -> (Vec<u8>, bool) {
     let mut out = Vec::new();
     for chunk in chunks {
-        match guard.on_chunk(chunk.as_bytes()).await {
+        match guard
+            .on_chunk(&Bytes::copy_from_slice(chunk.as_bytes()))
+            .await
+        {
             ResponseStreamAction::Forward(bytes) => out.extend_from_slice(&bytes),
             ResponseStreamAction::Terminate(bytes) => {
                 if let Some(bytes) = bytes {
@@ -884,7 +887,10 @@ async fn sse_guard_holds_partial_events_until_complete() {
     let (default_bytes, _, _, _) = test_helpers::streaming_bounds_for_test();
     let mut guard = test_helpers::sse_guard_for_test(default_bytes);
 
-    match guard.on_chunk(b"data: {\"choices\":[{\"del").await {
+    match guard
+        .on_chunk(&Bytes::from_static(b"data: {\"choices\":[{\"del"))
+        .await
+    {
         ResponseStreamAction::Forward(bytes) => {
             assert!(bytes.is_empty(), "a partial event must not be released")
         }
@@ -1027,7 +1033,10 @@ async fn sse_guard_fails_closed_on_any_provider_bytes_after_the_terminal() {
 
     // Undecidable bytes after the marker: still refused with the terminal held.
     let mut guard = test_helpers::sse_guard_for_test(default_bytes);
-    let ResponseStreamAction::Forward(held) = guard.on_chunk(b"data: [DONE]\n\n").await else {
+    let ResponseStreamAction::Forward(held) = guard
+        .on_chunk(&Bytes::from_static(b"data: [DONE]\n\n"))
+        .await
+    else {
         panic!("a valid terminal event must be held, not terminate the stream");
     };
     assert!(
@@ -1037,7 +1046,7 @@ async fn sse_guard_fails_closed_on_any_provider_bytes_after_the_terminal() {
     let mut hostile = b"data: ".to_vec();
     hostile.extend_from_slice(&[0xff, 0xfe, 0xfd]);
     hostile.extend_from_slice(b"\n\n");
-    let action = guard.on_chunk(&hostile).await;
+    let action = guard.on_chunk(&Bytes::copy_from_slice(&hostile)).await;
     let ResponseStreamAction::Terminate(Some(bytes)) = action else {
         panic!("post-terminal undecidable bytes must terminate the stream, got {action:?}");
     };
@@ -1129,7 +1138,7 @@ async fn sse_guard_fails_closed_on_non_utf8_event() {
     let mut chunk = b"data: ".to_vec();
     chunk.extend_from_slice(&[0xff, 0xfe, 0xfd]);
     chunk.extend_from_slice(b"\n\n");
-    let action = guard.on_chunk(&chunk).await;
+    let action = guard.on_chunk(&Bytes::copy_from_slice(&chunk)).await;
     let ResponseStreamAction::Terminate(Some(bytes)) = action else {
         panic!("a non-UTF-8 event must terminate the stream, got {action:?}");
     };
@@ -2645,7 +2654,7 @@ fn strict_config_rejects_unknown_root_provider_and_circuit_fields() {
         let error = ai_federation::AiFederation::new(&config, create_test_http_client())
             .err()
             .expect("misspelled configuration must fail closed");
-        assert!(error.contains("unknown field"), "got: {error}");
+        assert!(error.contains("unknown configuration key"), "got: {error}");
     }
 }
 
@@ -3493,6 +3502,119 @@ fn request_for_provider(provider: &str, request: &Value) -> Value {
         object.remove("tool_choice");
     }
     request
+}
+
+/// Issue #7125: the tool list is parsed once at admission and every native
+/// adapter renders its declarations from that parse. Each adapter must still
+/// carry the exact name, description, and schema, omit an absent description,
+/// and substitute the empty object schema for omitted `parameters`.
+#[test]
+fn native_adapters_render_tool_declarations_from_the_admitted_parse() {
+    let schema = json!({
+        "type": "object",
+        "properties": {"city": {"type": "string"}},
+        "required": ["city"]
+    });
+    let empty_schema = json!({"type": "object", "properties": {}});
+    let request = json!({
+        "model": "m",
+        "messages": [{"role": "user", "content": "hi"}],
+        "tools": [
+            {
+                "type": "function",
+                "function": {"name": "get_weather", "description": "Get weather", "parameters": schema}
+            },
+            {"type": "function", "function": {"name": "ping"}}
+        ]
+    });
+    test_helpers::validate_openai_request_test(&request).unwrap();
+
+    let declarations = |provider: &str| -> Vec<Value> {
+        let (_, _, bytes) =
+            test_helpers::translate_request_test(provider, &request, "model-x", &json!({}))
+                .unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        match provider {
+            "anthropic" => body["tools"].as_array().unwrap().clone(),
+            "google_gemini" => body["tools"][0]["functionDeclarations"]
+                .as_array()
+                .unwrap()
+                .clone(),
+            "aws_bedrock" => body["toolConfig"]["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|tool| tool["toolSpec"].clone())
+                .collect(),
+            other => panic!("unexpected provider {other}"),
+        }
+    };
+
+    let anthropic = declarations("anthropic");
+    assert_eq!(
+        anthropic,
+        vec![
+            json!({"name": "get_weather", "description": "Get weather", "input_schema": schema}),
+            json!({"name": "ping", "input_schema": empty_schema}),
+        ]
+    );
+    let gemini = declarations("google_gemini");
+    assert_eq!(
+        gemini,
+        vec![
+            json!({"name": "get_weather", "description": "Get weather", "parameters": schema}),
+            json!({"name": "ping", "parameters": empty_schema}),
+        ]
+    );
+    let bedrock = declarations("aws_bedrock");
+    assert_eq!(
+        bedrock,
+        vec![
+            json!({"name": "get_weather", "description": "Get weather", "inputSchema": {"json": schema}}),
+            json!({"name": "ping", "inputSchema": {"json": empty_schema}}),
+        ]
+    );
+
+    // A direct translation still refuses a malformed tool list.
+    let mut malformed = request.clone();
+    malformed["tools"][1]["function"]["parameters"] = json!("not an object");
+    for provider in ["anthropic", "google_gemini", "aws_bedrock"] {
+        let error =
+            test_helpers::translate_request_test(provider, &malformed, "model-x", &json!({}))
+                .expect_err("malformed parameters must be refused");
+        assert!(error.contains("tools[1].function.parameters"), "{error}");
+    }
+}
+
+/// Issue #7125: Anthropic and Cohere read their endpoint from the same URL
+/// template as every other provider, so an operator `base_url` and the
+/// built-in default both reach the translated request.
+#[test]
+fn anthropic_and_cohere_urls_come_from_the_provider_url_template() {
+    let request = json!({"model": "m", "messages": [{"role": "user", "content": "hi"}]});
+    for (provider, default) in [
+        ("anthropic", "https://api.anthropic.com/v1/messages"),
+        ("cohere", "https://api.cohere.com/v2/chat"),
+    ] {
+        let (url, _, _) =
+            test_helpers::translate_request_test(provider, &request, "model-x", &json!({}))
+                .unwrap();
+        assert_eq!(url, default, "{provider}");
+        let custom = "https://llm-gateway.example.test/v1/chat";
+        let (url, _, _) = test_helpers::translate_request_test(
+            provider,
+            &request,
+            "model-x",
+            &json!({"base_url": custom}),
+        )
+        .unwrap();
+        assert_eq!(url, custom, "{provider}");
+        assert_eq!(
+            test_helpers::build_provider_url_for_test(provider, &json!({"base_url": custom}), "m")
+                .unwrap(),
+            custom
+        );
+    }
 }
 
 #[test]
@@ -10388,6 +10510,48 @@ async fn streaming_gateway_local_pre_header_refusals_are_circuit_neutral() {
     }
 }
 
+/// Issue #7125: a claimed stream marks the provider operation completed only
+/// when the provider answered with headers or may have executed the request.
+/// A dispatch that never reached the wire stays retry-safe, exactly as the
+/// buffered path's pre-wire failure does.
+#[tokio::test]
+async fn streaming_external_operation_marker_follows_dispatch_provenance() {
+    const COMPLETED: &str = "ferrum:external_operation_completed";
+    for (dispatch, status, completed) in [
+        (Some((ErrorClass::ConnectionRefused, false)), 502, false),
+        (Some((ErrorClass::ConnectionTimeout, false)), 504, false),
+        (
+            Some((ErrorClass::DispatchPolicyRejected, false)),
+            502,
+            false,
+        ),
+        (Some((ErrorClass::ReadWriteTimeout, true)), 504, true),
+        (Some((ErrorClass::ClientDisconnect, true)), 499, true),
+        (None, 200, true),
+        (None, 429, true),
+    ] {
+        let plugin = streaming_circuit_plugin(json!({}));
+        let (mut ctx, _headers, result) = claim_stream(&plugin, &streaming_body("gpt-4o")).await;
+        assert!(matches!(result, PluginResult::Continue), "{result:?}");
+        assert!(!ctx.metadata.contains_key(COMPLETED));
+        record_backend_dispatch_outcome_for_test(
+            &mut ctx,
+            dispatch.map(|(class, _)| class),
+            dispatch.is_some_and(|(_, on_wire)| on_wire),
+        );
+        let mut response_headers = HashMap::new();
+        response_headers.insert("content-type".to_string(), "text/event-stream".to_string());
+        plugin
+            .after_proxy(&mut ctx, status, &mut response_headers)
+            .await;
+        assert_eq!(
+            ctx.metadata.get(COMPLETED).map(String::as_str),
+            completed.then_some("true"),
+            "{dispatch:?} {status}"
+        );
+    }
+}
+
 /// A 2xx stream whose body dies on a provider read timeout or reset after
 /// headers never reaches the guard's `on_end`, so only the termination hook can
 /// score it. It must be a circuit failure, not a neutral release.
@@ -10409,7 +10573,10 @@ async fn streaming_mid_body_provider_fault_scores_a_circuit_failure() {
         let mut inspector = plugin
             .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
             .expect("guard");
-        match inspector.on_chunk(b"data: {\"a\":1}\n\n").await {
+        match inspector
+            .on_chunk(&Bytes::from_static(b"data: {\"a\":1}\n\n"))
+            .await
+        {
             ResponseStreamAction::Forward(_) => {}
             ResponseStreamAction::Terminate(_) => panic!("a valid event must be forwarded"),
         }

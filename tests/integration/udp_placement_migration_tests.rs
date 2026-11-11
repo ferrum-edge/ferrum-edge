@@ -901,6 +901,33 @@ fn retracting_the_publication_leaves_no_stale_identity_authorizing_adoption() {
     assert!(error.contains("different Kubernetes node UID"), "{error}");
 }
 
+#[test]
+fn a_set_but_invalid_explicit_node_uid_fails_closed_instead_of_using_the_publication() {
+    // `resolve` parses `FERRUM_K8S_NODE_UID` exactly as the preflight and the
+    // node-agent do: only an UNSET value falls back to the published file.
+    let registry = tempfile::tempdir().expect("registry");
+    let published = identity(NODE_A, BOOT_1);
+    publish_node_identity_for(registry.path(), &published).expect("publication");
+
+    assert_eq!(
+        UdpNodeIdentity::resolve_with_boot_id(None, registry.path(), BOOT_1).as_ref(),
+        Some(&published),
+        "an unset explicit UID uses the node-agent's publication"
+    );
+    assert_eq!(
+        UdpNodeIdentity::resolve_with_boot_id(Some(NODE_B), registry.path(), BOOT_1),
+        Some(identity(NODE_B, BOOT_1)),
+        "a valid explicit UID wins over the publication"
+    );
+    for invalid in ["", "   ", "-leading-dash", "has space", "node/uid"] {
+        assert_eq!(
+            UdpNodeIdentity::resolve_with_boot_id(Some(invalid), registry.path(), BOOT_1),
+            None,
+            "a set but invalid explicit UID {invalid:?} must resolve no identity"
+        );
+    }
+}
+
 #[cfg(unix)]
 #[test]
 fn identity_retraction_is_narrow_and_does_not_follow_symlinks() {

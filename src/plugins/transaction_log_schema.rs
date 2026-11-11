@@ -84,14 +84,12 @@ impl TransactionLogSchema {
         let config_object = config.as_object().ok_or_else(|| {
             "transaction_log_schema: config must be an object containing `schemas`".to_string()
         })?;
-        for key in config_object.keys() {
-            if !TRANSACTION_LOG_SCHEMA_CONFIG_KEYS.contains(&key.as_str()) {
-                return Err(format!(
-                    "transaction_log_schema: unknown config key {key:?} at `config` (valid keys: `{}`)",
-                    TRANSACTION_LOG_SCHEMA_CONFIG_KEYS.join("`, `")
-                ));
-            }
-        }
+        crate::util::unknown_keys::reject_unknown_keys(
+            config_object,
+            "config",
+            TRANSACTION_LOG_SCHEMA_CONFIG_KEYS,
+            "transaction_log_schema: `config`: ",
+        )?;
         let schemas_value = config_object.get("schemas").ok_or_else(|| {
             "transaction_log_schema: `schemas` is required (an object mapping name -> schema definition)".to_string()
         })?;
@@ -112,7 +110,6 @@ impl TransactionLogSchema {
         }
 
         let mut entries = Vec::with_capacity(obj.len());
-        let mut seen_names = BTreeSet::new();
         for (name, schema_value) in obj {
             if name.is_empty() {
                 return Err("transaction_log_schema: schema names must be non-empty".to_string());
@@ -120,11 +117,6 @@ impl TransactionLogSchema {
             if name.len() > MAX_SCHEMA_NAME_BYTES {
                 return Err(format!(
                     "transaction_log_schema: schema names must be at most {MAX_SCHEMA_NAME_BYTES} bytes"
-                ));
-            }
-            if !seen_names.insert(name.clone()) {
-                return Err(format!(
-                    "transaction_log_schema: duplicate schema name {name:?} within the same plugin config"
                 ));
             }
             // Compile (validates everything). Plugin name uses the schema
@@ -148,7 +140,6 @@ impl TransactionLogSchema {
     /// All schemas declared by this plugin instance. Used by tests; future
     /// loader code can call this to publish schemas explicitly when the
     /// validation-mode `register_named` no-op is undesirable.
-    #[allow(dead_code)]
     pub fn schemas(&self) -> &HashMap<String, Arc<SummarySchema>> {
         &self.schemas
     }

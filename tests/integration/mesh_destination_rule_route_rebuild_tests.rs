@@ -146,7 +146,13 @@ fn lb_effective_algorithm(state: &ProxyState, port: Option<u16>) -> LoadBalancer
 
 fn lb_hash_on_for_port(state: &ProxyState, port: u16) -> HashOnStrategy {
     let snapshot = state.load_balancer_cache.load();
-    LoadBalancerCache::get_hash_on_strategy_for_port_from(&snapshot, "default", "reviews-u", port)
+    LoadBalancerCache::get_hash_on_strategy_for_selection_from(
+        &snapshot,
+        "default",
+        "reviews-u",
+        Some(port),
+        None,
+    )
 }
 
 fn sd_upstream() -> Upstream {

@@ -39,6 +39,11 @@ pub enum AccessLogFilterExpr {
     StatusCodeMax { value: u16 },
     #[serde(rename = "min_latency_ms")]
     MinLatencyMs { value: u64 },
+    /// Strictly greater than `value` milliseconds (`response.duration > N`).
+    /// Latency is fractional milliseconds, so `> N` is not `>= N + 1`: a
+    /// 1000.4 ms request matches `> 1000` (issue #7245).
+    #[serde(rename = "latency_above_ms")]
+    LatencyAboveMs { value: u64 },
     #[serde(rename = "errors_only")]
     ErrorsOnly {},
 }
@@ -94,6 +99,7 @@ pub fn evaluate_access_log_filter_expr(
         AccessLogFilterExpr::StatusCodeMin { value } => ctx.response_status_code >= *value,
         AccessLogFilterExpr::StatusCodeMax { value } => ctx.response_status_code <= *value,
         AccessLogFilterExpr::MinLatencyMs { value } => ctx.latency_total_ms >= (*value as f64),
+        AccessLogFilterExpr::LatencyAboveMs { value } => ctx.latency_total_ms > (*value as f64),
         AccessLogFilterExpr::ErrorsOnly {} => ctx.is_terminal_failure,
     }
 }
@@ -115,6 +121,7 @@ pub fn evaluate_access_log_filter_expr_for_stream(
             false
         }
         AccessLogFilterExpr::MinLatencyMs { value } => ctx.duration_ms >= (*value as f64),
+        AccessLogFilterExpr::LatencyAboveMs { value } => ctx.duration_ms > (*value as f64),
         AccessLogFilterExpr::ErrorsOnly {} => ctx.has_error,
     }
 }
@@ -157,7 +164,9 @@ pub fn validate_access_log_filter_expr(expr: &AccessLogFilterExpr) -> Result<(),
                     ));
                 }
             }
-            AccessLogFilterExpr::MinLatencyMs { .. } | AccessLogFilterExpr::ErrorsOnly {} => {}
+            AccessLogFilterExpr::MinLatencyMs { .. }
+            | AccessLogFilterExpr::LatencyAboveMs { .. }
+            | AccessLogFilterExpr::ErrorsOnly {} => {}
         }
     }
     // The node ceiling above bounds this recursion's depth.
@@ -198,6 +207,7 @@ fn reject_unsatisfiable_status_conjunctions(
         AccessLogFilterExpr::StatusCodeMin { .. }
         | AccessLogFilterExpr::StatusCodeMax { .. }
         | AccessLogFilterExpr::MinLatencyMs { .. }
+        | AccessLogFilterExpr::LatencyAboveMs { .. }
         | AccessLogFilterExpr::ErrorsOnly {} => Ok(()),
     }
 }
@@ -221,6 +231,7 @@ fn collect_conjunction_status_bounds(
         }
         AccessLogFilterExpr::Or { .. }
         | AccessLogFilterExpr::MinLatencyMs { .. }
+        | AccessLogFilterExpr::LatencyAboveMs { .. }
         | AccessLogFilterExpr::ErrorsOnly {} => {}
     }
 }
@@ -636,7 +647,9 @@ fn collect_and_atoms<'a>(
             collect_and_atoms(right, out)?;
             Some(())
         }
-        AccessLogFilterExpr::Or { .. } => None,
+        // The flat fields have no strict latency bound, so a conjunction with
+        // `> N` on duration stays an expression tree.
+        AccessLogFilterExpr::Or { .. } | AccessLogFilterExpr::LatencyAboveMs { .. } => None,
         leaf => {
             out.push(leaf);
             Some(())
@@ -664,7 +677,9 @@ fn apply_atom_to_filter(
             )?;
         }
         AccessLogFilterExpr::ErrorsOnly {} => filter.errors_only = true,
-        AccessLogFilterExpr::And { .. } | AccessLogFilterExpr::Or { .. } => {
+        AccessLogFilterExpr::And { .. }
+        | AccessLogFilterExpr::Or { .. }
+        | AccessLogFilterExpr::LatencyAboveMs { .. } => {
             return Err(
                 "internal access log filter canonicalization produced an unexpected boolean node"
                     .to_string(),
@@ -712,8 +727,8 @@ fn duration_comparison_to_expr(
         DurationComparison::Gte(n) => Ok(AccessLogFilterExpr::MinLatencyMs {
             value: duration_value(n)?,
         }),
-        DurationComparison::Gt(n) => Ok(AccessLogFilterExpr::MinLatencyMs {
-            value: duration_value(comparison_increment(n)?)?,
+        DurationComparison::Gt(n) => Ok(AccessLogFilterExpr::LatencyAboveMs {
+            value: duration_value(n)?,
         }),
     }
 }
@@ -813,7 +828,7 @@ mod tests {
             expr,
             AccessLogFilterExpr::Or {
                 left: Box::new(AccessLogFilterExpr::StatusCodeMin { value: 500 }),
-                right: Box::new(AccessLogFilterExpr::MinLatencyMs { value: 1001 }),
+                right: Box::new(AccessLogFilterExpr::LatencyAboveMs { value: 1000 }),
             }
         );
     }

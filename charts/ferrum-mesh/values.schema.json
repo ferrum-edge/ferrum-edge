@@ -88,10 +88,6 @@
           "type": "boolean",
           "description": "Required when install=false. Confirms the operator applied the CRD out of band and accepts that helm upgrade will not update it."
         },
-        "adoptExisting": {
-          "type": "boolean",
-          "description": "Required once when adopting a CRD installed by an older chart's crds/ directory (no Helm release ownership). Pair with helm upgrade --take-ownership."
-        },
         "udpResponseAmplificationPolicy": {
           "type": "object",
           "additionalProperties": false,
@@ -486,21 +482,6 @@
       "properties": {
         "enabled": {
           "type": "boolean"
-        },
-        "inboundPort": {
-          "type": "integer",
-          "minimum": 1,
-          "maximum": 65535
-        },
-        "outboundPort": {
-          "type": "integer",
-          "minimum": 1,
-          "maximum": 65535
-        },
-        "hbonePort": {
-          "type": "integer",
-          "minimum": 1,
-          "maximum": 65535
         },
         "captureMode": {
           "type": "string"

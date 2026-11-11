@@ -31,6 +31,16 @@ every scrape and are unaffected by the TTL:
   (`ferrum_mesh_remote_discovery_*`), and xDS intake (`ferrum_xds_*`)
 - the NodeWaypoint ADR series (`ferrum_mesh_node_waypoint_*`)
 - the shared JWKS trust/failure families (`ferrum_jwks_*`)
+- service-discovery task health (`ferrum_service_discovery_tasks*` gauges and
+  the wall-clock `ferrum_service_discovery_last_success_age_seconds_max`),
+  compression codec admission (`ferrum_compression_codec_*`,
+  `ferrum_compression_response_buffer_*`), the admin audit pipeline
+  (`ferrum_admin_audit_*`, including `ferrum_admin_audit_available` and
+  `ferrum_admin_audit_degraded`), UDP response amplification
+  (`ferrum_udp_amplification_*`), gateway trust bundles
+  (`ferrum_gateway_trust_bundle_*`), the admin and CP gRPC connection limiters
+  (`ferrum_admin_*_connections*`, `ferrum_cp_grpc_*_connections*`), and the node
+  agent (`ferrum_node_agent_*`, `ferrum_mesh_node_topology_degraded`)
 
 Keeping these off the cache is load-bearing rather than incidental. Their
 counters would otherwise appear frozen to any scrape landing inside the TTL of a

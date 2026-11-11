@@ -520,14 +520,12 @@ fn parse_config(config: &Value) -> Result<GeoRestrictionConfig, String> {
             config = config.to_string()
         )
     })?;
-    if let Some(unknown) = object
-        .keys()
-        .find(|key| !CONFIG_KEYS.contains(&key.as_str()))
-    {
-        return Err(format!(
-            "geo_restriction: unknown configuration field {unknown:?}"
-        ));
-    }
+    crate::util::unknown_keys::reject_unknown_keys(
+        object,
+        "config",
+        CONFIG_KEYS,
+        "geo_restriction: `config`: ",
+    )?;
 
     let db_path = string_config(config, "db_path")?;
     let allow_countries = parse_country_set(config, "allow_countries")?;

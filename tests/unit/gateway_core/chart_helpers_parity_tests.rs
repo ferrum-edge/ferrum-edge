@@ -28,6 +28,7 @@ const SHARED: &[&str] = &[
     "ipv6Bits",
     "ipv6Hextets",
     "isIpLiteral",
+    "isLoopbackBind",
     "renderSecretEnv",
     "structuredDbUrl",
     "unsignedBinaryBits",
@@ -199,5 +200,62 @@ fn gateway_chart_carries_the_mapped_ipv4_fixes() {
     assert!(
         explicit_prefix < subtract && subtract < branch_end,
         "the -96 mapped-prefix adjustment must sit inside the explicit-prefix branch"
+    );
+}
+
+/// Issue #7299 items 3-4: the gateway chart classifies loopback binds and gates
+/// SleepAction / a null grace period by the same rules as the mesh chart.
+#[test]
+fn gateway_chart_shares_mesh_loopback_and_shutdown_rules() {
+    let gateway = defines(GATEWAY_HELPERS, "ferrum-gateway.");
+    let mesh = defines(MESH_HELPERS, "ferrum-mesh.");
+
+    // Loopback is parsed (0:0:0:0:0:0:0:1 is ::1), never prefix-matched.
+    assert!(
+        !GATEWAY_HELPERS.contains(r#"hasPrefix "127." "#)
+            && !GATEWAY_HELPERS.contains(r#"regexMatch "^127\\." "#)
+            && !GATEWAY_HELPERS.contains(r#"(eq $normalizedBind "::1")"#)
+            && !GATEWAY_HELPERS.contains(r#"(eq $cpBindHost "::1")"#),
+        "the gateway chart must classify loopback binds with ferrum-gateway.isLoopbackBind"
+    );
+    assert_eq!(
+        GATEWAY_HELPERS
+            .matches(r#"include "ferrum-gateway.isLoopbackBind""#)
+            .count(),
+        3,
+        "the CP gRPC, admin Service and ServiceMonitor loopback checks must all use isLoopbackBind"
+    );
+
+    // SleepAction: Helm's 1.20 default kube version is a sentinel, not a cluster.
+    let validate = gateway
+        .values()
+        .find(|body| body.contains("lifecycle.preStop.sleep (SleepAction)"))
+        .expect("gateway SleepAction guard");
+    let mesh_sleep = &mesh["validateSleepActionSupported"];
+    for needle in ["(eq $kubeMajor 1) (eq $kubeMinor 20)", "(lt $kubeMinor 29)"] {
+        assert!(
+            validate.contains(needle),
+            "gateway SleepAction guard must skip the helm-template 1.20 sentinel: missing {needle}"
+        );
+    }
+    assert!(
+        mesh_sleep.contains("(eq $major 1) (eq $minor 20)")
+            && mesh_sleep.contains("(lt $minor 29)"),
+        "mesh SleepAction guard changed; keep the gateway copy in step"
+    );
+    assert!(
+        !validate.contains("semverCompare \"<1.29.0-0\""),
+        "the gateway SleepAction guard must not fail the helm-template default kube version"
+    );
+
+    // A null terminationGracePeriodSeconds fails in both charts.
+    assert!(
+        validate.contains("{{- if kindIs \"invalid\" $grace -}}")
+            && validate.contains("terminationGracePeriodSeconds is required"),
+        "a null gateway terminationGracePeriodSeconds must fail the render"
+    );
+    assert!(
+        mesh["validateShutdown"].contains("{{- if kindIs \"invalid\" $grace -}}"),
+        "mesh null-grace rule changed; keep the gateway copy in step"
     );
 }

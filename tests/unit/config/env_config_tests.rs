@@ -900,6 +900,70 @@ fn test_env_config_dp_mode_missing_jwt_secret() {
     );
 }
 
+/// Issue #7273: a stock DP sends a random per-process `node_id`, and
+/// `ConfigSync.Subscribe` requires the token's `sub` to equal it, so an
+/// externally issued token can never authenticate a DP. The token file wins
+/// over a configured secret when both are set, so `dp` mode must refuse the
+/// token file whether or not the secret is present, instead of starting a DP
+/// that loops on `PERMISSION_DENIED`.
+#[test]
+fn test_env_config_dp_mode_refuses_cp_token_file() {
+    for with_secret in [false, true] {
+        let mut vars = vec![
+            ("FERRUM_MODE", "dp"),
+            (
+                "FERRUM_ADMIN_JWT_SECRET",
+                "dp-admin-secret-padding-at-least-32-bytes",
+            ),
+            ("FERRUM_DP_CP_GRPC_URLS", "http://cp:50051"),
+            (
+                "FERRUM_DP_CP_GRPC_TOKEN_FILE",
+                "/var/run/secrets/ferrum/cp-dp-token",
+            ),
+        ];
+        if with_secret {
+            vars.push((
+                "FERRUM_CP_DP_GRPC_JWT_SECRET",
+                "secret-padding-for-32-char-min!!",
+            ));
+        }
+        with_env_vars(&vars, || {
+            let error = EnvConfig::from_env()
+                .expect_err("dp mode must refuse FERRUM_DP_CP_GRPC_TOKEN_FILE");
+            assert!(
+                error.contains("FERRUM_DP_CP_GRPC_TOKEN_FILE is not supported in dp mode"),
+                "unexpected error (with_secret={with_secret}): {error}"
+            );
+        });
+    }
+}
+
+/// The same token file stays valid on a mesh node, which presents a stable
+/// identity and needs no signing secret alongside it.
+#[test]
+fn test_env_config_mesh_mode_accepts_cp_token_file_without_secret() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "mesh"),
+            ("FERRUM_DP_CP_GRPC_URLS", "http://cp:50051"),
+            (
+                "FERRUM_DP_CP_GRPC_TOKEN_FILE",
+                "/var/run/secrets/ferrum/cp-dp-token",
+            ),
+            ("FERRUM_MESH_ALLOW_NO_CA", "true"),
+        ],
+        || {
+            remove_var("FERRUM_CP_DP_GRPC_JWT_SECRET");
+            let config = EnvConfig::from_env().expect("mesh accepts a token file without a secret");
+            assert_eq!(config.mode, OperatingMode::Mesh);
+            assert_eq!(
+                config.dp_cp_grpc_token_file.as_deref(),
+                Some("/var/run/secrets/ferrum/cp-dp-token")
+            );
+        },
+    );
+}
+
 #[test]
 fn test_env_config_mesh_mode_valid() {
     with_env_vars(
@@ -918,10 +982,7 @@ fn test_env_config_mesh_mode_valid() {
         || {
             let config = EnvConfig::from_env().unwrap();
             assert_eq!(config.mode, OperatingMode::Mesh);
-            assert_eq!(
-                config.resolved_dp_cp_grpc_urls(),
-                vec!["http://cp:50051".to_string()]
-            );
+            assert_eq!(config.dp_cp_grpc_urls, vec!["http://cp:50051".to_string()]);
         },
     );
 }
@@ -1171,8 +1232,8 @@ fn test_env_config_mesh_mode_file_needs_no_ferrum_cp_credentials() {
 /// Issue #7075: `EnvConfig` validation (what `ferrum-edge validate` runs),
 /// `bootstrap_allowed`, and `bootstrap_dev_root` read
 /// `FERRUM_MESH_CA_BOOTSTRAP_DEV` through one helper, so they agree on every
-/// spelling. Only `true` (ASCII case-insensitive, untrimmed) opts in; every
-/// other value fails closed.
+/// spelling. Only the strict guardrail truthy values (`true`/`1`, trimmed,
+/// ASCII case-insensitive) opt in; every other value fails closed.
 #[test]
 fn test_internal_ca_bootstrap_opt_in_spelling_agrees_between_validate_and_bootstrap() {
     use ferrum_edge::identity::ca::bootstrap;
@@ -1182,9 +1243,11 @@ fn test_internal_ca_bootstrap_opt_in_spelling_agrees_between_validate_and_bootst
         ("true", true),
         ("TRUE", true),
         ("True", true),
-        (" true", false),
-        ("true ", false),
-        ("1", false),
+        // The identity guardrail rule (#7237): trimmed, case-insensitive
+        // true/1 opt in; anything that is not a boolean is refused.
+        (" true", true),
+        ("true ", true),
+        ("1", true),
         ("yes", false),
         ("false", false),
         ("", false),
@@ -7107,7 +7170,7 @@ fn test_env_config_node_agent_rejects_hbone_port_equal_to_outbound_capture() {
 // --- DP CP failover URL tests ---
 
 #[test]
-fn test_resolved_dp_cp_grpc_urls_single_entry() {
+fn test_dp_cp_grpc_urls_single_entry() {
     with_env_vars(
         &[
             ("FERRUM_MODE", "dp"),
@@ -7125,14 +7188,14 @@ fn test_resolved_dp_cp_grpc_urls_single_entry() {
         ],
         || {
             let config = EnvConfig::from_env().unwrap();
-            let urls = config.resolved_dp_cp_grpc_urls();
+            let urls = config.dp_cp_grpc_urls.clone();
             assert_eq!(urls, vec!["http://cp1:50051"]);
         },
     );
 }
 
 #[test]
-fn test_resolved_dp_cp_grpc_urls_multi_urls_only() {
+fn test_dp_cp_grpc_urls_multi_urls_only() {
     with_env_vars(
         &[
             ("FERRUM_MODE", "dp"),
@@ -7151,7 +7214,7 @@ fn test_resolved_dp_cp_grpc_urls_multi_urls_only() {
         ],
         || {
             let config = EnvConfig::from_env().unwrap();
-            let urls = config.resolved_dp_cp_grpc_urls();
+            let urls = config.dp_cp_grpc_urls.clone();
             assert_eq!(
                 urls,
                 vec![
@@ -7165,7 +7228,7 @@ fn test_resolved_dp_cp_grpc_urls_multi_urls_only() {
 }
 
 #[test]
-fn test_resolved_dp_cp_grpc_urls_trims_whitespace() {
+fn test_dp_cp_grpc_urls_trims_whitespace() {
     with_env_vars(
         &[
             ("FERRUM_MODE", "dp"),
@@ -7193,7 +7256,7 @@ fn test_resolved_dp_cp_grpc_urls_trims_whitespace() {
 }
 
 #[test]
-fn test_resolved_dp_cp_grpc_urls_filters_empty() {
+fn test_dp_cp_grpc_urls_filters_empty() {
     with_env_vars(
         &[
             ("FERRUM_MODE", "dp"),
@@ -7237,7 +7300,7 @@ fn test_dp_mode_validation_accepts_urls() {
         ],
         || {
             let config = EnvConfig::from_env().unwrap();
-            assert_eq!(config.resolved_dp_cp_grpc_urls(), vec!["https://cp1:50051"]);
+            assert_eq!(config.dp_cp_grpc_urls, vec!["https://cp1:50051"]);
         },
     );
 }
@@ -8824,4 +8887,33 @@ fn test_unconfigured_tls_managed_store_path_is_private_to_the_process() {
     with_env_vars(&explicit, || {
         assert_eq!(tls_managed_store_path_from_env(), EXPLICIT);
     });
+}
+
+/// Issue #7218: `FERRUM_TLS_CURVES` was a compatibility alias of
+/// `FERRUM_TLS_KEY_EXCHANGE_GROUPS`; build-out policy keeps no aliases, so only
+/// the canonical name selects the key-exchange groups.
+#[test]
+fn tls_key_exchange_groups_read_only_the_canonical_env_name() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/path/to/config.yaml"),
+            ("FERRUM_TLS_CURVES", "secp384r1"),
+        ],
+        || {
+            let config = EnvConfig::from_env().unwrap();
+            assert_eq!(config.tls_curves, None);
+        },
+    );
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/path/to/config.yaml"),
+            ("FERRUM_TLS_KEY_EXCHANGE_GROUPS", "X25519,secp384r1"),
+        ],
+        || {
+            let config = EnvConfig::from_env().unwrap();
+            assert_eq!(config.tls_curves.as_deref(), Some("X25519,secp384r1"));
+        },
+    );
 }

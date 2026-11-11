@@ -503,13 +503,59 @@ pub(crate) fn udp_ack_requirement_exists(ready_dir: &Path, pod_uid: &str) -> boo
         .is_some_and(|path| path.is_file())
 }
 
+/// Run one blocking backend call — `setns` thread spawn+joins and `sh -c`
+/// iptables scripts that can wait seconds on the xtables lock — on tokio's
+/// blocking pool rather than a runtime worker that serves proxy traffic
+/// (issue #7170). The caller awaits it before its next step, so the
+/// fail-closed ordering of reconcile and cleanup is unchanged. A panicked call
+/// resolves to `failed`, the same outcome as a backend failure.
+async fn run_backend_blocking<B, T, F>(backend: &Arc<B>, failed: T, call: F) -> T
+where
+    B: Send + Sync + 'static,
+    T: Send + 'static,
+    F: FnOnce(&B) -> T + Send + 'static,
+{
+    let backend = Arc::clone(backend);
+    match tokio::task::spawn_blocking(move || call(&backend)).await {
+        Ok(result) => result,
+        Err(error) => {
+            warn!(%error, "Ambient UDP capture backend call did not complete");
+            failed
+        }
+    }
+}
+
+/// Run a retained guard's blocking cleanup or recovery on the blocking pool,
+/// handing the guard back with the outcome so the caller keeps cleanup
+/// ownership on failure. A panicked call drops the guard WITHOUT running its
+/// cleanup, which leaves the fail-closed rules in place.
+async fn run_guard_blocking(
+    mut guard: RetainedUdpGuard,
+    op: fn(&mut RetainedUdpGuard) -> bool,
+) -> Option<(RetainedUdpGuard, bool)> {
+    match tokio::task::spawn_blocking(move || {
+        let done = op(&mut guard);
+        (guard, done)
+    })
+    .await
+    {
+        Ok(outcome) => Some(outcome),
+        Err(error) => {
+            warn!(%error, "Ambient UDP fail-closed guard operation did not complete");
+            None
+        }
+    }
+}
+
 /// Reconciles per-pod-netns UDP capture producers against the enrolled-pod set.
 pub struct NetnsUdpCaptureManager<B: NetnsUdpBackend> {
     /// The UDP capture port bound (dual-stack `[::]`) inside each pod netns.
     /// Stored for the startup/diagnostic log only; the backend owns the bind.
     capture_port: u16,
     source: Arc<dyn PodCaptureSource>,
-    backend: B,
+    /// Shared so blocking calls can run on the blocking pool
+    /// ([`run_backend_blocking`]).
+    backend: Arc<B>,
     poll_interval: Duration,
     /// netns inode → its active producer.
     active: HashMap<u64, ActiveUdpCapture>,
@@ -548,7 +594,7 @@ impl<B: NetnsUdpBackend> NetnsUdpCaptureManager<B> {
         Self {
             capture_port,
             source,
-            backend,
+            backend: Arc::new(backend),
             poll_interval,
             active: HashMap::new(),
             guarded: HashMap::new(),
@@ -630,26 +676,30 @@ impl<B: NetnsUdpBackend> NetnsUdpCaptureManager<B> {
                 );
                 continue;
             }
-            let cleaned = self
-                .pending_ack_guards
-                .get_mut(&netns)
-                .is_some_and(|pending| pending.handle.cleanup());
+            let Some(mut pending) = self.pending_ack_guards.remove(&netns) else {
+                continue;
+            };
+            let Some((handle, cleaned)) =
+                run_guard_blocking(pending.handle, RetainedUdpGuard::cleanup).await
+            else {
+                continue;
+            };
+            pending.handle = handle;
             if !cleaned {
                 warn!(
                     netns_inode = netns,
                     "Ambient UDP producer could not remove a late-acknowledged fail-closed guard; retrying"
                 );
+                self.pending_ack_guards.insert(netns, pending);
                 continue;
             }
-            if let Some(pending) = self.pending_ack_guards.remove(&netns) {
-                if let Some(dir) = &self.ready_dir {
-                    clear_udp_ack_requirement(dir, &pending.pod_uids);
-                }
-                info!(
-                    netns_inode = netns,
-                    "Consumed late Ambient UDP close acknowledgement and removed retained guard"
-                );
+            if let Some(dir) = &self.ready_dir {
+                clear_udp_ack_requirement(dir, &pending.pod_uids);
             }
+            info!(
+                netns_inode = netns,
+                "Consumed late Ambient UDP close acknowledgement and removed retained guard"
+            );
         }
 
         // Bound entries whose original namespace is gone. A proven inode change
@@ -935,12 +985,16 @@ impl<B: NetnsUdpBackend> NetnsUdpCaptureManager<B> {
             .map(|(netns, _)| *netns)
             .collect();
         for netns in abandoned_guards {
-            let cleaned = self
-                .guarded
-                .get_mut(&netns)
-                .is_some_and(|guarded| guarded.handle.cleanup());
+            let Some(mut guarded) = self.guarded.remove(&netns) else {
+                continue;
+            };
+            let Some((handle, cleaned)) =
+                run_guard_blocking(guarded.handle, RetainedUdpGuard::cleanup).await
+            else {
+                continue;
+            };
+            guarded.handle = handle;
             if cleaned {
-                self.guarded.remove(&netns);
                 info!(
                     netns_inode = netns,
                     "Removed abandoned Ambient UDP fail-closed guard"
@@ -950,6 +1004,7 @@ impl<B: NetnsUdpBackend> NetnsUdpCaptureManager<B> {
                     netns_inode = netns,
                     "Could not remove abandoned Ambient UDP fail-closed guard; retaining cleanup ownership and retrying"
                 );
+                self.guarded.insert(netns, guarded);
             }
         }
 
@@ -988,13 +1043,21 @@ impl<B: NetnsUdpBackend> NetnsUdpCaptureManager<B> {
                         }
                     }
                 }
-                if self.guarded.contains_key(&netns) {
-                    let recovered = self
-                        .guarded
-                        .get_mut(&netns)
-                        .is_some_and(|guarded| guarded.handle.recover_active());
+                if let Some(mut guarded) = self.guarded.remove(&netns) {
+                    let recovered =
+                        match run_guard_blocking(guarded.handle, RetainedUdpGuard::recover_active)
+                            .await
+                        {
+                            Some((handle, recovered)) => {
+                                guarded.handle = handle;
+                                if !recovered {
+                                    self.guarded.insert(netns, guarded);
+                                }
+                                recovered
+                            }
+                            None => false,
+                        };
                     if recovered {
-                        self.guarded.remove(&netns);
                         info!(
                             netns_inode = netns,
                             "Removed stale Ambient UDP replacement guard after source identity reverted"
@@ -1016,7 +1079,14 @@ impl<B: NetnsUdpBackend> NetnsUdpCaptureManager<B> {
             // still destination-validated against the live pod UID/SPIFFE pair,
             // while tearing it down here would create plaintext bypass.
             if self.active.contains_key(&netns) {
-                match self.backend.prepare_udp_capture_guard(&target, netns) {
+                let guard_target = target.clone();
+                match run_backend_blocking(
+                    &self.backend,
+                    NetnsUdpGuardResult::Failed,
+                    move |backend| backend.prepare_udp_capture_guard(&guard_target, netns),
+                )
+                .await
+                {
                     NetnsUdpGuardResult::Installed(handle) => {
                         if let Some(old_guard) = self.guarded.remove(&netns) {
                             old_guard.handle.disarm();
@@ -1114,7 +1184,12 @@ impl<B: NetnsUdpBackend> NetnsUdpCaptureManager<B> {
                      before reopen; proceeding to reinstall rules"
                 );
             }
-            match self.backend.open_udp_capture(&target, netns) {
+            let open_target = target.clone();
+            match run_backend_blocking(&self.backend, NetnsUdpOpenResult::Failed, move |backend| {
+                backend.open_udp_capture(&open_target, netns)
+            })
+            .await
+            {
                 NetnsUdpOpenResult::Opened(handle) => {
                     self.disarm_pending_ack_guards_after_reopen(netns, &pod_uids);
                     // The successful backend transition removed all guard jumps.
@@ -1279,7 +1354,9 @@ impl<B: NetnsUdpBackend> NetnsUdpCaptureManager<B> {
 /// proxy is cleaned without requiring UDP capture to be re-enabled.
 pub struct NetnsUdpCleanupManager<B: NetnsUdpCleanupBackend> {
     source: Arc<dyn PodCaptureSource>,
-    backend: B,
+    /// Shared so cleanup commands can run on the blocking pool
+    /// ([`run_backend_blocking`]).
+    backend: Arc<B>,
     poll_interval: Duration,
     cleaned_netns: HashSet<u64>,
     last_registry_uids: HashSet<String>,
@@ -1315,7 +1392,7 @@ impl<B: NetnsUdpCleanupBackend> NetnsUdpCleanupManager<B> {
     pub fn new(source: Arc<dyn PodCaptureSource>, backend: B, poll_interval: Duration) -> Self {
         Self {
             source,
-            backend,
+            backend: Arc::new(backend),
             poll_interval,
             cleaned_netns: HashSet::new(),
             last_registry_uids: HashSet::new(),
@@ -1568,9 +1645,14 @@ impl<B: NetnsUdpCleanupBackend> NetnsUdpCleanupManager<B> {
             if let Some(dir) = &self.ready_dir {
                 clear_udp_ack_requirement(dir, &pod_uids);
             }
-            match self
-                .backend
-                .cleanup_udp_capture_until(&target, netns, self.deadline)
+            let cleanup_target = target.clone();
+            let deadline = self.deadline;
+            match run_backend_blocking(
+                &self.backend,
+                NetnsUdpCleanupCommandOutcome::Failed,
+                move |backend| backend.cleanup_udp_capture_until(&cleanup_target, netns, deadline),
+            )
+            .await
             {
                 NetnsUdpCleanupCommandOutcome::Succeeded => {
                     self.cleaned_netns.insert(netns);

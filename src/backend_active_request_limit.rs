@@ -303,7 +303,6 @@ impl BackendActiveRequestLimiter {
 
     /// Current active-request count for a destination lane. Test/diagnostics
     /// only — the hot path uses [`Self::try_acquire`] directly.
-    #[allow(dead_code)]
     pub fn current(&self, scope: DestinationScope<'_>) -> u64 {
         ACTIVE_KEY_BUF.with(|buf| {
             let mut buf = buf.borrow_mut();
@@ -317,7 +316,6 @@ impl BackendActiveRequestLimiter {
     }
 
     /// Number of resident lanes. Test/diagnostics only.
-    #[allow(dead_code)]
     pub fn resident_lanes(&self) -> usize {
         self.inner.len()
     }

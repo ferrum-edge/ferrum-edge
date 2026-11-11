@@ -46,8 +46,6 @@ macro_rules! define_header_name_set {
 }
 
 define_header_name_set! {
-    // Public inventory is consumed by library tests, not the binary target.
-    #[allow(dead_code)]
     /// Closed set of lowercase names stripped by
     /// [`is_backend_request_strip_header`]. Secondary-request builders call that
     /// predicate directly; this const is the shared inventory for docs/tests.
@@ -71,8 +69,9 @@ define_header_name_set! {
     ///   by the compression plugin to track the pre-compression encoding;
     ///   never forward to the backend.
     ///
-    /// - **`x-grpc-web-mode`:** internal grpc_web plugin marker used only between
-    ///   request header and body plugin phases; never forward to the backend.
+    /// - **`x-grpc-web-mode`:** reserved grpc_web name. The plugin keeps its
+    ///   mode in request metadata and never emits it; a client copy is never
+    ///   forwarded to the backend.
     ///
     /// - **`expect`:** the gateway has already satisfied the expectation. Hyper's
     ///   HTTP/1 *server* writes the interim `100 Continue` itself when the
@@ -323,8 +322,6 @@ pub fn is_gateway_assertion_header(name: &str) -> bool {
 }
 
 define_header_name_set! {
-    // Public inventory is consumed by library tests, not the binary target.
-    #[allow(dead_code)]
     /// Closed set of lowercase proxy-owned forwarding identity headers stripped
     /// before Ferrum regenerates them on primary dispatch (and before secondary
     /// request builders copy the materialised map).
@@ -2178,7 +2175,6 @@ impl GatewayOwnedResponseHeaders {
     /// [`Self::insert`] at the point of each builder write; this name-driven
     /// form exists so external tests can reach the real name-to-variant mapping
     /// through [`crate::_test_support`] rather than restating it.
-    #[allow(dead_code)] // Bin target omits lib::_test_support; external tests call via that seam.
     pub(crate) fn from_names(names: &[String]) -> Self {
         let mut owned = Self::default();
         for name in names {

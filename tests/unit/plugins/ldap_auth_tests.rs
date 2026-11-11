@@ -443,9 +443,11 @@ fn test_cache_ttl_config() {
     assert!(plugin.is_ok());
 }
 
+/// `consumer_mapping` is an ordinary unknown key (no dedicated removed-key
+/// diagnostic, issue #7113).
 #[test]
-fn test_consumer_mapping_flag_is_rejected() {
-    let plugin = LdapAuth::new(
+fn test_consumer_mapping_is_an_unknown_key() {
+    let error = LdapAuth::new(
         &json!({
             "ldap_url": "ldaps://ldap.example.com:636",
             "bind_dn_template": "uid={username},ou=users,dc=example,dc=com",
@@ -453,8 +455,13 @@ fn test_consumer_mapping_flag_is_rejected() {
             "consumer_mapping": false
         }),
         http_client(),
+    )
+    .err()
+    .expect("consumer_mapping must be rejected");
+    assert!(
+        error.contains("unknown configuration key(s): \"config.consumer_mapping\""),
+        "{error}"
     );
-    assert!(plugin.is_err());
 }
 
 #[test]
@@ -472,7 +479,9 @@ fn test_unknown_config_key_rejected() {
     .expect("misspelled authorization key must fail closed");
 
     assert!(
-        error.contains("unknown config key \"required_group\""),
+        error.contains(
+            "unknown configuration key(s): \"config.required_group\" (did you mean `required_groups`?)"
+        ),
         "{error}"
     );
 }
@@ -3399,7 +3408,10 @@ async fn test_group_name_preparation_keeps_distinct_names_distinct() {
 fn configuration_diagnostics_keep_schema_and_withhold_supplied_values() {
     let canary = "'SECURITY_DIAGNOSTIC_CANARY\"`\n\\payload";
     let cases: &[(serde_json::Value, &[&str])] = &[
-        (json!({(canary): true}), &["unknown config key"]),
+        (
+            json!({(canary): true}),
+            &["unknown configuration key(s)", "`config`"],
+        ),
         (
             json!({"ldap_url": 8675309}),
             &["`ldap_url`", "must be a string"],

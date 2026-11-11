@@ -42,6 +42,15 @@ const HTTP_METHODS: &[&str] = &[
     "get", "post", "put", "delete", "options", "head", "patch", "trace",
 ];
 
+/// OpenAPI 3.2 Path Item operation fields the importer does not support.
+///
+/// `query` (the QUERY method) and `additionalOperations` (arbitrary method
+/// names) are not in [`HTTP_METHODS`], so the generated validator, the MCP
+/// bridge, schema indexing and `operation_count` would all skip them. A
+/// document declaring either is refused at import instead of being accepted
+/// with those operations silently ignored (issue #7201).
+const UNSUPPORTED_PATH_ITEM_OPERATION_FIELDS: &[&str] = &["query", "additionalOperations"];
+
 // ---------------------------------------------------------------------------
 // Public types
 // ---------------------------------------------------------------------------
@@ -152,6 +161,13 @@ pub enum ExtractError {
     SchemaReferenceCycle { path: String },
     #[error("resolved schema exceeds the expansion limit while resolving '{location}'")]
     SchemaTooLarge { location: String },
+    /// A Path Item declares an OpenAPI 3.2 `query` operation or
+    /// `additionalOperations`, which the importer cannot serve or validate.
+    /// `location` names document structure only (`paths.<template>.<field>`).
+    #[error(
+        "'{location}' is not supported: OpenAPI 3.2 `query` and `additionalOperations` operations cannot be imported"
+    )]
+    UnsupportedOperationField { location: String },
 }
 
 // ---------------------------------------------------------------------------
@@ -161,6 +177,46 @@ pub enum ExtractError {
 /// Returns `true` iff `s` is a valid SemVer string for OpenAPI 3.x.
 fn is_openapi3_version(s: &str) -> bool {
     semver::Version::parse(s).is_ok_and(|version| version.major == 3)
+}
+
+/// Refuse a Path Item object that declares an unsupported operation field.
+fn reject_unsupported_path_item_operations(
+    path_item: &Map<String, Value>,
+    location: &str,
+) -> Result<(), ExtractError> {
+    match UNSUPPORTED_PATH_ITEM_OPERATION_FIELDS
+        .iter()
+        .find(|field| path_item.contains_key(**field))
+    {
+        Some(field) => Err(ExtractError::UnsupportedOperationField {
+            location: format!("{location}.{field}"),
+        }),
+        None => Ok(()),
+    }
+}
+
+/// Refuse a document whose `paths` or `components.pathItems` entries declare
+/// an unsupported operation field. Path Items reached through an external
+/// `$ref` are checked again after resolution by the generators.
+fn reject_unsupported_operation_fields(root: &Value) -> Result<(), ExtractError> {
+    let sections = [
+        ("paths", root.get("paths")),
+        (
+            "components.pathItems",
+            root.get("components").and_then(|c| c.get("pathItems")),
+        ),
+    ];
+    for (prefix, section) in sections {
+        let Some(items) = section.and_then(Value::as_object) else {
+            continue;
+        };
+        for (name, item) in items {
+            if let Some(item) = item.as_object() {
+                reject_unsupported_path_item_operations(item, &format!("{prefix}.{name}"))?;
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Plugin config keys that are forbidden inside a plugin's `config` value.
@@ -337,10 +393,6 @@ pub fn autodetect_format(body: &[u8]) -> SpecFormat {
 ///
 /// `(bundle, metadata)` on success, or an [`ExtractError`] describing the
 /// first problem encountered.
-// The binary target compiles this public library module privately and uses the
-// policy-aware entry point directly; integration tests retain this compatibility
-// entry point for the default fail-closed behavior.
-#[allow(dead_code)]
 pub fn extract(
     body: &[u8],
     declared_format: Option<SpecFormat>,
@@ -374,6 +426,7 @@ pub fn extract_with_external_refs(
 
     // --- Version detection -----------------------------------------------
     let version = detect_version(&root)?;
+    reject_unsupported_operation_fields(&root)?;
 
     // --- External / cross-document $ref policy ---------------------------
     let extension = parse_external_ref_extension(&root)?;
@@ -1568,6 +1621,7 @@ fn extract_mcp_bridge_operations(
         let Some(path_object) = resolved_path_item.as_object() else {
             continue;
         };
+        reject_unsupported_path_item_operations(path_object, &format!("paths.{path_template}"))?;
         let path_item_bases = openapi_server_bases(
             path_object.get("servers"),
             &format!("paths.{path_template}.servers"),
@@ -2283,6 +2337,7 @@ fn extract_operation_schemas(
         let Some(path_object) = resolved_path_item.as_object() else {
             continue;
         };
+        reject_unsupported_path_item_operations(path_object, &format!("paths.{path_template}"))?;
         let path_item_bases = if version == "2.0" {
             None
         } else {
@@ -5071,12 +5126,12 @@ fn decode_uri_fragment(raw: &str, reference: &str) -> Result<String, ExtractErro
                         "malformed percent-encoding in $ref '{reference}'"
                     )));
                 }
-                let hi = hex_nibble(bytes[index + 1]).ok_or_else(|| {
+                let hi = crate::util::hex_nibble(bytes[index + 1]).ok_or_else(|| {
                     schema_reference_error(format!(
                         "malformed percent-encoding in $ref '{reference}'"
                     ))
                 })?;
-                let lo = hex_nibble(bytes[index + 2]).ok_or_else(|| {
+                let lo = crate::util::hex_nibble(bytes[index + 2]).ok_or_else(|| {
                     schema_reference_error(format!(
                         "malformed percent-encoding in $ref '{reference}'"
                     ))
@@ -5093,15 +5148,6 @@ fn decode_uri_fragment(raw: &str, reference: &str) -> Result<String, ExtractErro
     String::from_utf8(out).map_err(|_| {
         schema_reference_error(format!("malformed percent-encoding in $ref '{reference}'"))
     })
-}
-
-fn hex_nibble(byte: u8) -> Option<u8> {
-    match byte {
-        b'0'..=b'9' => Some(byte - b'0'),
-        b'a'..=b'f' => Some(byte - b'a' + 10),
-        b'A'..=b'F' => Some(byte - b'A' + 10),
-        _ => None,
-    }
 }
 
 fn is_json_pointer_fragment(decoded: &str) -> bool {

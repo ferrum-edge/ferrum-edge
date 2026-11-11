@@ -358,6 +358,9 @@ struct FakeBackendState {
     listener_exits: bool,
     listeners: usize,
     listener_stops: usize,
+    /// Thread each blocking datapath effect (guard / capture / teardown /
+    /// release script) ran on.
+    effect_threads: Vec<std::thread::ThreadId>,
 }
 
 #[derive(Clone, Default)]
@@ -368,6 +371,16 @@ struct FakeBackend {
 impl FakeBackend {
     fn record(&self, call: &str) {
         self.inner.lock().unwrap().calls.push(call.to_string());
+    }
+
+    fn record_effect(&self, call: &str) {
+        let mut state = self.inner.lock().unwrap();
+        state.calls.push(call.to_string());
+        state.effect_threads.push(std::thread::current().id());
+    }
+
+    fn effect_threads(&self) -> Vec<std::thread::ThreadId> {
+        self.inner.lock().unwrap().effect_threads.clone()
     }
 
     fn calls(&self) -> Vec<String> {
@@ -419,7 +432,7 @@ impl HostUdpCaptureBackend for FakeBackend {
     }
 
     fn install_guard(&self, ifaces: &[String]) -> Result<(), String> {
-        self.record(&format!("guard:{}", ifaces.join(",")));
+        self.record_effect(&format!("guard:{}", ifaces.join(",")));
         if self.inner.lock().unwrap().fail_install_guard {
             return Err("iptables guard failed".to_string());
         }
@@ -427,7 +440,7 @@ impl HostUdpCaptureBackend for FakeBackend {
     }
 
     fn install_capture(&self, ifaces: &[String]) -> Result<(), String> {
-        self.record(&format!("capture:{}", ifaces.join(",")));
+        self.record_effect(&format!("capture:{}", ifaces.join(",")));
         if self.inner.lock().unwrap().fail_install_capture {
             return Err("iptables failed".to_string());
         }
@@ -435,12 +448,12 @@ impl HostUdpCaptureBackend for FakeBackend {
     }
 
     fn teardown_capture_rules(&self) -> Result<(), String> {
-        self.record("teardown_capture");
+        self.record_effect("teardown_capture");
         Ok(())
     }
 
     fn release_guard(&self) -> Result<(), String> {
-        self.record("release_guard");
+        self.record_effect("release_guard");
         if self.inner.lock().unwrap().fail_release_guard {
             return Err("xtables lock timeout".to_string());
         }
@@ -448,7 +461,7 @@ impl HostUdpCaptureBackend for FakeBackend {
     }
 
     fn teardown_all(&self) -> Result<(), String> {
-        self.record("teardown_all");
+        self.record_effect("teardown_all");
         if self.inner.lock().unwrap().fail_teardown_all {
             return Err("xtables lock timeout".to_string());
         }
@@ -520,6 +533,37 @@ async fn reconcile_installs_the_guard_before_capture_and_releases_it_after() {
         "enrolled UDP egress must be dropped, never plaintext, for the whole rebuild"
     );
     assert_eq!(backend.listeners(), 1);
+}
+
+/// Every iptables / routing effect blocks on a child process (seconds under
+/// xtables-lock contention), so none may run on the runtime thread that drives
+/// the manager (issue #7170). The current-thread test runtime makes that
+/// thread observable: it is the test's own thread.
+#[tokio::test]
+async fn blocking_datapath_effects_never_run_on_the_runtime_thread() {
+    let source = Arc::new(FakeSource::default());
+    source.set(vec![target(POD_A_UID, "a", Some("10.244.1.5"))]);
+    let backend = FakeBackend::default();
+    backend.set_interface(POD_A_UID, "vetha", 11);
+    let mut manager = manager(Arc::clone(&source), backend.clone(), None);
+
+    manager.reconcile_once().await;
+    source.set(Vec::new());
+    manager.reconcile_once().await;
+    manager.shutdown().await;
+
+    let runtime_thread = std::thread::current().id();
+    let threads = backend.effect_threads();
+    assert!(
+        threads.len() >= 4,
+        "the reconcile and shutdown passes must have run datapath effects: {:?}",
+        backend.calls()
+    );
+    assert!(
+        threads.iter().all(|thread| *thread != runtime_thread),
+        "a blocking datapath effect ran on the runtime thread: {:?}",
+        backend.calls()
+    );
 }
 
 #[tokio::test]
@@ -827,31 +871,39 @@ async fn a_removed_pods_capture_rule_survives_until_its_gate_close_is_acknowledg
 
     manager.reconcile_once().await;
     assert!(ready_dir.join(POD_A_UID).is_file());
+    assert_eq!(backend.listeners(), 1);
     backend.reset_calls();
 
     // Pod A leaves and the node-agent never acknowledges closing its gate. Its
     // rule must NOT be rebuilt away: the old rule plus an open BPF gate is
-    // capture, while no rule plus an open BPF gate is plaintext egress.
+    // capture, while no rule plus an open BPF gate is plaintext egress. Pod B's
+    // capture is live and unchanged, so it keeps its egress (issue #7184): only
+    // A's interface is guarded, and the listener is restarted with B's
+    // evidence alone so no session admitted under A's evidence survives.
     source.set(vec![b.clone()]);
     let state = manager.reconcile_once().await;
     assert_eq!(state.ifaces(), vec!["vethb".to_string()]);
     let calls = backend.calls();
     assert_eq!(
         calls,
-        vec!["guard:vetha,vethb".to_string()],
-        "an unacknowledged gate close installs the union guard and touches nothing else: \
-         {calls:?}"
+        vec!["guard:vetha".to_string(), "start_listener".to_string()],
+        "an unacknowledged gate close guards only the departing pod and leaves the ruleset \
+         alone: {calls:?}"
     );
+    assert_eq!(backend.listeners(), 2);
+    assert_eq!(backend.listener_stops(), 1);
 
     // Retrying keeps the same posture and must not re-issue the request, which
-    // would delete an acknowledgement that has since landed.
+    // would delete an acknowledgement that has since landed, nor restart the
+    // listener the settled pod is using.
     backend.reset_calls();
     manager.reconcile_once().await;
     assert_eq!(
         backend.calls(),
-        vec!["guard:vetha,vethb".to_string()],
+        vec!["guard:vetha".to_string()],
         "a retry stays fail-closed rather than removing the departing pod's rule"
     );
+    assert_eq!(backend.listeners(), 2);
 
     std::fs::create_dir_all(&ack_dir).expect("ack dir");
     std::fs::write(ack_dir.join(POD_A_UID), b"").expect("ack marker");
@@ -867,6 +919,15 @@ async fn a_removed_pods_capture_rule_survives_until_its_gate_close_is_acknowledg
         calls.last().map(String::as_str),
         Some("release_guard"),
         "and only then does the guard come down: {calls:?}"
+    );
+    assert!(
+        calls.contains(&"guard:vetha,vethb".to_string()),
+        "the rebuild itself runs under the full guard: {calls:?}"
+    );
+    assert_eq!(
+        backend.listeners(),
+        2,
+        "the listener already restarted with the settled evidence is not restarted again"
     );
 }
 

@@ -331,21 +331,18 @@ impl DatagramListenerBinding {
     }
 
     /// Receive-boundary protocol.
-    #[allow(dead_code)] // Accessor for the external tests; decode reads the field.
     #[inline]
     pub fn protocol(&self) -> DatagramListenerProtocol {
         self.protocol
     }
 
     /// Canonical bind address.
-    #[allow(dead_code)] // Accessor for the external tests; decode reads the field.
     #[inline]
     pub fn bind_addr(&self) -> IpAddr {
         self.bind_addr
     }
 
     /// Receiving port.
-    #[allow(dead_code)] // Accessor for the external tests; decode reads the field.
     #[inline]
     pub fn port(&self) -> u16 {
         self.port
@@ -386,7 +383,6 @@ impl DatagramListenerBinding {
     ///
     /// Exposed so the sender-side encoder and the conformance tests can pin the
     /// exact identity rather than re-deriving it.
-    #[allow(dead_code)] // Used by external tests; the receive path uses the inline buffer.
     pub fn canonical_domain(&self) -> Vec<u8> {
         let mut buf = [0u8; DOMAIN_PREFIX_MAX];
         let len = self.write_domain(&mut buf);
@@ -415,7 +411,6 @@ pub struct DatagramFreshness {
 
 impl DatagramFreshness {
     /// Serialize the 29-byte TLV value.
-    #[allow(dead_code)] // Sender-side surface: the gateway only ever decodes.
     pub fn encode_value(&self) -> [u8; FRESHNESS_VALUE_LEN] {
         let mut out = [0u8; FRESHNESS_VALUE_LEN];
         out[0] = FRESHNESS_VERSION;
@@ -427,7 +422,6 @@ impl DatagramFreshness {
     }
 
     /// Serialize the complete freshness TLV (type, length, value).
-    #[allow(dead_code)] // Sender-side surface: the gateway only ever decodes.
     pub fn encode_tlv(&self) -> [u8; FRESHNESS_TLV_LEN] {
         let mut out = [0u8; FRESHNESS_TLV_LEN];
         out[0] = FRESHNESS_TLV_TYPE;
@@ -804,7 +798,6 @@ impl DatagramReplayGuard {
     }
 
     /// Number of senders currently tracked. Bounded by [`MAX_REPLAY_SENDERS`].
-    #[allow(dead_code)] // Surfaced through the gate for the external tests.
     fn tracked_senders(&self) -> usize {
         self.senders.len()
     }
@@ -1056,7 +1049,6 @@ impl DatagramClientAddressGate {
     }
 
     /// This listener's canonical domain identity.
-    #[allow(dead_code)] // Accessor for the external tests; decode reads the field.
     #[inline]
     pub fn binding(&self) -> DatagramListenerBinding {
         self.binding
@@ -1064,7 +1056,6 @@ impl DatagramClientAddressGate {
 
     /// Senders currently holding replay state on this listener. Bounded by
     /// [`MAX_REPLAY_SENDERS`]; exposed so the bound is assertable.
-    #[allow(dead_code)] // Used by external tests to assert the state bound.
     #[inline]
     pub fn tracked_replay_senders(&self) -> usize {
         self.replay.tracked_senders()
@@ -1422,7 +1413,6 @@ fn walk_envelope_tlvs(
 /// All four forms carry the same authentication, listener-binding, and
 /// freshness contract when a key is supplied; the address-less ones simply
 /// confer no forwarded identity.
-#[allow(dead_code)] // Sender-side surface: the gateway only ever decodes.
 #[derive(Debug, Clone, Copy)]
 pub enum DatagramEnvelopeForm {
     /// `LOCAL`, spec-conventional `0x00` `fam_transport`, no addresses. The
@@ -1448,7 +1438,6 @@ pub enum DatagramEnvelopeForm {
 ///
 /// Deliberately not `Debug`: it holds the root HMAC key, and no formatter should
 /// ever be able to render it.
-#[allow(dead_code)] // Sender-side surface: the gateway only ever decodes.
 #[derive(Clone, Copy)]
 pub struct DatagramEnvelopeAuth<'a> {
     /// HMAC-SHA-256 key over the exact configured
@@ -1472,7 +1461,6 @@ pub struct DatagramEnvelopeAuth<'a> {
 /// the documented trusted-network posture, which has **no** cryptographic
 /// authenticity and **no** freshness — trust rests entirely on the socket peer
 /// being inside `FERRUM_TRUSTED_PROXIES`.
-#[allow(dead_code)] // Used by external tests; the gateway only ever decodes.
 pub fn encode_datagram_with_metadata(
     form: DatagramEnvelopeForm,
     payload: &[u8],

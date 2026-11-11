@@ -238,8 +238,9 @@ impl FaultInjectionPlugin {
         let obj = config
             .as_object()
             .ok_or("fault_injection: config must be an object")?;
-        reject_unknown_keys(
-            obj.keys(),
+        crate::util::unknown_keys::reject_unknown_keys(
+            obj,
+            "config",
             &[
                 "abort",
                 "delay",
@@ -247,15 +248,16 @@ impl FaultInjectionPlugin {
                 "match",
                 "expires_at",
             ],
-            "config",
+            "fault_injection: `config`: ",
         )?;
 
         let abort = match obj.get("abort") {
             Some(Value::Object(abort_obj)) => {
-                reject_unknown_keys(
-                    abort_obj.keys(),
-                    &["status_code", "percentage", "grpc_status", "body"],
+                crate::util::unknown_keys::reject_unknown_keys(
+                    abort_obj,
                     "abort",
+                    &["status_code", "percentage", "grpc_status", "body"],
+                    "fault_injection: `abort`: ",
                 )?;
                 let status_code = abort_obj.get("status_code").and_then(json_u64).ok_or(
                     "fault_injection: `abort.status_code` is required and must be an integer",
@@ -305,7 +307,12 @@ impl FaultInjectionPlugin {
 
         let delay = match obj.get("delay") {
             Some(Value::Object(delay_obj)) => {
-                reject_unknown_keys(delay_obj.keys(), &["duration_ms", "percentage"], "delay")?;
+                crate::util::unknown_keys::reject_unknown_keys(
+                    delay_obj,
+                    "delay",
+                    &["duration_ms", "percentage"],
+                    "fault_injection: `delay`: ",
+                )?;
                 let duration_ms = delay_obj.get("duration_ms").and_then(json_u64).ok_or(
                     "fault_injection: `delay.duration_ms` is required and must be a positive integer",
                 )?;
@@ -375,7 +382,12 @@ fn parse_request_match(val: Option<&Value>) -> Result<Option<RequestMatch>, Stri
         Some(Value::Null) | None => return Ok(None),
         Some(_) => return Err("fault_injection: `match` must be an object".to_string()),
     };
-    reject_unknown_keys(match_obj.keys(), &["headers"], "match")?;
+    crate::util::unknown_keys::reject_unknown_keys(
+        match_obj,
+        "match",
+        &["headers"],
+        "fault_injection: `match`: ",
+    )?;
     let Some(Value::Object(headers_obj)) = match_obj.get("headers") else {
         return Err(
             "fault_injection: `match.headers` is required and must be an object".to_string(),
@@ -429,19 +441,6 @@ fn parse_expires_at(val: Option<&Value>) -> Result<Option<i64>, String> {
         Some(Value::Null) | None => Ok(None),
         Some(_) => Err("fault_injection: `expires_at` must be an RFC 3339 timestamp".to_string()),
     }
-}
-
-fn reject_unknown_keys<'a>(
-    keys: impl Iterator<Item = &'a String>,
-    allowed: &[&str],
-    scope: &str,
-) -> Result<(), String> {
-    for key in keys {
-        if !allowed.contains(&key.as_str()) {
-            return Err(format!("fault_injection: unknown `{scope}` field {key:?}"));
-        }
-    }
-    Ok(())
 }
 
 /// Accept JSON integers and mathematically integral numbers (`503.0`, `5.03e2`).

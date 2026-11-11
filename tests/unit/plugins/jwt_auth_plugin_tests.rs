@@ -158,7 +158,13 @@ fn test_jwt_auth_rejects_unknown_security_policy_keys() {
         let err = JwtAuth::new(&config)
             .err()
             .expect("unknown jwt_auth config key must fail closed");
-        assert_eq!(err, format!("jwt_auth: unknown config key {unknown_key:?}"));
+        assert!(
+            err.starts_with(&format!(
+                "jwt_auth: `config`: unknown configuration key(s): {:?}",
+                format!("config.{unknown_key}")
+            )),
+            "{err}"
+        );
     }
 }
 
@@ -1227,7 +1233,10 @@ async fn array_issuer_rejects_even_with_no_issuer_configured() {
 fn configuration_diagnostics_keep_schema_and_withhold_supplied_values() {
     let canary = "'SECURITY_DIAGNOSTIC_CANARY\"`\n\\payload";
     let cases: &[(serde_json::Value, &[&str])] = &[
-        (json!({(canary): true}), &["unknown config key"]),
+        (
+            json!({(canary): true}),
+            &["unknown configuration key(s)", "`config`"],
+        ),
         (
             json!({"audiences": [true]}),
             &["`audiences[0]`", "must be a string"],
@@ -1378,7 +1387,13 @@ async fn shared_secret_quarantine_blocks_cross_consumer_impersonation() {
     let mut ctx = bearer_ctx(&forged);
     assert_continue(plugin.authenticate(&mut ctx, &unquarantined).await);
 
-    assert_eq!(config.quarantine_invalid_jwt_credentials().len(), 2);
+    assert_eq!(
+        config
+            .quarantine_invalid_jwt_credentials_against(&Default::default())
+            .messages
+            .len(),
+        2
+    );
     let index = ConsumerIndex::new(&config.consumers);
     for sub in ["alice", "eve"] {
         let mut ctx = bearer_ctx(&create_jwt_token(&json!({ "sub": sub }), shared));

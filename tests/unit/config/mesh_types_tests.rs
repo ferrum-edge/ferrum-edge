@@ -263,8 +263,9 @@ fn peer_authentication_default_mtls_mode_is_permissive() {
     let pa = PeerAuthentication {
         name: "allow-mixed".into(),
         namespace: "default".into(),
-        scope: None,
-        selector: None,
+        scope: PolicyScope::Namespace {
+            namespace: "default".into(),
+        },
         mtls_mode: MtlsMode::default(),
         port_overrides: HashMap::new(),
     };
@@ -277,13 +278,18 @@ fn peer_authentication_default_mtls_mode_is_permissive() {
 /// marker survives the CP -> DP carrier.
 #[test]
 fn peer_authentication_unset_mode_is_explicit_and_round_trips() {
-    let omitted = serde_json::json!({"name": "omitted", "namespace": "default"});
+    let omitted = serde_json::json!({
+        "name": "omitted",
+        "namespace": "default",
+        "scope": {"kind": "namespace", "namespace": "default"}
+    });
     let omitted: PeerAuthentication = serde_json::from_value(omitted).unwrap();
     assert_eq!(omitted.mtls_mode, MtlsMode::Permissive);
 
     let unset = serde_json::json!({
         "name": "inherit",
         "namespace": "default",
+        "scope": {"kind": "namespace", "namespace": "default"},
         "mtls_mode": "unset",
         "port_overrides": {"8080": "unset"}
     });
@@ -298,6 +304,98 @@ fn peer_authentication_unset_mode_is_explicit_and_round_trips() {
     let encoded = serde_json::to_string(&unset).unwrap();
     let back: PeerAuthentication = serde_json::from_str(&encoded).unwrap();
     assert_eq!(back, unset);
+}
+
+fn decode_peer_authentication(value: serde_json::Value) -> Result<PeerAuthentication, String> {
+    serde_json::from_value(value).map_err(|error| error.to_string())
+}
+
+fn api_selector(namespace: Option<&str>) -> WorkloadSelector {
+    WorkloadSelector {
+        labels: HashMap::from([("app".to_string(), "api".to_string())]),
+        namespace: namespace.map(str::to_string),
+    }
+}
+
+/// `scope` is the one PeerAuthentication applicability shape (issue #7243),
+/// and it is what a PeerAuthentication serializes: no `selector` member.
+#[test]
+fn peer_authentication_serializes_scope_and_no_selector() {
+    let pa = PeerAuthentication {
+        name: "api-strict".into(),
+        namespace: "default".into(),
+        scope: PolicyScope::WorkloadSelector {
+            selector: api_selector(Some("default")),
+        },
+        mtls_mode: MtlsMode::Strict,
+        port_overrides: HashMap::new(),
+    };
+    let encoded = serde_json::to_value(&pa).unwrap();
+    assert!(encoded.get("selector").is_none(), "{encoded}");
+    assert_eq!(
+        encoded["scope"],
+        serde_json::json!({
+            "kind": "workload_selector",
+            "selector": {"labels": {"app": "api"}, "namespace": "default"}
+        })
+    );
+    assert_eq!(decode_peer_authentication(encoded).unwrap(), pa);
+}
+
+/// The scope-less form earlier builds wrote is refused (issue #7243): a
+/// document without `scope` is missing a required field, and the legacy
+/// `selector` member is refused like any other unknown member, with or
+/// without a `scope` beside it. ConfigSync protocol revision 4 carries this
+/// shape, so no earlier build's snapshot reaches this decoder.
+#[test]
+fn peer_authentication_legacy_scope_less_forms_are_refused() {
+    let missing_scope = decode_peer_authentication(serde_json::json!({
+        "name": "ns-strict",
+        "namespace": "default",
+        "mtls_mode": "strict"
+    }))
+    .unwrap_err();
+    assert!(
+        missing_scope.contains("missing field `scope`"),
+        "unexpected error: {missing_scope}"
+    );
+
+    for document in [
+        serde_json::json!({
+            "name": "api-strict",
+            "namespace": "default",
+            "selector": {"labels": {"app": "api"}},
+            "mtls_mode": "strict"
+        }),
+        serde_json::json!({
+            "name": "api-strict",
+            "namespace": "default",
+            "scope": {
+                "kind": "workload_selector",
+                "selector": {"labels": {"app": "api"}, "namespace": "default"}
+            },
+            "selector": {"labels": {"app": "api"}, "namespace": "default"}
+        }),
+    ] {
+        let error = decode_peer_authentication(document).unwrap_err();
+        assert!(
+            error.contains("unknown field `selector`"),
+            "unexpected error: {error}"
+        );
+    }
+}
+
+/// The decode shape stays closed (issue #6616): an unknown member is refused.
+#[test]
+fn peer_authentication_unknown_member_is_refused() {
+    let error = decode_peer_authentication(serde_json::json!({
+        "name": "api-strict",
+        "namespace": "default",
+        "scope": {"kind": "namespace", "namespace": "default"},
+        "mtls_mod": "strict"
+    }))
+    .unwrap_err();
+    assert!(error.contains("unknown field"), "unexpected error: {error}");
 }
 
 #[test]

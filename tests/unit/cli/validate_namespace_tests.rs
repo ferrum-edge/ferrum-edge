@@ -319,6 +319,36 @@ fn empty_mismatch_helper_distinguishes_empty_documents() {
     assert!(diagnostic.contains("proxies=0"));
 }
 
+/// The rendered diagnostic (what `validate` actually prints) withholds the
+/// supplied namespace names but keeps the counts, the number of document
+/// namespaces, and the recovery hint intact.
+#[test]
+fn rendered_namespace_mismatch_withholds_names_and_keeps_counts() {
+    let mismatch = ValidateNamespaceFilter {
+        active_namespace: "tenant-other".into(),
+        document_namespaces: vec!["tenant-a".into(), "tenant-b".into()],
+        document_had_namespaced_resources: true,
+        count_fields: vec![("proxies", 0), ("consumers", 0)],
+    };
+    let rendered = ferrum_edge::startup::render_startup_error(
+        anyhow::anyhow!("{}. Set FERRUM_NAMESPACE now", mismatch.diagnostic()),
+        &[],
+    );
+    assert!(
+        !rendered.contains("tenant-"),
+        "namespace names must be withheld"
+    );
+    assert!(rendered.contains("left 0 surviving resources (proxies=0, consumers=0)"));
+    assert!(
+        rendered.contains("the document resources use 2 namespace(s): <redacted scalar>"),
+        "got: {rendered}"
+    );
+    assert!(
+        rendered.ends_with(". Set FERRUM_NAMESPACE now"),
+        "no apostrophe may swallow the hint: {rendered}"
+    );
+}
+
 #[test]
 fn validate_prints_warning_when_empty_namespace_is_allowed() {
     let source = include_str!("../../../src/cli.rs")

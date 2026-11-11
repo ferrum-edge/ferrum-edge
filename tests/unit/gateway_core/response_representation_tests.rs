@@ -22,7 +22,7 @@ use std::sync::{
 };
 
 use ferrum_edge::_test_support::{
-    apply_synthetic_response_body_hooks_for_test, clone_log_metadata_for_test,
+    apply_synthetic_response_body_hooks_for_test, clone_log_metadata,
     discard_grpc_application_trailers_after_body_rewrite_for_test,
     finalize_selected_buffered_grpc_terminal_response_for_test,
     refresh_grpc_status_metadata_for_test, representation_rejection_reason_for_test,
@@ -3068,7 +3068,7 @@ fn origin_fragment_marker_is_stripped_from_transaction_metadata() {
             "{case}: the gate must have stamped its fragment evidence"
         );
 
-        let metadata = clone_log_metadata_for_test(&ctx);
+        let metadata = clone_log_metadata(&ctx);
 
         assert!(
             !metadata.contains_key("ferrum:origin_fragment_response"),
@@ -3095,7 +3095,7 @@ fn no_internal_origin_response_stamp_reaches_transaction_metadata() {
     headers.insert("content-length".to_string(), "128".to_string());
     stamp_original_response_metadata_for_test(&mut ctx, 206, &headers);
 
-    let metadata = clone_log_metadata_for_test(&ctx);
+    let metadata = clone_log_metadata(&ctx);
 
     let leaked: Vec<&String> = metadata
         .keys()

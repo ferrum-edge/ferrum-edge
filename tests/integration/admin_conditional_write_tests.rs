@@ -4191,7 +4191,7 @@ async fn assert_deployment_cancellation_and_live_ack(db: Arc<dyn DatabaseBackend
         });
         if live {
             tokio::time::timeout(Duration::from_secs(10), async {
-                while apply.waiter_count() == 0 {
+                while apply.wake_signal().signals_total() == 0 {
                     tokio::task::yield_now().await;
                 }
             })
@@ -5024,7 +5024,7 @@ async fn assert_mongo_deployment_raw_preservation(
         }
     });
     tokio::time::timeout(std::time::Duration::from_secs(10), async {
-        while apply.waiter_count() == 0 {
+        while apply.wake_signal().signals_total() == 0 {
             tokio::task::yield_now().await;
         }
     })

@@ -2801,6 +2801,72 @@ async fn test_websocket_method_policy_uses_forwarded_get_method() {
     echo_handle.abort();
 }
 
+/// Issue #7188: a clean end of an H3 WebSocket session halts the client's
+/// still-open request direction with `STOP_SENDING(H3_NO_ERROR)`, never the
+/// `STOP_SENDING(0)` a dropped receive half produces (`0x0` is not an HTTP/3
+/// code, so clients log a reset on a successful session).
+#[ignore]
+#[tokio::test]
+async fn test_h3_websocket_clean_close_stops_the_request_direction_with_h3_no_error() {
+    let backend_port = free_port().await;
+    let echo_handle = tokio::spawn(start_ws_echo_server(backend_port));
+    sleep(Duration::from_millis(300)).await;
+
+    let temp_dir = TempDir::new().expect("Failed to create temp dir");
+    let config_path = temp_dir.path().join("config.yaml");
+    write_ws_config(&config_path, backend_port);
+    let cert_path = "tests/certs/server.crt";
+    let key_path = "tests/certs/server.key";
+    build_gateway().expect("Failed to build gateway");
+    let (mut gateway, _gateway_http_port, gateway_https_port) =
+        start_gateway_tls_with_retry(config_path.to_str().unwrap(), cert_path, key_path).await;
+
+    let h3_url = format!("https://localhost:{gateway_https_port}/ws-echo");
+    let h3_client = Http3Client::insecure().expect("H3 client");
+    let mut h3_ws = h3_client
+        .websocket(&h3_url, WebSocketOptions::default())
+        .await
+        .expect("send H3 Extended CONNECT");
+    assert_eq!(h3_ws.status, StatusCode::OK);
+    h3_ws.send_text("before close").await.expect("send text");
+    assert_eq!(h3_ws.recv_text().await.expect("echo"), "Echo: before close");
+
+    // A WebSocket Close WITHOUT a QUIC FIN: the client's request direction
+    // stays open while the gateway ends the session cleanly.
+    h3_ws
+        .send_fragment(0x8, &[], true)
+        .await
+        .expect("send Close frame");
+    loop {
+        match h3_ws.recv_frame().await {
+            Ok(H3WebSocketFrame::Close(_)) | Err(_) => break,
+            Ok(_) => continue,
+        }
+    }
+
+    // The client sees the gateway's STOP_SENDING code on its next write.
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let stopped = loop {
+        match h3_ws.send_binary(b"after close").await {
+            Err(error) => break error.to_string(),
+            Ok(()) => {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "the gateway never halted the client's request direction"
+                );
+                sleep(Duration::from_millis(50)).await;
+            }
+        }
+    };
+    assert!(
+        stopped.contains("H3_NO_ERROR"),
+        "a clean H3 WebSocket end must halt the request direction with H3_NO_ERROR: {stopped}"
+    );
+
+    gateway.shutdown();
+    echo_handle.abort();
+}
+
 /// Issue #2467: response_mock intentionally participates in every WebSocket
 /// handshake frontend. Matching and default-unmatched responses must terminate
 /// H1 Upgrade and H2/H3 Extended CONNECT before any backend dial or frame relay.

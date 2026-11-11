@@ -15,15 +15,11 @@ use dashmap::DashMap;
 use dashmap::mapref::entry::Entry;
 use serde_json::Value;
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, Weak};
-use std::time::Duration;
-use tokio::task::JoinHandle;
 
 use super::{Plugin, PluginResult, StreamAdmissionPermit, StreamConnectionContext};
 
-const MAX_CLEANUP_INTERVAL_SECONDS: u64 = 86_400;
-const DEFAULT_CLEANUP_INTERVAL_SECONDS: u64 = 60;
 /// Default IPv6 grouping for anonymous (IP-keyed) budgets: one `/64` is the
 /// conventional single-site allocation, so a host cannot mint fresh budgets by
 /// rotating addresses inside its own subnet. Matches `rate_limiting`.
@@ -35,7 +31,6 @@ const IPV6_PREFIX_ERROR: &str =
 /// Effective configuration after parsing and defaulting.
 struct ParsedConfig {
     max_connections_per_key: u64,
-    cleanup_interval_seconds: u64,
     ipv6_prefix: u8,
 }
 
@@ -43,15 +38,13 @@ struct ConnectionCounter {
     active: AtomicU64,
 }
 
-struct CleanupTask {
-    interval_seconds: u64,
-    handle: Option<JoinHandle<()>>,
-}
-
 /// Stable accounting state shared by compatible plugin-cache generations.
+///
+/// An entry exists only while its count is positive: admission creates it at
+/// 1 and the release that takes it from 1 removes it under the same shard
+/// entry guard, so no zero-count entry is ever left behind to sweep.
 pub(crate) struct TcpConnectionThrottleState {
     active_counts: DashMap<String, Arc<ConnectionCounter>>,
-    cleanup_task: Mutex<CleanupTask>,
 }
 
 impl TcpConnectionThrottleState {
@@ -59,10 +52,6 @@ impl TcpConnectionThrottleState {
         let shard_amount = crate::util::sharding::pool_shard_amount(pool_shard_amount);
         Arc::new(Self {
             active_counts: DashMap::with_shard_amount(shard_amount),
-            cleanup_task: Mutex::new(CleanupTask {
-                interval_seconds: 0,
-                handle: None,
-            }),
         })
     }
 
@@ -129,61 +118,10 @@ impl TcpConnectionThrottleState {
             total.saturating_add(entry.value().active.load(Ordering::Relaxed))
         })
     }
-
-    fn sweep_residual_zero_entries(&self) {
-        self.active_counts
-            .retain(|_, counter| counter.active.load(Ordering::Relaxed) > 0);
-    }
-
-    pub(crate) fn set_cleanup_interval(self: &Arc<Self>, interval_seconds: u64) {
-        let runtime = tokio::runtime::Handle::try_current().ok();
-        let mut task = self
-            .cleanup_task
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if task.interval_seconds == interval_seconds
-            && (interval_seconds == 0 || task.handle.is_some() || runtime.is_none())
-        {
-            return;
-        }
-        if let Some(handle) = task.handle.take() {
-            handle.abort();
-        }
-        task.interval_seconds = interval_seconds;
-        let Some(runtime) = runtime.filter(|_| interval_seconds > 0) else {
-            return;
-        };
-
-        let state: Weak<Self> = Arc::downgrade(self);
-        task.handle = Some(runtime.spawn(async move {
-            let mut timer = tokio::time::interval(Duration::from_secs(interval_seconds));
-            timer.tick().await;
-            loop {
-                timer.tick().await;
-                let Some(state) = state.upgrade() else {
-                    return;
-                };
-                state.sweep_residual_zero_entries();
-            }
-        }));
-    }
-}
-
-impl Drop for TcpConnectionThrottleState {
-    fn drop(&mut self) {
-        let task = self
-            .cleanup_task
-            .get_mut()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if let Some(handle) = task.handle.take() {
-            handle.abort();
-        }
-    }
 }
 
 pub struct TcpConnectionThrottle {
     max_connections_per_key: u64,
-    cleanup_interval_seconds: u64,
     ipv6_prefix: u8,
     state: Arc<TcpConnectionThrottleState>,
 }
@@ -194,13 +132,9 @@ impl TcpConnectionThrottle {
         pool_shard_amount: usize,
     ) -> Result<Self, String> {
         let parsed = parse_config(config)?;
-        // The residual-entry sweep starts in `commit_background_tasks` (or
-        // from the plugin cache's shared-state commit), never here: config
-        // validation constructs and drops instances (issue #6616).
         let state = TcpConnectionThrottleState::new(pool_shard_amount);
         Ok(Self {
             max_connections_per_key: parsed.max_connections_per_key,
-            cleanup_interval_seconds: parsed.cleanup_interval_seconds,
             ipv6_prefix: parsed.ipv6_prefix,
             state,
         })
@@ -213,7 +147,6 @@ impl TcpConnectionThrottle {
         let parsed = parse_config(config)?;
         Ok(Self {
             max_connections_per_key: parsed.max_connections_per_key,
-            cleanup_interval_seconds: parsed.cleanup_interval_seconds,
             ipv6_prefix: parsed.ipv6_prefix,
             state,
         })
@@ -221,10 +154,6 @@ impl TcpConnectionThrottle {
 
     pub(crate) fn shared_state(&self) -> Arc<TcpConnectionThrottleState> {
         Arc::clone(&self.state)
-    }
-
-    pub(crate) fn cleanup_interval_seconds(&self) -> u64 {
-        self.cleanup_interval_seconds
     }
 
     fn throttle_key(&self, ctx: &StreamConnectionContext) -> String {
@@ -278,13 +207,6 @@ fn parse_config(config: &Value) -> Result<ParsedConfig, String> {
             "tcp_connection_throttle: `max_connections_per_key` must be greater than 0".to_string(),
         );
     }
-    let cleanup_interval_seconds = parse_optional_u64(object, "cleanup_interval_seconds")?
-        .unwrap_or(DEFAULT_CLEANUP_INTERVAL_SECONDS);
-    if cleanup_interval_seconds > MAX_CLEANUP_INTERVAL_SECONDS {
-        return Err(format!(
-            "tcp_connection_throttle: `cleanup_interval_seconds` must be at most {MAX_CLEANUP_INTERVAL_SECONDS}"
-        ));
-    }
     let ipv6_prefix = match object.get("ipv6_prefix") {
         None => DEFAULT_IPV6_PREFIX,
         Some(value) => value
@@ -293,33 +215,16 @@ fn parse_config(config: &Value) -> Result<ParsedConfig, String> {
             .filter(|prefix| (1..=128).contains(prefix))
             .ok_or_else(|| IPV6_PREFIX_ERROR.to_string())?,
     };
-    reject_unknown_fields(object)?;
+    crate::util::unknown_keys::reject_unknown_keys(
+        object,
+        "config",
+        &["max_connections_per_key", "ipv6_prefix"],
+        "tcp_connection_throttle: `config`: ",
+    )?;
     Ok(ParsedConfig {
         max_connections_per_key,
-        cleanup_interval_seconds,
         ipv6_prefix,
     })
-}
-
-fn reject_unknown_fields(object: &serde_json::Map<String, Value>) -> Result<(), String> {
-    let unknown: Vec<&str> = object
-        .keys()
-        .map(String::as_str)
-        .filter(|field| {
-            !matches!(
-                *field,
-                "max_connections_per_key" | "cleanup_interval_seconds" | "ipv6_prefix"
-            )
-        })
-        .collect();
-    if unknown.is_empty() {
-        Ok(())
-    } else {
-        Err(format!(
-            "tcp_connection_throttle: unknown config field(s): {:?}",
-            unknown.join(", ")
-        ))
-    }
 }
 
 fn parse_required_u64(object: &serde_json::Map<String, Value>, field: &str) -> Result<u64, String> {
@@ -328,33 +233,10 @@ fn parse_required_u64(object: &serde_json::Map<String, Value>, field: &str) -> R
     })
 }
 
-fn parse_optional_u64(
-    object: &serde_json::Map<String, Value>,
-    field: &str,
-) -> Result<Option<u64>, String> {
-    object
-        .get(field)
-        .map(|value| {
-            value
-                .as_u64()
-                .ok_or_else(|| format!("tcp_connection_throttle: `{field}` must be an integer"))
-        })
-        .transpose()
-}
-
 #[async_trait]
 impl Plugin for TcpConnectionThrottle {
     fn name(&self) -> &str {
         "tcp_connection_throttle"
-    }
-
-    /// Arm the residual-entry sweep for the installed generation. Idempotent:
-    /// `set_cleanup_interval` keeps a running task at an unchanged interval.
-    /// The plugin cache also re-applies intervals for its shared states after
-    /// installation; this covers instances that own a private state.
-    fn commit_background_tasks(&self) {
-        self.state
-            .set_cleanup_interval(self.cleanup_interval_seconds);
     }
 
     fn priority(&self) -> u16 {

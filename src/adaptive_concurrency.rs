@@ -471,10 +471,6 @@ impl AdaptiveConcurrencyLimiter {
         self.tracking_space.load().inner.len()
     }
 
-    // Public convenience entrypoint used by the library's external tests and
-    // custom integrations. The binary crate uses the generation-aware path
-    // through `AdaptiveConcurrency::try_backend_admission` instead.
-    #[allow(dead_code)]
     pub fn try_acquire(
         &self,
         proxy: &Proxy,
@@ -986,7 +982,6 @@ impl AdaptiveConcurrencyLimiter {
         }
     }
 
-    #[allow(dead_code)]
     pub fn snapshot(
         &self,
         proxy: &Proxy,
@@ -1012,7 +1007,6 @@ impl AdaptiveConcurrencyLimiter {
     /// target only needs a shared read of its shard. `None` when the target is
     /// not tracked in the active space.
     #[doc(hidden)]
-    #[allow(dead_code)] // External unit tests call this through the library target.
     pub fn hold_target_read_guard_for_test<R>(
         &self,
         proxy: &Proxy,
@@ -1056,7 +1050,6 @@ impl AdaptiveConcurrencyLimiter {
 
     /// Every target tracked in the active tracking space. Inspection only, for
     /// in-process fixtures that settle real requests through the proxy.
-    #[allow(dead_code)] // Bin target omits lib::_test_support; integration tests call via that seam.
     pub(crate) fn snapshots(&self) -> Vec<AdaptiveConcurrencySnapshot> {
         let tracking_space = self.tracking_space.load();
         tracking_space
@@ -1156,7 +1149,6 @@ pub enum AdaptiveConcurrencyAdmissionKind {
     UntrackedBypass,
 }
 
-#[allow(dead_code)]
 #[derive(Clone, Debug)]
 pub struct AdaptiveConcurrencySnapshot {
     pub key: AdaptiveConcurrencyKey,

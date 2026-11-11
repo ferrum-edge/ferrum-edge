@@ -2,7 +2,6 @@
 //!
 //! HBONE is HTTP/2 CONNECT over mTLS. Ferrum keeps this parsing boundary small
 //! and explicit so future ambient transports can plug in beside it.
-#![allow(dead_code)]
 
 use std::collections::BTreeMap;
 

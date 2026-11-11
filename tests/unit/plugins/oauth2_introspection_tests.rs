@@ -263,6 +263,45 @@ fn new_accepts_credentialed_client_auth_for_remote_https_endpoint() {
     }
 }
 
+/// Issue #7275: plugin config is never environment-expanded, so a
+/// `client_secret` written as `${NAME}` would be sent to the provider verbatim
+/// and every introspection would fail. Admission refuses it for both secret
+/// methods, without echoing the value, and still admits ordinary secret text
+/// that merely contains `${`.
+#[test]
+fn new_rejects_env_placeholder_client_secret() {
+    for method in ["client_secret_basic", "client_secret_post"] {
+        for secret in [
+            "${INTROSPECTION_CLIENT_SECRET}",
+            "prefix-${CLIENT_SECRET}-suffix",
+        ] {
+            let mut config = config_with_client_auth("https://idp.internal/introspect", method);
+            config["providers"][0]["client_auth"]["client_secret"] = json!(secret);
+            let err = match Oauth2Introspection::new(&config, PluginHttpClient::default()) {
+                Ok(_) => {
+                    panic!("method {method}: an env placeholder client_secret must be refused")
+                }
+                Err(err) => err,
+            };
+            assert_eq!(
+                err,
+                "oauth2_introspection: `provider[0].client_auth.client_secret` contains an \
+                 unresolved `${NAME}` placeholder; plugin config values are literal",
+                "method {method} produced an unexpected error"
+            );
+        }
+    }
+    for secret in ["literal-${-secret", "${9NOT_A_NAME}-secret"] {
+        let mut config =
+            config_with_client_auth("https://idp.internal/introspect", "client_secret_basic");
+        config["providers"][0]["client_auth"]["client_secret"] = json!(secret);
+        assert!(
+            Oauth2Introspection::new(&config, PluginHttpClient::default()).is_ok(),
+            "ordinary secret text containing `${{` must be admitted"
+        );
+    }
+}
+
 #[test]
 fn new_accepts_credentialed_client_auth_for_loopback_http_endpoint() {
     for endpoint in [
@@ -944,7 +983,10 @@ fn new_rejects_unknown_fields_at_every_config_layer() {
         let error = Oauth2Introspection::new(&config, PluginHttpClient::default())
             .err()
             .expect("unknown config key must fail closed");
-        assert!(error.contains("unknown field"), "unexpected error: {error}");
+        assert!(
+            error.contains("unknown configuration key"),
+            "unexpected error: {error}"
+        );
     }
 }
 
@@ -2712,7 +2754,7 @@ fn configuration_diagnostics_keep_schema_and_withhold_supplied_values() {
     let cases: &[(serde_json::Value, &[&str])] = &[
         (
             json!({"providers": [{(canary): true}]}),
-            &["provider[0]", "unknown field"],
+            &["`provider[0]`", "unknown configuration key(s)"],
         ),
         (
             json!({"providers": [{

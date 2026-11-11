@@ -399,22 +399,118 @@ fn udp_route_reference_grant_for_another_kind_does_not_authorize() {
     );
 }
 
-#[test]
-fn udp_route_rejects_cross_namespace_parent_ref() {
+/// A UDP Gateway in `backends` whose listener admits routes `from` the given
+/// namespace policy.
+fn backends_udp_gateway(allowed_from: &str) -> K8sObject {
     let mut gateway = udp_gateway("edge", "dns", 15353);
     gateway.metadata.namespace = "backends".to_string();
-    gateway.spec["listeners"][0]["allowedRoutes"]["namespaces"]["from"] = json!("All");
-    let spec = json!({
-        "parentRefs": [{"name": "edge", "namespace": "backends"}],
-        "rules": [{"backendRefs": [{"name": "coredns", "port": 5353}]}]
-    });
-    let objects = [gateway_class(), gateway, udp_route("dns", spec)];
+    gateway.spec["listeners"][0]["allowedRoutes"]["namespaces"]["from"] = json!(allowed_from);
+    gateway
+}
 
-    let translated = translate_k8s_objects(&objects, multi_namespace_options());
-    let err = translated.expect_err("cross-namespace L4 parents fail closed");
+fn cross_namespace_parent(legs: Value) -> Value {
+    json!({
+        "parentRefs": [{"name": "edge", "namespace": "backends", "sectionName": "dns"}],
+        "rules": [{"backendRefs": legs}]
+    })
+}
 
-    let message = err.to_string();
-    assert!(message.contains("UDPRoute cross-namespace parentRefs"));
+/// Issue #7305: a cross-namespace UDPRoute parentRef follows the same
+/// `allowedRoutes` contract as TCPRoute/TLSRoute and materializes in the
+/// parent Gateway's namespace, under a source-bound id.
+#[test]
+fn udp_route_cross_namespace_parent_ref_materializes_in_gateway_namespace() {
+    let spec = cross_namespace_parent(json!([{"name": "coredns", "port": 5353}]));
+    let objects = [
+        gateway_class(),
+        backends_udp_gateway("All"),
+        service("default", "coredns", 5353),
+        udp_route("dns", spec),
+    ];
+
+    let result = translate_k8s_objects(&objects, multi_namespace_options())
+        .expect("an All-namespaces UDP listener admits a cross-namespace parentRef");
+
+    assert_eq!(result.config.proxies.len(), 1);
+    assert!(result.config.upstreams.is_empty());
+    let proxy = &result.config.proxies[0];
+    assert_eq!(proxy.namespace, "backends");
+    assert_eq!(proxy.listen_port, Some(15353));
+    assert_eq!(proxy.backend_scheme, Some(BackendScheme::Udp));
+    assert_eq!(proxy.backend_host, "coredns.default.svc.cluster.local");
+    assert!(
+        proxy.id.starts_with("gwapi-l4-") && proxy.id.contains("__"),
+        "a route materialized outside its namespace gets a source-bound id: {}",
+        proxy.id
+    );
+    assert!(
+        proxy.udp_max_response_amplification_factor.is_some(),
+        "the cross-namespace proxy still carries the amplification posture"
+    );
+    assert!(result.materialized_route_parents.iter().any(|parent| {
+        parent.route.namespace == "default"
+            && parent.route.name == "dns"
+            && parent.parent_ref.contains("/Gateway/backends/edge/dns")
+    }));
+
+    let updates = plan_gateway_api_status_updates(&objects, multi_namespace_options(), &[]);
+    assert_eq!(
+        route_condition(&updates, "dns", "Accepted").as_deref(),
+        Some("True")
+    );
+}
+
+#[test]
+fn udp_route_cross_namespace_weighted_upstream_lives_in_gateway_namespace() {
+    let spec = cross_namespace_parent(json!([
+        {"name": "coredns-a", "port": 5353, "weight": 3},
+        {"name": "coredns-b", "port": 5354, "weight": 1}
+    ]));
+    let objects = [
+        gateway_class(),
+        backends_udp_gateway("All"),
+        udp_route("dns", spec),
+    ];
+
+    let result =
+        translate_k8s_objects(&objects, multi_namespace_options()).expect("translation succeeds");
+    let (proxy, upstream) = sole_proxy_and_upstream(&result);
+
+    // The proxy resolves its upstream inside its own namespace, so the
+    // upstream must follow it into the Gateway's namespace.
+    assert_eq!(upstream.namespace, "backends");
+    assert!(
+        upstream.id.starts_with("gwapi-l4-upstream-") && upstream.id.contains("__"),
+        "{}",
+        upstream.id
+    );
+    assert_eq!(proxy.listen_port, Some(15353));
+    assert_eq!(
+        target_weights(upstream),
+        vec![
+            ("coredns-a.default.svc.cluster.local".to_string(), 5353, 3),
+            ("coredns-b.default.svc.cluster.local".to_string(), 5354, 1),
+        ]
+    );
+}
+
+#[test]
+fn udp_route_cross_namespace_parent_ref_needs_listener_allowance() {
+    let spec = cross_namespace_parent(json!([{"name": "coredns", "port": 5353}]));
+    let objects = [
+        gateway_class(),
+        backends_udp_gateway("Same"),
+        udp_route("dns", spec),
+    ];
+
+    let err = translate_k8s_objects(&objects, multi_namespace_options())
+        .expect_err("a Same-only listener refuses a cross-namespace UDPRoute");
+
+    assert!(
+        err.to_string()
+            .contains("not permitted by the target Gateway listener"),
+        "{err}"
+    );
 }
 
 #[test]

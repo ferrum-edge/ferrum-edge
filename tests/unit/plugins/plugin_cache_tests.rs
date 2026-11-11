@@ -378,13 +378,12 @@ fn cache_diagnostics_withhold_values_before_startup_and_reload_log_emission() {
     for value in [json!(DIAGNOSTIC_VALUE), json!(918273641), json!(true)] {
         cases.push((
             "ip_restriction",
-            json!({"allow": ["127.0.0.1"], "mode": value}),
+            json!({"allow": value}),
             None,
             vec![
                 "config validation failed",
-                "`mode`",
-                "`allow_first`",
-                "`deny_first`",
+                "`allow`",
+                "must be an array of IP/CIDR strings",
             ],
             false,
         ));
@@ -569,18 +568,18 @@ fn cache_diagnostics_preserve_ordered_causes_after_adversarial_identities() {
         }))
         .unwrap(),
     );
-    let mut invalid_mode = make_plugin_config_with_json(
+    let mut invalid_allow = make_plugin_config_with_json(
         "second",
         "ip_restriction",
-        json!({"allow": ["127.0.0.1"], "mode": true}),
+        json!({"allow": true}),
         PluginScope::Global,
         None,
     );
     // A trigger forces concrete construction during candidate admission too;
     // an ordinary IP restriction is otherwise only a topology placeholder.
-    invalid_mode.trigger =
+    invalid_allow.trigger =
         Some(serde_json::from_value(json!({"when": {"match": {"method": ["GET"]}}})).unwrap());
-    let config = make_config(vec![], vec![triggered, invalid_mode]);
+    let config = make_config(vec![], vec![triggered, invalid_allow]);
     for error in [
         validate_plugin_composition_candidate_with_real_ip_header_for_test(&config, None)
             .expect_err("candidate admission must preserve both rejections"),
@@ -593,10 +592,10 @@ fn cache_diagnostics_preserve_ordered_causes_after_adversarial_identities() {
         let trigger = rendered
             .find("trigger: `path` regex is invalid or too large")
             .unwrap();
-        let mode = rendered
-            .find("`mode` must be `allow_first` or `deny_first`")
+        let allow = rendered
+            .find("`allow` must be an array of IP/CIDR strings")
             .unwrap();
-        assert!(trigger < mode, "{rendered}");
+        assert!(trigger < allow, "{rendered}");
     }
 }
 
@@ -3524,7 +3523,7 @@ fn test_response_caching_unknown_key_reload_keeps_last_known_good() {
             json!({
                 "ttl_seconds": 60,
                 "vary_by_headers": ["x-tenant"],
-                "cache_key_include_consumer": true
+                "anonymous_caller_scope": "shared"
             }),
             PluginScope::Proxy,
             Some("p1"),
@@ -3543,7 +3542,7 @@ fn test_response_caching_unknown_key_reload_keeps_last_known_good() {
             json!({
                 "ttl_seconds": 60,
                 "vary_by_header": ["x-tenant"],
-                "cache_key_include_consumr": true
+                "anonymous_caller_scop": "shared"
             }),
             PluginScope::Proxy,
             Some("p1"),
@@ -3561,8 +3560,8 @@ fn test_response_caching_unknown_key_reload_keeps_last_known_good() {
         "reload error must path-qualify Vary typo: {error}"
     );
     assert!(
-        error.contains("\"config.cache_key_include_consumr\""),
-        "reload error must path-qualify consumer typo: {error}"
+        error.contains("\"config.anonymous_caller_scop\""),
+        "reload error must path-qualify the caller-scope typo: {error}"
     );
 
     let after = cache.get_plugins("ferrum", "p1");
@@ -7446,7 +7445,7 @@ fn test_apply_delta_rejects_unknown_jwt_auth_key_and_keeps_last_known_good() {
     assert!(
         error
             .to_string()
-            .contains("jwt_auth: unknown config key \"audience\""),
+            .contains("jwt_auth: `config`: unknown configuration key(s): \"config.audience\""),
         "unexpected reload error: {error}"
     );
 
@@ -12545,7 +12544,7 @@ async fn test_tcp_connection_throttle_partial_rejection_rolls_back_all_instances
     let mut wide = make_plugin_config_with_json(
         "wide",
         "tcp_connection_throttle",
-        json!({"max_connections_per_key": 2, "cleanup_interval_seconds": 0}),
+        json!({"max_connections_per_key": 2}),
         PluginScope::Proxy,
         Some("p1"),
     );
@@ -12553,7 +12552,7 @@ async fn test_tcp_connection_throttle_partial_rejection_rolls_back_all_instances
     let mut strict = make_plugin_config_with_json(
         "strict",
         "tcp_connection_throttle",
-        json!({"max_connections_per_key": 1, "cleanup_interval_seconds": 0}),
+        json!({"max_connections_per_key": 1}),
         PluginScope::Proxy,
         Some("p1"),
     );
@@ -12591,14 +12590,14 @@ async fn test_tcp_connection_throttle_active_connections_counts_live_permits() {
             make_plugin_config_with_json(
                 "wide",
                 "tcp_connection_throttle",
-                json!({"max_connections_per_key": 2, "cleanup_interval_seconds": 0}),
+                json!({"max_connections_per_key": 2}),
                 PluginScope::Proxy,
                 Some("p1"),
             ),
             make_plugin_config_with_json(
                 "strict",
                 "tcp_connection_throttle",
-                json!({"max_connections_per_key": 5, "cleanup_interval_seconds": 0}),
+                json!({"max_connections_per_key": 5}),
                 PluginScope::Proxy,
                 Some("p1"),
             ),
@@ -12640,7 +12639,7 @@ async fn test_tcp_connection_throttle_full_reload_preserves_live_admissions() {
         vec![make_plugin_config_with_json(
             "throttle",
             "tcp_connection_throttle",
-            json!({"max_connections_per_key": 1, "cleanup_interval_seconds": 0}),
+            json!({"max_connections_per_key": 1}),
             PluginScope::Proxy,
             Some("p1"),
         )],
@@ -12672,7 +12671,7 @@ async fn test_tcp_connection_throttle_delta_reload_applies_new_limit_to_shared_s
         vec![make_plugin_config_with_json(
             "throttle",
             "tcp_connection_throttle",
-            json!({"max_connections_per_key": 1, "cleanup_interval_seconds": 0}),
+            json!({"max_connections_per_key": 1}),
             PluginScope::Proxy,
             Some("p1"),
         )],
@@ -12683,8 +12682,7 @@ async fn test_tcp_connection_throttle_delta_reload_applies_new_limit_to_shared_s
     assert!(run_tcp_connect_chain(&old_plugins, &mut old_connection).await);
 
     let mut replacement = initial.clone();
-    replacement.plugin_configs[0].config =
-        json!({"max_connections_per_key": 2, "cleanup_interval_seconds": 0});
+    replacement.plugin_configs[0].config = json!({"max_connections_per_key": 2});
     replacement.plugin_configs[0].updated_at = Utc::now();
     cache
         .apply_delta(
@@ -12712,7 +12710,7 @@ async fn test_tcp_connection_throttle_decreased_limit_waits_for_old_permits_to_d
         vec![make_plugin_config_with_json(
             "throttle",
             "tcp_connection_throttle",
-            json!({"max_connections_per_key": 2, "cleanup_interval_seconds": 0}),
+            json!({"max_connections_per_key": 2}),
             PluginScope::Proxy,
             Some("p1"),
         )],
@@ -12725,8 +12723,7 @@ async fn test_tcp_connection_throttle_decreased_limit_waits_for_old_permits_to_d
     assert!(run_tcp_connect_chain(&old_plugins, &mut second).await);
 
     let mut replacement = initial.clone();
-    replacement.plugin_configs[0].config =
-        json!({"max_connections_per_key": 1, "cleanup_interval_seconds": 0});
+    replacement.plugin_configs[0].config = json!({"max_connections_per_key": 1});
     cache.rebuild(&replacement).unwrap();
     let new_plugins = cache.get_plugins_for_protocol("ferrum", "p1", ProxyProtocol::Tcp);
     let mut blocked = make_tcp_stream_context("10.0.0.5");
@@ -12745,7 +12742,7 @@ async fn test_tcp_connection_throttle_scope_move_keeps_same_proxy_accounting() {
         vec![make_plugin_config_with_json(
             "throttle",
             "tcp_connection_throttle",
-            json!({"max_connections_per_key": 1, "cleanup_interval_seconds": 0}),
+            json!({"max_connections_per_key": 1}),
             PluginScope::Proxy,
             Some("p1"),
         )],
@@ -12774,7 +12771,7 @@ async fn test_tcp_connection_throttle_rejected_reload_keeps_old_generation() {
         vec![make_plugin_config_with_json(
             "throttle",
             "tcp_connection_throttle",
-            json!({"max_connections_per_key": 1, "cleanup_interval_seconds": 0}),
+            json!({"max_connections_per_key": 1}),
             PluginScope::Proxy,
             Some("p1"),
         )],
@@ -12802,7 +12799,7 @@ async fn test_tcp_connection_throttle_removed_policy_is_generation_isolated() {
         vec![make_plugin_config_with_json(
             "throttle",
             "tcp_connection_throttle",
-            json!({"max_connections_per_key": 1, "cleanup_interval_seconds": 0}),
+            json!({"max_connections_per_key": 1}),
             PluginScope::Proxy,
             Some("p1"),
         )],
@@ -13787,12 +13784,6 @@ fn test_auth_plugins_precomputed_for_protocol() {
     assert_eq!(auth.len(), 1);
     assert_eq!(auth[0].name(), "key_auth");
 
-    let caps = cache.get_capabilities("ferrum", "p1", ProxyProtocol::Http);
-    assert!(
-        caps.has(PluginCapabilities::HAS_AUTH_PLUGINS),
-        "key_auth should set HAS_AUTH_PLUGINS"
-    );
-
     // TCP should not have key_auth (HTTP_FAMILY only)
     let tcp_auth = cache.get_auth_plugins("ferrum", "p1", ProxyProtocol::Tcp);
     assert_eq!(
@@ -13925,10 +13916,6 @@ fn test_request_view_contains_all_precomputed_fields() {
     assert!(
         view.capabilities()
             .has(PluginCapabilities::MODIFIES_REQUEST_HEADERS)
-    );
-    assert!(
-        view.capabilities()
-            .has(PluginCapabilities::HAS_AUTH_PLUGINS)
     );
 
     // Buffering flags

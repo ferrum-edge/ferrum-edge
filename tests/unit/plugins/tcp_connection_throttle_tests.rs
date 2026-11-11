@@ -62,31 +62,22 @@ fn test_tcp_connection_throttle_requires_positive_limit() {
     assert!(make_plugin(&json!({})).is_err());
     assert!(make_plugin(&json!({"max_connections_per_key": "1"})).is_err());
     assert!(make_plugin(&json!({"max_connections_per_key": 0})).is_err());
-    assert!(
-        make_plugin(&json!({
+    // The residual-entry sweep and its `cleanup_interval_seconds` knob were
+    // removed (issue #7152): entries never sit at zero, so the field is now an
+    // unknown key like any other.
+    for removed in [json!(0), json!(60)] {
+        let Err(error) = make_plugin(&json!({
             "max_connections_per_key": 1,
-            "cleanup_interval_seconds": "60"
-        }))
-        .is_err()
-    );
-    assert!(
-        make_plugin(&json!({
-            "max_connections_per_key": 1,
-            "cleanup_interval_seconds": 0
-        }))
-        .is_ok()
-    );
+            "cleanup_interval_seconds": removed
+        })) else {
+            panic!("the removed cleanup_interval_seconds field must be refused");
+        };
+        assert!(error.contains("cleanup_interval_seconds"), "{error}");
+    }
     assert!(
         make_plugin(&json!({
             "max_connections_per_key": 1,
             "cleanup_intervl_seconds": 60
-        }))
-        .is_err()
-    );
-    assert!(
-        make_plugin(&json!({
-            "max_connections_per_key": 1,
-            "cleanup_interval_seconds": 86401
         }))
         .is_err()
     );
@@ -293,8 +284,7 @@ async fn test_tcp_connection_throttle_auth_boundary_permits_do_not_overwrite() {
 #[tokio::test]
 async fn test_tcp_connection_throttle_release_admission_race_never_detaches_increment() {
     let plugin = make_plugin(&json!({
-        "max_connections_per_key": 1,
-        "cleanup_interval_seconds": 0
+        "max_connections_per_key": 1
     }))
     .unwrap();
 
@@ -540,8 +530,8 @@ fn configuration_diagnostics_keep_schema_and_withhold_supplied_values() {
     for (config, field, reason) in [
         (
             json!({"max_connections_per_key": 1, token: true}),
-            "tcp_connection_throttle",
-            "unknown config field",
+            "`config`",
+            "unknown configuration key(s)",
         ),
         (
             json!({"max_connections_per_key": true}),
@@ -732,8 +722,7 @@ async fn ipv6_prefix_never_groups_ipv4_or_mapped_ipv4() {
 async fn ipv6_grouped_keys_release_exactly_the_admitted_slot() {
     let per_host = make_plugin(&json!({
         "max_connections_per_key": 1,
-        "ipv6_prefix": 128,
-        "cleanup_interval_seconds": 0
+        "ipv6_prefix": 128
     }))
     .unwrap();
     let mut first = make_ctx("tcp-proxy", "2001:db8::1", None);
@@ -766,8 +755,7 @@ async fn ipv6_grouped_keys_release_exactly_the_admitted_slot() {
     assert_eq!(per_host.tracked_keys_count(), Some(0));
 
     let grouped = make_plugin(&json!({
-        "max_connections_per_key": 1,
-        "cleanup_interval_seconds": 0
+        "max_connections_per_key": 1
     }))
     .unwrap();
     let mut holder = make_ctx("tcp-proxy", "2001:db8::1", None);

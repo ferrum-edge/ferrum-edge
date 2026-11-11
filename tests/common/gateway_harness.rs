@@ -715,7 +715,6 @@ pub struct TestGatewayBuilder {
     health_timeout: Duration,
     max_attempts: u32,
     auto_build: bool,
-    prefer_release: bool,
     extra_env: Vec<(String, String)>,
     /// `true` after [`Self::log_level`] — the test requested a specific
     /// filter, so [`HARNESS_GATEWAY_RUST_LOG_OPT_IN`] must not override it.
@@ -753,7 +752,6 @@ impl Default for TestGatewayBuilder {
             health_timeout: Duration::from_secs(30),
             max_attempts: 3,
             auto_build: true,
-            prefer_release: false,
             extra_env: Vec::new(),
             log_level_explicit: false,
             ephemeral_port_env: Vec::new(),
@@ -872,13 +870,6 @@ impl TestGatewayBuilder {
     /// already exist under `target/debug/` or `target/release/`.
     pub fn skip_auto_build(mut self) -> Self {
         self.auto_build = false;
-        self
-    }
-
-    /// Prefer `target/release/ferrum-edge` if it exists. Defaults to debug.
-    /// Useful for perf/load tests.
-    pub fn prefer_release(mut self) -> Self {
-        self.prefer_release = true;
         self
     }
 
@@ -1069,7 +1060,7 @@ impl TestGatewayBuilder {
         // still be winding down, and a retry must never be satisfiable by it.
         let identity = SpawnedGatewayIdentity::mint_for_builder(self);
 
-        let binary = locate_binary(self.prefer_release)?;
+        let binary = locate_binary(false)?;
 
         let (mut env, mut db_url, config_path) = build_env(
             self,
@@ -1216,7 +1207,7 @@ impl TestGatewayBuilder {
         let admin_port = ephemeral_port_excluding(&mut excluded_ports).await?;
         let proxy_port = ephemeral_port_excluding(&mut excluded_ports).await?;
         let identity = SpawnedGatewayIdentity::mint_for_builder(self);
-        let binary = locate_binary(self.prefer_release)?;
+        let binary = locate_binary(false)?;
         let (mut env, db_url, config_path) = build_env(
             self,
             &identity,

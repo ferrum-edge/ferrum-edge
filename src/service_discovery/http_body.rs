@@ -106,7 +106,6 @@ impl ChargedDiscoveryBody {
 
     /// Move the bytes out while keeping the permit alive until the returned
     /// [`Bytes`] (and any clones) drop.
-    #[allow(dead_code)] // available to callers / tests that need Bytes ownership
     pub fn into_bytes(self) -> Bytes {
         Bytes::from_owner(ChargedDiscoveryBodyOwner {
             bytes: self.bytes,
@@ -226,7 +225,6 @@ pub fn install_discovery_body_limits(limits: DiscoveryBodyLimits) -> Result<(), 
 /// Callers must clear the override on the same thread after every owned permit
 /// has dropped. A permit retains the override-owned counter itself, so a drop on
 /// another thread still releases the correct budget.
-#[allow(dead_code)] // reached via `_test_support` from the external test crate
 pub fn override_discovery_body_limits_for_test(limits: DiscoveryBodyLimits) -> Result<(), String> {
     crate::config::env_config::parse_discovery_body_limits(
         Some(&limits.max_response_bytes.to_string()),
@@ -247,7 +245,6 @@ pub fn override_discovery_body_limits_for_test(limits: DiscoveryBodyLimits) -> R
 
 /// Clear the calling thread's test override without changing production state.
 /// Existing permits retain and release their own override-owned counter.
-#[allow(dead_code)] // reached via `_test_support` from the external test crate
 pub fn clear_discovery_body_limits_override_for_test() {
     TEST_OVERRIDE_LIMITS.with(|slot| {
         if let Ok(mut slot) = slot.try_borrow_mut() {
@@ -303,7 +300,6 @@ fn release_budget_counter(used_counter: &AtomicUsize, bytes: usize) {
 }
 
 /// Observation seam for tests: bytes currently charged against the shared budget.
-#[allow(dead_code)] // reached via `_test_support` from the external test crate
 pub fn discovery_body_budget_used_for_test() -> usize {
     if let Some(budget) = active_test_budget() {
         return budget.used.load(Ordering::Acquire);
@@ -312,7 +308,6 @@ pub fn discovery_body_budget_used_for_test() -> usize {
 }
 
 /// Observation seam for tests: configured shared budget ceiling.
-#[allow(dead_code)] // reached via `_test_support` from the external test crate
 pub fn discovery_body_budget_max_for_test() -> usize {
     if let Some(budget) = active_test_budget() {
         return budget.limits.body_budget_bytes;

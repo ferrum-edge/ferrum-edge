@@ -15,7 +15,6 @@ so THIS release manages no CRD and will not update its schema on upgrade.
 That is fine when one release intentionally owns the cluster-scoped CRD — keep
 that release upgraded, and check the schema marker above. To make the split
 explicit here instead, set crds.install=false and crds.skipInstallAcknowledged=true.
-To take ownership: helm upgrade --take-ownership --set crds.adoptExisting=true
 {{- end }}
 {{- if not .Values.crds.install }}
 
@@ -38,11 +37,5 @@ Injector webhook is enabled (failurePolicy={{ .Values.injector.failurePolicy }})
   clientConfig.caBundle is set from injector.caBundle
 {{- end }}
 {{- end }}
-
-Existing clusters that installed the CRD from the former crds/ directory must
-adopt it once before the first upgrade:
-
-  helm upgrade {{ .Release.Name }} ./charts/ferrum-mesh -n {{ .Release.Namespace }} \
-    --take-ownership --set crds.adoptExisting=true
 
 Docs: docs/kubernetes_deployment.md and docs/upgrade_guide.md

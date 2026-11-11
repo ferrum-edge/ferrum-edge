@@ -302,7 +302,6 @@ impl BackendConnectionLimiter {
     /// path uses, so a diagnostic lookup can never report zero for a
     /// destination that is actually at its ceiling just because the caller
     /// spelled the host differently.
-    #[allow(dead_code)]
     pub fn current(&self, host: &str, port: u16) -> u64 {
         self.inner
             .get(&BackendConnKey::new(host, port))
@@ -507,7 +506,6 @@ impl<'a> PooledConnectionAdmission<'a> {
     }
 
     /// Configured `connectionPool.tcp.maxConnections` for this lane.
-    #[allow(dead_code)]
     pub fn cap(&self) -> u32 {
         self.cap
     }
@@ -795,13 +793,11 @@ impl ReqwestConnectionAdmission {
 
     /// Number of dial destinations with a live lane. Tests/diagnostics — proves
     /// the registry drains rather than accumulating retired policy.
-    #[allow(dead_code)]
     pub fn live_lane_count(&self) -> usize {
         self.lanes.len()
     }
 
     /// Current open-socket count for a destination lane. Tests/diagnostics.
-    #[allow(dead_code)]
     pub fn current(&self, host: &str, policy_port: u16) -> u64 {
         self.limiter.current(host, policy_port)
     }

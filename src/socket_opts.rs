@@ -1,8 +1,8 @@
 //! Platform-specific socket optimizations inspired by Cloudflare Pingora.
 //!
 //! Provides `IP_BIND_ADDRESS_NO_PORT` (defers ephemeral port allocation to connect()),
-//! `TCP_FASTOPEN` (saves 1 RTT on repeat connections), `TCP_INFO` access for
-//! kernel-level BDP-optimal buffer sizing, `SO_BUSY_POLL` for low-latency UDP,
+//! `TCP_FASTOPEN` (saves 1 RTT on repeat connections), `SO_BUSY_POLL` for
+//! low-latency UDP,
 //! `UDP_GRO`/`UDP_SEGMENT` for kernel-level
 //! datagram batching, and `kTLS` for enabling splice(2) on TLS paths.
 //! Linux-only options are no-ops on other platforms, or fail closed where a
@@ -71,7 +71,6 @@ pub fn set_ip_bind_address_no_port(
 }
 
 #[cfg(not(target_os = "linux"))]
-#[allow(dead_code)]
 pub fn set_ip_bind_address_no_port(_fd: i32, _enable: bool) -> std::io::Result<()> {
     Ok(()) // No-op on non-Linux
 }
@@ -101,7 +100,6 @@ pub fn set_socket_mark(fd: std::os::unix::io::RawFd, mark: u32) -> std::io::Resu
 }
 
 #[cfg(not(target_os = "linux"))]
-#[allow(dead_code)]
 pub fn set_socket_mark(_fd: i32, _mark: u32) -> std::io::Result<()> {
     Ok(())
 }
@@ -379,7 +377,6 @@ pub fn set_tcp_fastopen_server(
 }
 
 #[cfg(not(target_os = "linux"))]
-#[allow(dead_code)]
 pub fn set_tcp_fastopen_server(_fd: i32, _queue_len: i32) -> std::io::Result<()> {
     Ok(())
 }
@@ -412,7 +409,6 @@ pub fn set_tcp_fastopen_client(fd: std::os::unix::io::RawFd) -> std::io::Result<
 }
 
 #[cfg(not(target_os = "linux"))]
-#[allow(dead_code)]
 pub fn set_tcp_fastopen_client(_fd: i32) -> std::io::Result<()> {
     Ok(())
 }
@@ -628,73 +624,6 @@ fn apply_pooled_tcp_keepalive_cfg(
     }
 }
 
-// ── TCP_INFO (BDP-optimal buffer sizing) ───────────────────────────────
-
-/// Kernel-level TCP connection metrics from `getsockopt(TCP_INFO)`.
-///
-/// Used to compute Bandwidth-Delay Product (BDP) for optimal buffer sizing
-/// on long-lived TCP stream connections. BDP = (rtt_us / 1_000_000) × cwnd × mss.
-#[derive(Debug, Clone, Copy)]
-#[allow(dead_code)]
-pub struct TcpConnectionInfo {
-    /// Smoothed round-trip time in microseconds (SRTT).
-    pub rtt_us: u32,
-    /// Congestion window in segments.
-    pub snd_cwnd: u32,
-    /// Maximum segment size in bytes.
-    pub snd_mss: u32,
-}
-
-#[allow(dead_code)]
-impl TcpConnectionInfo {
-    /// Compute the Bandwidth-Delay Product in bytes.
-    ///
-    /// BDP represents the optimal amount of data in-flight between sender and
-    /// receiver. Socket buffers sized to BDP maximize throughput without waste.
-    pub fn bdp_bytes(&self) -> usize {
-        if self.rtt_us == 0 || self.snd_cwnd == 0 || self.snd_mss == 0 {
-            return 0;
-        }
-        // cwnd × mss gives the current congestion window in bytes.
-        // This already reflects the BDP as the kernel adjusts cwnd based on RTT.
-        (self.snd_cwnd as usize).saturating_mul(self.snd_mss as usize)
-    }
-}
-
-/// Retrieve TCP connection info from the kernel via `getsockopt(TCP_INFO)`.
-///
-/// Returns RTT, congestion window, and MSS for BDP-optimal buffer sizing.
-/// Linux 2.6+ only. No-op on non-Linux (returns `None`).
-#[cfg(target_os = "linux")]
-#[allow(dead_code)]
-pub fn get_tcp_info(fd: std::os::unix::io::RawFd) -> Option<TcpConnectionInfo> {
-    let mut info: libc::tcp_info = unsafe { std::mem::zeroed() };
-    let mut len = std::mem::size_of::<libc::tcp_info>() as libc::socklen_t;
-    let ret = unsafe {
-        libc::getsockopt(
-            fd,
-            libc::IPPROTO_TCP,
-            libc::TCP_INFO,
-            &mut info as *mut libc::tcp_info as *mut libc::c_void,
-            &mut len,
-        )
-    };
-    if ret != 0 {
-        return None;
-    }
-    Some(TcpConnectionInfo {
-        rtt_us: info.tcpi_rtt,
-        snd_cwnd: info.tcpi_snd_cwnd,
-        snd_mss: info.tcpi_snd_mss,
-    })
-}
-
-#[cfg(not(target_os = "linux"))]
-#[allow(dead_code)]
-pub fn get_tcp_info(_fd: i32) -> Option<TcpConnectionInfo> {
-    None
-}
-
 // ── Send-queue depth (SIOCOUTQ / SO_NWRITE) ────────────────────────────
 
 /// Bytes this socket has handed to the kernel that the PEER has not yet
@@ -771,9 +700,6 @@ pub fn socket_send_queue_bytes(_fd: i32) -> std::io::Result<u64> {
     ))
 }
 
-// Reached from the binary only through `BackendSocketHandle`, whose production
-// callers are per-request transports; with none active it is test-support only.
-#[allow(dead_code)]
 /// Whether [`socket_send_queue_bytes`] can answer at all on this build target.
 ///
 /// Callers use it to skip installing the sampler entirely rather than paying a
@@ -811,7 +737,6 @@ pub fn set_so_busy_poll(fd: std::os::unix::io::RawFd, busy_poll_us: u32) -> std:
 }
 
 #[cfg(not(target_os = "linux"))]
-#[allow(dead_code)]
 pub fn set_so_busy_poll(_fd: i32, _busy_poll_us: u32) -> std::io::Result<()> {
     Ok(())
 }
@@ -843,7 +768,6 @@ pub fn set_so_prefer_busy_poll(fd: std::os::unix::io::RawFd, enable: bool) -> st
 }
 
 #[cfg(not(target_os = "linux"))]
-#[allow(dead_code)]
 pub fn set_so_prefer_busy_poll(_fd: i32, _enable: bool) -> std::io::Result<()> {
     Ok(())
 }
@@ -859,7 +783,6 @@ pub fn set_so_prefer_busy_poll(_fd: i32, _enable: bool) -> std::io::Result<()> {
 ///
 /// No-op on non-Linux platforms.
 #[cfg(target_os = "linux")]
-#[allow(dead_code)] // GRO infrastructure ready but not active (recv_from lacks cmsg)
 pub fn set_udp_gro(fd: std::os::unix::io::RawFd, enable: bool) -> std::io::Result<()> {
     // UDP_GRO = 104 (Linux 5.0+)
     const UDP_GRO: libc::c_int = 104;
@@ -881,12 +804,45 @@ pub fn set_udp_gro(fd: std::os::unix::io::RawFd, enable: bool) -> std::io::Resul
 }
 
 #[cfg(not(target_os = "linux"))]
-#[allow(dead_code)]
 pub fn set_udp_gro(_fd: i32, _enable: bool) -> std::io::Result<()> {
     Ok(())
 }
 
 // ── UDP GSO (Generic Segmentation Offload) ─────────────────────────────
+
+/// Bytes reserved for one `sendmsg` control block: an `IPV6_PKTINFO` cmsg
+/// plus a `UDP_SEGMENT` cmsg is `CMSG_SPACE(20) + CMSG_SPACE(2)` = 64 bytes on
+/// 64-bit Linux (48 on 32-bit), the largest block the send helpers build.
+#[cfg(target_os = "linux")]
+const SEND_CMSG_BUF_LEN: usize = 64;
+
+/// Stack control-message buffer for the UDP send helpers.
+///
+/// The zero-length `cmsghdr` array gives the buffer `cmsghdr` alignment, which
+/// `CMSG_FIRSTHDR`/`CMSG_NXTHDR` require, without a per-`sendmsg` heap
+/// allocation (issue #7207; the kTLS path follows the same rule).
+#[cfg(target_os = "linux")]
+#[repr(C)]
+struct SendCmsgBuf {
+    _align: [libc::cmsghdr; 0],
+    bytes: [u8; SEND_CMSG_BUF_LEN],
+}
+
+#[cfg(target_os = "linux")]
+impl SendCmsgBuf {
+    /// A zeroed buffer, refusing a control block larger than it can hold.
+    fn zeroed_for(len: usize) -> std::io::Result<Self> {
+        if len > SEND_CMSG_BUF_LEN {
+            return Err(std::io::Error::other(
+                "UDP send control block exceeds the stack cmsg buffer",
+            ));
+        }
+        Ok(Self {
+            _align: [],
+            bytes: [0u8; SEND_CMSG_BUF_LEN],
+        })
+    }
+}
 
 /// Enable `UDP_SEGMENT` (GSO) for batched UDP sending (Linux 4.18+ only).
 ///
@@ -917,14 +873,14 @@ pub fn send_with_gso(
     // Build control message for UDP_SEGMENT (GSO segment size).
     // cmsg layout: cmsg_hdr + u16 segment_size
     let cmsg_space = unsafe { libc::CMSG_SPACE(std::mem::size_of::<u16>() as u32) } as usize;
-    let mut cmsg_buf = vec![0u8; cmsg_space];
+    let mut cmsg_buf = SendCmsgBuf::zeroed_for(cmsg_space)?;
 
     let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
     msg.msg_name = dest as *const libc::sockaddr_storage as *mut libc::c_void;
     msg.msg_namelen = dest_len;
     msg.msg_iov = &iov as *const libc::iovec as *mut libc::iovec;
     msg.msg_iovlen = 1;
-    msg.msg_control = cmsg_buf.as_mut_ptr() as *mut libc::c_void;
+    msg.msg_control = cmsg_buf.bytes.as_mut_ptr() as *mut libc::c_void;
     msg.msg_controllen = cmsg_space;
 
     // Fill in the cmsg header and data.
@@ -951,7 +907,6 @@ pub fn send_with_gso(
 }
 
 #[cfg(not(target_os = "linux"))]
-#[allow(dead_code)]
 pub fn send_with_gso(
     _fd: i32,
     _data: &[u8],
@@ -996,7 +951,6 @@ pub fn extract_gro_segment_size(msg: &libc::msghdr) -> Option<u16> {
 }
 
 #[cfg(not(target_os = "linux"))]
-#[allow(dead_code)]
 pub fn extract_gro_segment_size(_msg: &()) -> Option<u16> {
     None
 }
@@ -1058,13 +1012,11 @@ pub fn set_ipv6_recvpktinfo(fd: std::os::unix::io::RawFd) -> std::io::Result<()>
 }
 
 #[cfg(not(target_os = "linux"))]
-#[allow(dead_code)]
 pub fn set_ip_pktinfo(_fd: i32) -> std::io::Result<()> {
     Ok(())
 }
 
 #[cfg(not(target_os = "linux"))]
-#[allow(dead_code)]
 pub fn set_ipv6_recvpktinfo(_fd: i32) -> std::io::Result<()> {
     Ok(())
 }
@@ -1236,7 +1188,6 @@ pub fn enable_ingress_pktinfo(
 /// Non-Linux builds have no `IP_PKTINFO` ingress-interface channel at all, so
 /// a listener that depends on it fails closed here rather than starting.
 #[cfg(not(target_os = "linux"))]
-#[allow(dead_code)]
 pub fn enable_ingress_pktinfo(
     _fd: i32,
     local: std::net::SocketAddr,
@@ -1361,7 +1312,6 @@ pub fn set_udp_dont_fragment(fd: std::os::unix::io::RawFd, is_ipv4: bool) -> std
     not(any(target_os = "linux", target_os = "android")),
     not(target_vendor = "apple")
 ))]
-#[allow(dead_code)]
 pub fn set_udp_dont_fragment(_fd: std::os::unix::io::RawFd, _is_ipv4: bool) -> std::io::Result<()> {
     Err(std::io::Error::new(
         std::io::ErrorKind::Unsupported,
@@ -1371,7 +1321,6 @@ pub fn set_udp_dont_fragment(_fd: std::os::unix::io::RawFd, _is_ipv4: bool) -> s
 
 /// Fail-closed arm for non-Unix targets. See the Unix arm above.
 #[cfg(not(unix))]
-#[allow(dead_code)]
 pub fn set_udp_dont_fragment(_fd: i32, _is_ipv4: bool) -> std::io::Result<()> {
     Err(std::io::Error::new(
         std::io::ErrorKind::Unsupported,
@@ -1381,7 +1330,6 @@ pub fn set_udp_dont_fragment(_fd: i32, _is_ipv4: bool) -> std::io::Result<()> {
 
 /// Fixed diagnostic for the unsupported-target arms of
 /// [`set_udp_dont_fragment`]. Named so the message cannot drift between them.
-#[allow(dead_code)]
 pub const UDP_DONT_FRAGMENT_UNSUPPORTED_MESSAGE: &str =
     "no do-not-fragment socket option is available on this build target";
 
@@ -1482,7 +1430,6 @@ pub fn extract_pktinfo_local_addr(msg: &libc::msghdr) -> Option<PktinfoLocal> {
 }
 
 #[cfg(not(target_os = "linux"))]
-#[allow(dead_code)]
 pub fn extract_pktinfo_local_addr(_msg: &()) -> Option<PktinfoLocal> {
     None
 }
@@ -1560,13 +1507,11 @@ pub fn set_ipv6_transparent(fd: std::os::unix::io::RawFd) -> std::io::Result<()>
 }
 
 #[cfg(not(target_os = "linux"))]
-#[allow(dead_code)]
 pub fn set_ip_transparent(_fd: i32) -> std::io::Result<()> {
     Ok(())
 }
 
 #[cfg(not(target_os = "linux"))]
-#[allow(dead_code)]
 pub fn set_ipv6_transparent(_fd: i32) -> std::io::Result<()> {
     Ok(())
 }
@@ -1612,7 +1557,6 @@ pub fn set_scoped_reply_transparent(
 /// steering datapath is Linux-only, so a scoped listener refuses to start here
 /// rather than serving a one-way datapath.
 #[cfg(not(target_os = "linux"))]
-#[allow(dead_code)]
 pub fn set_scoped_reply_transparent(_fd: i32, _ipv6: bool) -> std::io::Result<()> {
     Err(std::io::Error::new(
         std::io::ErrorKind::Unsupported,
@@ -1678,13 +1622,11 @@ pub fn set_ipv6_recvorigdstaddr(fd: std::os::unix::io::RawFd) -> std::io::Result
 }
 
 #[cfg(not(target_os = "linux"))]
-#[allow(dead_code)]
 pub fn set_ip_recvorigdstaddr(_fd: i32) -> std::io::Result<()> {
     Ok(())
 }
 
 #[cfg(not(target_os = "linux"))]
-#[allow(dead_code)]
 pub fn set_ipv6_recvorigdstaddr(_fd: i32) -> std::io::Result<()> {
     Ok(())
 }
@@ -1735,7 +1677,6 @@ pub fn extract_origdst(msg: &libc::msghdr) -> Option<std::net::SocketAddr> {
 }
 
 #[cfg(not(target_os = "linux"))]
-#[allow(dead_code)]
 pub fn extract_origdst(_msg: &()) -> Option<std::net::SocketAddr> {
     None
 }
@@ -1783,15 +1724,16 @@ pub fn send_with_pktinfo(
     } else {
         0
     };
-    let mut cmsg_buf = vec![0u8; pktinfo_space + gso_space];
+    let cmsg_space = pktinfo_space + gso_space;
+    let mut cmsg_buf = SendCmsgBuf::zeroed_for(cmsg_space)?;
 
     let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
     msg.msg_name = dest as *const libc::sockaddr_storage as *mut libc::c_void;
     msg.msg_namelen = dest_len;
     msg.msg_iov = &iov as *const libc::iovec as *mut libc::iovec;
     msg.msg_iovlen = 1;
-    msg.msg_control = cmsg_buf.as_mut_ptr() as *mut libc::c_void;
-    msg.msg_controllen = cmsg_buf.len();
+    msg.msg_control = cmsg_buf.bytes.as_mut_ptr() as *mut libc::c_void;
+    msg.msg_controllen = cmsg_space;
 
     // First cmsg: pktinfo.
     let cmsg = unsafe { libc::CMSG_FIRSTHDR(&msg) };
@@ -1867,7 +1809,6 @@ pub fn send_with_pktinfo(
 }
 
 #[cfg(not(target_os = "linux"))]
-#[allow(dead_code)]
 pub fn send_with_pktinfo(
     _fd: i32,
     _data: &[u8],
@@ -1913,7 +1854,6 @@ pub fn is_udp_pktinfo_available() -> bool {
 }
 
 #[cfg(not(target_os = "linux"))]
-#[allow(dead_code)]
 pub fn is_udp_pktinfo_available() -> bool {
     false
 }
@@ -2195,135 +2135,6 @@ pub mod ktls {
         let mut seq = [0u8; 8];
         seq.copy_from_slice(&buf[layout.seq_offset..layout.seq_offset + 8]);
         Ok(u64::from_be_bytes(seq))
-    }
-
-    /// Current `SO_RCVBUF` for a socket, in bytes.
-    ///
-    /// This is the kernel's `sk_rcvbuf`, already doubled for skb overhead. TCP
-    /// admits another skb only while the receive-memory charge is at or below
-    /// this value, so it bounds unread wire data together with one admitted-skb
-    /// overshoot. On its own it is **not** a stable bound: TCP receive
-    /// autotuning rewrites it as the connection runs.
-    /// [`pin_socket_receive_buffer`] is what makes a readback hold still.
-    pub fn socket_receive_buffer_bytes(fd: std::os::unix::io::RawFd) -> std::io::Result<u64> {
-        let mut value: libc::c_int = 0;
-        let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
-        // SAFETY: `value` is a live `c_int` and `len` describes it exactly.
-        let ret = unsafe {
-            libc::getsockopt(
-                fd,
-                libc::SOL_SOCKET,
-                libc::SO_RCVBUF,
-                std::ptr::addr_of_mut!(value).cast::<libc::c_void>(),
-                &mut len,
-            )
-        };
-        if ret != 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-        if len as usize != std::mem::size_of::<libc::c_int>() || value < 0 {
-            return Err(std::io::Error::other(
-                "kTLS: SO_RCVBUF readback is not a non-negative int",
-            ));
-        }
-        Ok(value as u64)
-    }
-
-    /// Bytes currently queued on `fd` for reading, from the kernel's own
-    /// `FIONREAD` accounting.
-    ///
-    /// Called on a socket that carries the TLS ULP but no keys yet, so this is
-    /// still plain `tcp_ioctl` accounting: exactly the unread wire bytes
-    /// `rcv_nxt - copied_seq`. It is the *only* sound way to bound data that
-    /// was already queued before [`pin_socket_receive_buffer`] took effect —
-    /// that data was admitted under whatever `sk_rcvbuf` autotuning had reached
-    /// at the time, which no later observation can reconstruct.
-    pub fn socket_receive_queue_bytes(fd: std::os::unix::io::RawFd) -> std::io::Result<u64> {
-        let mut queued: libc::c_int = 0;
-        // SAFETY: `fd` is borrowed from a live socket by the caller and
-        // `FIONREAD` writes exactly one `c_int` through the pointer.
-        let ret = unsafe { libc::ioctl(fd, libc::FIONREAD, std::ptr::addr_of_mut!(queued)) };
-        if ret != 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-        if queued < 0 {
-            return Err(std::io::Error::other(
-                "kTLS: FIONREAD reported a negative receive queue",
-            ));
-        }
-        Ok(queued as u64)
-    }
-
-    /// Pin this socket's receive buffer so the kernel can never grow it again,
-    /// and return the kernel's own readback of the pinned size.
-    ///
-    /// # The invariant this establishes
-    ///
-    /// A successful `setsockopt(SOL_SOCKET, SO_RCVBUF)` sets `SOCK_RCVBUF_LOCK`
-    /// in `sk->sk_userlocks`, and every kernel path that would otherwise raise
-    /// `sk_rcvbuf` — `tcp_rcv_space_adjust`, `tcp_clamp_window` — is gated on
-    /// that flag being clear. From the moment this returns, `sk_rcvbuf` for this
-    /// socket can only change through another `setsockopt` on this same fd,
-    /// which the gateway never issues. Raising `net.ipv4.tcp_rmem[2]` or
-    /// `net.core.rmem_max` afterwards therefore cannot move it: those sysctls
-    /// feed autotuning and future `setsockopt` clamping, not a locked socket.
-    ///
-    /// That is what a confidentiality bound needs and what a `/proc` snapshot
-    /// can never give: a *per-socket* ceiling the kernel itself enforces for the
-    /// remaining life of the connection.
-    ///
-    /// # Linux doubling and clamping, handled by readback
-    ///
-    /// The kernel clamps the requested value to `net.core.rmem_max`, then stores
-    /// `max(2 * value, SOCK_MIN_RCVBUF)`. Neither adjustment is predicted here —
-    /// the `getsockopt` readback afterwards *is* the answer, and it is the value
-    /// the caller must bound with. `request_bytes` is only a request.
-    ///
-    /// The request is floored at half the socket's live `SO_RCVBUF`, converting
-    /// the doubled readback back into `setsockopt` request units so pinning does
-    /// not accidentally double an already-large buffer. If the kernel still
-    /// lands below the prior readback (a small `rmem_max` against an
-    /// already-autotuned socket), no queued byte is lost: Linux keeps skbs that
-    /// are already on the receive queue and merely stops admitting more, and
-    /// the caller bounds the pre-existing queue separately with
-    /// [`socket_receive_queue_bytes`].
-    pub fn pin_socket_receive_buffer(
-        fd: std::os::unix::io::RawFd,
-        request_bytes: u64,
-    ) -> std::io::Result<u64> {
-        let current = socket_receive_buffer_bytes(fd)?;
-        // `sk_setsockopt` rejects a negative value and internally clamps to
-        // `INT_MAX / 2` before doubling, so saturate here rather than wrap. A
-        // getsockopt readback is already doubled; convert it back to request
-        // units before applying the throughput floor.
-        let current_request_units = current.div_ceil(2);
-        let want = request_bytes
-            .max(current_request_units)
-            .min(libc::c_int::MAX as u64 / 2) as libc::c_int;
-        // SAFETY: `want` is a live `c_int` and `len` describes it exactly; `fd`
-        // is borrowed from a live socket by the caller.
-        let ret = unsafe {
-            libc::setsockopt(
-                fd,
-                libc::SOL_SOCKET,
-                libc::SO_RCVBUF,
-                std::ptr::addr_of!(want).cast::<libc::c_void>(),
-                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
-            )
-        };
-        if ret != 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-        // The readback, not the request, is the bound. A kernel that answered
-        // the set but cannot report the result leaves nothing to bound with, so
-        // the error propagates and the caller refuses the handoff.
-        let pinned = socket_receive_buffer_bytes(fd)?;
-        if pinned == 0 {
-            return Err(std::io::Error::other(
-                "kTLS: pinned SO_RCVBUF read back as zero",
-            ));
-        }
-        Ok(pinned)
     }
 
     /// Attempt to enable kTLS on a connected TCP socket.
@@ -3068,34 +2879,28 @@ pub mod ktls {
         Chacha20Poly1305,
     }
 
-    #[allow(dead_code)]
     pub fn enable_ktls(_fd: i32, _params: &KtlsParams) -> std::io::Result<bool> {
         Ok(false)
     }
 
-    #[allow(dead_code)]
     pub fn is_ktls_available() -> bool {
         false
     }
 
-    #[allow(dead_code)]
     pub fn is_ktls_aes128gcm_available() -> bool {
         false
     }
 
-    #[allow(dead_code)]
     pub fn is_ktls_aes256gcm_available() -> bool {
         false
     }
 
-    #[allow(dead_code)]
     pub fn is_ktls_chacha20_poly1305_available() -> bool {
         false
     }
 
     /// Same shape as the Linux accessor so callers (notably the live-kernel
     /// gate's failure message) need no `cfg`.
-    #[allow(dead_code)]
     pub fn ktls_availability_diagnostic() -> String {
         "kTLS is Linux-only: aes128=false aes256=false chacha20=false".to_string()
     }
@@ -3103,35 +2908,16 @@ pub mod ktls {
     /// No kernel TLS ULP exists off Linux, so no record sequence number can be
     /// observed. Reporting `false` keeps the confidentiality-limit gate
     /// fail-closed on every non-Linux build.
-    #[allow(dead_code)]
     pub fn is_ktls_record_seq_observable(_cipher: KtlsCipher) -> bool {
         false
     }
 
-    #[allow(dead_code)]
     pub fn read_ktls_record_seq(
         _fd: i32,
         _cipher: KtlsCipher,
         _tls_version: u16,
         _is_tx: bool,
     ) -> std::io::Result<u64> {
-        Err(std::io::Error::other("kTLS is Linux-only"))
-    }
-
-    #[allow(dead_code)]
-    pub fn socket_receive_buffer_bytes(_fd: i32) -> std::io::Result<u64> {
-        Err(std::io::Error::other("kTLS is Linux-only"))
-    }
-
-    #[allow(dead_code)]
-    pub fn socket_receive_queue_bytes(_fd: i32) -> std::io::Result<u64> {
-        Err(std::io::Error::other("kTLS is Linux-only"))
-    }
-
-    /// No socket can be pinned off Linux because no socket can carry kTLS
-    /// there. Failing keeps the receive-window bound fail-closed.
-    #[allow(dead_code)]
-    pub fn pin_socket_receive_buffer(_fd: i32, _request_bytes: u64) -> std::io::Result<u64> {
         Err(std::io::Error::other("kTLS is Linux-only"))
     }
 }
@@ -3259,6 +3045,78 @@ pub mod io_uring_splice {
     pub const BACKEND_READ_TIMEOUT_MSG: &str = "backend read inactivity timeout";
     pub const BACKEND_WRITE_TIMEOUT_MSG: &str = "backend write inactivity timeout";
 
+    /// Upper bound for one readiness wait in [`io_uring_splice_loop`].
+    ///
+    /// Every deadline the loop enforces bounds the wait on its own, and the
+    /// parent's `shutdown(SHUT_RDWR)` wakes it at once, so this cap only bounds
+    /// how long an untimed relay sleeps between deadline rechecks.
+    const MAX_READINESS_WAIT_MS: u64 = 1_000;
+
+    /// Block until `fd` reports one of `events` (or an error / hangup, which
+    /// `poll(2)` always reports) or `timeout_ms` elapses.
+    ///
+    /// Returns `true` when the descriptor reported readiness (or `poll` itself
+    /// failed, so the caller's next syscall surfaces the real error) and
+    /// `false` on timeout. Runs on the relay's blocking thread.
+    pub fn wait_fd_ready(fd: i32, events: libc::c_short, timeout_ms: u64) -> bool {
+        let mut pollfd = libc::pollfd {
+            fd,
+            events,
+            revents: 0,
+        };
+        let timeout = libc::c_int::try_from(timeout_ms).unwrap_or(libc::c_int::MAX);
+        loop {
+            // SAFETY: one initialized `pollfd` that outlives the call.
+            let ready = unsafe { libc::poll(&mut pollfd, 1, timeout) };
+            if ready > 0 {
+                return true;
+            }
+            if ready == 0 {
+                return false;
+            }
+            if std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
+                return true;
+            }
+        }
+    }
+
+    /// Milliseconds until the nearest deadline the splice loop enforces, capped
+    /// at [`MAX_READINESS_WAIT_MS`] and at least 1. A disarmed write watermark
+    /// (`u64::MAX`) and inactive watermarks impose no deadline.
+    fn readiness_wait_ms(
+        now: u64,
+        shared_last_activity_ms: &std::sync::atomic::AtomicU64,
+        timeout_ms: u64,
+        read_watermark: Option<&std::sync::atomic::AtomicU64>,
+        read_timeout_ms: u64,
+        write_watermark: Option<&std::sync::atomic::AtomicU64>,
+        write_timeout_ms: u64,
+    ) -> u64 {
+        let remaining = |last: u64, limit: u64| limit.saturating_sub(now.saturating_sub(last));
+        let mut wait = MAX_READINESS_WAIT_MS;
+        if timeout_ms > 0 {
+            let last = shared_last_activity_ms.load(std::sync::atomic::Ordering::Relaxed);
+            wait = wait.min(remaining(last, timeout_ms));
+        }
+        if read_timeout_ms > 0
+            && let Some(wm) = read_watermark
+        {
+            wait = wait.min(remaining(
+                wm.load(std::sync::atomic::Ordering::Relaxed),
+                read_timeout_ms,
+            ));
+        }
+        if write_timeout_ms > 0
+            && let Some(wm) = write_watermark
+        {
+            let last = wm.load(std::sync::atomic::Ordering::Relaxed);
+            if last != u64::MAX {
+                wait = wait.min(remaining(last, write_timeout_ms));
+            }
+        }
+        wait.max(1)
+    }
+
     /// Splice data in one direction using io_uring: src_fd → pipe → dst_fd.
     ///
     /// Runs on a blocking thread (called via `tokio::task::spawn_blocking`).
@@ -3287,6 +3145,15 @@ pub mod io_uring_splice {
     /// bytes and refreshed on every successful write. Both watermarks emit a
     /// distinct message body (see `BACKEND_*_TIMEOUT_MSG`) so the caller can
     /// attribute the timeout to the correct `(Direction, StreamIoSide)`.
+    ///
+    /// Every splice is submitted with `SPLICE_F_NONBLOCK`. On `EAGAIN` the
+    /// worker waits in `poll(2)` for the descriptor that blocked (source
+    /// readable in phase 1, destination writable in phase 2) until the nearest
+    /// timeout deadline, so an idle relay sleeps instead of resubmitting every
+    /// millisecond, and the first byte after a quiet period is spliced as soon
+    /// as it arrives (issue #7226). If `poll` reports readiness but the next
+    /// splice still blocks, the worker sleeps 1 ms before waiting again, so a
+    /// descriptor that stays "ready" cannot spin the thread.
     #[allow(clippy::too_many_arguments)]
     pub fn io_uring_splice_loop(
         src_fd: i32,
@@ -3320,6 +3187,20 @@ pub mod io_uring_splice {
         let chunk_size: u32 = 128 * 1024;
         let read_wm_active = read_watermark.is_some() && read_timeout_ms > 0;
         let write_wm_active = write_watermark.is_some() && write_timeout_ms > 0;
+        // Set when the last readiness wait reported the descriptor ready; a
+        // further `EAGAIN` right after it backs off before waiting again.
+        let mut woke_ready = false;
+        let wait_ms = || {
+            readiness_wait_ms(
+                super::monotonic_now_ms(),
+                shared_last_activity_ms,
+                timeout_ms,
+                read_watermark,
+                read_timeout_ms,
+                write_watermark,
+                write_timeout_ms,
+            )
+        };
 
         loop {
             // Inline idle timeout check using the shared cross-direction timestamp.
@@ -3398,7 +3279,7 @@ pub mod io_uring_splice {
             if n < 0 {
                 let err = std::io::Error::from_raw_os_error(-n);
                 if err.kind() == std::io::ErrorKind::WouldBlock {
-                    // Recheck idle timeout inline before sleeping, even though the
+                    // Recheck idle timeout inline before waiting, even though the
                     // outer loop also checks it. Keeping the check here makes the
                     // two WouldBlock branches (Phase 1 here, Phase 2 below) behave
                     // uniformly and avoids relying on reviewers to trace control flow.
@@ -3440,12 +3321,17 @@ pub mod io_uring_splice {
                             ));
                         }
                     }
-                    // Back off to avoid tight spin — sleep 1ms then retry.
-                    std::thread::sleep(std::time::Duration::from_millis(1));
+                    // Wait for the source to become readable (or for the
+                    // nearest deadline) instead of resubmitting on a timer.
+                    if woke_ready {
+                        std::thread::sleep(std::time::Duration::from_millis(1));
+                    }
+                    woke_ready = wait_fd_ready(src_fd, libc::POLLIN, wait_ms());
                     continue;
                 }
                 return Err(SpliceError::read(total, err));
             }
+            woke_ready = false;
 
             // Successful src→pipe: refresh the read watermark and prime the
             // write watermark (we now have queued bytes ready for dst).
@@ -3490,11 +3376,11 @@ pub mod io_uring_splice {
                     let err = std::io::Error::from_raw_os_error(-w);
                     if err.kind() == std::io::ErrorKind::WouldBlock {
                         // CRITICAL: This inner-loop WouldBlock branch must recheck
-                        // the idle timeout before sleeping. The `while remaining > 0`
+                        // the idle timeout before waiting. The `while remaining > 0`
                         // loop has no timeout check, so if the destination socket
                         // stops reading while data is buffered in the pipe, this
-                        // branch would spin at 1000 iters/sec forever without
-                        // releasing the blocking thread to the tokio pool.
+                        // branch would wait forever without releasing the
+                        // blocking thread to the tokio pool.
                         if timeout_ms > 0 {
                             let now = super::monotonic_now_ms();
                             let last =
@@ -3537,11 +3423,17 @@ pub mod io_uring_splice {
                                 ));
                             }
                         }
-                        std::thread::sleep(std::time::Duration::from_millis(1));
+                        // Wait for the destination to drain (or for the
+                        // nearest deadline) instead of resubmitting on a timer.
+                        if woke_ready {
+                            std::thread::sleep(std::time::Duration::from_millis(1));
+                        }
+                        woke_ready = wait_fd_ready(dst_fd, libc::POLLOUT, wait_ms());
                         continue;
                     }
                     return Err(SpliceError::write(total, err));
                 }
+                woke_ready = false;
                 remaining -= w as u32;
                 total = total.saturating_add(w as u64);
                 // Refresh shared idle timeout — activity in either direction
@@ -3566,7 +3458,6 @@ pub mod io_uring_splice {
 
 #[cfg(not(target_os = "linux"))]
 pub mod io_uring_splice {
-    #[allow(dead_code)]
     pub fn check_io_uring_available() -> bool {
         false
     }
@@ -3575,16 +3466,13 @@ pub mod io_uring_splice {
     /// that produced them. `is_write_side = false` for all non-Linux stubs.
     /// `bytes_so_far` is always 0 on the stub (no transfer occurs).
     #[derive(Debug)]
-    #[allow(dead_code)] // Fields are consumed only by the Linux splice path.
     pub struct SpliceError {
         pub is_write_side: bool,
         pub bytes_so_far: u64,
         pub source: std::io::Error,
     }
 
-    #[allow(dead_code)]
     pub const BACKEND_READ_TIMEOUT_MSG: &str = "backend read inactivity timeout";
-    #[allow(dead_code)]
     pub const BACKEND_WRITE_TIMEOUT_MSG: &str = "backend write inactivity timeout";
 
     #[allow(dead_code, clippy::too_many_arguments)]
@@ -3629,7 +3517,6 @@ pub fn is_tcp_fastopen_available() -> bool {
 }
 
 #[cfg(not(target_os = "linux"))]
-#[allow(dead_code)]
 pub fn is_tcp_fastopen_available() -> bool {
     false
 }
@@ -3660,7 +3547,6 @@ pub fn is_udp_gro_available() -> bool {
 }
 
 #[cfg(not(target_os = "linux"))]
-#[allow(dead_code)]
 pub fn is_udp_gro_available() -> bool {
     false
 }
@@ -3691,7 +3577,6 @@ pub fn is_udp_gso_available() -> bool {
 }
 
 #[cfg(not(target_os = "linux"))]
-#[allow(dead_code)]
 pub fn is_udp_gso_available() -> bool {
     false
 }
@@ -4490,5 +4375,25 @@ mod original_dst_live_tests {
             Some(SocketAddr::from((Ipv4Addr::LOCALHOST, DIAL_PORT))),
             "an accepted REDIRECTed connection must report the pre-NAT destination"
         );
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod send_cmsg_buf_tests {
+    use super::{SEND_CMSG_BUF_LEN, SendCmsgBuf};
+
+    /// The stack control buffer must be `cmsghdr`-aligned and hold the
+    /// largest block the send helpers build (IPv6 pktinfo + UDP_SEGMENT).
+    #[test]
+    fn send_cmsg_buf_is_aligned_and_fits_the_largest_block() {
+        assert!(std::mem::align_of::<SendCmsgBuf>() >= std::mem::align_of::<libc::cmsghdr>());
+        let largest = unsafe {
+            libc::CMSG_SPACE(std::mem::size_of::<libc::in6_pktinfo>() as u32) as usize
+                + libc::CMSG_SPACE(std::mem::size_of::<u16>() as u32) as usize
+        };
+        assert!(largest <= SEND_CMSG_BUF_LEN, "largest={largest}");
+        let buf = SendCmsgBuf::zeroed_for(largest).expect("largest block fits");
+        assert!(buf.bytes.iter().all(|byte| *byte == 0));
+        assert!(SendCmsgBuf::zeroed_for(SEND_CMSG_BUF_LEN + 1).is_err());
     }
 }

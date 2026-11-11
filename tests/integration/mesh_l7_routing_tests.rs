@@ -212,10 +212,15 @@ fn mesh_l7_routing_virtual_service_weighted_split_uses_generated_upstream_weight
     let lb = LoadBalancerCache::new(&result.config);
     let mut counts: HashMap<String, usize> = HashMap::new();
     for i in 0..1000 {
-        let target = lb
-            .select_target("default", &upstream.id, &i.to_string(), None)
-            .expect("target")
-            .target;
+        let target = LoadBalancerCache::select_target_from(
+            &lb.load(),
+            "default",
+            &upstream.id,
+            &i.to_string(),
+            None,
+        )
+        .expect("target")
+        .target;
         *counts.entry(target.host.clone()).or_default() += 1;
     }
 

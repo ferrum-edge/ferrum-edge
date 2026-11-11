@@ -831,7 +831,6 @@ impl Http2ConnectionPool {
         self.h1.clear();
     }
 
-    #[allow(dead_code)] // exercised from integration/unit tests
     pub fn pool_key_for_warmup(proxy: &Proxy) -> String {
         pool_key_owned(proxy, None, &PoolConfig::default())
     }
@@ -842,7 +841,6 @@ impl Http2ConnectionPool {
     /// `pool_key_for_warmup` is this with `svid_generation = None` and
     /// `PoolConfig::default()`. Runtime `get_sender` uses the pool manager's
     /// global instead of reconstructing `PoolConfig` a second time.
-    #[allow(dead_code)] // exercised from unit/integration tests
     pub fn pool_key_with_global(
         proxy: &Proxy,
         svid_generation: Option<u64>,
@@ -853,7 +851,6 @@ impl Http2ConnectionPool {
 
     /// TLS-config cache key (no host/port). Used by unit tests to prove two
     /// endpoints sharing trust material reuse one `ClientConfig`.
-    #[allow(dead_code)] // exercised from unit tests
     pub fn tls_config_cache_key_for_warmup(proxy: &Proxy, svid_generation: Option<u64>) -> String {
         backend_tls_config_cache_key(
             &proxy.resolved_tls,
@@ -910,7 +907,6 @@ impl Http2ConnectionPool {
         self.pool.manager().tls_configs.retain_keys(&live_tls_keys);
     }
 
-    #[allow(dead_code)] // exercised from unit tests
     pub fn insert_rr_counter_for_tests(&self, key: impl Into<String>) {
         self.rr_counters
             .insert(key.into(), Arc::new(AtomicUsize::new(0)));
@@ -920,7 +916,6 @@ impl Http2ConnectionPool {
     /// post-insert stale-generation removal. Used by integration tests to
     /// prove insert-before-retire and retire-before-insert without a live
     /// backend handshake.
-    #[allow(dead_code)] // exercised from integration tests
     pub fn get_or_seed_rr_counter_for_tests(
         &self,
         key: &str,
@@ -934,22 +929,18 @@ impl Http2ConnectionPool {
         )
     }
 
-    #[allow(dead_code)] // exercised from unit tests
     pub fn rr_counter_len(&self) -> usize {
         self.rr_counters.len()
     }
 
-    #[allow(dead_code)] // exercised from unit tests
     pub fn contains_rr_counter(&self, key: &str) -> bool {
         self.rr_counters.contains_key(key)
     }
 
-    #[allow(dead_code)] // exercised from unit tests
     pub fn backend_tls_config_cache(&self) -> &BackendTlsConfigCache {
         &self.pool.manager().tls_configs
     }
 
-    #[allow(dead_code)]
     pub fn write_shard_key(buf: &mut String, base_key: &str, shard: usize) {
         buf.clear();
         buf.push_str(base_key);
@@ -1150,7 +1141,15 @@ impl Http2ConnectionPool {
         });
         match acquired {
             Ok(sender) => Ok(sender),
-            Err(err) => {
+            // Only a `maxConnections` refusal (the creator's, or a coalesced
+            // waiter's rebuilt from `SharedPoolCreateKind::MaxConnections`)
+            // reuses an already-established shard, so a cap below the shard
+            // count converges on `cap` connections. Any other create failure
+            // (TLS, ALPN `http/1.1`, refused connect, ...) surfaces, rather
+            // than being masked by a still-open sibling for as long as one
+            // lives — which would also answer a capability probe `Ok` for a
+            // target whose new connections fail (issue #7181).
+            Err(err @ Http2PoolError::MaxConnectionsExceeded { .. }) => {
                 // Phase 2 (synchronous re-borrow): rebuild the pool key in
                 // the same thread-local buffer and probe alternative shards.
                 // The proxy outlives this future and is read-only, so the
@@ -1176,6 +1175,7 @@ impl Http2ConnectionPool {
                     None => Err(err),
                 }
             }
+            Err(err) => Err(err),
         }
     }
 }
@@ -1904,7 +1904,6 @@ impl Http2ConnectionPool {
     }
 
     /// Idle direct-H1 connections across all lanes.
-    #[allow(dead_code)] // exercised from tests
     pub fn h1_idle_connections(&self) -> usize {
         self.h1.idle_connections()
     }
@@ -2968,7 +2967,6 @@ mod tests {
             pool_http2_max_concurrent_streams: None,
             pool_http3_connections_per_backend: None,
             h2_upgrade_policy: None,
-            pool_max_requests_per_connection: None,
             pool_http1_max_pending_requests: None,
             upstream_id: None,
             upstream_subset: None,

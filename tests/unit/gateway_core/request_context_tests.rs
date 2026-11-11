@@ -610,6 +610,12 @@ const PLUGIN_STATE_MUT_CALL_SITES: &[(&str, Option<&str>, &str)] = &[
          true` and an admitted outcome to publish",
     ),
     (
+        "stage_gateway_minted_traceparent",
+        None,
+        "reached only from a configured `otel_tracing` or `workload_metrics` \
+         instance after it minted a fresh gateway span into `traceparent`",
+    ),
+    (
         "stage_response_cache_request_header_delta",
         Some("if delta.is_empty() {"),
         "a configured `response_caching` instance stages a delta only when the \

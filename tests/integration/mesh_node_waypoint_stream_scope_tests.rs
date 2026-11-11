@@ -438,11 +438,35 @@ mod node_waypoint_capture_inventory {
         AppProtocol, MeshConfig, MeshPolicy, MeshRule, MtlsMode, NodeWaypointEndpoint,
         PeerAuthentication, PolicyAction, PolicyScope, Workload, WorkloadPort, WorkloadSelector,
     };
+    use ferrum_edge::modes::mesh::config_consumer::xds_client::{
+        XdsClientConfig, reverse_translate_xds_snapshot,
+    };
     use ferrum_edge::modes::mesh::slice::{
         MeshSlice, MeshSliceRequest, node_waypoint_destination_peer_authentications,
         resolve_effective_mtls_mode,
     };
     use ferrum_edge::xds::carrier::MeshSliceCarrier;
+    use ferrum_edge::xds::translate_mesh_slice_to_snapshot;
+
+    /// Rebuild `slice` through the DP's production xDS path (SotW accumulator
+    /// and reverse translation) as the NodeWaypoint that requested it.
+    fn rebuild_over_xds(slice: &MeshSlice) -> Result<MeshSlice, String> {
+        let config = XdsClientConfig {
+            cp_urls: Vec::new(),
+            node_id: slice.node_id.clone(),
+            cluster: String::new(),
+            namespace: slice.namespace.clone(),
+            workload_spiffe_id: slice.workload_spiffe_id.clone(),
+            waypoint_name: slice.waypoint_name.clone(),
+            ambient_udp_source_scoping: false,
+            node_waypoint_capture_scoping: true,
+            stream_channel_capacity: 1,
+            primary_retry_secs: 0,
+            connect_timeout_seconds: 0,
+            labels: slice.labels.clone(),
+        };
+        reverse_translate_xds_snapshot(&translate_mesh_slice_to_snapshot(slice), &config)
+    }
 
     const THIS_WAYPOINT: &str = "spiffe://cluster.local/ns/ferrum/sa/node-waypoint-a";
     const OTHER_WAYPOINT: &str = "spiffe://cluster.local/ns/ferrum/sa/node-waypoint-b";
@@ -490,10 +514,9 @@ mod node_waypoint_capture_inventory {
         PeerAuthentication {
             name: format!("{namespace}-default"),
             namespace: namespace.to_string(),
-            scope: Some(PolicyScope::Namespace {
+            scope: PolicyScope::Namespace {
                 namespace: namespace.to_string(),
-            }),
-            selector: None,
+            },
             mtls_mode: mode,
             port_overrides: HashMap::new(),
         }
@@ -685,11 +708,12 @@ mod node_waypoint_capture_inventory {
         let dtls_overlay = PeerAuthentication {
             name: "dtls-echo".to_string(),
             namespace: "ferrum".to_string(),
-            scope: None,
-            selector: Some(WorkloadSelector {
-                labels: HashMap::from([("app".to_string(), "dtls-echo".to_string())]),
-                namespace: None,
-            }),
+            scope: PolicyScope::WorkloadSelector {
+                selector: WorkloadSelector {
+                    labels: HashMap::from([("app".to_string(), "dtls-echo".to_string())]),
+                    namespace: Some("ferrum".to_string()),
+                },
+            },
             mtls_mode: MtlsMode::Strict,
             port_overrides: HashMap::from([(DTLS_PORT, MtlsMode::Permissive)]),
         };
@@ -774,7 +798,6 @@ mod node_waypoint_capture_inventory {
             MeshSlice::from_gateway_config(&config_with_workloads(), node_waypoint_request());
         let resources = ferrum_edge::xds::translator::translate_mesh_slice_carriers(&slice);
 
-        let mut rebuilt = MeshSlice::default();
         let mut saw_destinations = false;
         let mut saw_peer_authentications = false;
         let mut saw_mesh_policies = false;
@@ -806,8 +829,8 @@ mod node_waypoint_capture_inventory {
                 carrier,
                 MeshSliceCarrier::NodeWaypointCaptureMeshPolicies(_)
             );
-            ferrum_edge::xds::carrier::apply_carrier(&mut rebuilt, carrier);
         }
+        let rebuilt = rebuild_over_xds(&slice).expect("the DP rebuilds the capture inventory");
 
         assert!(
             saw_destinations && saw_peer_authentications,
@@ -1068,7 +1091,6 @@ mod node_waypoint_capture_inventory {
             .expect("an explicitly complete empty inventory is valid");
         prepare(&slice).expect("a complete empty inventory is served");
 
-        let mut rebuilt = MeshSlice::default();
         let mut saw_empty_carrier = false;
         for resource in ferrum_edge::xds::translator::translate_mesh_slice_carriers(&slice) {
             let typed_extension =
@@ -1087,8 +1109,8 @@ mod node_waypoint_capture_inventory {
             if let MeshSliceCarrier::NodeWaypointCaptureMeshPolicies(policies) = &carrier {
                 saw_empty_carrier = policies.is_empty();
             }
-            ferrum_edge::xds::carrier::apply_carrier(&mut rebuilt, carrier);
         }
+        let rebuilt = rebuild_over_xds(&slice).expect("the DP rebuilds a complete empty inventory");
         assert!(
             saw_empty_carrier,
             "the AuthorizationPolicy carrier is the completeness evidence and must be emitted \
@@ -1144,7 +1166,6 @@ mod node_waypoint_capture_inventory {
 
         // xDS: the older shape emits no AuthorizationPolicy carrier, so the
         // recovered slice carries no evidence and is refused the same way.
-        let mut recovered = MeshSlice::default();
         for resource in
             ferrum_edge::xds::translator::translate_mesh_slice_carriers(&missing_evidence)
         {
@@ -1166,14 +1187,13 @@ mod node_waypoint_capture_inventory {
                     ),
                     "an unresolved inventory must not emit completeness evidence"
                 );
-                ferrum_edge::xds::carrier::apply_carrier(&mut recovered, carrier);
             }
         }
-        assert!(!recovered.node_waypoint_capture_destinations.is_empty());
+        let error = rebuild_over_xds(&missing_evidence)
+            .expect_err("the DP refuses capture destinations without policy evidence");
         assert!(
-            recovered
-                .validate_node_waypoint_capture_inventory()
-                .is_err()
+            error.contains("node_waypoint_capture_mesh_policies_resolved"),
+            "diagnostic must name the missing evidence: {error}"
         );
 
         // Policies without evidence are incoherent and refused too.

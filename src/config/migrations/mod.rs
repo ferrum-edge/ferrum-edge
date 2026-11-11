@@ -1,16 +1,7 @@
-pub(crate) mod mysql_collation_probe;
 pub(crate) mod sql_dialect;
 pub(crate) mod sql_statements;
 pub mod v001_initial_schema;
 
-#[allow(unused_imports)] // Re-exported for external unit tests / public API consumers.
-pub use mysql_collation_probe::{
-    IdentityBearingColumn, LiveColumnCollation, LiveTableCollation,
-    REQUIRED_MYSQL_IDENTITY_COLLATION, StaleCollationFinding, find_stale_column_collations,
-    find_stale_table_collations, format_affected_columns_summary, identity_bearing_columns,
-    inspect_mysql_identity_collations, merge_stale_collation_findings,
-    remediation_alter_statements, warn_stale_mysql_identity_collations,
-};
 pub use sql_statements::{
     split_plugin_migration_statements, statements_require_non_transactional_postgres,
 };
@@ -1015,7 +1006,6 @@ impl MigrationRunner {
         Ok(())
     }
 
-    #[allow(dead_code)] // core-only helper for run_pending; production uses validate_known_history_locked
     async fn validate_core_history_locked(
         &self,
         connection: &mut AnyConnection,
@@ -1069,7 +1059,6 @@ impl MigrationRunner {
     ///
     /// This helper is intentionally core-only. Production startup uses
     /// [`Self::run_pending_with_plugin_history`] for combined validation.
-    #[allow(dead_code)] // exercised via external migration tests; production uses run_pending_with_plugin_history
     pub async fn run_pending(&self) -> Result<Vec<MigrationRecord>, anyhow::Error> {
         let mut migration_lock =
             MigrationConnectionLock::acquire(&self.pool, &self.db_type).await?;
@@ -1189,13 +1178,6 @@ impl MigrationRunner {
 
             newly_applied.push(record);
         }
-
-        // MySQL-only: warn when upgraded deployments still carry a non-
-        // utf8mb4_0900_bin identity collation. Warn-and-continue (never refuse
-        // startup) — matching the pending-plugin-migration posture. No-op on
-        // PostgreSQL / SQLite; MongoDB never reaches MigrationRunner.
-        mysql_collation_probe::warn_stale_mysql_identity_collations(connection, &self.db_type)
-            .await;
 
         Ok(newly_applied)
     }

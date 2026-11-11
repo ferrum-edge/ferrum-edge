@@ -99,12 +99,11 @@ pub struct HmacAuthCredential {
     /// `true` when the selected field was RFC 9530 `Content-Digest`.
     /// `false` means RFC 3230 `Digest`. The two spellings are not interchangeable.
     pub digest_is_rfc9530: bool,
-    /// `ferrum-hmac-v2` client nonce from the `Authorization` parameters,
-    /// already validated for wire form. Bound into the v2 signing base and, once
-    /// the signature and body digest verify, claimed exactly once against the
-    /// shared replay authority. `None` under the legacy `ferrum-hmac-v1`
-    /// profile, which accepts no nonce and provides no single-use guarantee.
-    pub nonce: Option<String>,
+    /// Client nonce (`ferrum-hmac-v2` `Authorization` parameter or `rfc9421`
+    /// signature parameter), already validated for wire form. Bound into the
+    /// signature and, once the signature and body digest verify, claimed
+    /// exactly once against the shared replay authority.
+    pub nonce: String,
     /// Canonical values of the policy's `signed_headers`, in configuration
     /// order, appended to the Ferrum signing base. Empty when the policy
     /// requires no extra headers, and always empty under `rfc9421`, whose
@@ -144,7 +143,7 @@ impl fmt::Debug for HmacAuthCredential {
             .field("query", &"[REDACTED]")
             .field("digest_header", &"[REDACTED]")
             .field("digest_is_rfc9530", &self.digest_is_rfc9530)
-            .field("nonce", &self.nonce.as_ref().map(|_| "[REDACTED]"))
+            .field("nonce", &"[REDACTED]")
             // Header values and the RFC 9421 base can carry application data
             // and the raw query; only their shape is observable.
             .field("signed_header_values", &self.signed_header_values.len())
@@ -373,17 +372,6 @@ pub enum CredentialDeadline {
     /// The expiry cannot describe a live credential at all — an end before the
     /// Unix epoch, or a leeway too wide to be a signed offset. Reject.
     Invalid,
-}
-
-impl CredentialDeadline {
-    /// The representable deadline, if there is one. `None` for both
-    /// `Unbounded` and `Invalid`, so this must never decide admission.
-    pub fn bounded(self) -> Option<tokio::time::Instant> {
-        match self {
-            Self::Bounded(deadline) => Some(deadline),
-            Self::Unbounded | Self::Invalid => None,
-        }
-    }
 }
 
 /// Wall-clock seconds since the Unix epoch, saturating for a host clock that
@@ -879,13 +867,6 @@ fn parse_authentication_challenges(value: &str) -> Option<Vec<ParsedChallenge<'_
         pos = skip_list_separators(bytes, pos);
     }
     Some(challenges)
-}
-
-/// The auth-scheme token that opens a challenge (RFC 9110 §11.1).
-pub fn authentication_challenge_scheme(challenge: &str) -> &str {
-    let challenge = challenge.trim_start_matches([' ', '\t', ',']);
-    let end = scan_token(challenge.as_bytes(), 0);
-    &challenge[..end]
 }
 
 /// Whether `value` may be emitted as a `WWW-Authenticate` field value: a

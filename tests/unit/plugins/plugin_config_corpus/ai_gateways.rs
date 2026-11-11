@@ -83,7 +83,6 @@ pub(super) fn contract(name: &str) -> Option<PluginConfigContract> {
                 "threshold": 0.8
             }],
             "privacy": {
-                "log_raw_text": false,
                 "include_snippet_hash": true,
                 "snippet_hash_salt": "corpus-snippet-salt"
             },
@@ -419,7 +418,6 @@ pub(super) fn contract(name: &str) -> Option<PluginConfigContract> {
                     "aggregate_resources": true,
                     "aggregate_prompts": true,
                     "cache_ttl_seconds": 300,
-                    "hide_denied_items": true,
                     "namespace_separator": ".",
                     "on_new_tool": "hide_until_configured",
                     "on_schema_change": "hide_until_configured"

@@ -439,7 +439,6 @@ impl JwksKeyStore {
     }
 
     /// Currently installed on-demand refetch cooldown.
-    #[allow(dead_code)] // external unit tests assert the effective policy
     pub fn kid_miss_cooldown(&self) -> Duration {
         Duration::from_millis(self.kid_miss.cooldown_ms.load(Ordering::Acquire))
     }
@@ -489,7 +488,6 @@ impl JwksKeyStore {
     ///
     /// A count only — no key identifier, token, or claim is retained anywhere
     /// on this path.
-    #[allow(dead_code)] // external unit tests assert the rate-limit contract
     pub fn kid_miss_refresh_requests(&self) -> u64 {
         self.kid_miss.admitted.load(Ordering::Relaxed)
     }
@@ -529,7 +527,6 @@ impl JwksKeyStore {
     }
 
     /// Number of completed remote refresh attempts (success or failure).
-    #[allow(dead_code)] // external unit tests observe refresh sync; dead in the binary target
     pub fn refresh_completions(&self) -> u64 {
         self.refresh_completions.load(Ordering::Acquire)
     }
@@ -540,7 +537,6 @@ impl JwksKeyStore {
     /// do not need to sleep through virtual time to observe a forced refresh.
     /// Subscribe before reading the counter so a completion that races the
     /// check cannot be lost between the load and `notified().await`.
-    #[allow(dead_code)] // external unit tests observe refresh sync; dead in the binary target
     pub async fn wait_for_refresh_completion_after(&self, before: u64) {
         loop {
             let notified = self.refresh_notify.notified();

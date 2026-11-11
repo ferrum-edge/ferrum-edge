@@ -562,7 +562,6 @@ fn provider_stats(name: &str) -> Arc<ProviderStats> {
 /// One provider's per-provider counters, for tests and diagnostics: the
 /// non-zero `(outcome, count)` pairs and the number of timed checks. `None`
 /// when the name was never registered.
-#[allow(dead_code)] // external integration-test seam; unused in the binary target
 pub fn provider_snapshot(name: &str) -> Option<(Vec<(&'static str, u64)>, u64)> {
     let registry = PROVIDER_STATS
         .lock()
@@ -929,7 +928,6 @@ impl MeshExtAuthzExecutor {
     /// aggregate contract, and observe the ceiling, without opening the whole
     /// budget's worth of live provider connections. Production code touches
     /// the pool only inside [`Self::check`].
-    #[allow(dead_code)] // external integration-test seam; unused in the binary target
     pub fn check_budget(&self) -> &Arc<Semaphore> {
         &self.permits
     }
@@ -963,7 +961,6 @@ impl MeshExtAuthzExecutor {
     }
 
     /// Whether this generation carries `provider_name` at all.
-    #[allow(dead_code)] // external integration-test seam; unused in the binary target
     pub fn binds(&self, provider_name: &str) -> bool {
         self.providers.contains_key(provider_name)
     }

@@ -632,7 +632,7 @@ curl -X POST -H "Authorization: Bearer $TOKEN" \
   "http://localhost:9000/admin/tls/rotate/proxy_https"
 ```
 
-Supported force-reload surfaces are `proxy_https`, `backend_tls`, `admin_https`, `dtls`, `database_tls`, `cp_grpc`, `dp_grpc`, `svid`, and `all` for every registered watcher plus the configured gateway SVID. Aliases `frontend`, `backend`, `admin`, `frontend_dtls`, `db`, `database`, `cp_grpc_tls`, `dp_grpc_tls`, and `gateway_svid` are accepted. Watcher-backed TLS reloads are enqueued and report success or failure asynchronously through `/admin/tls/events` and `/metrics`; `svid` reloads are validated synchronously and publish a backend SVID generation bump on success. The `dtls` / `frontend_dtls` surface validates one immutable generation (server cert/key, optional client CA, CRLs) before publishing it into every active DTLS server; a rejected candidate retains the previous generation and is recorded as a rebuild failure without secret paths or PEM material. Authenticated `GET /overload` includes the bounded `stream_listeners.frontend_dtls_reload` generation, last publish count, timestamps, and fixed-cardinality outcome.
+Supported force-reload surfaces are `proxy_https`, `backend_tls`, `admin_https`, `dtls`, `database_tls`, `cp_grpc`, `dp_grpc`, `svid`, and `all` for every registered watcher plus the configured gateway SVID. Aliases `frontend`, `backend`, `admin`, `frontend_dtls`, `db`, `database`, `cp_grpc_tls`, `dp_grpc_tls`, and `gateway_svid` are accepted. Watcher-backed TLS reloads are enqueued and report success or failure asynchronously through `/admin/tls/events` and `/metrics`; `svid` reloads are validated synchronously and publish a backend SVID generation bump on success. The `dtls` / `frontend_dtls` surface validates one immutable generation (server cert/key, optional client CA, CRLs) before publishing it into every active DTLS server; a rejected candidate retains the previous generation and is recorded as a rebuild failure without secret paths or PEM material. Authenticated `GET /overload` includes the bounded `stream_listeners.frontend_dtls_reload` generation, last publish count, timestamps, and fixed-cardinality outcome. The owner-scoped mesh NodeWaypoint DTLS slot reports the same fields separately as `stream_listeners.mesh_node_waypoint_dtls_reload`, so a rejected mesh PeerAuthentication candidate is visible without touching the operator slot.
 
 ## TLS Validation
 
@@ -794,7 +794,7 @@ export FERRUM_FRONTEND_TLS_OCSP_RESPONSE_SOURCE="managed://ocsp-responses/edge-o
 export FERRUM_FRONTEND_TLS_LIVE_RELOAD_ENABLED=true
 ```
 
-JWKS-capable plugin fields can reference `managed://jwks/{id}#jwks` once the plugin accepts `CertSource` JWKS material.
+No setting or plugin field reads JWKS records yet: `jwks_auth` takes only `jwks_uri`, inline `jwks`, or discovery, and no field accepts a `managed://jwks/{id}#jwks` source. A stored JWKS record is kept and listed but has no runtime effect (issue #7277).
 
 `DELETE` returns `409 Conflict` when the current runtime/config inventory still references the record.
 
@@ -3046,11 +3046,12 @@ self-description, not a cryptographic attestation of its host. The set is a
 point-in-time view of connected Subscribe streams: a DP that is partitioned
 from the CP keeps serving its cached config but is not listed, and a DP using
 another control plane is never seen. Consumers should require
-`all_connected_public_only_guaranteed=true` **and** compare
-`connected_data_planes` (live streams) against their expected data-plane
-inventory. When replicas share one node id, compare the stream count, not the
-distinct `node_id`s. A transient reconnect overlap can briefly count one DP
-twice; that only weakens or over-counts the set, never hides a stream.
+`all_connected_public_only_guaranteed=true` **and** require a count of distinct
+`node_id` values in `data_planes` that reaches the number of data-plane
+processes they expect for the namespace. Each Edge DP process subscribes under
+its own random `node_id`; `connected_data_planes` counts streams, so a
+reconnect overlap can count one process twice. Replicas that share one node id
+(externally minted DP JWTs) count once, so the check fails closed for them.
 `GET /cluster` shows the same per-stream reports for every namespace.
 
 Authorization: this endpoint is open to `viewer` tokens and viewer-key

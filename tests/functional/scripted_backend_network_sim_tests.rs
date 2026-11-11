@@ -3,7 +3,7 @@
 //! These tests insert a [`crate::scaffolding::network::NetworkSimProxy`]
 //! middleman between the gateway and a scripted backend so each accepted
 //! connection goes through a `DelayedStream` / `BandwidthLimitedStream`
-//! / `TruncatedStream` pipeline. The gateway sees a "slow network" to
+//! pipeline. The gateway sees a "slow network" to
 //! the backend; the tests assert the gateway's timing + metrics behave
 //! correctly against it.
 //!

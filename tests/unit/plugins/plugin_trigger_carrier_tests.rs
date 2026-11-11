@@ -18,14 +18,16 @@ use ferrum_edge::_test_support::{
     collect_websocket_size_limit_plugins_for_test, plugin_trigger_carrier_counters_for_test,
 };
 use ferrum_edge::PluginCache;
+use ferrum_edge::config::plugin_trigger::PluginTrigger;
 use ferrum_edge::config::types::{
     BackendScheme, DispatchKind, GatewayConfig, PluginConfig, PluginScope, Proxy,
 };
 use ferrum_edge::consumer_index::ConsumerIndex;
 use ferrum_edge::plugins::api_chargeback::{ProtocolFamily, global_registry};
+use ferrum_edge::plugins::trigger::PluginTriggerGate;
 use ferrum_edge::plugins::{
     MirrorResponseMeta, Plugin, RequestContext, StreamConnectionContext, StreamFrontendTransport,
-    TransactionSummary, log_with_mirror,
+    StreamTriggerDecisions, TransactionSummary, log_with_mirror,
 };
 use serde_json::json;
 use std::sync::Arc;
@@ -244,6 +246,27 @@ async fn a_missing_carrier_runs_the_terminal_hook_and_records_the_invariant() {
         plugin_trigger_carrier_counters_for_test().missing_decision_carriers > before,
         "a missing carrier must record the bounded invariant signal"
     );
+}
+
+/// Issue #7144: an identity-reading trigger is undecided by design on stream
+/// connections and before `authenticate`, so its absent carrier is the
+/// documented fail-open path and is not reported as a stamping bug. A trigger
+/// that never reads identity still is. Both RUN the hook.
+#[test]
+fn only_identity_triggers_treat_a_missing_carrier_as_expected() {
+    let gate = |trigger: serde_json::Value| {
+        let trigger: PluginTrigger = serde_json::from_value(trigger).expect("trigger parses");
+        PluginTriggerGate::compile(&trigger, "carrier-expected").expect("trigger compiles")
+    };
+    let identity = gate(json!({"when": {"match": {"consumer": {"value": {"exact": ["alice"]}}}}}));
+    let path = gate(json!({"when": {"match": {"path": {"prefix": ["/never"]}}}}));
+
+    assert!(identity.missing_carrier_is_expected());
+    assert!(!path.missing_carrier_is_expected());
+
+    let undecided = StreamTriggerDecisions::default();
+    assert!(identity.stream_session_decision_or_run(&undecided));
+    assert!(path.stream_session_decision_or_run(&undecided));
 }
 
 #[tokio::test]

@@ -6,18 +6,14 @@
 //! (real backend has both H1 and H3), but attempts to establish QUIC never
 //! succeed — probing classifies the target as H3-`Unsupported`.
 //!
-//! Implementation note: real QUIC `CONNECTION_CLOSE` requires TLS/crypto,
-//! which is overkill for this fixture. Instead we use `quinn::Endpoint`
-//! with a TLS config that has no ALPN overlap with the client's `h3`, so
-//! quinn tears the handshake down at the transport layer, producing a
-//! QUIC-level close error that exercises the gateway's H3 classifier. We
-//! also offer a lower-level variant via [`QuicRefuser::start_alpn_mismatch`]
-//! that uses an ALPN of `no-quic` specifically so the gateway's ALPN check
-//! fails deterministically.
+//! Implementation note: [`QuicRefuser::start_alpn_mismatch`] runs a
+//! `quinn::Endpoint` whose server ALPN is `no-h3`, so it has no overlap with
+//! the client's `h3`: quinn tears the handshake down at the transport layer,
+//! producing a QUIC-level close error that exercises the gateway's H3
+//! classifier deterministically.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
 use quinn::Endpoint;
@@ -37,28 +33,16 @@ pub struct QuicRefuser {
     endpoint: Endpoint,
     handle: Option<JoinHandle<()>>,
     shutdown: Option<oneshot::Sender<()>>,
-    connections_seen: Arc<AtomicU32>,
 }
 
 impl QuicRefuser {
-    /// Start a QUIC refuser that closes every incoming connection with
-    /// `code=0` (`NO_ERROR`) immediately after accept. The UDP socket must
-    /// be pre-bound via [`super::super::ports::reserve_udp_port`] (or
-    /// [`super::super::ports::reserve_colocated_tcp_udp`] when the test
-    /// also needs a co-located TCP backend) to avoid the bind-drop-rebind
-    /// race.
-    pub fn start(
-        reservation: UdpPortReservation,
-        tls: H3TlsConfig,
-    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
-        Self::start_with_alpn(reservation, tls, vec![b"h3".to_vec()])
-    }
-
     /// Start a QUIC refuser whose server ALPN is explicitly *not* `h3`, so
     /// the gateway's H3 handshake fails with an ALPN-mismatch class
-    /// error. Useful when the test wants to exercise the "QUIC spoke to
-    /// us but refused the H3 negotiation" path rather than a raw
-    /// `CONNECTION_CLOSE`.
+    /// error ("QUIC spoke to us but refused the H3 negotiation"). The UDP
+    /// socket must be pre-bound via [`super::super::ports::reserve_udp_port`]
+    /// (or [`super::super::ports::reserve_colocated_tcp_udp`] when the test
+    /// also needs a co-located TCP backend) to avoid the bind-drop-rebind
+    /// race.
     pub fn start_alpn_mismatch(
         reservation: UdpPortReservation,
         tls: H3TlsConfig,
@@ -88,8 +72,6 @@ impl QuicRefuser {
 
         let (shutdown_tx, mut shutdown_rx) = oneshot::channel::<()>();
         let endpoint_task = endpoint.clone();
-        let connections_seen = Arc::new(AtomicU32::new(0));
-        let counter = connections_seen.clone();
 
         let handle = tokio::spawn(async move {
             loop {
@@ -103,7 +85,6 @@ impl QuicRefuser {
                         let Some(incoming) = incoming else {
                             return;
                         };
-                        counter.fetch_add(1, Ordering::SeqCst);
                         // Accept, then immediately close with NO_ERROR.
                         // Doing it this way (rather than refuse()) gives
                         // the client a visible CONNECTION_CLOSE rather
@@ -134,7 +115,6 @@ impl QuicRefuser {
             endpoint,
             handle: Some(handle),
             shutdown: Some(shutdown_tx),
-            connections_seen,
         })
     }
 
@@ -176,11 +156,6 @@ impl QuicRefuser {
         self.addr.port()
     }
 
-    /// Number of incoming QUIC connections this refuser observed.
-    pub fn connections_seen(&self) -> u32 {
-        self.connections_seen.load(Ordering::SeqCst)
-    }
-
     pub fn shutdown(&mut self) {
         if let Some(tx) = self.shutdown.take() {
             let _ = tx.send(());
@@ -210,9 +185,8 @@ mod tests {
         let (cert, key) = ca.valid().expect("leaf");
         let reservation = reserve_udp_port().await.expect("udp");
         let expected_port = reservation.port;
-        let refuser =
-            QuicRefuser::start(reservation, H3TlsConfig::new(cert, key)).expect("refuser");
+        let refuser = QuicRefuser::start_alpn_mismatch(reservation, H3TlsConfig::new(cert, key))
+            .expect("refuser");
         assert_eq!(refuser.port(), expected_port);
-        assert_eq!(refuser.connections_seen(), 0);
     }
 }

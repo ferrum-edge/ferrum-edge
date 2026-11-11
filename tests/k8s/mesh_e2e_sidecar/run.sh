@@ -811,6 +811,9 @@ mesh:
   peer_authentications:
     - name: mesh-strict
       namespace: $NS
+      scope:
+        kind: namespace
+        namespace: $NS
       mtls_mode: strict
   request_authentications:
     - name: jwt-fixture
@@ -890,6 +893,9 @@ mesh:
   peer_authentications:
     - name: mesh-strict
       namespace: $NS
+      scope:
+        kind: namespace
+        namespace: $NS
       mtls_mode: strict
 YAML
 )"
@@ -932,6 +938,9 @@ mesh:
   peer_authentications:
     - name: mesh-strict
       namespace: $DR_SERVICE_NS
+      scope:
+        kind: namespace
+        namespace: $DR_SERVICE_NS
       mtls_mode: strict
 YAML
 )"

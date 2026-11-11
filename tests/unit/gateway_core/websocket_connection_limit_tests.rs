@@ -3,8 +3,7 @@ use std::sync::atomic::Ordering;
 
 use ferrum_edge::proxy::{
     PerIpLimitExceeded, PerIpStreamAdmission, try_acquire_per_ip_slot,
-    try_acquire_per_ip_websocket_session, try_acquire_per_ip_websocket_session_with_prefix,
-    try_acquire_websocket_connection_permit,
+    try_acquire_per_ip_websocket_session_with_prefix, try_acquire_websocket_connection_permit,
 };
 
 #[test]
@@ -26,14 +25,17 @@ fn websocket_connection_permit_rejects_when_limit_is_exhausted() {
 
 #[test]
 fn per_ip_websocket_session_is_disabled_when_unconfigured() {
-    let guard = try_acquire_per_ip_websocket_session(None, "198.51.100.1", 1).unwrap();
+    let guard =
+        try_acquire_per_ip_websocket_session_with_prefix(None, "198.51.100.1", 1, 64).unwrap();
     assert!(guard.is_none());
 }
 
 #[test]
 fn per_ip_websocket_session_is_disabled_when_max_is_zero() {
     let counts = Arc::new(dashmap::DashMap::new());
-    let guard = try_acquire_per_ip_websocket_session(Some(&counts), "198.51.100.1", 0).unwrap();
+    let guard =
+        try_acquire_per_ip_websocket_session_with_prefix(Some(&counts), "198.51.100.1", 0, 64)
+            .unwrap();
     assert!(guard.is_none());
     assert!(counts.is_empty());
 }
@@ -41,9 +43,10 @@ fn per_ip_websocket_session_is_disabled_when_max_is_zero() {
 #[test]
 fn per_ip_websocket_session_rejects_when_limit_is_exhausted() {
     let counts = Arc::new(dashmap::DashMap::new());
-    let first = try_acquire_per_ip_websocket_session(Some(&counts), "198.51.100.1", 1)
-        .unwrap()
-        .expect("first session should be admitted");
+    let first =
+        try_acquire_per_ip_websocket_session_with_prefix(Some(&counts), "198.51.100.1", 1, 64)
+            .unwrap()
+            .expect("first session should be admitted");
     assert_eq!(
         counts
             .get("198.51.100.1")
@@ -52,7 +55,8 @@ fn per_ip_websocket_session_rejects_when_limit_is_exhausted() {
         1
     );
 
-    let second = try_acquire_per_ip_websocket_session(Some(&counts), "198.51.100.1", 1);
+    let second =
+        try_acquire_per_ip_websocket_session_with_prefix(Some(&counts), "198.51.100.1", 1, 64);
     assert!(
         matches!(second, Err(PerIpLimitExceeded)),
         "a second session from the same source must be refused"
@@ -79,13 +83,15 @@ fn per_ip_websocket_session_rejects_when_limit_is_exhausted() {
 #[test]
 fn per_ip_websocket_session_is_enforced_independently_per_source() {
     let counts = Arc::new(dashmap::DashMap::new());
-    let _first = try_acquire_per_ip_websocket_session(Some(&counts), "198.51.100.1", 1)
-        .unwrap()
-        .expect("first source should be admitted");
+    let _first =
+        try_acquire_per_ip_websocket_session_with_prefix(Some(&counts), "198.51.100.1", 1, 64)
+            .unwrap()
+            .expect("first source should be admitted");
 
-    let other = try_acquire_per_ip_websocket_session(Some(&counts), "198.51.100.2", 1)
-        .unwrap()
-        .expect("second source should still be admitted");
+    let other =
+        try_acquire_per_ip_websocket_session_with_prefix(Some(&counts), "198.51.100.2", 1, 64)
+            .unwrap()
+            .expect("second source should still be admitted");
     assert_eq!(
         counts
             .get("198.51.100.1")
@@ -106,14 +112,16 @@ fn per_ip_websocket_session_is_enforced_independently_per_source() {
 #[test]
 fn per_ip_websocket_session_slot_is_reusable_after_release() {
     let counts = Arc::new(dashmap::DashMap::new());
-    let first = try_acquire_per_ip_websocket_session(Some(&counts), "198.51.100.1", 1)
-        .unwrap()
-        .expect("first session should be admitted");
+    let first =
+        try_acquire_per_ip_websocket_session_with_prefix(Some(&counts), "198.51.100.1", 1, 64)
+            .unwrap()
+            .expect("first session should be admitted");
     drop(first);
 
-    let reused = try_acquire_per_ip_websocket_session(Some(&counts), "198.51.100.1", 1)
-        .unwrap()
-        .expect("released slot should be reusable");
+    let reused =
+        try_acquire_per_ip_websocket_session_with_prefix(Some(&counts), "198.51.100.1", 1, 64)
+            .unwrap()
+            .expect("released slot should be reusable");
     drop(reused);
 }
 

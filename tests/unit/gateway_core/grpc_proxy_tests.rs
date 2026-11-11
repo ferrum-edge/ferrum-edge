@@ -58,7 +58,6 @@ fn test_proxy() -> Proxy {
         pool_http2_max_concurrent_streams: None,
         pool_http3_connections_per_backend: None,
         h2_upgrade_policy: None,
-        pool_max_requests_per_connection: None,
         pool_http1_max_pending_requests: None,
         upstream_id: None,
         upstream_subset: None,
@@ -1023,7 +1022,6 @@ async fn test_proxy_grpc_request_from_bytes_error_on_unreachable_backend() {
     proxy.backend_port = 1; // intentionally unreachable port
     proxy.retry = None;
 
-    let dns = ferrum_edge::dns::DnsCache::new(ferrum_edge::dns::DnsConfig::default());
     let headers = headers_with_content_type("application/grpc");
     let body = Bytes::from_static(b"\x00\x00\x00\x00\x05hello");
     let proxy_headers = std::collections::HashMap::new();
@@ -1036,7 +1034,6 @@ async fn test_proxy_grpc_request_from_bytes_error_on_unreachable_backend() {
         &proxy,
         "http://127.0.0.1:1/test.Service/Method",
         &grpc_proxy::GrpcDispatchTransport::Direct(&pool),
-        &dns,
         &proxy_headers,
         false,
         0,

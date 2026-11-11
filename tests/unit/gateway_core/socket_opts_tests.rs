@@ -3,8 +3,8 @@
 //! The non-Linux stubs all return fixed values (Ok, None, false, Unsupported).
 //! These tests verify that every public function is callable and returns the
 //! expected stub value on macOS / non-Linux, and that platform-independent
-//! functions (monotonic_now_ms, TcpConnectionInfo::bdp_bytes,
-//! connect_with_socket_opts) work correctly on all platforms.
+//! functions (monotonic_now_ms, connect_with_socket_opts) work correctly on all
+//! platforms.
 
 use ferrum_edge::socket_opts::*;
 
@@ -38,73 +38,6 @@ fn monotonic_now_ms_advances_with_time() {
     );
 }
 
-// ── TcpConnectionInfo::bdp_bytes (platform-independent) ────────────────
-
-#[test]
-fn bdp_bytes_normal_values() {
-    let info = TcpConnectionInfo {
-        rtt_us: 10_000, // 10ms
-        snd_cwnd: 10,   // 10 segments
-        snd_mss: 1460,  // typical MSS
-    };
-    // BDP = cwnd * mss = 10 * 1460 = 14600
-    assert_eq!(info.bdp_bytes(), 14_600);
-}
-
-#[test]
-fn bdp_bytes_zero_rtt_returns_zero() {
-    let info = TcpConnectionInfo {
-        rtt_us: 0,
-        snd_cwnd: 10,
-        snd_mss: 1460,
-    };
-    assert_eq!(info.bdp_bytes(), 0);
-}
-
-#[test]
-fn bdp_bytes_zero_cwnd_returns_zero() {
-    let info = TcpConnectionInfo {
-        rtt_us: 10_000,
-        snd_cwnd: 0,
-        snd_mss: 1460,
-    };
-    assert_eq!(info.bdp_bytes(), 0);
-}
-
-#[test]
-fn bdp_bytes_zero_mss_returns_zero() {
-    let info = TcpConnectionInfo {
-        rtt_us: 10_000,
-        snd_cwnd: 10,
-        snd_mss: 0,
-    };
-    assert_eq!(info.bdp_bytes(), 0);
-}
-
-#[test]
-fn bdp_bytes_does_not_panic_on_large_values() {
-    let info = TcpConnectionInfo {
-        rtt_us: 1,
-        snd_cwnd: u32::MAX,
-        snd_mss: u32::MAX,
-    };
-    // saturating_mul prevents panic; on 64-bit the product fits in usize
-    let bdp = info.bdp_bytes();
-    assert!(bdp > 0);
-    assert_eq!(bdp, (u32::MAX as usize).saturating_mul(u32::MAX as usize));
-}
-
-#[test]
-fn bdp_bytes_large_realistic_values() {
-    let info = TcpConnectionInfo {
-        rtt_us: 100_000, // 100ms transatlantic
-        snd_cwnd: 500,   // large window
-        snd_mss: 1460,
-    };
-    // 500 * 1460 = 730_000 bytes ~= 712 KB
-    assert_eq!(info.bdp_bytes(), 730_000);
-}
-
 // ── Non-Linux socket option stubs ──────────────────────────────────────
 
 #[cfg(not(target_os = "linux"))]
@@ -126,11 +59,6 @@ mod non_linux_stubs {
     #[test]
     fn set_tcp_fastopen_client_noop() {
         assert!(set_tcp_fastopen_client(0).is_ok());
-    }
-
-    #[test]
-    fn get_tcp_info_returns_none() {
-        assert!(get_tcp_info(0).is_none());
     }
 
     #[test]
@@ -427,4 +355,66 @@ async fn connect_with_socket_opts_refuses_unreachable() {
     let addr: std::net::SocketAddr = "127.0.0.1:1".parse().unwrap();
     let result = connect_with_socket_opts(addr).await;
     assert!(result.is_err());
+}
+
+// ── io_uring splice readiness wait (Linux, issue #7226) ────────────────
+
+#[cfg(target_os = "linux")]
+mod io_uring_readiness_wait {
+    use ferrum_edge::socket_opts::io_uring_splice::wait_fd_ready;
+    use std::io::Write;
+    use std::os::fd::AsRawFd;
+    use std::os::unix::net::UnixStream;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn idle_descriptor_waits_until_the_deadline() {
+        let (reader, _writer) = UnixStream::pair().expect("socket pair");
+        let started = Instant::now();
+        assert!(!wait_fd_ready(reader.as_raw_fd(), libc::POLLIN, 50));
+        let waited = started.elapsed();
+        assert!(
+            waited >= Duration::from_millis(45),
+            "an idle relay must sleep until its deadline, not return at once: {waited:?}"
+        );
+    }
+
+    #[test]
+    fn arriving_data_wakes_the_wait_before_the_deadline() {
+        let (reader, mut writer) = UnixStream::pair().expect("socket pair");
+        let sender = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(20));
+            writer.write_all(b"x").expect("write");
+            writer
+        });
+        let started = Instant::now();
+        assert!(wait_fd_ready(reader.as_raw_fd(), libc::POLLIN, 10_000));
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "readiness must wake the relay, not the deadline"
+        );
+        drop(sender.join().expect("sender"));
+    }
+
+    #[test]
+    fn shutdown_wakes_a_waiting_relay() {
+        let (reader, writer) = UnixStream::pair().expect("socket pair");
+        let fd = reader.as_raw_fd();
+        let closer = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(20));
+            // The parent cancels a relay with shutdown(SHUT_RDWR).
+            reader.shutdown(std::net::Shutdown::Both).expect("shutdown");
+            (reader, writer)
+        });
+        let started = Instant::now();
+        assert!(wait_fd_ready(fd, libc::POLLIN, 10_000));
+        assert!(started.elapsed() < Duration::from_secs(5));
+        drop(closer.join().expect("closer"));
+    }
+
+    #[test]
+    fn writable_descriptor_is_ready_immediately() {
+        let (_reader, writer) = UnixStream::pair().expect("socket pair");
+        assert!(wait_fd_ready(writer.as_raw_fd(), libc::POLLOUT, 10_000));
+    }
 }

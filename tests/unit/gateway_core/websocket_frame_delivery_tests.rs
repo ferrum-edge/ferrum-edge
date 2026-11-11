@@ -383,12 +383,12 @@ async fn policy_close_is_recorded_when_logger_precedes_the_rejecting_plugin() {
         (
             20u64,
             WebSocketFrameDirection::ClientToBackend,
-            "client->backend",
+            "client_to_backend",
         ),
         (
             21u64,
             WebSocketFrameDirection::BackendToClient,
-            "backend->client",
+            "backend_to_client",
         ),
     ] {
         let capture = Capture::default();

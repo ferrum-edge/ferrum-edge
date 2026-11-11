@@ -885,6 +885,9 @@ mesh:
   peer_authentications:
     - name: strict-default
       namespace: ferrum
+      scope:
+        kind: namespace
+        namespace: ferrum
       mtls_mode: strict
 "#;
     let path = write_temp("yaml", VALID_STOCK_POLICY_YAML);
@@ -1077,6 +1080,9 @@ mesh:
   peer_authentications:
     - name: strict-default
       namespace: ferrum
+      scope:
+        kind: namespace
+        namespace: ferrum
       mtls_mode: strict
 "#;
     let stock_path = write_temp("yaml", stock_yaml);
@@ -1207,6 +1213,9 @@ mesh:
   peer_authentications:
     - name: strict-default
       namespace: ferrum
+      scope:
+        kind: namespace
+        namespace: ferrum
       mtls_mode: strict
 "#;
 
@@ -1216,6 +1225,9 @@ mesh:
   peer_authentications:
     - name: renamed-after-reload
       namespace: ferrum
+      scope:
+        kind: namespace
+        namespace: ferrum
       mtls_mode: strict
 "#;
 

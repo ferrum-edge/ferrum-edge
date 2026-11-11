@@ -12,7 +12,7 @@
 //! Because the signer chooses the identity claim, a secret shared by two
 //! Consumers would let either sign as the other: config admission refuses
 //! such duplicates and every load/swap quarantines them on all holders
-//! (`GatewayConfig::quarantine_invalid_jwt_credentials`). The verifier itself
+//! (`GatewayConfig::quarantine_invalid_jwt_credentials_against`). The verifier itself
 //! never checks a signature against a stored secret below the
 //! non-whitespace length floor.
 //!
@@ -266,12 +266,12 @@ fn reject_unknown_keys(config: &serde_json::Map<String, Value>) -> Result<(), St
         "hide_credentials",
         "algorithm",
     ];
-    for key in config.keys() {
-        if !KNOWN_KEYS.contains(&key.as_str()) {
-            return Err(format!("jwt_auth: unknown config key {key:?}"));
-        }
-    }
-    Ok(())
+    crate::util::unknown_keys::reject_unknown_keys(
+        config,
+        "config",
+        &KNOWN_KEYS,
+        "jwt_auth: `config`: ",
+    )
 }
 
 #[async_trait]

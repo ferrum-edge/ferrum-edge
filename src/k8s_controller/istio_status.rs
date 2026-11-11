@@ -102,9 +102,10 @@ use tracing::warn;
 use crate::config_sources::k8s::{
     K8sObject, K8sTranslateError, K8sTranslation, K8sTranslationOptions, SidecarOutboundPolicy,
     classify_sidecar_outbound_traffic_policy, route_local_fault_delay_for_rule,
-    service_entry_port_protocol_is_udp, service_entry_spec_has_unresolvable_stream_wildcard_host,
-    sidecar_selector_from_istio, translate_k8s_objects_collecting_skips,
-    workload_entry_service_key_from_host, workload_selector_from_istio,
+    service_entry_endpoint_is_network_gateway_only, service_entry_port_protocol_is_udp,
+    service_entry_spec_has_unresolvable_stream_wildcard_host, sidecar_selector_from_istio,
+    translate_k8s_objects_collecting_skips, workload_entry_service_key_from_host,
+    workload_selector_from_istio,
 };
 use crate::k8s_controller::metrics::ControllerMetrics;
 use crate::k8s_controller::status::StatusTranslationReuse;
@@ -1511,6 +1512,21 @@ fn virtual_service_deferred_fields(spec: &Value) -> Vec<&'static str> {
              share of a weighted split — move them to http[].headers)",
         );
     }
+    // Istio-valid `retries` settings the translator accepts but does not
+    // enforce (`perTryTimeout`, `retryRemoteLocalities`, and `retryOn`
+    // policies outside Ferrum's retry model). Invalid `retryOn` tokens refuse
+    // the resource instead and surface through the `Invalid` arm.
+    for retries in http_routes
+        .into_iter()
+        .flatten()
+        .filter_map(|route| route.get("retries"))
+    {
+        for field in crate::config_sources::k8s::virtual_service_retry_deferred_fields(retries) {
+            if !deferred.contains(&field) {
+                deferred.push(field);
+            }
+        }
+    }
     deferred
 }
 
@@ -1540,16 +1556,14 @@ fn virtual_service_clamped_fields(spec: &Value) -> Vec<&'static str> {
 /// counts so operators can confirm Ferrum's view of an external service.
 ///
 /// A `protocol: UDP` port is ACCEPTED (it translates to `AppProtocol::Udp`) but
-/// its EgressGateway egress lane is INERT: the EgressGateway materializer skips
-/// UDP ports because ServiceEntry/egress-external UDP is out of scope (east-west
-/// UDP capture/egress shipped in F3 §3.3, but external-UDP egress did not), so
-/// the resource would
-/// otherwise show as fully accepted in `kubectl describe` while no
-/// proxy/listener/upstream is produced. Surface that gap as a `deferred_fields`
-/// entry (keeping `FerrumAccepted=True` — it IS accepted/translated, just
-/// inert), detected via the SHARED `service_entry_port_protocol_is_udp` predicate
-/// so the status report can never diverge from the translator's classification or
-/// the materializer's skip.
+/// its external egress is CONDITIONAL (issue #3263): the EgressGateway admits
+/// it into a datagram allowlist only with `FERRUM_MESH_EGRESS_STREAM_ENABLED`,
+/// and Sidecar/Ambient sources capture it only for a `MESH_EXTERNAL`,
+/// `resolution: STATIC` entry with IP-literal endpoints. No listener is ever
+/// bound for it. Surface those conditions as a `deferred_fields` entry
+/// (keeping `FerrumAccepted=True`), detected via the SHARED
+/// `service_entry_port_protocol_is_udp` predicate so the status report can never
+/// diverge from the translator's classification.
 ///
 /// A wildcard `spec.hosts[]` element on a stream-family port is reported the
 /// same way (issue #4535): the stream materialization branch refuses a wildcard
@@ -1596,15 +1610,10 @@ fn service_entry_status(
         .unwrap_or(0);
 
     // A `protocol: UDP` ServiceEntry is accepted (it translates to
-    // `AppProtocol::Udp`) but the EgressGateway materializer skips UDP ports as
-    // inert (ServiceEntry/egress-external UDP is out of scope; east-west UDP
-    // capture/egress shipped in F3 §3.3 — see `build_egress_proxies_and_upstreams`
-    // in `src/modes/mesh/mod.rs`, which keys its one-time deferral warning off
-    // `AppProtocol::Udp`). Surface that gap as a deferred field so the resource
-    // does not appear fully accepted while no proxy/listener/upstream is produced.
-    // Detect UDP ports on the raw spec via the SHARED predicate the translator's
-    // classifier feeds, so this report stays in lock-step with the materializer's
-    // skip.
+    // `AppProtocol::Udp`), but external UDP egress needs conditions the
+    // resource alone does not establish (see the doc comment above). Detect UDP
+    // ports on the raw spec via the SHARED predicate the translator's
+    // classifier feeds, so this report stays in lock-step with it.
     let has_udp_port = object
         .spec
         .get("ports")
@@ -1617,9 +1626,11 @@ fn service_entry_status(
     let mut deferred: Vec<&'static str> = Vec::new();
     if has_udp_port {
         deferred.push(
-            "spec.ports[].protocol: UDP — egress materialization deferred \
-             (ServiceEntry/egress-external UDP is out of scope; east-west UDP \
-             capture/egress shipped in F3 §3.3)",
+            "spec.ports[].protocol: UDP — external UDP egress is conditional (the \
+             EgressGateway admits it only with FERRUM_MESH_EGRESS_STREAM_ENABLED; \
+             Sidecar/Ambient sources capture it only for a MESH_EXTERNAL, \
+             resolution: STATIC entry with IP-literal endpoints; no UDP listener is \
+             bound)",
         );
     }
 
@@ -1638,6 +1649,34 @@ fn service_entry_status(
              deferred (a stream-family wildcard host is only materializable with \
              resolution: STATIC and a non-empty endpoints[]; a raw stream has no request \
              authority from which to concretize the dial target)",
+        );
+    }
+
+    // An address-less endpoint that names a `network` is valid Istio (reached
+    // through that network's gateway) but is skipped by the translator through
+    // the SAME shared predicate; report it rather than counting it served.
+    if object
+        .spec
+        .get("endpoints")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .any(service_entry_endpoint_is_network_gateway_only)
+    {
+        deferred.push(
+            "spec.endpoints[] without address (network-gateway endpoints are not \
+             materialized)",
+        );
+    }
+
+    // `spec.workloadSelector` is translated onto `ServiceEntry.workload_selector`
+    // but nothing consumes it: Ferrum does not select the entry's endpoints from
+    // the matching Pods/WorkloadEntries (Istio's meaning), so the entry serves
+    // only its declared `endpoints[]` (issue #7243).
+    if object.spec.get("workloadSelector").is_some() {
+        deferred.push(
+            "spec.workloadSelector — endpoint selection from the selected workloads is \
+             not implemented; only the declared endpoints[] are used",
         );
     }
 
@@ -2298,7 +2337,8 @@ fn telemetry_status(
 
     match result {
         Ok(_translation) => {
-            let message = if sections.is_empty() {
+            let deferred = crate::config_sources::k8s::telemetry_deferred_fields(&object.spec);
+            let mut message = if sections.is_empty() {
                 "Ferrum accepted this Telemetry (no tracing/metrics/accessLogging sections)"
                     .to_string()
             } else {
@@ -2307,10 +2347,14 @@ fn telemetry_status(
                     sections.join(", ")
                 )
             };
+            if !deferred.is_empty() {
+                message.push_str(&format!("; deferred fields: {}", deferred.join(", ")));
+            }
             let detail = json!({
                 "translation": {
                     "sections": sections,
                     "target_refs_declared": declared_target_refs,
+                    "deferred_fields": deferred,
                 }
             });
             accepted_status(object, true, "Accepted", &message, Some(detail))
@@ -4138,8 +4182,8 @@ mod tests {
         assert!(
             deferred
                 .iter()
-                .any(|f| f.contains("UDP") && f.contains("egress materialization deferred")),
-            "deferred_fields should mention the deferred UDP egress lane, got {deferred:?}"
+                .any(|f| f.contains("UDP") && f.contains("external UDP egress is conditional")),
+            "deferred_fields should state the UDP egress conditions, got {deferred:?}"
         );
     }
 
@@ -4963,6 +5007,91 @@ mod tests {
             .collect();
         assert!(sections.contains(&"metrics"));
         assert!(sections.contains(&"accessLogging"));
+    }
+
+    #[test]
+    fn telemetry_reports_entries_past_the_first_as_deferred() {
+        let obj = object(
+            "telemetry.istio.io/v1",
+            "Telemetry",
+            "multi-provider",
+            json!({
+                "metrics": [
+                    { "providers": [ { "name": "prometheus" } ] },
+                    { "providers": [ { "name": "stackdriver" } ], "overrides": [ { "disabled": true } ] }
+                ],
+                "accessLogging": [ { "disabled": false } ]
+            }),
+        );
+        let updates = plan_istio_status_updates(&[obj], options());
+        let c = find_condition(
+            updates[0].status["conditions"].as_array().unwrap(),
+            "FerrumAccepted",
+        );
+        assert_eq!(c["status"].as_str(), Some("True"));
+        let detail = updates[0].ferrum_detail.as_ref().unwrap();
+        let deferred: Vec<&str> = detail["translation"]["deferred_fields"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(Value::as_str)
+            .collect();
+        assert_eq!(deferred.len(), 1, "{deferred:?}");
+        assert!(deferred[0].starts_with("metrics[1..]"));
+        assert!(
+            c["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("deferred fields: metrics[1..]"))
+        );
+    }
+
+    #[test]
+    fn virtual_service_reports_unenforced_retry_settings_as_deferred() {
+        let obj = object(
+            "networking.istio.io/v1",
+            "VirtualService",
+            "retry-vs",
+            json!({
+                "hosts": ["reviews.default.svc.cluster.local"],
+                "http": [
+                    {
+                        "route": [ { "destination": { "host": "reviews.default.svc.cluster.local" } } ],
+                        "retries": { "attempts": 2, "retryOn": "5xx,retriable-4xx", "perTryTimeout": "1s" }
+                    },
+                    {
+                        "route": [ { "destination": { "host": "reviews.default.svc.cluster.local" } } ],
+                        "retries": { "attempts": 2, "perTryTimeout": "1s" }
+                    }
+                ]
+            }),
+        );
+        let updates = plan_istio_status_updates(&[obj], options());
+        let c = find_condition(
+            updates[0].status["conditions"].as_array().unwrap(),
+            "FerrumAccepted",
+        );
+        assert_eq!(c["status"].as_str(), Some("True"));
+        let detail = updates[0].ferrum_detail.as_ref().unwrap();
+        let deferred: Vec<&str> = detail["translation"]["deferred_fields"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(Value::as_str)
+            .collect();
+        assert_eq!(
+            deferred
+                .iter()
+                .filter(|field| field.starts_with("http[].retries.perTryTimeout"))
+                .count(),
+            1,
+            "{deferred:?}"
+        );
+        assert!(
+            deferred
+                .iter()
+                .any(|field| field.starts_with("http[].retries.retryOn")),
+            "{deferred:?}"
+        );
     }
 
     #[test]

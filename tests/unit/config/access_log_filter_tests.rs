@@ -220,3 +220,49 @@ fn direct_expression_validation_refuses_dead_conjunctions_and_unreachable_bounds
     validate_access_log_filter_expr(&split_across_or)
         .expect("an `or` branch may still match, so the conjunction is not provably dead");
 }
+
+/// Issue #7245: latency is fractional milliseconds, so `duration > N` must be
+/// a strict bound, not `>= N + 1`. A 1000.4 ms request matches `> 1000`, and a
+/// conjunction with a strict bound stays an expression tree because the flat
+/// fields have no strict latency field.
+#[test]
+fn strict_duration_bound_matches_fractional_milliseconds() {
+    let context = |latency_total_ms: f64| AccessLogFilterContext {
+        response_status_code: 200,
+        latency_total_ms,
+        is_terminal_failure: false,
+    };
+
+    let filter = parse_access_log_filter_expression("response.duration > 1000")
+        .expect("parses")
+        .expect("filter");
+    assert_eq!(filter.min_latency_ms, None);
+    let expr = filter
+        .expression
+        .expect("a strict bound is an expression tree");
+    assert_eq!(expr, AccessLogFilterExpr::LatencyAboveMs { value: 1000 });
+    assert!(evaluate_access_log_filter_expr(&expr, context(1000.4)));
+    assert!(!evaluate_access_log_filter_expr(&expr, context(1000.0)));
+    validate_access_log_filter_expr(&expr).expect("the strict atom is a valid tree");
+
+    let filter = parse_access_log_filter_expression("response.code >= 500 && duration > 1s")
+        .expect("parses")
+        .expect("filter");
+    assert_eq!(
+        filter.status_code_min, None,
+        "no flat fields with a strict bound"
+    );
+    let expr = filter.expression.expect("conjunction stays a tree");
+    let failed_slow = AccessLogFilterContext {
+        response_status_code: 503,
+        latency_total_ms: 1000.4,
+        is_terminal_failure: false,
+    };
+    assert!(evaluate_access_log_filter_expr(&expr, failed_slow));
+
+    // `>=` keeps its inclusive flat form.
+    let filter = parse_access_log_filter_expression("response.duration >= 1000")
+        .expect("parses")
+        .expect("filter");
+    assert_eq!(filter.min_latency_ms, Some(1000));
+}
