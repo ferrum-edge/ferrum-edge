@@ -1634,7 +1634,7 @@ pub fn reverse_translate_xds_snapshot(
             .iter()
             .map(crate::xds::XdsResource::to_any)
             .collect();
-        accumulator.apply_sotw_response(type_url, &resources, &snapshot.version)?;
+        accumulator.replace_sotw_type(type_url, &resources, &snapshot.version)?;
     }
     reverse_translate(&accumulator, config)
 }
