@@ -499,7 +499,7 @@ of the vendor copy and must keep passing after retirement:
   (`test_*websocket_ping_*`).
 - The tungstenite / tokio-tungstenite fragment-accounting regressions live in
   the vendored crate (`protocol::tests::fragment_*`,
-  `protocol::tests::incomplete_message_*`) and in
+  `protocol::tests::incomplete_message_*`, run by the vendored-patch job) and in
   `tests/unit/gateway_core/websocket_fragment_metering_tests.rs`.
 - The dimpl credential regressions live in
   `vendor/dimpl-0.6.1-ferrum-patched/tests/auto/credential_security.rs`. They
