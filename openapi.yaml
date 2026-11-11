@@ -42278,6 +42278,25 @@ components:
             tls:
               type: object
               additionalProperties: false
+              # reqwest's rustls backend disables hostname verification only
+              # together with a pinned CA bundle (or with certificate
+              # verification off entirely), so the constructor refuses
+              # `verify_hostname: false` without either.
+              if:
+                required: [verify_hostname]
+                properties:
+                  verify_hostname:
+                    const: false
+              then:
+                anyOf:
+                  - required: [ca_file]
+                    properties:
+                      ca_file:
+                        type: string
+                  - required: [insecure_skip_verify]
+                    properties:
+                      insecure_skip_verify:
+                        const: true
               properties:
                 ca_file:
                   type: [string, "null"]
@@ -42297,7 +42316,12 @@ components:
                 verify_hostname:
                   type: boolean
                   default: true
-                  description: Verify the ClickHouse server hostname. Disabling this logs a warning and is for testing only.
+                  description: >-
+                    Verify the ClickHouse server hostname. Disabling this logs a
+                    warning and is for testing only, and requires `ca_file`
+                    (the server certificate is still verified against that
+                    pinned bundle) or `insecure_skip_verify: true`; without
+                    either the constructor refuses the configuration.
                 insecure_skip_verify:
                   type: boolean
                   default: false

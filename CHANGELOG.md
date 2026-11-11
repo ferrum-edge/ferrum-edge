@@ -541,6 +541,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   so future relay fixes apply to both paths at once.
 
 ### Fixed
+- An `api_chargeback_sink` with `clickhouse.tls.verify_hostname: false` and
+  neither `clickhouse.tls.ca_file` nor `clickhouse.tls.insecure_skip_verify:
+  true` is now refused at admission with a message naming both remedies. It
+  used to be admitted and then never activate, because the TLS client refuses
+  to disable hostname verification without a pinned CA bundle.
+- Admission now refuses a `graphql` instance composed beside a request-body
+  egress plugin or at or after an `ai_semantic_cache` instance, as runtime
+  plugin-cache construction already did (issue #7118). `graphql` was missing
+  from the finalized-request-policy candidate inventory, so an Admin API write
+  could persist a composition every data plane then refused.
 - `request_transformer` and `response_transformer` body rules that `remove` a
   JSON member no longer reorder the members that remain. The removal was a
   swap-remove under serde_json's insertion-ordered map, which moved the last

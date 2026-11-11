@@ -5438,6 +5438,18 @@ fn validate_config(config: &ApiChargebackSinkConfig) -> Result<(), String> {
         ));
     }
     validate_query_params(&config.clickhouse.insert_query_params)?;
+    // reqwest's rustls backend disables hostname verification only together
+    // with a pinned CA bundle (`tls_certs_only`) or with certificate
+    // verification off; anything else fails when the client is built, so the
+    // sink could never activate. Refuse it at admission instead.
+    if !config.clickhouse.tls.verify_hostname
+        && !config.clickhouse.tls.insecure_skip_verify
+        && config.clickhouse.tls.ca_file.is_none()
+    {
+        return Err(format!(
+            "{PLUGIN_NAME}: `clickhouse.tls.verify_hostname: false` requires `clickhouse.tls.ca_file` (the server certificate is still verified against that pinned bundle) or `clickhouse.tls.insecure_skip_verify: true`"
+        ));
+    }
     validate_insert_durability_settings(&config.clickhouse)?;
 
     if config.batch.size == 0 || config.batch.size > MAX_BATCH_SIZE {
