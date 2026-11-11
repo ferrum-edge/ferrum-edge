@@ -1768,7 +1768,7 @@ jobs:
         with:
           # Pinned to the version the deny.toml schema was validated against, so
           # a future cargo-deny release can't silently change gate behavior.
-          tool: cargo-deny@0.19.9
+          tool: cargo-deny@0.20.2
 
       - name: cargo-deny (advisories, bans, sources, licenses)
         # BLOCKING dependency-security gate. A new RUSTSEC advisory not
@@ -1794,8 +1794,8 @@ jobs:
         # never pulls in); with `unused-ignored-advisory = "deny"` those entries
         # would otherwise fail this run for not matching anything here.
         run: >-
-          cargo deny --manifest-path ebpf/Cargo.toml
-          check --allow advisory-not-detected --config deny.toml advisories bans sources licenses
+          cargo deny --manifest-path ebpf/Cargo.toml --config deny.toml
+          check --allow advisory-not-detected advisories bans sources licenses
 
       - name: cargo-deny advisories (standalone Cargo workspaces)
         # BLOCKING advisory scan over every standalone Cargo workspace the
@@ -1814,8 +1814,8 @@ jobs:
           failed=0
           for manifest in "${manifests[@]}"; do
             echo "::group::cargo deny advisories ${manifest}"
-            if ! cargo deny --manifest-path "$manifest" \
-              check --allow advisory-not-detected --config deny.toml advisories; then
+            if ! cargo deny --manifest-path "$manifest" --config deny.toml \
+              check --allow advisory-not-detected advisories; then
               echo "::error file=${manifest}::cargo-deny advisories failed for ${manifest}"
               failed=1
             fi

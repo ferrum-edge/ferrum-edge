@@ -283,13 +283,13 @@ benchmark inputs stay otherwise stable.
 Run locally:
 
 ```bash
-cargo install --locked cargo-deny
+cargo install --locked cargo-deny --version 0.20.2
 cargo deny check advisories bans sources licenses   # the gate (root workspace)
-cargo deny --manifest-path ebpf/Cargo.toml \
-    check --allow advisory-not-detected --config deny.toml advisories bans sources licenses          # the gate (eBPF workspace)
+cargo deny --manifest-path ebpf/Cargo.toml --config deny.toml \
+    check --allow advisory-not-detected advisories bans sources licenses          # the gate (eBPF workspace)
 for manifest in $(python3 .github/scripts/standalone_cargo_manifests.py); do
-  cargo deny --manifest-path "$manifest" \
-    check --allow advisory-not-detected --config deny.toml advisories   # standalone workspaces
+  cargo deny --manifest-path "$manifest" --config deny.toml \
+    check --allow advisory-not-detected advisories   # standalone workspaces
 done
 ```
 
