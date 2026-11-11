@@ -2308,7 +2308,9 @@ fn buffered_grpc_client_disconnect_is_cancelled_not_a_gateway_error() {
         .split("\n}\n")
         .next()
         .expect("bounded client-disconnect log wrapper");
-    assert!(wrapper.contains("        true,\n        true,\n    )"));
+    // include_backend_target and client_disconnect are both set; the wrapper
+    // always has a matched proxy, so it keeps the default namespace.
+    assert!(wrapper.contains("        true,\n        true,\n        None,\n    )"));
 
     let grpc = include_str!("../../../src/proxy/grpc_proxy.rs");
     let collect = grpc
