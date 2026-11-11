@@ -5,7 +5,7 @@ use ferrum_edge::plugins::response_mock::{
     RESPONSE_MOCK_CONFIG_KEYS, RESPONSE_MOCK_MATCH_KEYS, RESPONSE_MOCK_MAX_BODY_BYTES,
     RESPONSE_MOCK_MAX_DELAY_MS, RESPONSE_MOCK_MAX_HEADER_VALUE_BYTES,
     RESPONSE_MOCK_MAX_HEADERS_PER_RULE, RESPONSE_MOCK_MAX_MATCH_CONDITIONS,
-    RESPONSE_MOCK_MAX_RULES, RESPONSE_MOCK_RULE_KEYS, ResponseMock,
+    RESPONSE_MOCK_MAX_RULES, ResponseMock,
 };
 use ferrum_edge::plugins::utils::fault_delay::FaultDelayAdmission;
 use ferrum_edge::plugins::{Plugin, PluginResult, RequestContext};
