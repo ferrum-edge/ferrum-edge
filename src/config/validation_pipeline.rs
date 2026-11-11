@@ -1048,7 +1048,7 @@ mod tests {
             ..Default::default()
         };
 
-        assert_single_rejecting_error(config, "unknown configuration field \"alow\"");
+        assert_single_rejecting_error(config, "unknown configuration key(s): \"config.alow\"");
     }
 
     #[test]
