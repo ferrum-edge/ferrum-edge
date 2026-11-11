@@ -258,8 +258,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   verifiers: the `coverage-merge` and `fips-build.yml` transitions, the
   retired in-CI sanitizer `fuzz-smoke` generation, the
   `setup-kubernetes-tools` transition, the retired Ambient `type=gha`
-  image-cache generation, the dead `ci.yml` publication contracts, and four
-  runtime-cache checks only their self-test called (#7281).
+  image-cache generation, the two-family `release.yml` image-family
+  generation with its transition and Cross-surface projection (the policy
+  now admits only the three-family shape), the dead `ci.yml` publication
+  contracts, and four runtime-cache checks only their self-test called
+  (#7281).
 - CI: the dead pull-request change detection in `performance-regression.yml`
   (#7291).
 - `Dockerfile.test`, which could not build and no workflow used (#7296).
