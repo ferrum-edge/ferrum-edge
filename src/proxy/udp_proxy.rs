@@ -5202,7 +5202,7 @@ async fn process_new_session_datagram(
         let lb_hash_key =
             udp_session_lb_hash_key(identity.resolved().ip(), session_key.destination);
         let (backend_host, backend_port) = resolve_backend_target(
-            &view.proxy,
+            view.proxy,
             &epoch.load_balancer,
             health_checker,
             &lb_hash_key,
