@@ -2605,43 +2605,14 @@ under the now-trusted policy and runs the full hosted matrix. Because the base
 now carries the three-family shape, the two-family generation only matters as
 the refused rollback target.
 
-##### Admitted `fips-build.yml` generation transition (issue #3888 lineage / issue #4018, temporary)
+##### `fips-build.yml` generation transitions (none open)
 
-The temporary whole-file SHA-256 admission first used for PR #3889 (retired by
-#3943), then re-armed for PR #3950 and spent when #3950 landed, is **re-armed
-for exactly one transition**: the issue #4018 mitigation for the
-`fips-test-build` job.
-
-`Precompile FIPS test binaries for consumers` is killed with `exit code 143`
-and `The runner has received a shutdown signal` on a large minority of runs.
-The log always ends the same way — the dependency graph finishes, the run goes
-silent for several minutes while Cargo builds `unit_tests` and
-`integration_tests`, and the runner dies mid-tail with no diagnostic. That is
-the hosted runner's memory ceiling, not a compile error: `[profile.dev]` sets
-`debug = true` and the `test` profile inherits it, so every concurrent codegen
-thread holds a full-debuginfo LLVM module for the whole crate.
-
-The destination adds a job-level `env` capping `CARGO_BUILD_JOBS` at 3 and
-setting `line-tables-only` debuginfo on the `dev` **and** `test` profiles (both,
-rather than relying on `test` inheriting from `dev`), plus a best-effort
-additive 8 GiB Ferrum-owned swapfile immediately before that step. The swap
-step is deliberately not fail-closed — it is insurance rather than a
-correctness gate, and this file is digest-frozen. It never disables, removes,
-or rewrites the runner image's existing swap; failure cleanup targets only
-`/mnt/ferrum-fips-swapfile`. It cannot pass silently: any failure raises a
-warning annotation and the resulting `SwapTotal` is always printed.
-
-The pair is exact and one-way: trusted-base
-`17bfb40fbd31e80e6ae1a0efca922069c54ec485ec7a611c3420840da3e5e9e1` (the workflow
-after PR #3950's landed artifact handoff — the previous admission's adopted end)
-→ `7d995d79d9932c9595d3f19eddf16c1dbd1a0d2842230f1d92eb1b24502ca401`. Recompute
-and re-pin if review changes the workflow bytes. The digest is over
-universal-newline-decoded text. The mitigation has landed (the swapfile step is
-in `fips-build.yml`, and later edits moved the file past both pinned digests),
-so this admission is spent; its `FIPS_BUILD_*_GENERATION_SHA256` constants in
-`verify_cross_build_policy.py` must be retired, exactly as #3943 retired the
-#3889 pair. Any other `fips-build.yml` edit
-is still compared by the normal fail-closed Cross surface scan.
+No whole-file `fips-build.yml` generation transition is open, and the verifier
+no longer carries the mechanism. Its admissions (PR #3889, retired by #3943;
+PR #3950; and the issue #4018 `fips-test-build` memory mitigation) are all
+spent: each destination landed on `main` and later edits moved the file past
+both pinned digests. Every `fips-build.yml` edit is compared by the normal
+fail-closed Cross surface scan.
 
 ##### Coverage-shard compile-memory knobs (issues #4099 / #4368)
 

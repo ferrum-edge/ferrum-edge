@@ -1068,7 +1068,7 @@ reachable on *either* revision stays in scope, so a pull request cannot drop the
 reachability edge and edit the file in the same commit. Newly reaching an
 already-Cross-sensitive script from a protected job is still rejected.
 
-#### Temporary generation transitions (`fips-build.yml`, CI jobs, `setup-rust-ci`)
+#### Generation transitions (`fips-build.yml`, CI jobs, `setup-rust-ci`)
 
 The verifier can admit an exact whole-file SHA-256 source→destination pair for
 a frozen surface, so one reviewed rewrite can pass the Cross surface scan. Each
@@ -1076,17 +1076,16 @@ pair is path- or job-bound, one-way, fail-closed, and decided entirely by the
 trusted base; anything else is scanned as an ordinary Cross surface change.
 Current admissions:
 
-- `fips-build.yml`: one transition for the issue #4018 memory mitigation on the
-  `fips-test-build` job (`FIPS_BUILD_ADMITTED_GENERATION_TRANSITION`). The
-  earlier #3889 admission was retired by #3943.
+- `fips-build.yml`: none. The #3889, #3950 and issue #4018 whole-file
+  admissions are spent and the verifier no longer carries the mechanism.
 - Cross-sensitive `ci.yml` jobs (`CI_JOB_GENERATION_TRANSITIONS`) and local
   composite actions (`LOCAL_ACTION_GENERATION_TRANSITIONS`): both tables are
   currently empty. Their pairs, including the `setup-rust-ci` #3889→#3911
   chain and the issue #6573 BoringCache retirement pairs, are spent and
   retired.
 
-Details and digests: `docs/ci_cd.md` → "Admitted `fips-build.yml` generation
-transition", "Admitted CI job SHA-256 generation transitions", and "Admitted
+Details: `docs/ci_cd.md` → "`fips-build.yml` generation transitions (none
+open)", "Admitted CI job SHA-256 generation transitions", and "Admitted
 local-action generation transitions".
 
 ### Refreshing kind / kubectl / Helm versions and checksums
