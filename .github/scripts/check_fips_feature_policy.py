@@ -124,8 +124,8 @@ AWS_LC_FEATURE_MARKERS = ("aws-lc", "aws_lc", "fips")
 #
 # Those feature-name checks now refuse everything this table refuses as well
 # (an entry that names `aws-lc-rs` carries an AWS-LC marker, and `dep:ring`
-# carries the ring token), so this is a second line of defence, and emptying it
-# alone is the one policy mutation the self-test cannot tell apart.
+# carries the ring token), so this is a second line of defence. No manifest
+# mutation can single it out, so the self-test pins it by value instead.
 BACKEND_CRATE_PREFIXES = {
     "crypto-ring": ("aws-lc-rs", "aws_lc_rs", "aws-lc-fips-sys", "aws-lc-sys"),
     "fips": ("ring",),
@@ -525,6 +525,12 @@ def check_manifest_text(manifest: str) -> list[str]:
     return failures
 
 
+def source_uses_forbidden_crate(source: str) -> bool:
+    """`True` when production source reaches a RustCrypto SHA-2/HMAC crate."""
+
+    return any(pattern.search(source) for pattern in FORBIDDEN_PRODUCTION_CRATE_PATTERNS)
+
+
 def check_manifest() -> list[str]:
     failures = check_manifest_text(read_manifest())
 
@@ -534,7 +540,7 @@ def check_manifest() -> list[str]:
         if source_path == REPO_ROOT / "src/fips/approved.rs":
             continue
         source = source_path.read_text(encoding="utf-8")
-        if any(pattern.search(source) for pattern in FORBIDDEN_PRODUCTION_CRATE_PATTERNS):
+        if source_uses_forbidden_crate(source):
             failures.append(
                 f"{source_path.relative_to(REPO_ROOT)} imports a RustCrypto SHA-2/HMAC "
                 "implementation; route it through crate::fips::approved"
@@ -624,7 +630,7 @@ def claimed_profiles() -> tuple[tuple[str, str, bool], ...]:
     )
 
 
-def check_claimed_profiles_declared() -> list[str]:
+def check_claimed_profiles_declared(manifest: str | None = None) -> list[str]:
     """Every optional cargo feature must be accounted for by a claimed profile.
 
     This is what stops the inventory from silently going stale: adding a new
@@ -632,7 +638,8 @@ def check_claimed_profiles_declared() -> list[str]:
     under FIPS fails here, rather than shipping as an implicit claim.
     """
 
-    manifest = read_manifest()
+    if manifest is None:
+        manifest = read_manifest()
     table = _FEATURES_TABLE_RE.search(manifest)
     if table is None:
         return ["Cargo.toml has no `[features]` table"]
@@ -815,6 +822,42 @@ _PINNED_FORBIDDEN_INLINE = (
 )
 _PINNED_REQUIRED_INLINE = (("jsonwebtoken", "aws_lc_rs"),)
 
+# Tables whose rows carry no mutation of their own are pinned by value: the
+# backend-crate table is fully covered by the stricter feature-name checks, and
+# a claimed FIPS profile is an entry in CI's audit and compile matrix, not a
+# rule the checker applies to a manifest.
+_PINNED_BACKEND_CRATE_PREFIXES = {
+    "crypto-ring": ("aws-lc-rs", "aws_lc_rs", "aws-lc-fips-sys", "aws-lc-sys"),
+    "fips": ("ring",),
+}
+_PINNED_CLAIMED_FIPS_PROFILES = (
+    ("fips", "fips"),
+    ("fips + acme", "fips,acme"),
+    ("fips + pkcs11", "fips,pkcs11"),
+    ("fips + ebpf", "fips,ebpf"),
+    ("fips + bench-h1-profile", "fips,bench-h1-profile"),
+    ("fips + bench-pool-profile", "fips,bench-pool-profile"),
+    ("fips + bench-udp-profile", "fips,bench-udp-profile"),
+    ("fips + bench-h1-profile + bench-udp-profile", "fips,bench-h1-profile,bench-udp-profile"),
+    ("fips + acme + pkcs11 + ebpf", "fips,acme,pkcs11,ebpf"),
+)
+_PINNED_CLAIMED_FIPS_PROFILES_UNSUPPORTED_AT_RUNTIME = (
+    ("fips + cloud-secrets", "fips,cloud-secrets"),
+)
+
+# One source line per production-crate pattern, each matched by that pattern
+# alone, and lines the patterns must leave alone.
+_FORBIDDEN_SOURCE_SAMPLES = (
+    "use sha2;",
+    "let digest = sha2::Sha256::digest(bytes);",
+    "use hmac;",
+    "type Mac = hmac::Hmac<Hash>;",
+)
+_ADMISSIBLE_SOURCE_SAMPLES = (
+    "use crate::fips::approved::Sha256;",
+    "let mac = crate::fips::approved::hmac_sha256(key, data);",
+)
+
 # Paired aws-lc arms the ordinary graph has always resolved next to their ring
 # counterparts, through dimpl. They are the only pair-table arms that
 # FORBIDDEN_RESOLVED_RING may leave out.
@@ -870,6 +913,18 @@ def self_test() -> list[str]:
     are both kept independently of the tables `check_selections` reads, so a row
     removed from a live table still has a case that expects it. A mutation that
     is *accepted* is the failure: a check has been weakened or bypassed.
+
+    Coverage, so the limits are stated rather than implied: every row of the
+    feature-pair, required-edge, default-features, inline and resolved-graph
+    tables has a mutation of its own; duplicate and redundant activation, the
+    default feature set, the dev-only reference crates, the unclaimed-feature
+    rule and each production-crate pattern have one each; the backend-crate and
+    claimed-profile tables are pinned by value. Not covered here: the walk over
+    `src/` in `check_manifest` (only its predicate is), the cargo-tree parser,
+    which the hosted audit exercises on real graphs, and three reports that
+    cannot fire alone: the two "feature list is missing" ones (the required-edge
+    rules fire with them) and the second own-line report for jsonwebtoken, which
+    is in both inline tables.
     """
 
     failures: list[str] = []
@@ -953,6 +1008,43 @@ def self_test() -> list[str]:
         (
             "sha2 becomes a production dependency",
             lambda: manifest.replace("[dependencies]\n", '[dependencies]\nsha2 = "0.10"\n', 1),
+        ),
+        (
+            "hmac becomes a production dependency",
+            lambda: manifest.replace("[dependencies]\n", '[dependencies]\nhmac = "0.12"\n', 1),
+        ),
+        # Duplicate and redundant activations, which no other rule refuses.
+        (
+            "crypto-ring lists rustls/ring twice",
+            lambda: _with_feature_entry(manifest, "crypto-ring", "rustls/ring"),
+        ),
+        (
+            "fips lists aws-lc-rs/fips twice",
+            lambda: _with_feature_entry(manifest, "fips", "aws-lc-rs/fips"),
+        ),
+        (
+            "fips activates aws-lc-rs both by dep: and by feature",
+            lambda: _with_feature_entry(manifest, "fips", "dep:aws-lc-rs"),
+        ),
+        # A dependency whose backend is selected inline may not also be selected
+        # by a profile list.
+        (
+            "fips selects a jsonwebtoken feature",
+            lambda: _with_feature_entry(manifest, "fips", "jsonwebtoken/use_pem"),
+        ),
+        # The inline rules read one line per dependency, so a dependency that
+        # is not declared on a line of its own cannot be checked and is refused.
+        (
+            "tonic is no longer declared on a line of its own",
+            lambda: _with_dependency_line(manifest, "tonic", "tonic = {", "tonic  = {"),
+        ),
+        (
+            "quinn is no longer declared on a line of its own",
+            lambda: _with_dependency_line(manifest, "quinn", "quinn = {", "quinn  = {"),
+        ),
+        (
+            "the [dependencies] table is missing",
+            lambda: manifest.replace("\n[dependencies]\n", "\n[dependencies-renamed]\n", 1),
         ),
     ]
     for ring_edge, fips_edge in _PINNED_FEATURE_PAIRS:
@@ -1043,6 +1135,49 @@ def self_test() -> list[str]:
                 f"self-test: {label} has entries the self-test does not pin: {unpinned}; add "
                 "them to the pinned copy so each keeps a rejection case"
             )
+
+    # Tables pinned by value.
+    for label, live, pinned in (
+        ("BACKEND_CRATE_PREFIXES", BACKEND_CRATE_PREFIXES, _PINNED_BACKEND_CRATE_PREFIXES),
+        ("CLAIMED_FIPS_PROFILES", CLAIMED_FIPS_PROFILES, _PINNED_CLAIMED_FIPS_PROFILES),
+        (
+            "CLAIMED_FIPS_PROFILES_UNSUPPORTED_AT_RUNTIME",
+            CLAIMED_FIPS_PROFILES_UNSUPPORTED_AT_RUNTIME,
+            _PINNED_CLAIMED_FIPS_PROFILES_UNSUPPORTED_AT_RUNTIME,
+        ),
+    ):
+        if live != pinned:
+            failures.append(
+                f"self-test: {label} differs from the copy the self-test pins; a deliberate "
+                "change must update both"
+            )
+
+    # An optional cargo feature that no claimed profile names must be refused.
+    unclaimed = manifest.replace("[features]\n", "[features]\nself-test-unclaimed = []\n", 1)
+    if unclaimed == manifest or not check_claimed_profiles_declared(unclaimed):
+        failures.append(
+            "self-test: an optional cargo feature named by no claimed FIPS profile was accepted"
+        )
+    if check_claimed_profiles_declared(manifest):
+        failures.append("self-test baseline: the committed feature set is not fully claimed")
+
+    # Each production-crate pattern must flag the one line written for it.
+    for sample in _FORBIDDEN_SOURCE_SAMPLES:
+        matching = [
+            pattern for pattern in FORBIDDEN_PRODUCTION_CRATE_PATTERNS if pattern.search(sample)
+        ]
+        if len(matching) != 1:
+            failures.append(
+                f"self-test: {sample!r} should be flagged by exactly one production-crate "
+                f"pattern, and {len(matching)} matched"
+            )
+    if len(FORBIDDEN_PRODUCTION_CRATE_PATTERNS) != len(_FORBIDDEN_SOURCE_SAMPLES):
+        failures.append(
+            "self-test: FORBIDDEN_PRODUCTION_CRATE_PATTERNS has a pattern with no sample line"
+        )
+    for sample in _ADMISSIBLE_SOURCE_SAMPLES:
+        if source_uses_forbidden_crate(sample):
+            failures.append(f"self-test: the admissible line {sample!r} was flagged")
 
     ordinary = set(REQUIRED_RESOLVED_RING)
     fips = set(REQUIRED_RESOLVED_FIPS)

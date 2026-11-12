@@ -1175,21 +1175,48 @@ const PROVIDER_LESS_CONSTRUCTORS: [&str; 10] = [
     "HttpsConnectorBuilder::new().with_webpki_roots()",
 ];
 
-/// `text` reduced to its production code, with all whitespace removed.
+/// Reported in place of a constructor when a `#[cfg(test)]` item's end could
+/// not be found, so the file fails the guard instead of passing unread.
+const UNDELIMITED_SOURCE: &str = "a #[cfg(test)] item or block comment whose end was not found";
+
+/// `text` reduced to its production code, with all whitespace removed, or
+/// `None` when a test-only item or a block comment could not be delimited.
 ///
-/// Comment lines and every item under a bare `#[cfg(test)]` are dropped. A
-/// test-only item is found by layout, which `cargo fmt --check` keeps stable:
-/// its body closes on a line that holds only `}` (or `};`) at the attribute's
-/// own indentation. Removing whitespace makes the search indifferent to how a
-/// call is wrapped. A constructor reached through a renamed import is not
-/// recognised; the runtime tests above are what cover the paths that matter.
-fn production_source(text: &str) -> String {
+/// Comments and every item under a bare `#[cfg(test)]` are dropped. A block
+/// comment that runs over lines is dropped whole, so a `#[cfg(test)]` line
+/// inside one starts no item. A test-only item is found by layout, which
+/// `cargo fmt --check` keeps stable: its body closes on a line that starts
+/// with `}` at the attribute's own indentation and carries nothing after it
+/// but `;` or a comment. If no such line follows, the answer is `None` rather
+/// than a guess: skipping to the end of the file would hide whatever
+/// production code came after. Removing whitespace makes the search
+/// indifferent to how a call is wrapped.
+///
+/// Two forms are not recognised: a constructor reached through a renamed
+/// import, and a line reading exactly `#[cfg(test)]` inside a multi-line
+/// string literal, which is taken for an attribute. The runtime tests above
+/// are what cover the paths that matter.
+fn production_source(text: &str) -> Option<String> {
     let lines: Vec<&str> = text.lines().collect();
     let mut kept = String::new();
     let mut index = 0;
     while index < lines.len() {
         let line = lines[index];
         let trimmed = line.trim_start();
+        if trimmed.starts_with("/*") && !trimmed.contains("*/") {
+            index += 1;
+            while index < lines.len() && !lines[index].contains("*/") {
+                index += 1;
+            }
+            let (_, after_comment) = lines.get(index)?.split_once("*/")?;
+            kept.extend(
+                after_comment
+                    .chars()
+                    .filter(|character| !character.is_whitespace()),
+            );
+            index += 1;
+            continue;
+        }
         if trimmed != "#[cfg(test)]" {
             if !trimmed.starts_with("//") {
                 kept.extend(
@@ -1223,18 +1250,35 @@ fn production_source(text: &str) -> String {
         }
         if end < lines.len() && lines[end].trim_end().ends_with('{') {
             let closing = format!("{indent}}}");
-            let closing_statement = format!("{indent}}};");
-            while end < lines.len() && lines[end] != closing && lines[end] != closing_statement {
+            end += 1;
+            while end < lines.len() && !closes_item(lines[end], &closing) {
                 end += 1;
+            }
+            if end == lines.len() {
+                return None;
             }
         }
         index = end + 1;
     }
-    kept
+    Some(kept)
 }
 
+/// `true` when `line` is the closing brace of an item whose brace sits at
+/// `closing`'s indentation: `}`, `};`, and either followed by a comment.
+fn closes_item(line: &str, closing: &str) -> bool {
+    let Some(rest) = line.strip_prefix(closing) else {
+        return false;
+    };
+    let rest = rest.strip_prefix(';').unwrap_or(rest).trim_start();
+    rest.is_empty() || rest.starts_with("//")
+}
+
+/// The provider-less constructors in `text`'s production code, or a marker
+/// when the file could not be scanned.
 fn provider_less_constructors_in(text: &str) -> Vec<&'static str> {
-    let production = production_source(text);
+    let Some(production) = production_source(text) else {
+        return vec![UNDELIMITED_SOURCE];
+    };
     PROVIDER_LESS_CONSTRUCTORS
         .into_iter()
         .filter(|pattern| production.contains(pattern))
@@ -1372,6 +1416,31 @@ fn the_provider_guard_rejects_the_forms_it_exists_for() {
     );
     let test_only_method = "impl Sink {\n    #[cfg(test)]\n    fn for_test() -> Self {\n        rustls::ServerConfig::builder()\n    }\n\n    fn real(&self) {\n        rustls::ClientConfig::builder()\n    }\n}\n";
     assert_eq!(caught(test_only_method), ["ClientConfig::builder()"]);
+    // A comment after the module's closing brace does not extend the exemption.
+    let commented_close = "#[cfg(test)]\nmod tests {\n    #[test]\n    fn test_only() {}\n} // end tests\n\nfn real() {\n    let _ = rustls::ClientConfig::builder();\n}\n";
+    assert_eq!(caught(commented_close), ["ClientConfig::builder()"]);
+    let commented_statement_close = "#[cfg(test)]\nconst FIXTURE: Fixture = Fixture {\n    name: \"x\",\n}; // fixture\n\nfn real() {\n    rustls::ServerConfig::builder()\n}\n";
+    assert_eq!(
+        caught(commented_statement_close),
+        ["ServerConfig::builder()"]
+    );
+    // A test-only item that cannot be delimited fails the guard; it is never
+    // read as "the rest of the file is test code".
+    let undelimited = "#[cfg(test)]\nmod tests {\n    #[test]\n    fn test_only() {\n        rustls::ClientConfig::builder();\n    }\n";
+    assert_eq!(caught(undelimited), [UNDELIMITED_SOURCE]);
+
+    // A block comment is not code: an attribute spelled inside one starts no
+    // test item, a constructor spelled inside one is not a call, and one that
+    // never ends is reported.
+    assert_eq!(
+        caught("/*\n#[cfg(test)]\n*/\nfn real() {\n    rustls::ClientConfig::builder()\n}\n"),
+        ["ClientConfig::builder()"]
+    );
+    assert!(caught("/*\n    rustls::ClientConfig::builder()\n*/\nfn real() {}\n").is_empty());
+    assert_eq!(
+        caught("/*\nfn real() {\n    rustls::ClientConfig::builder()\n}\n"),
+        [UNDELIMITED_SOURCE]
+    );
     // A test-only item with no body hides nothing that follows it.
     let test_only_import = "#[cfg(test)]\nuse std::sync::Once;\n\nfn real() {\n    rustls::ClientConfig::builder()\n}\n";
     assert_eq!(caught(test_only_import), ["ClientConfig::builder()"]);
