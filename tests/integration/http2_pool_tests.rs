@@ -1471,6 +1471,73 @@ async fn wait_for_direct_h2_fills_to_finish(pool: &Http2ConnectionPool) {
     .expect("background shard fill finished");
 }
 
+/// A real, empty `hyper::body::Incoming`, which hyper gives no public
+/// constructor: the body of an empty response read over an in-memory
+/// connection.
+async fn empty_incoming_body() -> Incoming {
+    let (client_io, server_io) = tokio::io::duplex(1024);
+    tokio::spawn(async move {
+        let service = service_fn(|_req: Request<Incoming>| async move {
+            Ok::<_, hyper::Error>(Response::new(Full::new(Bytes::new())))
+        });
+        let _ = hyper::server::conn::http1::Builder::new()
+            .serve_connection(TokioIo::new(server_io), service)
+            .await;
+    });
+    let (mut sender, conn) =
+        hyper::client::conn::http1::handshake::<_, Full<Bytes>>(TokioIo::new(client_io))
+            .await
+            .expect("in-memory h1 handshake");
+    tokio::spawn(async move {
+        let _ = conn.await;
+    });
+    let request = Request::get("/")
+        .header("host", "body.test")
+        .body(Full::new(Bytes::new()))
+        .expect("request");
+    sender
+        .send_request(request)
+        .await
+        .expect("in-memory response")
+        .into_body()
+}
+
+/// Wait until `sender`'s connection driver has published `expected` as the
+/// backend's `SETTINGS_MAX_CONCURRENT_STREAMS`.
+///
+/// hyper polls the driver when a request reaches it, not when the backend's
+/// SETTINGS arrive, and a TLS connection is handed out before they do. Each
+/// round therefore hands the driver a request and drops its response future
+/// at once: the driver is polled, finds the request cancelled, and opens no
+/// stream for it.
+async fn wait_for_direct_h2_peer_max_streams(
+    sender: &ferrum_edge::proxy::http2_pool::Http2Sender,
+    expected: usize,
+) {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while sender.peer_max_concurrent_streams() != expected {
+            let body = ferrum_edge::proxy::body::DirectH2RequestBody::Passthrough {
+                inner: empty_incoming_body().await,
+                cancel: None,
+                seen: 0,
+                observed: Arc::new(AtomicU64::new(0)),
+                published: false,
+                latch: Arc::new(ferrum_edge::proxy::body::DirectH2BytesLatch::new()),
+                require_end_stream: false,
+                trailer_credential_header_names: None,
+            };
+            let request = Request::get("https://127.0.0.1/")
+                .body(body)
+                .expect("request");
+            let mut driver_handle = sender.clone();
+            drop(driver_handle.send_request(request));
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("backend SETTINGS_MAX_CONCURRENT_STREAMS sampled");
+}
+
 #[tokio::test]
 async fn test_http2_pool_widens_past_the_capability_probe_connection() {
     let (_backend, port, accepted) = start_counting_h2_tls_backend().await;
@@ -1682,13 +1749,7 @@ async fn test_http2_pool_does_not_pin_to_a_backend_allowing_no_streams() {
         .run(pool.get_sender(&proxy))
         .await
         .expect("draining affinity sender");
-    tokio::time::timeout(Duration::from_secs(5), async {
-        while draining.peer_max_concurrent_streams() != 0 {
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-    })
-    .await
-    .expect("backend SETTINGS_MAX_CONCURRENT_STREAMS of 0 sampled");
+    wait_for_direct_h2_peer_max_streams(&draining, 0).await;
 
     // The second frontend connection's shard is missing, and the only ready
     // shard allows no streams, so nothing is borrowed: the request creates
@@ -1815,14 +1876,24 @@ async fn test_http2_pool_drain_fences_a_background_create_that_has_not_started()
     let proxy = direct_h2_proxy(port);
     pool.get_sender(&proxy).await.expect("warm shard");
 
-    // Borrow until a request schedules the missing shard's create. Nothing
-    // here yields, so the detached task has not been polled yet.
-    while pool.shard_fills_in_flight() == 0 {
+    // Borrow until a request schedules the missing shard's create: with two
+    // shards and one open, round-robin reaches the missing one within two
+    // requests. Nothing here yields, so the detached task has not been
+    // polled yet.
+    for _ in 0..16 {
+        if pool.shard_fills_in_flight() > 0 {
+            break;
+        }
         pool.get_sender(&proxy)
             .now_or_never()
             .expect("a warm pool serves at once")
             .expect("borrowed sender");
     }
+    assert_eq!(
+        pool.shard_fills_in_flight(),
+        1,
+        "a borrow scheduled the missing shard's create"
+    );
     assert_eq!(
         accepted.load(Ordering::Relaxed),
         1,
@@ -1833,6 +1904,11 @@ async fn test_http2_pool_drain_fences_a_background_create_that_has_not_started()
     // drain sample when it was scheduled, so what it dials is not published.
     pool.force_drain_all();
     wait_for_direct_h2_fills_to_finish(&pool).await;
+    assert_eq!(
+        accepted.load(Ordering::Relaxed),
+        2,
+        "the scheduled create dialled after the drain"
+    );
     assert_eq!(
         pool.pool_size(),
         0,
@@ -1901,14 +1977,9 @@ async fn test_http2_pool_affinity_respects_the_backend_stream_limit() {
         .run(pool.get_sender(&proxy))
         .await
         .expect("affinity sender");
-    // The driver publishes the backend's limit once h2 applies its SETTINGS.
-    tokio::time::timeout(Duration::from_secs(5), async {
-        while sender.peer_max_concurrent_streams() != PEER_MAX {
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-    })
-    .await
-    .expect("backend SETTINGS_MAX_CONCURRENT_STREAMS sampled");
+    // The driver publishes the backend's limit once h2 has applied its
+    // SETTINGS and a request has reached the driver.
+    wait_for_direct_h2_peer_max_streams(&sender, PEER_MAX).await;
 
     // At the backend's limit the connection still keeps its own shard.
     for _ in 0..8 {

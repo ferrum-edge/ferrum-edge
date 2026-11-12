@@ -2146,12 +2146,13 @@ async fn every_pool_family_key_is_drained_by_the_svid_generation_matcher() {
 // ---------------------------------------------------------------------------
 // The drain-epoch sample precedes the SVID generation read
 //
-// A pool key embeds `|svidg=<n>`. A rotation advances the generation and then
-// drains, which bumps the pool's drain epoch. An acquisition that read the
-// generation BEFORE sampling the epoch could straddle that drain, sample the
-// new epoch, and publish a connection under the retired generation's key:
-// no later request looks it up there, and it can hold a `maxConnections`
-// slot the current generation needs.
+// A pool key embeds `|svidg=<n>`. A generation drain (a withdrawn trust
+// bundle, or an SVID rotation's forced drain after its configured window)
+// runs after the generation has advanced, and bumps the pool's drain epoch.
+// An acquisition that read the generation BEFORE sampling the epoch could
+// straddle that drain, sample the new epoch, and publish a connection under
+// the drained generation's key: no later request looks it up there, and it
+// can hold a `maxConnections` slot the current generation needs.
 //
 // Siblings: the direct HTTP/2 and gRPC request paths, both pools' detached
 // shard fills, and `GenericPool::get_with` (the reqwest pool). The HTTP/3

@@ -597,16 +597,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 - **A pooled backend connection still being established when its pool is
   drained is no longer published after the drain.** A TLS material or CRL
-  reload and an SVID rotation drain the reqwest, direct HTTP/2, gRPC and
-  HTTP/3 pools, but a connection whose handshake was in
-  flight at that moment was cached when it completed, under the configuration
-  it had started with, and later requests could reuse it. A create that had
-  entered the pool before the drain, or a request that waited on one and
-  dialled after it, now hands its connection to its own caller only, and a
-  connection is no longer published under the pool key of an SVID generation
-  a rotation has retired. The HTTP/3 pool reads its TLS configuration and
-  SVID generation just before entering the pool, so an HTTP/3 create that
-  straddles a drain at exactly that point is not yet covered.
+  reload, a withdrawn trust bundle, and an SVID rotation's forced drain
+  (`FERRUM_MESH_SVID_ROTATION_DRAIN_SECONDS` above `0`) drain the reqwest,
+  direct HTTP/2, gRPC and HTTP/3 pools, but a connection whose handshake was
+  in flight at that moment was cached when it completed, under the
+  configuration it had started with, and later requests could reuse it. A
+  create that had entered the pool before the drain, or a request that waited
+  on one and dialled after it, now hands its connection to its own caller
+  only. Two older, narrower windows are not yet covered: the HTTP/3 pool
+  reads its TLS configuration and SVID generation just before entering the
+  pool, and the direct HTTP/1.1 pool's idle lanes sit outside this fence, so
+  a create or checkout that straddles a drain at exactly that point can still
+  be pooled.
 - An `api_chargeback_sink` with `clickhouse.tls.verify_hostname: false` and
   neither `clickhouse.tls.ca_file` nor `clickhouse.tls.insecure_skip_verify:
   true` is now refused at admission with a message naming both remedies. It
