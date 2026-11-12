@@ -1009,6 +1009,18 @@ impl Http2ConnectionPool {
         if self.shard_fills.contains_key(key) || self.pool.has_pending_creation(key) {
             return;
         }
+        // Sample the drain epoch now, not when the detached task first runs,
+        // so a drain in between fences this create. Then make sure the SVID
+        // generation the request captured (and built `key` from) is still
+        // current: a rotation advances the generation before it drains, so
+        // either this check sees the advance or the drain's epoch bump comes
+        // after the sample. Without both, a fill scheduled across a rotation
+        // could publish under the retired generation's key and hold a
+        // `maxConnections` slot the current generation needs.
+        let drain_epoch = self.pool.drain_epoch();
+        if self.pool.manager().svid_generation_for_proxy(proxy) != svid_generation {
+            return;
+        }
         let Some(permit) = self.pool.try_background_create_permit() else {
             return;
         };
@@ -1034,6 +1046,7 @@ impl Http2ConnectionPool {
                 .create_or_get_existing_owned_in_background(
                     key,
                     permit,
+                    drain_epoch,
                     PoolCreateCaller::Request,
                     |_| {},
                     |_| {},

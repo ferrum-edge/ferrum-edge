@@ -989,6 +989,13 @@ impl<M: PoolManager> GenericPool<M> {
         )
     }
 
+    /// The current drain epoch (see [`Self::clear`]). A caller that captures
+    /// dial inputs before it enters the pool's create path (a detached shard
+    /// fill) samples this first and hands the sample in. Cold path.
+    pub(crate) fn drain_epoch(&self) -> u64 {
+        self.drain_epoch.load(Ordering::Acquire)
+    }
+
     /// Whether a create of `key` is already pending, request-path or
     /// background. A background fill skips such a key rather than hold a
     /// background permit while merely joining a create that runs anyway.
@@ -1173,6 +1180,7 @@ impl<M: PoolManager> GenericPool<M> {
         self.create_or_get_existing_owned_budgeted(
             key,
             CreateBudget::Request,
+            None,
             caller,
             |_| {},
             |_| {},
@@ -1241,6 +1249,7 @@ impl<M: PoolManager> GenericPool<M> {
         self.create_or_get_existing_owned_budgeted(
             key,
             CreateBudget::Request,
+            None,
             caller,
             on_join,
             on_waiter_failure,
@@ -1252,7 +1261,10 @@ impl<M: PoolManager> GenericPool<M> {
 
     /// As [`Self::create_or_get_existing_owned_with_recovery`], for a
     /// speculative create that holds `permit` from the background budget
-    /// instead of waiting for a request-path permit. It still coalesces with
+    /// instead of waiting for a request-path permit. `drain_epoch` is the
+    /// [`Self::drain_epoch`] sample its caller took when it scheduled the
+    /// create, before the detached task first runs, so a drain between
+    /// scheduling and the first poll fences it too. It still coalesces with
     /// request-path creates of the same key: a request that joins it waits on
     /// this attempt, and this attempt joins a request-path create in flight.
     #[allow(clippy::too_many_arguments)]
@@ -1260,6 +1272,7 @@ impl<M: PoolManager> GenericPool<M> {
         &self,
         key: String,
         permit: BackgroundCreatePermit,
+        drain_epoch: u64,
         caller: PoolCreateCaller,
         on_join: J,
         on_waiter_failure: W,
@@ -1278,6 +1291,7 @@ impl<M: PoolManager> GenericPool<M> {
             .create_or_get_existing_owned_budgeted(
                 key,
                 CreateBudget::Background,
+                Some(drain_epoch),
                 caller,
                 on_join,
                 on_waiter_failure,
@@ -1294,6 +1308,7 @@ impl<M: PoolManager> GenericPool<M> {
         &self,
         key: String,
         budget: CreateBudget,
+        entry_drain_epoch: Option<u64>,
         caller: PoolCreateCaller,
         mut on_join: J,
         mut on_waiter_failure: W,
@@ -1310,8 +1325,9 @@ impl<M: PoolManager> GenericPool<M> {
     {
         let mut create = Some(create);
         // Sampled once, before the first cache check, and kept across every
-        // coalesced wait and re-election below (see `clear`).
-        let drain_epoch = self.drain_epoch.load(Ordering::Acquire);
+        // coalesced wait and re-election below (see `clear`). A detached
+        // create brings the sample it took when it was scheduled.
+        let drain_epoch = entry_drain_epoch.unwrap_or_else(|| self.drain_epoch());
 
         loop {
             if let Some(conn) = self.cached(&key) {

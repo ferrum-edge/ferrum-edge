@@ -1807,6 +1807,40 @@ async fn test_http2_pool_drain_is_remembered_by_a_waiter_that_dials_after_it() {
 }
 
 #[tokio::test]
+async fn test_http2_pool_drain_fences_a_background_create_that_has_not_started() {
+    use futures_util::FutureExt;
+
+    let (_backend, port, accepted) = start_counting_h2_tls_backend().await;
+    let pool = direct_h2_pool(2);
+    let proxy = direct_h2_proxy(port);
+    pool.get_sender(&proxy).await.expect("warm shard");
+
+    // Borrow until a request schedules the missing shard's create. Nothing
+    // here yields, so the detached task has not been polled yet.
+    while pool.shard_fills_in_flight() == 0 {
+        pool.get_sender(&proxy)
+            .now_or_never()
+            .expect("a warm pool serves at once")
+            .expect("borrowed sender");
+    }
+    assert_eq!(
+        accepted.load(Ordering::Relaxed),
+        1,
+        "the scheduled create has not dialled"
+    );
+
+    // The pool is drained before that task first runs. The create took its
+    // drain sample when it was scheduled, so what it dials is not published.
+    pool.force_drain_all();
+    wait_for_direct_h2_fills_to_finish(&pool).await;
+    assert_eq!(
+        pool.pool_size(),
+        0,
+        "a create scheduled before the drain publishes nothing"
+    );
+}
+
+#[tokio::test]
 async fn test_http2_pool_selective_drain_also_fences_a_create_in_flight() {
     let (port, accepted, gate) = start_scripted_h2_tls_backend(H2TlsBackendScript::GateLater).await;
     let pool = direct_h2_pool(2);

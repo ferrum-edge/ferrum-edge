@@ -1287,6 +1287,13 @@ impl GrpcConnectionPool {
         if self.shard_fills.contains_key(key) || self.pool.has_pending_creation(key) {
             return;
         }
+        // Sample the drain epoch now, not when the detached task first runs,
+        // and make sure the captured SVID generation is still current (see
+        // the direct HTTP/2 pool's `spawn_shard_fill`).
+        let drain_epoch = self.pool.drain_epoch();
+        if self.pool.manager().svid_generation_for_proxy(proxy) != svid_generation {
+            return;
+        }
         let Some(permit) = self.pool.try_background_create_permit() else {
             return;
         };
@@ -1312,6 +1319,7 @@ impl GrpcConnectionPool {
                 .create_or_get_existing_owned_in_background(
                     key,
                     permit,
+                    drain_epoch,
                     purpose.pool_caller(),
                     |attempt| note_grpc_establishment_join(attempt, purpose),
                     |attempt| note_grpc_establishment_waiter_failure(attempt, purpose),
