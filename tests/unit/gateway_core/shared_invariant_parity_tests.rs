@@ -4579,8 +4579,16 @@ fn every_functional_gateway_spawner_launches_the_harness_selected_binary() {
 // executable to a sibling `ferrum-edge`. That depends on Cargo's target
 // directory layout: Cargo 1.100 moved test executables out of
 // `target/<profile>/deps/`, the walk found nothing, and all four smokes failed
-// on `main` as "binary not found". Nothing in either suite re-executes itself,
-// so any read of the test executable's path there is that spelling again.
+// on `main` as "binary not found".
+//
+// The scan covers the files inside the two suite directories only. Both suites
+// also compile the shared `tests/scaffolding` helpers through `#[path]`, and
+// those legitimately re-execute the test executable for their child fixtures;
+// they stay out of the scan. No file inside either suite directory has that
+// reason, so one that reads the test executable's path is that spelling again.
+// The match is textual and deliberately broad (a comment trips it too): if a
+// suite-local test ever needs to re-execute itself, exempt that file here by
+// name rather than loosening the rule for the gateway locator.
 
 const FEATURE_SUITE_SOURCES: [&str; 2] = ["tests/secrets_functional", "tests/service_integration"];
 const SECRETS_STARTUP_SMOKE: &str = "tests/secrets_functional/startup_smoke.rs";
@@ -4595,7 +4603,8 @@ fn feature_suite_gateway_spawners_use_the_binary_cargo_built_for_them() {
     assert!(
         offenders.is_empty(),
         "resolve the gateway with env!(\"CARGO_BIN_EXE_ferrum-edge\"), not from the test \
-         executable's own location, which follows Cargo's target layout: {offenders:#?}"
+         executable's own location, which follows Cargo's target layout (a suite-local \
+         self re-exec needs a named exemption in this test): {offenders:#?}"
     );
 
     let smoke = source(SECRETS_STARTUP_SMOKE);
