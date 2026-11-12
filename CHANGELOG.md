@@ -2159,8 +2159,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   it is unless the request runs a body-buffering plugin that needs a hook
   context: 0.4–0.7% of gateway user CPU on the HTTP/2 10 KiB benchmark. The
   contexts are now boxed and allocated only for those requests. The handler's
-  per-request state shrinks from 67.1 KiB to 49.3 KiB in the release build, so
-  its allocation moves from jemalloc's 80 KiB size class to the 56 KiB one.
+  per-request state shrinks from 67,096 to 49,336 bytes in the release build,
+  so its allocation moves from jemalloc's 80 KiB size class to the 56 KiB one.
   No configuration or behaviour change.
 - **Proxied requests no longer copy their backend-attempt future, and HTTP/2
   streams no longer carry a 6.5 KiB task.** A request dispatched through the
