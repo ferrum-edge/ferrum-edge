@@ -602,10 +602,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   flight at that moment was cached when it completed, under the configuration
   it had started with, and later requests could reuse it. A create that had
   entered the pool before the drain, or a request that waited on one and
-  dialled after it, now hands its connection to its own caller only. The
-  HTTP/3 pool reads its TLS configuration just before entering the pool, so
-  an HTTP/3 create that straddles a drain at exactly that point is not yet
-  covered.
+  dialled after it, now hands its connection to its own caller only, and a
+  connection is no longer published under the pool key of an SVID generation
+  a rotation has retired. The HTTP/3 pool reads its TLS configuration and
+  SVID generation just before entering the pool, so an HTTP/3 create that
+  straddles a drain at exactly that point is not yet covered.
 - An `api_chargeback_sink` with `clickhouse.tls.verify_hostname: false` and
   neither `clickhouse.tls.ca_file` nor `clickhouse.tls.insecure_skip_verify:
   true` is now refused at admission with a message naming both remedies. It

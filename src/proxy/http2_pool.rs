@@ -1328,6 +1328,12 @@ impl Http2ConnectionPool {
         // The closure body is synchronous — `now_or_never(sender.ready())`
         // polls once without yielding, and DashMap lookups never await — so
         // the `RefCell::borrow_mut()` lifetime stays inside this block.
+        //
+        // The drain epoch is sampled BEFORE the SVID generation is read: a
+        // rotation advances the generation before it drains, so a generation
+        // read here is either current when the drain runs or the drain's
+        // epoch bump comes after this sample and fences the create below.
+        let drain_epoch = self.pool.drain_epoch();
         let svid_generation = self.pool.manager().svid_generation_for_proxy(proxy);
         let phase1 = crate::profile_pool_sync!(Phase1, {
             self.with_pool_key(proxy, svid_generation, |key_buf| -> Phase1 {
@@ -1429,6 +1435,7 @@ impl Http2ConnectionPool {
         let acquired = crate::profile_pool_future!(FallbackPoll, {
             self.pool.create_or_get_existing_owned_with_recovery(
                 selected_key,
+                drain_epoch,
                 caller,
                 |_| {},
                 |_| {},

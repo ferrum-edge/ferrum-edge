@@ -2144,6 +2144,74 @@ async fn every_pool_family_key_is_drained_by_the_svid_generation_matcher() {
 }
 
 // ---------------------------------------------------------------------------
+// The drain-epoch sample precedes the SVID generation read
+//
+// A pool key embeds `|svidg=<n>`. A rotation advances the generation and then
+// drains, which bumps the pool's drain epoch. An acquisition that read the
+// generation BEFORE sampling the epoch could straddle that drain, sample the
+// new epoch, and publish a connection under the retired generation's key:
+// no later request looks it up there, and it can hold a `maxConnections`
+// slot the current generation needs.
+//
+// Siblings: the direct HTTP/2 and gRPC request paths, both pools' detached
+// shard fills, and `GenericPool::get_with` (the reqwest pool). The HTTP/3
+// pool reads its dial inputs before it enters the pool and is NOT covered;
+// `docs/connection_pooling.md` states that limit.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn every_generation_keyed_acquisition_samples_the_drain_epoch_first() {
+    // (file, item signature, epoch sample, generation read)
+    let sites: &[(&str, &str, &str, &str)] = &[
+        (
+            "src/proxy/http2_pool.rs",
+            "    async fn get_sender_unprofiled(",
+            "self.pool.drain_epoch()",
+            "svid_generation_for_proxy(proxy)",
+        ),
+        (
+            "src/proxy/grpc_proxy.rs",
+            "    async fn get_sender_with_purpose_unprofiled(",
+            "self.pool.drain_epoch()",
+            "svid_generation_for_proxy(proxy)",
+        ),
+        (
+            "src/proxy/http2_pool.rs",
+            "    fn spawn_shard_fill(",
+            "self.pool.drain_epoch()",
+            "svid_generation_for_proxy(proxy) != svid_generation",
+        ),
+        (
+            "src/proxy/grpc_proxy.rs",
+            "    fn spawn_shard_fill(",
+            "self.pool.drain_epoch()",
+            "svid_generation_for_proxy(proxy) != svid_generation",
+        ),
+        (
+            "src/pool/mod.rs",
+            "    pub async fn get_with<",
+            "self.drain_epoch()",
+            "self.lookup_or_build_key(build_key)",
+        ),
+    ];
+    for (file, signature, sample, read) in sites {
+        let text = source(file);
+        let body = item_body(&text, signature, "\n    }\n");
+        let sampled_at = body
+            .find(sample)
+            .unwrap_or_else(|| panic!("{file}: `{signature}` must sample the drain epoch"));
+        let read_at = body
+            .find(read)
+            .unwrap_or_else(|| panic!("{file}: `{signature}` must read the SVID generation"));
+        assert!(
+            sampled_at < read_at,
+            "{file}: `{signature}` must sample the drain epoch before it reads the SVID \
+             generation, or a rotation between the two publishes under the retired key"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Declared response Content-Length ceiling skips bodyless replies (issue #5116)
 //
 // A representation Content-Length on HEAD / 1xx / 204 / 205 / 304 is not a
