@@ -286,13 +286,13 @@ fn bounded_inline_children_are_constructed_in_their_final_slot() {
         source.split_whitespace().collect::<Vec<_>>().join(" ")
     }
     fn between<'a>(source: &'a str, start: &str, end: &str) -> &'a str {
-        source
-            .split(start)
-            .nth(1)
-            .unwrap_or_else(|| panic!("`{start}` must exist"))
-            .split(end)
-            .next()
-            .unwrap_or_else(|| panic!("`{start}` must be bounded by `{end}`"))
+        let (_, after_start) = source
+            .split_once(start)
+            .unwrap_or_else(|| panic!("`{start}` must exist"));
+        let (region, _) = after_start
+            .split_once(end)
+            .unwrap_or_else(|| panic!("`{start}` must be bounded by `{end}`"));
+        region
     }
 
     let src = include_str!("../../../src/proxy/mod.rs");
@@ -356,61 +356,4 @@ fn bounded_inline_children_are_constructed_in_their_final_slot() {
         frontend.contains("Box::pin(handle_proxy_request_on_frontend_port("),
         "the frontend future must be built directly in its box"
     );
-}
-
-struct SetOnDrop(Arc<std::sync::atomic::AtomicBool>);
-
-impl Drop for SetOnDrop {
-    fn drop(&mut self) {
-        self.0.store(true, std::sync::atomic::Ordering::Relaxed);
-    }
-}
-
-#[test]
-fn a_child_built_in_a_slot_resolves_once_and_leaves_the_slot_empty() {
-    use std::future::Future;
-    use std::task::{Context, Poll, Waker};
-
-    let mut slot = std::pin::pin!(None);
-    {
-        let mut child = std::pin::pin!(
-            ferrum_edge::proxy::request_stack_test_support::child_in_slot(
-                slot.as_mut(),
-                || async { 7 },
-            )
-        );
-        let mut cx = Context::from_waker(Waker::noop());
-        assert_eq!(child.as_mut().poll(&mut cx), Poll::Ready(7));
-        // Like a fused future, it stays pending once it has returned.
-        assert_eq!(child.as_mut().poll(&mut cx), Poll::Pending);
-    }
-    assert!(slot.is_none(), "a returned child must not stay in the slot");
-}
-
-#[test]
-fn dropping_the_future_of_a_child_built_in_a_slot_cancels_the_child() {
-    use std::future::Future;
-    use std::sync::atomic::{AtomicBool, Ordering};
-    use std::task::{Context, Poll, Waker};
-
-    let cancelled = Arc::new(AtomicBool::new(false));
-    let guard = SetOnDrop(Arc::clone(&cancelled));
-    let mut slot = std::pin::pin!(None);
-    {
-        let mut child = std::pin::pin!(
-            ferrum_edge::proxy::request_stack_test_support::child_in_slot(
-                slot.as_mut(),
-                || async move {
-                    let _held = guard;
-                    std::future::pending::<()>().await;
-                },
-            )
-        );
-        let mut cx = Context::from_waker(Waker::noop());
-        assert_eq!(child.as_mut().poll(&mut cx), Poll::Pending);
-        assert!(!cancelled.load(Ordering::Relaxed));
-    }
-    // The slot is still in scope: the child went with the future that polled it.
-    assert!(cancelled.load(Ordering::Relaxed));
-    assert!(slot.is_none());
 }

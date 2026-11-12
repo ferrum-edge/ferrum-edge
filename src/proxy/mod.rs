@@ -35320,15 +35320,6 @@ pub mod request_stack_test_support {
         std::mem::size_of::<F>()
     }
 
-    /// A caller's future run the way the handler runs a bounded inline child:
-    /// constructed in `slot` and polled there.
-    pub fn child_in_slot<F: std::future::Future>(
-        slot: std::pin::Pin<&mut Option<F>>,
-        construct: impl FnOnce() -> F,
-    ) -> impl std::future::Future<Output = F::Output> {
-        construct_proxy_future_in(slot, construct)
-    }
-
     /// Frontend boundary, concrete frontend, concrete routing handler, and
     /// concrete backend attempt sizes, including their awaited child state.
     pub fn future_sizes() -> [usize; 4] {
@@ -58955,7 +58946,8 @@ pin_project_lite::pin_project! {
     /// Future returned by [`await_backend_attempt_route_deadline`].
     ///
     /// Hand-written rather than an `async fn` so the (large) backend attempt
-    /// future is stored exactly once (production dispatch passes a boxed child).
+    /// future is stored exactly once (production dispatch passes a boxed child
+    /// or, for the first attempt, a child built in a slot of the handler).
     /// The deadline-free path adds two `Option` checks per poll. The timer is
     /// armed only when a deadline or a started attempt budget exists and the
     /// attempt returns `Pending`.
@@ -68554,6 +68546,81 @@ pub(crate) async fn proxy_to_backend_http3_retry(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_child_built_in_a_slot_resolves_once_and_leaves_the_slot_empty() {
+        let mut slot = std::pin::pin!(None);
+        {
+            let mut child =
+                std::pin::pin!(super::construct_proxy_future_in(slot.as_mut(), || async {
+                    7
+                }));
+            let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+            assert_eq!(
+                std::future::Future::poll(child.as_mut(), &mut cx),
+                std::task::Poll::Ready(7)
+            );
+            // Like a fused future, it stays pending once it has returned.
+            assert_eq!(
+                std::future::Future::poll(child.as_mut(), &mut cx),
+                std::task::Poll::Pending
+            );
+        }
+        assert!(slot.is_none(), "a returned child must not stay in the slot");
+    }
+
+    #[test]
+    fn dropping_the_future_of_a_child_built_in_a_slot_cancels_the_child() {
+        struct SetOnDrop(std::sync::Arc<std::sync::atomic::AtomicBool>);
+        impl Drop for SetOnDrop {
+            fn drop(&mut self) {
+                self.0.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+
+        let cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let was_cancelled = || cancelled.load(std::sync::atomic::Ordering::Relaxed);
+        // Never polled: the child is built eagerly and goes with its future.
+        {
+            let guard = SetOnDrop(std::sync::Arc::clone(&cancelled));
+            let mut slot = std::pin::pin!(None);
+            drop(super::construct_proxy_future_in(
+                slot.as_mut(),
+                || async move {
+                    let _held = guard;
+                },
+            ));
+            assert!(
+                was_cancelled(),
+                "an unpolled child must be dropped with its future"
+            );
+            assert!(slot.is_none());
+        }
+        cancelled.store(false, std::sync::atomic::Ordering::Relaxed);
+        // Pending: the child is cancelled while the slot is still in scope.
+        let guard = SetOnDrop(std::sync::Arc::clone(&cancelled));
+        let mut slot = std::pin::pin!(None);
+        {
+            let mut child = std::pin::pin!(super::construct_proxy_future_in(
+                slot.as_mut(),
+                || async move {
+                    let _held = guard;
+                    std::future::pending::<()>().await;
+                }
+            ));
+            let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+            assert_eq!(
+                std::future::Future::poll(child.as_mut(), &mut cx),
+                std::task::Poll::Pending
+            );
+            assert!(!was_cancelled());
+        }
+        assert!(
+            was_cancelled(),
+            "a pending child must be dropped with its future"
+        );
+        assert!(slot.is_none());
+    }
+
     #[test]
     fn route_rebase_preserves_rewrite_for_finalized_egress() {
         let mut ctx = crate::plugins::RequestContext::new(
