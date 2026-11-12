@@ -9,12 +9,19 @@ cell measured in that window loses 20-25% of its CPU. It hit whichever arm ran
 an image first, so always the same arms in pair 1.
 
 The runner therefore starts every distinct binary/image once before the first
-measured pair and calls this helper to wait, with nothing else running, until
-the host is quiet. The helper only reads `/proc`; it starts and stops nothing.
+measured pair, drives a short discarded load, and calls this helper to wait,
+with the arm idle, until the host is quiet. The helper only reads `/proc`; it
+starts and stops nothing.
+
+Times are counted from `--since`: the moment the arm was up, taken by the
+runner after the start returned, so an image pull or a slow start cannot use
+up the minimum hold. Sampling begins when the helper is called, after the
+discarded load, so a burst that began and ended during that load is covered by
+the minimum hold but is not in the record.
 
 `wait` appends one record per arm to a JSON file so a run shows what the hold
 saw: how long it waited, how much CPU other processes used meanwhile, when
-that burst began and ended relative to the start, and which processes those
+that burst began and ended relative to `--since`, and which processes those
 were. A burst that ends close to the release time means the minimum hold is
 too short for that host.
 """
@@ -202,7 +209,9 @@ def wait(args, sleep=time.sleep, now=time.time):
         verdict = settle.verdict(current_time - args.since)
     top = sorted(used.items(), key=lambda item: -item[1])[: args.top]
     record.update(
-        available=True,
+        # False when /proc/stat stopped being readable part-way: the figures
+        # below then cover only the samples taken before that.
+        available=verdict != "unavailable",
         reason=verdict,
         waited_seconds=round(previous_time - started_waiting, 3),
         held_since_start_seconds=round(previous_time - args.since, 3),
@@ -238,7 +247,7 @@ def build_parser():
     waiter = commands.add_parser("wait", help="hold until the host is quiet, then record what was seen")
     waiter.add_argument("--arm", required=True)
     waiter.add_argument("--image", required=True)
-    waiter.add_argument("--since", type=float, required=True, help="unix time just before the arm started")
+    waiter.add_argument("--since", type=float, required=True, help="unix time at which the arm was up")
     waiter.add_argument("--output", required=True)
     waiter.add_argument("--min-hold", type=float, default=25.0)
     waiter.add_argument("--quiet-seconds", type=float, default=3.0)

@@ -23,7 +23,7 @@
 #   --experiment-manifest PATH (explicit opt-in; default remains experiment.json)
 #   --no-process-usage          (diagnostic only; paired comparisons invalid)
 #   --settle | --no-settle      (first-start settle before pair 1; default on for the
-#                                plain comparison lane, off for profile/trace lanes)
+#                                comparison lanes, off for profile/trace/observation lanes)
 #   --pool-profile calibration|profile (separate fixed-window H2/gRPC lane)
 #   --h1-profile calibration|cutoff|diagnostic (separate manual H1 lane; see docs/h1_internal_profile.md)
 #   --h2-window default|64k     (http2/grpcs only; default $BENCH_H2_WINDOW or `default`)
@@ -43,7 +43,8 @@
 # of their CPU, always for the arms that ran an image first in pair 1. Before the
 # first measured pair the runner therefore starts every distinct binary/image
 # once, drives a short discarded load, and waits (host_settle.py) until the host
-# is quiet. What each hold saw is recorded in host_settle.json.
+# is quiet. What each hold saw is recorded in host_settle.json. Best effort: an
+# arm that cannot start or be held is skipped and the run continues.
 #
 # All gateways (including Ferrum) run in Docker with --network host so no gateway
 # has a native-binary advantage. proto_backend and proto_bench run natively
@@ -388,6 +389,10 @@ KRAKEND_IMAGE="krakend:2.13.11"
 BACKEND_PID=""
 REDIS_CID=""
 GATEWAY_CID=""
+# First-start settle: the subshell holding one arm's discarded start, and how
+# the last one ended.
+SETTLE_PID=""
+SETTLE_STATUS=0
 sampler_pid=""
 sampler_stop_file=""
 CERT_DIR="$SCRIPT_DIR/certs"
@@ -452,6 +457,12 @@ check_ports_available() {
 
 cleanup() {
     echo "[cleanup] stopping processes this run started..."
+    if [ -n "$SETTLE_PID" ]; then
+        # A settle subshell owns everything it started: ask it to take that
+        # down and wait until it has.
+        kill -TERM "$SETTLE_PID" 2>/dev/null || true
+        wait "$SETTLE_PID" 2>/dev/null || true
+    fi
     if [ -n "$sampler_pid" ]; then
         if [ -n "$sampler_stop_file" ]; then
             touch "$sampler_stop_file"
@@ -1438,8 +1449,9 @@ run_bench() {
 # processes carrying traffic as they will in the measured cells.
 SETTLE_LOAD_SECONDS=3
 
-# Discarded client run against the arm that is currently up. Mirrors run_bench's
-# target and workload flags but records nothing and never fails the run.
+# Discarded client run against the arm that is currently up. Uses run_bench's
+# target and its workload flags for the comparison lanes, records nothing and
+# never fails the run.
 settle_load() {
     local target="$1"  # "gateway" or "direct"
     local params
@@ -1479,18 +1491,88 @@ settle_identity() {
     fi
 }
 
+# Everything one settle subshell started, taken down however the subshell ends.
+settle_teardown() {
+    trap - EXIT
+    trap '' TERM INT HUP
+    if [ -n "$SETTLE_HELPER_PID" ]; then
+        kill "$SETTLE_HELPER_PID" 2>/dev/null || true
+    fi
+    stop_gateway
+    stop_pid "$BACKEND_PID"
+    if [ -n "$SETTLE_SCRATCH" ]; then rm -rf "$SETTLE_SCRATCH"; fi
+}
+
+# One arm's discarded first start: bring it up, drive the discarded load, hold
+# until the host is quiet, take it down. Sets SETTLE_STATUS and never fails.
+#
+# It runs in a subshell of its own because a settle must cost the run nothing:
+# - start_backend and start_redis report a start that fails by ending the
+#   shell, which here ends only the subshell;
+# - the subshell removes what it started on every way out, a signal included
+#   (cleanup() signals it through SETTLE_PID);
+# - no shell state a start function sets reaches the measured pairs, and
+#   OUTPUT_DIR points at a scratch directory, so nothing a start function
+#   writes lands in the results.
+# The start uses the arm's image with default arguments (Envoy with stream
+# limit 100, ferrum without an experiment arm's environment): the host reacts
+# to an image's first start, not to a container's arguments.
+settle_arm() {
+    local gw="$1"
+    local image="$2"
+    local record="$3"
+    SETTLE_STATUS=0
+    (
+        BACKEND_PID=""
+        GATEWAY_CID=""
+        REDIS_CID=""
+        SETTLE_HELPER_PID=""
+        SETTLE_SCRATCH=""
+        trap 'exit 143' TERM INT HUP
+        trap settle_teardown EXIT
+        SETTLE_SCRATCH=$(mktemp -d "${TMPDIR:-/tmp}/ferrum-bench-settle.XXXXXX") || exit 1
+        OUTPUT_DIR="$SETTLE_SCRATCH"
+        start_backend || exit 1
+        case "$gw" in
+            direct) ;;
+            ferrum|ferrum-exp-*) start_ferrum ;;
+            ferrum-baseline) FERRUM_IMAGE="$BASELINE_IMAGE" start_ferrum ;;
+            envoy|envoy-limit-4) ENVOY_STREAM_LIMIT=100 start_envoy ;;
+            kong) start_kong ;;
+            tyk) start_tyk ;;
+            krakend) start_krakend ;;
+        esac || exit 1
+        # The hold is timed from here, with every process of the arm up: an
+        # image pull or a slow start must not use up the minimum hold.
+        local since
+        since=$(python3 -c 'import time; print(f"{time.time():.3f}")') || exit 1
+        if [ "$gw" = direct ]; then settle_load direct; else settle_load gateway; fi
+        # In the background so a signal ends the hold at once: bash runs a
+        # trap only after a foreground command returns.
+        python3 "$SCRIPT_DIR/host_settle.py" wait --arm "$gw" --image "$image" \
+            --since "$since" --output "$record" &
+        SETTLE_HELPER_PID=$!
+        wait "$SETTLE_HELPER_PID" || exit $?
+        SETTLE_HELPER_PID=""
+    ) &
+    SETTLE_PID=$!
+    wait "$SETTLE_PID" || SETTLE_STATUS=$?
+    SETTLE_PID=""
+}
+
 # Start every distinct binary/image once, before any measured pair, and hold
 # until the host is quiet. Arms that share an image (ferrum and ferrum-exp-*,
 # envoy and envoy-limit-4) settle once: the host reacts to the image, not to
-# the container. An image already started on this host since boot (an earlier
+# the container. An image already settled on this host since boot (an earlier
 # invocation of this runner in the same job, i.e. iteration 2 onwards) is not
 # held again; the marker lives outside the results. Nothing here is a sample:
-# no file is written under pairs/.
+# no file is written under pairs/. Best effort throughout: an arm that cannot
+# start or be held is skipped and left for the measured pair to report.
 settle_first_starts() {
     local record="$1"
     local arms="$2"
     local settled=" "
-    local gw image identity marker since
+    local gw image identity marker
     local marker_dir=""
     if [ -r /proc/sys/kernel/random/boot_id ]; then
         marker_dir="${RUNNER_TEMP:-${TMPDIR:-/tmp}}/ferrum-bench-first-start/$(cat /proc/sys/kernel/random/boot_id)"
@@ -1515,41 +1597,19 @@ settle_first_starts() {
         if [ -n "$marker_dir" ] && [ -n "$identity" ]; then
             marker="$marker_dir/${identity//[^A-Za-z0-9._-]/_}"
             if [ -e "$marker" ]; then
-                echo "[settle] $gw ($image) already started on this host since boot"
+                echo "[settle] $gw ($image) already settled on this host since boot"
                 python3 "$SCRIPT_DIR/host_settle.py" note --arm "$gw" --image "$image" \
                     --reason already_started --output "$record" || true
                 continue
             fi
         fi
         echo "[settle] first start of $gw ($image)"
-        if [ -n "$BACKEND_PID" ]; then
-            kill "$BACKEND_PID" 2>/dev/null || true
-            wait "$BACKEND_PID" 2>/dev/null || true
+        settle_arm "$gw" "$image" "$record"
+        if [ "$SETTLE_STATUS" -ne 0 ]; then
+            # The measured pair reports an arm that cannot start.
+            echo "[settle] $gw was not settled (status $SETTLE_STATUS); continuing"
+            continue
         fi
-        since=$(python3 -c 'import time; print(f"{time.time():.3f}")')
-        start_backend
-        case "$gw" in
-            direct) settle_load direct ;;
-            *)
-                case "$gw" in
-                    ferrum|ferrum-exp-*) start_ferrum ;;
-                    ferrum-baseline) FERRUM_IMAGE="$BASELINE_IMAGE" start_ferrum ;;
-                    envoy|envoy-limit-4) ENVOY_STREAM_LIMIT=100 start_envoy ;;
-                    kong) start_kong ;;
-                    tyk) start_tyk ;;
-                    krakend) start_krakend ;;
-                esac || {
-                    # The measured pair reports a gateway that cannot start.
-                    echo "[settle] $gw failed to start; not settled"
-                    stop_gateway
-                    continue
-                }
-                settle_load gateway
-                ;;
-        esac
-        python3 "$SCRIPT_DIR/host_settle.py" wait --arm "$gw" --image "$image" \
-            --since "$since" --output "$record" || true
-        stop_gateway
         if [ -n "$marker" ]; then : > "$marker" || true; fi
     done
 }
@@ -1712,8 +1772,8 @@ PYEOF
         KONG_IMAGE=$(docker image inspect "$KONG_IMAGE" --format '{{.Id}}')
     fi
     # Profile, trace and H2-observation lanes keep their fixed, separately
-    # verified process and manifest accounting; only the plain comparison lane
-    # settles first starts by default.
+    # verified process and manifest accounting; the comparison lanes, the
+    # HTTP/3 budget lane included, settle first starts by default.
     if [ "$SETTLE" = auto ]; then
         # Without /proc the hold has nothing to observe, so it would only add
         # idle starts (macOS and BSD development hosts).

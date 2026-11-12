@@ -404,22 +404,35 @@ the job, `ferrum` about a minute in (18 of 18 jobs), Envoy about two minutes in
 two-pair 10 KiB average for `ferrum`, a bias in the same direction every run.
 Before the first measured pair the runner therefore starts every distinct
 binary/image once, drives three seconds of discarded load, and waits through
-`host_settle.py` until at least 25 seconds have passed since the start and the
-host has been quiet (under 0.2 cores busy) for three seconds, capped at 60
-seconds. Arms that share an image settle once. An image already started on the
-host since boot (iteration 2 onwards) is not held again. `host_settle.json` in
-the run directory records, per arm, how long the hold lasted, how much CPU the
-host used meanwhile, when that burst began and ended relative to the start
-(`first_burst_since_start_seconds`, `last_burst_since_start_seconds`), and which
-processes used it. `reason: max_wait` means the host never went quiet, and a
-burst that ends within a few seconds of the release means the 25-second minimum
-is too short for that host; in either case read pair 1 with the CPU timelines
-beside it. The settle is on by default for the plain comparison lane on hosts with
-`/proc`, and off for the profile, trace and H2-observation lanes, which keep
-their own fixed process accounting; `--settle` and `--no-settle` override it.
-It removes the first-start window only. Later disturbances are not detected
-(see the known limitations below), so the per-sample diagnostics remain the
-check for a single odd sample.
+`host_settle.py` until at least 25 seconds have passed since the arm was up and
+the host has been quiet (under 0.2 cores busy) for three seconds, capped at 60
+seconds. The clock starts when the start returns, so an image pull or a slow
+start cannot use up the minimum. Arms that share an image settle once, and the
+start uses the image with default arguments (Envoy with stream limit 100,
+`ferrum` without an experiment arm's environment): the host reacts to an
+image's first start, and a second container from an image that had already run
+showed no burst (0 of 6). An image already settled on the host since boot
+(iteration 2 onwards) is not held again.
+
+The settle is best effort and cannot fail a run. Each start runs in a subshell
+of its own that removes what it started however it ends and writes nothing
+into the run directory; an arm that cannot start or be held is logged as
+`[settle] <arm> was not settled`, skipped, and left for the measured pair to
+report. `host_settle.json` in the run directory records, per arm, how long the
+hold lasted, how much CPU the host used meanwhile, when that burst began and
+ended relative to the arm being up (`first_burst_since_start_seconds`,
+`last_burst_since_start_seconds`), and which processes used it. An arm with no
+record was not settled. `reason: max_wait` means the host never went quiet, and
+a burst that ends within a few seconds of the release means the 25-second
+minimum is too short for that host; in each of those cases read pair 1 with the
+CPU timelines beside it.
+
+The settle is on by default for the comparison lanes, the HTTP/3 budget lane
+included, on hosts with `/proc`. It is off for the profile, trace and
+H2-observation lanes, which keep their own fixed process accounting;
+`--settle` and `--no-settle` override the default. It removes the first-start
+window only. Later disturbances are not detected (see the known limitations
+below), so the per-sample diagnostics remain the check for a single odd sample.
 
 For a revision experiment, make both images available on the **same hosted
 runner**, pin their digests, and run, for example:
@@ -528,8 +541,10 @@ For the full `http1-tls` matrix (direct + five gateways, five sizes), budget
 `iterations × pairs × 30 × (duration + 15) / 60 + 5` minutes. This conservative
 planning envelope allocates 15 seconds overhead per call and five minutes fixed
 headroom; slow starts, warmups, or failures can still exceed it. The first-start
-settle adds about 35 seconds per distinct image once per job (about four minutes
-for direct plus five gateways), inside that headroom. Keep at least ten
+settle adds about 30 seconds per distinct image once per job: about three
+minutes for direct plus five gateways, inside that headroom, and up to about 70
+seconds per image (seven minutes) on a host that never goes quiet, which is
+not. Keep at least ten
 minutes below the frozen 75-minute step. The frozen dispatcher cannot set pairs
 or adaptive flags and therefore uses **2 pairs, adaptive off**.
 
@@ -563,12 +578,12 @@ or adaptive flags and therefore uses **2 pairs, adaptive off**.
   kinds were seen in six identical-code validation jobs. One job had a dip of
   up to two seconds every 60 seconds through both pairs: gateway and backend
   CPU drop together by about 20% in the `process_usage` timeline, whichever
-  arm is running. In another job the host slowed down without taking CPU time
-  away, so the timeline looks normal: gateway and backend CPU seconds per
-  request were both about 20% higher for one arm's 10 KiB sample than for the
-  same arm in the other pair, with identical system calls per request, and
-  that sample read 17% low. Compare CPU per request across pairs before
-  trusting a two-pair average.
+  arm is running. In another job one arm's 10 KiB sample read 17% low with a
+  normal-looking timeline: the same CPU time, but gateway and backend CPU
+  seconds per request both about 20% higher than for the same arm in the
+  other pair, with identical system calls per request. Neither cause is
+  established. Compare CPU per request across pairs before trusting a
+  two-pair average.
 
 #### Window, client and revision inputs (#6038, #6022)
 

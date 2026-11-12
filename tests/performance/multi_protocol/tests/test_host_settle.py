@@ -4,16 +4,20 @@ On GitHub-hosted runners the provisioner's job daemon uses about one core for
 four to five seconds the first time a new binary or container image runs in a
 job. The benchmark runner starts every distinct image once before pair 1 and
 waits, through ``host_settle.py``, until the host is quiet. These tests pin the
-wait rule without a live host, and the runner's side of the contract from its
-source.
+wait rule without a live host, the runner's side of the contract from its
+source, and the runner's settle code itself, run in bash with the start
+functions, Docker and the helper replaced by stand-ins.
 """
 
 import argparse
 import json
+import os
 import re
+import signal
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -158,6 +162,26 @@ class WaitTests(unittest.TestCase):
             self.assertEqual(record["top_processes"][0]["comm"], "provjobd123")
             self.assertAlmostEqual(record["top_processes"][0]["cpu_seconds"], 4.0, places=1)
 
+    def test_proc_lost_during_the_hold_is_not_reported_as_observed(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "proc"
+            root.mkdir()
+            output = Path(temporary) / "host_settle.json"
+            clock = [10.0]
+
+            def sleep(interval):
+                clock[0] += interval
+                if clock[0] >= 11.0:
+                    (root / "stat").unlink()
+
+            self.write_stat(root, 0, {})
+            record = host_settle.wait(
+                self.arguments(root, output, since=10.0, min_hold=25.0, quiet_seconds=3.0),
+                sleep=sleep, now=lambda: clock[0])
+            self.assertEqual(record["reason"], "unavailable")
+            self.assertFalse(record["available"])
+            self.assertEqual(record["samples"], 1)
+
     def test_records_accumulate_per_arm_with_the_settings_used(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary) / "proc"
@@ -257,31 +281,302 @@ class RunnerContractTests(unittest.TestCase):
         self.assertIn('ferrum|ferrum-exp-*) image="$FERRUM_IMAGE" ;;', self.settle)
         self.assertIn('envoy|envoy-limit-4) image="$ENVOY_IMAGE" ;;', self.settle)
 
-    def test_an_image_already_started_since_boot_is_not_held_again(self):
+    def test_the_since_boot_marker_is_keyed_by_image_identity_outside_the_results(self):
         # Iteration 2 onwards of the hosted workflow re-invokes the runner in
         # the same job; the host only reacts to an image's first start.
         body = self.settle.split("\n}\n", 1)[0]
         self.assertIn("/proc/sys/kernel/random/boot_id", body)
-        skip = body.index('if [ -e "$marker" ]; then')
-        self.assertLess(skip, body.index("start_backend"))
         self.assertIn("--reason already_started", body)
-        # The marker is written only after the hold, and only outside results.
-        self.assertLess(body.index("host_settle.py\" wait"), body.index(': > "$marker"'))
         self.assertIn('${RUNNER_TEMP:-${TMPDIR:-/tmp}}/ferrum-bench-first-start/', body)
         identity = self.source.split("settle_identity() {", 1)[1].split("\n}\n", 1)[0]
         self.assertIn("docker image inspect", identity)
         self.assertIn("'{{.Id}}'", identity)
 
-    def test_settle_writes_no_sample_and_owns_only_what_it_started(self):
+    def test_settle_load_is_discarded_and_nothing_is_killed_by_name(self):
         load = self.source.split("settle_load() {", 1)[1].split("\n}\n", 1)[0]
         self.assertIn(">/dev/null 2>&1 || true", load)
-        for forbidden in ("run_bench", "$OUTPUT_DIR", "pairs/", "benchmark_plan.py"):
+        section = self.source.split("# ── First-start settle", 1)[1].split("# ── Orchestration", 1)[0]
+        for forbidden in ("run_bench", "pairs/", "benchmark_plan.py"):
             self.assertNotIn(forbidden, load + self.settle.split("\n}\n", 1)[0])
-        body = self.settle.split("\n}\n", 1)[0]
-        # Each first start is torn down before the next one and before pair 1.
-        self.assertLess(body.index("host_settle.py"), body.rindex("stop_gateway"))
-        self.assertIn('kill "$BACKEND_PID"', body)
-        self.assertNotRegex(body, r"pkill|killall|xargs")
+        self.assertNotRegex(section, r"pkill|killall|xargs")
+
+    def test_cleanup_takes_down_a_settle_in_progress(self):
+        cleanup = self.source.split("\ncleanup() {\n", 1)[1].split("\n}\n", 1)[0]
+        self.assertIn('kill -TERM "$SETTLE_PID"', cleanup)
+        self.assertIn('wait "$SETTLE_PID"', cleanup)
+
+
+def shell_function(source, name):
+    start = source.index(f"\n{name}() {{\n") + 1
+    return source[start:source.index("\n}\n", start) + 3]
+
+
+DRIVER_HEAD = r"""
+set -eo pipefail
+FERRUM_IMAGE=ferrum-edge:bench
+BASELINE_IMAGE=baseline:image
+ENVOY_IMAGE=envoy:image
+KONG_IMAGE=kong:image
+TYK_IMAGE=tyk:image
+KRAKEND_IMAGE=krakend:image
+PAYLOAD_SIZES="10240 71680"
+CONCURRENCY=100
+H2_WINDOW=default
+H2_STREAM_WINDOW=0
+GRPC_CLIENT_CONNECTIONS=pooled
+TIMEOUT_CMD=""
+BACKEND_PID=""
+REDIS_CID=""
+GATEWAY_CID=""
+SETTLE_PID=""
+SETTLE_STATUS=0
+sampler_pid=""
+sampler_stop_file=""
+OUTPUT_DIR="$RUN_DIR"
+log() { printf '%s\n' "$*" >> "$LOG"; }
+h1_trace_stop() { :; }
+bench_params() { echo "http1 https://127.0.0.1:8443/echo https://127.0.0.1:3443/echo"; }
+scale_concurrency_for_payload() { echo "$2"; }
+docker() {
+    if [ "$1" = image ]; then echo "sha256:$3"; else log "docker $*"; fi
+}
+# Stands in for both uses of python3: the clock read and host_settle.py.
+python3() {
+    if [ "$1" = -c ]; then cat "$CLOCK"; return 0; fi
+    shift
+    log "helper $*"
+    if [ "$1" = wait ] && [ -n "${HELPER_BLOCKS:-}" ]; then
+        exec "$REAL_PYTHON" -c 'import os, sys, time; open(sys.argv[1], "w").write(str(os.getpid())); time.sleep(60)' "$HELPER_PIDFILE"
+    fi
+    if [ "$1" = wait ] && [ "${HELPER_FAILS_FOR:-}" = "$gw" ]; then return 3; fi
+    return 0
+}
+start_backend() {
+    log "start_backend gw=$gw output=$OUTPUT_DIR"
+    if [ "${BACKEND_EXITS_FOR:-}" = "$gw" ]; then log "backend exits"; exit 1; fi
+    sleep 300 &
+    BACKEND_PID=$!
+    log "backend pid $BACKEND_PID"
+}
+gateway_up() {
+    GATEWAY_CID="cid-$gw"
+    LEAKED_BY_START=yes
+    mkdir -p "$OUTPUT_DIR/diagnostics"
+    echo config > "$OUTPUT_DIR/diagnostics/${gw}_config.yaml"
+    if [ "${SLOW_START_FOR:-}" = "$gw" ]; then echo 1040.000 > "$CLOCK"; fi
+    [ "${GATEWAY_FAILS_FOR:-}" != "$gw" ]
+}
+start_ferrum() { log "start_ferrum image=$FERRUM_IMAGE"; gateway_up; }
+start_envoy() { log "start_envoy limit=$ENVOY_STREAM_LIMIT"; gateway_up; }
+start_kong() { log start_kong; gateway_up; }
+start_krakend() { log start_krakend; gateway_up; }
+start_tyk() {
+    log start_tyk
+    REDIS_CID=cid-redis
+    if [ -n "${REDIS_EXITS:-}" ]; then log "redis exits"; exit 1; fi
+    gateway_up
+}
+stop_gateway() {
+    log "stop_gateway gateway=$GATEWAY_CID redis=$REDIS_CID"
+    stop_container "$GATEWAY_CID"
+    stop_container "$REDIS_CID"
+    GATEWAY_CID=""
+    REDIS_CID=""
+}
+"""
+
+DRIVER_TAIL = r"""
+trap cleanup EXIT
+settle_first_starts "$RUN_DIR/host_settle.json" "$ARMS"
+log "measured phase backend=[$BACKEND_PID] gateway=[$GATEWAY_CID] redis=[$REDIS_CID] leaked=[${LEAKED_BY_START:-}] output=$OUTPUT_DIR"
+"""
+
+
+def alive(pid):
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return False
+    return True
+
+
+class SettleBehaviourTests(unittest.TestCase):
+    """The runner's own settle code, with everything it starts replaced."""
+
+    def setUp(self):
+        source = RUNNER.read_text()
+        section = source.split("# ── First-start settle", 1)[1].split("# ── Orchestration", 1)[0]
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.root = Path(self.temporary.name)
+        self.run_dir = self.root / "results"
+        self.run_dir.mkdir()
+        self.log = self.root / "events.log"
+        self.log.write_text("")
+        self.clock = self.root / "clock"
+        self.clock.write_text("1000.000\n")
+        script_dir = self.root / "harness"
+        release = script_dir / "target" / "release"
+        release.mkdir(parents=True)
+        (release / "proto_backend").write_text("backend\n")
+        bench = release / "proto_bench"
+        bench.write_text('#!/bin/sh\nprintf \'load %s\\n\' "$*" >> "$LOG"\n')
+        bench.chmod(0o755)
+        self.driver = self.root / "driver.sh"
+        self.driver.write_text(
+            DRIVER_HEAD
+            + shell_function(source, "stop_pid")
+            + shell_function(source, "stop_container")
+            + shell_function(source, "cleanup")
+            + "# ── First-start settle" + section
+            + DRIVER_TAIL)
+        self.environment = dict(
+            os.environ, LOG=str(self.log), RUN_DIR=str(self.run_dir), CLOCK=str(self.clock),
+            SCRIPT_DIR=str(script_dir), RUNNER_TEMP=str(self.root / "runner-temp"),
+            TMPDIR=str(self.root), REAL_PYTHON=sys.executable,
+            HELPER_PIDFILE=str(self.root / "helper.pid"))
+
+    def run_settle(self, arms, **scenario):
+        result = subprocess.run(
+            ["bash", str(self.driver)], env=dict(self.environment, ARMS=arms, **scenario),
+            capture_output=True, text=True, timeout=120)
+        return result, self.log.read_text().splitlines()
+
+    def assert_nothing_left(self, events):
+        pids = [int(line.split()[-1]) for line in events if line.startswith("backend pid ")]
+        self.assertTrue(pids)
+        for pid in pids:
+            self.assertFalse(alive(pid), f"backend {pid} outlived the settle")
+        scratch = {line.split("output=", 1)[1] for line in events if line.startswith("start_backend ")}
+        for directory in scratch:
+            self.assertNotEqual(Path(directory), self.run_dir)
+            self.assertNotIn(self.run_dir, Path(directory).parents)
+            self.assertFalse(Path(directory).exists(), "the scratch directory was left behind")
+        self.assertEqual(sorted(path.name for path in self.run_dir.iterdir()), [],
+                         "a settle start wrote into the run directory")
+
+    def test_each_image_is_started_once_with_default_arguments_then_removed(self):
+        result, events = self.run_settle("direct ferrum ferrum-exp-a envoy envoy-limit-4 ferrum-baseline")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual([line for line in events if line.startswith("start_ferrum")],
+                         ["start_ferrum image=ferrum-edge:bench", "start_ferrum image=baseline:image"])
+        self.assertEqual([line for line in events if line.startswith("start_envoy")],
+                         ["start_envoy limit=100"])
+        waits = [line.split() for line in events if line.startswith("helper wait")]
+        self.assertEqual([words[words.index("--arm") + 1] for words in waits],
+                         ["direct", "ferrum", "envoy", "ferrum-baseline"])
+        # Every arm is taken down before the next starts and before pair 1.
+        order = [line.split()[0] for line in events
+                 if line.split()[0] in ("start_backend", "stop_gateway", "measured")]
+        self.assertEqual(order, ["start_backend", "stop_gateway"] * 4 + ["measured"])
+        self.assertIn("docker stop --time 5 cid-ferrum", events)
+        self.assert_nothing_left(events)
+
+    def test_no_shell_state_or_file_of_a_settle_start_reaches_the_measured_phase(self):
+        result, events = self.run_settle("ferrum")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(
+            f"measured phase backend=[] gateway=[] redis=[] leaked=[] output={self.run_dir}", events)
+        self.assert_nothing_left(events)
+
+    def test_the_hold_is_timed_from_when_the_arm_is_up_not_from_before_an_image_pull(self):
+        result, events = self.run_settle("direct krakend", SLOW_START_FOR="krakend")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        waits = {words[words.index("--arm") + 1]: words[words.index("--since") + 1]
+                 for words in (line.split() for line in events if line.startswith("helper wait"))}
+        # The stand-in start moves the clock by 40 s, as a cold `docker run` would.
+        self.assertEqual(waits, {"direct": "1000.000", "krakend": "1040.000"})
+        steps = [line.split()[0] for line in events]
+        krakend = steps.index("start_krakend")
+        self.assertLess(krakend, steps.index("load", krakend))
+        self.assertLess(steps.index("load", krakend), len(steps) - 1 - steps[::-1].index("helper"))
+
+    def test_a_backend_that_cannot_start_does_not_end_the_run(self):
+        # start_backend reports failure with `exit 1`.
+        result, events = self.run_settle("direct ferrum envoy", BACKEND_EXITS_FOR="ferrum")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("backend exits", events)
+        self.assertIn("[settle] ferrum was not settled (status 1); continuing", result.stdout)
+        self.assertIn("start_envoy limit=100", events)
+        self.assertTrue(events[-1].startswith("measured phase"), events[-1])
+        waits = [line.split() for line in events if line.startswith("helper wait")]
+        self.assertEqual([words[words.index("--arm") + 1] for words in waits], ["direct", "envoy"])
+        self.assert_nothing_left(events)
+
+    def test_a_gateway_that_cannot_start_is_removed_and_skipped(self):
+        result, events = self.run_settle("ferrum envoy", GATEWAY_FAILS_FOR="ferrum")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("docker stop --time 5 cid-ferrum", events)
+        self.assertNotIn("load", [line.split()[0] for line in events[:events.index("start_envoy limit=100")]])
+        self.assertTrue(events[-1].startswith("measured phase"), events[-1])
+        self.assert_nothing_left(events)
+
+    def test_a_dependency_that_ends_the_shell_inside_a_gateway_start_does_not_end_the_run(self):
+        # start_tyk -> start_redis reports failure with `exit 1`.
+        result, events = self.run_settle("tyk envoy", REDIS_EXITS="1")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("redis exits", events)
+        self.assertIn("docker stop --time 5 cid-redis", events)
+        self.assertIn("start_envoy limit=100", events)
+        self.assertTrue(events[-1].startswith("measured phase"), events[-1])
+        self.assert_nothing_left(events)
+
+    def test_a_helper_failure_skips_the_arm_without_ending_the_run(self):
+        result, events = self.run_settle("ferrum envoy", HELPER_FAILS_FOR="ferrum")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("[settle] ferrum was not settled (status 3); continuing", result.stdout)
+        self.assertIn("start_envoy limit=100", events)
+        self.assert_nothing_left(events)
+
+    @unittest.skipUnless(os.path.exists("/proc/sys/kernel/random/boot_id"), "needs Linux boot_id")
+    def test_only_a_settled_image_is_skipped_by_a_later_invocation(self):
+        first, _ = self.run_settle("direct ferrum envoy", GATEWAY_FAILS_FOR="ferrum")
+        self.assertEqual(first.returncode, 0, first.stderr)
+        self.log.write_text("")
+        second, events = self.run_settle("direct ferrum envoy")
+        self.assertEqual(second.returncode, 0, second.stderr)
+        notes = [line.split() for line in events if line.startswith("helper note")]
+        self.assertEqual([words[words.index("--arm") + 1] for words in notes], ["direct", "envoy"])
+        # The image whose first start failed is started and held again.
+        self.assertEqual([line for line in events if line.startswith("start_")][1:],
+                         ["start_ferrum image=ferrum-edge:bench"])
+        markers = list((self.root / "runner-temp" / "ferrum-bench-first-start").glob("*/*"))
+        self.assertEqual(len(markers), 3)
+        self.assertEqual(sorted(path.name for path in self.run_dir.iterdir()), [])
+
+    def test_an_interrupt_during_the_hold_takes_the_arm_down_at_once(self):
+        process = subprocess.Popen(
+            ["bash", str(self.driver)],
+            env=dict(self.environment, ARMS="ferrum envoy", HELPER_BLOCKS="1"),
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        pidfile = Path(self.environment["HELPER_PIDFILE"])
+        try:
+            deadline = time.monotonic() + 30
+            while not (pidfile.exists() and pidfile.read_text().strip()):
+                self.assertLess(time.monotonic(), deadline, "the hold never began")
+                self.assertIsNone(process.poll(), "the runner ended before the hold")
+                time.sleep(0.05)
+            helper = int(pidfile.read_text())
+            signalled = time.monotonic()
+            process.send_signal(signal.SIGTERM)
+            process.communicate(timeout=30)
+        finally:
+            if process.poll() is None:
+                process.kill()
+                process.communicate()
+        self.assertLess(time.monotonic() - signalled, 20, "teardown waited for the hold to finish")
+        # bash runs its EXIT trap and then dies of the signal.
+        self.assertIn(process.returncode, (-signal.SIGTERM, 128 + signal.SIGTERM))
+        events = self.log.read_text().splitlines()
+        self.assertIn("stop_gateway gateway=cid-ferrum redis=", events)
+        self.assertIn("docker stop --time 5 cid-ferrum", events)
+        self.assertNotIn("start_envoy limit=100", events)
+        self.assertFalse(any(line.startswith("measured phase") for line in events))
+        deadline = time.monotonic() + 5
+        while alive(helper) and time.monotonic() < deadline:
+            time.sleep(0.05)
+        self.assertFalse(alive(helper), "the hold helper outlived the interrupt")
+        self.assert_nothing_left(events)
 
 
 if __name__ == "__main__":
