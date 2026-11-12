@@ -2124,20 +2124,20 @@ pub(crate) async fn drive_sampling_peer_max_streams<C>(
 where
     C: std::future::Future<Output = hyper::Result<()>> + Unpin,
 {
-    drive_sampling_peer_max_streams_until(conn, current_max_send_streams, peer_max_streams, || {
-        tokio::time::Instant::now() + PEER_MAX_STREAMS_ZERO_RESAMPLE
+    drive_sampling_peer_max_streams_with(conn, current_max_send_streams, peer_max_streams, || {
+        Box::pin(tokio::time::sleep(PEER_MAX_STREAMS_ZERO_RESAMPLE))
     })
     .await
 }
 
-/// [`drive_sampling_peer_max_streams`] with the deadline of each zero-limit
-/// re-sample supplied by the caller, so a test can hand it one that has
-/// already passed.
-async fn drive_sampling_peer_max_streams_until<C>(
+/// [`drive_sampling_peer_max_streams`] with each zero-limit re-sample timer
+/// supplied by the caller, so a test can hand it one that has already
+/// expired.
+async fn drive_sampling_peer_max_streams_with<C>(
     conn: &mut C,
     current_max_send_streams: impl Fn(&C) -> usize,
     peer_max_streams: &AtomicUsize,
-    next_zero_resample: impl Fn() -> tokio::time::Instant,
+    mut zero_resample_timer: impl FnMut() -> Pin<Box<tokio::time::Sleep>>,
 ) -> hyper::Result<()>
 where
     C: std::future::Future<Output = hyper::Result<()>> + Unpin,
@@ -2161,7 +2161,7 @@ where
             if current != 0 || polled.is_ready() {
                 zero_resample = None;
             } else if resample_due || zero_resample.is_none() {
-                let mut timer = Box::pin(tokio::time::sleep_until(next_zero_resample()));
+                let mut timer = zero_resample_timer();
                 // The first poll registers this task for the timer's expiry.
                 // A timer that has already expired (this thread was held up
                 // between creating and polling it) registers nothing, so ask
@@ -7187,7 +7187,7 @@ mod tests {
     /// A zero-limit re-sample timer that has already expired when it is first
     /// polled registers no wake-up. The driver must then ask for another poll
     /// itself, or it never samples again: the connection here never wakes its
-    /// task, as an idle hyper connection does not. Inline because the deadline
+    /// task, as an idle hyper connection does not. Inline because the timer
     /// hook is private.
     #[tokio::test]
     async fn zero_limit_resample_survives_a_timer_already_expired_at_its_first_poll() {
@@ -7204,9 +7204,18 @@ mod tests {
             }
         }
 
+        // Timers created now and first polled a second later: each has
+        // already expired at its first poll.
         tokio::time::pause();
-        let expired = tokio::time::Instant::now();
+        let mut expired_timers: Vec<std::pin::Pin<Box<tokio::time::Sleep>>> = (0..256)
+            .map(|_| Box::pin(tokio::time::sleep(std::time::Duration::from_millis(1))))
+            .collect();
         tokio::time::advance(std::time::Duration::from_secs(1)).await;
+        assert!(
+            futures_util::FutureExt::now_or_never(expired_timers.pop().expect("a prepared timer"))
+                .is_some(),
+            "a prepared timer is ready at its first poll"
+        );
 
         let limit = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let published = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(usize::MAX));
@@ -7216,11 +7225,11 @@ mod tests {
             let mut conn = IdleConnection {
                 limit: driver_limit,
             };
-            let _ = drive_sampling_peer_max_streams_until(
+            let _ = drive_sampling_peer_max_streams_with(
                 &mut conn,
                 |conn| conn.limit.load(std::sync::atomic::Ordering::Relaxed),
                 &driver_published,
-                || expired,
+                move || expired_timers.pop().expect("a prepared timer"),
             )
             .await;
         });
