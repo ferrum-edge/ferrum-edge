@@ -32,10 +32,10 @@ use hyper::body::Incoming;
 use hyper::client::conn::http2;
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, OnceLock};
 use std::task::{Context, Poll};
 use std::time::Duration;
 use tokio::net::TcpStream;
@@ -48,6 +48,7 @@ use crate::config::PoolConfig;
 use crate::config::types::{BackendScheme, GatewayConfig, Proxy};
 use crate::dns::{DnsCache, DnsConfig};
 use crate::plugins::{BufferedInitialResponseHeaderPolicyState, Plugin};
+use crate::pool::shard_fill::{ShardCreateBackoff, ShardCreateGuard, ShardFill, ShardRing};
 use crate::pool::{CoalescedCreateAttempt, GenericPool, PoolCreateCaller, PoolManager};
 use crate::proxy::client_abort::CLIENT_CLOSED_REQUEST_STATUS;
 use crate::proxy::hbone_pool::HbonePoolError;
@@ -831,114 +832,6 @@ pub struct GrpcConnectionPool {
     frontend_slots: Arc<crate::proxy::frontend_affinity::SlotTable>,
 }
 
-/// How long a failed affinity or spill shard create keeps that shard on the
-/// borrow path before it is dialled again.
-const SHARD_CREATE_BACKOFF: Duration = Duration::from_secs(2);
-
-/// Hard bound on retained failure keys and FIFO records. Recording one
-/// physical failure evicts at most one record; there are no full-map scans.
-const SHARD_CREATE_BACKOFF_CAPACITY: usize = 4096;
-
-/// A shard key's place in its ring: the base key length, the preferred
-/// shard, and the ring size.
-#[derive(Clone, Copy)]
-struct ShardRing {
-    base_len: usize,
-    start: usize,
-    shards: usize,
-}
-
-/// Removes a background shard fill from the in-flight set when its task ends,
-/// however it ends.
-struct ShardFill {
-    fills: Arc<DashMap<String, ()>>,
-    key: String,
-}
-
-impl Drop for ShardFill {
-    fn drop(&mut self) {
-        self.fills.remove(&self.key);
-    }
-}
-
-struct ShardCreateBackoff {
-    failures: DashMap<Arc<str>, ShardCreateFailure>,
-    // Only physical failed/cancelled creates take this lock. Warm requests
-    // never consult the backoff cache, and coalesced waiters never record.
-    order: Mutex<VecDeque<(Arc<str>, usize)>>,
-    recorded: AtomicUsize,
-    evicted: AtomicUsize,
-}
-
-struct ShardCreateFailure {
-    at: tokio::time::Instant,
-    generation: usize,
-}
-
-impl ShardCreateBackoff {
-    fn new(shards: usize) -> Self {
-        Self {
-            failures: DashMap::with_shard_amount(shards),
-            order: Mutex::new(VecDeque::with_capacity(SHARD_CREATE_BACKOFF_CAPACITY)),
-            recorded: AtomicUsize::new(0),
-            evicted: AtomicUsize::new(0),
-        }
-    }
-
-    fn backed_off(&self, key: &str) -> bool {
-        let failed_at = match self.failures.get(key) {
-            Some(entry) => entry.at,
-            None => return false,
-        };
-        if failed_at.elapsed() < SHARD_CREATE_BACKOFF {
-            return true;
-        }
-        self.failures.remove_if(key, |_, failure| {
-            failure.at.elapsed() >= SHARD_CREATE_BACKOFF
-        });
-        false
-    }
-
-    fn record(&self, key: String) {
-        // Recover the bounded bookkeeping after a panic without dropping the
-        // cancellation cooldown. No user work runs while this lock is held.
-        let mut order = self.order.lock().unwrap_or_else(|err| err.into_inner());
-        if order.len() == SHARD_CREATE_BACKOFF_CAPACITY
-            && let Some((old_key, old_generation)) = order.pop_front()
-        {
-            self.failures.remove_if(old_key.as_ref(), |_, failure| {
-                failure.generation == old_generation
-            });
-            self.evicted.fetch_add(1, Ordering::Relaxed);
-        }
-        let key: Arc<str> = key.into();
-        let generation = self.recorded.fetch_add(1, Ordering::Relaxed);
-        self.failures.insert(
-            Arc::clone(&key),
-            ShardCreateFailure {
-                at: tokio::time::Instant::now(),
-                generation,
-            },
-        );
-        order.push_back((key, generation));
-    }
-}
-
-/// Lives inside the elected physical creator, so cancellation records the
-/// cooldown before GenericPool wakes waiters to elect the next creator.
-struct ShardCreateGuard<'a> {
-    backoff: &'a ShardCreateBackoff,
-    key: Option<String>,
-}
-
-impl Drop for ShardCreateGuard<'_> {
-    fn drop(&mut self) {
-        if let Some(key) = self.key.take() {
-            self.backoff.record(key);
-        }
-    }
-}
-
 #[derive(Clone)]
 struct GrpcPoolManager {
     global_pool_config: PoolConfig,
@@ -1221,17 +1114,14 @@ impl GrpcConnectionPool {
     /// Shard keys currently backed off after a failed affinity or spill
     /// create.
     pub fn shard_create_backoff_len(&self) -> usize {
-        self.shard_create_backoff.failures.len()
+        self.shard_create_backoff.backed_off_keys()
     }
 
     /// Physical failure records and bounded FIFO eviction operations. Exposed
     /// for outage/fanout regression coverage, not logical request counts.
     #[doc(hidden)]
     pub fn shard_create_backoff_work(&self) -> (usize, usize) {
-        (
-            self.shard_create_backoff.recorded.load(Ordering::Relaxed),
-            self.shard_create_backoff.evicted.load(Ordering::Relaxed),
-        )
+        self.shard_create_backoff.work()
     }
 
     /// Background shard creates currently in flight. Exposed for borrow and
@@ -1397,6 +1287,13 @@ impl GrpcConnectionPool {
         if self.shard_fills.contains_key(key) || self.pool.has_pending_creation(key) {
             return;
         }
+        // Sample the drain epoch now, not when the detached task first runs,
+        // and make sure the captured SVID generation is still current (see
+        // the direct HTTP/2 pool's `spawn_shard_fill`).
+        let drain_epoch = self.pool.drain_epoch();
+        if self.pool.manager().svid_generation_for_proxy(proxy) != svid_generation {
+            return;
+        }
         let Some(permit) = self.pool.try_background_create_permit() else {
             return;
         };
@@ -1422,6 +1319,7 @@ impl GrpcConnectionPool {
                 .create_or_get_existing_owned_in_background(
                     key,
                     permit,
+                    drain_epoch,
                     purpose.pool_caller(),
                     |attempt| note_grpc_establishment_join(attempt, purpose),
                     |attempt| note_grpc_establishment_waiter_failure(attempt, purpose),
@@ -1587,6 +1485,10 @@ impl GrpcConnectionPool {
         // The closure body is synchronous — `now_or_never(sender.ready())`
         // polls once without yielding, and DashMap lookups never await — so
         // the `RefCell::borrow_mut()` lifetime stays inside this block.
+        //
+        // The drain epoch is sampled BEFORE the SVID generation is read (see
+        // the direct HTTP/2 pool's `get_sender_unprofiled`).
+        let drain_epoch = self.pool.drain_epoch();
         let svid_generation = self.pool.manager().svid_generation_for_proxy(proxy);
         let phase1 = crate::profile_pool_sync!(Phase1, {
             self.with_pool_key(proxy, svid_generation, |key_buf| -> GrpcPhase1 {
@@ -1695,6 +1597,7 @@ impl GrpcConnectionPool {
         let acquired = crate::profile_pool_future!(FallbackPoll, {
             self.pool.create_or_get_existing_owned_with_recovery(
                 selected_key,
+                drain_epoch,
                 purpose.pool_caller(),
                 |attempt| note_grpc_establishment_join(attempt, purpose),
                 |attempt| note_grpc_establishment_waiter_failure(attempt, purpose),
@@ -2172,14 +2075,24 @@ const PEER_MAX_STREAMS_EAGER_POLLS: u32 = 32;
 /// per this many polls. A power of two.
 const PEER_MAX_STREAMS_SAMPLE_INTERVAL: u32 = 64;
 
+/// How often the driver samples again while the backend allows no streams.
+///
+/// Both pools skip a connection whose published limit is 0, so no request
+/// reaches its driver, and hyper polls the driver only when one does (the
+/// backend's SETTINGS wake hyper's separate I/O task, not this future).
+/// Without this timer a backend that raises its limit again would stay
+/// skipped for as long as the connection lives. Armed only while the
+/// published limit is 0.
+const PEER_MAX_STREAMS_ZERO_RESAMPLE: Duration = Duration::from_millis(100);
+
 /// Whether driver poll number `poll` (counting from 1) samples the backend's
 /// stream limit.
 fn samples_peer_max_streams(poll: u32) -> bool {
     poll <= PEER_MAX_STREAMS_EAGER_POLLS || (poll & (PEER_MAX_STREAMS_SAMPLE_INTERVAL - 1)) == 0
 }
 
-/// Drive a pooled gRPC backend connection to completion, publishing the
-/// backend's current `SETTINGS_MAX_CONCURRENT_STREAMS`.
+/// Drive a pooled gRPC or direct HTTP/2 backend connection to completion,
+/// publishing the backend's current `SETTINGS_MAX_CONCURRENT_STREAMS`.
 ///
 /// hyper exposes the value only on the `Connection`, never on the
 /// `SendRequest` the pool hands out, and h2 applies the peer's SETTINGS only
@@ -2197,7 +2110,13 @@ fn samples_peer_max_streams(poll: u32) -> bool {
 /// out once its handshake completes, before the backend's SETTINGS arrive, so
 /// a burst on a fresh TLS connection can exhaust the eager window on the
 /// pre-SETTINGS default. The store is skipped while the value is unchanged.
-async fn drive_sampling_peer_max_streams<C>(
+///
+/// hyper polls this future when a request reaches the connection, so the
+/// polls above are request-driven. A connection published at a limit of 0 is
+/// skipped by its pool and gets no request, so while the published limit is
+/// 0 the driver also samples every [`PEER_MAX_STREAMS_ZERO_RESAMPLE`] on a
+/// timer of its own, and a backend that raises its limit is used again.
+pub(crate) async fn drive_sampling_peer_max_streams<C>(
     conn: &mut C,
     current_max_send_streams: impl Fn(&C) -> usize,
     peer_max_streams: &AtomicUsize,
@@ -2205,14 +2124,52 @@ async fn drive_sampling_peer_max_streams<C>(
 where
     C: std::future::Future<Output = hyper::Result<()>> + Unpin,
 {
+    drive_sampling_peer_max_streams_with(conn, current_max_send_streams, peer_max_streams, || {
+        Box::pin(tokio::time::sleep(PEER_MAX_STREAMS_ZERO_RESAMPLE))
+    })
+    .await
+}
+
+/// [`drive_sampling_peer_max_streams`] with each zero-limit re-sample timer
+/// supplied by the caller, so a test can hand it one that has already
+/// expired.
+async fn drive_sampling_peer_max_streams_with<C>(
+    conn: &mut C,
+    current_max_send_streams: impl Fn(&C) -> usize,
+    peer_max_streams: &AtomicUsize,
+    mut zero_resample_timer: impl FnMut() -> Pin<Box<tokio::time::Sleep>>,
+) -> hyper::Result<()>
+where
+    C: std::future::Future<Output = hyper::Result<()>> + Unpin,
+{
     let mut polls: u32 = 0;
+    // `Some` only while the published limit is 0.
+    let mut zero_resample: Option<Pin<Box<tokio::time::Sleep>>> = None;
     std::future::poll_fn(|cx| {
         let polled = std::future::Future::poll(Pin::new(&mut *conn), cx);
         polls = polls.wrapping_add(1);
-        if samples_peer_max_streams(polls) {
+        // Polling the timer also keeps this task registered for its expiry.
+        let resample_due = match zero_resample.as_mut() {
+            Some(timer) => std::future::Future::poll(timer.as_mut(), cx).is_ready(),
+            None => false,
+        };
+        if resample_due || samples_peer_max_streams(polls) {
             let current = current_max_send_streams(&*conn);
             if peer_max_streams.load(Ordering::Relaxed) != current {
                 peer_max_streams.store(current, Ordering::Relaxed);
+            }
+            if current != 0 || polled.is_ready() {
+                zero_resample = None;
+            } else if resample_due || zero_resample.is_none() {
+                let mut timer = zero_resample_timer();
+                // The first poll registers this task for the timer's expiry.
+                // A timer that has already expired (this thread was held up
+                // between creating and polling it) registers nothing, so ask
+                // for another poll: it finds the timer ready and samples.
+                if std::future::Future::poll(timer.as_mut(), cx).is_ready() {
+                    cx.waker().wake_by_ref();
+                }
+                zero_resample = Some(timer);
             }
         }
         polled
@@ -7226,6 +7183,82 @@ mod tests {
         AuthMode, BackendScheme, BackendTlsConfig, DispatchKind, ResponseBodyMode,
     };
     use chrono::Utc;
+
+    /// A zero-limit re-sample timer that has already expired when it is first
+    /// polled registers no wake-up. The driver must then ask for another poll
+    /// itself, or it never samples again: the connection here never wakes its
+    /// task, as an idle hyper connection does not. Inline because the timer
+    /// hook is private.
+    #[tokio::test]
+    async fn zero_limit_resample_survives_a_timer_already_expired_at_its_first_poll() {
+        struct IdleConnection {
+            limit: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        }
+        impl std::future::Future for IdleConnection {
+            type Output = hyper::Result<()>;
+            fn poll(
+                self: std::pin::Pin<&mut Self>,
+                _cx: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<Self::Output> {
+                std::task::Poll::Pending
+            }
+        }
+
+        // A timer created now and first polled a second later has already
+        // expired at its first poll. `probe` checks that premise; `stale` is
+        // the first timer the driver gets. Every later one is an ordinary
+        // pending timer, so the driver does not spin.
+        tokio::time::pause();
+        let probe = Box::pin(tokio::time::sleep(std::time::Duration::from_millis(1)));
+        let mut stale = Some(Box::pin(tokio::time::sleep(
+            std::time::Duration::from_millis(1),
+        )));
+        tokio::time::advance(std::time::Duration::from_secs(1)).await;
+        assert!(
+            futures_util::FutureExt::now_or_never(probe).is_some(),
+            "a timer created before the clock advanced is ready at its first poll"
+        );
+
+        let limit = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let published = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(usize::MAX));
+        let driver_limit = std::sync::Arc::clone(&limit);
+        let driver_published = std::sync::Arc::clone(&published);
+        let driver = tokio::spawn(async move {
+            let mut conn = IdleConnection {
+                limit: driver_limit,
+            };
+            let _ = drive_sampling_peer_max_streams_with(
+                &mut conn,
+                |conn| conn.limit.load(std::sync::atomic::Ordering::Relaxed),
+                &driver_published,
+                move || match stale.take() {
+                    Some(timer) => timer,
+                    None => Box::pin(tokio::time::sleep(std::time::Duration::from_secs(3600))),
+                },
+            )
+            .await;
+        });
+
+        // The driver's first poll publishes the limit and is handed the
+        // expired timer. Only the wake-up it then asks for gets it polled
+        // again, to arm a timer that can actually fire.
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(published.load(std::sync::atomic::Ordering::Relaxed), 0);
+
+        // The limit rises. No request and no wake-up from the connection
+        // arrives: the paused clock runs on to the driver's next timer, if
+        // the driver armed one.
+        limit.store(7, std::sync::atomic::Ordering::Relaxed);
+        tokio::time::sleep(std::time::Duration::from_secs(7200)).await;
+        assert_eq!(
+            published.load(std::sync::atomic::Ordering::Relaxed),
+            7,
+            "an already-expired timer must still lead to another sample"
+        );
+        driver.abort();
+    }
 
     #[test]
     fn terminal_grpc_status_prefers_trailers_and_preserves_ok() {
