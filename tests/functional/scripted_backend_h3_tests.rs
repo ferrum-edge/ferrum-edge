@@ -717,7 +717,9 @@ async fn wait_for_capability_entry(
 /// an HTTPS target's HTTP/2 verdict as soon as that probe answers, with
 /// `plain_http.h3` still `unknown`, and merges the HTTP/3 verdict when its
 /// probe finishes. At the deadline this returns whatever entry is published
-/// (or `None`), so the caller's `h3` assertion reports the state it found.
+/// (or `None`) instead of failing here, so that the caller's `h3` assertion
+/// reports the state it found. Every caller must therefore assert
+/// `plain_http.h3` on the result; none may discard it.
 async fn wait_for_h3_supported_entry(
     harness: &GatewayHarness,
     timeout: Duration,
@@ -2059,9 +2061,15 @@ async fn h3_native_pool_synthesizes_host_from_upstream_target_not_proxy_backend_
 
     // Wait for capability classification — gateway must see h3=supported
     // before it'll route via the native H3 pool.
-    let _ = wait_for_h3_supported_entry(&harness, Duration::from_secs(15))
+    let entry = wait_for_h3_supported_entry(&harness, Duration::from_secs(15))
         .await
-        .expect("registry populated");
+        .expect("fetch capability entry")
+        .expect("registry populated within timeout");
+    assert_eq!(
+        entry["plain_http"]["h3"].as_str(),
+        Some("supported"),
+        "expected h3=supported so the request uses the native H3 backend path; entry: {entry:#?}"
+    );
 
     // H3 client sends only `:authority` (no explicit Host). Mimics curl,
     // Chromium, Firefox, reqwest defaults.
