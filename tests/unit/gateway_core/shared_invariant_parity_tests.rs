@@ -4572,6 +4572,40 @@ fn every_functional_gateway_spawner_launches_the_harness_selected_binary() {
     assert!(path.contains("locate_binary(false)"));
 }
 
+// The feature-gated suites (`secrets_functional`, `service_integration`) are
+// outside that harness rule on purpose: they spawn the gateway Cargo built
+// with THEIR features, through the compile-time `CARGO_BIN_EXE_ferrum-edge`.
+// The secrets startup smoke used a third spelling, walking up from its own
+// executable to a sibling `ferrum-edge`. That depends on Cargo's target
+// directory layout: Cargo 1.100 moved test executables out of
+// `target/<profile>/deps/`, the walk found nothing, and all four smokes failed
+// on `main` as "binary not found". Nothing in either suite re-executes itself,
+// so any read of the test executable's path there is that spelling again.
+
+const FEATURE_SUITE_SOURCES: [&str; 2] = ["tests/secrets_functional", "tests/service_integration"];
+const SECRETS_STARTUP_SMOKE: &str = "tests/secrets_functional/startup_smoke.rs";
+
+#[test]
+fn feature_suite_gateway_spawners_use_the_binary_cargo_built_for_them() {
+    let offenders: Vec<String> = rust_sources_under(&FEATURE_SUITE_SOURCES)
+        .into_iter()
+        .filter(|(_, text)| text.contains("current_exe("))
+        .map(|(path, _)| path)
+        .collect();
+    assert!(
+        offenders.is_empty(),
+        "resolve the gateway with env!(\"CARGO_BIN_EXE_ferrum-edge\"), not from the test \
+         executable's own location, which follows Cargo's target layout: {offenders:#?}"
+    );
+
+    let smoke = source(SECRETS_STARTUP_SMOKE);
+    let locate = item_body(&smoke, "fn locate_binary()", "\n}\n");
+    assert!(
+        locate.contains("env!(\"CARGO_BIN_EXE_ferrum-edge\")"),
+        "the secrets startup smoke must spawn the binary Cargo built with its features"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Thread-local tracing captures register the process-wide interest floor
 // ---------------------------------------------------------------------------
