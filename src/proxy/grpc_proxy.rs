@@ -2124,6 +2124,24 @@ pub(crate) async fn drive_sampling_peer_max_streams<C>(
 where
     C: std::future::Future<Output = hyper::Result<()>> + Unpin,
 {
+    drive_sampling_peer_max_streams_until(conn, current_max_send_streams, peer_max_streams, || {
+        tokio::time::Instant::now() + PEER_MAX_STREAMS_ZERO_RESAMPLE
+    })
+    .await
+}
+
+/// [`drive_sampling_peer_max_streams`] with the deadline of each zero-limit
+/// re-sample supplied by the caller, so a test can hand it one that has
+/// already passed.
+async fn drive_sampling_peer_max_streams_until<C>(
+    conn: &mut C,
+    current_max_send_streams: impl Fn(&C) -> usize,
+    peer_max_streams: &AtomicUsize,
+    next_zero_resample: impl Fn() -> tokio::time::Instant,
+) -> hyper::Result<()>
+where
+    C: std::future::Future<Output = hyper::Result<()>> + Unpin,
+{
     let mut polls: u32 = 0;
     // `Some` only while the published limit is 0.
     let mut zero_resample: Option<Pin<Box<tokio::time::Sleep>>> = None;
@@ -2143,9 +2161,14 @@ where
             if current != 0 || polled.is_ready() {
                 zero_resample = None;
             } else if resample_due || zero_resample.is_none() {
-                let mut timer = Box::pin(tokio::time::sleep(PEER_MAX_STREAMS_ZERO_RESAMPLE));
-                // A fresh timer is pending: this poll registers the wake-up.
-                let _ = std::future::Future::poll(timer.as_mut(), cx);
+                let mut timer = Box::pin(tokio::time::sleep_until(next_zero_resample()));
+                // The first poll registers this task for the timer's expiry.
+                // A timer that has already expired (this thread was held up
+                // between creating and polling it) registers nothing, so ask
+                // for another poll: it finds the timer ready and samples.
+                if std::future::Future::poll(timer.as_mut(), cx).is_ready() {
+                    cx.waker().wake_by_ref();
+                }
                 zero_resample = Some(timer);
             }
         }
@@ -7160,6 +7183,66 @@ mod tests {
         AuthMode, BackendScheme, BackendTlsConfig, DispatchKind, ResponseBodyMode,
     };
     use chrono::Utc;
+
+    /// A zero-limit re-sample timer that has already expired when it is first
+    /// polled registers no wake-up. The driver must then ask for another poll
+    /// itself, or it never samples again: the connection here never wakes its
+    /// task, as an idle hyper connection does not. Inline because the deadline
+    /// hook is private.
+    #[tokio::test]
+    async fn zero_limit_resample_survives_a_timer_already_expired_at_its_first_poll() {
+        struct IdleConnection {
+            limit: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        }
+        impl std::future::Future for IdleConnection {
+            type Output = hyper::Result<()>;
+            fn poll(
+                self: std::pin::Pin<&mut Self>,
+                _cx: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<Self::Output> {
+                std::task::Poll::Pending
+            }
+        }
+
+        tokio::time::pause();
+        let expired = tokio::time::Instant::now();
+        tokio::time::advance(std::time::Duration::from_secs(1)).await;
+
+        let limit = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let published = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(usize::MAX));
+        let driver_limit = std::sync::Arc::clone(&limit);
+        let driver_published = std::sync::Arc::clone(&published);
+        let driver = tokio::spawn(async move {
+            let mut conn = IdleConnection {
+                limit: driver_limit,
+            };
+            let _ = drive_sampling_peer_max_streams_until(
+                &mut conn,
+                |conn| conn.limit.load(std::sync::atomic::Ordering::Relaxed),
+                &driver_published,
+                || expired,
+            )
+            .await;
+        });
+
+        // Run the driver past its eager sampling window, so only the
+        // re-sample timer can make it sample again.
+        for _ in 0..(PEER_MAX_STREAMS_EAGER_POLLS * 2) {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(published.load(std::sync::atomic::Ordering::Relaxed), 0);
+
+        limit.store(7, std::sync::atomic::Ordering::Relaxed);
+        for _ in 0..(PEER_MAX_STREAMS_SAMPLE_INTERVAL / 2) {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            published.load(std::sync::atomic::Ordering::Relaxed),
+            7,
+            "an already-expired timer must still lead to another sample"
+        );
+        driver.abort();
+    }
 
     #[test]
     fn terminal_grpc_status_prefers_trailers_and_preserves_ok() {
