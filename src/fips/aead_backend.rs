@@ -61,8 +61,11 @@
 //! from [`super::base_crypto_provider`]. Resolving the selection in that same
 //! step gives the process one provider for its whole life. A request that
 //! appears only in the settings file therefore arrives too late, exactly as a
-//! FIPS request does, and [`verify_resolved_request`] refuses it with an
-//! explicit message instead of running a mixed or silently ignored selection.
+//! FIPS request does. When it asks for something other than what bootstrap
+//! selected, [`verify_resolved_request`] refuses it with an explicit message
+//! instead of running a mixed or silently ignored selection; when it asks for
+//! the same thing (`auto`, with nothing in the environment) there is nothing
+//! to refuse.
 
 use std::sync::OnceLock;
 

@@ -2186,8 +2186,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   **Operator action:** none. The choice is logged once at startup at
   INFO with its reason; `FERRUM_TLS_AEAD_BACKEND=ring` restores the previous
   behaviour everywhere. Set it in the environment: like `FERRUM_FIPS_MODE` it
-  is acted on before `ferrum.conf` is read, and a value set only there is
-  refused at startup. The FIPS build is unchanged (every suite already comes
+  is acted on before `ferrum.conf` is read, and `ring` or `aws-lc` set only
+  there is refused at startup (`auto` there asks for what already happened and
+  is accepted). The FIPS build is unchanged (every suite already comes
   from the AWS-LC FIPS module; `ring` is refused there). The feature policy now
   allows exactly one AWS-LC edge, `rustls/aws_lc_rs`, in the ordinary profile
   and still refuses any `ring` arm in the FIPS profile. See

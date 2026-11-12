@@ -8288,8 +8288,9 @@ impl EnvConfig {
         // Same two steps as the FIPS request above, for the same reason: the
         // backend is fixed when the provider is installed, before `ferrum.conf`
         // is readable. A malformed value is a configuration error; a value
-        // this build cannot honour (`ring` on the FIPS profile) or one that
-        // arrived after bootstrap is refused rather than ignored.
+        // this build cannot honour (`ring` on the FIPS profile), or one that
+        // arrived after bootstrap and differs from what bootstrap selected,
+        // is refused rather than ignored.
         let tls_aead_backend =
             crate::fips::aead_backend::AeadBackendRequest::parse(&self.tls_aead_backend)?;
         crate::fips::aead_backend::verify_resolved_request(tls_aead_backend)?;

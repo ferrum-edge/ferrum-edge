@@ -1312,9 +1312,10 @@ fn run_ambient_udp_preflight(args: &cli::AmbientUdpPreflightArgs) -> i32 {
     }
 
     // The TLS record-layer backend is fixed in that same bootstrap step, so a
-    // request that arrives only through ferrum.conf or an external secret gets
-    // the same explicit refusal here as it does from `EnvConfig` on `run` and
-    // `validate`, rather than being ignored by this one-shot.
+    // request that arrives only through ferrum.conf or an external secret, and
+    // differs from what bootstrap selected, gets the same explicit refusal
+    // here as it does from `EnvConfig` on `run` and `validate`, rather than
+    // being ignored by this one-shot.
     let aead_raw = config::conf_file::resolve_ferrum_var(fips::aead_backend::TLS_AEAD_BACKEND_ENV)
         .unwrap_or_else(|| "auto".to_string());
     match fips::aead_backend::AeadBackendRequest::parse(&aead_raw)
