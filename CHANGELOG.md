@@ -597,8 +597,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 - **A pooled backend connection still being established when its pool is
   drained is no longer published after the drain.** A TLS material or CRL
-  reload, an SVID rotation and a config reload drain the reqwest, direct
-  HTTP/2, gRPC and HTTP/3 pools, but a connection whose handshake was in
+  reload and an SVID rotation drain the reqwest, direct HTTP/2, gRPC and
+  HTTP/3 pools, but a connection whose handshake was in
   flight at that moment was cached when it completed, under the configuration
   it had started with, and later requests could reuse it. A create that had
   entered the pool before the drain, or a request that waited on one and

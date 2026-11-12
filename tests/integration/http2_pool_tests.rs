@@ -1332,6 +1332,8 @@ enum H2TlsBackendScript {
     /// Hold the TLS handshake of every connection, the first included, while
     /// the gate is closed.
     GateAll,
+    /// Every connection advertises this `SETTINGS_MAX_CONCURRENT_STREAMS`.
+    AllowStreams(u32),
 }
 
 /// Handles to a scripted backend's live connections, oldest first. Aborting
@@ -1407,8 +1409,14 @@ async fn start_scripted_h2_tls_backend_with_connections(
                     Ok::<_, hyper::Error>(Response::new(Full::new(Bytes::from_static(b"ok"))))
                 });
                 let mut builder = hyper::server::conn::http2::Builder::new(TokioExecutor::new());
-                if first && matches!(script, H2TlsBackendScript::FirstAllowsNoStreams) {
-                    builder.max_concurrent_streams(0);
+                match script {
+                    H2TlsBackendScript::FirstAllowsNoStreams if first => {
+                        builder.max_concurrent_streams(0);
+                    }
+                    H2TlsBackendScript::AllowStreams(max_streams) => {
+                        builder.max_concurrent_streams(max_streams);
+                    }
+                    _ => {}
                 }
                 let _ = builder
                     .serve_connection(TokioIo::new(tls_stream), service)
@@ -1796,6 +1804,104 @@ async fn test_http2_pool_drain_is_remembered_by_a_waiter_that_dials_after_it() {
     pool.get_sender(&proxy).await.expect("fresh sender");
     assert_eq!(accepted.load(Ordering::Relaxed), 3);
     assert_eq!(pool.pool_size(), 1);
+}
+
+#[tokio::test]
+async fn test_http2_pool_selective_drain_also_fences_a_create_in_flight() {
+    let (port, accepted, gate) = start_scripted_h2_tls_backend(H2TlsBackendScript::GateLater).await;
+    let pool = direct_h2_pool(2);
+    let mut proxy = direct_h2_proxy(port);
+    proxy.backend_connect_timeout_ms = 30_000;
+    pool.get_sender(&proxy).await.expect("warm shard");
+
+    gate.send_replace(true);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while pool.shard_fills_in_flight() == 0 {
+            pool.get_sender(&proxy).await.expect("borrowed sender");
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("a background create started");
+    wait_for_affinity_accepts(&accepted, 2).await;
+
+    // An SVID rotation drains by generation. No pooled key carries this one,
+    // so the warm shard stays, but the create in flight is fenced all the
+    // same: a selective drain does not try to tell which creates it concerns.
+    pool.force_drain_svid_generation(7);
+    assert_eq!(pool.pool_size(), 1);
+    gate.send_replace(false);
+    wait_for_direct_h2_fills_to_finish(&pool).await;
+    assert_eq!(
+        pool.pool_size(),
+        1,
+        "a create in flight at a selective drain is not published"
+    );
+    assert_eq!(accepted.load(Ordering::Relaxed), 2);
+
+    // Later requests start the shard's create again, and that one is kept.
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while pool.pool_size() < 2 {
+            pool.get_sender(&proxy).await.expect("request sender");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the shard was created after the drain");
+    wait_for_direct_h2_fills_to_finish(&pool).await;
+    assert_eq!(accepted.load(Ordering::Relaxed), 3);
+}
+
+#[tokio::test]
+async fn test_http2_pool_affinity_respects_the_backend_stream_limit() {
+    use ferrum_edge::proxy::frontend_affinity::FrontendConnectionAffinity;
+    const PEER_MAX: usize = 4;
+
+    let (port, accepted, _gate) =
+        start_scripted_h2_tls_backend(H2TlsBackendScript::AllowStreams(PEER_MAX as u32)).await;
+    let pool = direct_h2_pool(4);
+    let proxy = direct_h2_proxy(port);
+    let connection = FrontendConnectionAffinity::with_table(&affinity_slot_table());
+    let mut streams: Vec<_> = (0..PEER_MAX).map(|_| connection.open_stream()).collect();
+    let sender = streams[0]
+        .run(pool.get_sender(&proxy))
+        .await
+        .expect("affinity sender");
+    // The driver publishes the backend's limit once h2 applies its SETTINGS.
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while sender.peer_max_concurrent_streams() != PEER_MAX {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("backend SETTINGS_MAX_CONCURRENT_STREAMS sampled");
+
+    // At the backend's limit the connection still keeps its own shard.
+    for _ in 0..8 {
+        streams[0]
+            .run(pool.get_sender(&proxy))
+            .await
+            .expect("pinned sender");
+    }
+    assert_eq!(accepted.load(Ordering::Relaxed), 1);
+    assert_eq!(pool.shard_fills_in_flight(), 0);
+
+    // One stream more than the backend allows on one connection: requests
+    // spill round-robin (well under the fixed bound of 32) and widen the pool.
+    streams.push(connection.open_stream());
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while pool.pool_size() < 4 {
+            streams[0]
+                .run(pool.get_sender(&proxy))
+                .await
+                .expect("spilled sender");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("spilled requests widened the pool");
+    wait_for_direct_h2_fills_to_finish(&pool).await;
+    assert_eq!(accepted.load(Ordering::Relaxed), 4);
 }
 
 #[tokio::test]
