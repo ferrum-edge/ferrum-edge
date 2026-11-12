@@ -1509,36 +1509,62 @@ been measured, so it keeps `ring` too, as does any other CPU that is not on the
 list.
 
 The allow-list is the CPUs with hosted measurements behind them (AMD Zen 4 and
-Zen 5, Intel Emerald Rapids; see the table below) plus the rest of the Intel
-server line from Sapphire Rapids on: Sapphire Rapids itself, which shares
-Emerald Rapids' core design, and Granite Rapids. Those two are admitted by that
-relationship, not by a measurement of their own. If one of them turns out not to
-benefit, `FERRUM_TLS_AEAD_BACKEND=ring` restores the previous behaviour.
+Zen 5, Intel Emerald Rapids and Granite Rapids; see the table below) plus two
+close relatives that have none of their own: Sapphire Rapids, which shares
+Emerald Rapids' core design, and Granite Rapids-D, which uses Granite Rapids'
+cores. If one of those two turns out not to benefit,
+`FERRUM_TLS_AEAD_BACKEND=ring` restores the previous behaviour.
 
-**Where it helps and where it does not.** Hosted benchmark, TLS on both legs,
-same binary and same runner per row, gateway CPU per request with AWS-LC
-relative to `ring`:
+**Where it helps and where it does not.** Hosted benchmark, TLS on both legs.
+Each row is one job that ran the same binary on one runner with `ring` forced
+and with `aws-lc` forced. The figures are AWS-LC relative to `ring`: gateway CPU
+per request at 10 KiB / 70 KiB / 1 MiB, and the throughput range over all five
+payload sizes (10 KiB to 5 MiB). In the rows where `auto` keeps `ring`, they are
+what forcing `aws-lc` would cost.
 
-| Runner CPU | `auto` | 10 KiB | 70 KiB | 1 MiB |
-|------------|--------|--------|--------|-------|
-| AMD EPYC 9V45 (Zen 5), TCP+TLS | AWS-LC | −9% | −11% | −12% |
-| AMD EPYC 9V45 (Zen 5), HTTP/2 | AWS-LC | −1% | −10% | −12% |
-| AMD EPYC 9V74 (Zen 4), HTTP/2 | AWS-LC | −1% | −5% | −6% |
-| AMD EPYC 9V74 (Zen 4), HTTP/1.1 over TLS | AWS-LC | +1% | −3% | −7% |
-| Intel Xeon 8573C (Emerald Rapids), TCP+TLS | AWS-LC | −3% | −3% | −6% |
-| Intel Xeon 8370C (Ice Lake), TCP+TLS | `ring` | +4% | −6% | −4% |
-| AMD EPYC 7763 (Zen 3, no AVX-512) | `ring` | +6–8% | +14–19% | +23–36% |
+| Runner CPU | `auto` | Protocol | CPU per request | Throughput |
+|------------|--------|----------|-----------------|------------|
+| AMD EPYC 9V45 (Zen 5) | AWS-LC | TCP+TLS | −10% / −13% / −16% | +7% to +13% |
+| AMD EPYC 9V45 (Zen 5) | AWS-LC | HTTP/2 | −5% / −7% / −7% | 0% to +8% |
+| AMD EPYC 9V45 (Zen 5) | AWS-LC | gRPC (two jobs) | −2% / −6% / −9% | +1% to +6% |
+| AMD EPYC 9V74 (Zen 4) | AWS-LC | gRPC | +1% / −3% / −6% | 0% to +3% |
+| AMD EPYC 9V74 (Zen 4) | AWS-LC | HTTP/3 | +2% / +2% / −3% | −1% to +4% |
+| Intel Xeon 6975P-C (Granite Rapids) | AWS-LC | TCP+TLS | −4% / −6% / −8% | +2% to +7% |
+| Intel Xeon 8573C (Emerald Rapids) | AWS-LC | HTTP/1.1 over TLS | −1% / −4% / −7% | +2% to +6% |
+| Intel Xeon 8573C (Emerald Rapids) | AWS-LC | HTTP/2 | +1% / −1% / −4% | −1% to +4% |
+| AMD EPYC 9V74, AVX-512 hidden from the VM | `ring` | HTTP/3 | +9% / +12% / +14% | −8% to −6% |
+| AMD EPYC 7763 (Zen 3, no AVX-512) | `ring` | TCP+TLS | +17% / +28% / +33% | −14% to +1% |
+| AMD EPYC 7763 (Zen 3, no AVX-512) | `ring` | HTTP/1.1 over TLS (two jobs) | +8% / +18% / +34% | −17% to +2% |
+| AMD EPYC 7763 (Zen 3, no AVX-512) | `ring` | HTTP/2 | +11% / +19% / +28% | −13% to −1% |
+| AMD EPYC 7763 (Zen 3, no AVX-512) | `ring` | HTTP/3 | +9% / +16% / +17% | −12% to −5% |
+| Intel Xeon 8370C (Ice Lake) | `ring` | TCP+TLS (earlier run) | +4% / −6% / −4% | −5% to +5% |
 
-- It helps bulk transfer on AVX-512 AMD CPUs most: on Zen 5, 9–12% less gateway
-  CPU per request and 6–10% more throughput for TCP+TLS and HTTP/2. The gain is
-  smaller on Zen 4 and on Intel Sapphire Rapids-class CPUs.
-- It does little for small responses. At 10 KiB the HTTP results are within the
-  benchmark's run-to-run noise on every CPU, because the handshake, framing and
-  syscalls dominate and those do not move.
+Every job also ran a third arm with `auto`. It selected the backend shown and
+tracked the faster of the two forced arms. Two arms running the same code
+differed by up to about 5% in single cells of these runs (7% in one), so a
+smaller difference in the table is not evidence either way.
+
+- It helps bulk transfer most on Zen 5: 10–16% less gateway CPU per request and
+  7–13% more throughput for TCP+TLS, and 6–11% less CPU for HTTP/2 and gRPC from
+  70 KiB up. The gain is smaller on Zen 4 (3–7% for gRPC from 70 KiB up),
+  Emerald Rapids (4–9% for HTTP/1.1 over TLS, up to 4% for HTTP/2) and Granite
+  Rapids (4–9% for TCP+TLS).
+- It does little for small responses. At 10 KiB the HTTP and gRPC results are
+  within noise everywhere except Zen 5, where HTTP/2 used about 5% less CPU,
+  because the handshake, framing and syscalls dominate and those do not move.
+- It does nothing for HTTP/3. QUIC packets are about 1.2 KB, too small for the
+  512-bit path to matter, and the Zen 4 result is within noise. HTTP/3 follows
+  the same selection anyway, so a process has one implementation, not two.
 - On Ice Lake the CPU saving did not turn into throughput (it fell at two of the
   three sizes), so `auto` keeps `ring` there.
-- On a CPU without AVX-512 AWS-LC is slower at every size, which is the case
-  `auto` exists to avoid and the reason `aws-lc` logs a warning there.
+- Without AVX-512 AWS-LC is slower at every size: 8–40% more gateway CPU per
+  request and up to 17% less throughput on Zen 3. That is the case `auto` exists
+  to avoid and the reason `aws-lc` logs a warning there.
+- The CPU model is not enough on its own. One runner reported an EPYC 9V74 with
+  the AVX-512 features absent, because the VM did not expose them, and AWS-LC
+  cost 9–14% more CPU per request there. `auto` reads the features the process
+  can actually use, so it kept `ring` on that machine and chose AWS-LC on the
+  other 9V74s.
 - Nothing changes on non-x86-64 targets, on Windows or on macOS.
 
 The selection is made once, when the crypto provider is installed, and cannot

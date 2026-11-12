@@ -2168,14 +2168,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   packet keys); key exchange, signature verification and the key provider stay
   on `ring`, and the suites offered and negotiated are the same.
   On the hosted protocol benchmark (same binary and runner per comparison, TLS
-  on both legs) gateway CPU per request fell 9–12% for TCP+TLS and 10–12% for
-  HTTP/2 from 70 KiB up on an EPYC 9V45 (Zen 5), with 6–10% more throughput;
-  5–7% at 70 KiB to 1 MiB on an EPYC 9V74 (Zen 4); and 3–6% on a Xeon 8573C
-  (Emerald Rapids). **Where it does not help:** 10 KiB HTTP responses are
-  within run-to-run noise on every CPU; an Ice Lake Xeon 8370C showed no net
-  gain; and on an EPYC 7763 (Zen 3, no AVX-512) AWS-LC cost 6–36% more CPU,
-  which is why `auto` keeps `ring` there. Non-x86-64 targets, Windows and macOS
-  are unchanged. **Operator action:** none. The choice is logged once at startup at
+  on both legs) gateway CPU per request fell 10–16% for TCP+TLS, with 7–13%
+  more throughput, and 6–11% for HTTP/2 and gRPC from 70 KiB up on an EPYC 9V45
+  (Zen 5); 3–7% for gRPC from 70 KiB up on an EPYC 9V74 (Zen 4); 4–9% for
+  HTTP/1.1 over TLS from 70 KiB up on a Xeon 8573C (Emerald Rapids); and 4–9%
+  for TCP+TLS on a Xeon 6975P-C (Granite Rapids). **Where it does not help:**
+  10 KiB HTTP and gRPC responses are within run-to-run noise on every CPU but
+  Zen 5;
+  HTTP/3 is unchanged, because QUIC packets are too small for the 512-bit path
+  to matter; an Ice Lake Xeon 8370C showed no net gain; and without AVX-512 (an
+  EPYC 7763, or a VM that hides the features of a newer CPU) AWS-LC cost 8–40%
+  more CPU per request and up to 17% of throughput, which is why `auto` keeps
+  `ring` there. Non-x86-64 targets, Windows and macOS are unchanged.
+  **Operator action:** none. The choice is logged once at startup at
   INFO with its reason; `FERRUM_TLS_AEAD_BACKEND=ring` restores the previous
   behaviour everywhere. Set it in the environment: like `FERRUM_FIPS_MODE` it
   is acted on before `ferrum.conf` is read, and a value set only there is

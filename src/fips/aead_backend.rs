@@ -39,9 +39,9 @@
 //! because of downclocking, allowing them again from Sapphire Rapids. Rocket
 //! Lake has the features too and has not been measured. All three keep `ring`,
 //! and so does any CPU that is not listed. The list holds the CPUs that were
-//! measured (AMD Zen 4 and Zen 5, Intel Emerald Rapids) and the rest of the
-//! Intel server line from Sapphire Rapids on; anything outside it stays on
-//! `ring` until it has been measured.
+//! measured (AMD Zen 4 and Zen 5, Intel Emerald Rapids and Granite Rapids) and
+//! two close relatives, Sapphire Rapids and Granite Rapids-D; anything outside
+//! it stays on `ring` until it has been measured.
 //!
 //! The gate mirrors what AWS-LC can observe at run time. Two things it cannot
 //! mirror are an `OPENSSL_ia32cap` environment override, which masks CPU
@@ -367,10 +367,11 @@ pub const INTEL_FAMILY_6: u32 = 0x6;
 /// Intel family-6 models admitted by `auto`: Sapphire Rapids (`0x8F`), Emerald
 /// Rapids (`0xCF`), Granite Rapids (`0xAD`), and Granite Rapids-D (`0xAE`).
 ///
-/// Emerald Rapids is the measured entry. The others are admitted as the same
-/// server line from Sapphire Rapids on, which is also where BoringSSL stops
-/// avoiding 512-bit registers; `docs/frontend_tls.md` records which entries
-/// have hosted measurements behind them.
+/// Emerald Rapids and Granite Rapids are the measured entries. Sapphire Rapids
+/// shares Emerald Rapids' core design and Granite Rapids-D uses Granite Rapids'
+/// cores; both are admitted on that relationship, and Sapphire Rapids is also
+/// where BoringSSL stops avoiding 512-bit registers. `docs/frontend_tls.md`
+/// records the hosted measurements.
 pub const INTEL_QUALIFIED_MODELS: &[u32] = &[0x8f, 0xcf, 0xad, 0xae];
 
 /// Intel family-6 models older than Sapphire Rapids that report the full
