@@ -6,8 +6,11 @@
 //! A hostname whose answering record type is already known stays sequential.
 //!
 //! The fixture is a UDP DNS server that can hold or delay SRV replies, hold,
-//! fail or rotate A replies, and answer AAAA. Exact query counts use absolute
-//! names (trailing dot), so search-list and `ndots` settings cannot skew them.
+//! fail or rotate A replies, and optionally answer AAAA. Exact query counts use
+//! absolute names (trailing dot), so search-list and `ndots` settings cannot
+//! skew them. AAAA is off by default: `lookup_ip` (SRV targets, `CNAME`) lists
+//! AAAA before A under hickory's default `Ipv6AndIpv4` strategy, so an AAAA
+//! answer would replace the IPv4 address a test asserts on.
 
 use crate::scaffolding::port_registry::TestSocket;
 
@@ -25,7 +28,7 @@ use std::time::Duration;
 /// other A query answers `HOST_IP`, so the result shows which record type won.
 const SRV_TARGET_PREFIX: &str = "srv-target.";
 const HOST_IP: Ipv4Addr = Ipv4Addr::new(127, 0, 0, 1);
-/// Every AAAA query answers this.
+/// Every AAAA query answers this when `Behavior::answer_aaaa` is set.
 const HOST_IP6: Ipv6Addr = Ipv6Addr::LOCALHOST;
 const SRV_TARGET_IP: Ipv4Addr = Ipv4Addr::new(127, 0, 0, 2);
 /// Answered for the host's second and later A queries when
@@ -51,10 +54,13 @@ struct Behavior {
     srv_target: Option<&'static str>,
     /// Defer every SRV reply until the first A or AAAA query arrives.
     hold_srv_until_a: bool,
-    /// Send each held SRV reply this long after that first address query.
+    /// Send every SRV reply this long after both the SRV query and the first
+    /// address query have arrived, whichever order they arrive in.
     srv_delay_after_a: Option<Duration>,
-    /// When false, A and AAAA queries answer NOERROR with no records.
+    /// When false, A queries answer NOERROR with no records.
     answer_a: bool,
+    /// When false (the default), AAAA queries answer NOERROR with no records.
+    answer_aaaa: bool,
     /// Answer the host's second and later A queries with `ROTATED_HOST_IP`.
     rotate_host_a: bool,
     /// Answer the first A query for each host name NOERROR with no records
@@ -76,6 +82,7 @@ impl ColdMissDnsServer {
             hold_srv_until_a,
             srv_delay_after_a,
             answer_a,
+            answer_aaaa,
             rotate_host_a,
             negative_first_host_a,
             hold_host_a,
@@ -118,6 +125,20 @@ impl ColdMissDnsServer {
                             held.push((request, peer));
                             continue;
                         }
+                        // The address query already arrived (SRV and A go out
+                        // together, in either order): delay from now.
+                        if let Some(delay) = srv_delay_after_a {
+                            let reply =
+                                answer(request, srv_target.as_ref(), false, false, host_ip, ttl);
+                            if let Some(encoded) = reply {
+                                let socket = Arc::clone(&socket);
+                                tokio::spawn(async move {
+                                    tokio::time::sleep(delay).await;
+                                    let _ = socket.send_to(&encoded, peer).await;
+                                });
+                            }
+                            continue;
+                        }
                     }
                     RecordType::AAAA => address_seen = true,
                     RecordType::A => {
@@ -143,14 +164,27 @@ impl ColdMissDnsServer {
                     }
                     _ => {}
                 }
-                let reply = answer(request, srv_target.as_ref(), answer_addresses, host_ip, ttl);
+                let reply = answer(
+                    request,
+                    srv_target.as_ref(),
+                    answer_addresses,
+                    answer_aaaa,
+                    host_ip,
+                    ttl,
+                );
                 if let Some(encoded) = reply {
                     let _ = socket.send_to(&encoded, peer).await;
                 }
                 if address_seen {
                     for (held_request, held_peer) in held.drain(..) {
-                        let reply =
-                            answer(held_request, srv_target.as_ref(), answer_a, HOST_IP, ttl);
+                        let reply = answer(
+                            held_request,
+                            srv_target.as_ref(),
+                            answer_a,
+                            answer_aaaa,
+                            HOST_IP,
+                            ttl,
+                        );
                         let Some(encoded) = reply else {
                             continue;
                         };
@@ -219,6 +253,7 @@ fn answer(
     request: Message,
     srv_target: Option<&Name>,
     answer_a: bool,
+    answer_aaaa: bool,
     host_ip: Ipv4Addr,
     ttl: u32,
 ) -> Option<Vec<u8>> {
@@ -246,7 +281,7 @@ fn answer(
             };
             response.add_answer(Record::from_rdata(name, ttl, RData::A(ip.into())));
         }
-        RecordType::AAAA if answer_a => {
+        RecordType::AAAA if answer_aaaa => {
             let data = RData::AAAA(HOST_IP6.into());
             response.add_answer(Record::from_rdata(name, ttl, data));
         }
@@ -262,6 +297,7 @@ impl Default for Behavior {
             hold_srv_until_a: false,
             srv_delay_after_a: None,
             answer_a: true,
+            answer_aaaa: false,
             rotate_host_a: false,
             negative_first_host_a: false,
             hold_host_a: false,
@@ -393,6 +429,7 @@ async fn cold_miss_overlaps_srv_and_aaaa_when_aaaa_follows_srv() {
     // sent alongside SRV. The held SRV reply is released by the AAAA query.
     let dns = ColdMissDnsServer::spawn(Behavior {
         hold_srv_until_a: true,
+        answer_aaaa: true,
         ..Behavior::default()
     })
     .await;
