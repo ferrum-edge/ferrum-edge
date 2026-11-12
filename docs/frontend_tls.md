@@ -1589,10 +1589,11 @@ build its selection reads `not-bootstrapped` and its provider is ring's, and on
 a FIPS build it reads `fips-build` as it always does.
 
 Because the provider is installed before `ferrum.conf` is read, the variable
-must be set in the process environment. A value that appears only in
+must be set in the process environment. `ring` or `aws-lc` that appears only in
 `ferrum.conf`, or only through an external secret source, is refused at startup
 and by `ferrum-edge validate` with a message that says so; it is never silently
-ignored.
+ignored. `auto` there is accepted, because it asks for what the process already
+did.
 
 `ferrum-edge health` is the one command that does not read the variable. It
 exits before the provider is bootstrapped and builds its probe client on the
