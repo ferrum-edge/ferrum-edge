@@ -35188,11 +35188,62 @@ pub async fn handle_proxy_request(
 }
 
 /// Construct a bounded child future in a separate synchronous frame without
-/// allocating. The caller keeps the child inline, in the same task and task
-/// locals; dropping it still releases its existing cancellation guards.
+/// allocating, directly in `slot`: its final place in the caller's state. The
+/// caller keeps the child inline, in the same task and task locals. Dropping
+/// the returned future drops the child, cancelling it and releasing its
+/// existing cancellation guards, exactly as dropping the child itself would.
+///
+/// The child is written through `slot` instead of being returned by value on
+/// purpose. A factory that returns it hands the caller a stack temporary, and
+/// the caller then copies the whole state machine, not just the arguments it
+/// captured, into its own state: an 18 KiB copy per request for the backend
+/// attempt. Writing through `slot` stores only the captured arguments.
+///
+/// The caller declares the slot as `std::pin::pin!(None)` in a block that ends
+/// with the await, so the borrows the child holds end there too.
 #[inline(never)]
-fn construct_proxy_future<F: std::future::Future>(construct: impl FnOnce() -> F) -> F {
-    construct()
+fn construct_proxy_future_in<'slot, F>(
+    mut slot: std::pin::Pin<&'slot mut Option<F>>,
+    construct: impl FnOnce() -> F,
+) -> ProxyFutureInSlot<'slot, F>
+where
+    F: std::future::Future,
+{
+    slot.set(Some(construct()));
+    ProxyFutureInSlot { slot }
+}
+
+/// A child future polled in the caller-owned slot that
+/// [`construct_proxy_future_in`] filled. The slot holds the child only while
+/// this future is alive and the child has not returned.
+struct ProxyFutureInSlot<'slot, F> {
+    slot: std::pin::Pin<&'slot mut Option<F>>,
+}
+
+impl<F: std::future::Future> std::future::Future for ProxyFutureInSlot<'_, F> {
+    type Output = F::Output;
+
+    fn poll(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> Poll<F::Output> {
+        let Some(child) = self.slot.as_mut().as_pin_mut() else {
+            // The slot is emptied only below, when the child returned. Like a
+            // fused future, a poll after completion stays pending.
+            return Poll::Pending;
+        };
+        let output = std::task::ready!(child.poll(cx));
+        self.slot.set(None);
+        Poll::Ready(output)
+    }
+}
+
+impl<F> Drop for ProxyFutureInSlot<'_, F> {
+    fn drop(&mut self) {
+        // Cancel a child that has not returned where a by-value child would
+        // be dropped, whatever the scope of the slot itself.
+        self.slot.set(None);
+    }
 }
 
 /// Construct and box a concrete child future in a separate synchronous frame.
@@ -35209,9 +35260,17 @@ where
     Box::pin(construct())
 }
 
-/// Construct the bounded frontend future before the affinity task-local scopes.
-/// The larger routing handler remains boxed; its state and the concrete backend
-/// dispatch state have separate regression budgets.
+/// Construct and box the bounded frontend future before the affinity
+/// task-local scopes, so every layer above it holds a pointer.
+///
+/// The listener's service future stores this future, and so do the affinity
+/// scopes it passes through by value. Inline, each of them carried a copy of
+/// its ~2 KiB state, which made the per-request service future ~6.5 KiB; hyper
+/// and the runtime each copy that future once when they spawn an HTTP/2
+/// stream. Boxed, it is written once, in place, and the service future shrinks
+/// to its own captures. The larger routing handler remains boxed separately;
+/// its state and the concrete backend dispatch state have their own regression
+/// budgets.
 #[allow(clippy::too_many_arguments)]
 #[inline(never)]
 fn construct_frontend_proxy_request(
@@ -35224,7 +35283,7 @@ fn construct_frontend_proxy_request(
     mtls_auth_connection_cache: Option<Arc<crate::plugins::mtls_auth::MtlsAuthConnectionCache>>,
     connection_metadata: RequestConnectionMetadata,
 ) -> impl std::future::Future<Output = Result<Response<ProxyBody>, hyper::Error>> + Send {
-    handle_proxy_request_on_frontend_port(
+    Box::pin(handle_proxy_request_on_frontend_port(
         req,
         state,
         remote_addr,
@@ -35233,7 +35292,7 @@ fn construct_frontend_proxy_request(
         tls_client_cert_chain_der,
         mtls_auth_connection_cache,
         connection_metadata,
-    )
+    ))
 }
 
 /// Compiled coroutine sizes for external stack regressions. The type probes
@@ -35259,6 +35318,15 @@ pub mod request_stack_test_support {
         ) -> F,
     ) -> usize {
         std::mem::size_of::<F>()
+    }
+
+    /// A caller's future run the way the handler runs a bounded inline child:
+    /// constructed in `slot` and polled there.
+    pub fn child_in_slot<F: std::future::Future>(
+        slot: std::pin::Pin<&mut Option<F>>,
+        construct: impl FnOnce() -> F,
+    ) -> impl std::future::Future<Output = F::Output> {
+        construct_proxy_future_in(slot, construct)
     }
 
     /// Frontend boundary, concrete frontend, concrete routing handler, and
@@ -45003,48 +45071,53 @@ async fn handle_proxy_request_inner(
         // it over, and marks that handoff itself: an attempt refused before it
         // (backend admission) never reached the backend and is not exported.
         initial_attempt_span.handoff_reported_by_dispatch();
-        let initial_attempt = await_backend_attempt_route_deadline(
-            route_request_deadline,
-            RouteAttemptBudget::from_handoff(
-                route_attempt_timeout,
-                initial_attempt_handoff.marker(),
-                &mut route_attempt_deadline,
-            ),
-            initial_attempt_span.trace(),
-            construct_proxy_future(|| {
-                proxy_to_backend(
-                    &state,
-                    &proxy,
-                    &current_url,
-                    &method,
-                    initial_attempt_span
-                        .headers_view(ctx.request_headers_view(owned_proxy_headers_ref)),
-                    client_request_body,
-                    upstream_target.as_deref(),
-                    &plugins,
-                    backend_admission_plugins.as_ref(),
-                    std::mem::take(&mut preacquired_backend_admission),
-                    body_hook_ctx.as_mut(),
-                    &ctx,
-                    should_stream,
-                    requires_request_body_buffering,
-                    stream_request_body,
-                    has_retry,
-                    request_body_prepared,
-                    &request_client_ip,
-                    &request_xff_append_ip,
-                    ctx.request_is_secure,
-                    current_dispatch_hbone,
-                    current_dispatch_mesh_mtls,
-                    current_dispatch_h3,
-                    &bytes_sent_observed,
-                    inbound_version,
-                    &mut backend_admission_started_at,
-                    &initial_attempt_handoff,
-                )
-            }),
-        )
-        .await;
+        // The attempt is built in this slot of the handler's state, not copied
+        // into it; the block drops it where the deadline wrapper used to.
+        let initial_attempt = {
+            let mut attempt_slot = std::pin::pin!(None);
+            await_backend_attempt_route_deadline(
+                route_request_deadline,
+                RouteAttemptBudget::from_handoff(
+                    route_attempt_timeout,
+                    initial_attempt_handoff.marker(),
+                    &mut route_attempt_deadline,
+                ),
+                initial_attempt_span.trace(),
+                construct_proxy_future_in(attempt_slot.as_mut(), || {
+                    proxy_to_backend(
+                        &state,
+                        &proxy,
+                        &current_url,
+                        &method,
+                        initial_attempt_span
+                            .headers_view(ctx.request_headers_view(owned_proxy_headers_ref)),
+                        client_request_body,
+                        upstream_target.as_deref(),
+                        &plugins,
+                        backend_admission_plugins.as_ref(),
+                        std::mem::take(&mut preacquired_backend_admission),
+                        body_hook_ctx.as_mut(),
+                        &ctx,
+                        should_stream,
+                        requires_request_body_buffering,
+                        stream_request_body,
+                        has_retry,
+                        request_body_prepared,
+                        &request_client_ip,
+                        &request_xff_append_ip,
+                        ctx.request_is_secure,
+                        current_dispatch_hbone,
+                        current_dispatch_mesh_mtls,
+                        current_dispatch_h3,
+                        &bytes_sent_observed,
+                        inbound_version,
+                        &mut backend_admission_started_at,
+                        &initial_attempt_handoff,
+                    )
+                }),
+            )
+            .await
+        };
         let initial_handed_to_backend = initial_attempt_handoff.handed_to_backend();
         // The attempt span starts where the backend dial / send began, after
         // the dispatch prepared the request (issue #5864).
@@ -45857,51 +45930,56 @@ async fn handle_proxy_request_inner(
             ctx.request_headers_view(owned_proxy_headers_ref),
         );
         dispatch_attempt_span.handoff_reported_by_dispatch();
-        // Construct the bounded attempt out of line before the deadline wrapper.
-        // Larger transport children retain their separate boxing boundaries;
-        // the state-budget tests cover this handler and the concrete attempt.
-        let dispatch_attempt = await_backend_attempt_route_deadline(
-            route_request_deadline,
-            RouteAttemptBudget::from_handoff(
-                route_attempt_timeout,
-                dispatch_attempt_handoff.marker(),
-                &mut route_attempt_deadline,
-            ),
-            dispatch_attempt_span.trace(),
-            construct_proxy_future(|| {
-                proxy_to_backend(
-                    &state,
-                    &proxy,
-                    &backend_url,
-                    &method,
-                    dispatch_attempt_span
-                        .headers_view(ctx.request_headers_view(owned_proxy_headers_ref)),
-                    client_request_body,
-                    upstream_target.as_deref(),
-                    &plugins,
-                    backend_admission_plugins.as_ref(),
-                    std::mem::take(&mut preacquired_backend_admission),
-                    body_hook_ctx.as_mut(),
-                    &ctx,
-                    should_stream,
-                    requires_request_body_buffering,
-                    stream_request_body,
-                    false, // no retry — don't retain body
-                    request_body_prepared,
-                    &request_client_ip,
-                    &request_xff_append_ip,
-                    ctx.request_is_secure,
-                    current_dispatch_hbone,
-                    current_dispatch_mesh_mtls,
-                    current_dispatch_h3,
-                    &bytes_sent_observed,
-                    inbound_version,
-                    &mut backend_admission_started_at,
-                    &dispatch_attempt_handoff,
-                )
-            }),
-        )
-        .await;
+        // Construct the bounded attempt out of line, directly in this slot of
+        // the handler's state, before the deadline wrapper; the block drops it
+        // where the wrapper used to. Larger transport children retain their
+        // separate boxing boundaries; the state-budget tests cover this
+        // handler and the concrete attempt.
+        let dispatch_attempt = {
+            let mut attempt_slot = std::pin::pin!(None);
+            await_backend_attempt_route_deadline(
+                route_request_deadline,
+                RouteAttemptBudget::from_handoff(
+                    route_attempt_timeout,
+                    dispatch_attempt_handoff.marker(),
+                    &mut route_attempt_deadline,
+                ),
+                dispatch_attempt_span.trace(),
+                construct_proxy_future_in(attempt_slot.as_mut(), || {
+                    proxy_to_backend(
+                        &state,
+                        &proxy,
+                        &backend_url,
+                        &method,
+                        dispatch_attempt_span
+                            .headers_view(ctx.request_headers_view(owned_proxy_headers_ref)),
+                        client_request_body,
+                        upstream_target.as_deref(),
+                        &plugins,
+                        backend_admission_plugins.as_ref(),
+                        std::mem::take(&mut preacquired_backend_admission),
+                        body_hook_ctx.as_mut(),
+                        &ctx,
+                        should_stream,
+                        requires_request_body_buffering,
+                        stream_request_body,
+                        false, // no retry — don't retain body
+                        request_body_prepared,
+                        &request_client_ip,
+                        &request_xff_append_ip,
+                        ctx.request_is_secure,
+                        current_dispatch_hbone,
+                        current_dispatch_mesh_mtls,
+                        current_dispatch_h3,
+                        &bytes_sent_observed,
+                        inbound_version,
+                        &mut backend_admission_started_at,
+                        &dispatch_attempt_handoff,
+                    )
+                }),
+            )
+            .await
+        };
         let dispatch_handed_to_backend = dispatch_attempt_handoff.handed_to_backend();
         // See `initial_attempt_span.handed_off_at` in the retry arm above.
         if dispatch_handed_to_backend {
@@ -52826,31 +52904,34 @@ async fn proxy_to_backend(
                 };
                 let mut passthrough_request_bytes = None;
                 let mut client_upload_gate_wait = Duration::ZERO;
-                let (backend_resp, request_body_exceeded) = construct_proxy_future(|| {
-                    proxy_to_backend_http2(
-                        state,
-                        direct_h2_proxy,
-                        sender,
-                        backend_url,
-                        method,
-                        headers,
-                        request,
-                        plugins,
-                        response_decision_ctx,
-                        request_ctx.grpc_deadline_at(),
-                        stream_response,
-                        client_ip,
-                        xff_append_ip,
-                        request_is_secure,
-                        resolved_ip,
-                        ctx_bytes_sent_observed,
-                        route_request_body_limit,
-                        route_response_body_limit,
-                        &mut passthrough_request_bytes,
-                        &mut client_upload_gate_wait,
-                    )
-                })
-                .await;
+                let (backend_resp, request_body_exceeded) = {
+                    let mut dispatch_slot = std::pin::pin!(None);
+                    construct_proxy_future_in(dispatch_slot.as_mut(), || {
+                        proxy_to_backend_http2(
+                            state,
+                            direct_h2_proxy,
+                            sender,
+                            backend_url,
+                            method,
+                            headers,
+                            request,
+                            plugins,
+                            response_decision_ctx,
+                            request_ctx.grpc_deadline_at(),
+                            stream_response,
+                            client_ip,
+                            xff_append_ip,
+                            request_is_secure,
+                            resolved_ip,
+                            ctx_bytes_sent_observed,
+                            route_request_body_limit,
+                            route_response_body_limit,
+                            &mut passthrough_request_bytes,
+                            &mut client_upload_gate_wait,
+                        )
+                    })
+                    .await
+                };
                 return BackendDispatchResult::Response {
                     response: Box::new(backend_resp),
                     retained_body: None,
@@ -52969,7 +53050,8 @@ async fn proxy_to_backend(
             request_body_prepared,
         )
     {
-        return construct_proxy_future(|| {
+        let mut dispatch_slot = std::pin::pin!(None);
+        return construct_proxy_future_in(dispatch_slot.as_mut(), || {
             proxy_to_backend_direct_h1(
                 state,
                 proxy,

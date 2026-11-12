@@ -255,3 +255,162 @@ fn frontend_and_backend_future_state_stays_within_the_stack_budget() {
         );
     }
 }
+
+/// The listener's service future stores the frontend future, and the affinity
+/// scopes pass it along by value. It must stay a pointer: stored inline, its
+/// state was copied by each of those layers, and the service future that
+/// carried the copies was itself copied twice more per request, when hyper and
+/// the runtime spawn the HTTP/2 stream.
+#[test]
+fn the_frontend_boundary_future_is_a_pointer_to_the_frontend_state() {
+    let [frontend_boundary, frontend, ..] =
+        ferrum_edge::proxy::request_stack_test_support::future_sizes();
+    assert_eq!(
+        frontend_boundary,
+        std::mem::size_of::<usize>(),
+        "the frontend future the listeners store must be boxed, not {frontend_boundary} bytes inline"
+    );
+    assert!(
+        frontend > frontend_boundary,
+        "the concrete frontend state ({frontend} bytes) is what the pointer keeps out of the service future"
+    );
+}
+
+/// A bounded child the handler keeps inline is written straight into its slot
+/// of the handler's state. A factory that returns the child by value makes the
+/// caller copy the whole state machine out of a stack temporary: 18 KiB per
+/// request for the backend attempt.
+#[test]
+fn bounded_inline_children_are_constructed_in_their_final_slot() {
+    fn squeezed(source: &str) -> String {
+        source.split_whitespace().collect::<Vec<_>>().join(" ")
+    }
+    fn between<'a>(source: &'a str, start: &str, end: &str) -> &'a str {
+        source
+            .split(start)
+            .nth(1)
+            .unwrap_or_else(|| panic!("`{start}` must exist"))
+            .split(end)
+            .next()
+            .unwrap_or_else(|| panic!("`{start}` must be bounded by `{end}`"))
+    }
+
+    let src = include_str!("../../../src/proxy/mod.rs");
+    assert!(
+        !src.contains("fn construct_proxy_future<"),
+        "an inline child must not be returned by value from an out-of-line factory"
+    );
+    assert!(
+        src.contains("#[inline(never)]\nfn construct_proxy_future_in<"),
+        "construct_proxy_future_in must stay an out-of-line factory"
+    );
+    let factory = between(src, "fn construct_proxy_future_in<", "\n}\n");
+    assert!(
+        factory.contains("slot.set(Some(construct()));"),
+        "the factory must write the child through the caller's slot"
+    );
+
+    let handler = squeezed(between(
+        src,
+        "\nasync fn handle_proxy_request_inner(",
+        "\nasync fn proxy_to_backend(",
+    ));
+    let attempt_in_slot = "construct_proxy_future_in(attempt_slot.as_mut(), || { proxy_to_backend(";
+    assert_eq!(
+        handler.matches(attempt_in_slot).count(),
+        2,
+        "the retry-configured and the single-attempt dispatch each build their attempt in a slot"
+    );
+    assert_eq!(
+        handler.matches("proxy_to_backend(").count(),
+        2,
+        "every backend attempt the handler keeps inline must be built in its slot"
+    );
+
+    let dispatch = squeezed(between(
+        src,
+        "\nasync fn proxy_to_backend(",
+        "\nasync fn proxy_to_backend_direct_h1(",
+    ));
+    for child in ["proxy_to_backend_http2(", "proxy_to_backend_direct_h1("] {
+        let child_in_slot =
+            format!("construct_proxy_future_in(dispatch_slot.as_mut(), || {{ {child}");
+        assert_eq!(
+            dispatch.matches(child_in_slot.as_str()).count(),
+            1,
+            "{child} must be built in its slot of the backend attempt"
+        );
+        assert_eq!(
+            dispatch.matches(child).count(),
+            1,
+            "{child} must not also be awaited by value in the backend attempt"
+        );
+    }
+
+    assert!(
+        src.contains("#[inline(never)]\nfn construct_frontend_proxy_request("),
+        "construct_frontend_proxy_request must stay an out-of-line factory"
+    );
+    let frontend = between(src, "fn construct_frontend_proxy_request(", "\n}\n");
+    assert!(
+        frontend.contains("Box::pin(handle_proxy_request_on_frontend_port("),
+        "the frontend future must be built directly in its box"
+    );
+}
+
+struct SetOnDrop(Arc<std::sync::atomic::AtomicBool>);
+
+impl Drop for SetOnDrop {
+    fn drop(&mut self) {
+        self.0.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+#[test]
+fn a_child_built_in_a_slot_resolves_once_and_leaves_the_slot_empty() {
+    use std::future::Future;
+    use std::task::{Context, Poll, Waker};
+
+    let mut slot = std::pin::pin!(None);
+    {
+        let mut child = std::pin::pin!(
+            ferrum_edge::proxy::request_stack_test_support::child_in_slot(
+                slot.as_mut(),
+                || async { 7 },
+            )
+        );
+        let mut cx = Context::from_waker(Waker::noop());
+        assert_eq!(child.as_mut().poll(&mut cx), Poll::Ready(7));
+        // Like a fused future, it stays pending once it has returned.
+        assert_eq!(child.as_mut().poll(&mut cx), Poll::Pending);
+    }
+    assert!(slot.is_none(), "a returned child must not stay in the slot");
+}
+
+#[test]
+fn dropping_the_future_of_a_child_built_in_a_slot_cancels_the_child() {
+    use std::future::Future;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::task::{Context, Poll, Waker};
+
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let guard = SetOnDrop(Arc::clone(&cancelled));
+    let mut slot = std::pin::pin!(None);
+    {
+        let mut child = std::pin::pin!(
+            ferrum_edge::proxy::request_stack_test_support::child_in_slot(
+                slot.as_mut(),
+                || async move {
+                    let _held = guard;
+                    std::future::pending::<()>().await;
+                },
+            )
+        );
+        let mut cx = Context::from_waker(Waker::noop());
+        assert_eq!(child.as_mut().poll(&mut cx), Poll::Pending);
+        assert!(!cancelled.load(Ordering::Relaxed));
+    }
+    // The slot is still in scope: the child went with the future that polled it.
+    assert!(cancelled.load(Ordering::Relaxed));
+    assert!(slot.is_none());
+}
