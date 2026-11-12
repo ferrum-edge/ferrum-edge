@@ -170,11 +170,29 @@ thread_local! {
 #[derive(Clone, Debug)]
 pub struct Http2Sender {
     inner: http2::SendRequest<DirectH2RequestBody>,
+    /// The backend's current `SETTINGS_MAX_CONCURRENT_STREAMS`, kept current
+    /// by this connection's driver. An open hyper HTTP/2 sender reports ready
+    /// however many streams it carries, so this is what tells the pool that a
+    /// backend allows no new streams (a draining limit of 0) or fewer than a
+    /// frontend connection wants to pin.
+    peer_max_streams: Arc<AtomicUsize>,
 }
 
 impl Http2Sender {
-    pub(crate) fn new(inner: http2::SendRequest<DirectH2RequestBody>) -> Self {
-        Self { inner }
+    pub(crate) fn new(
+        inner: http2::SendRequest<DirectH2RequestBody>,
+        peer_max_streams: Arc<AtomicUsize>,
+    ) -> Self {
+        Self {
+            inner,
+            peer_max_streams,
+        }
+    }
+
+    /// The backend's current `SETTINGS_MAX_CONCURRENT_STREAMS` as the
+    /// connection driver last saw it.
+    pub fn peer_max_concurrent_streams(&self) -> usize {
+        self.peer_max_streams.load(Ordering::Relaxed)
     }
 
     /// No per-request socket is available for this multiplexed transport.
@@ -476,7 +494,7 @@ impl Http2PoolManager {
 
                 let io = TokioIo::new(tls_stream);
                 let builder = Self::build_h2_builder(pool_config);
-                let (sender, conn) = builder.handshake(io).await.map_err(|e| {
+                let (sender, mut conn) = builder.handshake(io).await.map_err(|e| {
                     Http2PoolError::BackendUnavailable {
                         message: format!("h2 handshake failed: {}", e),
                         source: Some(BackendUnavailableSource::Hyper(e)),
@@ -485,17 +503,27 @@ impl Http2PoolManager {
 
                 // ALPN has already proved H2 for this TLS candidate.
                 let observation = H2DriverObservation::new("backend_h2_tls");
+                let peer_max_streams = Arc::new(AtomicUsize::new(conn.current_max_send_streams()));
+                let driver_peer_max_streams = Arc::clone(&peer_max_streams);
                 tokio::spawn(async move {
                     // The `maxConnections` slot lives exactly as long as the
                     // connection driver, i.e. as long as the socket is open.
                     let _conn_slot = conn_slot;
-                    let result = conn.await;
+                    let result = crate::proxy::grpc_proxy::drive_sampling_peer_max_streams(
+                        &mut conn,
+                        |conn| conn.current_max_send_streams(),
+                        &driver_peer_max_streams,
+                    )
+                    .await;
                     observation.finish(result.as_ref().err().map(|e| e as &dyn std::error::Error));
                     if let Err(e) = result {
                         debug!("http2_pool: TLS connection closed: {}", e);
                     }
                 });
-                Ok(Http2CandidateOutcome::Established(Http2Sender::new(sender)))
+                Ok(Http2CandidateOutcome::Established(Http2Sender::new(
+                    sender,
+                    peer_max_streams,
+                )))
             }
         })
         .await
@@ -1058,17 +1086,138 @@ impl Http2ConnectionPool {
             buf.push_str(&key[..base_len]);
             for offset in 1..shards {
                 write_http2_shard_key_inplace(&mut buf, base_len, (start + offset) % shards);
+                // Skip a sibling allowing no new streams, as the probe does:
+                // the request would queue inside h2.
                 if let Some(mut sender) = pool.cached(&buf)
                     && matches!(
                         futures_util::FutureExt::now_or_never(sender.ready()),
                         Some(Ok(()))
                     )
+                    && sender.peer_max_concurrent_streams() != 0
                 {
                     return Some(sender);
                 }
             }
             None
         })
+    }
+
+    fn round_robin_start(
+        &self,
+        base_key: &str,
+        svid_generation: Option<u64>,
+        shard_count: usize,
+    ) -> usize {
+        let rr = get_or_seed_rr_counter(
+            &self.rr_counters,
+            base_key,
+            svid_generation,
+            &self.pool.manager().backend_svid_generation,
+        );
+        rr.fetch_add(1, Ordering::Relaxed) % shard_count
+    }
+
+    /// One synchronous sweep of the shard ring from `start`. `now_or_never`
+    /// never awaits, so there is no per-shard stall.
+    ///
+    /// An open hyper HTTP/2 sender always reports ready, however many streams
+    /// it carries, so "the first ready shard" alone would keep every request
+    /// on the first connection ever opened (the startup capability probe's)
+    /// and the pool would never reach `http2_connections_per_host`: one
+    /// connection task here, and one on the backend, would then carry every
+    /// stream. With `widen`, a missing or closed `start` shard (not on a
+    /// create cooldown) is swept past: a ready sibling is returned as
+    /// [`ShardProbe::Borrowed`] so the caller fills the shard in the
+    /// background, and only a ring with no usable shard falls through to the
+    /// awaited create.
+    fn probe_shards(
+        &self,
+        key_buf: &mut String,
+        base_len: usize,
+        start: usize,
+        shard_count: usize,
+        widen: bool,
+        affinity_open_streams: Option<usize>,
+    ) -> ShardProbe {
+        #[cfg(feature = "bench-pool-profile")]
+        let mut saw_busy = false;
+        let mut fill_start = false;
+        for offset in 0..shard_count {
+            let shard = (start + offset) % shard_count;
+            Self::write_shard_key_inplace(key_buf, base_len, shard);
+
+            crate::profile_pool_event!(Probe);
+            let cached = crate::profile_pool_sync!(Probe, self.pool.cached(key_buf));
+            if let Some(mut sender) = cached {
+                match crate::profile_pool_ready!(futures_util::FutureExt::now_or_never(
+                    sender.ready()
+                )) {
+                    Some(Ok(())) => {
+                        let peer_max = sender.peer_max_concurrent_streams();
+                        // A backend allowing no new streams (a draining
+                        // `SETTINGS_MAX_CONCURRENT_STREAMS` of 0) would queue
+                        // the request inside h2: skip it like a busy shard,
+                        // so a sibling serves the request and nothing pins
+                        // to it.
+                        if peer_max == 0 {
+                            #[cfg(feature = "bench-pool-profile")]
+                            {
+                                saw_busy = true;
+                            }
+                            continue;
+                        }
+                        // The frontend connection already has more open
+                        // streams than this backend allows it to pin.
+                        if offset == 0
+                            && affinity_open_streams.is_some_and(|open_streams| {
+                                open_streams
+                                    > crate::proxy::frontend_affinity::affinity_stream_limit(
+                                        peer_max,
+                                    )
+                            })
+                        {
+                            return ShardProbe::OverPeerLimit;
+                        }
+                        crate::profile_pool_event!(WarmHit);
+                        return if fill_start {
+                            ShardProbe::Borrowed(sender)
+                        } else {
+                            ShardProbe::Ready(sender)
+                        };
+                    }
+                    Some(Err(_)) => {
+                        self.pool.invalidate(key_buf);
+                        // A closed preferred shard is refilled, as a missing
+                        // one is below.
+                        if offset == 0 && widen {
+                            fill_start = !self.shard_create_backoff.backed_off(key_buf);
+                        }
+                    }
+                    // Not ready yet. Skip — phase 2's coalesced create checks
+                    // `cached()` first; the existing sender is still healthy
+                    // (`!is_closed()`), so the create closure never runs and
+                    // the pool does NOT grow beyond the shard ring.
+                    None => {
+                        #[cfg(feature = "bench-pool-profile")]
+                        {
+                            saw_busy = true;
+                        }
+                    }
+                }
+            } else if offset == 0 && widen {
+                // The preferred shard does not exist yet. A shard whose create
+                // failed recently is borrowed around without a new create.
+                fill_start = !self.shard_create_backoff.backed_off(key_buf);
+            }
+        }
+
+        #[cfg(feature = "bench-pool-profile")]
+        crate::pool_profile::event(if saw_busy {
+            crate::pool_profile::Event::BusyFallback
+        } else {
+            crate::pool_profile::Event::MissFallback
+        });
+        ShardProbe::Miss
     }
 
     pub fn contains_rr_counter(&self, key: &str) -> bool {
@@ -1171,104 +1320,74 @@ impl Http2ConnectionPool {
             self.with_pool_key(proxy, svid_generation, |key_buf| -> Phase1 {
                 let base_len = key_buf.len();
 
-                // The preferred shard. An HTTP/2 frontend connection keeps its
-                // streams on its own shard (`frontend_affinity`), as the gRPC
-                // pool does; every other request takes the per-host
-                // round-robin shard. On FIRST access the round-robin counter
-                // is seeded with a thread-local PRNG offset so a burst of
-                // concurrent requests on a cold pool does not land all on
-                // shard 0 before the atomic counter wraps around.
-                // `AtomicUsize::fetch_add(1, Relaxed)` is wait-free after the
-                // seed.
-                let start = crate::profile_pool_sync!(Rr, {
+                // The preferred shard. An HTTP/2 frontend connection under its
+                // affinity bound keeps its streams on its own shard
+                // (`frontend_affinity`), as the gRPC pool does; one over it,
+                // and every other request, takes the per-host round-robin
+                // shard. On FIRST access the round-robin counter is seeded
+                // with a thread-local PRNG offset so a burst of concurrent
+                // requests on a cold pool does not land all on shard 0 before
+                // the atomic counter wraps around. `AtomicUsize::fetch_add(1,
+                // Relaxed)` is wait-free after the seed.
+                let (mut start, mut affinity_open_streams) = crate::profile_pool_sync!(Rr, {
                     use crate::proxy::frontend_affinity::{ShardStart, shard_start};
                     match shard_start(shard_count) {
-                        ShardStart::Affinity { shard, .. } => shard,
-                        ShardStart::Spill | ShardStart::Unscoped => {
-                            let rr = get_or_seed_rr_counter(
-                                &self.rr_counters,
+                        ShardStart::Affinity {
+                            shard,
+                            open_streams,
+                        } => (shard, Some(open_streams)),
+                        ShardStart::Spill | ShardStart::Unscoped => (
+                            self.round_robin_start(
                                 &key_buf[..base_len],
                                 svid_generation,
-                                &self.pool.manager().backend_svid_generation,
-                            );
-                            rr.fetch_add(1, Ordering::Relaxed) % shard_count
-                        }
+                                shard_count,
+                            ),
+                            None,
+                        ),
                     }
                 });
 
-                // Probe the ring from the preferred shard; `now_or_never`
-                // never awaits, so there is no per-shard stall. An open hyper
-                // HTTP/2 sender always reports ready, however many streams it
-                // carries, so "the first ready shard" alone would keep every
-                // request on the first connection ever opened (the startup
-                // capability probe's) and the pool would never reach
-                // `http2_connections_per_host`: one connection task here, and
-                // one on the backend, would then carry every stream. When the
-                // preferred shard is missing or closed, a ready sibling serves
-                // the request at once and the shard is created in the
-                // background, so the pool widens without a request waiting on
-                // a dial.
-                let mut fill_start = false;
-                #[cfg(feature = "bench-pool-profile")]
-                let mut saw_busy = false;
-                for offset in 0..shard_count {
-                    let shard = (start + offset) % shard_count;
-                    Self::write_shard_key_inplace(key_buf, base_len, shard);
-
-                    crate::profile_pool_event!(Probe);
-                    if let Some(mut sender) =
-                        crate::profile_pool_sync!(Probe, self.pool.cached(key_buf))
-                    {
-                        match crate::profile_pool_ready!(futures_util::FutureExt::now_or_never(
-                            sender.ready()
-                        )) {
-                            Some(Ok(())) => {
-                                crate::profile_pool_event!(WarmHit);
-                                if fill_start {
-                                    Self::write_shard_key_inplace(key_buf, base_len, start);
-                                    let ring = ShardRing {
-                                        base_len,
-                                        start,
-                                        shards: shard_count,
-                                    };
-                                    self.spawn_shard_fill(proxy, svid_generation, key_buf, ring);
-                                }
-                                return Phase1::Hit(sender);
-                            }
-                            Some(Err(_)) => {
-                                self.pool.invalidate(key_buf);
-                                // A closed preferred shard is refilled, as a
-                                // missing one is below.
-                                if offset == 0 && widen {
-                                    fill_start = !self.shard_create_backoff.backed_off(key_buf);
-                                }
-                            }
-                            // Not ready yet. Skip — phase 2's coalesced create
-                            // checks `cached()` first; the existing sender is
-                            // still healthy (`!is_closed()`), so the create
-                            // closure never runs and the pool does NOT grow
-                            // beyond the shard ring.
-                            None => {
-                                #[cfg(feature = "bench-pool-profile")]
-                                {
-                                    saw_busy = true;
-                                }
-                            }
+                loop {
+                    match self.probe_shards(
+                        key_buf,
+                        base_len,
+                        start,
+                        shard_count,
+                        widen,
+                        affinity_open_streams,
+                    ) {
+                        ShardProbe::Ready(sender) => return Phase1::Hit(sender),
+                        // The preferred shard is missing or closed: the ready
+                        // sibling serves the request at once and the shard is
+                        // created in the background, so the pool widens
+                        // without a request waiting on a dial.
+                        ShardProbe::Borrowed(sender) => {
+                            Self::write_shard_key_inplace(key_buf, base_len, start);
+                            let ring = ShardRing {
+                                base_len,
+                                start,
+                                shards: shard_count,
+                            };
+                            self.spawn_shard_fill(proxy, svid_generation, key_buf, ring);
+                            return Phase1::Hit(sender);
                         }
-                    } else if offset == 0 && widen {
-                        // The preferred shard does not exist yet. A shard
-                        // whose create failed recently is borrowed around
-                        // without a new create.
-                        fill_start = !self.shard_create_backoff.backed_off(key_buf);
+                        // The connection's own shard is ready, but the
+                        // connection already has as many open streams as that
+                        // backend allows: spill this request round-robin.
+                        ShardProbe::OverPeerLimit => {
+                            start = crate::profile_pool_sync!(Rr, {
+                                self.round_robin_start(
+                                    &key_buf[..base_len],
+                                    svid_generation,
+                                    shard_count,
+                                )
+                            });
+                            affinity_open_streams = None;
+                        }
+                        ShardProbe::Miss => break,
                     }
                 }
 
-                #[cfg(feature = "bench-pool-profile")]
-                crate::pool_profile::event(if saw_busy {
-                    crate::pool_profile::Event::BusyFallback
-                } else {
-                    crate::pool_profile::Event::MissFallback
-                });
                 Self::write_shard_key_inplace(key_buf, base_len, start);
                 // Clone the selected key for the asynchronous fallback. Cold
                 // pending-registration and creation paths can allocate further keys.
@@ -2108,6 +2227,20 @@ impl Http2ConnectionPool {
     pub fn h1_pool_stats(&self) -> Http1PoolStats {
         self.h1.stats()
     }
+}
+
+/// Outcome of one shard-ring sweep in `get_sender`.
+enum ShardProbe {
+    /// A usable shard was immediately ready; nothing to fill.
+    Ready(Http2Sender),
+    /// The start shard was missing or closed and a ready sibling serves the
+    /// request; the start shard is created in the background.
+    Borrowed(Http2Sender),
+    /// The affinity shard is ready but its backend allows fewer concurrent
+    /// streams than the frontend connection has open; spill instead.
+    OverPeerLimit,
+    /// No usable shard was immediately ready.
+    Miss,
 }
 
 /// Outcome of the synchronous phase-1 sweep in `get_sender`.

@@ -2068,8 +2068,8 @@ fn samples_peer_max_streams(poll: u32) -> bool {
     poll <= PEER_MAX_STREAMS_EAGER_POLLS || (poll & (PEER_MAX_STREAMS_SAMPLE_INTERVAL - 1)) == 0
 }
 
-/// Drive a pooled gRPC backend connection to completion, publishing the
-/// backend's current `SETTINGS_MAX_CONCURRENT_STREAMS`.
+/// Drive a pooled gRPC or direct HTTP/2 backend connection to completion,
+/// publishing the backend's current `SETTINGS_MAX_CONCURRENT_STREAMS`.
 ///
 /// hyper exposes the value only on the `Connection`, never on the
 /// `SendRequest` the pool hands out, and h2 applies the peer's SETTINGS only
@@ -2087,7 +2087,7 @@ fn samples_peer_max_streams(poll: u32) -> bool {
 /// out once its handshake completes, before the backend's SETTINGS arrive, so
 /// a burst on a fresh TLS connection can exhaust the eager window on the
 /// pre-SETTINGS default. The store is skipped while the value is unchanged.
-async fn drive_sampling_peer_max_streams<C>(
+pub(crate) async fn drive_sampling_peer_max_streams<C>(
     conn: &mut C,
     current_max_send_streams: impl Fn(&C) -> usize,
     peer_max_streams: &AtomicUsize,

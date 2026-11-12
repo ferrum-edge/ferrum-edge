@@ -480,6 +480,11 @@ struct PendingCreation {
     /// The creator is a capability probe with a capped connect budget. Its
     /// failure is broadcast to probe waiters only; request waiters re-elect.
     probe_owned: bool,
+    /// Set when the pool was drained of this key (a TLS material or CRL
+    /// reload, an SVID rotation, a config reload) while this create was in
+    /// flight. The connection it produces was established before the drain,
+    /// so it is handed to its creator alone and never published.
+    drained: AtomicBool,
     /// Set when any live-request caller joins this coalesced create.
     request_joined: AtomicBool,
     /// Highest establishment-log rank claimed for this attempt:
@@ -617,6 +622,7 @@ impl PendingCreation {
         Self {
             outcome_tx,
             probe_owned: false,
+            drained: AtomicBool::new(false),
             request_joined: AtomicBool::new(false),
             emitted_rank: AtomicU8::new(0),
             log_context: OnceLock::new(),
@@ -1024,14 +1030,33 @@ impl<M: PoolManager> GenericPool<M> {
         }
     }
 
+    /// Drain every connection: the published entries, and any still being
+    /// established.
+    ///
+    /// A create in flight took its dial inputs (the backend TLS
+    /// configuration, the SVID generation) before this drain, so its
+    /// connection must not be published after it. Such creates are marked
+    /// BEFORE the entries are removed: a creator that passed the mark check
+    /// had already published under its entry lock, and the removal pass below
+    /// then takes that entry too. Cold path.
     pub fn clear(&self) {
+        for pending in self.pending_creations.iter() {
+            pending.value().drained.store(true, Ordering::Release);
+        }
         let keys = self.keys_snapshot();
         for key in keys {
             self.invalidate(&key);
         }
     }
 
+    /// Drain the connections whose key `predicate` selects, including any
+    /// still being established (see [`Self::clear`]). Cold path.
     pub fn invalidate_matching(&self, predicate: impl Fn(&str) -> bool) {
+        for pending in self.pending_creations.iter() {
+            if predicate(pending.key()) {
+                pending.value().drained.store(true, Ordering::Release);
+            }
+        }
         let keys = self.keys_snapshot();
         for key in keys {
             if predicate(&key) {
@@ -1322,7 +1347,7 @@ impl<M: PoolManager> GenericPool<M> {
             crate::profile_pool_event!(CreateOwner);
             let pending_guard = PendingCreationGuard::new(self, key.clone(), pending);
             let result = self
-                .create_after_recheck(key.clone(), budget, &recover, {
+                .create_after_recheck(key.clone(), budget, &attempt.inner, &recover, {
                     let create = create
                         .take()
                         .expect("create closure should only be consumed by the creator");
@@ -1397,6 +1422,7 @@ impl<M: PoolManager> GenericPool<M> {
         &self,
         key: String,
         budget: CreateBudget,
+        pending: &PendingCreation,
         recover: R,
         create: C,
     ) -> std::result::Result<M::Connection, E>
@@ -1437,7 +1463,16 @@ impl<M: PoolManager> GenericPool<M> {
         };
         let now = now_tick_ms();
 
-        match self.entries.entry(key) {
+        let slot = self.entries.entry(key);
+        // Checked under the entry lock, so it is atomic with a drain's mark
+        // and removal passes (see `clear`). A connection established before a
+        // drain serves its creator, as any request already in flight at the
+        // drain does, and is closed when that caller drops it.
+        if pending.drained.load(Ordering::Acquire) {
+            drop(slot);
+            return Ok(created);
+        }
+        match slot {
             dashmap::mapref::entry::Entry::Occupied(mut occupied) => {
                 let entry = occupied.get_mut();
                 if self.manager.is_healthy(&entry.conn) {

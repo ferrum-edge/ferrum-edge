@@ -77,10 +77,11 @@
 //! The direct HTTP/2 pool reads the same count through [`shard_start`]: an
 //! HTTP/2 frontend connection under [`AFFINITY_MAX_OPEN_STREAMS`] keeps its
 //! requests on its own shard, and every other request takes the round-robin
-//! shard. That pool has no sampled backend stream limit, so its only bound is
-//! [`AFFINITY_MAX_OPEN_STREAMS`]. Like the gRPC pool it serves a request from a
-//! ready sibling while a missing or closed preferred shard is created in the
-//! background (`pool::shard_fill`). Before it did, the direct pool took the
+//! shard. Its connection drivers sample the backend's stream limit the same
+//! way, so the same [`affinity_stream_limit`] bound and zero-stream skip
+//! apply. Like the gRPC pool it serves a request from a ready sibling while a
+//! missing or closed preferred shard is created in the background
+//! (`pool::shard_fill`). Before it did, the direct pool took the
 //! first ready shard, which is always the first connection it ever opened
 //! (the startup capability probe's): every stream shared one backend
 //! connection, and the gateway and the backend each ran one connection task

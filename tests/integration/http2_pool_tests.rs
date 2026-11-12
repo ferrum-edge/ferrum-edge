@@ -1310,23 +1310,26 @@ async fn start_counting_h2_tls_backend() -> (tokio::task::JoinHandle<()>, u16, A
     (handle, port, accepted)
 }
 
-/// What a [`start_scripted_h2_tls_backend`] does with a connection it accepts
-/// after the first.
+/// How a [`start_scripted_h2_tls_backend`] treats the connections it accepts.
 #[derive(Clone, Copy)]
-enum LaterConnections {
-    /// Hold the TLS handshake until the gate opens: a slow dial that
-    /// eventually succeeds.
-    Gated,
-    /// Close the socket before the TLS handshake: a backend refusing new
-    /// connections while its established one keeps serving.
-    Refused,
+enum H2TlsBackendScript {
+    /// Serve the first connection; hold the TLS handshake of every later one
+    /// while the gate is closed: a slow dial that eventually succeeds.
+    GateLater,
+    /// Serve the first connection; close every later socket before its TLS
+    /// handshake: a backend refusing new connections while its established
+    /// one keeps serving.
+    RefuseLater,
+    /// The first connection advertises `SETTINGS_MAX_CONCURRENT_STREAMS` of 0
+    /// (a draining instance); later ones serve normally.
+    FirstAllowsNoStreams,
 }
 
-/// TLS + HTTP/2 backend that serves its first connection normally and treats
-/// every later one as `later` says. Returns the port, the accepted-connection
-/// count and the gate (`true` holds [`LaterConnections::Gated`] dials).
+/// TLS + HTTP/2 backend following `script`. Returns the port, the
+/// accepted-connection count and the gate (`true` holds
+/// [`H2TlsBackendScript::GateLater`] dials).
 async fn start_scripted_h2_tls_backend(
-    later: LaterConnections,
+    script: H2TlsBackendScript,
 ) -> (u16, Arc<AtomicUsize>, tokio::sync::watch::Sender<bool>) {
     let listener = tokio::net::TcpListener::bind_test("127.0.0.1:0")
         .await
@@ -1354,7 +1357,7 @@ async fn start_scripted_h2_tls_backend(
     tokio::spawn(async move {
         while let Ok((socket, _)) = listener.accept().await {
             let first = task_accepted.fetch_add(1, Ordering::Relaxed) == 0;
-            if !first && matches!(later, LaterConnections::Refused) {
+            if !first && matches!(script, H2TlsBackendScript::RefuseLater) {
                 drop(socket);
                 continue;
             }
@@ -1370,7 +1373,11 @@ async fn start_scripted_h2_tls_backend(
                 let service = service_fn(|_req: Request<Incoming>| async move {
                     Ok::<_, hyper::Error>(Response::new(Full::new(Bytes::from_static(b"ok"))))
                 });
-                let _ = hyper::server::conn::http2::Builder::new(TokioExecutor::new())
+                let mut builder = hyper::server::conn::http2::Builder::new(TokioExecutor::new());
+                if first && matches!(script, H2TlsBackendScript::FirstAllowsNoStreams) {
+                    builder.max_concurrent_streams(0);
+                }
+                let _ = builder
                     .serve_connection(TokioIo::new(tls_stream), service)
                     .await;
             });
@@ -1527,7 +1534,7 @@ async fn test_http2_pool_keeps_a_frontend_connection_on_its_own_shard() {
 async fn test_http2_pool_serves_from_a_ready_sibling_while_its_shard_dials() {
     use futures_util::FutureExt;
 
-    let (port, accepted, gate) = start_scripted_h2_tls_backend(LaterConnections::Gated).await;
+    let (port, accepted, gate) = start_scripted_h2_tls_backend(H2TlsBackendScript::GateLater).await;
     let pool = direct_h2_pool(4);
     let mut proxy = direct_h2_proxy(port);
     proxy.backend_connect_timeout_ms = 30_000;
@@ -1556,6 +1563,20 @@ async fn test_http2_pool_serves_from_a_ready_sibling_while_its_shard_dials() {
         "a borrowed sender never aliases the missing shard"
     );
 
+    // Let a background create reach the backend and stall in its handshake,
+    // then borrow again: requests still do not wait on it.
+    wait_for_affinity_accepts(&accepted, 2).await;
+    assert_eq!(pool.pool_size(), 1, "the stalled dial published nothing");
+    for _ in 0..16 {
+        let sender = pool
+            .get_sender(&proxy)
+            .now_or_never()
+            .expect("a ready sibling serves the request while the dial is stalled")
+            .expect("borrowed sender");
+        assert!(!sender.is_closed());
+    }
+    assert_eq!(pool.pool_size(), 1);
+
     // The background creates complete once the backend answers.
     gate.send_replace(false);
     wait_for_direct_h2_pool_size(&pool, 2).await;
@@ -1565,7 +1586,8 @@ async fn test_http2_pool_serves_from_a_ready_sibling_while_its_shard_dials() {
 
 #[tokio::test]
 async fn test_http2_pool_backs_off_a_shard_whose_background_create_failed() {
-    let (port, accepted, _gate) = start_scripted_h2_tls_backend(LaterConnections::Refused).await;
+    let (port, accepted, _gate) =
+        start_scripted_h2_tls_backend(H2TlsBackendScript::RefuseLater).await;
     let pool = direct_h2_pool(2);
     let proxy = direct_h2_proxy(port);
     pool.get_sender(&proxy).await.expect("first shard");
@@ -1597,6 +1619,105 @@ async fn test_http2_pool_backs_off_a_shard_whose_background_create_failed() {
         "a backed-off shard is not redialled on every request"
     );
     assert_eq!(pool.pool_size(), 1);
+}
+
+#[tokio::test]
+async fn test_http2_pool_does_not_pin_to_a_backend_allowing_no_streams() {
+    use ferrum_edge::proxy::frontend_affinity::FrontendConnectionAffinity;
+
+    let (port, accepted, _gate) =
+        start_scripted_h2_tls_backend(H2TlsBackendScript::FirstAllowsNoStreams).await;
+    let pool = direct_h2_pool(2);
+    let proxy = direct_h2_proxy(port);
+    let table = affinity_slot_table();
+    let first = FrontendConnectionAffinity::with_table(&table);
+    let first_stream = first.open_stream();
+    let draining = first_stream
+        .run(pool.get_sender(&proxy))
+        .await
+        .expect("draining affinity sender");
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while draining.peer_max_concurrent_streams() != 0 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("backend SETTINGS_MAX_CONCURRENT_STREAMS of 0 sampled");
+
+    // The second frontend connection's shard is missing, and the only ready
+    // shard allows no streams, so nothing is borrowed: the request creates
+    // its own shard.
+    let second = FrontendConnectionAffinity::with_table(&table);
+    let second_stream = second.open_stream();
+    let open = second_stream
+        .run(pool.get_sender(&proxy))
+        .await
+        .expect("second affinity sender");
+    assert_ne!(open.peer_max_concurrent_streams(), 0);
+    assert_eq!(accepted.load(Ordering::Relaxed), 2);
+    assert_eq!(pool.pool_size(), 2);
+
+    // The first connection's requests no longer pin to its draining shard,
+    // and requests with no frontend connection skip it too, without a dial.
+    for _ in 0..8 {
+        let sender = first_stream
+            .run(pool.get_sender(&proxy))
+            .await
+            .expect("spilled sender");
+        assert_ne!(
+            sender.peer_max_concurrent_streams(),
+            0,
+            "a request must not queue on a backend allowing no streams"
+        );
+        let sender = pool.get_sender(&proxy).await.expect("unscoped sender");
+        assert_ne!(sender.peer_max_concurrent_streams(), 0);
+    }
+    assert_eq!(accepted.load(Ordering::Relaxed), 2);
+    assert_eq!(pool.shard_fills_in_flight(), 0);
+}
+
+#[tokio::test]
+async fn test_http2_pool_drain_discards_a_connection_still_being_established() {
+    let (port, accepted, gate) = start_scripted_h2_tls_backend(H2TlsBackendScript::GateLater).await;
+    let pool = direct_h2_pool(2);
+    let mut proxy = direct_h2_proxy(port);
+    proxy.backend_connect_timeout_ms = 30_000;
+    pool.get_sender(&proxy).await.expect("warm shard");
+    assert_eq!(accepted.load(Ordering::Relaxed), 1);
+
+    // A request whose shard is missing starts that shard's background create,
+    // which reaches the backend and stalls in its TLS handshake.
+    gate.send_replace(true);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while pool.shard_fills_in_flight() == 0 {
+            pool.get_sender(&proxy).await.expect("borrowed sender");
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("a background create started");
+    wait_for_affinity_accepts(&accepted, 2).await;
+
+    // A TLS material reload or SVID rotation drains the pool while that
+    // handshake is still in flight.
+    pool.force_drain_all();
+    assert_eq!(pool.pool_size(), 0);
+
+    // The handshake completes after the drain: its connection is not
+    // published, so no later request can reuse it.
+    gate.send_replace(false);
+    wait_for_direct_h2_fills_to_finish(&pool).await;
+    assert_eq!(
+        pool.pool_size(),
+        0,
+        "a connection established before the drain is not published after it"
+    );
+
+    // The next request dials afresh.
+    let sender = pool.get_sender(&proxy).await.expect("fresh sender");
+    assert!(!sender.is_closed());
+    assert_eq!(pool.pool_size(), 1);
+    assert_eq!(accepted.load(Ordering::Relaxed), 3);
 }
 
 // ============================================================================

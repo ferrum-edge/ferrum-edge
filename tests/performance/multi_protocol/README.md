@@ -594,8 +594,11 @@ done
 **gRPC connection affinity (#5991, #6022 item 6).** Affinity has no runtime
 toggle; it applies to every gRPC pool with more than one connection per host.
 Pair the dispatched `main` against the published image of #5991's parent
-(`main-cc2499b2…`), pooled and per-RPC, at 10 KiB and 5 MiB; `http2` covers the
-direct HTTP/2 pool, which keeps round-robin:
+(`main-cc2499b2…`), pooled and per-RPC, at 10 KiB and 5 MiB. `http2` covers the
+direct HTTP/2 pool, which has used the same affinity since the pool-width
+change (see "Direct HTTP/2 Pool Width" in `docs/connection_pooling.md`); at
+that baseline it took the first ready connection, so its `http2` rows are not
+an affinity-free control for a current `main`:
 
 ```bash
 gh workflow run gateways-protocol-benchmark.yml --ref main \

@@ -595,6 +595,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   benchmark caches are restore-only (`save-if: "false"`) (#7285).
 
 ### Fixed
+- **A pooled backend connection still being established when its pool is
+  drained is no longer published after the drain.** A TLS material or CRL
+  reload, an SVID rotation and a config reload drain the reqwest, direct
+  HTTP/2, gRPC and HTTP/3 pools, but a connection whose handshake was in
+  flight at that moment was cached when it completed, under the configuration
+  it had started with, and later requests could reuse it. Such a connection
+  now serves only the request that created it and is then closed.
 - An `api_chargeback_sink` with `clickhouse.tls.verify_hostname: false` and
   neither `clickhouse.tls.ca_file` nor `clickhouse.tls.insecure_skip_verify:
   true` is now refused at admission with a message naming both remedies. It
@@ -2142,6 +2149,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   sibling when that shard is missing or closed, and the shard is created in the
   background, so no request waits on a dial. A shard whose create failed is
   borrowed around for 2 seconds; the capability probe never widens the pool.
+  Each connection's driver now samples the backend's
+  `SETTINGS_MAX_CONCURRENT_STREAMS`, as the gRPC pool's does, so a shard whose
+  backend allows no streams is skipped and a frontend connection pins no more
+  streams than its backend allows.
   On the hosted protocol benchmark (three same-runner A/B runs, 100 streams,
   TLS on both legs) HTTP/2 throughput rose 11–15% at 10 KiB, 24–42% at 70 KiB
   and 28–51% from 512 KiB to 5 MiB, taking the result against Envoy 1.39 from
