@@ -282,8 +282,15 @@ fn the_frontend_boundary_future_is_a_pointer_to_the_frontend_state() {
 /// request for the backend attempt.
 #[test]
 fn bounded_inline_children_are_constructed_in_their_final_slot() {
+    // Code only: a comment that names one of the counted calls must not
+    // change a count.
     fn squeezed(source: &str) -> String {
-        source.split_whitespace().collect::<Vec<_>>().join(" ")
+        source
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .flat_map(str::split_whitespace)
+            .collect::<Vec<_>>()
+            .join(" ")
     }
     fn between<'a>(source: &'a str, start: &str, end: &str) -> &'a str {
         let (_, after_start) = source

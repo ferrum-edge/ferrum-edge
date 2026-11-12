@@ -35196,10 +35196,10 @@ pub async fn handle_proxy_request(
 /// The child is written through `slot` instead of being returned by value on
 /// purpose. A factory that returns it hands the caller a stack temporary, and
 /// the caller then copies the whole state machine, not just the arguments it
-/// captured, into its own state: an 18 KiB copy per request for the backend
-/// attempt. With the destination in hand, an optimized build stores only the
-/// captured arguments. An unoptimized build still builds the child in this
-/// frame first, which returns before anything is polled.
+/// captured, into its own state: a copy of about 18 KiB per request for the
+/// backend attempt. With the destination in hand, an optimized build stores
+/// only the captured arguments. An unoptimized build still builds the child
+/// in this frame first, which returns before anything is polled.
 ///
 /// The caller declares the slot as `std::pin::pin!(None)` in a block that ends
 /// with the await, so the borrows the child holds end there too.
@@ -58955,8 +58955,8 @@ pin_project_lite::pin_project! {
     /// Future returned by [`await_backend_attempt_route_deadline`].
     ///
     /// Hand-written rather than an `async fn` so the (large) backend attempt
-    /// future is stored exactly once (production dispatch passes a boxed child
-    /// or, for the first attempt, a child built in a slot of the handler).
+    /// future is stored exactly once. The handler's inline attempts are built
+    /// in a slot of the handler; retry-loop children are boxed.
     /// The deadline-free path adds two `Option` checks per poll. The timer is
     /// armed only when a deadline or a started attempt budget exists and the
     /// attempt returns `Pending`.
