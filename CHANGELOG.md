@@ -2131,6 +2131,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `CONTRIBUTING.md` correctly and list every operating mode (#7309).
 
 ### Performance
+- **The direct HTTP/2 pool now reaches `FERRUM_POOL_HTTP2_CONNECTIONS_PER_HOST`.**
+  The pool took the first ready shard, and an open HTTP/2 connection always
+  reports ready, so every request used the first connection the pool ever
+  opened (normally the startup capability probe's). All streams to a backend
+  then shared one connection: one connection task in the gateway and one in the
+  backend did that backend's TLS and HTTP/2 framing, whatever the setting said.
+  Requests now prefer a specific shard (an HTTP/2 frontend connection's own
+  shard, as in the gRPC pool; otherwise round-robin), are served by a ready
+  sibling when that shard is missing or closed, and the shard is created in the
+  background, so no request waits on a dial. A shard whose create failed is
+  borrowed around for 2 seconds; the capability probe never widens the pool.
+  On the hosted protocol benchmark (three same-runner A/B runs, 100 streams,
+  TLS on both legs) HTTP/2 throughput rose 11–15% at 10 KiB, 24–42% at 70 KiB
+  and 28–51% from 512 KiB to 5 MiB, taking the result against Envoy 1.39 from
+  0.84–1.08× to 1.04–1.51×. **Operator action:** a gateway now opens up to
+  that many HTTP/2 connections per backend host (default: CPU cores clamped to
+  2–8) where it held one. Size backend connection limits and DestinationRule
+  `maxConnections` for that width, or set
+  `FERRUM_POOL_HTTP2_CONNECTIONS_PER_HOST=1`. See
+  [Direct HTTP/2 Pool Width](docs/connection_pooling.md#direct-http2-pool-width).
 - **A cold DNS miss sends the SRV and A/AAAA queries together.** Under an
   order that starts with `SRV` followed by `A` or `AAAA` (the default
   `CACHE,SRV,A,CNAME`), a hostname with no recorded answering type used to

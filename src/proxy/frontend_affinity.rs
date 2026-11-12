@@ -74,9 +74,17 @@
 //! backend host can see up to `http2_connections_per_host` backend
 //! connections where round-robin borrowing would have reused fewer.
 //!
-//! The direct HTTP/2 pool keeps the round-robin start for every request: on the
-//! protocol benchmark the same affinity made HTTP/2 slower (up to about 20% at
-//! 1–5 MiB on one runner type), while gRPC gained at 10 KiB on every runner.
+//! The direct HTTP/2 pool reads the same count through [`shard_start`]: an
+//! HTTP/2 frontend connection under [`AFFINITY_MAX_OPEN_STREAMS`] keeps its
+//! requests on its own shard, and every other request takes the round-robin
+//! shard. That pool has no sampled backend stream limit, so its only bound is
+//! [`AFFINITY_MAX_OPEN_STREAMS`]. Like the gRPC pool it serves a request from a
+//! ready sibling while a missing or closed preferred shard is created in the
+//! background (`pool::shard_fill`). Before it did, the direct pool took the
+//! first ready shard, which is always the first connection it ever opened
+//! (the startup capability probe's): every stream shared one backend
+//! connection, and the gateway and the backend each ran one connection task
+//! for all of them.
 
 use std::future::Future;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -268,7 +276,8 @@ tokio::task_local! {
     static FRONTEND_STREAM: Arc<FrontendConnectionAffinity>;
 }
 
-/// Where the gRPC pool's shard probe starts for the current call.
+/// Where a sharded HTTP/2 pool's probe starts for the current call (the gRPC
+/// pool and the direct HTTP/2 pool).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ShardStart {
     /// The frontend connection's own shard, created if missing. The pool
