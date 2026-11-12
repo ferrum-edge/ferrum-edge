@@ -756,10 +756,7 @@ impl Plugin for AiTokenMetrics {
     fn should_buffer_response_body(&self, ctx: &RequestContext) -> bool {
         // Request hints avoid buffering before headers. When no hint exists,
         // the response-header and retry-release hooks also recognize origin SSE.
-        if !self.buffer_streaming_responses && self.request_prefers_streaming(ctx) {
-            return false;
-        }
-        true
+        self.buffer_streaming_responses || !self.request_prefers_streaming(ctx)
     }
 
     fn may_release_response_body_under_retries(&self, ctx: &RequestContext) -> bool {
