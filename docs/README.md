@@ -251,6 +251,8 @@ text. Governance lives in [dependency-policy.md](dependency-policy.md).
   ([patch](upstream-hyper-patches/007-h2-request-body-deadline/hyper-h2-request-body-deadline.patch))
 - 008 — [bound how long an HTTP/2 response body may wait for client window](upstream-hyper-patches/008-h2-response-write-timeout/README.md)
   ([patch](upstream-hyper-patches/008-h2-response-write-timeout/hyper-h2-response-write-timeout.patch))
+- 009 — [box the HTTP/2 client connection task](upstream-hyper-patches/009-h2-client-conn-task-box/README.md)
+  ([patch](upstream-hyper-patches/009-h2-client-conn-task-box/hyper-h2-client-conn-task-box.patch))
 
 ### h2
 

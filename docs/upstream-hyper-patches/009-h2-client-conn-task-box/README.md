@@ -1,0 +1,91 @@
+# hyper: box the HTTP/2 client connection task so per-request tasks stay small
+
+> Governance: tracked in [docs/dependency-policy.md](../../dependency-policy.md).
+> Any change to `vendor/hyper-1.10.0-ferrum-patched/` must regenerate the
+> drift manifest (`scripts/update_vendor_integrity.sh`).
+
+## Status
+
+Deliberate fork with no upstream filing yet, governed by the
+[deliberate fork policy](../../dependency-policy.md#deliberate-fork-policy-and-sla).
+Owner: Ferrum Edge maintainers. The change has no Ferrum-specific surface and
+is suitable for upstream as it stands; an issue draft is at the end of this
+file.
+
+## The problem
+
+hyper's HTTP/2 client hands its executor three kinds of future, all through one
+enum, `proto::h2::client::H2ClientFuture`:
+
+- `Task`: the connection task. One per connection. It owns the h2
+  `Connection`, so it is large.
+- `Send`: resolves a request's response. One per request.
+- `Pipe`: writes a request body. One per request that has a body.
+
+An enum is as large as its largest variant. With `Task` stored inline, every
+`Send` and `Pipe` future was as large as the connection task. On Ferrum's
+direct HTTP/2 pool (`H2ClientFuture<DirectH2RequestBody, TokioIo<TlsStream<TcpStream>>, TokioExecutor>`)
+that is about 2.5 KiB (the release binary copies 2,528 to 2,536 bytes at each
+site), against a few hundred bytes of real state. The executor copies the
+future into a task allocation of that size for every request, and the runtime
+writes a value of the same size again when the task finishes.
+
+In CPU profiles of the HTTP/2 10 KiB benchmark cell (13 runs on `main`
+856ea7634, five runner CPU models) those copies were 0.5% to 1.4% of the
+gateway's user CPU: a mean of 0.70% on EPYC 7763, 1.07% on EPYC 9V74, 0.52% on
+Xeon 8573C, 0.67% on Xeon 6973P-C and 0.67% on EPYC 9V45.
+
+## Patch
+
+Apply [the complete ordered stack](../README.md) for reproducible vendor source.
+
+The change is confined to `src/proto/h2/client.rs`. The unified diff is
+[`hyper-h2-client-conn-task-box.patch`](hyper-h2-client-conn-task-box.patch),
+taken against the published hyper 1.10.0 crate with patches 001 to 008 applied.
+
+`H2ClientFuture::Task` holds `Pin<Box<ConnTask<T, B>>>` instead of an inline,
+pin-projected `ConnTask<T, B>`. `handshake` boxes the connection task once when
+it spawns it, and the enum's `poll` forwards to the box. Nothing else changes:
+the connection task is polled by the same executor task, and dropping the
+future drops the connection task as before.
+
+The cost is one allocation per connection. The enum is then as large as its
+largest per-request variant.
+
+## Regression coverage
+
+- `proto::h2::client::ferrum_client_conn_task_box_tests` in the vendored crate
+  asserts that the spawned future is no larger than its largest per-request
+  variant plus the enum tag, and smaller than the connection task. Run with
+  `cargo test --manifest-path vendor/hyper-1.10.0-ferrum-patched/Cargo.toml --features full --lib ferrum_client_conn_task_box`.
+- Behaviour is unchanged, so the gateway's existing HTTP/2 client coverage is
+  the behavioural regression: every test in
+  `tests/integration/http2_pool_tests.rs` drives requests through the boxed
+  connection task on a real connection, including connection close and pool
+  refill.
+
+## Retirement plan
+
+Retire when hyper stops sizing its per-request HTTP/2 client futures by the
+connection task (for example by boxing `ConnTask`, or by spawning it through a
+separate executor bound), or when the vendored hyper is retired as a whole.
+Drop the patch's hunks from the vendored copy, the inventory row, the lifecycle
+entry and this directory, remove it from `series` and from the reconstruction
+verifier, then regenerate `vendor/VENDOR_INTEGRITY.sha256`.
+
+## Upstream issue draft
+
+**Title:** HTTP/2 client: per-request `H2ClientFuture` is sized by the connection task
+
+`H2ClientFuture` has three variants: `Pipe` and `Send` are spawned per request,
+`Task` once per connection. `Task` holds `ConnTask<T, B>` inline, which owns
+the h2 `Connection` (about 2.4 KiB with a TLS transport), so every `Pipe` and
+`Send` future an executor receives is that large too. With tokio this means a
+2.5 KiB task allocation and copy per request for futures whose own state is a
+few hundred bytes.
+
+Boxing the connection task (`Task { task: Pin<Box<ConnTask<T, B>>> }`) costs
+one allocation per connection and makes the enum as large as its largest
+per-request variant. It needs no API change: the type lives in a private
+module and reaches executors only through the sealed `Http2ClientConnExec`
+bound, so its layout is not part of the public API.

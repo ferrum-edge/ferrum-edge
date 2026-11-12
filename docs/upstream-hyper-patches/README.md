@@ -22,6 +22,7 @@ root. Each patch is based on the output of all preceding patches:
 | [006](006-h2-stream-termination-origin/README.md) | Hyper 1.10.0 + 001 + 002 + 003 + 004 + 005 | Publish why an HTTP/2 server stream ended while its service future is dropped |
 | [007](007-h2-request-body-deadline/README.md) | Hyper 1.10.0 + 001 + 002 + 003 + 004 + 005 + 006 | Absolute HTTP/2 client request-body deadline that resets the stream whatever the body pipe is parked on |
 | [008](008-h2-response-write-timeout/README.md) | Hyper 1.10.0 + 001–007 | HTTP/2 server response-body bound on a closed client flow-control window |
+| [009](009-h2-client-conn-task-box/README.md) | Hyper 1.10.0 + 001–008 | Box the HTTP/2 client connection task so per-request client futures are not sized by it |
 
 Patch 002 supplies `pending_data`; patches 004 and 005 build on it, and patch
 008 applies patch 004's write-stall timer to the server's response pipe. Patch 002
@@ -46,7 +47,7 @@ at `capacity()`.
 The **Dependency Audit (cargo-deny)** job in
 [CI](../../.github/workflows/ci.yml) downloads and checks the pinned archive,
 then runs [the reconstruction verifier](../../.github/scripts/verify_hyper_patch_stack.py)
-before Cargo touches the vendor tree. It applies all eight patches with
+before Cargo touches the vendor tree. It applies all nine patches with
 `git apply` to a fresh extracted crate. It neither formats the result nor
 copies source from `vendor/` over it.
 

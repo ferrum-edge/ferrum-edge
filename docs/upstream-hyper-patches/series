@@ -6,3 +6,4 @@
 006-h2-stream-termination-origin/hyper-h2-stream-termination-origin.patch
 007-h2-request-body-deadline/hyper-h2-request-body-deadline.patch
 008-h2-response-write-timeout/hyper-h2-response-write-timeout.patch
+009-h2-client-conn-task-box/hyper-h2-client-conn-task-box.patch
