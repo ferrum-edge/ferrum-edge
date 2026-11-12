@@ -1,0 +1,38 @@
+# Throwaway diagnostic (never merge): print Rust type and future sizes.
+name: Tmp Type Sizes
+on:
+  push:
+    branches: [bench/type-sizes]
+permissions:
+  contents: read
+jobs:
+  sizes:
+    name: Print type sizes
+    runs-on: ubuntu-26.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          toolchain: stable
+      - name: Native prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler libcurl4-openssl-dev
+      - name: Print type sizes
+        env:
+          RUSTC_BOOTSTRAP: "1"
+        run: |
+          set -o pipefail
+          cargo rustc --locked --profile ci-release --lib -- -Zprint-type-sizes \
+            | python3 scripts/tmp_filter_type_sizes.py > type-sizes.txt
+          wc -l type-sizes.txt
+          gzip -9 type-sizes.txt
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: type-sizes
+          path: type-sizes.txt.gz
+          retention-days: 7
