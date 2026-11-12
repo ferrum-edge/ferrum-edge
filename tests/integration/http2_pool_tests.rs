@@ -1759,6 +1759,46 @@ async fn test_http2_pool_drain_discards_a_connection_still_being_established() {
 }
 
 #[tokio::test]
+async fn test_http2_pool_drain_is_remembered_by_a_waiter_that_dials_after_it() {
+    let (port, accepted, gate) = start_scripted_h2_tls_backend(H2TlsBackendScript::GateAll).await;
+    let pool = direct_h2_pool(1);
+    let mut proxy = direct_h2_proxy(port);
+    proxy.backend_connect_timeout_ms = 30_000;
+
+    // Two requests miss the cold pool: one dials (and stalls in TLS), the
+    // other waits on that create. The pool is drained while both are in the
+    // create path, then the backend answers.
+    gate.send_replace(true);
+    let drain_then_release = async {
+        wait_for_affinity_accepts(&accepted, 1).await;
+        pool.force_drain_all();
+        gate.send_replace(false);
+    };
+    let (creator, waiter, ()) = tokio::join!(
+        pool.get_sender(&proxy),
+        pool.get_sender(&proxy),
+        drain_then_release
+    );
+    assert!(!creator.expect("creator sender").is_closed());
+    assert!(!waiter.expect("waiter sender").is_closed());
+
+    // Neither connection was published: the creator's predates the drain,
+    // and the waiter entered the pool before the drain too, so the connection
+    // it dialled afterwards is its own as well.
+    assert_eq!(accepted.load(Ordering::Relaxed), 2);
+    assert_eq!(
+        pool.pool_size(),
+        0,
+        "an acquisition that began before the drain publishes nothing"
+    );
+
+    // A request that arrives after the drain dials and is published.
+    pool.get_sender(&proxy).await.expect("fresh sender");
+    assert_eq!(accepted.load(Ordering::Relaxed), 3);
+    assert_eq!(pool.pool_size(), 1);
+}
+
+#[tokio::test]
 async fn test_http2_pool_refills_a_closed_preferred_shard_in_the_background() {
     use ferrum_edge::proxy::frontend_affinity::FrontendConnectionAffinity;
     use futures_util::FutureExt;

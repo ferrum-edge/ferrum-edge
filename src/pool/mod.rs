@@ -480,11 +480,6 @@ struct PendingCreation {
     /// The creator is a capability probe with a capped connect budget. Its
     /// failure is broadcast to probe waiters only; request waiters re-elect.
     probe_owned: bool,
-    /// Set when the pool was drained of this key (a TLS material or CRL
-    /// reload, an SVID rotation, a config reload) while this create was in
-    /// flight. The connection it produces was established before the drain,
-    /// so it is handed to its creator alone and never published.
-    drained: AtomicBool,
     /// Set when any live-request caller joins this coalesced create.
     request_joined: AtomicBool,
     /// Highest establishment-log rank claimed for this attempt:
@@ -622,7 +617,6 @@ impl PendingCreation {
         Self {
             outcome_tx,
             probe_owned: false,
-            drained: AtomicBool::new(false),
             request_joined: AtomicBool::new(false),
             emitted_rank: AtomicU8::new(0),
             log_context: OnceLock::new(),
@@ -912,6 +906,11 @@ pub struct GenericPool<M: PoolManager> {
     /// permit or queues ahead of a request-path create.
     background_inflight: Arc<Semaphore>,
     pending_creations: Arc<DashMap<String, Arc<PendingCreation>>>,
+    /// Bumped by every drain ([`Self::clear`], [`Self::invalidate_matching`]).
+    /// A cold acquisition samples it once on entry and keeps that sample
+    /// across coalesced waits and re-election; a connection it creates is
+    /// published only while the value is unchanged. Never read on a warm hit.
+    drain_epoch: AtomicU64,
 }
 
 /// One permit from a pool's background-create budget
@@ -957,6 +956,7 @@ impl<M: PoolManager> GenericPool<M> {
             inflight: Arc::new(Semaphore::new(inflight_limit)),
             background_inflight: Arc::new(Semaphore::new(background_limit)),
             pending_creations: Arc::new(DashMap::with_shard_amount(shards)),
+            drain_epoch: AtomicU64::new(0),
         });
         pool.clone().spawn_cleanup();
         pool
@@ -1030,33 +1030,32 @@ impl<M: PoolManager> GenericPool<M> {
         }
     }
 
-    /// Drain every connection: the published entries, and any still being
-    /// established.
+    /// Drain every published connection, and stop every cold acquisition
+    /// already under way from publishing the connection it creates.
     ///
-    /// A create in flight took its dial inputs (the backend TLS
-    /// configuration, the SVID generation) before this drain, so its
-    /// connection must not be published after it. Such creates are marked
-    /// BEFORE the entries are removed: a creator that passed the mark check
-    /// had already published under its entry lock, and the removal pass below
-    /// then takes that entry too. Cold path.
+    /// A cold acquisition took its dial inputs (the backend TLS
+    /// configuration, the SVID generation) before this drain, so a connection
+    /// it establishes must not be published after it. Each one sampled the
+    /// drain epoch when it entered the pool and carries that sample across
+    /// coalesced waits and re-election, so bumping the epoch here fences the
+    /// creator in flight and every waiter that would re-elect after it. The
+    /// bump comes BEFORE the entries are removed: a creator that passed its
+    /// epoch check had already published under its entry lock, and the
+    /// removal pass below then takes that entry too. Cold path.
     pub fn clear(&self) {
-        for pending in self.pending_creations.iter() {
-            pending.value().drained.store(true, Ordering::Release);
-        }
+        self.drain_epoch.fetch_add(1, Ordering::AcqRel);
         let keys = self.keys_snapshot();
         for key in keys {
             self.invalidate(&key);
         }
     }
 
-    /// Drain the connections whose key `predicate` selects, including any
-    /// still being established (see [`Self::clear`]). Cold path.
+    /// Drain the published connections whose key `predicate` selects. Cold
+    /// acquisitions already under way are fenced as in [`Self::clear`], for
+    /// every key: a selective drain is rare, and an acquisition it fences
+    /// needlessly only hands its connection to its own caller. Cold path.
     pub fn invalidate_matching(&self, predicate: impl Fn(&str) -> bool) {
-        for pending in self.pending_creations.iter() {
-            if predicate(pending.key()) {
-                pending.value().drained.store(true, Ordering::Release);
-            }
-        }
+        self.drain_epoch.fetch_add(1, Ordering::AcqRel);
         let keys = self.keys_snapshot();
         for key in keys {
             if predicate(&key) {
@@ -1310,6 +1309,9 @@ impl<M: PoolManager> GenericPool<M> {
         R: Fn(&str) -> Option<M::Connection>,
     {
         let mut create = Some(create);
+        // Sampled once, before the first cache check, and kept across every
+        // coalesced wait and re-election below (see `clear`).
+        let drain_epoch = self.drain_epoch.load(Ordering::Acquire);
 
         loop {
             if let Some(conn) = self.cached(&key) {
@@ -1347,7 +1349,7 @@ impl<M: PoolManager> GenericPool<M> {
             crate::profile_pool_event!(CreateOwner);
             let pending_guard = PendingCreationGuard::new(self, key.clone(), pending);
             let result = self
-                .create_after_recheck(key.clone(), budget, &attempt.inner, &recover, {
+                .create_after_recheck(key.clone(), budget, drain_epoch, &recover, {
                     let create = create
                         .take()
                         .expect("create closure should only be consumed by the creator");
@@ -1422,7 +1424,7 @@ impl<M: PoolManager> GenericPool<M> {
         &self,
         key: String,
         budget: CreateBudget,
-        pending: &PendingCreation,
+        drain_epoch: u64,
         recover: R,
         create: C,
     ) -> std::result::Result<M::Connection, E>
@@ -1464,11 +1466,11 @@ impl<M: PoolManager> GenericPool<M> {
         let now = now_tick_ms();
 
         let slot = self.entries.entry(key);
-        // Checked under the entry lock, so it is atomic with a drain's mark
-        // and removal passes (see `clear`). A connection established before a
-        // drain serves its creator, as any request already in flight at the
-        // drain does, and is closed when that caller drops it.
-        if pending.drained.load(Ordering::Acquire) {
+        // Checked under the entry lock, so it is atomic with a drain's epoch
+        // bump and removal pass (see `clear`). A connection this acquisition
+        // began before a drain serves its caller, as any request already in
+        // flight at the drain does, and is closed when that caller drops it.
+        if self.drain_epoch.load(Ordering::Acquire) != drain_epoch {
             drop(slot);
             return Ok(created);
         }
