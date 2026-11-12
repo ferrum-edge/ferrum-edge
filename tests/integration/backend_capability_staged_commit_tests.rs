@@ -41,11 +41,22 @@ const SUPPORTED: ProtocolSupport = ProtocolSupport::Supported;
 const UNSUPPORTED: ProtocolSupport = ProtocolSupport::Unsupported;
 const UNKNOWN: ProtocolSupport = ProtocolSupport::Unknown;
 
-/// Bound for every wait on the fixture. The HTTP/3 probe itself gives up
-/// after `backend_connect_timeout_ms` (capped at 5 s for probes), so each
-/// test must reach its release well inside that; nothing here sleeps for a
-/// fixed time.
+/// Bound for every wait on the fixture; nothing here sleeps for a fixed time.
 const WAIT: Duration = Duration::from_secs(15);
+
+/// How long the gateway's HTTP/3 probe waits for the held handshake before it
+/// gives up: `backend_connect_timeout_ms` below, which is also the probe cap.
+/// Each test reaches its release in a small fraction of this (one TLS
+/// handshake plus registry polls). Both fixture waits check that it did, so a
+/// runner stalled for seconds fails with that reason rather than with a
+/// misleading registry assertion.
+const H3_PROBE_BUDGET: Duration = Duration::from_millis(5_000);
+
+/// One refresh running on its own task, and when it started.
+struct RunningRefresh {
+    handle: JoinHandle<()>,
+    started: tokio::time::Instant,
+}
 
 /// One HTTPS target whose HTTP/2 side answers immediately and whose HTTP/3
 /// side is held at a barrier, plus a `ProxyState` that has not probed it yet.
@@ -136,9 +147,11 @@ impl StagedProbeFixture {
     }
 
     /// Run one refresh on its own task, as the background refresh does.
-    fn spawn_refresh(&self) -> JoinHandle<()> {
+    fn spawn_refresh(&self) -> RunningRefresh {
         let state = self.state.clone();
-        tokio::spawn(async move { state.refresh_backend_capabilities().await })
+        let started = tokio::time::Instant::now();
+        let handle = tokio::spawn(async move { state.refresh_backend_capabilities().await });
+        RunningRefresh { handle, started }
     }
 
     /// The published record, read the way dispatch reads it.
@@ -146,64 +159,74 @@ impl StagedProbeFixture {
         self.state.backend_capabilities.get(&self.proxy, None)
     }
 
-    async fn wait_for_record(
+    /// Wait until the registry reports the HTTP/2 verdict AND the HTTP/3
+    /// probe's Initial is parked at the barrier, and return that record.
+    ///
+    /// The window under test exists only while the HTTP/3 probe is waiting,
+    /// which it does for at most `H3_PROBE_BUDGET`. Every observation below
+    /// is therefore taken first and accepted only if the budget had not run
+    /// out by then: a record read inside the budget with a handshake held and
+    /// none completed cannot carry an HTTP/3 verdict, so it is the early
+    /// stage, and the refresh cannot have finished. Past the budget the test
+    /// fails here, naming the cause, instead of at a later registry assertion.
+    async fn wait_for_h2_verdict_with_h3_held(
         &self,
-        what: &str,
-        ready: impl Fn(&BackendCapabilityRecord) -> bool,
+        refresh: &RunningRefresh,
     ) -> Arc<BackendCapabilityRecord> {
-        let deadline = tokio::time::Instant::now() + WAIT;
         loop {
+            let refresh_finished = refresh.handle.is_finished();
             let record = self.record();
-            if let Some(record) = &record
-                && ready(record.as_ref())
+            let held = self.h3_backend.held_handshakes();
+            let completed = self.h3_backend.accepted_handshakes();
+            let waited = refresh.started.elapsed();
+            assert!(
+                waited < H3_PROBE_BUDGET,
+                "after {waited:?} the early HTTP/2 verdict and a held HTTP/3 handshake had \
+                 not both been observed (held: {held}, completed: {completed}, refresh \
+                 finished: {refresh_finished}, published record: {record:?}). The HTTP/3 \
+                 probe gives up after {H3_PROBE_BUDGET:?}, so the window under test is gone: \
+                 a stalled runner, or the early stage was never published"
+            );
+            if held > 0
+                && let Some(record) = &record
+                && record.plain_http.h2_tls == SUPPORTED
             {
+                assert_eq!(
+                    completed, 0,
+                    "the HTTP/3 handshake must still be held when the early record is read"
+                );
+                assert!(
+                    !refresh_finished,
+                    "the refresh as a whole must still be waiting for the HTTP/3 probe"
+                );
                 return Arc::clone(record);
             }
-            assert!(
-                tokio::time::Instant::now() < deadline,
-                "timed out waiting for {what}; published record: {record:?}"
-            );
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
-    }
-
-    /// Wait until the registry reports the HTTP/2 verdict AND the HTTP/3
-    /// probe's Initial is parked at the barrier. From then until
-    /// `release_handshakes` the HTTP/3 probe cannot have a verdict, so any
-    /// record read in that window is the early stage.
-    async fn wait_for_h2_verdict_with_h3_held(&self) -> Arc<BackendCapabilityRecord> {
-        let deadline = tokio::time::Instant::now() + WAIT;
-        while self.h3_backend.held_handshakes() == 0 {
-            assert!(
-                tokio::time::Instant::now() < deadline,
-                "the HTTP/3 probe never reached the gated QUIC listener \
-                 (connections seen: {})",
-                self.h3_backend.accepted_connections()
-            );
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-        let early = self
-            .wait_for_record("the early HTTP/2 verdict", |record| {
-                record.plain_http.h2_tls == SUPPORTED
-            })
-            .await;
-        assert_eq!(
-            self.h3_backend.accepted_handshakes(),
-            0,
-            "precondition: the HTTP/3 handshake must still be held"
-        );
-        early
     }
 
     /// Open the barrier, let the refresh finish, and prove the HTTP/3 probe
-    /// really completed its handshake (so it had a `Supported` verdict to
-    /// publish, whatever the registry then did with it).
-    async fn release_h3_and_finish(&self, refresh: JoinHandle<()>) {
+    /// really connected (so the verdict it held was `Supported`, whatever the
+    /// registry then did with it).
+    async fn release_h3_and_finish(&self, refresh: RunningRefresh) {
+        let held_for = refresh.started.elapsed();
+        assert!(
+            held_for < H3_PROBE_BUDGET,
+            "the test reached the release only after {held_for:?}, past the \
+             {H3_PROBE_BUDGET:?} HTTP/3 probe budget, so the probe has already \
+             timed out and its verdict is not the one under test (stalled runner)"
+        );
         self.h3_backend.release_handshakes();
-        tokio::time::timeout(WAIT, refresh)
+        tokio::time::timeout(WAIT, refresh.handle)
             .await
             .expect("refresh must finish once the HTTP/3 probe is released")
             .expect("refresh task");
+        // Client side: the probe returns `Supported` exactly when it pooled a
+        // connection, and nothing else in these tests dials HTTP/3.
+        assert!(
+            self.state.h3_pool.pool_size() >= 1,
+            "the gateway's HTTP/3 probe must have connected once released"
+        );
         let deadline = tokio::time::Instant::now() + WAIT;
         while self.h3_backend.accepted_handshakes() == 0 {
             if tokio::time::Instant::now() >= deadline {
@@ -229,12 +252,9 @@ async fn h2_verdict_is_published_while_the_h3_probe_is_still_open() {
     );
 
     let refresh = fixture.spawn_refresh();
-    let early = fixture.wait_for_h2_verdict_with_h3_held().await;
+    // Also asserts the refresh itself was still running when `early` was read.
+    let early = fixture.wait_for_h2_verdict_with_h3_held(&refresh).await;
 
-    assert!(
-        !refresh.is_finished(),
-        "the refresh as a whole still waits for the HTTP/3 probe"
-    );
     assert_eq!(early.plain_http.h2_tls, SUPPORTED);
     assert_eq!(
         early.grpc_transport.h2_tls, SUPPORTED,
@@ -286,7 +306,7 @@ async fn early_stage_keeps_the_previous_h3_value_until_the_h3_probe_finishes() {
     assert_eq!(seeded.plain_http.h2_tls, UNKNOWN);
 
     let refresh = fixture.spawn_refresh();
-    let early = fixture.wait_for_h2_verdict_with_h3_held().await;
+    let early = fixture.wait_for_h2_verdict_with_h3_held(&refresh).await;
 
     assert_eq!(early.plain_http.h2_tls, SUPPORTED);
     assert_eq!(
@@ -311,7 +331,7 @@ async fn early_stage_keeps_the_previous_h3_value_until_the_h3_probe_finishes() {
 async fn h3_downgrade_between_the_stages_is_not_overwritten_by_the_h3_verdict() {
     let fixture = StagedProbeFixture::start("staged-commit-h3-mark").await;
     let refresh = fixture.spawn_refresh();
-    let early = fixture.wait_for_h2_verdict_with_h3_held().await;
+    let early = fixture.wait_for_h2_verdict_with_h3_held(&refresh).await;
     assert_eq!(early.plain_http.h3, UNKNOWN);
 
     fixture
@@ -343,7 +363,11 @@ async fn h3_downgrade_between_the_stages_is_not_overwritten_by_the_h3_verdict() 
 
     // The discarded verdict is not lost for good: the next refresh merges
     // against the downgraded record and re-classifies from there.
-    fixture.spawn_refresh().await.expect("second refresh");
+    fixture
+        .spawn_refresh()
+        .handle
+        .await
+        .expect("second refresh");
     let reprobed = fixture.record().expect("published record");
     assert_eq!(reprobed.plain_http.h3, SUPPORTED);
     assert_eq!(reprobed.plain_http.h2_tls, SUPPORTED);
@@ -357,7 +381,7 @@ async fn h3_downgrade_between_the_stages_is_not_overwritten_by_the_h3_verdict() 
 async fn h2_downgrade_between_the_stages_survives_the_h3_stage() {
     let fixture = StagedProbeFixture::start("staged-commit-h2-mark").await;
     let refresh = fixture.spawn_refresh();
-    let early = fixture.wait_for_h2_verdict_with_h3_held().await;
+    let early = fixture.wait_for_h2_verdict_with_h3_held(&refresh).await;
     assert_eq!(early.plain_http.h3, UNKNOWN);
 
     assert!(

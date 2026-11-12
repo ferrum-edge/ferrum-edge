@@ -243,6 +243,13 @@ impl StagedCommitLoss {
 /// stage therefore breaks the chain exactly as it breaks a single
 /// `commit_probe`: the newer record wins whichever field it touched.
 ///
+/// "Exactly as" includes `commit_probe`'s one blind spot: an absent key has
+/// no version. A first stage whose expectation is "vacant" commits whenever
+/// the key is vacant at that moment, even if the target was inserted and
+/// pruned, or simply left the config, during the probe; the next refresh's
+/// `retain_keys` removes such an entry. Staging narrows that window (the
+/// first stage commits as soon as HTTP/2 answers) but does not close it.
+///
 /// A lost stage is final. Every later stage reports the same rejection
 /// without touching the registry — it does not fall back to comparing
 /// against an older expectation. That matters for a first probe: its opening

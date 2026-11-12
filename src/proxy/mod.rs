@@ -13076,6 +13076,12 @@ impl ProxyState {
         // Probes whose write-back lost to newer registry state (a request-path
         // downgrade, or a `retain_keys` eviction) during the probe window.
         let conflicts = Arc::new(AtomicU64::new(0));
+        // The subset of `conflicts` that had already published an early
+        // HTTP/2 verdict when the live state superseded them. That verdict was
+        // visible (and may still be, under the downgrade that replaced it),
+        // but the target is not in the protocol tallies: those describe
+        // complete classifications only.
+        let conflicts_after_early_stage = Arc::new(AtomicU64::new(0));
 
         stream::iter(targets)
             .for_each_concurrent(buffer, |target| {
@@ -13086,6 +13092,7 @@ impl ProxyState {
                 let h2c_supported = h2c_supported.clone();
                 let hbone_supported = hbone_supported.clone();
                 let conflicts = conflicts.clone();
+                let conflicts_after_early_stage = conflicts_after_early_stage.clone();
                 let semaphore = semaphore.clone();
                 async move {
                     // Same rule as `run_warmup_task_batch`: prefer
@@ -13128,12 +13135,18 @@ impl ProxyState {
                     let committed = match outcome {
                         CapabilityCommitOutcome::Committed(committed) => committed,
                         rejected => {
-                            // Counters and the summary line describe committed
-                            // registry state only — a discarded probe must not
-                            // be reported as this target's classification.
-                            // `published_stages` is 1 when the HTTP/2 verdict
-                            // went out before the live state superseded it.
+                            // The protocol tallies describe complete
+                            // classifications only — a probe whose final
+                            // commit lost must not be reported as this
+                            // target's classification. `published_stages` is
+                            // 1 when its HTTP/2 verdict went out before the
+                            // live state superseded it; that case is counted
+                            // on its own so the summary does not claim the
+                            // refresh published nothing for the target.
                             conflicts.fetch_add(1, Ordering::Relaxed);
+                            if commit.published_stages() > 0 {
+                                conflicts_after_early_stage.fetch_add(1, Ordering::Relaxed);
+                            }
                             debug!(
                                 proxy_id = %target.proxy.id,
                                 backend_host = %target.host(),
@@ -13162,19 +13175,23 @@ impl ProxyState {
             })
             .await;
 
-        // Every tally below is drawn from records this refresh actually
-        // committed. Targets whose probe lost the compare-and-commit are
-        // reported separately as `discarded` — they keep the newer live
-        // classification, so folding them into the protocol counts would
-        // misreport the registry.
+        // Every protocol tally below is drawn from the complete record a
+        // probe committed as its last stage. Targets whose probe lost the
+        // compare-and-commit are reported separately as `discarded` — they
+        // keep the newer live classification, so folding them into the
+        // protocol counts would misreport the registry. A discarded HTTPS
+        // probe may still have published its HTTP/2 verdict as an early
+        // stage before it was superseded; those are called out so "discarded"
+        // is not read as "published nothing".
         info!(
-            "Backend capability refresh complete: {} backends classified (h2_tls={}, h3={}, h2c={}, hbone={}), {} probe results discarded in favor of newer live state",
+            "Backend capability refresh complete: {} backends classified (h2_tls={}, h3={}, h2c={}, hbone={}), {} probe results discarded in favor of newer live state ({} of them after publishing an early HTTP/2 verdict)",
             refreshed.load(Ordering::Relaxed),
             h2_supported.load(Ordering::Relaxed),
             h3_supported.load(Ordering::Relaxed),
             h2c_supported.load(Ordering::Relaxed),
             hbone_supported.load(Ordering::Relaxed),
             conflicts.load(Ordering::Relaxed),
+            conflicts_after_early_stage.load(Ordering::Relaxed),
         );
     }
 
