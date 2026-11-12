@@ -98,7 +98,10 @@ and says so in its tables:
 `--manifest-check` also runs a synthetic self-test (`--self-test` runs it
 alone): each case is one mutation of the real manifest or of a resolved
 selection set, such as a ring arm added to `fips` or a second AWS-LC edge added
-to `crypto-ring`, and the gate fails if any mutation is accepted.
+to `crypto-ring`, and the gate fails if any mutation is accepted. The
+resolved-graph rows are written out a second time inside the self-test and
+cross-checked against the manifest pair table, so a row deleted from a policy
+table is reported instead of taking its test case with it.
 
 ### Building the FIPS profile
 

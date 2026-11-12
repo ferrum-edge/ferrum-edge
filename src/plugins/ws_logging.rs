@@ -1296,6 +1296,14 @@ fn build_tls_connector(
     )))
 }
 
+/// `rustls::ClientConfig::builder()` with the provider named explicitly, so the
+/// sink does not depend on a process-default provider having been installed.
+fn tls_client_config_builder()
+-> Result<rustls::ConfigBuilder<rustls::ClientConfig, rustls::WantsVerifier>, String> {
+    crate::tls::backend_client_config_builder(None)
+        .map_err(|_| "ws_logging: failed to build TLS client configuration".to_string())
+}
+
 /// Build the `wss://` sink's rustls config from the gateway TLS inputs.
 pub(crate) fn build_tls_client_config(
     tls_no_verify: bool,
@@ -1328,7 +1336,7 @@ pub(crate) fn build_tls_client_config(
 
     let mut client_config = if tls_no_verify {
         // No-verify path bypasses CRL checking entirely; warn below on first build.
-        rustls::ClientConfig::builder()
+        tls_client_config_builder()?
             .with_root_certificates(root_store)
             .with_no_client_auth()
     } else {
@@ -1341,7 +1349,7 @@ pub(crate) fn build_tls_client_config(
                 let verifier = client
                     .crl_server_verifier(root_store)
                     .map_err(|_| "ws_logging: failed to build TLS verifier".to_string())?;
-                let mut config = rustls::ClientConfig::builder()
+                let mut config = tls_client_config_builder()?
                     .dangerous()
                     .with_custom_certificate_verifier(verifier)
                     .with_no_client_auth();
@@ -1353,7 +1361,7 @@ pub(crate) fn build_tls_client_config(
             None => {
                 let verifier = crate::tls::build_server_verifier_with_crls(root_store, crls)
                     .map_err(|_| "ws_logging: failed to build TLS verifier".to_string())?;
-                let mut config = rustls::ClientConfig::builder()
+                let mut config = tls_client_config_builder()?
                     .with_webpki_verifier(verifier)
                     .with_no_client_auth();
                 // The connector is reused across reconnects; resumption would skip the

@@ -122,6 +122,9 @@ const EAX_AMD_FAMILY_1BH: u32 = 0x00C0_0F00;
 const EAX_INTEL_EMERALD_RAPIDS_8573C: u32 = 0x000C_06F2;
 const EAX_INTEL_SAPPHIRE_RAPIDS: u32 = 0x0008_06F8;
 const EAX_INTEL_GRANITE_RAPIDS: u32 = 0x000A_06D1;
+const EAX_INTEL_GRANITE_RAPIDS_D: u32 = 0x000A_06E0;
+const EAX_INTEL_ICE_LAKE_CLIENT_7D: u32 = 0x0007_06D0;
+const EAX_INTEL_ICE_LAKE_NNPI: u32 = 0x0009_06D0;
 const EAX_INTEL_ICE_LAKE_SERVER_8370C: u32 = 0x0006_06A6;
 const EAX_INTEL_ICE_LAKE_D: u32 = 0x0006_06C1;
 const EAX_INTEL_ICE_LAKE_CLIENT: u32 = 0x0007_06E5;
@@ -148,6 +151,14 @@ fn display_family_and_model_are_decoded_from_the_signature() {
         ),
         ("Sapphire Rapids", EAX_INTEL_SAPPHIRE_RAPIDS, 0x6, 0x8f),
         ("Granite Rapids", EAX_INTEL_GRANITE_RAPIDS, 0x6, 0xad),
+        ("Granite Rapids-D", EAX_INTEL_GRANITE_RAPIDS_D, 0x6, 0xae),
+        (
+            "Ice Lake client (0x7D)",
+            EAX_INTEL_ICE_LAKE_CLIENT_7D,
+            0x6,
+            0x7d,
+        ),
+        ("Ice Lake NNPI", EAX_INTEL_ICE_LAKE_NNPI, 0x6, 0x9d),
         (
             "Xeon 8370C (Ice Lake)",
             EAX_INTEL_ICE_LAKE_SERVER_8370C,
@@ -260,6 +271,12 @@ fn auto_selects_aws_lc_only_on_the_measured_avx512_cpus() {
         (
             "Intel Granite Rapids",
             x86_64(CpuVendor::Intel, EAX_INTEL_GRANITE_RAPIDS, all),
+            AeadBackend::AwsLc,
+            QualifiedCpu,
+        ),
+        (
+            "Intel Granite Rapids-D",
+            x86_64(CpuVendor::Intel, EAX_INTEL_GRANITE_RAPIDS_D, all),
             AeadBackend::AwsLc,
             QualifiedCpu,
         ),
@@ -433,10 +450,75 @@ fn auto_requires_every_feature_aws_lc_dispatches_on() {
 }
 
 #[test]
+fn every_listed_intel_model_has_a_pinned_verdict() {
+    // The lists are written out again here on purpose: dropping, adding or
+    // mistyping a model in the module must fail a test, not pass silently.
+    assert_eq!(aead_backend::AMD_FAMILY_19H, 0x19);
+    assert_eq!(aead_backend::AMD_FAMILY_1AH, 0x1a);
+    assert_eq!(aead_backend::INTEL_FAMILY_6, 0x6);
+    assert_eq!(
+        aead_backend::INTEL_QUALIFIED_MODELS,
+        &[0x8f, 0xcf, 0xad, 0xae]
+    );
+    assert_eq!(
+        aead_backend::INTEL_PRE_SAPPHIRE_RAPIDS_MODELS,
+        &[0x6a, 0x6c, 0x7d, 0x7e, 0x9d, 0x8c, 0x8d, 0xa7]
+    );
+
+    let intel = |model: u32| CpuFacts {
+        target: TargetClass::X86_64,
+        vendor: CpuVendor::Intel,
+        family: aead_backend::INTEL_FAMILY_6,
+        model,
+        features: Avx512GcmFeatures::ALL,
+    };
+    for model in aead_backend::INTEL_QUALIFIED_MODELS {
+        let verdict = aead_backend::auto_verdict(&intel(*model));
+        assert_eq!(verdict.backend, AeadBackend::AwsLc, "model {model:#x}");
+        assert_eq!(
+            verdict.reason,
+            AeadSelectionReason::QualifiedCpu,
+            "model {model:#x}"
+        );
+    }
+    for model in aead_backend::INTEL_PRE_SAPPHIRE_RAPIDS_MODELS {
+        let verdict = aead_backend::auto_verdict(&intel(*model));
+        assert_eq!(verdict.backend, AeadBackend::Ring, "model {model:#x}");
+        assert_eq!(
+            verdict.reason,
+            AeadSelectionReason::IntelPreSapphireRapids,
+            "model {model:#x}"
+        );
+    }
+    // A model on neither list, and the same model numbers on another family or
+    // vendor, do not qualify.
+    for model in aead_backend::INTEL_QUALIFIED_MODELS {
+        let other_family = CpuFacts {
+            family: 0xf,
+            ..intel(*model)
+        };
+        assert_eq!(
+            aead_backend::auto_verdict(&other_family).backend,
+            AeadBackend::Ring,
+            "family 15 model {model:#x}"
+        );
+        let amd = CpuFacts {
+            vendor: CpuVendor::Amd,
+            ..intel(*model)
+        };
+        assert_eq!(
+            aead_backend::auto_verdict(&amd).backend,
+            AeadBackend::Ring,
+            "AMD family 6 model {model:#x}"
+        );
+    }
+}
+
+#[test]
 fn auto_keeps_ring_off_x86_64_and_on_windows() {
     // A qualifying CPU signature and feature set, on targets where they do not
-    // matter: AWS-LC has no AVX-512 AES-GCM on Windows, and no other
-    // architecture was measured.
+    // matter: AWS-LC has no AVX-512 AES-GCM on Windows, never treats AVX-512 as
+    // usable on Apple platforms, and no other architecture was measured.
     let windows = CpuFacts {
         target: TargetClass::X86_64Windows,
         ..zen5()
@@ -444,6 +526,14 @@ fn auto_keeps_ring_off_x86_64_and_on_windows() {
     let verdict = aead_backend::auto_verdict(&windows);
     assert_eq!(verdict.backend, AeadBackend::Ring);
     assert_eq!(verdict.reason, AeadSelectionReason::WindowsTarget);
+
+    let apple = CpuFacts {
+        target: TargetClass::X86_64Apple,
+        ..zen5()
+    };
+    let verdict = aead_backend::auto_verdict(&apple);
+    assert_eq!(verdict.backend, AeadBackend::Ring);
+    assert_eq!(verdict.reason, AeadSelectionReason::AppleTarget);
 
     let other_arch = CpuFacts {
         target: TargetClass::Other,
@@ -461,13 +551,15 @@ fn auto_keeps_ring_off_x86_64_and_on_windows() {
 #[test]
 fn detected_cpu_facts_agree_with_the_build_target() {
     let detected = CpuFacts::detect();
-    if cfg!(all(target_arch = "x86_64", not(windows))) {
+    if cfg!(not(target_arch = "x86_64")) {
+        assert_eq!(detected, CpuFacts::UNKNOWN);
+    } else if cfg!(windows) {
+        assert_eq!(detected.target, TargetClass::X86_64Windows);
+    } else if cfg!(target_vendor = "apple") {
+        assert_eq!(detected.target, TargetClass::X86_64Apple);
+    } else {
         assert_eq!(detected.target, TargetClass::X86_64);
         assert!(detected.family > 0, "x86-64 always reports a family");
-    } else if cfg!(target_arch = "x86_64") {
-        assert_eq!(detected.target, TargetClass::X86_64Windows);
-    } else {
-        assert_eq!(detected, CpuFacts::UNKNOWN);
     }
     // Whatever this machine is, the rule gives it a definite answer, and that
     // answer is AWS-LC only when the features really are present.
@@ -523,6 +615,14 @@ fn override_is_honoured_as_given_on_the_ordinary_build() {
             },
             AeadSelectionReason::WindowsTarget,
         ),
+        (
+            "macOS",
+            CpuFacts {
+                target: TargetClass::X86_64Apple,
+                ..zen5()
+            },
+            AeadSelectionReason::AppleTarget,
+        ),
     ] {
         let selection = aead_backend::select(AeadBackendRequest::AwsLc, &cpu, false)
             .expect("an explicit aws-lc request is honoured");
@@ -575,6 +675,7 @@ fn renderings_are_fixed_and_distinct() {
         AeadSelectionReason::QualifiedCpu,
         AeadSelectionReason::NotX86_64,
         AeadSelectionReason::WindowsTarget,
+        AeadSelectionReason::AppleTarget,
         AeadSelectionReason::MissingCpuFeatures,
         AeadSelectionReason::IntelPreSapphireRapids,
         AeadSelectionReason::UnlistedCpu,
@@ -722,25 +823,31 @@ fn env_config_refuses_ring_on_the_fips_build() {
 const BOOTSTRAP_CHILD: &str = "AEAD_BACKEND_BOOTSTRAP_TEST_CHILD";
 const UNSET: &str = "<unset>";
 
-/// Re-run one test of this binary in a child process with `request` as the
-/// bootstrap request. `install_crypto_provider` sets two process-lifetime
-/// values (the selection and the rustls process default), so running it in the
-/// shared test process would change what every sibling test builds from.
-fn run_bootstrap_child(test_name: &str, request: &str) {
+/// Re-run one test of this binary in a child process with `marker=value` set.
+/// The rustls process-default provider and the record-layer selection are both
+/// set at most once per process, so a test that sets either, or that depends on
+/// neither being set, needs a process of its own: in the shared test process it
+/// would change, or be changed by, what sibling tests build from.
+fn run_child(test_name: &str, marker: &str, value: &str) {
     let test_path = format!("unit::tls::aead_backend_tests::{test_name}");
     let output = std::process::Command::new(std::env::current_exe().expect("test executable"))
         .args(["--exact", test_path.as_str(), "--nocapture"])
-        .env(BOOTSTRAP_CHILD, request)
+        .env(marker, value)
         .output()
-        .expect("spawn bootstrap child");
+        .expect("spawn child test process");
     assert!(
         output.status.success(),
-        "bootstrap child for {request:?} failed: {output:?}"
+        "child {test_name} ({value:?}) failed: {output:?}"
     );
     assert!(
         String::from_utf8_lossy(&output.stdout).contains("1 passed"),
-        "bootstrap child for {request:?} did not run the test: {output:?}"
+        "child {test_name} ({value:?}) did not run the test: {output:?}"
     );
+}
+
+/// [`run_child`] with `request` as the bootstrap request.
+fn run_bootstrap_child(test_name: &str, request: &str) {
+    run_child(test_name, BOOTSTRAP_CHILD, request);
 }
 
 /// In the child: set the request, bootstrap, and return the result.
@@ -849,6 +956,218 @@ fn bootstrap_refuses_ring_on_the_fips_build() {
         )
     );
     assert!(rustls::crypto::CryptoProvider::get_default().is_none());
+}
+
+#[test]
+fn a_refused_bootstrap_publishes_no_selection() {
+    // `install_default` succeeds at most once per process. When another
+    // provider is already installed, bootstrap fails and must leave the
+    // record-layer selection unpublished: otherwise `base_crypto_provider()`
+    // would follow a request for a provider that never took effect.
+    let Ok(request) = std::env::var(BOOTSTRAP_CHILD) else {
+        run_bootstrap_child("a_refused_bootstrap_publishes_no_selection", "aws-lc");
+        return;
+    };
+
+    let before = aead_backend::selection();
+    fips::base_crypto_provider()
+        .install_default()
+        .expect("nothing is installed in a fresh process");
+
+    let err = bootstrap_as_child(&request).expect_err("a second provider cannot be installed");
+    assert_eq!(err, fips::BootstrapError::ProviderAlreadyInstalled);
+
+    let after = aead_backend::selection();
+    assert_eq!(after, before, "a refused bootstrap changed the selection");
+    assert_eq!(after.request, AeadBackendRequest::Auto);
+    if fips::build_capable() {
+        assert_eq!(after.reason, AeadSelectionReason::FipsBuild);
+    } else {
+        assert_eq!(after.backend, AeadBackend::Ring);
+        assert_eq!(after.reason, AeadSelectionReason::NotBootstrapped);
+    }
+    // With nothing published there is nothing to reconcile against, so the
+    // request bootstrap could not apply is not treated as in effect either.
+    aead_backend::verify_resolved_request(AeadBackendRequest::Auto)
+        .expect("no selection was published");
+
+    #[cfg(not(feature = "fips"))]
+    ordinary_profile::assert_provider_matches_backend(
+        &fips::base_crypto_provider(),
+        AeadBackend::Ring,
+    );
+}
+
+/// Marker for the child of
+/// `ferrum_tls_constructors_need_no_process_default_provider`.
+const NO_DEFAULT_PROVIDER_CHILD: &str = "AEAD_BACKEND_NO_DEFAULT_PROVIDER_TEST_CHILD";
+
+#[test]
+fn ferrum_tls_constructors_need_no_process_default_provider() {
+    // rustls's provider-less builders (`WebPkiClientVerifier::builder`,
+    // `ClientConfig::builder`) read the process-default provider and, when none
+    // is installed, the one its crate features name. With both of rustls's
+    // providers linked that fallback is ambiguous and the call panics, so
+    // Ferrum's own constructors must name their provider and must work in a
+    // process where nothing was ever installed.
+    if std::env::var_os(NO_DEFAULT_PROVIDER_CHILD).is_none() {
+        run_child(
+            "ferrum_tls_constructors_need_no_process_default_provider",
+            NO_DEFAULT_PROVIDER_CHILD,
+            "1",
+        );
+        return;
+    }
+    assert!(
+        rustls::crypto::CryptoProvider::get_default().is_none(),
+        "the child must start with no process-default provider"
+    );
+
+    // A client CA and an ECDSA server leaf it signed, as PEM files.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let ca_key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).expect("CA key");
+    let mut ca_params = rcgen::CertificateParams::new(Vec::<String>::new()).expect("CA params");
+    ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+    ca_params
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, "aead backend test CA");
+    ca_params.key_usages = vec![
+        rcgen::KeyUsagePurpose::KeyCertSign,
+        rcgen::KeyUsagePurpose::DigitalSignature,
+    ];
+    let ca_cert = ca_params.self_signed(&ca_key).expect("CA cert");
+    let issuer = rcgen::Issuer::new(ca_params, ca_key);
+    let server_key =
+        rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).expect("server key");
+    let server_cert = rcgen::CertificateParams::new(vec!["aead-backend.test".to_string()])
+        .expect("server params")
+        .signed_by(&server_key, &issuer)
+        .expect("server cert");
+
+    let cert_path = dir.path().join("server.pem");
+    let key_path = dir.path().join("server-key.pem");
+    let ca_path = dir.path().join("client-ca.pem");
+    std::fs::write(&cert_path, server_cert.pem()).expect("write server cert");
+    std::fs::write(&key_path, server_key.serialize_pem()).expect("write server key");
+    std::fs::write(&ca_path, ca_cert.pem()).expect("write client CA");
+    let cert = cert_path.to_str().expect("utf-8 path");
+    let key = key_path.to_str().expect("utf-8 path");
+    let ca = ca_path.to_str().expect("utf-8 path");
+
+    let policy = ferrum_edge::tls::TlsPolicy {
+        protocol_versions: vec![&rustls::version::TLS12, &rustls::version::TLS13],
+        crypto_provider: std::sync::Arc::new(fips::base_crypto_provider()),
+        prefer_server_cipher_order: false,
+        session_cache_size: 64,
+        early_data_max_size: 0,
+    };
+
+    // Frontend mTLS: proxy HTTPS/H2, TCP+TLS, admin HTTPS and CP gRPC.
+    ferrum_edge::tls::load_tls_config_with_client_auth(
+        cert,
+        key,
+        Some(ca),
+        false,
+        &policy,
+        30,
+        30,
+        &[],
+    )
+    .expect("frontend mTLS configuration builds without a process default");
+    // The HTTP/3 listener's client-certificate verifier.
+    ferrum_edge::tls::build_client_cert_verifier(ca, &[])
+        .expect("the HTTP/3 client verifier builds without a process default");
+    // Frontend DTLS with client-certificate verification.
+    ferrum_edge::dtls::build_frontend_dtls_config(cert, key, Some(ca), &[], Some(&policy))
+        .expect("frontend DTLS configuration builds without a process default");
+
+    // And none of them reached for the global accessor, which would have
+    // installed a provider as a side effect where it did not panic.
+    assert!(
+        rustls::crypto::CryptoProvider::get_default().is_none(),
+        "a Ferrum TLS constructor installed a process-default provider"
+    );
+}
+
+// ── Production code names its rustls provider ───────────────────────────────
+
+/// rustls constructors that read the process-default provider instead of
+/// taking one.
+const PROVIDER_LESS_CONSTRUCTORS: [&str; 5] = [
+    "ClientConfig::builder()",
+    "ServerConfig::builder()",
+    "WebPkiClientVerifier::builder(",
+    "WebPkiServerVerifier::builder(",
+    "with_platform_verifier()",
+];
+
+/// The only places under `src/` that still use one, with how many times: all
+/// inside inline `#[cfg(test)]` modules, which install a default first.
+const INLINE_TEST_PROVIDER_LESS_USES: [(&str, usize); 3] = [
+    ("src/health_check.rs", 1),
+    ("src/http3/server.rs", 3),
+    ("src/plugins/tcp_logging.rs", 1),
+];
+
+#[test]
+fn production_code_names_its_rustls_provider() {
+    // With both of rustls's providers linked, a provider-less constructor
+    // panics unless a process default was installed. The gateway binary always
+    // installs one, but the library must not depend on that, so every
+    // constructor in production code names its provider. The runtime test
+    // above covers the verifier paths; this covers the rest (log sinks, health
+    // probes, ACME) by construction.
+    let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let mut found: Vec<(String, usize)> = Vec::new();
+    let mut pending = vec![root.join("src")];
+    while let Some(dir) = pending.pop() {
+        for entry in std::fs::read_dir(&dir)
+            .expect("read a source directory")
+            .flatten()
+        {
+            let path = entry.path();
+            if path.is_dir() {
+                pending.push(path);
+                continue;
+            }
+            if path.extension().and_then(|extension| extension.to_str()) != Some("rs") {
+                continue;
+            }
+            let text = std::fs::read_to_string(&path).expect("read a source file");
+            let uses: usize = text
+                .lines()
+                .map(str::trim_start)
+                .filter(|line| !line.starts_with("//"))
+                .map(|line| {
+                    PROVIDER_LESS_CONSTRUCTORS
+                        .iter()
+                        .filter(|pattern| line.contains(**pattern))
+                        .count()
+                })
+                .sum();
+            if uses > 0 {
+                let relative = path
+                    .strip_prefix(&root)
+                    .expect("the file is under the repository root")
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                found.push((relative, uses));
+            }
+        }
+    }
+    found.sort();
+
+    let expected: Vec<(String, usize)> = INLINE_TEST_PROVIDER_LESS_USES
+        .iter()
+        .map(|(file, uses)| ((*file).to_string(), *uses))
+        .collect();
+    assert_eq!(
+        found, expected,
+        "a rustls constructor under src/ reads the process-default provider. Name the provider \
+         instead (`builder_with_provider`, or `tls::backend_client_config_builder(None)` for a \
+         client that takes the build defaults). Only an inline test module that installs a \
+         default first belongs in INLINE_TEST_PROVIDER_LESS_USES."
+    );
 }
 
 // ── The ordinary profile's two providers, exercised for real ────────────────
@@ -1455,23 +1774,23 @@ mod ordinary_profile {
                     format!("{suite:?} server={server_backend:?} client={client_backend:?}");
 
                 assert_packet_keys_interoperate(
-                    &*client.local.packet,
-                    &*server.remote.packet,
+                    client.local.packet.as_ref(),
+                    server.remote.packet.as_ref(),
                     &label,
                 );
                 assert_packet_keys_interoperate(
-                    &*server.local.packet,
-                    &*client.remote.packet,
+                    server.local.packet.as_ref(),
+                    client.remote.packet.as_ref(),
                     &label,
                 );
                 assert_header_keys_interoperate(
-                    &*client.local.header,
-                    &*server.remote.header,
+                    client.local.header.as_ref(),
+                    server.remote.header.as_ref(),
                     &label,
                 );
                 assert_header_keys_interoperate(
-                    &*server.local.header,
-                    &*client.remote.header,
+                    server.local.header.as_ref(),
+                    client.remote.header.as_ref(),
                     &label,
                 );
             }

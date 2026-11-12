@@ -1431,8 +1431,10 @@ pub(crate) fn finish_frontend_server_config_capturing_trust(
                 client_auth_roots.len()
             );
 
-            let mut verifier_builder =
-                rustls::server::WebPkiClientVerifier::builder(Arc::new(client_auth_roots));
+            let mut verifier_builder = rustls::server::WebPkiClientVerifier::builder_with_provider(
+                Arc::new(client_auth_roots),
+                tls_policy.crypto_provider.clone(),
+            );
             verifier_builder = crl_policy::apply_client_crl_policy(verifier_builder, crls);
             if !crls.is_empty() {
                 info!(
@@ -2107,7 +2109,10 @@ pub(crate) fn load_mesh_tls_config_with_identity_and_client_ca_bytes(
                 )?;
 
                 let mut verifier_builder =
-                    rustls::server::WebPkiClientVerifier::builder(Arc::new(client_auth_roots));
+                    rustls::server::WebPkiClientVerifier::builder_with_provider(
+                        Arc::new(client_auth_roots),
+                        tls_policy.crypto_provider.clone(),
+                    );
 
                 if client_auth == MeshClientAuth::Optional {
                     verifier_builder = verifier_builder.allow_unauthenticated();
@@ -2354,8 +2359,16 @@ pub fn validate_backend_tls_policy_for_quic(policy: &TlsPolicy) -> Result<(), an
 /// This ensures outbound connections enforce the same TLS settings (cipher suites,
 /// min/max protocol versions, key exchange groups) as inbound listeners.
 ///
-/// Falls back to `ClientConfig::builder()` (using the installed global default
-/// `CryptoProvider`) when no `TlsPolicy` is available — e.g., in unit tests.
+/// With no `TlsPolicy` this is `ClientConfig::builder()` with the provider
+/// named explicitly: the seam's provider and rustls's safe default protocol
+/// versions. Ferrum-owned clients that take the build defaults (log sinks,
+/// health probes) call it that way instead of `ClientConfig::builder()`, which
+/// reads rustls's process-default provider and, when none is installed, the one
+/// its crate features name. The ordinary build links both of rustls's
+/// providers (see `fips::aead_backend`), so that fallback is ambiguous there
+/// and the provider-less call panics. Naming the provider keeps these
+/// constructors independent of process-global state; it is the same provider
+/// bootstrap installs as the process default.
 pub fn backend_client_config_builder(
     tls_policy: Option<&TlsPolicy>,
 ) -> Result<rustls::ConfigBuilder<rustls::ClientConfig, rustls::WantsVerifier>, anyhow::Error> {
@@ -2496,8 +2509,10 @@ pub fn build_client_cert_verifier_candidate(
     )
     .map_err(|error| anyhow::anyhow!("{error}"))?;
 
-    let mut verifier_builder =
-        rustls::server::WebPkiClientVerifier::builder(Arc::new(client_auth_roots));
+    let mut verifier_builder = rustls::server::WebPkiClientVerifier::builder_with_provider(
+        Arc::new(client_auth_roots),
+        Arc::new(crate::fips::base_crypto_provider()),
+    );
     verifier_builder = crl_policy::apply_client_crl_policy(verifier_builder, crls);
     if !crls.is_empty() {
         info!(

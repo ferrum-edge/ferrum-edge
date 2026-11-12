@@ -1278,8 +1278,13 @@ pub fn build_frontend_dtls_config(
             )
         })?;
         let root_store = loaded.roots;
-        let mut verifier_builder =
-            rustls::server::WebPkiClientVerifier::builder(Arc::new(root_store));
+        // The provider is named rather than left to rustls's process-default
+        // lookup, which panics when both of its providers are linked and no
+        // default was installed.
+        let mut verifier_builder = rustls::server::WebPkiClientVerifier::builder_with_provider(
+            Arc::new(root_store),
+            Arc::new(crate::fips::base_crypto_provider()),
+        );
         verifier_builder = crate::tls::crl_policy::apply_client_crl_policy(verifier_builder, crls);
         let verifier = verifier_builder
             .build()

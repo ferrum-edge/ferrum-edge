@@ -1469,10 +1469,16 @@ openssl s_client -connect localhost:8443 -cipher 'ALL' -tls1_2
 ### Record-layer cipher-suite backend
 
 The ordinary (non-FIPS) build links two implementations of every TLS cipher
-suite, `ring`'s and AWS-LC's, and uses one of them for the whole process. The
+suite, `ring`'s and AWS-LC's, and picks one of them once per process. The
 choice is about speed only: the suites, their order, the negotiated protocol
 and everything on the wire are identical either way, and the settings above
 apply unchanged.
+
+The selection covers every TLS configuration Ferrum builds (proxy and admin
+listeners, HTTP/3, backend connections, health probes, CP/DP and mesh, log
+sinks) and every library client that takes rustls's process-default provider.
+A dependency that names its own provider keeps `ring`'s suites regardless; the
+SQL config-database client (sqlx) is one.
 
 Only the record layer moves: the AEAD and the HKDF/PRF hash a suite carries,
 which for TLS 1.3 includes the QUIC packet and header-protection keys HTTP/3
@@ -1490,7 +1496,7 @@ therefore faster on some CPUs and clearly slower on others.
 
 | Value | Behaviour |
 |-------|-----------|
-| `auto` (default) | AWS-LC when **all** of these hold, `ring` otherwise: the target is x86-64 and not Windows; the CPU and OS expose VAES, VPCLMULQDQ and AVX-512 F, DQ, BW and VL (the features AWS-LC itself requires before it uses its AVX-512 AES-GCM); and the CPU is on the measured allow-list: AMD family 19h with those features (Zen 4) and family 1Ah (Zen 5), Intel Sapphire Rapids, Emerald Rapids and Granite Rapids |
+| `auto` (default) | AWS-LC when **all** of these hold, `ring` otherwise: the target is x86-64 and neither Windows nor macOS (AWS-LC does not use its AVX-512 AES-GCM on either); the CPU and OS expose VAES, VPCLMULQDQ and AVX-512 F, DQ, BW and VL (the features AWS-LC itself requires before it uses that code); and the CPU is on the allow-list: AMD family 19h with those features (Zen 4) and family 1Ah (Zen 5), Intel Sapphire Rapids, Emerald Rapids and Granite Rapids |
 | `ring` | Always `ring` |
 | `aws-lc` | Always AWS-LC. Honoured even where `auto` keeps `ring`, with a startup `WARN`, because it is expected to be slower there |
 
@@ -1500,7 +1506,14 @@ Intel Ice Lake reports every feature above and showed no net gain when measured
 Lake because of downclocking and allows them again from Sapphire Rapids, and
 `auto` follows the same line. Rocket Lake also has the features and has not
 been measured, so it keeps `ring` too, as does any other CPU that is not on the
-list: a new microarchitecture is added after it has been measured.
+list.
+
+The allow-list is the CPUs with hosted measurements behind them (AMD Zen 4 and
+Zen 5, Intel Emerald Rapids; see the table below) plus the rest of the Intel
+server line from Sapphire Rapids on: Sapphire Rapids itself, which shares
+Emerald Rapids' core design, and Granite Rapids. Those two are admitted by that
+relationship, not by a measurement of their own. If one of them turns out not to
+benefit, `FERRUM_TLS_AEAD_BACKEND=ring` restores the previous behaviour.
 
 **Where it helps and where it does not.** Hosted benchmark, TLS on both legs,
 same binary and same runner per row, gateway CPU per request with AWS-LC
@@ -1526,7 +1539,7 @@ relative to `ring`:
   three sizes), so `auto` keeps `ring` there.
 - On a CPU without AVX-512 AWS-LC is slower at every size, which is the case
   `auto` exists to avoid and the reason `aws-lc` logs a warning there.
-- Nothing changes on non-x86-64 targets or on Windows.
+- Nothing changes on non-x86-64 targets, on Windows or on macOS.
 
 The selection is made once, when the crypto provider is installed, and cannot
 change without a restart. It is recorded at startup at INFO:
@@ -1537,7 +1550,7 @@ TLS record-layer cipher suites: backend=aws-lc, requested=auto, reason=cpu-quali
 
 `reason` is one of `cpu-qualified`, `cpu-features-missing`,
 `intel-pre-sapphire-rapids`, `cpu-not-listed`, `not-x86-64`, `windows-target`,
-`operator-override` or `fips-build`. INFO is hidden at the default
+`apple-target`, `operator-override` or `fips-build`. INFO is hidden at the default
 `FERRUM_LOG_LEVEL=warn`; `FERRUM_LOG_LEVEL=warn,ferrum_edge::fips::aead_backend=info`
 shows this record alone.
 
@@ -1546,6 +1559,11 @@ must be set in the process environment. A value that appears only in
 `ferrum.conf`, or only through an external secret source, is refused at startup
 and by `ferrum-edge validate` with a message that says so; it is never silently
 ignored.
+
+`ferrum-edge health` is the one command that does not read the variable. It
+exits before the provider is bootstrapped and builds its probe client on the
+build's baseline provider (`ring` on the ordinary build), so the variable,
+valid or not, has no effect on it.
 
 On a FIPS build every cipher suite comes from the AWS-LC FIPS module and `ring`
 is not linked. `auto` and `aws-lc` change nothing there, and `ring` is refused.

@@ -336,6 +336,23 @@ pub fn base_crypto_provider() -> CryptoProvider {
     rustls::crypto::aws_lc_rs::default_provider()
 }
 
+/// The provider bootstrap installs for a resolved record-layer selection.
+///
+/// Built from the selection itself rather than through
+/// [`base_crypto_provider`], which reads the *published* selection: bootstrap
+/// publishes only after rustls has accepted this provider.
+#[cfg(all(feature = "crypto-ring", not(feature = "fips")))]
+fn bootstrap_provider(selection: &aead_backend::AeadSelection) -> CryptoProvider {
+    aead_backend::ordinary_profile_provider(selection.backend)
+}
+
+/// The provider bootstrap installs. The FIPS profile has one provider whatever
+/// the record-layer selection says.
+#[cfg(feature = "fips")]
+fn bootstrap_provider(_selection: &aead_backend::AeadSelection) -> CryptoProvider {
+    base_crypto_provider()
+}
+
 /// The process-default crypto provider is not the one an enforcing FIPS
 /// process requires.
 ///
@@ -639,13 +656,11 @@ pub fn install_crypto_provider() -> Result<FipsState, BootstrapError> {
         return Err(BootstrapError::SelfTestFailed(reason));
     }
 
-    // Fix the TLS record-layer backend before the provider is built, so the
-    // process default installed below and every later `base_crypto_provider()`
-    // call are the same provider. On a FIPS build this only refuses a request
-    // for `ring`; the suites are the module's either way.
-    aead_backend::resolve_and_install_bootstrap_selection()?;
-
-    let provider = base_crypto_provider();
+    // Resolve the TLS record-layer backend and build the provider from that
+    // value directly. On a FIPS build this only refuses a request for `ring`;
+    // the suites are the module's either way.
+    let aead_selection = aead_backend::resolve_bootstrap_selection()?;
+    let provider = bootstrap_provider(&aead_selection);
     let provider_is_fips = provider.fips();
 
     if mode.is_enforcing() && !provider_is_fips {
@@ -654,6 +669,11 @@ pub fn install_crypto_provider() -> Result<FipsState, BootstrapError> {
 
     CryptoProvider::install_default(provider)
         .map_err(|_| BootstrapError::ProviderAlreadyInstalled)?;
+
+    // Published only now that rustls accepted the provider, so the process
+    // default and every later `base_crypto_provider()` call are the same
+    // provider, and a refused bootstrap leaves no selection behind.
+    aead_backend::publish_bootstrap_selection(aead_selection);
 
     let resolved = FipsState {
         mode,

@@ -25,8 +25,9 @@
 //! `auto` selects AWS-LC only when all of the following hold, and keeps `ring`
 //! otherwise:
 //!
-//! 1. the target is x86-64 and not Windows (AWS-LC compiles its AVX-512 AES-GCM
-//!    out on Windows);
+//! 1. the target is x86-64 and neither Windows nor an Apple platform (AWS-LC
+//!    compiles its AVX-512 AES-GCM out on Windows and never reports AVX-512 as
+//!    usable on Darwin);
 //! 2. the CPU and operating system expose every feature AWS-LC's own dispatch
 //!    (`crypto_gcm_avx512_enabled`) requires: VAES, VPCLMULQDQ, and AVX-512 F,
 //!    DQ, BW, and VL;
@@ -37,8 +38,16 @@
 //! measured, and BoringSSL avoids 512-bit registers on Ice Lake and Tiger Lake
 //! because of downclocking, allowing them again from Sapphire Rapids. Rocket
 //! Lake has the features too and has not been measured. All three keep `ring`,
-//! and so does any CPU that is not listed: a new microarchitecture is admitted
-//! by measurement, not by assumption.
+//! and so does any CPU that is not listed. The list holds the CPUs that were
+//! measured (AMD Zen 4 and Zen 5, Intel Emerald Rapids) and the rest of the
+//! Intel server line from Sapphire Rapids on; anything outside it stays on
+//! `ring` until it has been measured.
+//!
+//! The gate mirrors what AWS-LC can observe at run time. Two things it cannot
+//! mirror are an `OPENSSL_ia32cap` environment override, which masks CPU
+//! features inside AWS-LC only, and an AWS-LC built with `OPENSSL_SMALL`, which
+//! omits the AVX-512 code. Ferrum sets neither; an operator who does should
+//! also set `FERRUM_TLS_AEAD_BACKEND=ring`.
 //!
 //! `FERRUM_TLS_AEAD_BACKEND` (`auto`, `ring`, `aws-lc`) overrides the rule. The
 //! override is honoured as given on the ordinary build, including `aws-lc` on a
@@ -157,6 +166,10 @@ pub enum TargetClass {
     /// x86-64 Windows. AWS-LC excludes its AVX-512 AES-GCM from Windows builds,
     /// so the CPU's features cannot make it the faster implementation there.
     X86_64Windows,
+    /// x86-64 macOS and the other Apple platforms. AWS-LC treats AVX-512 as
+    /// unusable on Darwin whatever the CPU reports (`os_supports_avx512` in its
+    /// `cpu_intel.c`), so it never dispatches to the AVX-512 AES-GCM there.
+    X86_64Apple,
     /// Every other architecture.
     Other,
 }
@@ -167,6 +180,7 @@ impl TargetClass {
         match self {
             Self::X86_64 => "x86_64",
             Self::X86_64Windows => "x86_64-windows",
+            Self::X86_64Apple => "x86_64-apple",
             Self::Other => "other",
         }
     }
@@ -275,6 +289,8 @@ fn detect_cpu_facts() -> CpuFacts {
     CpuFacts {
         target: if cfg!(windows) {
             TargetClass::X86_64Windows
+        } else if cfg!(target_vendor = "apple") {
+            TargetClass::X86_64Apple
         } else {
             TargetClass::X86_64
         },
@@ -350,6 +366,11 @@ pub const INTEL_FAMILY_6: u32 = 0x6;
 
 /// Intel family-6 models admitted by `auto`: Sapphire Rapids (`0x8F`), Emerald
 /// Rapids (`0xCF`), Granite Rapids (`0xAD`), and Granite Rapids-D (`0xAE`).
+///
+/// Emerald Rapids is the measured entry. The others are admitted as the same
+/// server line from Sapphire Rapids on, which is also where BoringSSL stops
+/// avoiding 512-bit registers; `docs/frontend_tls.md` records which entries
+/// have hosted measurements behind them.
 pub const INTEL_QUALIFIED_MODELS: &[u32] = &[0x8f, 0xcf, 0xad, 0xae];
 
 /// Intel family-6 models older than Sapphire Rapids that report the full
@@ -377,6 +398,8 @@ pub enum AeadSelectionReason {
     NotX86_64,
     /// `auto`: x86-64 Windows, where AWS-LC has no AVX-512 AES-GCM.
     WindowsTarget,
+    /// `auto`: an x86-64 Apple platform, where AWS-LC never uses AVX-512.
+    AppleTarget,
     /// `auto`: at least one feature AWS-LC's AVX-512 AES-GCM needs is missing.
     MissingCpuFeatures,
     /// `auto`: an Intel CPU older than Sapphire Rapids that has the features.
@@ -395,6 +418,7 @@ impl AeadSelectionReason {
             Self::QualifiedCpu => "cpu-qualified",
             Self::NotX86_64 => "not-x86-64",
             Self::WindowsTarget => "windows-target",
+            Self::AppleTarget => "apple-target",
             Self::MissingCpuFeatures => "cpu-features-missing",
             Self::IntelPreSapphireRapids => "intel-pre-sapphire-rapids",
             Self::UnlistedCpu => "cpu-not-listed",
@@ -429,6 +453,7 @@ pub fn auto_verdict(cpu: &CpuFacts) -> AutoVerdict {
     match cpu.target {
         TargetClass::X86_64 => {}
         TargetClass::X86_64Windows => return ring(AeadSelectionReason::WindowsTarget),
+        TargetClass::X86_64Apple => return ring(AeadSelectionReason::AppleTarget),
         TargetClass::Other => return ring(AeadSelectionReason::NotX86_64),
     }
     if !cpu.features.complete() {
@@ -600,21 +625,31 @@ pub fn bootstrap_request_from_env() -> Result<AeadBackendRequest, String> {
     }
 }
 
-/// Resolve the bootstrap selection and fix it for the life of the process.
+/// Resolve the bootstrap selection from the environment and this CPU, without
+/// publishing it.
 ///
-/// Called by [`super::install_crypto_provider`] immediately before it builds
-/// the process-default provider, so that provider and every later
-/// [`super::base_crypto_provider`] call agree.
-pub(super) fn resolve_and_install_bootstrap_selection()
--> Result<AeadSelection, super::BootstrapError> {
+/// [`super::install_crypto_provider`] builds the process-default provider from
+/// the returned value and publishes it with [`publish_bootstrap_selection`]
+/// only once rustls has accepted that provider. Resolving and publishing are
+/// separate so a bootstrap that fails — most plainly because another provider
+/// was already installed — leaves [`selection`] exactly as it was, rather than
+/// describing a provider that never took effect.
+pub(super) fn resolve_bootstrap_selection() -> Result<AeadSelection, super::BootstrapError> {
     let request =
         bootstrap_request_from_env().map_err(super::BootstrapError::InvalidAeadBackend)?;
-    let resolved = select(request, &CpuFacts::detect(), BUILD_CAPABLE)
-        .map_err(super::BootstrapError::AeadBackendUnavailable)?;
-    // A second bootstrap in one process is already refused by
-    // `CryptoProvider::install_default`; keeping the first selection here means
-    // the provider that call rejected cannot change what is in effect.
-    Ok(*SELECTION.get_or_init(|| resolved))
+    select(request, &CpuFacts::detect(), BUILD_CAPABLE)
+        .map_err(super::BootstrapError::AeadBackendUnavailable)
+}
+
+/// Fix the selection for the life of the process.
+///
+/// Called exactly once, after `CryptoProvider::install_default` accepted the
+/// provider built from `selection`, so the process default and every later
+/// [`super::base_crypto_provider`] call are the same provider. `install_default`
+/// succeeds at most once per process, so this cannot be reached twice; the
+/// `OnceLock` keeps the first value regardless.
+pub(super) fn publish_bootstrap_selection(selection: AeadSelection) {
+    let _ = SELECTION.set(selection);
 }
 
 /// Re-check the fully resolved request against the bootstrap selection.

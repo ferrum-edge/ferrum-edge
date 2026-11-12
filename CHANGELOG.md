@@ -2158,9 +2158,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and loses on others. The ordinary build now links rustls's AWS-LC cipher
   suites beside `ring`'s and picks one set for the process at startup. The new
   `FERRUM_TLS_AEAD_BACKEND` (`auto`, `ring`, `aws-lc`; default `auto`) selects
-  AWS-LC only on x86-64 (not Windows) CPUs that have VAES, VPCLMULQDQ and
-  AVX-512 F/DQ/BW/VL and are on the measured allow-list: AMD Zen 4 and Zen 5,
-  Intel Sapphire Rapids, Emerald Rapids and Granite Rapids. Everything else
+  AWS-LC only on x86-64 (not Windows or macOS) CPUs that have VAES, VPCLMULQDQ
+  and AVX-512 F/DQ/BW/VL and are on the allow-list: AMD Zen 4 and Zen 5, Intel
+  Sapphire Rapids, Emerald Rapids and Granite Rapids. Everything else
   keeps `ring`, including Intel Ice Lake, Tiger Lake and Rocket Lake (they have
   the features; Ice Lake showed no net gain when measured) and any CPU not on
   the list. Only the cipher
@@ -2174,8 +2174,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (Emerald Rapids). **Where it does not help:** 10 KiB HTTP responses are
   within run-to-run noise on every CPU; an Ice Lake Xeon 8370C showed no net
   gain; and on an EPYC 7763 (Zen 3, no AVX-512) AWS-LC cost 6–36% more CPU,
-  which is why `auto` keeps `ring` there. Non-x86-64 targets and Windows are
-  unchanged. **Operator action:** none. The choice is logged once at startup at
+  which is why `auto` keeps `ring` there. Non-x86-64 targets, Windows and macOS
+  are unchanged. **Operator action:** none. The choice is logged once at startup at
   INFO with its reason; `FERRUM_TLS_AEAD_BACKEND=ring` restores the previous
   behaviour everywhere. Set it in the environment: like `FERRUM_FIPS_MODE` it
   is acted on before `ferrum.conf` is read, and a value set only there is

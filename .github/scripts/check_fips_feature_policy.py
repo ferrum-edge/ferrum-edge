@@ -680,13 +680,102 @@ def _without_feature_entry(manifest: str, feature: str, entry: str) -> str:
     return manifest[:start] + block.replace(line, "", 1) + manifest[end:]
 
 
+# The self-test's own copy of the resolved-graph policy.
+#
+# These rows are written out a second time, deliberately. The self-test asks
+# `check_selections` to reject each of them; if it built its cases from the live
+# REQUIRED_/FORBIDDEN_ tables instead, deleting or mistyping a row there would
+# delete the case with it and the gate would stay green. A deliberate policy
+# change therefore edits two places, and an accidental one fails here.
+_PINNED_FORBIDDEN_RESOLVED_RING = frozenset({
+    ("aws-lc-rs", "fips"),
+    ("jsonwebtoken", "rust_crypto"),
+    ("rustls", "fips"),
+    ("rustls-webpki", "aws-lc-rs-fips"),
+    ("tokio-rustls", "aws_lc_rs"),
+    ("tokio-rustls", "aws-lc-rs"),
+    ("tokio-rustls", "fips"),
+    ("quinn", "rustls-aws-lc-rs"),
+    ("quinn", "rustls-aws-lc-rs-fips"),
+    ("quinn-proto", "rustls-aws-lc-rs"),
+    ("quinn-proto", "rustls-aws-lc-rs-fips"),
+    ("sqlx", "tls-rustls-aws-lc-rs"),
+    ("sqlx-core", "_tls-rustls-aws-lc-rs"),
+    ("ldap3", "tls-rustls-aws-lc-rs"),
+    ("tonic", "tls-aws-lc"),
+    ("hyper-rustls", "aws-lc-rs"),
+    ("hyper-rustls", "fips"),
+    ("kube", "aws-lc-rs"),
+    ("kube-client", "aws-lc-rs"),
+    ("mongodb", "rustls-tls-aws-lc"),
+    ("rcgen", "fips"),
+    ("reqwest", "__rustls-aws-lc-rs"),
+    ("instant-acme", "aws-lc-rs"),
+    ("instant-acme", "fips"),
+})
+_PINNED_REQUIRED_RESOLVED_RING = frozenset({
+    ("jsonwebtoken", "aws_lc_rs"),
+    ("kube", "ring"),
+    ("mongodb", "rustls-tls"),
+    ("reqwest", "__rustls-ring"),
+    ("rustls", "aws_lc_rs"),
+    ("rustls", "ring"),
+    ("tokio-rustls", "ring"),
+    ("quinn-proto", "rustls-ring"),
+    ("tonic", "tls-ring"),
+})
+_PINNED_FORBIDDEN_RESOLVED_FIPS = frozenset({
+    ("rustls", "ring"),
+    ("tokio-rustls", "ring"),
+    ("quinn", "rustls-ring"),
+    ("quinn-proto", "rustls-ring"),
+    ("sqlx", "tls-rustls-ring"),
+    ("sqlx-core", "_tls-rustls-ring-webpki"),
+    ("sqlx-core", "_tls-rustls-ring-native-roots"),
+    ("ldap3", "tls-rustls-ring"),
+    ("tonic", "tls-ring"),
+    ("hyper-rustls", "ring"),
+    ("kube", "ring"),
+    ("kube-client", "ring"),
+    ("mongodb", "rustls-tls"),
+    ("rcgen", "ring"),
+    ("jsonwebtoken", "rust_crypto"),
+    ("x509-parser", "verify"),
+    ("reqwest", "__rustls-ring"),
+    ("rustls-webpki", "ring"),
+    ("webpki", "ring"),
+    ("instant-acme", "ring"),
+})
+_PINNED_REQUIRED_RESOLVED_FIPS = frozenset({
+    ("aws-lc-rs", "fips"),
+    ("jsonwebtoken", "aws_lc_rs"),
+    ("kube", "aws-lc-rs"),
+    ("mongodb", "rustls-tls-aws-lc"),
+    ("reqwest", "__rustls-aws-lc-rs"),
+    ("rustls", "fips"),
+})
+
+# Paired aws-lc arms the ordinary graph has always resolved next to their ring
+# counterparts, through dimpl. They are the only pair-table arms that
+# FORBIDDEN_RESOLVED_RING may leave out.
+_RING_GRAPH_PAIRED_ARM_EXCEPTIONS = frozenset({("x509-parser", "verify-aws")})
+
+
+def _resolved_row(edge: str) -> tuple[str, str]:
+    """`dep/feature` or `dep?/feature` as a resolved `(crate, feature)` row."""
+
+    crate, feature = edge.split("/", 1)
+    return crate.rstrip("?"), feature
+
+
 def self_test() -> list[str]:
     """Prove the checks still reject what they exist to reject.
 
-    Every case is a single mutation of the real manifest, or of a resolved
-    selection set built from this script's own tables, so the cases cannot
-    drift from the policy they exercise. A mutation that is *accepted* is the
-    failure: it means a check has been weakened or bypassed.
+    Manifest cases are single mutations of the real `Cargo.toml`. Resolved-graph
+    cases come from the pinned rows above and from REQUIRED_FEATURE_PAIRS, which
+    are both kept independently of the tables `check_selections` reads, so a row
+    removed from a live table still has a case that expects it. A mutation that
+    is *accepted* is the failure: a check has been weakened or bypassed.
     """
 
     failures: list[str] = []
@@ -720,6 +809,12 @@ def self_test() -> list[str]:
         (
             "crypto-ring adds rustls's FIPS arm",
             lambda: _with_feature_entry(manifest, "crypto-ring", "rustls/fips"),
+        ),
+        (
+            # Not a paired edge and not an aws-lc spelling: only the FIPS
+            # marker refuses it.
+            "crypto-ring adds an unpaired FIPS-named arm",
+            lambda: _with_feature_entry(manifest, "crypto-ring", "tonic/fips"),
         ),
         (
             "crypto-ring activates the aws-lc-rs backend crate",
@@ -798,11 +893,18 @@ def self_test() -> list[str]:
                 f"from the required selections by {delta}"
             )
 
-    # Every forbidden row must be individually fatal, in both profiles, so a row
-    # cannot be shadowed by an early return or a mistyped table.
-    for profile, base, forbidden in (
-        ("crypto-ring", ordinary, FORBIDDEN_RESOLVED_RING),
-        ("fips", fips, FORBIDDEN_RESOLVED_FIPS),
+    # Every pinned forbidden row must be individually fatal and every pinned
+    # required row individually necessary, in both profiles. The rows come from
+    # the self-test's own copy, so one that has gone missing from a live table
+    # is reported here instead of silently losing its case.
+    for profile, base, forbidden, required in (
+        (
+            "crypto-ring",
+            ordinary,
+            _PINNED_FORBIDDEN_RESOLVED_RING,
+            _PINNED_REQUIRED_RESOLVED_RING,
+        ),
+        ("fips", fips, _PINNED_FORBIDDEN_RESOLVED_FIPS, _PINNED_REQUIRED_RESOLVED_FIPS),
     ):
         for row in sorted(forbidden):
             if not check_selections(base | {row}, profile):
@@ -810,6 +912,45 @@ def self_test() -> list[str]:
                     f"self-test: the resolved-graph audit accepted the forbidden {profile} "
                     f"selection {row[0]}/{row[1]}"
                 )
+        for row in sorted(required):
+            if not check_selections((base | required) - {row}, profile):
+                failures.append(
+                    f"self-test: the resolved-graph audit accepted a {profile} graph without "
+                    f"the required selection {row[0]}/{row[1]}"
+                )
+
+    # A live table that has grown must grow the pinned copy too, or the new row
+    # would have no case of its own.
+    for label, live, pinned in (
+        ("FORBIDDEN_RESOLVED_RING", FORBIDDEN_RESOLVED_RING, _PINNED_FORBIDDEN_RESOLVED_RING),
+        ("REQUIRED_RESOLVED_RING", REQUIRED_RESOLVED_RING, _PINNED_REQUIRED_RESOLVED_RING),
+        ("FORBIDDEN_RESOLVED_FIPS", FORBIDDEN_RESOLVED_FIPS, _PINNED_FORBIDDEN_RESOLVED_FIPS),
+        ("REQUIRED_RESOLVED_FIPS", REQUIRED_RESOLVED_FIPS, _PINNED_REQUIRED_RESOLVED_FIPS),
+    ):
+        unpinned = sorted(set(live) - pinned)
+        if unpinned:
+            failures.append(
+                f"self-test: {label} has rows the self-test does not pin: {unpinned}; add them "
+                "to the pinned copy so each keeps a rejection case"
+            )
+
+    # The resolved tables must also agree with the manifest pair table, which
+    # is maintained separately: each dependency's ring arm is forbidden in the
+    # FIPS graph, and each aws-lc arm is forbidden in the ordinary graph.
+    for ring_edge, fips_edge in REQUIRED_FEATURE_PAIRS:
+        ring_row, fips_row = _resolved_row(ring_edge), _resolved_row(fips_edge)
+        if not check_selections(fips | {ring_row}, "fips"):
+            failures.append(
+                f"self-test: the FIPS graph audit accepted {ring_row[0]}/{ring_row[1]}, the ring "
+                f"arm paired with {fips_edge!r}"
+            )
+        if fips_row in _RING_GRAPH_PAIRED_ARM_EXCEPTIONS:
+            continue
+        if not check_selections(ordinary | {fips_row}, "crypto-ring"):
+            failures.append(
+                f"self-test: the ordinary graph audit accepted {fips_row[0]}/{fips_row[1]}, the "
+                f"aws-lc arm paired with {ring_edge!r}"
+            )
 
     return failures
 

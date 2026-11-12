@@ -3808,7 +3808,9 @@ fn build_grpc_probe_client_config(
         .client_key_path
         .as_deref()
         .or(global_identity.key.as_deref());
-    let builder = rustls::ClientConfig::builder().with_root_certificates(root_store);
+    let builder = crate::tls::backend_client_config_builder(None)
+        .map_err(|error| error.to_string())?
+        .with_root_certificates(root_store);
     let mut client_config = match (cert_path, key_path) {
         (Some(cert_path), Some(key_path)) => {
             let certs = load_probe_tls_certificates(
