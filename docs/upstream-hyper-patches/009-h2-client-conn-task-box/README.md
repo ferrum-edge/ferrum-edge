@@ -25,15 +25,18 @@ enum, `proto::h2::client::H2ClientFuture`:
   one per request.
 
 An enum is as large as its largest variant. With `Task` stored inline, every
-`Send` and `Pipe` future was as large as the connection task, whatever the
-body, transport and executor types. The sizes below are for one
-instantiation, the one measured: Ferrum's direct HTTP/2 pool over TLS
+`Send` and `Pipe` future was at least as large as the connection task. Whether
+that is waste depends on the body, transport and executor types: the
+connection task dominates only where the per-request variants are smaller,
+which they are in the instantiations measured here. The sizes below are for
+one of them: Ferrum's direct HTTP/2 pool over TLS
 (`H2ClientFuture<DirectH2RequestBody, TokioIo<TlsStream<TcpStream>>, TokioExecutor>`).
-There the enum was about 2.5 KiB (the release binary copies 2,528 to 2,536
+There the enum was about 2.5 KiB (the release binary copies 2,528 to 2,544
 bytes at each site), against a few hundred bytes of per-request state. The
 executor copies the future into a task allocation of that size for each
-spawned future, and the runtime writes a value of the same size again when the
-task finishes.
+spawned future (the copies under `execute_h2_future`), and tokio writes a
+whole task stage of the same size again when the task finishes (the
+2,536-byte copies under `tokio::runtime::task::core::Core::set_stage`).
 
 In CPU profiles of the HTTP/2 10 KiB benchmark cell on that pool (13 runs on
 `main` 856ea7634, five runner CPU models) those copies were 0.5% to 1.4% of
@@ -55,7 +58,7 @@ the connection task is polled by the same executor task, and dropping the
 future drops the connection task as before.
 
 The cost is one allocation per connection. The enum is then as large as its
-largest per-request variant.
+largest per-request variant, wherever the connection task was the largest.
 
 ## Measured
 
@@ -69,16 +72,20 @@ Size of the future the executor receives per request:
 | The regression test's types (`Full<Bytes>` body, a zero-sized I/O type) | at least the 1,424-byte connection task | 304 bytes (`Pipe` 304, `Send` 104) |
 
 CPU profiles of the HTTP/2 10 KiB benchmark cell, as a share of the gateway's
-user CPU:
+user CPU. This is a second set of eight runs, taken together on Rust 1.100.0
+for a like-for-like comparison, and separate from the thirteen runs quoted
+under "The problem" (which were on `main` 856ea7634 and include other runner
+CPUs). Its six runs without the patch are `main` 818a092c7 and two branches
+of it that do not touch hyper:
 
 | | Without the patch (six runs: EPYC 9V74, EPYC 7763, Xeon 8370C) | With the patch (EPYC 9V74, EPYC 7763) |
 |---|---|---|
 | Constant-size copies on the client spawn path | 0.5% to 1.3% | 0.09%, 0.05% |
 | Allocator time called from the client spawn path | 0.2% to 0.6% | 0.18%, 0.30% |
 
-That is the whole effect: about 1% of the gateway's user CPU on this cell. A
-same-job A/B of gateway CPU per request is recorded in the pull request that
-added the patch.
+These are sampled shares of the work the patch removes: about 1% of the
+gateway's user CPU on this cell before the patch. They are not a measurement
+of the change in total CPU per request.
 
 ## Regression coverage
 
@@ -117,13 +124,14 @@ verifier, then regenerate `vendor/VENDOR_INTEGRITY.sha256`.
 
 `H2ClientFuture` has three variants: `Pipe` and `Send` are spawned per request,
 `Task` once per connection. `Task` holds `ConnTask<T, B>` inline, which owns
-the h2 `Connection` (about 2.4 KiB with a TLS transport), so every `Pipe` and
-`Send` future an executor receives is that large too. With tokio this means a
-2.5 KiB task allocation and copy per request for futures whose own state is a
-few hundred bytes.
+the h2 `Connection`, so every `Pipe` and `Send` future an executor receives is
+at least that large. One measured case: a tokio-rustls transport, a small
+streaming body and hyper-util's `TokioExecutor`, where the enum is 2,528 bytes
+and its largest per-request variant 368. With tokio that is a 2.5 KiB task
+allocation and copy per spawned future, for a few hundred bytes of state.
 
 Boxing the connection task (`Task { task: Pin<Box<ConnTask<T, B>>> }`) costs
 one allocation per connection and makes the enum as large as its largest
-per-request variant. It needs no API change: the type lives in a private
+per-request variant wherever the connection task was the largest. It needs no API change: the type lives in a private
 module and reaches executors only through the sealed `Http2ClientConnExec`
 bound, so its layout is not part of the public API.

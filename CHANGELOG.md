@@ -2162,9 +2162,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   over TLS, where its own state is a few hundred bytes. On the HTTP/2 10 KiB
   benchmark those copies were 0.5–1.4% of gateway user CPU. The vendored hyper
   now boxes the connection task (patch 009, one allocation per connection).
-  The change reaches every path that uses hyper's HTTP/2 client: the direct
-  HTTP/2 pool, the gRPC pool (including gRPC nested in HBONE), mesh mTLS and
-  Unix-socket HTTP/2 backends, and HTTP/2 through the shared reqwest client.
+  The change reaches every user of hyper's HTTP/2 client in the gateway. Among
+  them are the proxy's backend paths (the direct HTTP/2 pool, the gRPC pool
+  including gRPC nested in HBONE, mesh mTLS and Unix-socket HTTP/2 backends,
+  HTTP/2 through the shared reqwest client) and the tonic-based gRPC clients
+  (gRPC health probes, the control-plane and mesh configuration channels).
   No configuration or behaviour change.
 - **The direct HTTP/2 pool now reaches `FERRUM_POOL_HTTP2_CONNECTIONS_PER_HOST`.**
   The pool took the first ready shard, and an open HTTP/2 connection always
