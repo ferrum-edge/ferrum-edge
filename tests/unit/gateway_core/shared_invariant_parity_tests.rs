@@ -2406,6 +2406,12 @@ fn the_direct_http1_lane_map_fences_a_checkout_that_straddles_a_drain() {
         checked_at < inserted_at,
         "the epoch must be compared, under the shard lock, before a lane is inserted"
     );
+    let lookup = without_whitespace(lookup);
+    assert!(
+        lookup.contains("retired:AtomicBool::new(fenced)")
+            && lookup.contains("if!fenced{vacant.insert(Arc::clone(&lane));}"),
+        "a fenced checkout's lane must be retired from birth and must not enter the map"
+    );
     for drain in ["    fn clear(&self) {", "    fn retain_keys("] {
         let body = item_body(lanes, drain, "\n    }\n");
         let bumped_at = body

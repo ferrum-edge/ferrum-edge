@@ -2776,7 +2776,7 @@ fn held_h3_tls_config(
         release_rx
             .await
             .map_err(|_| anyhow::anyhow!("the held TLS configuration read was abandoned"))?;
-        Ok(tls)
+        Ok::<_, anyhow::Error>(tls)
     };
     (read, entered_rx, release_tx)
 }
@@ -2798,15 +2798,17 @@ const H3_FENCED_ENTRIES: [H3FencedEntry; 3] = [
     H3FencedEntry::StreamingTarget,
 ];
 
-/// Send one request through `entry`, running `drain` while the checkout is
-/// reading its TLS configuration, and return the response status.
-async fn h3_status_with_drain_during_tls_read(
+/// Send one request through `entry` and return the response status. The pool
+/// polls `tls_config` only on a checkout that has to dial.
+async fn h3_fenced_entry_status<F>(
     pool: &ferrum_edge::http3::client::Http3ConnectionPool,
     proxy: &Proxy,
     entry: H3FencedEntry,
-    tls: Arc<rustls::ClientConfig>,
-    drain: impl FnOnce(),
-) -> u16 {
+    tls_config: F,
+) -> u16
+where
+    F: std::future::Future<Output = Result<Arc<rustls::ClientConfig>, anyhow::Error>>,
+{
     let port = proxy.backend_port;
     let url = format!("https://127.0.0.1:{port}/");
     let headers = [(
@@ -2814,47 +2816,60 @@ async fn h3_status_with_drain_during_tls_read(
         http::header::HeaderValue::from_str(&format!("127.0.0.1:{port}"))
             .expect("backend authority"),
     )];
-    let (read, entered, release) = held_h3_tls_config(tls);
-    let request = async {
-        match entry {
-            H3FencedEntry::Buffered => h3_pool_buffered_request_for_test(
-                pool,
-                proxy,
-                None,
-                "GET",
-                &url,
-                &headers,
-                bytes::Bytes::new(),
-                read,
-            )
-            .await
-            .map(|response| response.status),
-            H3FencedEntry::BufferedTarget => h3_pool_buffered_request_for_test(
-                pool,
-                proxy,
-                Some(("127.0.0.1", port, port)),
-                "GET",
-                &url,
-                &headers,
-                bytes::Bytes::new(),
-                read,
-            )
-            .await
-            .map(|response| response.status),
-            H3FencedEntry::StreamingTarget => h3_pool_streaming_request_with_target_for_test(
-                pool,
-                proxy,
-                ("127.0.0.1", port, port),
-                "GET",
-                &url,
-                &headers,
-                bytes::Bytes::new(),
-                read,
-            )
-            .await
-            .map(|response| response.status),
-        }
+    let status = match entry {
+        H3FencedEntry::Buffered => h3_pool_buffered_request_for_test(
+            pool,
+            proxy,
+            None,
+            "GET",
+            &url,
+            &headers,
+            bytes::Bytes::new(),
+            tls_config,
+        )
+        .await
+        .map(|response| response.status),
+        H3FencedEntry::BufferedTarget => h3_pool_buffered_request_for_test(
+            pool,
+            proxy,
+            Some(("127.0.0.1", port, port)),
+            "GET",
+            &url,
+            &headers,
+            bytes::Bytes::new(),
+            tls_config,
+        )
+        .await
+        .map(|response| response.status),
+        H3FencedEntry::StreamingTarget => h3_pool_streaming_request_with_target_for_test(
+            pool,
+            proxy,
+            ("127.0.0.1", port, port),
+            "GET",
+            &url,
+            &headers,
+            bytes::Bytes::new(),
+            tls_config,
+        )
+        .await
+        .map(|response| response.status),
     };
+    status.unwrap_or_else(|error| panic!("{entry:?} request must be served: {error}"))
+}
+
+/// Send one request that has to dial through `entry`, running `drain` while
+/// the checkout is reading its TLS configuration, and return the response
+/// status. Only for a cold checkout: a warm one never reads a TLS
+/// configuration, so there would be nothing to hold.
+async fn h3_status_with_drain_during_tls_read(
+    pool: &ferrum_edge::http3::client::Http3ConnectionPool,
+    proxy: &Proxy,
+    entry: H3FencedEntry,
+    tls: Arc<rustls::ClientConfig>,
+    drain: impl FnOnce(),
+) -> u16 {
+    let (read, entered, release) = held_h3_tls_config(tls);
+    let request = h3_fenced_entry_status(pool, proxy, entry, read);
     let drain_then_release = async {
         entered
             .await
@@ -2865,7 +2880,7 @@ async fn h3_status_with_drain_during_tls_read(
             .expect("the checkout must still be waiting on its TLS configuration");
     };
     let (status, ()) = tokio::join!(request, drain_then_release);
-    status.unwrap_or_else(|error| panic!("{entry:?} request must be served: {error}"))
+    status
 }
 
 /// A TLS material or CRL reload drains the pool while a checkout still holds
@@ -2907,11 +2922,17 @@ async fn h3_pool_drain_does_not_publish_a_checkout_that_read_its_tls_config_befo
         );
         assert_eq!(pool.pool_size(), 1, "{entry:?}");
 
-        // And it is the one later requests reuse.
-        let status =
-            h3_status_with_drain_during_tls_read(&pool, &proxy, entry, client_tls, || {}).await;
+        // And it is the one later requests reuse: a warm checkout dials
+        // nothing, so it never asks for a TLS configuration.
+        let status = h3_fenced_entry_status(&pool, &proxy, entry, async {
+            Err::<Arc<rustls::ClientConfig>, _>(anyhow::anyhow!(
+                "a warm checkout must not read a TLS configuration"
+            ))
+        })
+        .await;
         assert_eq!(status, 200, "{entry:?}");
         assert_eq!(backend.accepted_handshakes(), 2, "{entry:?}");
+        assert_eq!(pool.pool_size(), 1, "{entry:?}");
 
         drop(backend);
     }
@@ -3047,7 +3068,9 @@ async fn spawn_gated_h3_udp_relay(
 
 /// The pool is drained while a create is inside it with its QUIC handshake in
 /// flight. The handshake completes after the drain: the connection serves the
-/// request that dialled it and is not published.
+/// request that dialled it and is not published. This is the part of the fence
+/// the shared pool already had; it is pinned here because no HTTP/3 test
+/// covered it.
 #[tokio::test]
 async fn h3_pool_drain_does_not_publish_a_connection_whose_handshake_was_in_flight() {
     use std::time::Duration;
