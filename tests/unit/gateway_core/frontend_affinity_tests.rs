@@ -389,9 +389,10 @@ fn bounded_inline_children_are_constructed_in_their_final_slot() {
 
 /// A final-request-body hook context is a whole `RequestContext`, about 3 KiB.
 /// The handler keeps several of them across awaits and moves them between
-/// slots with `Option::take`, which copies the full value even when the slot
-/// is empty: the normal case, with no body-hook plugin. Boxed, an empty slot
-/// is a null pointer and a move is eight bytes.
+/// slots with `Option::take`. In the release build that move was a copy of
+/// the full value on every request, including when the slot is empty: the
+/// normal case, with no body-hook plugin. Boxed, an empty slot is a null
+/// pointer and a move is eight bytes whatever the optimizer does.
 #[test]
 fn body_hook_contexts_are_boxed_in_the_request_handler() {
     let src = include_str!("../../../src/proxy/mod.rs");
