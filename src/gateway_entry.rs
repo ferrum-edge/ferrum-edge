@@ -188,6 +188,10 @@ unsafe fn run_gateway_cli() {
     // module's power-on self-test, or the provider's algorithm classification
     // is missing, this errors out instead of installing a non-validated
     // provider.
+    //
+    // The same step fixes which implementation serves the TLS record layer on
+    // the ordinary build (`FERRUM_TLS_AEAD_BACKEND`, default `auto` = by CPU);
+    // see `fips::aead_backend`. It is logged once tracing exists.
     match fips::install_crypto_provider() {
         Ok(state) => {
             if state.is_enforcing() {
@@ -884,6 +888,9 @@ fn run_gateway(cli: &cli::Cli) -> i32 {
             &format!("{:?}", env_config.mode),
         ))
     );
+    // Which implementation serves the TLS record layer, and why. Fixed at
+    // provider bootstrap; recorded here because tracing did not exist then.
+    fips::aead_backend::log_startup_selection();
     info!(
         "Proxy bind address: {}, Admin bind address: {}",
         sanitize_startup_scalar(secrets::report_env_field(
@@ -1298,6 +1305,25 @@ fn run_ambient_udp_preflight(args: &cli::AmbientUdpPreflightArgs) -> i32 {
         Err(error) => {
             error!(
                 "FIPS verification failed: {}",
+                render_startup_error(anyhow::anyhow!(error), &[])
+            );
+            return 1;
+        }
+    }
+
+    // The TLS record-layer backend is fixed in that same bootstrap step, so a
+    // request that arrives only through ferrum.conf or an external secret gets
+    // the same explicit refusal here as it does from `EnvConfig` on `run` and
+    // `validate`, rather than being ignored by this one-shot.
+    let aead_raw = config::conf_file::resolve_ferrum_var(fips::aead_backend::TLS_AEAD_BACKEND_ENV)
+        .unwrap_or_else(|| "auto".to_string());
+    match fips::aead_backend::AeadBackendRequest::parse(&aead_raw)
+        .and_then(fips::aead_backend::verify_resolved_request)
+    {
+        Ok(()) => {}
+        Err(error) => {
+            error!(
+                "TLS record-layer backend verification failed: {}",
                 render_startup_error(anyhow::anyhow!(error), &[])
             );
             return 1;

@@ -124,6 +124,13 @@ http = "1"
 # implementation in charge while looking switched. Moving every provider
 # selection onto the feature pair is what makes the switch real.
 #
+# The one additive edge is deliberate and runs the safe way round: the ordinary
+# `crypto-ring` profile also links rustls's own AWS-LC arm (`rustls/aws_lc_rs`)
+# so `crate::fips::aead_backend` can pick the faster TLS record-layer cipher
+# suites for the CPU at startup. That profile claims no validated module, every
+# dependency in it still selects its ring arm, and the `fips` profile is
+# untouched. See the `[features]` comments below.
+#
 # `ring` and `aws-lc-rs` are the ring-API-compatible backends behind
 # `crate::fips::backend` (randomness, HMAC, digests, signature verification).
 # The direct rustls/tokio-rustls dependencies and reqwest deliberately select
@@ -431,14 +438,33 @@ bench-udp-profile = []
 # feature graph so a transitive edge cannot quietly put ring back in control of
 # a nominal FIPS build.
 #
-# `crypto-ring` (default) reproduces the historical, non-FIPS build, with one
-# deliberate exception: jsonwebtoken signs and verifies on AWS-LC on both
-# profiles (its backend is selected inline above, not by this pair). Ordinary
-# deployments are otherwise behaviourally unchanged by the existence of the
-# FIPS profile.
+# `crypto-ring` (default) reproduces the historical, non-FIPS build, with two
+# deliberate exceptions:
+#
+# 1. jsonwebtoken signs and verifies on AWS-LC on both profiles (its backend is
+#    selected inline above, not by this pair).
+# 2. `rustls/aws_lc_rs` links rustls's AWS-LC cipher suites BESIDE ring's. They
+#    are used only for the TLS record layer, and only where
+#    `crate::fips::aead_backend` selects them: by default on the x86-64 CPUs
+#    where AWS-LC's AVX-512 AES-GCM measurably beats ring's AVX2 one, or when
+#    `FERRUM_TLS_AEAD_BACKEND=aws-lc` asks for them. Key exchange, signature
+#    verification and every dependency's own provider arm stay on ring. No new
+#    library is linked: `aws-lc-sys` is already in this profile through
+#    jsonwebtoken and dimpl.
+#
+# `rustls/aws_lc_rs` is the ONLY AWS-LC edge this list may carry.
+# `.github/scripts/check_fips_feature_policy.py` allows exactly that entry
+# (`RING_PROFILE_ALLOWED_AWS_LC_EDGES`), refuses any other spelling or any
+# other dependency's aws-lc arm here, and audits the resolved graph so no
+# dependency in this profile moves off its ring arm. It is not mirrored in
+# `fips`, whose `rustls/fips` already implies it.
+#
+# Ordinary deployments are otherwise behaviourally unchanged by the existence
+# of the FIPS profile.
 crypto-ring = [
     "dep:ring",
     "rustls/ring",
+    "rustls/aws_lc_rs",
     "tokio-rustls/ring",
     "tonic/tls-ring",
     "quinn/rustls-ring",
@@ -455,9 +481,9 @@ crypto-ring = [
 
 # `fips` builds against the FIPS build of AWS-LC (`aws-lc-fips-sys`) through
 # `aws-lc-rs` and rustls. Every arm below is the aws-lc counterpart of the
-# `crypto-ring` line directly above it, so the two lists must stay
-# position-for-position comparable — that correspondence is what the CI policy
-# check reads.
+# `crypto-ring` line in the same position once that list's one unpaired entry
+# (`rustls/aws_lc_rs`, see above) is set aside, so the two lists must stay
+# comparable in order — that correspondence is what the CI policy check reads.
 #
 # Building this profile requires a C toolchain, CMake, Go, and Perl for
 # `aws-lc-fips-sys`. The committed lockfile pins both profiles; feature

@@ -11,10 +11,27 @@ non-validated implementation.
 
 So this reads what cargo actually resolved, not what the manifest asked for.
 
+The two profiles are not symmetric, and the checks say so explicitly:
+
+* The `fips` profile may carry no `ring` arm of any kind. That is the hazard
+  above, and nothing here relaxes it.
+* The ordinary `crypto-ring` profile makes no validation claim, so it may link
+  rustls's own AWS-LC cipher suites *beside* ring (`rustls/aws_lc_rs`), which
+  `src/fips/aead_backend.rs` selects for the TLS record layer on the CPUs where
+  they are faster. That is the only AWS-LC edge the profile may declare
+  (`RING_PROFILE_ALLOWED_AWS_LC_EDGES`). Every dependency in it must still
+  resolve to its ring arm, and the FIPS module must stay out of it.
+
 Usage:
 
     check_fips_feature_policy.py --manifest-check
         Static checks over `Cargo.toml` only. No cargo invocation, no network.
+        Also runs the synthetic self-test below, so the gate cannot go green on
+        a checker that has stopped rejecting what it exists to reject.
+
+    check_fips_feature_policy.py --self-test
+        Synthetic mutations of the manifest and of resolved feature graphs,
+        each of which must be rejected. No cargo invocation, no network.
 
     check_fips_feature_policy.py --tree <path-to-cargo-tree-output> --profile fips
     check_fips_feature_policy.py --tree <path> --profile crypto-ring
@@ -70,13 +87,40 @@ REQUIRED_FEATURE_PAIRS = (
 # dep. `crypto-ring` still needs an explicit `dep:ring`, because `ring` is
 # activated by nothing else in that list.
 REQUIRED_FIPS_ONLY = ("aws-lc-rs/fips",)
-REQUIRED_RING_ONLY = ("dep:ring",)
+
+# The one AWS-LC edge the ordinary profile may declare, spelled exactly.
+#
+# `rustls/aws_lc_rs` compiles rustls's AWS-LC cipher suites next to its ring
+# ones. Ferrum installs them only for the TLS record layer, and only where
+# `src/fips/aead_backend.rs` selects them (by CPU, or by an explicit
+# `FERRUM_TLS_AEAD_BACKEND=aws-lc`); key exchange, signature verification and
+# every dependency's provider arm stay on ring. It adds no library to the
+# profile: `aws-lc-sys` is already linked there through jsonwebtoken and dimpl.
+#
+# This is an allow-list, not a pattern. A second entry is a policy decision that
+# needs the same review this one had; any other AWS-LC spelling in the
+# `crypto-ring` list fails `check_manifest_text`.
+RING_PROFILE_ALLOWED_AWS_LC_EDGES = ("rustls/aws_lc_rs",)
+
+# `src/fips/mod.rs` names `rustls::crypto::aws_lc_rs` in its `crypto-ring` arm,
+# so the allowed edge is also required: dropping it is a compile failure, and
+# this reports it as the manifest fault it is.
+REQUIRED_RING_ONLY = ("dep:ring",) + RING_PROFILE_ALLOWED_AWS_LC_EDGES
+
+# Substrings that mark a feature name as an AWS-LC (or FIPS-module) arm. Used to
+# refuse any such edge in the `crypto-ring` list that is not on the allow-list
+# above, whichever dependency it is on and however it is spelled.
+AWS_LC_FEATURE_MARKERS = ("aws-lc", "aws_lc", "fips")
 
 # Neither profile may name the other's backend crate at all, in any spelling.
 # The pair table above catches a known counterpart edge; this catches a *new*
 # edge onto the wrong crate that nobody thought to pair. jsonwebtoken's inline
 # `aws_lc_rs` (REQUIRED_INLINE_DECLARATIONS) is outside both lists by design:
 # it is the same AWS-LC selection on both profiles, not a profile arm.
+#
+# `rustls/aws_lc_rs` in `crypto-ring` does not name the `aws-lc-rs` crate — it
+# is a feature of rustls — so it is not an exception to this table. The
+# feature-name checks in `check_manifest_text` are what bound it.
 BACKEND_CRATE_PREFIXES = {
     "crypto-ring": ("aws-lc-rs", "aws_lc_rs", "aws-lc-fips-sys", "aws-lc-sys"),
     "fips": ("ring",),
@@ -204,17 +248,55 @@ REQUIRED_RESOLVED_FIPS = {
 
 # The ordinary profile's contract, so a change that quietly moves the default
 # build onto a different backend is caught too.
+#
+# `rustls/aws_lc_rs` is required beside `rustls/ring`: the ordinary build links
+# both of rustls's cipher-suite implementations and chooses between them at
+# startup. `rustls/ring` staying required is what keeps ring the provider for
+# key exchange and signatures.
 REQUIRED_RESOLVED_RING = {
     ("jsonwebtoken", "aws_lc_rs"),
     ("kube", "ring"),
     ("mongodb", "rustls-tls"),
     ("reqwest", "__rustls-ring"),
+    ("rustls", "aws_lc_rs"),
     ("rustls", "ring"),
+    ("tokio-rustls", "ring"),
+    ("quinn-proto", "rustls-ring"),
+    ("tonic", "tls-ring"),
 }
+
+# What "beside ring" must not turn into. The allowed edge is on rustls alone, so
+# no dependency may resolve to its own aws-lc arm (each gates that arm on the
+# absence of its ring arm, and several would silently switch provider), and the
+# FIPS module must not enter the ordinary build by any route.
+#
+# `rcgen/aws_lc_rs` and `x509-parser/verify-aws` are deliberately absent: dimpl
+# has always enabled both in this profile, next to their ring counterparts.
 FORBIDDEN_RESOLVED_RING = {
     ("aws-lc-rs", "fips"),
     ("jsonwebtoken", "rust_crypto"),
     ("rustls", "fips"),
+    ("rustls-webpki", "aws-lc-rs-fips"),
+    ("tokio-rustls", "aws_lc_rs"),
+    ("tokio-rustls", "aws-lc-rs"),
+    ("tokio-rustls", "fips"),
+    ("quinn", "rustls-aws-lc-rs"),
+    ("quinn", "rustls-aws-lc-rs-fips"),
+    ("quinn-proto", "rustls-aws-lc-rs"),
+    ("quinn-proto", "rustls-aws-lc-rs-fips"),
+    ("sqlx", "tls-rustls-aws-lc-rs"),
+    ("sqlx-core", "_tls-rustls-aws-lc-rs"),
+    ("ldap3", "tls-rustls-aws-lc-rs"),
+    ("tonic", "tls-aws-lc"),
+    ("hyper-rustls", "aws-lc-rs"),
+    ("hyper-rustls", "fips"),
+    ("kube", "aws-lc-rs"),
+    ("kube-client", "aws-lc-rs"),
+    ("mongodb", "rustls-tls-aws-lc"),
+    ("rcgen", "fips"),
+    ("reqwest", "__rustls-aws-lc-rs"),
+    ("instant-acme", "aws-lc-rs"),
+    ("instant-acme", "fips"),
 }
 
 # Ferrum-owned production code must not bypass `crate::fips::approved` by
@@ -256,8 +338,17 @@ def dependency_line(manifest: str, name: str) -> str | None:
     return match.group(1) if match else None
 
 
-def check_manifest() -> list[str]:
-    manifest = read_manifest()
+def feature_name(entry: str) -> str:
+    """The feature half of a `[features]` entry (`dep/feature` or `dep:name`)."""
+
+    if "/" in entry:
+        return entry.split("/", 1)[1]
+    return entry.removeprefix("dep:")
+
+
+def check_manifest_text(manifest: str) -> list[str]:
+    """Every manifest check that is a pure function of the `Cargo.toml` text."""
+
     failures: list[str] = []
 
     ring_features = feature_list(manifest, "crypto-ring")
@@ -330,6 +421,44 @@ def check_manifest() -> list[str]:
                         "the profiles are mutually exclusive"
                     )
 
+    # The ordinary profile may link AWS-LC cipher suites beside ring through
+    # exactly the allow-listed edge. Any other feature that names AWS-LC or the
+    # FIPS module is refused by name, whichever dependency carries it: several
+    # dependencies gate their aws-lc arm on the absence of their ring arm, so an
+    # unreviewed second edge is how a provider gets switched by accident.
+    for entry in ring_features:
+        if entry in RING_PROFILE_ALLOWED_AWS_LC_EDGES:
+            continue
+        name = feature_name(entry)
+        if any(marker in name for marker in AWS_LC_FEATURE_MARKERS):
+            failures.append(
+                f"`crypto-ring` selects the AWS-LC feature {entry!r}; the ordinary profile may "
+                f"link AWS-LC only through {list(RING_PROFILE_ALLOWED_AWS_LC_EDGES)} "
+                "(rustls's cipher suites, beside ring)"
+            )
+
+    # The allow-listed edge belongs to the ordinary profile alone. `rustls/fips`
+    # already implies rustls's aws-lc arm, so listing it under `fips` would only
+    # blur which list owns it.
+    for entry in RING_PROFILE_ALLOWED_AWS_LC_EDGES:
+        if entry in fips_features:
+            failures.append(
+                f"`fips` must not select {entry!r}: it is the ordinary profile's edge, and "
+                "`rustls/fips` already selects rustls's aws-lc arm"
+            )
+
+    # The mirror image, and the one that matters for a deployment: no `fips`
+    # entry may select a feature named for ring, on any dependency, whether or
+    # not that dependency has a row in REQUIRED_FEATURE_PAIRS. This is a
+    # manifest-level statement of what FORBIDDEN_RESOLVED_FIPS then verifies in
+    # the resolved graph.
+    for entry in fips_features:
+        if "ring" in re.split(r"[^a-z0-9]+", feature_name(entry).lower()):
+            failures.append(
+                f"`fips` selects the ring feature {entry!r}; a FIPS build must not compile a "
+                "ring arm on any dependency"
+            )
+
     for dep, forbidden in FORBIDDEN_INLINE_DECLARATIONS.items():
         line = dependency_line(manifest, dep)
         if line is None:
@@ -388,6 +517,12 @@ def check_manifest() -> list[str]:
                     "production SHA-2/HMAC uses crate::fips::approved"
                 )
 
+    return failures
+
+
+def check_manifest() -> list[str]:
+    failures = check_manifest_text(read_manifest())
+
     for source_path in sorted((REPO_ROOT / "src").rglob("*.rs")):
         # This module intentionally names the old API in rustdoc while
         # implementing the provider-backed compatibility surface itself.
@@ -433,10 +568,23 @@ def check_tree(path: Path, profile: str) -> list[str]:
             "`cargo tree -e normal,build --prefix none -f '{p}|{f}'`"
         ]
 
+    return check_selections(selections, profile)
+
+
+def check_selections(selections: set[tuple[str, str]], profile: str) -> list[str]:
+    """Audit one resolved feature graph, already parsed into selections."""
+
     if profile == "fips":
         required, forbidden = REQUIRED_RESOLVED_FIPS, FORBIDDEN_RESOLVED_FIPS
+        consequence = (
+            "so a non-validated implementation remains in control of that path"
+        )
     elif profile == "crypto-ring":
         required, forbidden = REQUIRED_RESOLVED_RING, FORBIDDEN_RESOLVED_RING
+        consequence = (
+            "but the ordinary profile may link AWS-LC only as rustls's cipher suites beside "
+            "ring: no dependency may leave its ring arm, and the FIPS module must stay out"
+        )
     else:
         return [f"unknown profile {profile!r}"]
 
@@ -455,8 +603,7 @@ def check_tree(path: Path, profile: str) -> list[str]:
     for crate, feature in sorted(forbidden):
         if (crate, feature) in selections:
             failures.append(
-                f"[{profile}] resolved graph still selects {crate}/{feature}, so a "
-                "non-validated implementation remains in control of that path"
+                f"[{profile}] resolved graph selects {crate}/{feature}, {consequence}"
             )
     return failures
 
@@ -512,9 +659,169 @@ def check_claimed_profiles_declared() -> list[str]:
     return []
 
 
+def _with_feature_entry(manifest: str, feature: str, entry: str) -> str:
+    """Return `manifest` with `entry` appended to one `[features]` list."""
+
+    opening = f"{feature} = [\n"
+    if manifest.count(opening) != 1:
+        raise ValueError(f"expected exactly one multi-line `{feature}` feature list")
+    return manifest.replace(opening, f'{opening}    "{entry}",\n', 1)
+
+
+def _without_feature_entry(manifest: str, feature: str, entry: str) -> str:
+    """Return `manifest` with `entry` removed from one `[features]` list."""
+
+    start = manifest.index(f"{feature} = [\n")
+    end = manifest.index("\n]", start)
+    line = f'    "{entry}",\n'
+    block = manifest[start:end]
+    if block.count(line) != 1:
+        raise ValueError(f"`{feature}` does not list {entry!r} exactly once")
+    return manifest[:start] + block.replace(line, "", 1) + manifest[end:]
+
+
+def self_test() -> list[str]:
+    """Prove the checks still reject what they exist to reject.
+
+    Every case is a single mutation of the real manifest, or of a resolved
+    selection set built from this script's own tables, so the cases cannot
+    drift from the policy they exercise. A mutation that is *accepted* is the
+    failure: it means a check has been weakened or bypassed.
+    """
+
+    failures: list[str] = []
+    manifest = read_manifest()
+
+    baseline = check_manifest_text(manifest)
+    if baseline:
+        # Reported by the ordinary manifest check too; the mutations below are
+        # only meaningful against a manifest that is itself admissible.
+        return [f"self-test baseline: the committed manifest is not admissible: {baseline}"]
+
+    allowed = RING_PROFILE_ALLOWED_AWS_LC_EDGES[0]
+    manifest_mutations = (
+        # The ordinary profile's allowance is exactly one edge, spelled one way.
+        (
+            "crypto-ring drops the allowed rustls AWS-LC edge",
+            lambda: _without_feature_entry(manifest, "crypto-ring", allowed),
+        ),
+        (
+            "crypto-ring adds tokio-rustls's AWS-LC arm",
+            lambda: _with_feature_entry(manifest, "crypto-ring", "tokio-rustls/aws_lc_rs"),
+        ),
+        (
+            "crypto-ring adds quinn's AWS-LC arm",
+            lambda: _with_feature_entry(manifest, "crypto-ring", "quinn/rustls-aws-lc-rs"),
+        ),
+        (
+            "crypto-ring adds the hyphenated rustls AWS-LC alias",
+            lambda: _with_feature_entry(manifest, "crypto-ring", "rustls/aws-lc-rs"),
+        ),
+        (
+            "crypto-ring adds rustls's FIPS arm",
+            lambda: _with_feature_entry(manifest, "crypto-ring", "rustls/fips"),
+        ),
+        (
+            "crypto-ring activates the aws-lc-rs backend crate",
+            lambda: _with_feature_entry(manifest, "crypto-ring", "dep:aws-lc-rs"),
+        ),
+        (
+            "crypto-ring binds the FIPS module",
+            lambda: _with_feature_entry(manifest, "crypto-ring", "aws-lc-rs/fips"),
+        ),
+        # The FIPS profile is unchanged: no ring arm, by pair or by name.
+        (
+            "fips adds rustls's ring arm",
+            lambda: _with_feature_entry(manifest, "fips", "rustls/ring"),
+        ),
+        (
+            "fips adds an unpaired ring arm",
+            lambda: _with_feature_entry(manifest, "fips", "quinn/ring"),
+        ),
+        (
+            "fips activates the ring backend crate",
+            lambda: _with_feature_entry(manifest, "fips", "dep:ring"),
+        ),
+        (
+            "fips drops the validated-module binding",
+            lambda: _without_feature_entry(manifest, "fips", "aws-lc-rs/fips"),
+        ),
+        (
+            "fips lists the ordinary profile's edge",
+            lambda: _with_feature_entry(manifest, "fips", allowed),
+        ),
+    )
+    for label, mutate in manifest_mutations:
+        try:
+            mutated = mutate()
+        except ValueError as error:
+            failures.append(f"self-test could not build the mutation {label!r}: {error}")
+            continue
+        if not check_manifest_text(mutated):
+            failures.append(f"self-test: the manifest check accepted a manifest where {label}")
+
+    ordinary = set(REQUIRED_RESOLVED_RING)
+    fips = set(REQUIRED_RESOLVED_FIPS)
+    for profile, selections in (("crypto-ring", ordinary), ("fips", fips)):
+        accepted = check_selections(selections, profile)
+        if accepted:
+            failures.append(
+                f"self-test baseline: the required {profile} selections are not admissible: "
+                f"{accepted}"
+            )
+
+    selection_mutations = (
+        # Linking AWS-LC cipher suites beside ring must not become a dependency
+        # leaving its ring arm, or the FIPS module entering the ordinary build.
+        ("crypto-ring", ordinary | {("tokio-rustls", "aws_lc_rs")}),
+        ("crypto-ring", ordinary | {("quinn-proto", "rustls-aws-lc-rs")}),
+        ("crypto-ring", ordinary | {("reqwest", "__rustls-aws-lc-rs")}),
+        ("crypto-ring", ordinary | {("aws-lc-rs", "fips")}),
+        ("crypto-ring", ordinary | {("rustls", "fips")}),
+        ("crypto-ring", ordinary - {("rustls", "ring")}),
+        ("crypto-ring", ordinary - {("rustls", "aws_lc_rs")}),
+        # A nominal FIPS build cannot end up with ring in control of a path.
+        ("fips", fips | {("rustls", "ring")}),
+        ("fips", fips | {("tokio-rustls", "ring")}),
+        ("fips", fips | {("quinn-proto", "rustls-ring")}),
+        ("fips", fips | {("rustls-webpki", "ring")}),
+        ("fips", fips | {("reqwest", "__rustls-ring")}),
+        ("fips", fips - {("aws-lc-rs", "fips")}),
+        ("fips", fips - {("rustls", "fips")}),
+    )
+    for profile, selections in selection_mutations:
+        if not check_selections(selections, profile):
+            base = ordinary if profile == "crypto-ring" else fips
+            delta = sorted(selections ^ base)
+            failures.append(
+                f"self-test: the resolved-graph audit accepted a {profile} graph that differs "
+                f"from the required selections by {delta}"
+            )
+
+    # Every forbidden row must be individually fatal, in both profiles, so a row
+    # cannot be shadowed by an early return or a mistyped table.
+    for profile, base, forbidden in (
+        ("crypto-ring", ordinary, FORBIDDEN_RESOLVED_RING),
+        ("fips", fips, FORBIDDEN_RESOLVED_FIPS),
+    ):
+        for row in sorted(forbidden):
+            if not check_selections(base | {row}, profile):
+                failures.append(
+                    f"self-test: the resolved-graph audit accepted the forbidden {profile} "
+                    f"selection {row[0]}/{row[1]}"
+                )
+
+    return failures
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--manifest-check", action="store_true")
+    parser.add_argument(
+        "--self-test",
+        action="store_true",
+        help="Run only the synthetic rejection cases (also part of --manifest-check).",
+    )
     parser.add_argument("--tree", type=Path)
     parser.add_argument("--profile", choices=("fips", "crypto-ring"))
     parser.add_argument(
@@ -531,9 +838,20 @@ def main() -> int:
         return 0
 
     failures: list[str] = []
+    if args.self_test:
+        failures.extend(self_test())
+        if failures:
+            print("FIPS feature-policy self-test FAILED:", file=sys.stderr)
+            for failure in failures:
+                print(f"  - {failure}", file=sys.stderr)
+            return 1
+        print("FIPS feature-policy self-test passed.")
+        return 0
+
     if args.manifest_check or args.tree is None:
         failures.extend(check_manifest())
         failures.extend(check_claimed_profiles_declared())
+        failures.extend(self_test())
     if args.tree is not None:
         if args.profile is None:
             parser.error("--tree requires --profile")
