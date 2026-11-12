@@ -11,6 +11,8 @@ use tokio::sync::{Semaphore, watch};
 use crate::config::PoolConfig;
 use crate::config::types::Proxy;
 
+pub(crate) mod shard_fill;
+
 thread_local! {
     // Sized for identity fields plus the reqwest `rcfg=…` client-behavior suffix.
     static KEY_BUF: RefCell<String> = RefCell::new(String::with_capacity(192));

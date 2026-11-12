@@ -32,10 +32,10 @@ use hyper::body::Incoming;
 use hyper::client::conn::http2;
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, OnceLock};
 use std::task::{Context, Poll};
 use std::time::Duration;
 use tokio::net::TcpStream;
@@ -48,6 +48,7 @@ use crate::config::PoolConfig;
 use crate::config::types::{BackendScheme, GatewayConfig, Proxy};
 use crate::dns::{DnsCache, DnsConfig};
 use crate::plugins::{BufferedInitialResponseHeaderPolicyState, Plugin};
+use crate::pool::shard_fill::{ShardCreateBackoff, ShardCreateGuard, ShardFill, ShardRing};
 use crate::pool::{CoalescedCreateAttempt, GenericPool, PoolCreateCaller, PoolManager};
 use crate::proxy::client_abort::CLIENT_CLOSED_REQUEST_STATUS;
 use crate::proxy::hbone_pool::HbonePoolError;
@@ -831,114 +832,6 @@ pub struct GrpcConnectionPool {
     frontend_slots: Arc<crate::proxy::frontend_affinity::SlotTable>,
 }
 
-/// How long a failed affinity or spill shard create keeps that shard on the
-/// borrow path before it is dialled again.
-const SHARD_CREATE_BACKOFF: Duration = Duration::from_secs(2);
-
-/// Hard bound on retained failure keys and FIFO records. Recording one
-/// physical failure evicts at most one record; there are no full-map scans.
-const SHARD_CREATE_BACKOFF_CAPACITY: usize = 4096;
-
-/// A shard key's place in its ring: the base key length, the preferred
-/// shard, and the ring size.
-#[derive(Clone, Copy)]
-struct ShardRing {
-    base_len: usize,
-    start: usize,
-    shards: usize,
-}
-
-/// Removes a background shard fill from the in-flight set when its task ends,
-/// however it ends.
-struct ShardFill {
-    fills: Arc<DashMap<String, ()>>,
-    key: String,
-}
-
-impl Drop for ShardFill {
-    fn drop(&mut self) {
-        self.fills.remove(&self.key);
-    }
-}
-
-struct ShardCreateBackoff {
-    failures: DashMap<Arc<str>, ShardCreateFailure>,
-    // Only physical failed/cancelled creates take this lock. Warm requests
-    // never consult the backoff cache, and coalesced waiters never record.
-    order: Mutex<VecDeque<(Arc<str>, usize)>>,
-    recorded: AtomicUsize,
-    evicted: AtomicUsize,
-}
-
-struct ShardCreateFailure {
-    at: tokio::time::Instant,
-    generation: usize,
-}
-
-impl ShardCreateBackoff {
-    fn new(shards: usize) -> Self {
-        Self {
-            failures: DashMap::with_shard_amount(shards),
-            order: Mutex::new(VecDeque::with_capacity(SHARD_CREATE_BACKOFF_CAPACITY)),
-            recorded: AtomicUsize::new(0),
-            evicted: AtomicUsize::new(0),
-        }
-    }
-
-    fn backed_off(&self, key: &str) -> bool {
-        let failed_at = match self.failures.get(key) {
-            Some(entry) => entry.at,
-            None => return false,
-        };
-        if failed_at.elapsed() < SHARD_CREATE_BACKOFF {
-            return true;
-        }
-        self.failures.remove_if(key, |_, failure| {
-            failure.at.elapsed() >= SHARD_CREATE_BACKOFF
-        });
-        false
-    }
-
-    fn record(&self, key: String) {
-        // Recover the bounded bookkeeping after a panic without dropping the
-        // cancellation cooldown. No user work runs while this lock is held.
-        let mut order = self.order.lock().unwrap_or_else(|err| err.into_inner());
-        if order.len() == SHARD_CREATE_BACKOFF_CAPACITY
-            && let Some((old_key, old_generation)) = order.pop_front()
-        {
-            self.failures.remove_if(old_key.as_ref(), |_, failure| {
-                failure.generation == old_generation
-            });
-            self.evicted.fetch_add(1, Ordering::Relaxed);
-        }
-        let key: Arc<str> = key.into();
-        let generation = self.recorded.fetch_add(1, Ordering::Relaxed);
-        self.failures.insert(
-            Arc::clone(&key),
-            ShardCreateFailure {
-                at: tokio::time::Instant::now(),
-                generation,
-            },
-        );
-        order.push_back((key, generation));
-    }
-}
-
-/// Lives inside the elected physical creator, so cancellation records the
-/// cooldown before GenericPool wakes waiters to elect the next creator.
-struct ShardCreateGuard<'a> {
-    backoff: &'a ShardCreateBackoff,
-    key: Option<String>,
-}
-
-impl Drop for ShardCreateGuard<'_> {
-    fn drop(&mut self) {
-        if let Some(key) = self.key.take() {
-            self.backoff.record(key);
-        }
-    }
-}
-
 #[derive(Clone)]
 struct GrpcPoolManager {
     global_pool_config: PoolConfig,
@@ -1221,17 +1114,14 @@ impl GrpcConnectionPool {
     /// Shard keys currently backed off after a failed affinity or spill
     /// create.
     pub fn shard_create_backoff_len(&self) -> usize {
-        self.shard_create_backoff.failures.len()
+        self.shard_create_backoff.backed_off_keys()
     }
 
     /// Physical failure records and bounded FIFO eviction operations. Exposed
     /// for outage/fanout regression coverage, not logical request counts.
     #[doc(hidden)]
     pub fn shard_create_backoff_work(&self) -> (usize, usize) {
-        (
-            self.shard_create_backoff.recorded.load(Ordering::Relaxed),
-            self.shard_create_backoff.evicted.load(Ordering::Relaxed),
-        )
+        self.shard_create_backoff.work()
     }
 
     /// Background shard creates currently in flight. Exposed for borrow and
