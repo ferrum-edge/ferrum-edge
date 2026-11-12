@@ -2359,10 +2359,10 @@ pub fn validate_backend_tls_policy_for_quic(policy: &TlsPolicy) -> Result<(), an
 /// This ensures outbound connections enforce the same TLS settings (cipher suites,
 /// min/max protocol versions, key exchange groups) as inbound listeners.
 ///
-/// With no `TlsPolicy` this is `ClientConfig::builder()` with the provider
+/// With no `TlsPolicy` this is rustls's `ClientConfig` builder with the provider
 /// named explicitly: the seam's provider and rustls's safe default protocol
 /// versions. Ferrum-owned clients that take the build defaults (log sinks,
-/// health probes) call it that way instead of `ClientConfig::builder()`, which
+/// health probes) call it that way instead of the provider-less builder, which
 /// reads rustls's process-default provider and, when none is installed, the one
 /// its crate features name. The ordinary build links both of rustls's
 /// providers (see `fips::aead_backend`), so that fallback is ambiguous there

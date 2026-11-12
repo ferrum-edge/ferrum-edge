@@ -400,7 +400,7 @@ async fn connect_tcp(cfg: &TcpFlushConfig) -> Result<TcpWriter, String> {
     }
 }
 
-/// `rustls::ClientConfig::builder()` with the provider named explicitly, so the
+/// A rustls `ClientConfig` builder with the provider named explicitly, so the
 /// sink does not depend on a process-default provider having been installed.
 fn tls_client_config_builder()
 -> Result<rustls::ConfigBuilder<rustls::ClientConfig, rustls::WantsVerifier>, String> {
@@ -678,9 +678,15 @@ mod tests {
             "private key should be present",
         );
         let server_config = must(
-            rustls::ServerConfig::builder()
-                .with_no_client_auth()
-                .with_single_cert(cert_chain, key),
+            must(
+                rustls::ServerConfig::builder_with_provider(std::sync::Arc::new(
+                    crate::fips::base_crypto_provider(),
+                ))
+                .with_safe_default_protocol_versions(),
+                "select TLS protocol versions",
+            )
+            .with_no_client_auth()
+            .with_single_cert(cert_chain, key),
             "build TLS server config",
         );
         let acceptor = TlsAcceptor::from(Arc::new(server_config));

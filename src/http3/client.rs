@@ -5978,7 +5978,7 @@ mod h3_pool_health_tests {
 
     fn install_provider() {
         // rustls 0.23 requires a process-wide crypto provider before any
-        // `ClientConfig::builder()` / `ServerConfig::builder()` call. The
+        // provider-less `ClientConfig` / `ServerConfig` builder call. The
         // "ring" provider is installed wholesale by the gateway main; in
         // unit tests several test mods may race to install — `_ = ...`
         // ignores the "already installed" return.
@@ -6012,11 +6012,14 @@ mod h3_pool_health_tests {
     fn make_server_endpoint(addr: SocketAddr) -> Endpoint {
         let (cert, key) = issue_cert();
 
-        let mut server_crypto =
-            rustls::ServerConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
-                .with_no_client_auth()
-                .with_single_cert(vec![cert], key)
-                .expect("server config");
+        let mut server_crypto = rustls::ServerConfig::builder_with_provider(std::sync::Arc::new(
+            crate::fips::base_crypto_provider(),
+        ))
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .expect("TLS 1.3 is supported")
+        .with_no_client_auth()
+        .with_single_cert(vec![cert], key)
+        .expect("server config");
         server_crypto.alpn_protocols = vec![b"h3".to_vec()];
 
         let quic_server = quinn::crypto::rustls::QuicServerConfig::try_from(server_crypto)
@@ -6082,11 +6085,14 @@ mod h3_pool_health_tests {
             }
         }
 
-        let mut client_crypto =
-            rustls::ClientConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
-                .dangerous()
-                .with_custom_certificate_verifier(Arc::new(AcceptAny))
-                .with_no_client_auth();
+        let mut client_crypto = rustls::ClientConfig::builder_with_provider(std::sync::Arc::new(
+            crate::fips::base_crypto_provider(),
+        ))
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .expect("TLS 1.3 is supported")
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(AcceptAny))
+        .with_no_client_auth();
         client_crypto.alpn_protocols = vec![b"h3".to_vec()];
 
         let quic_client = quinn::crypto::rustls::QuicClientConfig::try_from(client_crypto)

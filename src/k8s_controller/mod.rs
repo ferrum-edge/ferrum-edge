@@ -821,8 +821,8 @@ pub async fn try_default_kube_client() -> Result<kube::Client, String> {
 /// [`redacted_kube_config_error`].
 ///
 /// It also makes sure a rustls process-default provider exists first.
-/// kube-client builds its TLS configuration with the provider-less
-/// `rustls::ClientConfig::builder()`, which reads that default and, when none
+/// kube-client builds its TLS configuration with rustls's provider-less
+/// `ClientConfig` builder, which reads that default and, when none
 /// is installed, the provider rustls's crate features name. The ordinary build
 /// links both of rustls's providers, so that fallback is ambiguous and the call
 /// panics. The gateway installs a provider at bootstrap, but `ferrum-cni

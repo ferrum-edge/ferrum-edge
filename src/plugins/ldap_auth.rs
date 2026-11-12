@@ -2963,7 +2963,7 @@ pub(crate) fn build_ldap_tls_config(
     // builder doesn't fall back to the (uninstalled) global default and
     // panic at first use. The gateway's own startup installs ring at
     // `main.rs::install_default()`, but that only matters for code paths
-    // that go through the global accessor — `ClientConfig::builder()`
+    // that go through the global accessor — a `ClientConfig` built
     // without `with_provider()` would also work in production but breaks
     // unit tests that exercise `LdapAuth::new()` before `install_default()`
     // has run. Always supplying the provider explicitly avoids that ordering

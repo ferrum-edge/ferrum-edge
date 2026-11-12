@@ -1296,7 +1296,7 @@ fn build_tls_connector(
     )))
 }
 
-/// `rustls::ClientConfig::builder()` with the provider named explicitly, so the
+/// A rustls `ClientConfig` builder with the provider named explicitly, so the
 /// sink does not depend on a process-default provider having been installed.
 fn tls_client_config_builder()
 -> Result<rustls::ConfigBuilder<rustls::ClientConfig, rustls::WantsVerifier>, String> {

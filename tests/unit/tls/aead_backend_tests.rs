@@ -1156,135 +1156,189 @@ fn kubernetes_client_builds_without_a_bootstrapped_provider() {
     );
 }
 
-// ── Production code names its rustls provider ───────────────────────────────
+// ── No code under src/ spells a provider-less rustls constructor ────────────
 
-/// rustls constructors that read the process-default provider instead of
-/// taking one, written without whitespace.
-const PROVIDER_LESS_CONSTRUCTORS: [&str; 10] = [
-    "ClientConfig::builder()",
-    "ServerConfig::builder()",
-    "ClientConfig::builder_with_protocol_versions(",
-    "ServerConfig::builder_with_protocol_versions(",
-    "WebPkiClientVerifier::builder(",
-    "WebPkiServerVerifier::builder(",
-    // hyper-rustls connector shorthands, each of which starts from
-    // `ClientConfig::builder()`.
-    "HttpsConnectorBuilder::new().with_platform_verifier()",
-    "HttpsConnectorBuilder::new().try_with_platform_verifier()",
-    "HttpsConnectorBuilder::new().with_native_roots()",
-    "HttpsConnectorBuilder::new().with_webpki_roots()",
+/// rustls and hyper-rustls constructors that read the process-default provider
+/// instead of taking one: the name each is reported by, and the words of the
+/// call in order.
+const PROVIDER_LESS_CONSTRUCTORS: [(&str, &[&str]); 18] = [
+    ("ClientConfig::builder", &["ClientConfig", "builder"]),
+    ("ServerConfig::builder", &["ServerConfig", "builder"]),
+    (
+        "ClientConfig::builder_with_protocol_versions",
+        &["ClientConfig", "builder_with_protocol_versions"],
+    ),
+    (
+        "ServerConfig::builder_with_protocol_versions",
+        &["ServerConfig", "builder_with_protocol_versions"],
+    ),
+    (
+        "WebPkiClientVerifier::builder",
+        &["WebPkiClientVerifier", "builder"],
+    ),
+    (
+        "WebPkiServerVerifier::builder",
+        &["WebPkiServerVerifier", "builder"],
+    ),
+    // hyper-rustls connector shorthands, each of which starts from a
+    // provider-less client configuration, from each way of starting the
+    // connector builder.
+    (
+        "HttpsConnectorBuilder::new().with_platform_verifier",
+        &["HttpsConnectorBuilder", "new", "with_platform_verifier"],
+    ),
+    (
+        "HttpsConnectorBuilder::new().try_with_platform_verifier",
+        &["HttpsConnectorBuilder", "new", "try_with_platform_verifier"],
+    ),
+    (
+        "HttpsConnectorBuilder::new().with_native_roots",
+        &["HttpsConnectorBuilder", "new", "with_native_roots"],
+    ),
+    (
+        "HttpsConnectorBuilder::new().with_webpki_roots",
+        &["HttpsConnectorBuilder", "new", "with_webpki_roots"],
+    ),
+    (
+        "HttpsConnectorBuilder::default().with_platform_verifier",
+        &["HttpsConnectorBuilder", "default", "with_platform_verifier"],
+    ),
+    (
+        "HttpsConnectorBuilder::default().try_with_platform_verifier",
+        &[
+            "HttpsConnectorBuilder",
+            "default",
+            "try_with_platform_verifier",
+        ],
+    ),
+    (
+        "HttpsConnectorBuilder::default().with_native_roots",
+        &["HttpsConnectorBuilder", "default", "with_native_roots"],
+    ),
+    (
+        "HttpsConnectorBuilder::default().with_webpki_roots",
+        &["HttpsConnectorBuilder", "default", "with_webpki_roots"],
+    ),
+    (
+        "HttpsConnector::builder().with_platform_verifier",
+        &["HttpsConnector", "builder", "with_platform_verifier"],
+    ),
+    (
+        "HttpsConnector::builder().try_with_platform_verifier",
+        &["HttpsConnector", "builder", "try_with_platform_verifier"],
+    ),
+    (
+        "HttpsConnector::builder().with_native_roots",
+        &["HttpsConnector", "builder", "with_native_roots"],
+    ),
+    (
+        "HttpsConnector::builder().with_webpki_roots",
+        &["HttpsConnector", "builder", "with_webpki_roots"],
+    ),
 ];
 
-/// The attribute that makes an item test-only, as `cargo fmt` writes it.
-const TEST_ONLY_ATTRIBUTE: &str = "#[cfg(test)]";
-
-/// Reported in place of a constructor when a file could not be read to its
-/// end, so the file fails the guard instead of passing unread.
-const UNDELIMITED_SOURCE: &str =
-    "a comment, a literal or a #[cfg(test)] item whose end was not found";
-
-/// `text` reduced to its production code, with all whitespace removed, or
-/// `None` when a comment, a literal or a test-only item never ends.
+/// The provider-less constructors spelled anywhere in `text`.
 ///
-/// Comments are dropped and string and character literals emptied first, so
-/// nothing written inside one can pass for code, for an attribute or for a
-/// delimiter. Every item under a bare `#[cfg(test)]` is then dropped by
-/// matching its delimiters, whatever its layout. Removing whitespace makes the
-/// search indifferent to how a call is wrapped.
+/// Nothing is skipped: not comments, not string literals, not `#[cfg(test)]`
+/// items. A call is recognised from where its first word stands, by reading
+/// forwards over what the compiler would allow between its words, so no
+/// mistake about where a comment, a literal or a test-only item ends can hide
+/// one. The price is that inline tests name their provider too, and that
+/// nothing under `src/` can quote one of these calls, even in a comment.
 ///
-/// Where the scan cannot be exact it reads test code as production code, never
-/// the reverse: an attribute that is not the bare `#[cfg(test)]` (such as
-/// `#[cfg(all(test, unix))]`) exempts nothing, and a test-only item can end
-/// early (see `after_test_only_item`). What it does not see is a constructor
-/// reached through a renamed import or written by a macro. What it cannot
-/// delimit is an attribute inside a macro invocation whose grammar ends the
-/// attribute's target some other way than Rust's own does. The runtime tests
-/// above are what cover the paths that matter.
-fn production_source(text: &str) -> Option<String> {
-    let code = code_only(text)?;
-    let mut production = String::with_capacity(code.len());
-    let mut rest = code.as_str();
-    while let Some((before, after)) = rest.split_once(TEST_ONLY_ATTRIBUTE) {
-        production.push_str(before);
-        let preceding = &code[..code.len() - rest.len() + before.len()];
-        rest = after_test_only_item(after, in_where_clause(preceding))?;
-    }
-    production.push_str(rest);
-    production.retain(|character| !character.is_whitespace());
-    Some(production)
+/// What it does not see is a constructor reached without the type's own name
+/// in front of it: through a renamed import, a type alias, `Self`, a variable
+/// that holds the hyper-rustls builder, or a macro that writes the call. The
+/// runtime tests above are what cover the paths that matter.
+fn provider_less_constructors_in(text: &str) -> Vec<&'static str> {
+    PROVIDER_LESS_CONSTRUCTORS
+        .into_iter()
+        .filter(|(_, words)| {
+            text.match_indices(words[0])
+                .any(|(start, _)| spells(text, start, words))
+        })
+        .map(|(name, _)| name)
+        .collect()
 }
 
-/// `text` with its comments removed and its string and character literals
-/// emptied, or `None` when one of them never ends.
-///
-/// Tokens are read forwards, the way the compiler reads them: a word (an
-/// identifier, a keyword or a number) is taken whole, a literal takes its
-/// suffix with it, and a lifetime takes its name. A raw string is therefore
-/// recognised by the word in front of it being exactly `r`, `br` or `cr`,
-/// never by whichever character happens to precede a quote.
-fn code_only(text: &str) -> Option<String> {
-    let chars: Vec<char> = text.chars().collect();
-    let mut code = String::with_capacity(text.len());
-    let mut index = 0;
-    while let Some(&current) = chars.get(index) {
-        let next = chars.get(index + 1).copied();
-        match current {
-            '/' if next == Some('/') => {
-                while chars.get(index).is_some_and(|&character| character != '\n') {
-                    index += 1;
-                }
+/// `true` when `text` spells `words` in order from byte `start`: each one a
+/// whole word, with nothing between two of them but what `after_connectors`
+/// passes over.
+fn spells(text: &str, start: usize, words: &[&str]) -> bool {
+    if text[..start].chars().next_back().is_some_and(is_word) {
+        return false;
+    }
+    let mut rest = &text[start..];
+    for (position, word) in words.iter().enumerate() {
+        if position > 0 {
+            rest = after_connectors(rest);
+        }
+        match rest.strip_prefix(*word) {
+            Some(after) if after.chars().next().is_none_or(|next| !is_word(next)) => rest = after,
+            _ => return false,
+        }
+    }
+    true
+}
+
+/// `text` without what can stand at its start between two words of one path or
+/// call chain: whitespace, comments, the punctuation of a path or a call
+/// (`:`, `<`, `>`, `(`, `)`, `.`) and the `r#` of a raw identifier.
+fn after_connectors(text: &str) -> &str {
+    let mut rest = text;
+    loop {
+        rest = rest.trim_start_matches(is_connector);
+        if rest.starts_with("//") {
+            rest = rest.split_once('\n').map_or("", |(_, after)| after);
+        } else if let Some(comment) = rest.strip_prefix("/*") {
+            match after_block_comment(comment) {
+                Some(after) => rest = after,
+                None => return rest,
             }
-            '/' if next == Some('*') => {
-                index = end_of_block_comment(&chars, index + 2)?;
-                code.push(' ');
-            }
-            '"' => {
-                index = end_of_word(&chars, end_of_quoted(&chars, index + 1, '"')?);
-                code.push_str("\"\"");
-            }
-            // A character literal: an escape, or one character and its quote.
-            '\'' if next == Some('\\') => {
-                index = end_of_word(&chars, end_of_quoted(&chars, index + 1, '\'')?);
-                code.push_str("''");
-            }
-            '\'' if chars.get(index + 2) == Some(&'\'') => {
-                index = end_of_word(&chars, index + 3);
-                code.push_str("''");
-            }
-            // Any other `'` starts a lifetime or a label.
-            '\'' => {
-                let end = end_of_word(&chars, index + 1);
-                code.extend(&chars[index..end]);
-                index = end;
-            }
-            _ if is_word(current) => {
-                let end = end_of_word(&chars, index);
-                match raw_string_contents(&chars, index, end) {
-                    Some((contents, hashes)) => {
-                        let closed = end_of_raw_string(&chars, contents, hashes)?;
-                        index = end_of_word(&chars, closed);
-                        code.push_str("\"\"");
-                    }
-                    None => {
-                        code.extend(&chars[index..end]);
-                        index = end;
-                    }
-                }
+        } else if let Some(after) = rest.strip_prefix("r#") {
+            rest = after;
+        } else {
+            return rest;
+        }
+    }
+}
+
+/// What follows a block comment, given the text after its `/*`; `None` when it
+/// never closes. Block comments nest.
+fn after_block_comment(text: &str) -> Option<&str> {
+    let mut depth = 1usize;
+    let mut rest = text;
+    while depth > 0 {
+        let close = rest.find("*/")?;
+        match rest.find("/*") {
+            Some(open) if open < close => {
+                depth += 1;
+                rest = &rest[open + 2..];
             }
             _ => {
-                code.push(current);
-                index += 1;
+                depth -= 1;
+                rest = &rest[close + 2..];
             }
         }
     }
-    Some(code)
+    Some(rest)
 }
 
-/// `true` for a character of an identifier, a keyword, a number or a literal
-/// suffix. Outside comments and literals, Rust source has no other use for a
-/// non-ASCII character than an identifier, except the five it treats as
-/// whitespace, so every other non-ASCII character counts without consulting
-/// the Unicode identifier tables.
+/// `true` for whitespace and for the punctuation that joins the words of a
+/// path or a call chain. `\u{200e}` and `\u{200f}` are whitespace to the
+/// compiler, though not to `char::is_whitespace`.
+fn is_connector(character: char) -> bool {
+    character.is_whitespace()
+        || matches!(
+            character,
+            ':' | '<' | '>' | '(' | ')' | '.' | '\u{200e}' | '\u{200f}'
+        )
+}
+
+/// `true` for a character of an identifier. Outside comments and literals,
+/// Rust source has no other use for a non-ASCII character than an identifier,
+/// except the five it treats as whitespace, so every other non-ASCII character
+/// counts without consulting the Unicode identifier tables.
 fn is_word(character: char) -> bool {
     const NON_ASCII_WHITESPACE: [char; 5] =
         ['\u{85}', '\u{200e}', '\u{200f}', '\u{2028}', '\u{2029}'];
@@ -1293,190 +1347,16 @@ fn is_word(character: char) -> bool {
         || (!character.is_ascii() && !NON_ASCII_WHITESPACE.contains(&character))
 }
 
-/// The index after the run of word characters that starts at `start`, which
-/// is `start` itself when there is none. After a literal, that run is the
-/// literal's suffix.
-fn end_of_word(chars: &[char], start: usize) -> usize {
-    start
-        + chars[start..]
-            .iter()
-            .take_while(|&&character| is_word(character))
-            .count()
-}
-
-/// The index after the block comment whose text starts at `start`. Block
-/// comments nest.
-fn end_of_block_comment(chars: &[char], start: usize) -> Option<usize> {
-    let mut depth = 1usize;
-    let mut index = start;
-    while depth > 0 {
-        match (*chars.get(index)?, chars.get(index + 1).copied()) {
-            ('/', Some('*')) => {
-                depth += 1;
-                index += 2;
-            }
-            ('*', Some('/')) => {
-                depth -= 1;
-                index += 2;
-            }
-            _ => index += 1,
-        }
-    }
-    Some(index)
-}
-
-/// The index after the closing `delimiter` of a string or character literal
-/// whose contents start at `start`. A backslash escapes the next character.
-fn end_of_quoted(chars: &[char], start: usize, delimiter: char) -> Option<usize> {
-    let mut index = start;
-    loop {
-        match *chars.get(index)? {
-            '\\' => index += 2,
-            character if character == delimiter => return Some(index + 1),
-            _ => index += 1,
-        }
-    }
-}
-
-/// Where a raw string's contents start, and how many `#`s close it, when the
-/// word at `start..end` is a raw-string prefix with `#`s and a `"` after it.
-fn raw_string_contents(chars: &[char], start: usize, end: usize) -> Option<(usize, usize)> {
-    if !matches!(&chars[start..end], ['r'] | ['b', 'r'] | ['c', 'r']) {
-        return None;
-    }
-    let hashes = chars[end..]
-        .iter()
-        .take_while(|&&character| character == '#')
-        .count();
-    (chars.get(end + hashes) == Some(&'"')).then_some((end + hashes + 1, hashes))
-}
-
-/// The index after the raw string whose contents start at `start` and which
-/// closes with `"` followed by `hashes` `#`s.
-fn end_of_raw_string(chars: &[char], start: usize, hashes: usize) -> Option<usize> {
-    let mut index = start;
-    loop {
-        let end = index + 1 + hashes;
-        if *chars.get(index)? == '"'
-            && chars
-                .get(index + 1..end)?
-                .iter()
-                .all(|&character| character == '#')
-        {
-            return Some(end);
-        }
-        index += 1;
-    }
-}
-
-/// What follows the item that a `#[cfg(test)]` attribute applies to, given the
-/// code right after that attribute; `None` when the item never ends.
-///
-/// The scan stops at the first place the item could end: a `;` or `,` outside
-/// its own brackets, the brace that closes its first block, or the close of
-/// whatever encloses it, which is a block or a list, a generic parameter list
-/// (`>`) or a closure's parameters (`|`). For a predicate of a `where` clause
-/// that is also the `{` or `=` that ends the clause. Every position an
-/// attribute can take in Rust ends at one of those, so the scan never runs
-/// past the item and production code after it is never skipped.
-///
-/// It can stop short: at a comma between generic arguments, at a `>` or `|`
-/// used as an operator, at the first block of an `if` that has an `else`. The
-/// rest of that test-only item is then read as production code. That is also
-/// what makes `cfg_if!` come out right, where the `else` block after
-/// `if #[cfg(test)] { .. }` is the production branch.
-fn after_test_only_item(source: &str, where_predicate: bool) -> Option<&str> {
-    let mut item = source.trim_start();
-    // Further attributes on the same item.
-    while item.starts_with("#[") {
-        item = after_attribute(item)?.trim_start();
-    }
-    let mut depth = 0usize;
-    // `<`s outside brackets that no `>` has matched yet.
-    let mut angles = 0usize;
-    for (offset, character) in item.char_indices() {
-        match character {
-            '{' | '=' if depth == 0 && where_predicate => return Some(&item[offset..]),
-            '(' | '[' | '{' => depth += 1,
-            ')' | ']' | '}' | '|' if depth == 0 => return Some(&item[offset..]),
-            '<' if depth == 0 => angles += 1,
-            // Not the `>` of `->` or `=>`.
-            '>' if depth == 0 && !item[..offset].ends_with(['-', '=']) => {
-                if angles == 0 {
-                    return Some(&item[offset..]);
-                }
-                angles -= 1;
-            }
-            ')' | ']' => depth -= 1,
-            '}' => {
-                depth -= 1;
-                if depth == 0 {
-                    let after = &item[offset + 1..];
-                    let next = after.trim_start();
-                    return Some(next.strip_prefix([';', ',']).unwrap_or(after));
-                }
-            }
-            ';' | ',' if depth == 0 => return Some(&item[offset + 1..]),
-            _ => {}
-        }
-    }
-    None
-}
-
-/// `true` when the code before an attribute leaves it among the predicates of
-/// a `where` clause: the keyword is there with no brace or semicolon after it.
-/// A clause with a braced expression in an earlier predicate is not recognised.
-fn in_where_clause(preceding: &str) -> bool {
-    preceding
-        .rsplit(['{', '}', ';'])
-        .next()
-        .is_some_and(|clause| {
-            clause
-                .split(|character: char| !is_word(character))
-                .any(|word| word == "where")
-        })
-}
-
-/// What follows the attribute that `source` starts with; `None` when its
-/// bracket never closes.
-fn after_attribute(source: &str) -> Option<&str> {
-    let mut depth = 0usize;
-    for (offset, character) in source.char_indices() {
-        match character {
-            '[' => depth += 1,
-            ']' => {
-                depth = depth.checked_sub(1)?;
-                if depth == 0 {
-                    return Some(&source[offset + 1..]);
-                }
-            }
-            _ => {}
-        }
-    }
-    None
-}
-
-/// The provider-less constructors in `text`'s production code, or a marker
-/// when the file could not be scanned.
-fn provider_less_constructors_in(text: &str) -> Vec<&'static str> {
-    let Some(production) = production_source(text) else {
-        return vec![UNDELIMITED_SOURCE];
-    };
-    PROVIDER_LESS_CONSTRUCTORS
-        .into_iter()
-        .filter(|pattern| production.contains(pattern))
-        .collect()
-}
-
 #[test]
-fn production_code_names_its_rustls_provider() {
+fn no_code_under_src_spells_a_provider_less_rustls_constructor() {
     // With both of rustls's providers linked, a provider-less constructor
     // panics unless a process default was installed. The gateway binary always
     // installs one, but the library must not depend on that, so every
-    // constructor in production code names its provider. The runtime tests
-    // above cover the verifier and Kubernetes paths; this covers the rest (log
-    // sinks, health probes, ACME) by construction. Inline `#[cfg(test)]`
-    // items are exempt: they install a default first.
+    // constructor names its provider. The runtime tests above cover the
+    // verifier and Kubernetes paths; this covers the rest (log sinks, health
+    // probes, ACME) by construction. Inline tests are held to the same rule:
+    // exempting them would mean deciding where test code ends, and every way
+    // of deciding that is a way to be wrong about production code.
     let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let mut offenders: Vec<String> = Vec::new();
     let mut scanned = 0usize;
@@ -1496,13 +1376,13 @@ fn production_code_names_its_rustls_provider() {
             }
             scanned += 1;
             let text = std::fs::read_to_string(&path).expect("read a source file");
-            for pattern in provider_less_constructors_in(&text) {
+            for constructor in provider_less_constructors_in(&text) {
                 let relative = path
                     .strip_prefix(&root)
                     .expect("the file is under the repository root")
                     .to_string_lossy()
                     .replace('\\', "/");
-                offenders.push(format!("{relative}: {pattern}"));
+                offenders.push(format!("{relative}: {constructor}"));
             }
         }
     }
@@ -1510,9 +1390,11 @@ fn production_code_names_its_rustls_provider() {
     assert!(scanned > 100, "the scan did not reach the source tree");
     assert!(
         offenders.is_empty(),
-        "production code under src/ reads rustls's process-default provider. Name the provider \
-         instead (`builder_with_provider`, or `tls::backend_client_config_builder(None)` for a \
-         client that takes the build defaults): {offenders:#?}"
+        "code under src/ spells a rustls constructor that reads the process-default provider. \
+         Name the provider instead (`builder_with_provider`, or \
+         `tls::backend_client_config_builder(None)` for a client that takes the build defaults). \
+         The scan reads everything, inline tests, comments and strings included, so a comment \
+         has to name the type and the constructor apart: {offenders:#?}"
     );
 }
 
@@ -1521,40 +1403,78 @@ fn the_provider_guard_rejects_the_forms_it_exists_for() {
     // The guard is only worth having if it sees what it claims to see.
     let caught = |source: &str| provider_less_constructors_in(source);
 
+    // However the call is wrapped.
     assert_eq!(
         caught(
             "fn build() {\n    let config = rustls::ClientConfig::builder()\n        .with_root_certificates(roots);\n}\n"
         ),
-        ["ClientConfig::builder()"]
+        ["ClientConfig::builder"]
     );
     assert_eq!(
         caught(
             "fn build() {\n    rustls::ServerConfig::builder_with_protocol_versions(&[&TLS13])\n}\n"
         ),
-        ["ServerConfig::builder_with_protocol_versions("]
+        ["ServerConfig::builder_with_protocol_versions"]
     );
     assert_eq!(
         caught(
             "fn build() {\n    ClientConfig::builder_with_protocol_versions(\n        versions,\n    )\n}\n"
         ),
-        ["ClientConfig::builder_with_protocol_versions("]
+        ["ClientConfig::builder_with_protocol_versions"]
     );
-    // However the call is wrapped.
     assert_eq!(
         caught(
             "fn build() {\n    let verifier = WebPkiClientVerifier::builder(\n        roots,\n    );\n}\n"
         ),
-        ["WebPkiClientVerifier::builder("]
+        ["WebPkiClientVerifier::builder"]
     );
     assert_eq!(
         caught("fn build() {\n    rustls::ServerConfig::\n        builder ( )\n}\n"),
-        ["ServerConfig::builder()"]
+        ["ServerConfig::builder"]
     );
     assert_eq!(
         caught(
             "fn build() {\n    HttpsConnectorBuilder::new()\n        .try_with_platform_verifier()\n}\n"
         ),
-        ["HttpsConnectorBuilder::new().try_with_platform_verifier()"]
+        ["HttpsConnectorBuilder::new().try_with_platform_verifier"]
+    );
+    assert_eq!(
+        caught("fn build() {\n    HttpsConnectorBuilder::new().with_native_roots()\n}\n"),
+        ["HttpsConnectorBuilder::new().with_native_roots"]
+    );
+    assert_eq!(
+        caught(
+            "fn build() {\n    hyper_rustls::HttpsConnector::<()>::builder().with_native_roots()\n}\n"
+        ),
+        ["HttpsConnector::builder().with_native_roots"]
+    );
+    assert_eq!(
+        caught("fn build() {\n    HttpsConnectorBuilder::default().with_platform_verifier()\n}\n"),
+        ["HttpsConnectorBuilder::default().with_platform_verifier"]
+    );
+    // With comments in the middle of it, as a qualified path, as a raw
+    // identifier, or taken as a function and called later.
+    assert_eq!(
+        caught(
+            "fn build() {\n    rustls::ClientConfig:: /* why */ builder // here\n        ()\n}\n"
+        ),
+        ["ClientConfig::builder"]
+    );
+    assert_eq!(
+        caught("fn build() {\n    rustls::ClientConfig::/* a /* nested */ one */builder()\n}\n"),
+        ["ClientConfig::builder"]
+    );
+    assert_eq!(
+        caught("fn build() {\n    <rustls::ServerConfig>::builder()\n}\n"),
+        ["ServerConfig::builder"]
+    );
+    assert_eq!(
+        caught("fn build() {\n    rustls::ClientConfig::r#builder()\n}\n"),
+        ["ClientConfig::builder"]
+    );
+    assert_eq!(
+        caught("fn build() {\n    let make = rustls::ServerConfig::builder;\n    make()\n}\n"),
+        ["ServerConfig::builder"]
     );
 
     // Naming the provider is what the guard asks for.
@@ -1574,135 +1494,76 @@ fn the_provider_guard_rejects_the_forms_it_exists_for() {
         )
         .is_empty()
     );
-    assert_eq!(
-        caught("fn build() {\n    HttpsConnectorBuilder::new().with_native_roots()\n}\n"),
-        ["HttpsConnectorBuilder::new().with_native_roots()"]
-    );
-    // Comments are not code.
+    // Another type's `builder`, and a longer name that ends in one of these
+    // names, are not these constructors.
     assert!(
-        caught("/// Unlike `ClientConfig::builder()`, this names its provider.\nfn build() {}\n")
-            .is_empty()
+        caught(
+            "fn build() {\n    QuicClientConfig::builder();\n    ClientConfigs::builder();\n    Endpoint::builder();\n    let config: ClientConfig = builder.build();\n}\n"
+        )
+        .is_empty()
     );
 
-    // An inline test module is exempt, and only the module: production code
-    // before it, after it, and beside a test-only item inside an `impl` is not.
-    let inline_tests = "fn build() {}\n\n#[cfg(test)]\nmod tests {\n    use super::*;\n\n    #[test]\n    fn it_builds() {\n        let config = rustls::ServerConfig::builder();\n    }\n}\n";
-    assert!(caught(inline_tests).is_empty());
-    let production_after_tests =
-        format!("{inline_tests}\nfn late() {{\n    rustls::ClientConfig::builder()\n}}\n");
-    assert_eq!(caught(&production_after_tests), ["ClientConfig::builder()"]);
-    let production_before_tests =
-        format!("fn early() {{\n    rustls::ClientConfig::builder()\n}}\n\n{inline_tests}");
-    assert_eq!(
-        caught(&production_before_tests),
-        ["ClientConfig::builder()"]
-    );
-    let test_only_method = "impl Sink {\n    #[cfg(test)]\n    fn for_test() -> Self {\n        rustls::ServerConfig::builder()\n    }\n\n    fn real(&self) {\n        rustls::ClientConfig::builder()\n    }\n}\n";
-    assert_eq!(caught(test_only_method), ["ClientConfig::builder()"]);
-    // A comment after the module's closing brace does not extend the exemption.
-    let commented_close = "#[cfg(test)]\nmod tests {\n    #[test]\n    fn test_only() {}\n} // end tests\n\nfn real() {\n    let _ = rustls::ClientConfig::builder();\n}\n";
-    assert_eq!(caught(commented_close), ["ClientConfig::builder()"]);
-    let commented_statement_close = "#[cfg(test)]\nconst FIXTURE: Fixture = Fixture {\n    name: \"x\",\n}; // fixture\n\nfn real() {\n    rustls::ServerConfig::builder()\n}\n";
-    assert_eq!(
-        caught(commented_statement_close),
-        ["ServerConfig::builder()"]
-    );
-    // Nor does a comment after a test-only item that has no body, or a block
-    // comment after a closing brace.
-    let commented_bodyless = "#[cfg(test)]\nconst FIXTURE: u8 = 0; // used only by tests\n\nfn real() {\n    let _ = rustls::ClientConfig::builder();\n}\n";
-    assert_eq!(caught(commented_bodyless), ["ClientConfig::builder()"]);
-    let block_commented_close = "#[cfg(test)]\nmod tests {\n    fn test_only() {}\n} /* end tests */\n\nfn real() {\n    rustls::ClientConfig::builder()\n}\n";
-    assert_eq!(caught(block_commented_close), ["ClientConfig::builder()"]);
-    // A test-only statement, field or branch ends where it ends, however the
-    // code around it is laid out.
-    let test_only_statement = "fn real() {\n    #[cfg(test)]\n    let hook = make_hook(|| {\n        rustls::ServerConfig::builder();\n    });\n    let config = rustls::ClientConfig::builder();\n    if ready {\n        go();\n    }\n}\n";
-    assert_eq!(caught(test_only_statement), ["ClientConfig::builder()"]);
-    let test_only_field = "struct Sink {\n    #[cfg(test)]\n    hook: Hook,\n}\n\nfn real() {\n    rustls::ServerConfig::builder()\n}\n";
-    assert_eq!(caught(test_only_field), ["ServerConfig::builder()"]);
-    // An `else` after a test-only block is read as production code, which in
-    // `cfg_if!` is exactly what it is.
-    let test_only_branch = "fn real() {\n    #[cfg(test)]\n    if hooked {\n        rustls::WebPkiClientVerifier::builder(roots);\n    } else {\n        rustls::ServerConfig::builder();\n    }\n    rustls::ClientConfig::builder();\n}\n";
-    assert_eq!(
-        caught(test_only_branch),
-        ["ClientConfig::builder()", "ServerConfig::builder()"]
-    );
-    let cfg_if_branches = "cfg_if::cfg_if! {\n    if #[cfg(test)] {\n        fn build() {\n            rustls::ServerConfig::builder();\n        }\n    } else {\n        fn build() {\n            rustls::ClientConfig::builder();\n        }\n    }\n}\n";
-    assert_eq!(caught(cfg_if_branches), ["ClientConfig::builder()"]);
-    // An attribute on a generic parameter, a closure parameter or a `where`
-    // predicate ends with it, not with the body that follows.
+    // Nothing is exempt, so nothing can be mistaken for exempt. An inline test
+    // module is read like any other code.
     assert_eq!(
         caught(
-            "fn real<T>() where #[cfg(test)] T: Hook {\n    rustls::ClientConfig::builder()\n}\n"
+            "#[cfg(test)]\nmod tests {\n    #[test]\n    fn it_builds() {\n        let config = rustls::ServerConfig::builder();\n    }\n}\n"
         ),
-        ["ClientConfig::builder()"]
+        ["ServerConfig::builder"]
+    );
+    // So is production code in each position that once led a scanner which
+    // skipped test code, comments or literals past it.
+    assert_eq!(
+        caught(
+            "#[cfg(test)]\nmod tests {\n    fn test_only() {}\n} // end tests\n\nfn real() {\n    rustls::ClientConfig::builder()\n}\n"
+        ),
+        ["ClientConfig::builder"]
     );
     assert_eq!(
         caught(
-            "fn real<T, U>()\nwhere\n    T: Clone,\n    #[cfg(test)]\n    U: Hook\n{\n    rustls::ClientConfig::builder()\n}\n"
+            "#[cfg(test)]\nconst FIXTURE: u8 = 0; // used only by tests\n\nfn real() {\n    rustls::ClientConfig::builder()\n}\n"
         ),
-        ["ClientConfig::builder()"]
+        ["ClientConfig::builder"]
     );
     assert_eq!(
         caught("fn real<#[cfg(test)] T>() {\n    rustls::ClientConfig::builder()\n}\n"),
-        ["ClientConfig::builder()"]
+        ["ClientConfig::builder"]
     );
     assert_eq!(
         caught(
-            "fn real<#[cfg(test)] T: Into<String>, U>() {\n    rustls::ClientConfig::builder()\n}\n"
+            "discard!(\"\"r\"\\\"\");\n\nfn real() {\n    rustls::ClientConfig::builder()\n}\n\ndiscard!(\"\\\"\");\n"
         ),
-        ["ClientConfig::builder()"]
+        ["ClientConfig::builder"]
     );
     assert_eq!(
-        caught("fn real() {\n    run(|#[cfg(test)] hook| rustls::ServerConfig::builder())\n}\n"),
-        ["ServerConfig::builder()"]
+        caught(
+            "discard!(r#r\"\\\"\");\n\nfn real() {\n    rustls::ClientConfig::builder()\n}\n\ndiscard!(\"\\\"\");\n"
+        ),
+        ["ClientConfig::builder"]
     );
-    // Text inside a literal is not code: a brace or an attribute spelled in
-    // one changes nothing, and a constructor spelled in one is not a call.
-    let brace_in_string = "#[cfg(test)]\nfn fixture() -> &'static str {\n    \"{\"\n}\n\nfn real() {\n    rustls::ClientConfig::builder()\n}\n";
-    assert_eq!(caught(brace_in_string), ["ClientConfig::builder()"]);
-    let brace_in_character = "#[cfg(test)]\nfn fixture() -> char {\n    '{'\n}\n\nfn real() {\n    rustls::ClientConfig::builder()\n}\n";
-    assert_eq!(caught(brace_in_character), ["ClientConfig::builder()"]);
-    let attribute_in_string = "const TEMPLATE: &str = r#\"\n#[cfg(test)]\nmod tests {\n\"#;\n\nfn real() {\n    rustls::ClientConfig::builder()\n}\n";
-    assert_eq!(caught(attribute_in_string), ["ClientConfig::builder()"]);
-    assert!(
-        caught("fn hint() -> &'static str {\n    \"prefer ClientConfig::builder() with a provider\"\n}\n")
-            .is_empty()
-    );
-    // A literal's suffix belongs to it: the `r` after the first string here is
-    // not the prefix of a raw string, which would run on to the last quote.
-    let suffixed_literal = "macro_rules! discard {\n    ($($tokens:tt)*) => {};\n}\n\ndiscard!(\"\"r\"\\\"\");\n\nfn real() {\n    let _ = rustls::ClientConfig::builder();\n}\n\ndiscard!(\"\\\"\");\n";
-    assert_eq!(caught(suffixed_literal), ["ClientConfig::builder()"]);
-    // So does a suffix the Unicode identifier tables allow but
-    // `char::is_alphanumeric` does not.
-    let symbol_suffix = "discard!(\"\"\u{2118}r\"\\\"\");\n\nfn real() {\n    let _ = rustls::ClientConfig::builder();\n}\n\ndiscard!(\"\\\"\");\n";
-    assert_eq!(caught(symbol_suffix), ["ClientConfig::builder()"]);
-    // A raw string is still one literal, quotes and all.
-    let raw_literal = "const QUOTED: &str = r#\"a \"quoted\" {\"#;\n\nfn real() {\n    rustls::ClientConfig::builder()\n}\n";
-    assert_eq!(caught(raw_literal), ["ClientConfig::builder()"]);
-    // A file that cannot be read to its end fails the guard; it is never read
-    // as "the rest of the file is test code".
     assert_eq!(
-        caught("fn real() {\n    let text = \"never closed;\n}\n"),
-        [UNDELIMITED_SOURCE]
+        caught(
+            "#!/usr/bin/env rust-script #[cfg(test)]\nfn real() {\n    rustls::ClientConfig::builder()\n}\n"
+        ),
+        ["ClientConfig::builder"]
     );
-    let undelimited = "#[cfg(test)]\nmod tests {\n    #[test]\n    fn test_only() {\n        rustls::ClientConfig::builder();\n    }\n";
-    assert_eq!(caught(undelimited), [UNDELIMITED_SOURCE]);
+    assert_eq!(
+        caught("/*\n// */ fn real() {\n    rustls::ClientConfig::builder()\n}\n"),
+        ["ClientConfig::builder"]
+    );
 
-    // A block comment is not code: an attribute spelled inside one starts no
-    // test item, a constructor spelled inside one is not a call, and one that
-    // never ends is reported.
+    // The same holds for a comment or a string: a call quoted in one is
+    // reported. Naming the type and the constructor apart is how to mention it.
     assert_eq!(
-        caught("/*\n#[cfg(test)]\n*/\nfn real() {\n    rustls::ClientConfig::builder()\n}\n"),
-        ["ClientConfig::builder()"]
+        caught("/// Unlike `ClientConfig::builder()`, this names its provider.\nfn build() {}\n"),
+        ["ClientConfig::builder"]
     );
-    assert!(caught("/*\n    rustls::ClientConfig::builder()\n*/\nfn real() {}\n").is_empty());
-    assert_eq!(
-        caught("/*\nfn real() {\n    rustls::ClientConfig::builder()\n}\n"),
-        [UNDELIMITED_SOURCE]
+    assert!(
+        caught(
+            "/// Unlike rustls's provider-less `ClientConfig` builder, this names its provider.\nfn build() {}\n"
+        )
+        .is_empty()
     );
-    // A test-only item with no body hides nothing that follows it.
-    let test_only_import = "#[cfg(test)]\nuse std::sync::Once;\n\nfn real() {\n    rustls::ClientConfig::builder()\n}\n";
-    assert_eq!(caught(test_only_import), ["ClientConfig::builder()"]);
 }
 
 // ── The ordinary profile's two providers, exercised for real ────────────────
