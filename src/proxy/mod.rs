@@ -35273,8 +35273,9 @@ where
 /// The listener's service future stores this future, and so do the affinity
 /// scopes it passes through by value. Inline, each of them carried a copy of
 /// its ~2 KiB state, which made the per-request service future ~6.5 KiB; hyper
-/// and the runtime each copy that future once when they spawn an HTTP/2
-/// stream. Boxed, the service future shrinks to its own captures and a
+/// and the runtime each copy that future when they spawn an HTTP/2 stream,
+/// and the runtime writes a value of the same size again when the stream's
+/// task finishes. Boxed, the service future shrinks to its own captures and a
 /// pointer. The price is one allocation of about 2 KiB per request, on
 /// HTTP/1.1 as well, where hyper keeps the service future in the connection
 /// instead of spawning a task for it. The larger routing handler remains
