@@ -2160,9 +2160,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the frontend future is boxed, which costs one allocation of about 2 KiB per
   request. On the Gateways Protocol Benchmark, with both builds measured in the
   same job, gateway CPU per request at 10 KiB fell 3.2–4.2% for HTTP/2 and
-  1.4–4.2% for gRPC (EPYC 9V45, EPYC 9V74, Xeon 8370C), and 1.2–3.2% for HTTP/2
-  at 70 KiB. HTTP/1.1 is within the benchmark's noise (0.4–1.8% lower at
-  10 KiB). No configuration or behaviour changes.
+  1.4–4.2% for gRPC on EPYC 9V45, EPYC 9V74 and Xeon 8370C runners, and
+  1.7–1.8% for HTTP/2 and 0.1–1.0% for gRPC on the EPYC 7763. HTTP/2 at
+  70 KiB fell 0.8–3.2%. HTTP/1.1 did not change measurably (between 1.8% lower
+  and 1.7% higher at 10 KiB over four jobs). No configuration or behaviour
+  changes.
 - **The direct HTTP/2 pool now reaches `FERRUM_POOL_HTTP2_CONNECTIONS_PER_HOST`.**
   The pool took the first ready shard, and an open HTTP/2 connection always
   reports ready, so every request used the first connection the pool ever
