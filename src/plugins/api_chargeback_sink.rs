@@ -6548,14 +6548,10 @@ fn is_hostile_path_component(value: &str) -> bool {
         return true;
     }
     let lower = value.to_ascii_lowercase();
-    if lower.starts_with(r"\\?\")
+    lower.starts_with(r"\\?\")
         || lower.starts_with(r"\\.\")
         || lower.starts_with("//?/")
         || lower.starts_with("//./")
-    {
-        return true;
-    }
-    false
 }
 
 fn is_safe_literal_path_component(value: &str) -> bool {
