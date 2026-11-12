@@ -2152,6 +2152,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `CONTRIBUTING.md` correctly and list every operating mode (#7309).
 
 ### Performance
+- **HTTP/2 and gRPC requests no longer copy their attempt and stream-task
+  futures.** Every proxied HTTP/1.1 and HTTP/2 request copied its
+  backend-attempt state (about 18 KiB) into the request handler, and each
+  HTTP/2 stream's service future (about 6.5 KiB) was copied when its task was
+  spawned and again when it finished. The attempt is now built in place, and
+  the frontend future is boxed, which costs one allocation of about 2 KiB per
+  request. On the Gateways Protocol Benchmark, with both builds measured in the
+  same job, gateway CPU per request at 10 KiB fell 3.2–4.2% for HTTP/2 and
+  1.4–4.2% for gRPC (EPYC 9V45, EPYC 9V74, Xeon 8370C), and 1.2–3.2% for HTTP/2
+  at 70 KiB. HTTP/1.1 is unchanged within 0.6%. No configuration or behaviour
+  changes.
 - **The direct HTTP/2 pool now reaches `FERRUM_POOL_HTTP2_CONNECTIONS_PER_HOST`.**
   The pool took the first ready shard, and an open HTTP/2 connection always
   reports ready, so every request used the first connection the pool ever
