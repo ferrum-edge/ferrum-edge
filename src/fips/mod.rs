@@ -308,7 +308,29 @@ pub fn is_enforcing() -> bool {
 /// switch rather than fifty-odd call sites that each have to remember.
 #[cfg(all(feature = "crypto-ring", not(feature = "fips")))]
 pub fn base_crypto_provider() -> CryptoProvider {
-    rustls::crypto::ring::default_provider()
+    // BENCH ONLY (never for merge): `FERRUM_BENCH_AEAD=awslc` swaps the
+    // record-layer cipher suites for AWS-LC's, which has an AVX-512 AES-GCM
+    // that ring 0.17 lacks. Key exchange and signatures stay on ring.
+    static AWSLC_AEAD: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        let enabled = std::env::var("FERRUM_BENCH_AEAD").is_ok_and(|value| value == "awslc");
+        eprintln!(
+            "bench: record-layer cipher suites from {}",
+            if enabled { "aws-lc" } else { "ring" }
+        );
+        enabled
+    });
+    let mut provider = rustls::crypto::ring::default_provider();
+    if *AWSLC_AEAD {
+        for suite in provider.cipher_suites.iter_mut() {
+            if let Some(replacement) = rustls::crypto::aws_lc_rs::ALL_CIPHER_SUITES
+                .iter()
+                .find(|candidate| candidate.suite() == suite.suite())
+            {
+                *suite = *replacement;
+            }
+        }
+    }
+    provider
 }
 
 /// Base rustls crypto provider for this build.

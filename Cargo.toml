@@ -439,6 +439,8 @@ bench-udp-profile = []
 crypto-ring = [
     "dep:ring",
     "rustls/ring",
+    # BENCH ONLY (never for merge): AWS-LC cipher suites beside ring's.
+    "rustls/aws_lc_rs",
     "tokio-rustls/ring",
     "tonic/tls-ring",
     "quinn/rustls-ring",
