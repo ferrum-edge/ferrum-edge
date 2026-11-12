@@ -1196,8 +1196,10 @@ const UNDELIMITED_SOURCE: &str =
 /// the reverse: an attribute that is not the bare `#[cfg(test)]` (such as
 /// `#[cfg(all(test, unix))]`) exempts nothing, and a test-only item can end
 /// early (see `after_test_only_item`). What it does not see is a constructor
-/// reached through a renamed import or written by a macro; the runtime tests
-/// above are what cover the paths that matter.
+/// reached through a renamed import or written by a macro. What it cannot
+/// delimit is an attribute inside a macro invocation that has a grammar of
+/// its own, or on a `where` predicate. The runtime tests above are what cover
+/// the paths that matter.
 fn production_source(text: &str) -> Option<String> {
     let code = code_only(text)?;
     let mut production = String::with_capacity(code.len());
@@ -1213,6 +1215,12 @@ fn production_source(text: &str) -> Option<String> {
 
 /// `text` with its comments removed and its string and character literals
 /// emptied, or `None` when one of them never ends.
+///
+/// Tokens are read forwards, the way the compiler reads them: a word (an
+/// identifier, a keyword or a number) is taken whole, a literal takes its
+/// suffix with it, and a lifetime takes its name. A raw string is therefore
+/// recognised by the word in front of it being exactly `r`, `br` or `cr`,
+/// never by whichever character happens to precede a quote.
 fn code_only(text: &str) -> Option<String> {
     let chars: Vec<char> = text.chars().collect();
     let mut code = String::with_capacity(text.len());
@@ -1230,20 +1238,37 @@ fn code_only(text: &str) -> Option<String> {
                 code.push(' ');
             }
             '"' => {
-                index = match raw_string_hashes(&chars, index) {
-                    Some(hashes) => end_of_raw_string(&chars, index + 1, hashes)?,
-                    None => end_of_quoted(&chars, index + 1, '"')?,
-                };
+                index = end_of_word(&chars, end_of_quoted(&chars, index + 1, '"')?);
                 code.push_str("\"\"");
             }
-            // A character literal. Any other `'` starts a lifetime or a label.
+            // A character literal: an escape, or one character and its quote.
             '\'' if next == Some('\\') => {
-                index = end_of_quoted(&chars, index + 1, '\'')?;
+                index = end_of_word(&chars, end_of_quoted(&chars, index + 1, '\'')?);
                 code.push_str("''");
             }
             '\'' if chars.get(index + 2) == Some(&'\'') => {
-                index += 3;
+                index = end_of_word(&chars, index + 3);
                 code.push_str("''");
+            }
+            // Any other `'` starts a lifetime or a label.
+            '\'' => {
+                let end = end_of_word(&chars, index + 1);
+                code.extend(&chars[index..end]);
+                index = end;
+            }
+            _ if is_word(current) => {
+                let end = end_of_word(&chars, index);
+                match raw_string_contents(&chars, index, end) {
+                    Some((contents, hashes)) => {
+                        let closed = end_of_raw_string(&chars, contents, hashes)?;
+                        index = end_of_word(&chars, closed);
+                        code.push_str("\"\"");
+                    }
+                    None => {
+                        code.extend(&chars[index..end]);
+                        index = end;
+                    }
+                }
             }
             _ => {
                 code.push(current);
@@ -1252,6 +1277,23 @@ fn code_only(text: &str) -> Option<String> {
         }
     }
     Some(code)
+}
+
+/// `true` for a character of an identifier, a keyword, a number or a literal
+/// suffix.
+fn is_word(character: char) -> bool {
+    character.is_alphanumeric() || character == '_'
+}
+
+/// The index after the run of word characters that starts at `start`, which
+/// is `start` itself when there is none. After a literal, that run is the
+/// literal's suffix.
+fn end_of_word(chars: &[char], start: usize) -> usize {
+    start
+        + chars[start..]
+            .iter()
+            .take_while(|&&character| is_word(character))
+            .count()
 }
 
 /// The index after the block comment whose text starts at `start`. Block
@@ -1288,16 +1330,17 @@ fn end_of_quoted(chars: &[char], start: usize, delimiter: char) -> Option<usize>
     }
 }
 
-/// The number of `#`s when the `"` at `quote` opens a raw string. An
-/// identifier directly before a string can only be a literal prefix in this
-/// edition, so an `r` there (alone, or after `b` or `c`) means a raw string.
-fn raw_string_hashes(chars: &[char], quote: usize) -> Option<usize> {
-    let hashes = chars[..quote]
+/// Where a raw string's contents start, and how many `#`s close it, when the
+/// word at `start..end` is a raw-string prefix with `#`s and a `"` after it.
+fn raw_string_contents(chars: &[char], start: usize, end: usize) -> Option<(usize, usize)> {
+    if !matches!(&chars[start..end], ['r'] | ['b', 'r'] | ['c', 'r']) {
+        return None;
+    }
+    let hashes = chars[end..]
         .iter()
-        .rev()
         .take_while(|&&character| character == '#')
         .count();
-    (chars[..quote - hashes].last() == Some(&'r')).then_some(hashes)
+    (chars.get(end + hashes) == Some(&'"')).then_some((end + hashes + 1, hashes))
 }
 
 /// The index after the raw string whose contents start at `start` and which
@@ -1322,11 +1365,12 @@ fn end_of_raw_string(chars: &[char], start: usize, hashes: usize) -> Option<usiz
 /// code right after that attribute; `None` when the item never ends.
 ///
 /// The item ends at the first `;` or `,` outside its own brackets, at the
-/// brace that closes its first block (an `else` continues it), or where the
-/// enclosing block or list closes. None of those lies beyond the item, so
-/// production code after it is never skipped. A comma between generic
-/// arguments, which is not inside brackets, can end the item early; the rest
-/// of that test-only item is then read as production code.
+/// brace that closes its first block (an `else` continues it), or where
+/// whatever encloses it closes: a block or a list, a generic parameter list
+/// (`>`), a closure's parameters (`|`). None of those lies beyond the item, so
+/// production code after it is never skipped. Several can come before its
+/// end, such as a comma between generic arguments or a `>` or `|` used as an
+/// operator; the rest of that test-only item is then read as production code.
 fn after_test_only_item(source: &str) -> Option<&str> {
     let mut item = source.trim_start();
     // Further attributes on the same item.
@@ -1334,10 +1378,20 @@ fn after_test_only_item(source: &str) -> Option<&str> {
         item = after_attribute(item)?.trim_start();
     }
     let mut depth = 0usize;
+    // `<`s outside brackets that no `>` has matched yet.
+    let mut angles = 0usize;
     for (offset, character) in item.char_indices() {
         match character {
             '(' | '[' | '{' => depth += 1,
-            ')' | ']' | '}' if depth == 0 => return Some(&item[offset..]),
+            ')' | ']' | '}' | '|' if depth == 0 => return Some(&item[offset..]),
+            '<' if depth == 0 => angles += 1,
+            // Not the `>` of `->` or `=>`.
+            '>' if depth == 0 && !item[..offset].ends_with(['-', '=']) => {
+                if angles == 0 {
+                    return Some(&item[offset..]);
+                }
+                angles -= 1;
+            }
             ')' | ']' => depth -= 1,
             '}' => {
                 depth -= 1;
@@ -1548,6 +1602,21 @@ fn the_provider_guard_rejects_the_forms_it_exists_for() {
     assert_eq!(caught(test_only_field), ["ServerConfig::builder()"]);
     let test_only_branch = "fn real() {\n    #[cfg(test)]\n    if hooked {\n        first();\n    } else {\n        rustls::ServerConfig::builder();\n    }\n    rustls::ClientConfig::builder();\n}\n";
     assert_eq!(caught(test_only_branch), ["ClientConfig::builder()"]);
+    // An attribute on a generic or closure parameter ends with the parameter.
+    assert_eq!(
+        caught("fn real<#[cfg(test)] T>() {\n    rustls::ClientConfig::builder()\n}\n"),
+        ["ClientConfig::builder()"]
+    );
+    assert_eq!(
+        caught(
+            "fn real<#[cfg(test)] T: Into<String>, U>() {\n    rustls::ClientConfig::builder()\n}\n"
+        ),
+        ["ClientConfig::builder()"]
+    );
+    assert_eq!(
+        caught("fn real() {\n    run(|#[cfg(test)] hook| rustls::ServerConfig::builder())\n}\n"),
+        ["ServerConfig::builder()"]
+    );
     // Text inside a literal is not code: a brace or an attribute spelled in
     // one changes nothing, and a constructor spelled in one is not a call.
     let brace_in_string = "#[cfg(test)]\nfn fixture() -> &'static str {\n    \"{\"\n}\n\nfn real() {\n    rustls::ClientConfig::builder()\n}\n";
@@ -1560,6 +1629,13 @@ fn the_provider_guard_rejects_the_forms_it_exists_for() {
         caught("fn hint() -> &'static str {\n    \"prefer ClientConfig::builder() with a provider\"\n}\n")
             .is_empty()
     );
+    // A literal's suffix belongs to it: the `r` after the first string here is
+    // not the prefix of a raw string, which would run on to the last quote.
+    let suffixed_literal = "macro_rules! discard {\n    ($($tokens:tt)*) => {};\n}\n\ndiscard!(\"\"r\"\\\"\");\n\nfn real() {\n    let _ = rustls::ClientConfig::builder();\n}\n\ndiscard!(\"\\\"\");\n";
+    assert_eq!(caught(suffixed_literal), ["ClientConfig::builder()"]);
+    // A raw string is still one literal, quotes and all.
+    let raw_literal = "const QUOTED: &str = r#\"a \"quoted\" {\"#;\n\nfn real() {\n    rustls::ClientConfig::builder()\n}\n";
+    assert_eq!(caught(raw_literal), ["ClientConfig::builder()"]);
     // A file that cannot be read to its end fails the guard; it is never read
     // as "the rest of the file is test code".
     assert_eq!(
