@@ -13,8 +13,10 @@ measured pair and calls this helper to wait, with nothing else running, until
 the host is quiet. The helper only reads `/proc`; it starts and stops nothing.
 
 `wait` appends one record per arm to a JSON file so a run shows what the hold
-saw: how long it waited, how much CPU other processes used meanwhile, and
-which processes those were.
+saw: how long it waited, how much CPU other processes used meanwhile, when
+that burst began and ended relative to the start, and which processes those
+were. A burst that ends close to the release time means the minimum hold is
+too short for that host.
 """
 
 import argparse
@@ -173,6 +175,7 @@ def wait(args, sleep=time.sleep, now=time.time):
     settle = Settle(args.min_hold, args.quiet_seconds, args.max_wait, args.quiet_cores, args.burst_cores)
     processes = read_processes(args.proc_root)
     used = {}
+    first_burst = last_burst = None
     started_waiting = previous_time = now()
     verdict = settle.verdict(previous_time - args.since)
     while verdict is None:
@@ -183,7 +186,12 @@ def wait(args, sleep=time.sleep, now=time.time):
             verdict = "unavailable"
             break
         elapsed = max(current_time - previous_time, 1e-6)
-        settle.observe(elapsed, (busy_ticks(current_cpu) - busy_ticks(cpu)) / ticks / elapsed)
+        busy_cores = (busy_ticks(current_cpu) - busy_ticks(cpu)) / ticks / elapsed
+        settle.observe(elapsed, busy_cores)
+        if busy_cores >= args.burst_cores:
+            if first_burst is None:
+                first_burst = previous_time - args.since
+            last_burst = current_time - args.since
         current_processes = read_processes(args.proc_root)
         for key, (comm, total) in current_processes.items():
             before = processes.get(key)
@@ -202,6 +210,10 @@ def wait(args, sleep=time.sleep, now=time.time):
         busy_cpu_seconds=round(settle.busy_cpu_seconds, 3),
         peak_busy_cores=round(settle.peak_busy_cores, 3),
         burst_seconds=round(settle.burst_seconds, 3),
+        # Seconds since the arm's start at which the first busy sample began
+        # and the last one ended; null when no sample reached `burst_cores`.
+        first_burst_since_start_seconds=None if first_burst is None else round(first_burst, 3),
+        last_burst_since_start_seconds=None if last_burst is None else round(last_burst, 3),
         top_processes=[{"comm": comm, "cpu_seconds": round(value / ticks, 3)} for comm, value in top],
     )
     append_record(args.output, settings, record)

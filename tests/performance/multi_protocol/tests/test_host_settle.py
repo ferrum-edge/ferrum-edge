@@ -150,6 +150,10 @@ class WaitTests(unittest.TestCase):
             self.assertAlmostEqual(record["waited_seconds"], 5.5)
             self.assertAlmostEqual(record["held_since_start_seconds"], 6.5)
             self.assertAlmostEqual(record["burst_seconds"], 4.0)
+            # The burst ran from the first sample (1 s after the start) to 5 s
+            # after it: the margin left before the release is readable.
+            self.assertAlmostEqual(record["first_burst_since_start_seconds"], 1.0)
+            self.assertAlmostEqual(record["last_burst_since_start_seconds"], 5.0)
             self.assertAlmostEqual(record["busy_cpu_seconds"], 4.0, places=1)
             self.assertEqual(record["top_processes"][0]["comm"], "provjobd123")
             self.assertAlmostEqual(record["top_processes"][0]["cpu_seconds"], 4.0, places=1)
@@ -167,6 +171,9 @@ class WaitTests(unittest.TestCase):
             self.assertEqual([row["arm"] for row in document["arms"]], ["direct", "ferrum", "envoy"])
             self.assertEqual(document["schema"], host_settle.SCHEMA)
             self.assertEqual(document["quiet_cores"], 0.2)
+            # A hold that saw no burst says so instead of reporting a time.
+            self.assertIsNone(document["arms"][0]["first_burst_since_start_seconds"])
+            self.assertIsNone(document["arms"][0]["last_burst_since_start_seconds"])
             # No "protocol" key: benchmark_plan.protocol_runs must not mistake
             # the record for a sample when it scans a run directory.
             self.assertNotIn("protocol", document)

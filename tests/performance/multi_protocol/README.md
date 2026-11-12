@@ -409,14 +409,17 @@ host has been quiet (under 0.2 cores busy) for three seconds, capped at 60
 seconds. Arms that share an image settle once. An image already started on the
 host since boot (iteration 2 onwards) is not held again. `host_settle.json` in
 the run directory records, per arm, how long the hold lasted, how much CPU the
-host used meanwhile and which processes used it; `reason: max_wait` means the
-host never went quiet and pair 1 should be read with the CPU timelines beside
-it. The settle is on by default for the plain comparison lane on hosts with
+host used meanwhile, when that burst began and ended relative to the start
+(`first_burst_since_start_seconds`, `last_burst_since_start_seconds`), and which
+processes used it. `reason: max_wait` means the host never went quiet, and a
+burst that ends within a few seconds of the release means the 25-second minimum
+is too short for that host; in either case read pair 1 with the CPU timelines
+beside it. The settle is on by default for the plain comparison lane on hosts with
 `/proc`, and off for the profile, trace and H2-observation lanes, which keep
 their own fixed process accounting; `--settle` and `--no-settle` override it.
-It removes the first-start window only: a burst of other activity later in a
-run is not detected, so `process_usage` timelines remain the check for a
-single odd sample.
+It removes the first-start window only. Later disturbances are not detected
+(see the known limitations below), so the per-sample diagnostics remain the
+check for a single odd sample.
 
 For a revision experiment, make both images available on the **same hosted
 runner**, pin their digests, and run, for example:
@@ -555,10 +558,17 @@ or adaptive flags and therefore uses **2 pairs, adaptive off**.
   request the full-matrix extension; its real-world frequency remains unmeasured.
 - Unmodelled order effects: equal mean position does not model drift or varying
   separation between compared arms; ratio noise can still vary across pairs.
-- Host activity after the first-start settle: the settle holds only each
-  image's first start. Other processes that take CPU later in a run are neither
-  prevented nor flagged; a sample whose gateway and backend CPU drop together
-  for several seconds in its `process_usage` timeline was probably disturbed.
+- Host disturbance after the first-start settle: the settle holds only each
+  image's first start, and nothing later in a run is prevented or flagged. Two
+  kinds were seen in six identical-code validation jobs. One job had a dip of
+  up to two seconds every 60 seconds through both pairs: gateway and backend
+  CPU drop together by about 20% in the `process_usage` timeline, whichever
+  arm is running. In another job the host slowed down without taking CPU time
+  away, so the timeline looks normal: gateway and backend CPU seconds per
+  request were both about 20% higher for one arm's 10 KiB sample than for the
+  same arm in the other pair, with identical system calls per request, and
+  that sample read 17% low. Compare CPU per request across pairs before
+  trusting a two-pair average.
 
 #### Window, client and revision inputs (#6038, #6022)
 
