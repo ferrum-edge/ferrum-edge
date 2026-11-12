@@ -1158,10 +1158,24 @@ fn kubernetes_client_builds_without_a_bootstrapped_provider() {
 
 // ── No code under src/ spells a provider-less rustls constructor ────────────
 
-/// rustls and hyper-rustls constructors that read the process-default provider
-/// instead of taking one: the name each is reported by, and the words of the
-/// call in order.
-const PROVIDER_LESS_CONSTRUCTORS: [(&str, &[&str]); 18] = [
+/// Constructors and shorthands that read rustls's process-default provider and
+/// have a form that takes one instead: the name each is reported by, and the
+/// words of the call in order.
+///
+/// The shorthands are listed by method name alone, whatever they are called
+/// on: hyper-rustls's connector builder has them, and so do quinn's client
+/// configuration and rustls-platform-verifier's builder extension. hyper-rustls
+/// also has `with_webpki_roots`, which is not here: its `webpki-roots` feature
+/// is off, so the method is not compiled in, and tonic's client method of the
+/// same name, which Ferrum does call, selects tonic's own provider.
+///
+/// An API that takes no provider and has no form that does cannot be on this
+/// list, because nothing in the text tells its safe uses from the rest:
+/// kube-client's client and tonic's built-in server TLS both build their
+/// rustls configuration that way. The rule for those is to install the
+/// provider at Ferrum's boundary first, as
+/// `k8s_controller::build_kube_client_from_config` does.
+const PROVIDER_LESS_CONSTRUCTORS: [(&str, &[&str]); 9] = [
     ("ClientConfig::builder", &["ClientConfig", "builder"]),
     ("ServerConfig::builder", &["ServerConfig", "builder"]),
     (
@@ -1180,61 +1194,12 @@ const PROVIDER_LESS_CONSTRUCTORS: [(&str, &[&str]); 18] = [
         "WebPkiServerVerifier::builder",
         &["WebPkiServerVerifier", "builder"],
     ),
-    // hyper-rustls connector shorthands, each of which starts from a
-    // provider-less client configuration, from each way of starting the
-    // connector builder.
+    ("with_platform_verifier", &["with_platform_verifier"]),
     (
-        "HttpsConnectorBuilder::new().with_platform_verifier",
-        &["HttpsConnectorBuilder", "new", "with_platform_verifier"],
+        "try_with_platform_verifier",
+        &["try_with_platform_verifier"],
     ),
-    (
-        "HttpsConnectorBuilder::new().try_with_platform_verifier",
-        &["HttpsConnectorBuilder", "new", "try_with_platform_verifier"],
-    ),
-    (
-        "HttpsConnectorBuilder::new().with_native_roots",
-        &["HttpsConnectorBuilder", "new", "with_native_roots"],
-    ),
-    (
-        "HttpsConnectorBuilder::new().with_webpki_roots",
-        &["HttpsConnectorBuilder", "new", "with_webpki_roots"],
-    ),
-    (
-        "HttpsConnectorBuilder::default().with_platform_verifier",
-        &["HttpsConnectorBuilder", "default", "with_platform_verifier"],
-    ),
-    (
-        "HttpsConnectorBuilder::default().try_with_platform_verifier",
-        &[
-            "HttpsConnectorBuilder",
-            "default",
-            "try_with_platform_verifier",
-        ],
-    ),
-    (
-        "HttpsConnectorBuilder::default().with_native_roots",
-        &["HttpsConnectorBuilder", "default", "with_native_roots"],
-    ),
-    (
-        "HttpsConnectorBuilder::default().with_webpki_roots",
-        &["HttpsConnectorBuilder", "default", "with_webpki_roots"],
-    ),
-    (
-        "HttpsConnector::builder().with_platform_verifier",
-        &["HttpsConnector", "builder", "with_platform_verifier"],
-    ),
-    (
-        "HttpsConnector::builder().try_with_platform_verifier",
-        &["HttpsConnector", "builder", "try_with_platform_verifier"],
-    ),
-    (
-        "HttpsConnector::builder().with_native_roots",
-        &["HttpsConnector", "builder", "with_native_roots"],
-    ),
-    (
-        "HttpsConnector::builder().with_webpki_roots",
-        &["HttpsConnector", "builder", "with_webpki_roots"],
-    ),
+    ("with_native_roots", &["with_native_roots"]),
 ];
 
 /// The provider-less constructors spelled anywhere in `text`.
@@ -1246,10 +1211,10 @@ const PROVIDER_LESS_CONSTRUCTORS: [(&str, &[&str]); 18] = [
 /// one. The price is that inline tests name their provider too, and that
 /// nothing under `src/` can quote one of these calls, even in a comment.
 ///
-/// What it does not see is a constructor reached without the type's own name
-/// in front of it: through a renamed import, a type alias, `Self`, a variable
-/// that holds the hyper-rustls builder, or a macro that writes the call. The
-/// runtime tests above are what cover the paths that matter.
+/// What it does not see is a rustls constructor reached without the type's
+/// own name in front of it: through a renamed import, a type alias, `Self`,
+/// or a macro that writes the call. The runtime tests above are what cover
+/// the paths that matter.
 fn provider_less_constructors_in(text: &str) -> Vec<&'static str> {
     PROVIDER_LESS_CONSTRUCTORS
         .into_iter()
@@ -1432,25 +1397,34 @@ fn the_provider_guard_rejects_the_forms_it_exists_for() {
         caught("fn build() {\n    rustls::ServerConfig::\n        builder ( )\n}\n"),
         ["ServerConfig::builder"]
     );
+    // A shorthand is reported whatever it is called on.
     assert_eq!(
         caught(
             "fn build() {\n    HttpsConnectorBuilder::new()\n        .try_with_platform_verifier()\n}\n"
         ),
-        ["HttpsConnectorBuilder::new().try_with_platform_verifier"]
-    );
-    assert_eq!(
-        caught("fn build() {\n    HttpsConnectorBuilder::new().with_native_roots()\n}\n"),
-        ["HttpsConnectorBuilder::new().with_native_roots"]
+        ["try_with_platform_verifier"]
     );
     assert_eq!(
         caught(
-            "fn build() {\n    hyper_rustls::HttpsConnector::<()>::builder().with_native_roots()\n}\n"
+            "fn build() {\n    hyper_rustls::HttpsConnector::<\n        hyper_util::client::legacy::connect::HttpConnector,\n    >::builder().with_native_roots()\n}\n"
         ),
-        ["HttpsConnector::builder().with_native_roots"]
+        ["with_native_roots"]
     );
     assert_eq!(
-        caught("fn build() {\n    HttpsConnectorBuilder::default().with_platform_verifier()\n}\n"),
-        ["HttpsConnectorBuilder::default().with_platform_verifier"]
+        caught(
+            "fn build() {\n    ({ hyper_rustls::HttpsConnectorBuilder::new() })\n        .try_with_platform_verifier()\n}\n"
+        ),
+        ["try_with_platform_verifier"]
+    );
+    assert_eq!(
+        caught(
+            "fn build() {\n    let builder = HttpsConnectorBuilder::default();\n    builder.with_platform_verifier()\n}\n"
+        ),
+        ["with_platform_verifier"]
+    );
+    assert_eq!(
+        caught("fn build() {\n    quinn::ClientConfig::with_platform_verifier()\n}\n"),
+        ["with_platform_verifier"]
     );
     // With comments in the middle of it, as a qualified path, as a raw
     // identifier, or taken as a function and called later.
@@ -1494,6 +1468,8 @@ fn the_provider_guard_rejects_the_forms_it_exists_for() {
         )
         .is_empty()
     );
+    // tonic's client method of this name selects tonic's own provider.
+    assert!(caught("fn build() {\n    client_tls.with_webpki_roots()\n}\n").is_empty());
     // Another type's `builder`, and a longer name that ends in one of these
     // names, are not these constructors.
     assert!(
