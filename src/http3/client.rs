@@ -44,6 +44,13 @@ use crate::tls::backend::{
 /// Construct a bounded per-request exchange without a heap allocation.
 /// Connection setup keeps its separate boxed boundaries; exchanges retain
 /// their original task, stream ownership, and cancellation guards.
+///
+/// The exchange is returned by value, so the caller copies its whole state
+/// out of a temporary. The HTTP/1.1 and HTTP/2 dispatch path builds the same
+/// kind of child in place (`construct_proxy_future_in` in `proxy/mod.rs`);
+/// this factory has not been converted because the HTTP/3 exchange has not
+/// been profiled. `bounded_inline_children_are_constructed_in_their_final_slot`
+/// names it as the one remaining by-value factory.
 #[inline(never)]
 fn construct_h3_future<F: std::future::Future>(construct: impl FnOnce() -> F) -> F {
     construct()

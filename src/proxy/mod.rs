@@ -35197,7 +35197,9 @@ pub async fn handle_proxy_request(
 /// purpose. A factory that returns it hands the caller a stack temporary, and
 /// the caller then copies the whole state machine, not just the arguments it
 /// captured, into its own state: an 18 KiB copy per request for the backend
-/// attempt. Writing through `slot` stores only the captured arguments.
+/// attempt. With the destination in hand, an optimized build stores only the
+/// captured arguments. An unoptimized build still builds the child in this
+/// frame first, which returns before anything is polled.
 ///
 /// The caller declares the slot as `std::pin::pin!(None)` in a block that ends
 /// with the await, so the borrows the child holds end there too.
@@ -35216,6 +35218,10 @@ where
 /// A child future polled in the caller-owned slot that
 /// [`construct_proxy_future_in`] filled. The slot holds the child only while
 /// this future is alive and the child has not returned.
+///
+/// Await it once. It must not be polled again after it returns `Ready`: the
+/// child is gone by then, so a later poll returns `Pending` without
+/// registering a waker and never completes.
 struct ProxyFutureInSlot<'slot, F> {
     slot: std::pin::Pin<&'slot mut Option<F>>,
 }
@@ -35228,8 +35234,9 @@ impl<F: std::future::Future> std::future::Future for ProxyFutureInSlot<'_, F> {
         cx: &mut std::task::Context<'_>,
     ) -> Poll<F::Output> {
         let Some(child) = self.slot.as_mut().as_pin_mut() else {
-            // The slot is emptied only below, when the child returned. Like a
-            // fused future, a poll after completion stays pending.
+            // Polled after it returned, against the type's contract: the slot
+            // is emptied only below. Pending rather than a panic on the
+            // request path.
             return Poll::Pending;
         };
         let output = std::task::ready!(child.poll(cx));
@@ -35267,10 +35274,12 @@ where
 /// scopes it passes through by value. Inline, each of them carried a copy of
 /// its ~2 KiB state, which made the per-request service future ~6.5 KiB; hyper
 /// and the runtime each copy that future once when they spawn an HTTP/2
-/// stream. Boxed, it is written once, in place, and the service future shrinks
-/// to its own captures. The larger routing handler remains boxed separately;
-/// its state and the concrete backend dispatch state have their own regression
-/// budgets.
+/// stream. Boxed, the service future shrinks to its own captures and a
+/// pointer. The price is one allocation of about 2 KiB per request, on
+/// HTTP/1.1 as well, where hyper keeps the service future in the connection
+/// instead of spawning a task for it. The larger routing handler remains
+/// boxed separately; its state and the concrete backend dispatch state have
+/// their own regression budgets.
 #[allow(clippy::too_many_arguments)]
 #[inline(never)]
 fn construct_frontend_proxy_request(
@@ -68548,24 +68557,37 @@ pub(crate) async fn proxy_to_backend_http3_retry(
 mod tests {
     #[test]
     fn a_child_built_in_a_slot_resolves_once_and_leaves_the_slot_empty() {
+        let mut child_polls = 0;
         let mut slot = std::pin::pin!(None);
         {
-            let mut child =
-                std::pin::pin!(super::construct_proxy_future_in(slot.as_mut(), || async {
-                    7
-                }));
+            let mut child = std::pin::pin!(super::construct_proxy_future_in(slot.as_mut(), || {
+                std::future::poll_fn(|_cx: &mut std::task::Context<'_>| {
+                    child_polls += 1;
+                    if child_polls == 1 {
+                        std::task::Poll::Pending
+                    } else {
+                        std::task::Poll::Ready(7)
+                    }
+                })
+            }));
             let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+            assert_eq!(
+                std::future::Future::poll(child.as_mut(), &mut cx),
+                std::task::Poll::Pending
+            );
             assert_eq!(
                 std::future::Future::poll(child.as_mut(), &mut cx),
                 std::task::Poll::Ready(7)
             );
-            // Like a fused future, it stays pending once it has returned.
+            // Once it has returned, a further poll pends and never reaches
+            // the child again.
             assert_eq!(
                 std::future::Future::poll(child.as_mut(), &mut cx),
                 std::task::Poll::Pending
             );
         }
         assert!(slot.is_none(), "a returned child must not stay in the slot");
+        assert_eq!(child_polls, 2);
     }
 
     #[test]

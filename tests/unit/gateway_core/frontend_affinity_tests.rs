@@ -300,6 +300,28 @@ fn bounded_inline_children_are_constructed_in_their_final_slot() {
         !src.contains("fn construct_proxy_future<"),
         "an inline child must not be returned by value from an out-of-line factory"
     );
+    // The same shape under any other name: a factory that takes a constructor
+    // and returns what it built by value.
+    let by_value_factory = "impl FnOnce() -> F) -> F {";
+    assert!(
+        !src.contains(by_value_factory),
+        "no factory in the HTTP/1.1 and HTTP/2 proxy path may return its child by value"
+    );
+    // The HTTP/3 backend client keeps the one remaining by-value factory: its
+    // exchange futures have not been profiled, so it is named here instead of
+    // converted. Converting it, or adding another, has to update this.
+    let h3_client = include_str!("../../../src/http3/client.rs");
+    assert_eq!(
+        h3_client.matches(by_value_factory).count(),
+        1,
+        "construct_h3_future is the only known by-value child factory left"
+    );
+    assert!(
+        h3_client.contains(
+            "fn construct_h3_future<F: std::future::Future>(construct: impl FnOnce() -> F) -> F {"
+        ),
+        "the remaining by-value factory is construct_h3_future"
+    );
     assert!(
         src.contains("#[inline(never)]\nfn construct_proxy_future_in<"),
         "construct_proxy_future_in must stay an out-of-line factory"
@@ -324,7 +346,7 @@ fn bounded_inline_children_are_constructed_in_their_final_slot() {
     assert_eq!(
         handler.matches("proxy_to_backend(").count(),
         2,
-        "every backend attempt the handler keeps inline must be built in its slot"
+        "the handler awaits exactly those two backend attempts inline; another call site needs its own slot"
     );
 
     let dispatch = squeezed(between(
