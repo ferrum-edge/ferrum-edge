@@ -393,6 +393,31 @@ baseline. Two pairs are a budget-conscious diagnostic default (Student-t with
 one degree of freedom); predeclare at least **four** pairs for performance claims
 and budget that experiment separately.
 
+**First-start settle.** On GitHub-hosted runners the provisioner's job daemon
+(`/tmp/provjobd<digits>`) uses about one core for four to five seconds the first
+time a new binary or container image runs in a job, starting 2 to 12 seconds
+after that start. The runner has four vCPUs and the benchmark saturates them, so
+a cell measured in that window showed gateway and backend CPU 20-25% lower for
+those seconds. It hit whichever arm ran an image first: `direct` at the start of
+the job, `ferrum` about a minute in (18 of 18 jobs), Envoy about two minutes in
+(11 of 12), always in pair 1 and never in pair 2. That is roughly 5% off a
+two-pair 10 KiB average for `ferrum`, a bias in the same direction every run.
+Before the first measured pair the runner therefore starts every distinct
+binary/image once, drives three seconds of discarded load, and waits through
+`host_settle.py` until at least 25 seconds have passed since the start and the
+host has been quiet (under 0.2 cores busy) for three seconds, capped at 60
+seconds. Arms that share an image settle once. An image already started on the
+host since boot (iteration 2 onwards) is not held again. `host_settle.json` in
+the run directory records, per arm, how long the hold lasted, how much CPU the
+host used meanwhile and which processes used it; `reason: max_wait` means the
+host never went quiet and pair 1 should be read with the CPU timelines beside
+it. The settle is on by default for the plain comparison lane on hosts with
+`/proc`, and off for the profile, trace and H2-observation lanes, which keep
+their own fixed process accounting; `--settle` and `--no-settle` override it.
+It removes the first-start window only: a burst of other activity later in a
+run is not detected, so `process_usage` timelines remain the check for a
+single odd sample.
+
 For a revision experiment, make both images available on the **same hosted
 runner**, pin their digests, and run, for example:
 
@@ -499,7 +524,9 @@ this echo experiment. See the audit for evidence and keep/reject dispositions.
 For the full `http1-tls` matrix (direct + five gateways, five sizes), budget
 `iterations × pairs × 30 × (duration + 15) / 60 + 5` minutes. This conservative
 planning envelope allocates 15 seconds overhead per call and five minutes fixed
-headroom; slow starts, warmups, or failures can still exceed it. Keep at least ten
+headroom; slow starts, warmups, or failures can still exceed it. The first-start
+settle adds about 35 seconds per distinct image once per job (about four minutes
+for direct plus five gateways), inside that headroom. Keep at least ten
 minutes below the frozen 75-minute step. The frozen dispatcher cannot set pairs
 or adaptive flags and therefore uses **2 pairs, adaptive off**.
 
@@ -528,6 +555,10 @@ or adaptive flags and therefore uses **2 pairs, adaptive off**.
   request the full-matrix extension; its real-world frequency remains unmeasured.
 - Unmodelled order effects: equal mean position does not model drift or varying
   separation between compared arms; ratio noise can still vary across pairs.
+- Host activity after the first-start settle: the settle holds only each
+  image's first start. Other processes that take CPU later in a run are neither
+  prevented nor flagged; a sample whose gateway and backend CPU drop together
+  for several seconds in its `process_usage` timeline was probably disturbed.
 
 #### Window, client and revision inputs (#6038, #6022)
 

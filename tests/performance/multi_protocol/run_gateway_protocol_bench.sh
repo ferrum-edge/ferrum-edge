@@ -22,6 +22,8 @@
 #   --wallclock-budget-seconds N (per invocation, default 4200)
 #   --experiment-manifest PATH (explicit opt-in; default remains experiment.json)
 #   --no-process-usage          (diagnostic only; paired comparisons invalid)
+#   --settle | --no-settle      (first-start settle before pair 1; default on for the
+#                                plain comparison lane, off for profile/trace lanes)
 #   --pool-profile calibration|profile (separate fixed-window H2/gRPC lane)
 #   --h1-profile calibration|cutoff|diagnostic (separate manual H1 lane; see docs/h1_internal_profile.md)
 #   --h2-window default|64k     (http2/grpcs only; default $BENCH_H2_WINDOW or `default`)
@@ -34,6 +36,14 @@
 # (#6038). Connection windows and competitor gateways keep their settings.
 # `--grpc-client-connections per-rpc` makes the gRPC client open and close one
 # connection per call (#6022 item 6). Both are recorded in manifest.json.
+#
+# First-start settle: on GitHub-hosted runners the provisioner's job daemon uses
+# about one core for 4-5 s the first time a new binary or container image runs
+# in a job, 2-12 s after that start. Measured cells in that window lost 20-25%
+# of their CPU, always for the arms that ran an image first in pair 1. Before the
+# first measured pair the runner therefore starts every distinct binary/image
+# once, drives a short discarded load, and waits (host_settle.py) until the host
+# is quiet. What each hold saw is recorded in host_settle.json.
 #
 # All gateways (including Ferrum) run in Docker with --network host so no gateway
 # has a native-binary advantage. proto_backend and proto_bench run natively
@@ -81,6 +91,8 @@ PAIRS=2
 ADAPTIVE=false
 WALLCLOCK_BUDGET=4200
 PROCESS_USAGE=true
+# auto = on for the plain comparison lane, off for profile/trace/observation lanes.
+SETTLE=auto
 BASELINE_IMAGE="${FERRUM_BASELINE_IMAGE:-}"
 PAIR=0
 ORDER_POSITION=0
@@ -116,6 +128,8 @@ while [[ $# -gt 0 ]]; do
         --adaptive) ADAPTIVE=true; shift ;;
         --wallclock-budget-seconds) WALLCLOCK_BUDGET="$2"; shift 2 ;;
         --no-process-usage) PROCESS_USAGE=false; shift ;;
+        --settle) SETTLE=true; shift ;;
+        --no-settle) SETTLE=false; shift ;;
         --h1-profile) H1_PROFILE="$2"; shift 2 ;;
         --h2-profile) H2_CPU_PROFILE="$2"; shift 2 ;;
         --profile-builds) H1_TRACE_BUILDS="$2"; shift 2 ;;
@@ -1419,6 +1433,127 @@ run_bench() {
     fi
 }
 
+# ── First-start settle ──────────────────────────────────────────────────────
+# Seconds of discarded load per first start, so the host sees the arm's
+# processes carrying traffic as they will in the measured cells.
+SETTLE_LOAD_SECONDS=3
+
+# Discarded client run against the arm that is currently up. Mirrors run_bench's
+# target and workload flags but records nothing and never fails the run.
+settle_load() {
+    local target="$1"  # "gateway" or "direct"
+    local params
+    params=($(bench_params))
+    local bench_proto="${params[0]}"
+    local bench_target="${params[1]}"
+    if [ "$target" = direct ]; then bench_target="${params[2]}"; fi
+    local extra_args=("${params[@]:3}")
+    if [ "$H2_WINDOW" != default ]; then
+        extra_args+=(--h2-stream-window "$H2_STREAM_WINDOW")
+    fi
+    if [ "$GRPC_CLIENT_CONNECTIONS" = per-rpc ]; then
+        extra_args+=(--connection-per-request)
+    fi
+    local settle_payload="${PAYLOAD_SIZES%% *}"
+    local settle_concurrency
+    settle_concurrency=$(scale_concurrency_for_payload "$settle_payload" "$CONCURRENCY")
+    local settle_cmd=("$SCRIPT_DIR/target/release/proto_bench" "$bench_proto"
+        --target "$bench_target" --duration "$SETTLE_LOAD_SECONDS"
+        --concurrency "$settle_concurrency" --payload-size "$settle_payload"
+        --json "${extra_args[@]}")
+    if [ -n "$TIMEOUT_CMD" ]; then
+        $TIMEOUT_CMD 90s "${settle_cmd[@]}" >/dev/null 2>&1 || true
+    else
+        "${settle_cmd[@]}" >/dev/null 2>&1 || true
+    fi
+}
+
+# What the host would recognise as "already seen": the image ID for a
+# container arm, the built binaries for direct. Empty when it cannot be told.
+settle_identity() {
+    if [ "$1" = direct ]; then
+        cksum "$SCRIPT_DIR/target/release/proto_backend" \
+            "$SCRIPT_DIR/target/release/proto_bench" 2>/dev/null | cksum | tr -d ' \n' || true
+    else
+        docker image inspect "$2" --format '{{.Id}}' 2>/dev/null || true
+    fi
+}
+
+# Start every distinct binary/image once, before any measured pair, and hold
+# until the host is quiet. Arms that share an image (ferrum and ferrum-exp-*,
+# envoy and envoy-limit-4) settle once: the host reacts to the image, not to
+# the container. An image already started on this host since boot (an earlier
+# invocation of this runner in the same job, i.e. iteration 2 onwards) is not
+# held again; the marker lives outside the results. Nothing here is a sample:
+# no file is written under pairs/.
+settle_first_starts() {
+    local record="$1"
+    local arms="$2"
+    local settled=" "
+    local gw image identity marker since
+    local marker_dir=""
+    if [ -r /proc/sys/kernel/random/boot_id ]; then
+        marker_dir="${RUNNER_TEMP:-${TMPDIR:-/tmp}}/ferrum-bench-first-start/$(cat /proc/sys/kernel/random/boot_id)"
+        mkdir -p "$marker_dir" 2>/dev/null || marker_dir=""
+    fi
+    rm -f "$record"
+    for gw in $arms; do
+        case "$gw" in
+            direct) image="host:proto_backend" ;;
+            ferrum|ferrum-exp-*) image="$FERRUM_IMAGE" ;;
+            ferrum-baseline) image="$BASELINE_IMAGE" ;;
+            envoy|envoy-limit-4) image="$ENVOY_IMAGE" ;;
+            kong) image="$KONG_IMAGE" ;;
+            tyk) image="$TYK_IMAGE" ;;
+            krakend) image="$KRAKEND_IMAGE" ;;
+            *) continue ;;
+        esac
+        case "$settled" in *" $image "*) continue ;; esac
+        settled+="$image "
+        identity=$(settle_identity "$gw" "$image")
+        marker=""
+        if [ -n "$marker_dir" ] && [ -n "$identity" ]; then
+            marker="$marker_dir/${identity//[^A-Za-z0-9._-]/_}"
+            if [ -e "$marker" ]; then
+                echo "[settle] $gw ($image) already started on this host since boot"
+                python3 "$SCRIPT_DIR/host_settle.py" note --arm "$gw" --image "$image" \
+                    --reason already_started --output "$record" || true
+                continue
+            fi
+        fi
+        echo "[settle] first start of $gw ($image)"
+        if [ -n "$BACKEND_PID" ]; then
+            kill "$BACKEND_PID" 2>/dev/null || true
+            wait "$BACKEND_PID" 2>/dev/null || true
+        fi
+        since=$(python3 -c 'import time; print(f"{time.time():.3f}")')
+        start_backend
+        case "$gw" in
+            direct) settle_load direct ;;
+            *)
+                case "$gw" in
+                    ferrum|ferrum-exp-*) start_ferrum ;;
+                    ferrum-baseline) FERRUM_IMAGE="$BASELINE_IMAGE" start_ferrum ;;
+                    envoy|envoy-limit-4) ENVOY_STREAM_LIMIT=100 start_envoy ;;
+                    kong) start_kong ;;
+                    tyk) start_tyk ;;
+                    krakend) start_krakend ;;
+                esac || {
+                    # The measured pair reports a gateway that cannot start.
+                    echo "[settle] $gw failed to start; not settled"
+                    stop_gateway
+                    continue
+                }
+                settle_load gateway
+                ;;
+        esac
+        python3 "$SCRIPT_DIR/host_settle.py" wait --arm "$gw" --image "$image" \
+            --since "$since" --output "$record" || true
+        stop_gateway
+        if [ -n "$marker" ]; then : > "$marker" || true; fi
+    done
+}
+
 # ── Orchestration ───────────────────────────────────────────────────────────
 main() {
     mkdir -p "$OUTPUT_DIR"
@@ -1575,6 +1710,22 @@ PYEOF
         # Preserve tag and immutable image evidence; no vendor correspondence inferred.
         docker image inspect "$KONG_IMAGE" > "$root_output/kong-image.json"
         KONG_IMAGE=$(docker image inspect "$KONG_IMAGE" --format '{{.Id}}')
+    fi
+    # Profile, trace and H2-observation lanes keep their fixed, separately
+    # verified process and manifest accounting; only the plain comparison lane
+    # settles first starts by default.
+    if [ "$SETTLE" = auto ]; then
+        # Without /proc the hold has nothing to observe, so it would only add
+        # idle starts (macOS and BSD development hosts).
+        if [ -n "$H1_PROFILE$POOL_PROFILE$UDP_PROFILE$H2_CPU_PROFILE" ] \
+            || [ "$H1_TRACE" != none ] || [ "$H2_OBSERVE" -eq 1 ] || [ ! -r /proc/stat ]; then
+            SETTLE=false
+        else
+            SETTLE=true
+        fi
+    fi
+    if [ "$SETTLE" = true ]; then
+        settle_first_starts "$root_output/host_settle.json" "$expected_gateways"
     fi
     local requested_pairs="$PAIRS"
     local final_pairs="$PAIRS"
