@@ -2749,6 +2749,377 @@ fn h3_pooled_connection_does_not_park_the_max_connections_slot() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// Pool drain fence: a checkout that read its dial inputs before a drain
+//
+// An H3 checkout reads the SVID generation its pool key carries and the
+// backend TLS configuration before it reaches the pool's create path. It
+// takes its place relative to drains before either read, so a drain that
+// lands anywhere after that keeps the connection out of the pool.
+// ---------------------------------------------------------------------------
+
+/// A backend TLS configuration read the test holds open. `entered` fires when
+/// the pool starts the read; the read completes once `release` is sent. A
+/// checkout parked here has read the SVID generation for its pool key and has
+/// not entered the pool's create path yet.
+fn held_h3_tls_config(
+    tls: Arc<rustls::ClientConfig>,
+) -> (
+    impl std::future::Future<Output = Result<Arc<rustls::ClientConfig>, anyhow::Error>>,
+    tokio::sync::oneshot::Receiver<()>,
+    tokio::sync::oneshot::Sender<()>,
+) {
+    let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+    let read = async move {
+        let _ = entered_tx.send(());
+        release_rx
+            .await
+            .map_err(|_| anyhow::anyhow!("the held TLS configuration read was abandoned"))?;
+        Ok(tls)
+    };
+    (read, entered_rx, release_tx)
+}
+
+/// The pool entry point a drain-fence case goes through.
+#[derive(Clone, Copy, Debug)]
+enum H3FencedEntry {
+    /// Buffered dispatch on the proxy's own backend key.
+    Buffered,
+    /// Buffered dispatch on an explicit-target key (the retry path).
+    BufferedTarget,
+    /// Authorized streaming dispatch on an explicit-target key.
+    StreamingTarget,
+}
+
+const H3_FENCED_ENTRIES: [H3FencedEntry; 3] = [
+    H3FencedEntry::Buffered,
+    H3FencedEntry::BufferedTarget,
+    H3FencedEntry::StreamingTarget,
+];
+
+/// Send one request through `entry`, running `drain` while the checkout is
+/// reading its TLS configuration, and return the response status.
+async fn h3_status_with_drain_during_tls_read(
+    pool: &ferrum_edge::http3::client::Http3ConnectionPool,
+    proxy: &Proxy,
+    entry: H3FencedEntry,
+    tls: Arc<rustls::ClientConfig>,
+    drain: impl FnOnce(),
+) -> u16 {
+    let port = proxy.backend_port;
+    let url = format!("https://127.0.0.1:{port}/");
+    let headers = [(
+        http::header::HOST,
+        http::header::HeaderValue::from_str(&format!("127.0.0.1:{port}"))
+            .expect("backend authority"),
+    )];
+    let (read, entered, release) = held_h3_tls_config(tls);
+    let request = async {
+        match entry {
+            H3FencedEntry::Buffered => h3_pool_buffered_request_for_test(
+                pool,
+                proxy,
+                None,
+                "GET",
+                &url,
+                &headers,
+                bytes::Bytes::new(),
+                read,
+            )
+            .await
+            .map(|response| response.status),
+            H3FencedEntry::BufferedTarget => h3_pool_buffered_request_for_test(
+                pool,
+                proxy,
+                Some(("127.0.0.1", port, port)),
+                "GET",
+                &url,
+                &headers,
+                bytes::Bytes::new(),
+                read,
+            )
+            .await
+            .map(|response| response.status),
+            H3FencedEntry::StreamingTarget => h3_pool_streaming_request_with_target_for_test(
+                pool,
+                proxy,
+                ("127.0.0.1", port, port),
+                "GET",
+                &url,
+                &headers,
+                bytes::Bytes::new(),
+                read,
+            )
+            .await
+            .map(|response| response.status),
+        }
+    };
+    let drain_then_release = async {
+        entered
+            .await
+            .expect("the checkout must read its TLS configuration");
+        drain();
+        release
+            .send(())
+            .expect("the checkout must still be waiting on its TLS configuration");
+    };
+    let (status, ()) = tokio::join!(request, drain_then_release);
+    status.unwrap_or_else(|error| panic!("{entry:?} request must be served: {error}"))
+}
+
+/// A TLS material or CRL reload drains the pool while a checkout still holds
+/// the configuration it read before the reload. The connection it then dials
+/// serves its own request and is not published, so the next request dials
+/// under the reloaded material.
+#[tokio::test]
+async fn h3_pool_drain_does_not_publish_a_checkout_that_read_its_tls_config_before_it() {
+    for entry in H3_FENCED_ENTRIES {
+        // Two requests per connection: the fenced connection takes one, the
+        // connection dialled after the drain takes two.
+        let (backend, port, client_tls) = capped_h3_backend("h3-drain-fence", 2).await;
+        let (pool, _limiter, mut proxy) = capped_h3_pool(8, port);
+        proxy.pool_http3_connections_per_backend = Some(1);
+
+        let status =
+            h3_status_with_drain_during_tls_read(&pool, &proxy, entry, client_tls.clone(), || {
+                pool.force_drain_all()
+            })
+            .await;
+        assert_eq!(status, 200, "{entry:?}");
+        assert_eq!(backend.accepted_handshakes(), 1, "{entry:?}");
+        assert_eq!(
+            pool.pool_size(),
+            0,
+            "{entry:?}: a connection dialled with a TLS configuration read before the drain \
+             must not be published after it"
+        );
+
+        // The next request dials afresh and that connection is published.
+        let status =
+            h3_status_with_drain_during_tls_read(&pool, &proxy, entry, client_tls.clone(), || {})
+                .await;
+        assert_eq!(status, 200, "{entry:?}");
+        assert_eq!(
+            backend.accepted_handshakes(),
+            2,
+            "{entry:?}: the request after the drain must dial a fresh connection"
+        );
+        assert_eq!(pool.pool_size(), 1, "{entry:?}");
+
+        // And it is the one later requests reuse.
+        let status =
+            h3_status_with_drain_during_tls_read(&pool, &proxy, entry, client_tls, || {}).await;
+        assert_eq!(status, 200, "{entry:?}");
+        assert_eq!(backend.accepted_handshakes(), 2, "{entry:?}");
+
+        drop(backend);
+    }
+}
+
+/// An SVID rotation advances the generation and then force-drains the
+/// outgoing one, both while a checkout still holds the generation it read
+/// before the rotation. Its connection is keyed on the drained generation, so
+/// it must not be published under that key.
+#[tokio::test]
+async fn h3_pool_generation_drain_does_not_publish_a_checkout_keyed_on_the_drained_generation() {
+    use ferrum_edge::dns::DnsConfig;
+    use ferrum_edge::http3::client::Http3ConnectionPool;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    const SVID_CERT_PATH: &str = "/var/run/ferrum/svid.pem";
+    const OUTGOING: u64 = 4;
+
+    for entry in H3_FENCED_ENTRIES {
+        let (backend, port, client_tls) = capped_h3_backend("h3-generation-fence", 2).await;
+        let generation = Arc::new(AtomicU64::new(OUTGOING));
+        let pool = Http3ConnectionPool::new_with_svid_generation(
+            Arc::new(EnvConfig {
+                gateway_svid_cert_path: Some(SVID_CERT_PATH.to_string()),
+                ..EnvConfig::default()
+            }),
+            DnsCache::new(DnsConfig::default()),
+            Arc::clone(&generation),
+        );
+        let mut proxy = create_http3_test_proxy();
+        proxy.backend_host = "127.0.0.1".to_string();
+        proxy.backend_port = port;
+        proxy.backend_tls_verify_server_cert = true;
+        proxy.pool_http3_connections_per_backend = Some(1);
+        // The proxy presents the gateway SVID, so its pool key carries the
+        // SVID generation. The test supplies the TLS configuration itself, so
+        // the path is never opened.
+        proxy.resolved_tls.client_cert_path = Some(SVID_CERT_PATH.to_string());
+
+        let status =
+            h3_status_with_drain_during_tls_read(&pool, &proxy, entry, client_tls.clone(), || {
+                generation.store(OUTGOING + 1, Ordering::Release);
+                pool.force_drain_svid_generation(OUTGOING);
+            })
+            .await;
+        assert_eq!(status, 200, "{entry:?}");
+        assert_eq!(backend.accepted_handshakes(), 1, "{entry:?}");
+        assert_eq!(
+            pool.pool_size(),
+            0,
+            "{entry:?}: a connection keyed on the drained generation must not be published"
+        );
+
+        // The next request reads the new generation, dials, and is published.
+        let status =
+            h3_status_with_drain_during_tls_read(&pool, &proxy, entry, client_tls, || {}).await;
+        assert_eq!(status, 200, "{entry:?}");
+        assert_eq!(
+            backend.accepted_handshakes(),
+            2,
+            "{entry:?}: the request after the rotation must dial a fresh connection"
+        );
+        assert_eq!(pool.pool_size(), 1, "{entry:?}");
+
+        drop(backend);
+    }
+}
+
+/// A UDP relay in front of an H3 backend that withholds the backend's
+/// datagrams while its gate is `true`, so a QUIC handshake through it stays in
+/// flight until the test opens the gate. One client address is enough: an H3
+/// pool dials every connection from one shared socket.
+async fn spawn_gated_h3_udp_relay(
+    backend_port: u16,
+) -> (
+    u16,
+    tokio::sync::watch::Sender<bool>,
+    tokio::task::JoinHandle<()>,
+) {
+    use crate::scaffolding::port_registry::TestSocket;
+
+    let front = crate::scaffolding::ports::reserve_udp_port()
+        .await
+        .expect("reserve relay port");
+    let port = front.port;
+    let front = front.into_socket();
+    let upstream = tokio::net::UdpSocket::bind_test("127.0.0.1:0")
+        .await
+        .expect("bind relay upstream socket");
+    upstream
+        .connect(("127.0.0.1", backend_port))
+        .await
+        .expect("connect relay to backend");
+
+    let (gate, mut gated) = tokio::sync::watch::channel(false);
+    let relay = tokio::spawn(async move {
+        let mut client = None;
+        let mut withheld: Vec<Vec<u8>> = Vec::new();
+        let mut from_client = vec![0u8; 65_535];
+        let mut from_backend = vec![0u8; 65_535];
+        loop {
+            tokio::select! {
+                received = front.recv_from(&mut from_client) => {
+                    let Ok((len, peer)) = received else { return };
+                    client = Some(peer);
+                    let _ = upstream.send(&from_client[..len]).await;
+                }
+                received = upstream.recv(&mut from_backend) => {
+                    let Ok(len) = received else { return };
+                    let holding = *gated.borrow();
+                    if holding {
+                        withheld.push(from_backend[..len].to_vec());
+                    } else if let Some(peer) = client {
+                        let _ = front.send_to(&from_backend[..len], peer).await;
+                    }
+                }
+                changed = gated.changed() => {
+                    if changed.is_err() {
+                        return;
+                    }
+                    let holding = *gated.borrow();
+                    if let (false, Some(peer)) = (holding, client) {
+                        for datagram in withheld.drain(..) {
+                            let _ = front.send_to(&datagram, peer).await;
+                        }
+                    }
+                }
+            }
+        }
+    });
+    (port, gate, relay)
+}
+
+/// The pool is drained while a create is inside it with its QUIC handshake in
+/// flight. The handshake completes after the drain: the connection serves the
+/// request that dialled it and is not published.
+#[tokio::test]
+async fn h3_pool_drain_does_not_publish_a_connection_whose_handshake_was_in_flight() {
+    use std::time::Duration;
+
+    let (backend, backend_port, client_tls) = capped_h3_backend("h3-drain-handshake", 2).await;
+    let (relay_port, gate, relay) = spawn_gated_h3_udp_relay(backend_port).await;
+    let (pool, _limiter, mut proxy) = capped_h3_pool(8, relay_port);
+    proxy.pool_http3_connections_per_backend = Some(1);
+    proxy.backend_connect_timeout_ms = 30_000;
+
+    let url = format!("https://127.0.0.1:{relay_port}/");
+    let headers = [(
+        http::header::HOST,
+        http::header::HeaderValue::from_str(&format!("127.0.0.1:{relay_port}"))
+            .expect("backend authority"),
+    )];
+
+    // The backend's handshake packets are withheld, so the create reaches the
+    // backend and then waits inside the pool.
+    gate.send_replace(true);
+    let request = h3_pool_buffered_request_for_test(
+        &pool,
+        &proxy,
+        None,
+        "GET",
+        &url,
+        &headers,
+        bytes::Bytes::new(),
+        std::future::ready(Ok(client_tls.clone())),
+    );
+    let drain_then_release = async {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while backend.accepted_connections() == 0 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the handshake must reach the backend");
+        pool.force_drain_all();
+        gate.send_replace(false);
+    };
+    let (response, ()) = tokio::join!(request, drain_then_release);
+    let response = response.expect("the request that dialled across the drain must be served");
+    assert_eq!(response.status, 200);
+    assert_eq!(backend.accepted_handshakes(), 1);
+    assert_eq!(
+        pool.pool_size(),
+        0,
+        "a connection whose handshake was in flight at the drain must not be published"
+    );
+
+    // The next request dials afresh and that connection is published.
+    let response = h3_pool_buffered_request_for_test(
+        &pool,
+        &proxy,
+        None,
+        "GET",
+        &url,
+        &headers,
+        bytes::Bytes::new(),
+        std::future::ready(Ok(client_tls)),
+    )
+    .await
+    .expect("the request after the drain must be served");
+    assert_eq!(response.status, 200);
+    assert_eq!(backend.accepted_handshakes(), 2);
+    assert_eq!(pool.pool_size(), 1);
+
+    relay.abort();
+    drop(backend);
+}
+
 /// An H3 pool + proxy whose `maxConnections` policy is published ONLY on
 /// `policy_port` while the workload is actually dialed on `dial_port` — the
 /// Kubernetes `targetPort` remap shape (Service `80` -> workload `8080`).
