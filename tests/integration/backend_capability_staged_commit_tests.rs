@@ -41,7 +41,9 @@ const SUPPORTED: ProtocolSupport = ProtocolSupport::Supported;
 const UNSUPPORTED: ProtocolSupport = ProtocolSupport::Unsupported;
 const UNKNOWN: ProtocolSupport = ProtocolSupport::Unknown;
 
-/// Bound for every wait on the fixture; nothing here sleeps for a fixed time.
+/// Bound for the waits that follow the release (the refresh finishing, the
+/// fixture's handshake counter). The wait before the release is bounded by
+/// `H3_PROBE_BUDGET` instead. Nothing here sleeps for a fixed time.
 const WAIT: Duration = Duration::from_secs(15);
 
 /// How long the gateway's HTTP/3 probe waits for the held handshake before it
