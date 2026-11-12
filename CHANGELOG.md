@@ -595,6 +595,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   benchmark caches are restore-only (`save-if: "false"`) (#7285).
 
 ### Fixed
+- **A pooled gRPC backend connection that advertised
+  `SETTINGS_MAX_CONCURRENT_STREAMS` of 0 is used again once the backend
+  raises the limit.** The pool skips such a connection while a sibling is
+  open, and its sampled limit was refreshed only when a call reached it, so
+  it stayed skipped for as long as it lived. The connection driver now
+  samples again every 100 ms while the limit reads 0. The direct HTTP/2 pool
+  shares the driver.
+- **A pooled backend connection still being established when its pool is
+  drained is no longer published after the drain.** A TLS material or CRL
+  reload, a withdrawn trust bundle, and an SVID rotation's forced drain
+  (`FERRUM_MESH_SVID_ROTATION_DRAIN_SECONDS` above `0`) drain the reqwest,
+  direct HTTP/2, gRPC and HTTP/3 pools, but a connection whose handshake was
+  in flight at that moment was cached when it completed, under the
+  configuration it had started with, and later requests could reuse it. A
+  create that had entered the pool before the drain, or a request that waited
+  on one and dialled after it, now hands its connection to its own caller
+  only. Two older, narrower windows are not yet covered: the HTTP/3 pool
+  reads its TLS configuration and SVID generation just before entering the
+  pool, and the direct HTTP/1.1 pool's idle lanes sit outside this fence, so
+  a create or checkout that straddles a drain at exactly that point can still
+  be pooled.
 - An `api_chargeback_sink` with `clickhouse.tls.verify_hostname: false` and
   neither `clickhouse.tls.ca_file` nor `clickhouse.tls.insecure_skip_verify:
   true` is now refused at admission with a message naming both remedies. It
@@ -2131,6 +2152,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `CONTRIBUTING.md` correctly and list every operating mode (#7309).
 
 ### Performance
+- **The direct HTTP/2 pool now reaches `FERRUM_POOL_HTTP2_CONNECTIONS_PER_HOST`.**
+  The pool took the first ready shard, and an open HTTP/2 connection always
+  reports ready, so every request used the first connection the pool ever
+  opened (normally the startup capability probe's). All streams to a backend
+  then shared one connection: one connection task in the gateway and one in the
+  backend did that backend's TLS and HTTP/2 framing, whatever the setting said.
+  Requests now prefer a specific shard (an HTTP/2 frontend connection's own
+  shard, as in the gRPC pool; otherwise round-robin), are served by a ready
+  sibling when that shard is missing or closed, and the shard is created in the
+  background, so no request waits on a dial. A shard whose create failed is
+  borrowed around for 2 seconds; the capability probe never widens the pool.
+  Each connection's driver now samples the backend's
+  `SETTINGS_MAX_CONCURRENT_STREAMS`, as the gRPC pool's does, so a shard whose
+  backend allows no streams is skipped and a frontend connection pins no more
+  streams than its backend allows.
+  On the hosted protocol benchmark (three same-runner A/B runs, 100 streams,
+  TLS on both legs) HTTP/2 throughput rose 11–15% at 10 KiB, 24–42% at 70 KiB
+  and 28–51% from 512 KiB to 5 MiB, taking the result against Envoy 1.39 from
+  0.84–1.08× to 1.04–1.51×. **Operator action:** a gateway now opens up to
+  that many HTTP/2 connections per backend host (default: CPU cores clamped to
+  2–8) where it held one. Size backend connection limits and DestinationRule
+  `maxConnections` for that width, or set
+  `FERRUM_POOL_HTTP2_CONNECTIONS_PER_HOST=1`. See
+  [Direct HTTP/2 Pool Width](docs/connection_pooling.md#direct-http2-pool-width).
 - **A cold DNS miss sends the SRV and A/AAAA queries together.** Under an
   order that starts with `SRV` followed by `A` or `AAAA` (the default
   `CACHE,SRV,A,CNAME`), a hostname with no recorded answering type used to
