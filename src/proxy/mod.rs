@@ -12512,10 +12512,22 @@ impl ProxyState {
                     },
                     &mut record,
                 );
+                // BENCH EXPERIMENT (never merge): cap the H3 probe wait so the
+                // record (and with it the H2/H1 verdict) is published sooner.
+                static BENCH_H3_PROBE_CAP_MS: std::sync::LazyLock<Option<u64>> =
+                    std::sync::LazyLock::new(|| {
+                        std::env::var("FERRUM_BENCH_H3_PROBE_CAP_MS")
+                            .ok()
+                            .and_then(|value| value.parse().ok())
+                    });
+                let h3_probe_timeout = match *BENCH_H3_PROBE_CAP_MS {
+                    Some(cap_ms) => probe_timeout.min(Duration::from_millis(cap_ms)),
+                    None => probe_timeout,
+                };
                 let h3_fut = Self::probe_h3(
                     &self.h3_pool,
                     &probe_proxy,
-                    probe_timeout,
+                    h3_probe_timeout,
                     tls_config_result,
                     host,
                     port,

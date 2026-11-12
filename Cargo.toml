@@ -796,3 +796,4 @@ dimpl = { path = "vendor/dimpl-0.6.1-ferrum-patched" }
 hyper-util = { path = "vendor/hyper-util-0.1.21-ferrum-patched" }
 hyper = { path = "vendor/hyper-1.10.0-ferrum-patched" }
 h2 = { path = "vendor/h2-0.4.20-ferrum-patched" }
+tokio-rustls = { path = "vendor/tokio-rustls-0.26.6-bench" }
