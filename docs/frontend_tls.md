@@ -1466,6 +1466,91 @@ openssl s_client -connect localhost:8443 -tls1_3
 openssl s_client -connect localhost:8443 -cipher 'ALL' -tls1_2
 ```
 
+### Record-layer cipher-suite backend
+
+The ordinary (non-FIPS) build links two implementations of every TLS cipher
+suite, `ring`'s and AWS-LC's, and uses one of them for the whole process. The
+choice is about speed only: the suites, their order, the negotiated protocol
+and everything on the wire are identical either way, and the settings above
+apply unchanged.
+
+Only the record layer moves: the AEAD and the HKDF/PRF hash a suite carries,
+which for TLS 1.3 includes the QUIC packet and header-protection keys HTTP/3
+uses. Key exchange, signature verification, the private-key provider, the
+random source and the session ticketer stay on `ring`. DTLS is unaffected (it
+runs on `dimpl`), and so is a kTLS-offloaded TCP+TLS leg after its handshake,
+because the kernel then does the record layer.
+
+**Why it is chosen per CPU.** `ring` implements AES-GCM on x86-64 with VAES
+over 256-bit (AVX2) vectors. AWS-LC has an AVX-512 implementation instead and
+no AVX2 VAES one, so without AVX-512 it falls back to plain AES-NI. AWS-LC is
+therefore faster on some CPUs and clearly slower on others.
+
+`FERRUM_TLS_AEAD_BACKEND` selects the backend:
+
+| Value | Behaviour |
+|-------|-----------|
+| `auto` (default) | AWS-LC when **all** of these hold, `ring` otherwise: the target is x86-64 and not Windows; the CPU and OS expose VAES, VPCLMULQDQ and AVX-512 F, DQ, BW and VL (the features AWS-LC itself requires before it uses its AVX-512 AES-GCM); and the CPU is on the measured allow-list: AMD family 19h with those features (Zen 4) and family 1Ah (Zen 5), Intel Sapphire Rapids, Emerald Rapids and Granite Rapids |
+| `ring` | Always `ring` |
+| `aws-lc` | Always AWS-LC. Honoured even where `auto` keeps `ring`, with a startup `WARN`, because it is expected to be slower there |
+
+The feature bits alone are not enough, which is why there is an allow-list.
+Intel Ice Lake reports every feature above and showed no net gain when measured
+(see the table below). BoringSSL avoids 512-bit registers on Ice Lake and Tiger
+Lake because of downclocking and allows them again from Sapphire Rapids, and
+`auto` follows the same line. Rocket Lake also has the features and has not
+been measured, so it keeps `ring` too, as does any other CPU that is not on the
+list: a new microarchitecture is added after it has been measured.
+
+**Where it helps and where it does not.** Hosted benchmark, TLS on both legs,
+same binary and same runner per row, gateway CPU per request with AWS-LC
+relative to `ring`:
+
+| Runner CPU | `auto` | 10 KiB | 70 KiB | 1 MiB |
+|------------|--------|--------|--------|-------|
+| AMD EPYC 9V45 (Zen 5), TCP+TLS | AWS-LC | −9% | −11% | −12% |
+| AMD EPYC 9V45 (Zen 5), HTTP/2 | AWS-LC | −1% | −10% | −12% |
+| AMD EPYC 9V74 (Zen 4), HTTP/2 | AWS-LC | −1% | −5% | −6% |
+| AMD EPYC 9V74 (Zen 4), HTTP/1.1 over TLS | AWS-LC | +1% | −3% | −7% |
+| Intel Xeon 8573C (Emerald Rapids), TCP+TLS | AWS-LC | −3% | −3% | −6% |
+| Intel Xeon 8370C (Ice Lake), TCP+TLS | `ring` | +4% | −6% | −4% |
+| AMD EPYC 7763 (Zen 3, no AVX-512) | `ring` | +6–8% | +14–19% | +23–36% |
+
+- It helps bulk transfer on AVX-512 AMD CPUs most: on Zen 5, 9–12% less gateway
+  CPU per request and 6–10% more throughput for TCP+TLS and HTTP/2. The gain is
+  smaller on Zen 4 and on Intel Sapphire Rapids-class CPUs.
+- It does little for small responses. At 10 KiB the HTTP results are within the
+  benchmark's run-to-run noise on every CPU, because the handshake, framing and
+  syscalls dominate and those do not move.
+- On Ice Lake the CPU saving did not turn into throughput (it fell at two of the
+  three sizes), so `auto` keeps `ring` there.
+- On a CPU without AVX-512 AWS-LC is slower at every size, which is the case
+  `auto` exists to avoid and the reason `aws-lc` logs a warning there.
+- Nothing changes on non-x86-64 targets or on Windows.
+
+The selection is made once, when the crypto provider is installed, and cannot
+change without a restart. It is recorded at startup at INFO:
+
+```
+TLS record-layer cipher suites: backend=aws-lc, requested=auto, reason=cpu-qualified, target=x86_64, cpu_vendor=amd, cpu_family=26, cpu_model=2, avx512_aes_gcm_features=present
+```
+
+`reason` is one of `cpu-qualified`, `cpu-features-missing`,
+`intel-pre-sapphire-rapids`, `cpu-not-listed`, `not-x86-64`, `windows-target`,
+`operator-override` or `fips-build`. INFO is hidden at the default
+`FERRUM_LOG_LEVEL=warn`; `FERRUM_LOG_LEVEL=warn,ferrum_edge::fips::aead_backend=info`
+shows this record alone.
+
+Because the provider is installed before `ferrum.conf` is read, the variable
+must be set in the process environment. A value that appears only in
+`ferrum.conf`, or only through an external secret source, is refused at startup
+and by `ferrum-edge validate` with a message that says so; it is never silently
+ignored.
+
+On a FIPS build every cipher suite comes from the AWS-LC FIPS module and `ring`
+is not linked. `auto` and `aws-lc` change nothing there, and `ring` is refused.
+See [FIPS mode](fips.md).
+
 ## Integration with Load Balancers
 
 When using load balancers:

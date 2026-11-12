@@ -33,11 +33,12 @@
 //! 3. the CPU is on the measured allow-list in [`auto_verdict`].
 //!
 //! The third condition exists because the feature bits are not sufficient.
-//! Intel Ice Lake, Tiger Lake, and Rocket Lake report every feature above and
-//! lower their clock when 512-bit registers are used, so they do not benefit;
-//! BoringSSL and the Linux kernel carry the same exclusion. An unlisted CPU
-//! keeps `ring`: a new microarchitecture is admitted by measurement, not by
-//! assumption.
+//! Intel Ice Lake reports every feature above and showed no net gain when
+//! measured, and BoringSSL avoids 512-bit registers on Ice Lake and Tiger Lake
+//! because of downclocking, allowing them again from Sapphire Rapids. Rocket
+//! Lake has the features too and has not been measured. All three keep `ring`,
+//! and so does any CPU that is not listed: a new microarchitecture is admitted
+//! by measurement, not by assumption.
 //!
 //! `FERRUM_TLS_AEAD_BACKEND` (`auto`, `ring`, `aws-lc`) overrides the rule. The
 //! override is honoured as given on the ordinary build, including `aws-lc` on a
@@ -351,10 +352,13 @@ pub const INTEL_FAMILY_6: u32 = 0x6;
 /// Rapids (`0xCF`), Granite Rapids (`0xAD`), and Granite Rapids-D (`0xAE`).
 pub const INTEL_QUALIFIED_MODELS: &[u32] = &[0x8f, 0xcf, 0xad, 0xae];
 
-/// Intel family-6 models that report the full feature set and are nevertheless
-/// excluded because 512-bit register use lowers their clock: Ice Lake server
-/// (`0x6A`, `0x6C`), Ice Lake client (`0x7D`, `0x7E`, `0x9D`), Tiger Lake
-/// (`0x8C`, `0x8D`), and Rocket Lake (`0xA7`).
+/// Intel family-6 models older than Sapphire Rapids that report the full
+/// feature set and are nevertheless excluded: Ice Lake server (`0x6A`, `0x6C`),
+/// Ice Lake client (`0x7D`, `0x7E`, `0x9D`), Tiger Lake (`0x8C`, `0x8D`), and
+/// Rocket Lake (`0xA7`). Ice Lake and Tiger Lake are the models BoringSSL avoids
+/// 512-bit registers on; Rocket Lake is here because it is unmeasured. They are
+/// named, rather than left to fall through as unlisted, so the startup record
+/// can say why a CPU that has the features was not selected.
 pub const INTEL_PRE_SAPPHIRE_RAPIDS_MODELS: &[u32] =
     &[0x6a, 0x6c, 0x7d, 0x7e, 0x9d, 0x8c, 0x8d, 0xa7];
 

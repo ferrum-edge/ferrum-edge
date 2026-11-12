@@ -1164,7 +1164,7 @@ Ferrum ships two mutually exclusive cryptographic-backend cargo features
 
 | Feature | Backend | Lockfile |
 |---|---|---|
-| `crypto-ring` (default) | `ring` + `rustls/ring` | the committed `Cargo.lock` |
+| `crypto-ring` (default) | `ring` + `rustls/ring`, plus `rustls/aws_lc_rs` for the TLS record layer (see below) | the committed `Cargo.lock` |
 | `fips` | `aws-lc-fips-sys` via `aws-lc-rs/fips` and `rustls/fips` | the committed `Cargo.lock` |
 
 Rules:
@@ -1196,6 +1196,24 @@ Rules:
   and `hyper-rustls` each gate their aws-lc arm on the *absence* of their ring
   arm, so "also enable aws-lc" produces a build that looks switched and is not.
   This is the whole reason the features are exclusive rather than layered.
+- **The ordinary profile carries exactly one AWS-LC edge, `rustls/aws_lc_rs`.**
+  It links rustls's AWS-LC cipher suites beside its ring ones so
+  `src/fips/aead_backend.rs` can use whichever is faster for the TLS record
+  layer on the CPU it runs on (`FERRUM_TLS_AEAD_BACKEND`, default `auto`). It
+  is safe in this direction because the profile claims no validated module,
+  rustls keeps `ring` for key exchange and signatures, and no dependency
+  changes arm: the resolved-graph audit requires `rustls/ring` and
+  `rustls/aws_lc_rs` together and forbids every dependency's own aws-lc arm
+  (`FORBIDDEN_RESOLVED_RING`). It adds no crate to the profile, which already
+  linked `aws-lc-sys` through jsonwebtoken and dimpl. The edge is an
+  allow-list entry (`RING_PROFILE_ALLOWED_AWS_LC_EDGES`), not a pattern: any
+  other AWS-LC or FIPS-module feature in the `crypto-ring` list fails the
+  manifest check, and adding a second entry is a policy decision that needs
+  the same review. It is not mirrored in `fips`, where `rustls/fips` already
+  implies rustls's aws-lc arm and no `ring` arm may appear at all. The two
+  standalone workspaces that depend on this crate by path (`fuzz/` and
+  `tests/performance/mesh/`) resolve the same edge, so their lockfiles carry
+  rustls's `aws-lc-rs` dependency too.
 - **The declared contract is not the audited one.**
   `.github/scripts/check_fips_feature_policy.py` reads what cargo actually
   resolved (`cargo tree -e normal,build --prefix none -f '{p}|{f}'`) for

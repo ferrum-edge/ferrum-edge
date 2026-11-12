@@ -27,7 +27,7 @@ Selecting both, or neither, is a `compile_error!`.
 
 | Profile | Build command | Backend | `BUILD_CAPABLE` |
 |---|---|---|---|
-| Ordinary (default) | `cargo build --release` | `ring` + `rustls/ring` | `false` |
+| Ordinary (default) | `cargo build --release` | `ring` + `rustls/ring`, with rustls's AWS-LC cipher suites linked beside them for the TLS record layer (see below) | `false` |
 | FIPS | `cargo build --release --no-default-features --features fips` | `aws-lc-fips-sys` via `aws-lc-rs/fips` + `rustls/fips` | `true` |
 
 The ordinary profile retains Ferrum's existing Ring-backed behavior for TLS,
@@ -50,6 +50,27 @@ CP/DP trust-bundle RSA public keys and DPoP proof keys now check it too
 refused by size instead of failing every signature. `FERRUM_FIPS_MODE=enforce` on an ordinary build refuses to start, with
 a diagnostic that names the missing module. It never downgrades to `ring`.
 
+The ordinary profile has one more AWS-LC edge, and it is a performance
+selection rather than a provider switch. `crypto-ring` enables
+`rustls/aws_lc_rs`, which compiles rustls's AWS-LC cipher suites next to its
+`ring` ones, and `src/fips/aead_backend.rs` installs one set or the other for
+the TLS record layer when the provider is bootstrapped: AWS-LC's on the x86-64
+CPUs where its AVX-512 AES-GCM measurably beats `ring`'s AVX2 one, `ring`'s
+everywhere else, or whichever `FERRUM_TLS_AEAD_BACKEND` names
+([details](frontend_tls.md#record-layer-cipher-suite-backend)). Key exchange,
+signature verification, the key provider and every dependency's own provider
+arm stay on `ring`, and no library is added: `aws-lc-sys` was already in this
+profile through jsonwebtoken and dimpl. None of this is a validated-module
+claim. It is non-FIPS AWS-LC on a build whose `BUILD_CAPABLE` is `false`, and
+`FERRUM_FIPS_MODE=enforce` is refused on it exactly as before.
+
+**The FIPS profile is unchanged by that edge.** It still declares no `ring` arm
+on any dependency, its resolved graph is still audited for one, every cipher
+suite still comes from the AWS-LC FIPS module, and there is no second
+implementation to select between. `FERRUM_TLS_AEAD_BACKEND=auto` and `aws-lc`
+are no-ops on a FIPS build; `ring` is refused at startup and by `validate`
+rather than ignored, because the build cannot honour it.
+
 Exclusivity is not stylistic. `sqlx-core`, `quinn-proto`, `tonic`, `ldap3`, and
 `hyper-rustls` each gate their aws-lc arm on the *absence* of their ring arm, so
 additively "also enabling aws-lc" produces a build that reports a FIPS provider
@@ -58,6 +79,26 @@ pair at compile time and
 [`.github/scripts/check_fips_feature_policy.py`](../.github/scripts/check_fips_feature_policy.py)
 re-checks the **resolved** feature graph in CI, because a transitive edge can
 re-enable `rustls/ring` without this crate's feature list ever mentioning it.
+
+That hazard runs one way: `ring` surviving in a build that claims the
+validated module. The checker therefore treats the two profiles differently,
+and says so in its tables:
+
+- **`fips`** may select no feature named for `ring` on any dependency, whether
+  or not that dependency has a row in the paired-arm table, and its resolved
+  graph may carry none of the ring selections in `FORBIDDEN_RESOLVED_FIPS`.
+- **`crypto-ring`** may link AWS-LC only through the single allow-listed edge
+  `rustls/aws_lc_rs` (`RING_PROFILE_ALLOWED_AWS_LC_EDGES`). Any other AWS-LC or
+  FIPS-module feature in the list is refused by name. In the resolved graph
+  `rustls/ring` and `rustls/aws_lc_rs` must both be present, every dependency
+  that has a provider arm must still be on its ring arm
+  (`FORBIDDEN_RESOLVED_RING` lists each dependency's aws-lc arm), and
+  `aws-lc-rs/fips` must be absent.
+
+`--manifest-check` also runs a synthetic self-test (`--self-test` runs it
+alone): each case is one mutation of the real manifest or of a resolved
+selection set, such as a ring arm added to `fips` or a second AWS-LC edge added
+to `crypto-ring`, and the gate fails if any mutation is accepted.
 
 ### Building the FIPS profile
 
@@ -133,6 +174,7 @@ state` step in `.github/workflows/fips-build.yml`).
 | Mutually exclusive `crypto-ring` / `fips` build profiles | **Shipped** |
 | AWS-LC FIPS module integration linked by the `fips` profile | **Shipped** |
 | Resolved-feature-graph audit in CI (both profiles, and every claimed optional combination) | **Shipped** |
+| Checker self-test: mutated manifests and resolved graphs must be rejected | **Shipped** |
 | Hosted compile lane for every claimed optional FIPS combination | **Shipped** |
 | Approved key-strength/form admission for certificates and JWKS keys | **Shipped** (`src/fips/keys.rs`) |
 | Fail-closed gate on the independently configurable peer-verification opt-outs (exceptions listed under §"What FIPS mode enforces") | **Shipped** |
