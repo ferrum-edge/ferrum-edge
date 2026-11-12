@@ -1197,16 +1197,17 @@ const UNDELIMITED_SOURCE: &str =
 /// `#[cfg(all(test, unix))]`) exempts nothing, and a test-only item can end
 /// early (see `after_test_only_item`). What it does not see is a constructor
 /// reached through a renamed import or written by a macro. What it cannot
-/// delimit is an attribute inside a macro invocation that has a grammar of
-/// its own, or on a `where` predicate. The runtime tests above are what cover
-/// the paths that matter.
+/// delimit is an attribute inside a macro invocation whose grammar ends the
+/// attribute's target some other way than Rust's own does. The runtime tests
+/// above are what cover the paths that matter.
 fn production_source(text: &str) -> Option<String> {
     let code = code_only(text)?;
     let mut production = String::with_capacity(code.len());
     let mut rest = code.as_str();
     while let Some((before, after)) = rest.split_once(TEST_ONLY_ATTRIBUTE) {
         production.push_str(before);
-        rest = after_test_only_item(after)?;
+        let preceding = &code[..code.len() - rest.len() + before.len()];
+        rest = after_test_only_item(after, in_where_clause(preceding))?;
     }
     production.push_str(rest);
     production.retain(|character| !character.is_whitespace());
@@ -1280,9 +1281,16 @@ fn code_only(text: &str) -> Option<String> {
 }
 
 /// `true` for a character of an identifier, a keyword, a number or a literal
-/// suffix.
+/// suffix. Outside comments and literals, Rust source has no other use for a
+/// non-ASCII character than an identifier, except the five it treats as
+/// whitespace, so every other non-ASCII character counts without consulting
+/// the Unicode identifier tables.
 fn is_word(character: char) -> bool {
-    character.is_alphanumeric() || character == '_'
+    const NON_ASCII_WHITESPACE: [char; 5] =
+        ['\u{85}', '\u{200e}', '\u{200f}', '\u{2028}', '\u{2029}'];
+    character.is_ascii_alphanumeric()
+        || character == '_'
+        || (!character.is_ascii() && !NON_ASCII_WHITESPACE.contains(&character))
 }
 
 /// The index after the run of word characters that starts at `start`, which
@@ -1364,14 +1372,20 @@ fn end_of_raw_string(chars: &[char], start: usize, hashes: usize) -> Option<usiz
 /// What follows the item that a `#[cfg(test)]` attribute applies to, given the
 /// code right after that attribute; `None` when the item never ends.
 ///
-/// The item ends at the first `;` or `,` outside its own brackets, at the
-/// brace that closes its first block (an `else` continues it), or where
-/// whatever encloses it closes: a block or a list, a generic parameter list
-/// (`>`), a closure's parameters (`|`). None of those lies beyond the item, so
-/// production code after it is never skipped. Several can come before its
-/// end, such as a comma between generic arguments or a `>` or `|` used as an
-/// operator; the rest of that test-only item is then read as production code.
-fn after_test_only_item(source: &str) -> Option<&str> {
+/// The scan stops at the first place the item could end: a `;` or `,` outside
+/// its own brackets, the brace that closes its first block, or the close of
+/// whatever encloses it, which is a block or a list, a generic parameter list
+/// (`>`) or a closure's parameters (`|`). For a predicate of a `where` clause
+/// that is also the `{` or `=` that ends the clause. Every position an
+/// attribute can take in Rust ends at one of those, so the scan never runs
+/// past the item and production code after it is never skipped.
+///
+/// It can stop short: at a comma between generic arguments, at a `>` or `|`
+/// used as an operator, at the first block of an `if` that has an `else`. The
+/// rest of that test-only item is then read as production code. That is also
+/// what makes `cfg_if!` come out right, where the `else` block after
+/// `if #[cfg(test)] { .. }` is the production branch.
+fn after_test_only_item(source: &str, where_predicate: bool) -> Option<&str> {
     let mut item = source.trim_start();
     // Further attributes on the same item.
     while item.starts_with("#[") {
@@ -1382,6 +1396,7 @@ fn after_test_only_item(source: &str) -> Option<&str> {
     let mut angles = 0usize;
     for (offset, character) in item.char_indices() {
         match character {
+            '{' | '=' if depth == 0 && where_predicate => return Some(&item[offset..]),
             '(' | '[' | '{' => depth += 1,
             ')' | ']' | '}' | '|' if depth == 0 => return Some(&item[offset..]),
             '<' if depth == 0 => angles += 1,
@@ -1395,8 +1410,8 @@ fn after_test_only_item(source: &str) -> Option<&str> {
             ')' | ']' => depth -= 1,
             '}' => {
                 depth -= 1;
-                let after = &item[offset + 1..];
-                if depth == 0 && !continues_with_else(after) {
+                if depth == 0 {
+                    let after = &item[offset + 1..];
                     let next = after.trim_start();
                     return Some(next.strip_prefix([';', ',']).unwrap_or(after));
                 }
@@ -1406,6 +1421,20 @@ fn after_test_only_item(source: &str) -> Option<&str> {
         }
     }
     None
+}
+
+/// `true` when the code before an attribute leaves it among the predicates of
+/// a `where` clause: the keyword is there with no brace or semicolon after it.
+/// A clause with a braced expression in an earlier predicate is not recognised.
+fn in_where_clause(preceding: &str) -> bool {
+    preceding
+        .rsplit(['{', '}', ';'])
+        .next()
+        .is_some_and(|clause| {
+            clause
+                .split(|character: char| !is_word(character))
+                .any(|word| word == "where")
+        })
 }
 
 /// What follows the attribute that `source` starts with; `None` when its
@@ -1425,16 +1454,6 @@ fn after_attribute(source: &str) -> Option<&str> {
         }
     }
     None
-}
-
-/// `true` when the code after a closing brace goes on with an `else` branch.
-fn continues_with_else(after_brace: &str) -> bool {
-    after_brace
-        .trim_start()
-        .strip_prefix("else")
-        .is_some_and(|rest| {
-            !rest.starts_with(|character: char| character.is_alphanumeric() || character == '_')
-        })
 }
 
 /// The provider-less constructors in `text`'s production code, or a marker
@@ -1600,9 +1619,29 @@ fn the_provider_guard_rejects_the_forms_it_exists_for() {
     assert_eq!(caught(test_only_statement), ["ClientConfig::builder()"]);
     let test_only_field = "struct Sink {\n    #[cfg(test)]\n    hook: Hook,\n}\n\nfn real() {\n    rustls::ServerConfig::builder()\n}\n";
     assert_eq!(caught(test_only_field), ["ServerConfig::builder()"]);
-    let test_only_branch = "fn real() {\n    #[cfg(test)]\n    if hooked {\n        first();\n    } else {\n        rustls::ServerConfig::builder();\n    }\n    rustls::ClientConfig::builder();\n}\n";
-    assert_eq!(caught(test_only_branch), ["ClientConfig::builder()"]);
-    // An attribute on a generic or closure parameter ends with the parameter.
+    // An `else` after a test-only block is read as production code, which in
+    // `cfg_if!` is exactly what it is.
+    let test_only_branch = "fn real() {\n    #[cfg(test)]\n    if hooked {\n        rustls::WebPkiClientVerifier::builder(roots);\n    } else {\n        rustls::ServerConfig::builder();\n    }\n    rustls::ClientConfig::builder();\n}\n";
+    assert_eq!(
+        caught(test_only_branch),
+        ["ClientConfig::builder()", "ServerConfig::builder()"]
+    );
+    let cfg_if_branches = "cfg_if::cfg_if! {\n    if #[cfg(test)] {\n        fn build() {\n            rustls::ServerConfig::builder();\n        }\n    } else {\n        fn build() {\n            rustls::ClientConfig::builder();\n        }\n    }\n}\n";
+    assert_eq!(caught(cfg_if_branches), ["ClientConfig::builder()"]);
+    // An attribute on a generic parameter, a closure parameter or a `where`
+    // predicate ends with it, not with the body that follows.
+    assert_eq!(
+        caught(
+            "fn real<T>() where #[cfg(test)] T: Hook {\n    rustls::ClientConfig::builder()\n}\n"
+        ),
+        ["ClientConfig::builder()"]
+    );
+    assert_eq!(
+        caught(
+            "fn real<T, U>()\nwhere\n    T: Clone,\n    #[cfg(test)]\n    U: Hook\n{\n    rustls::ClientConfig::builder()\n}\n"
+        ),
+        ["ClientConfig::builder()"]
+    );
     assert_eq!(
         caught("fn real<#[cfg(test)] T>() {\n    rustls::ClientConfig::builder()\n}\n"),
         ["ClientConfig::builder()"]
@@ -1633,6 +1672,10 @@ fn the_provider_guard_rejects_the_forms_it_exists_for() {
     // not the prefix of a raw string, which would run on to the last quote.
     let suffixed_literal = "macro_rules! discard {\n    ($($tokens:tt)*) => {};\n}\n\ndiscard!(\"\"r\"\\\"\");\n\nfn real() {\n    let _ = rustls::ClientConfig::builder();\n}\n\ndiscard!(\"\\\"\");\n";
     assert_eq!(caught(suffixed_literal), ["ClientConfig::builder()"]);
+    // So does a suffix the Unicode identifier tables allow but
+    // `char::is_alphanumeric` does not.
+    let symbol_suffix = "discard!(\"\"\u{2118}r\"\\\"\");\n\nfn real() {\n    let _ = rustls::ClientConfig::builder();\n}\n\ndiscard!(\"\\\"\");\n";
+    assert_eq!(caught(symbol_suffix), ["ClientConfig::builder()"]);
     // A raw string is still one literal, quotes and all.
     let raw_literal = "const QUOTED: &str = r#\"a \"quoted\" {\"#;\n\nfn real() {\n    rustls::ClientConfig::builder()\n}\n";
     assert_eq!(caught(raw_literal), ["ClientConfig::builder()"]);
