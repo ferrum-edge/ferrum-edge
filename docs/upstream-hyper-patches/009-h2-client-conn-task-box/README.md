@@ -57,6 +57,29 @@ future drops the connection task as before.
 The cost is one allocation per connection. The enum is then as large as its
 largest per-request variant.
 
+## Measured
+
+On hosted CI runners, Rust 1.100.0.
+
+Size of the future the executor receives per request:
+
+| Instantiation | Before | After |
+|---|---|---|
+| Direct HTTP/2 pool over TLS, release build (the size the binary copies at the spawn site) | 2,528 bytes | 368 bytes |
+| The regression test's types (`Full<Bytes>` body, a zero-sized I/O type) | at least the 1,424-byte connection task | 304 bytes (`Pipe` 304, `Send` 104) |
+
+CPU profiles of the HTTP/2 10 KiB benchmark cell, as a share of the gateway's
+user CPU:
+
+| | Without the patch (six runs: EPYC 9V74, EPYC 7763, Xeon 8370C) | With the patch (EPYC 9V74, EPYC 7763) |
+|---|---|---|
+| Constant-size copies on the client spawn path | 0.5% to 1.3% | 0.09%, 0.05% |
+| Allocator time called from the client spawn path | 0.2% to 0.6% | 0.18%, 0.30% |
+
+That is the whole effect: about 1% of the gateway's user CPU on this cell. A
+same-job A/B of gateway CPU per request is recorded in the pull request that
+added the patch.
+
 ## Regression coverage
 
 - `proto::h2::client::ferrum_client_conn_task_box_tests` in the vendored crate
