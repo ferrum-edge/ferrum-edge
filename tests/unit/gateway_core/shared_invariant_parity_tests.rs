@@ -2331,8 +2331,13 @@ fn every_http3_checkout_samples_the_drain_epoch_before_its_generation_and_tls_re
     let warmup = item_body(&client, "    pub async fn warmup_connection(", "\n    }\n");
     assert!(warmup.contains("drain_epoch: u64,"));
     let warmup = without_whitespace(warmup);
+    let probe_creates = warmup.matches(".create_or_get_probe_sender(").count();
+    assert!(
+        probe_creates > 0,
+        "`warmup_connection` must reach the pool through the probe create"
+    );
     assert_eq!(
-        warmup.matches(".create_or_get_probe_sender(").count(),
+        probe_creates,
         warmup
             .matches(".create_or_get_probe_sender(primary_key,drain_epoch,")
             .count()
@@ -2345,8 +2350,13 @@ fn every_http3_checkout_samples_the_drain_epoch_before_its_generation_and_tls_re
     // One way into the shared pool: the create that takes a sample. A create
     // that sampled inside the pool would be late for every caller above.
     let production = without_cfg_test_items(&client);
+    let pool_creates = production.matches(".create_or_get_existing_owned").count();
+    assert!(
+        pool_creates > 0,
+        "the HTTP/3 pool must create through the shared pool's sampled entry point"
+    );
     assert_eq!(
-        production.matches(".create_or_get_existing_owned").count(),
+        pool_creates,
         production
             .matches(".create_or_get_existing_owned_sampled_as(key, drain_epoch, caller,")
             .count(),
