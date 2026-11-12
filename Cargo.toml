@@ -757,7 +757,7 @@ tokio = { version = "1", features = ["net", "io-util", "time", "rt", "test-util"
 #
 # Retirement plan: when a hyper release can reset an upgraded HTTP/2 stream
 # with a chosen error code, move the HBONE relays to the upstream API and drop
-# only patch 001's hunks. The vendored copy also carries hyper patches 002-008
+# only patch 001's hunks. The vendored copy also carries hyper patches 002-009
 # (`docs/upstream-hyper-patches/series`), so remove the `hyper` line below (and
 # its fuzz and mesh mirrors), update the three lockfiles, and drop
 # `vendor/hyper-1.10.0-ferrum-patched/` only once every one of them has an

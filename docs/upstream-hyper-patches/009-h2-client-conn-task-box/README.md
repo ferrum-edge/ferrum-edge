@@ -20,20 +20,25 @@ enum, `proto::h2::client::H2ClientFuture`:
 - `Task`: the connection task. One per connection. It owns the h2
   `Connection`, so it is large.
 - `Send`: resolves a request's response. One per request.
-- `Pipe`: writes a request body. One per request that has a body.
+- `Pipe`: writes a request body. hyper first tries to write the body inline
+  and spawns `Pipe` only when that attempt is still pending, so it is at most
+  one per request.
 
 An enum is as large as its largest variant. With `Task` stored inline, every
-`Send` and `Pipe` future was as large as the connection task. On Ferrum's
-direct HTTP/2 pool (`H2ClientFuture<DirectH2RequestBody, TokioIo<TlsStream<TcpStream>>, TokioExecutor>`)
-that is about 2.5 KiB (the release binary copies 2,528 to 2,536 bytes at each
-site), against a few hundred bytes of real state. The executor copies the
-future into a task allocation of that size for every request, and the runtime
-writes a value of the same size again when the task finishes.
+`Send` and `Pipe` future was as large as the connection task, whatever the
+body, transport and executor types. The sizes below are for one
+instantiation, the one measured: Ferrum's direct HTTP/2 pool over TLS
+(`H2ClientFuture<DirectH2RequestBody, TokioIo<TlsStream<TcpStream>>, TokioExecutor>`).
+There the enum was about 2.5 KiB (the release binary copies 2,528 to 2,536
+bytes at each site), against a few hundred bytes of per-request state. The
+executor copies the future into a task allocation of that size for each
+spawned future, and the runtime writes a value of the same size again when the
+task finishes.
 
-In CPU profiles of the HTTP/2 10 KiB benchmark cell (13 runs on `main`
-856ea7634, five runner CPU models) those copies were 0.5% to 1.4% of the
-gateway's user CPU: a mean of 0.70% on EPYC 7763, 1.07% on EPYC 9V74, 0.52% on
-Xeon 8573C, 0.67% on Xeon 6973P-C and 0.67% on EPYC 9V45.
+In CPU profiles of the HTTP/2 10 KiB benchmark cell on that pool (13 runs on
+`main` 856ea7634, five runner CPU models) those copies were 0.5% to 1.4% of
+the gateway's user CPU: a mean of 0.70% on EPYC 7763, 1.07% on EPYC 9V74,
+0.52% on Xeon 8573C, 0.67% on Xeon 6973P-C and 0.67% on EPYC 9V45.
 
 ## Patch
 
@@ -58,11 +63,21 @@ largest per-request variant.
   asserts that the spawned future is no larger than its largest per-request
   variant plus the enum tag, and smaller than the connection task. Run with
   `cargo test --manifest-path vendor/hyper-1.10.0-ferrum-patched/Cargo.toml --features full --lib ferrum_client_conn_task_box`.
-- Behaviour is unchanged, so the gateway's existing HTTP/2 client coverage is
-  the behavioural regression: every test in
-  `tests/integration/http2_pool_tests.rs` drives requests through the boxed
-  connection task on a real connection, including connection close and pool
-  refill.
+- Behaviour is unchanged, so the gateway's existing live HTTP/2 client
+  coverage is the behavioural regression. hyper drives the socket of every
+  HTTP/2 client connection from the connection task, so a test that sends a
+  request, reads the backend's SETTINGS or observes a close on a real
+  connection runs through the box. In `tests/integration/http2_pool_tests.rs`
+  that includes
+  `direct_h2_backend_sees_matching_host_and_authority_on_non_default_port`
+  (requests and responses through the direct pool),
+  `test_http2_pool_does_not_pin_to_a_backend_allowing_no_streams` (the
+  backend's SETTINGS reach the pool),
+  `test_http2_pool_refills_a_closed_preferred_shard_in_the_background` (a
+  closed connection is noticed and replaced) and
+  `test_grpc_h2c_upload_coalesces_small_connection_window_increments` (a
+  request body written through the gRPC pool). The tests in that file that
+  never connect, or that exercise HTTP/1.1, are not coverage for this patch.
 
 ## Retirement plan
 

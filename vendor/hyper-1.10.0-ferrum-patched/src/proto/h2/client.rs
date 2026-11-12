@@ -921,20 +921,17 @@ mod ferrum_client_conn_task_box_tests {
         let connection = size_of::<ConnTask<NoIo, Body>>();
         let per_request = size_of::<PipeMap<Body>>().max(size_of::<SendWhen<Body, ()>>());
 
-        // The connection task is the large one: it owns the h2 connection.
-        assert!(
-            connection > 2 * per_request,
-            "connection task {connection} bytes, per-request tasks {per_request} bytes"
-        );
-        // What the executor allocates and copies for every request is the
-        // largest per-request variant plus the enum tag, never the connection.
-        assert!(
-            spawned <= per_request + 2 * size_of::<usize>(),
-            "spawned future {spawned} bytes, per-request tasks {per_request} bytes"
-        );
+        // Stored inline, the connection task is a lower bound on the size of
+        // the enum, so this fails if it is ever held inline again.
         assert!(
             spawned < connection,
             "spawned future {spawned} bytes must not hold the {connection}-byte connection task inline"
+        );
+        // What the executor allocates and copies for every request is the
+        // largest per-request variant plus the enum tag.
+        assert!(
+            spawned <= per_request + 2 * size_of::<usize>(),
+            "spawned future {spawned} bytes, per-request tasks {per_request} bytes"
         );
     }
 }

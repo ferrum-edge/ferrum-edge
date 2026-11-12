@@ -2154,15 +2154,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Performance
 - **HTTP/2 requests to a backend no longer spawn tasks the size of the whole
   backend connection.** hyper's HTTP/2 client hands its executor one enum for
-  three futures: the per-connection task and two per-request ones (the request
-  body writer and the response waiter). The enum held the connection task
-  inline, so each per-request task was allocated and copied at about 2.5 KiB
-  although its own state is a few hundred bytes; those copies were 0.5–1.4% of
-  gateway user CPU at HTTP/2 10 KiB. The vendored hyper now boxes the
-  connection task (patch 009, one allocation per connection). This applies to
-  every HTTP/2 backend path that uses hyper's client: the direct HTTP/2 pool,
-  the gRPC pool and HTTP/2 through the shared reqwest client. No configuration
-  or behaviour change.
+  three futures: the per-connection task and two per-request ones (the
+  response waiter, spawned for every request, and the request-body writer,
+  spawned when the body cannot be written at once). The enum held the
+  connection task inline, so each per-request task was allocated and copied at
+  the size of the connection task: about 2.5 KiB on the direct HTTP/2 pool
+  over TLS, where its own state is a few hundred bytes. On the HTTP/2 10 KiB
+  benchmark those copies were 0.5–1.4% of gateway user CPU. The vendored hyper
+  now boxes the connection task (patch 009, one allocation per connection).
+  The change reaches every path that uses hyper's HTTP/2 client: the direct
+  HTTP/2 pool, the gRPC pool (including gRPC nested in HBONE), mesh mTLS and
+  Unix-socket HTTP/2 backends, and HTTP/2 through the shared reqwest client.
+  No configuration or behaviour change.
 - **The direct HTTP/2 pool now reaches `FERRUM_POOL_HTTP2_CONNECTIONS_PER_HOST`.**
   The pool took the first ready shard, and an open HTTP/2 connection always
   reports ready, so every request used the first connection the pool ever

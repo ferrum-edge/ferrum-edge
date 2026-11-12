@@ -1070,7 +1070,7 @@
       "docs_path": "docs/upstream-hyper-patches/009-h2-client-conn-task-box/",
       "owner": "Ferrum Edge maintainers",
       "owner_github": null,
-      "reason": "hyper's HTTP/2 client spawns its per-request futures (Pipe, Send) and its per-connection task (Task) through one enum, H2ClientFuture, which is as large as its largest variant. Task owned the h2 Connection inline, so every per-request future was about 2.5 KiB on Ferrum's direct HTTP/2 pool although its own state is a few hundred bytes; the executor copied and allocated that for every backend request (0.5-1.4% of gateway user CPU at HTTP/2 10 KiB). Task now holds Pin<Box<ConnTask>>: one allocation per connection, no API or behaviour change.",
+      "reason": "hyper's HTTP/2 client spawns its per-request futures (Pipe, Send) and its per-connection task (Task) through one enum, H2ClientFuture, which is as large as its largest variant. Task owned the h2 Connection inline, so every per-request future was as large as the connection task: about 2.5 KiB on Ferrum's direct HTTP/2 pool over TLS, where its own state is a few hundred bytes. The executor allocated and copied that for each spawned future (0.5-1.4% of gateway user CPU on the HTTP/2 10 KiB benchmark). Task now holds Pin<Box<ConnTask>>: one allocation per connection, no API or behaviour change.",
       "upstream": {
         "filing": "deliberate_fork_unfiled",
         "github_repo": "hyperium/hyper",
