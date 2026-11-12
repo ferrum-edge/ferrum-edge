@@ -14,14 +14,9 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+      - uses: ./.github/actions/setup-rust-ci
         with:
-          toolchain: stable
-      - name: Native prerequisites
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y protobuf-compiler libcurl4-openssl-dev
+          shared-key: ci-test
       - name: Print type sizes
         env:
           RUSTC_BOOTSTRAP: "1"
