@@ -7527,11 +7527,16 @@ impl LoadBalancer {
         let mut best_idx = 0;
         let mut found = false;
 
-        for i in 0..self.targets.len() {
+        for (i, state) in self
+            .target_state
+            .iter()
+            .enumerate()
+            .take(self.targets.len())
+        {
             if !healthy.contains(i) {
                 continue;
             }
-            let conns = self.target_state[i].active_connections();
+            let conns = state.active_connections();
             if !found || conns < min_conns {
                 min_conns = conns;
                 best_idx = i;
@@ -7565,11 +7570,16 @@ impl LoadBalancer {
         let mut any_has_data = false;
         let mut unwarmed_count = 0usize;
 
-        for i in 0..self.targets.len() {
+        for (i, state) in self
+            .target_state
+            .iter()
+            .enumerate()
+            .take(self.targets.len())
+        {
             if !healthy.contains(i) {
                 continue;
             }
-            let samples = self.target_state[i].latency_sample_count();
+            let samples = state.latency_sample_count();
             if samples >= LATENCY_WARMUP_THRESHOLD {
                 warmed_count += 1;
             } else {
@@ -7616,11 +7626,15 @@ impl LoadBalancer {
             let mut best_latency = u64::MAX;
             let mut best_idx = 0;
             let mut found = false;
-            for i in 0..self.targets.len() {
+            for (i, state) in self
+                .target_state
+                .iter()
+                .enumerate()
+                .take(self.targets.len())
+            {
                 if !healthy.contains(i) {
                     continue;
                 }
-                let state = &self.target_state[i];
                 if state.latency_sample_count() < LATENCY_WARMUP_THRESHOLD {
                     continue;
                 }
@@ -7645,11 +7659,16 @@ impl LoadBalancer {
         let mut best_idx = 0;
         let mut found = false;
 
-        for i in 0..self.targets.len() {
+        for (i, state) in self
+            .target_state
+            .iter()
+            .enumerate()
+            .take(self.targets.len())
+        {
             if !healthy.contains(i) {
                 continue;
             }
-            let latency = self.target_state[i].latency_ewma_raw();
+            let latency = state.latency_ewma_raw();
             if !found || latency < best_latency {
                 best_latency = latency;
                 best_idx = i;

@@ -310,10 +310,7 @@ impl StdoutLogging {
         {
             return false;
         }
-        if filter.errors_only && !summary.is_terminal_failure() {
-            return false;
-        }
-        true
+        !filter.errors_only || summary.is_terminal_failure()
     }
 
     fn flat_filter_matches_stream(filter: &FlatFilter, summary: &StreamTransactionSummary) -> bool {
@@ -325,11 +322,7 @@ impl StdoutLogging {
         {
             return false;
         }
-        if filter.errors_only && summary.error_class.is_none() && summary.connection_error.is_none()
-        {
-            return false;
-        }
-        true
+        !filter.errors_only || summary.error_class.is_some() || summary.connection_error.is_some()
     }
 }
 

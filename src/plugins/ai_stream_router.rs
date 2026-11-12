@@ -6586,10 +6586,7 @@ impl GeminiStreamNormalizer {
             self.scan_cursor = self.cursor;
             return true;
         }
-        if self.buf.len() < UTF8_BOM.len() && UTF8_BOM.starts_with(&self.buf) {
-            return false;
-        }
-        true
+        self.buf.len() >= UTF8_BOM.len() || !UTF8_BOM.starts_with(&self.buf)
     }
 
     fn detect_framing(&mut self) -> Result<(), &'static str> {
