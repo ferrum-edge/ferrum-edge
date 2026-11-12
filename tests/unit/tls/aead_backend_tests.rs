@@ -1205,11 +1205,12 @@ const PROVIDER_LESS_CONSTRUCTORS: [(&str, &[&str]); 9] = [
 /// The provider-less constructors spelled anywhere in `text`.
 ///
 /// Nothing is skipped: not comments, not string literals, not `#[cfg(test)]`
-/// items. A call is recognised from where its first word stands, by reading
-/// forwards over what the compiler would allow between its words, so no
-/// mistake about where a comment, a literal or a test-only item ends can hide
-/// one. The price is that inline tests name their provider too, and that
-/// nothing under `src/` can quote one of these calls, even in a comment.
+/// items. A call is recognised from where its first word stands, by checking
+/// the one character before it and reading forwards over what the compiler
+/// would allow between its words, so no mistake about where a comment, a
+/// literal or a test-only item ends can hide one. The price is that inline
+/// tests name their provider too, and that nothing under `src/` can quote one
+/// of these calls, even in a comment.
 ///
 /// What it does not see is a rustls constructor reached without the type's
 /// own name in front of it: through a renamed import, a type alias, `Self`,
@@ -1290,26 +1291,27 @@ fn after_block_comment(text: &str) -> Option<&str> {
 }
 
 /// `true` for whitespace and for the punctuation that joins the words of a
-/// path or a call chain. `\u{200e}` and `\u{200f}` are whitespace to the
-/// compiler, though not to `char::is_whitespace`.
+/// path or a call chain.
 fn is_connector(character: char) -> bool {
-    character.is_whitespace()
-        || matches!(
-            character,
-            ':' | '<' | '>' | '(' | ')' | '.' | '\u{200e}' | '\u{200f}'
-        )
+    is_whitespace(character) || matches!(character, ':' | '<' | '>' | '(' | ')' | '.')
 }
 
-/// `true` for a character of an identifier. Outside comments and literals,
-/// Rust source has no other use for a non-ASCII character than an identifier,
-/// except the five it treats as whitespace, so every other non-ASCII character
-/// counts without consulting the Unicode identifier tables.
+/// `true` for a character of an identifier. Outside comments and literals, a
+/// non-ASCII character in Rust source is part of an identifier or it is
+/// whitespace, so every non-ASCII character that is not whitespace counts,
+/// without consulting the Unicode identifier tables.
 fn is_word(character: char) -> bool {
-    const NON_ASCII_WHITESPACE: [char; 5] =
-        ['\u{85}', '\u{200e}', '\u{200f}', '\u{2028}', '\u{2029}'];
     character.is_ascii_alphanumeric()
         || character == '_'
-        || (!character.is_ascii() && !NON_ASCII_WHITESPACE.contains(&character))
+        || (!character.is_ascii() && !is_whitespace(character))
+}
+
+/// `true` for whitespace, by either reading of it: everything
+/// `char::is_whitespace` accepts, and the two marks (`\u{200e}`, `\u{200f}`)
+/// that the compiler skips as whitespace though that method does not. Taking
+/// both keeps a boundary from being judged differently here and there.
+fn is_whitespace(character: char) -> bool {
+    character.is_whitespace() || matches!(character, '\u{200e}' | '\u{200f}')
 }
 
 #[test]
@@ -1449,6 +1451,11 @@ fn the_provider_guard_rejects_the_forms_it_exists_for() {
     assert_eq!(
         caught("fn build() {\n    let make = rustls::ServerConfig::builder;\n    make()\n}\n"),
         ["ServerConfig::builder"]
+    );
+    // Whatever stands for whitespace between its words.
+    assert_eq!(
+        caught("fn build() {\n    rustls::\u{a0}ClientConfig\u{200e}::\u{2028}builder()\n}\n"),
+        ["ClientConfig::builder"]
     );
 
     // Naming the provider is what the guard asks for.
