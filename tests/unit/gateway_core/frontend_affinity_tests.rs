@@ -386,3 +386,38 @@ fn bounded_inline_children_are_constructed_in_their_final_slot() {
         "the frontend future must be built directly in its box"
     );
 }
+
+/// A final-request-body hook context is a whole `RequestContext`, about 3 KiB.
+/// The handler keeps several of them across awaits and moves them between
+/// slots with `Option::take`, which copies the full value even when the slot
+/// is empty: the normal case, with no body-hook plugin. Boxed, an empty slot
+/// is a null pointer and a move is eight bytes.
+#[test]
+fn body_hook_contexts_are_boxed_in_the_request_handler() {
+    let src = include_str!("../../../src/proxy/mod.rs");
+    let (_, after_start) = src
+        .split_once("\nasync fn handle_proxy_request_inner(")
+        .expect("handle_proxy_request_inner must exist");
+    let (handler, _) = after_start
+        .split_once("\nasync fn proxy_to_backend(")
+        .expect("handle_proxy_request_inner must be bounded by proxy_to_backend");
+    assert_eq!(
+        handler
+            .matches(".then(|| Box::new(ctx.clone_for_final_request_body_hooks()))")
+            .count(),
+        3,
+        "the handler's three body-hook contexts are created boxed"
+    );
+    assert_eq!(
+        handler
+            .matches("clone_for_final_request_body_hooks()")
+            .count(),
+        3,
+        "a body-hook context the handler creates must not be stored inline"
+    );
+    assert!(
+        std::mem::size_of::<Option<Box<ferrum_edge::plugins::RequestContext>>>()
+            < std::mem::size_of::<ferrum_edge::plugins::RequestContext>() / 100,
+        "an inline slot costs a whole RequestContext; a boxed one a pointer"
+    );
+}

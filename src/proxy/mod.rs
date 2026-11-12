@@ -39757,7 +39757,7 @@ async fn handle_proxy_request_inner(
                     std::sync::atomic::Ordering::Release,
                 );
                 let mut body_hook_ctx = needs_final_request_body_context
-                    .then(|| ctx.clone_for_final_request_body_hooks());
+                    .then(|| Box::new(ctx.clone_for_final_request_body_hooks()));
                 let terminal_hook_start = Instant::now();
                 let grpc_deadline_at = ctx.grpc_deadline_at();
                 // Each replacement is charged before it is installed; an
@@ -39765,7 +39765,7 @@ async fn handle_proxy_request_inner(
                 // released inside the chain, before the refusal below awaits.
                 let transformed = apply_request_body_plugins_with_context(
                     &plugins,
-                    body_hook_ctx.as_mut(),
+                    body_hook_ctx.as_deref_mut(),
                     grpc_deadline_at,
                     &hook_headers,
                     std::mem::take(&mut buffered.body),
@@ -39797,14 +39797,14 @@ async fn handle_proxy_request_inner(
                 };
                 let mut final_body_result = run_final_request_body_hooks(
                     &plugins,
-                    body_hook_ctx.as_mut(),
+                    body_hook_ctx.as_deref_mut(),
                     grpc_deadline_at,
                     &hook_headers,
                     &transformed,
                 )
                 .await;
                 if let Some(body_hook_ctx) = body_hook_ctx {
-                    ctx.adopt_final_request_body_hook_context(body_hook_ctx);
+                    ctx.adopt_final_request_body_hook_context(*body_hook_ctx);
                 }
                 // Irreversible outbound egress runs here and nowhere earlier:
                 // `transformed` is the backend-visible body and every final
@@ -40276,13 +40276,13 @@ async fn handle_proxy_request_inner(
                 );
                 let grpc_deadline_at = ctx.grpc_deadline_at();
                 let mut body_hook_ctx = needs_final_request_body_context
-                    .then(|| ctx.clone_for_final_request_body_hooks());
+                    .then(|| Box::new(ctx.clone_for_final_request_body_hooks()));
                 // Each replacement is charged before it is installed; an
                 // uncovered one is dropped with the body and its charge
                 // released inside the chain.
                 let transformed = apply_request_body_plugins_with_context(
                     &plugins,
-                    body_hook_ctx.as_mut(),
+                    body_hook_ctx.as_deref_mut(),
                     grpc_deadline_at,
                     &hook_headers,
                     std::mem::take(&mut buffered.body),
@@ -40340,14 +40340,14 @@ async fn handle_proxy_request_inner(
                 };
                 let mut final_body_result = run_final_request_body_hooks(
                     &plugins,
-                    body_hook_ctx.as_mut(),
+                    body_hook_ctx.as_deref_mut(),
                     grpc_deadline_at,
                     &hook_headers,
                     &transformed,
                 )
                 .await;
                 if let Some(body_hook_ctx) = body_hook_ctx {
-                    ctx.adopt_final_request_body_hook_context(body_hook_ctx);
+                    ctx.adopt_final_request_body_hook_context(*body_hook_ctx);
                 }
                 // Finalized-request-egress boundary (GHSA-4vr5-4wm3-x5xv): the
                 // backend-visible body has been transformed and accepted by every
@@ -40437,7 +40437,7 @@ async fn handle_proxy_request_inner(
     // branch so request transforms and final hooks observe the same state.
     // Early-prepared bodies already ran both hook phases above.
     let mut deferred_body_hook_ctx = (!request_body_prepared && needs_final_request_body_context)
-        .then(|| ctx.clone_for_final_request_body_hooks());
+        .then(|| Box::new(ctx.clone_for_final_request_body_hooks()));
     // Fail-closed WebSocket gate for the `http2`/`grpc`-declared form of a
     // Unix-socket backend (a Sidecar `ingress[]` `defaultEndpoint: unix://…`,
     // carried on the selected target's reserved `mesh.unix_socket` tag).
@@ -41174,7 +41174,7 @@ async fn handle_proxy_request_inner(
                 "request_body_size_bytes".to_string(),
                 request_body_size_bytes.clone(),
             );
-            if let Some(body_hook_ctx) = deferred_body_hook_ctx.as_mut() {
+            if let Some(body_hook_ctx) = deferred_body_hook_ctx.as_deref_mut() {
                 body_hook_ctx.metadata.insert(
                     "request_body_size_bytes".to_string(),
                     request_body_size_bytes,
@@ -41201,7 +41201,7 @@ async fn handle_proxy_request_inner(
             // chain. The result is published with that charge, fail closed.
             let transformed = apply_request_body_plugins_with_context(
                 &plugins,
-                deferred_body_hook_ctx.as_mut(),
+                deferred_body_hook_ctx.as_deref_mut(),
                 grpc_deadline_at,
                 &hook_headers,
                 grpc_req_body,
@@ -41244,14 +41244,14 @@ async fn handle_proxy_request_inner(
             let mut body_hook_ctx = deferred_body_hook_ctx.take();
             let mut final_body_result = run_final_request_body_hooks(
                 &plugins,
-                body_hook_ctx.as_mut(),
+                body_hook_ctx.as_deref_mut(),
                 grpc_deadline_at,
                 &hook_headers,
                 &grpc_req_body,
             )
             .await;
             if let Some(body_hook_ctx) = body_hook_ctx {
-                ctx.adopt_final_request_body_hook_context(body_hook_ctx);
+                ctx.adopt_final_request_body_hook_context(*body_hook_ctx);
             }
             // Finalized-request-egress boundary for native gRPC
             // (GHSA-4vr5-4wm3-x5xv). `grpc_req_body` is the transformed,
@@ -45097,7 +45097,7 @@ async fn handle_proxy_request_inner(
                         &plugins,
                         backend_admission_plugins.as_ref(),
                         std::mem::take(&mut preacquired_backend_admission),
-                        body_hook_ctx.as_mut(),
+                        body_hook_ctx.as_deref_mut(),
                         &ctx,
                         should_stream,
                         requires_request_body_buffering,
@@ -45134,7 +45134,7 @@ async fn handle_proxy_request_inner(
             ),
         };
         if let Some(body_hook_ctx) = body_hook_ctx.take() {
-            ctx.adopt_final_request_body_hook_context(body_hook_ctx);
+            ctx.adopt_final_request_body_hook_context(*body_hook_ctx);
         }
         let (mut result, retained_body) = match initial_dispatch {
             BackendDispatchResult::Response {
@@ -45959,7 +45959,7 @@ async fn handle_proxy_request_inner(
                         &plugins,
                         backend_admission_plugins.as_ref(),
                         std::mem::take(&mut preacquired_backend_admission),
-                        body_hook_ctx.as_mut(),
+                        body_hook_ctx.as_deref_mut(),
                         &ctx,
                         should_stream,
                         requires_request_body_buffering,
@@ -45995,7 +45995,7 @@ async fn handle_proxy_request_inner(
             ),
         };
         if let Some(body_hook_ctx) = body_hook_ctx {
-            ctx.adopt_final_request_body_hook_context(body_hook_ctx);
+            ctx.adopt_final_request_body_hook_context(*body_hook_ctx);
         }
         let resp = match dispatch {
             BackendDispatchResult::Response {
