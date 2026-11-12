@@ -59,7 +59,8 @@
 //! The connection driver samples the backend's
 //! `SETTINGS_MAX_CONCURRENT_STREAMS` from hyper's
 //! `Connection::current_max_send_streams()` (after each of its first polls,
-//! then once every 64 polls), and the pool caps a connection's pinned streams
+//! then once every 64 polls, and on a 100 ms timer while the limit reads 0,
+//! when no request reaches the driver), and the pool caps a connection's pinned streams
 //! at the smaller of that and [`AFFINITY_MAX_OPEN_STREAMS`]. The bound is per frontend connection, not
 //! per shard: several busy connections whose slots share a shard still share
 //! its backend connection, each within its own bound, so a backend that allows

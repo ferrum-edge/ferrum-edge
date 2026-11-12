@@ -1962,6 +1962,156 @@ async fn test_http2_pool_selective_drain_also_fences_a_create_in_flight() {
     assert_eq!(accepted.load(Ordering::Relaxed), 3);
 }
 
+/// A SETTINGS frame carrying `SETTINGS_MAX_CONCURRENT_STREAMS` (setting 0x3).
+fn raw_h2_max_streams_settings(max_streams: u32) -> Vec<u8> {
+    let mut payload = vec![0, 3];
+    payload.extend_from_slice(&max_streams.to_be_bytes());
+    raw_h2_frame(RAW_H2_SETTINGS, 0, 0, &payload)
+}
+
+/// TLS + HTTP/2 backend speaking raw frames, so it can change its stream
+/// limit on a live connection. Its first connection advertises
+/// `SETTINGS_MAX_CONCURRENT_STREAMS` of 0 and raises it to `raised` once
+/// `true` is sent on the returned channel; later connections advertise no
+/// limit. It acknowledges SETTINGS and PING and answers no request: the test
+/// that uses it sends none. Returns the port, the accepted-connection count
+/// and the raise channel.
+async fn start_limit_raising_h2_tls_backend(
+    raised: u32,
+) -> (u16, Arc<AtomicUsize>, tokio::sync::watch::Sender<bool>) {
+    let listener = tokio::net::TcpListener::bind_test("127.0.0.1:0")
+        .await
+        .expect("bind raw h2 tls backend");
+    let port = listener.local_addr().expect("backend addr").port();
+    let accepted = Arc::new(AtomicUsize::new(0));
+    let task_accepted = Arc::clone(&accepted);
+    let acceptor = test_h2_tls_acceptor();
+    let (raise, _) = tokio::sync::watch::channel(false);
+    let task_raise = raise.clone();
+    tokio::spawn(async move {
+        while let Ok((socket, _)) = listener.accept().await {
+            let first = task_accepted.fetch_add(1, Ordering::Relaxed) == 0;
+            let acceptor = acceptor.clone();
+            let mut raise = task_raise.subscribe();
+            tokio::spawn(async move {
+                let Ok(stream) = acceptor.accept(socket).await else {
+                    return;
+                };
+                let (mut reader, writer) = tokio::io::split(stream);
+                let writer = Arc::new(tokio::sync::Mutex::new(writer));
+                let settings = if first {
+                    raw_h2_max_streams_settings(0)
+                } else {
+                    raw_h2_frame(RAW_H2_SETTINGS, 0, 0, &[])
+                };
+                {
+                    let mut writer = writer.lock().await;
+                    if writer.write_all(&settings).await.is_err() || writer.flush().await.is_err() {
+                        return;
+                    }
+                }
+                if first {
+                    let writer = Arc::clone(&writer);
+                    tokio::spawn(async move {
+                        if raise.wait_for(|raise| *raise).await.is_err() {
+                            return;
+                        }
+                        let mut writer = writer.lock().await;
+                        let _ = writer.write_all(&raw_h2_max_streams_settings(raised)).await;
+                        let _ = writer.flush().await;
+                    });
+                }
+                let mut preface = [0_u8; 24];
+                if reader.read_exact(&mut preface).await.is_err() {
+                    return;
+                }
+                loop {
+                    let mut head = [0_u8; 9];
+                    if reader.read_exact(&mut head).await.is_err() {
+                        return;
+                    }
+                    let len = u32::from_be_bytes([0, head[0], head[1], head[2]]) as usize;
+                    let mut payload = vec![0_u8; len];
+                    if reader.read_exact(&mut payload).await.is_err() {
+                        return;
+                    }
+                    let reply = match (head[3], head[4]) {
+                        (RAW_H2_SETTINGS, flags) if flags & 0x1 == 0 => {
+                            raw_h2_frame(RAW_H2_SETTINGS, 0x1, 0, &[])
+                        }
+                        (RAW_H2_PING, flags) if flags & 0x1 == 0 => {
+                            raw_h2_frame(RAW_H2_PING, 0x1, 0, &payload)
+                        }
+                        _ => continue,
+                    };
+                    let mut writer = writer.lock().await;
+                    if writer.write_all(&reply).await.is_err() || writer.flush().await.is_err() {
+                        return;
+                    }
+                }
+            });
+        }
+    });
+    (port, accepted, raise)
+}
+
+#[tokio::test]
+async fn test_http2_pool_returns_to_a_shard_whose_backend_raises_its_stream_limit() {
+    use ferrum_edge::proxy::frontend_affinity::FrontendConnectionAffinity;
+    // Not a default any pool or hyper setting uses, so only the raised
+    // connection can report it.
+    const RAISED: usize = 7;
+
+    let (port, accepted, raise) = start_limit_raising_h2_tls_backend(RAISED as u32).await;
+    let pool = direct_h2_pool(2);
+    let proxy = direct_h2_proxy(port);
+    let table = affinity_slot_table();
+    let first = FrontendConnectionAffinity::with_table(&table);
+    let first_stream = first.open_stream();
+    let limited = first_stream
+        .run(pool.get_sender(&proxy))
+        .await
+        .expect("first affinity sender");
+    wait_for_direct_h2_peer_max_streams(&limited, 0).await;
+
+    // A second frontend connection opens the other shard, which then serves
+    // the first connection's requests too.
+    let second = FrontendConnectionAffinity::with_table(&table);
+    let second_stream = second.open_stream();
+    second_stream
+        .run(pool.get_sender(&proxy))
+        .await
+        .expect("second affinity sender");
+    assert_eq!(accepted.load(Ordering::Relaxed), 2);
+    let spilled = first_stream
+        .run(pool.get_sender(&proxy))
+        .await
+        .expect("spilled sender");
+    assert_ne!(spilled.peer_max_concurrent_streams(), 0);
+
+    // The backend raises the first connection's limit. That shard is skipped,
+    // so no request reaches its driver: only the driver's own re-sample can
+    // notice, and the first connection's requests then return to its shard.
+    raise.send_replace(true);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let sender = first_stream
+                .run(pool.get_sender(&proxy))
+                .await
+                .expect("affinity sender");
+            if sender.peer_max_concurrent_streams() == RAISED {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the raised limit was sampled with no request on that connection");
+    assert_eq!(limited.peer_max_concurrent_streams(), RAISED);
+    assert_eq!(accepted.load(Ordering::Relaxed), 2);
+    assert_eq!(pool.shard_fills_in_flight(), 0);
+}
+
 #[tokio::test]
 async fn test_http2_pool_affinity_respects_the_backend_stream_limit() {
     use ferrum_edge::proxy::frontend_affinity::FrontendConnectionAffinity;

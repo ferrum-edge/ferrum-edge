@@ -595,6 +595,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   benchmark caches are restore-only (`save-if: "false"`) (#7285).
 
 ### Fixed
+- **A pooled gRPC backend connection that advertised
+  `SETTINGS_MAX_CONCURRENT_STREAMS` of 0 is used again once the backend
+  raises the limit.** The pool skips such a connection while a sibling is
+  open, and its sampled limit was refreshed only when a call reached it, so
+  it stayed skipped for as long as it lived. The connection driver now
+  samples again every 100 ms while the limit reads 0. The direct HTTP/2 pool
+  shares the driver.
 - **A pooled backend connection still being established when its pool is
   drained is no longer published after the drain.** A TLS material or CRL
   reload, a withdrawn trust bundle, and an SVID rotation's forced drain

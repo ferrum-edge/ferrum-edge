@@ -2075,6 +2075,16 @@ const PEER_MAX_STREAMS_EAGER_POLLS: u32 = 32;
 /// per this many polls. A power of two.
 const PEER_MAX_STREAMS_SAMPLE_INTERVAL: u32 = 64;
 
+/// How often the driver samples again while the backend allows no streams.
+///
+/// Both pools skip a connection whose published limit is 0, so no request
+/// reaches its driver, and hyper polls the driver only when one does (the
+/// backend's SETTINGS wake hyper's separate I/O task, not this future).
+/// Without this timer a backend that raises its limit again would stay
+/// skipped for as long as the connection lives. Armed only while the
+/// published limit is 0.
+const PEER_MAX_STREAMS_ZERO_RESAMPLE: Duration = Duration::from_millis(100);
+
 /// Whether driver poll number `poll` (counting from 1) samples the backend's
 /// stream limit.
 fn samples_peer_max_streams(poll: u32) -> bool {
@@ -2100,6 +2110,12 @@ fn samples_peer_max_streams(poll: u32) -> bool {
 /// out once its handshake completes, before the backend's SETTINGS arrive, so
 /// a burst on a fresh TLS connection can exhaust the eager window on the
 /// pre-SETTINGS default. The store is skipped while the value is unchanged.
+///
+/// hyper polls this future when a request reaches the connection, so the
+/// polls above are request-driven. A connection published at a limit of 0 is
+/// skipped by its pool and gets no request, so while the published limit is
+/// 0 the driver also samples every [`PEER_MAX_STREAMS_ZERO_RESAMPLE`] on a
+/// timer of its own, and a backend that raises its limit is used again.
 pub(crate) async fn drive_sampling_peer_max_streams<C>(
     conn: &mut C,
     current_max_send_streams: impl Fn(&C) -> usize,
@@ -2109,13 +2125,28 @@ where
     C: std::future::Future<Output = hyper::Result<()>> + Unpin,
 {
     let mut polls: u32 = 0;
+    // `Some` only while the published limit is 0.
+    let mut zero_resample: Option<Pin<Box<tokio::time::Sleep>>> = None;
     std::future::poll_fn(|cx| {
         let polled = std::future::Future::poll(Pin::new(&mut *conn), cx);
         polls = polls.wrapping_add(1);
-        if samples_peer_max_streams(polls) {
+        // Polling the timer also keeps this task registered for its expiry.
+        let resample_due = match zero_resample.as_mut() {
+            Some(timer) => std::future::Future::poll(timer.as_mut(), cx).is_ready(),
+            None => false,
+        };
+        if resample_due || samples_peer_max_streams(polls) {
             let current = current_max_send_streams(&*conn);
             if peer_max_streams.load(Ordering::Relaxed) != current {
                 peer_max_streams.store(current, Ordering::Relaxed);
+            }
+            if current != 0 || polled.is_ready() {
+                zero_resample = None;
+            } else if resample_due || zero_resample.is_none() {
+                let mut timer = Box::pin(tokio::time::sleep(PEER_MAX_STREAMS_ZERO_RESAMPLE));
+                // A fresh timer is pending: this poll registers the wake-up.
+                let _ = std::future::Future::poll(timer.as_mut(), cx);
+                zero_resample = Some(timer);
             }
         }
         polled
