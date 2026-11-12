@@ -1089,36 +1089,170 @@ fn ferrum_tls_constructors_need_no_process_default_provider() {
     );
 }
 
+/// Marker for the child of
+/// `kubernetes_client_builds_without_a_bootstrapped_provider`.
+const KUBE_CLIENT_CHILD: &str = "AEAD_BACKEND_KUBE_CLIENT_TEST_CHILD";
+
+#[test]
+fn kubernetes_client_builds_without_a_bootstrapped_provider() {
+    // `ferrum-cni await-cleanup` builds a Kubernetes client in a process that
+    // never runs the gateway bootstrap, and kube-client's TLS setup uses the
+    // provider-less `ClientConfig::builder()`. The one Kubernetes-client
+    // constructor therefore has to make sure a provider exists.
+    if std::env::var_os(KUBE_CLIENT_CHILD).is_none() {
+        run_child(
+            "kubernetes_client_builds_without_a_bootstrapped_provider",
+            KUBE_CLIENT_CHILD,
+            "1",
+        );
+        return;
+    }
+    assert!(
+        rustls::crypto::CryptoProvider::get_default().is_none(),
+        "the child must start with no process-default provider"
+    );
+
+    let ca_key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).expect("CA key");
+    let mut ca_params = rcgen::CertificateParams::new(Vec::<String>::new()).expect("CA params");
+    ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+    let ca_cert = ca_params.self_signed(&ca_key).expect("CA cert");
+
+    // A cluster CA is set so kube-client takes its `with_root_certificates`
+    // path rather than the platform verifier; nothing is ever dialled.
+    let mut config = kube::Config::new(
+        "https://127.0.0.1:6443"
+            .parse()
+            .expect("a valid cluster URL"),
+    );
+    config.root_cert = Some(vec![ca_cert.der().to_vec()]);
+
+    // The client's service stack is spawned onto the current runtime.
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("tokio runtime");
+    let _runtime_context = runtime.enter();
+    let client = ferrum_edge::k8s_controller::build_kube_client_from_config(config);
+    assert!(
+        client.is_ok(),
+        "the Kubernetes client must build without a bootstrapped provider: {:?}",
+        client.as_ref().err()
+    );
+
+    // The constructor installed the build's baseline provider, not a selection.
+    let installed = rustls::crypto::CryptoProvider::get_default()
+        .expect("the constructor installed a provider");
+    #[cfg(not(feature = "fips"))]
+    ordinary_profile::assert_provider_matches_backend(installed, AeadBackend::Ring);
+    #[cfg(feature = "fips")]
+    assert!(
+        installed.fips(),
+        "the FIPS build installs the module's provider"
+    );
+    assert_eq!(
+        aead_backend::selection().request,
+        AeadBackendRequest::Auto,
+        "building a client publishes no record-layer selection"
+    );
+}
+
 // ── Production code names its rustls provider ───────────────────────────────
 
 /// rustls constructors that read the process-default provider instead of
-/// taking one.
-const PROVIDER_LESS_CONSTRUCTORS: [&str; 5] = [
+/// taking one, written without whitespace.
+const PROVIDER_LESS_CONSTRUCTORS: [&str; 10] = [
     "ClientConfig::builder()",
     "ServerConfig::builder()",
+    "ClientConfig::builder_with_protocol_versions(",
+    "ServerConfig::builder_with_protocol_versions(",
     "WebPkiClientVerifier::builder(",
     "WebPkiServerVerifier::builder(",
-    "with_platform_verifier()",
+    // hyper-rustls connector shorthands, each of which starts from
+    // `ClientConfig::builder()`.
+    "HttpsConnectorBuilder::new().with_platform_verifier()",
+    "HttpsConnectorBuilder::new().try_with_platform_verifier()",
+    "HttpsConnectorBuilder::new().with_native_roots()",
+    "HttpsConnectorBuilder::new().with_webpki_roots()",
 ];
 
-/// The only places under `src/` that still use one, with how many times: all
-/// inside inline `#[cfg(test)]` modules, which install a default first.
-const INLINE_TEST_PROVIDER_LESS_USES: [(&str, usize); 3] = [
-    ("src/health_check.rs", 1),
-    ("src/http3/server.rs", 3),
-    ("src/plugins/tcp_logging.rs", 1),
-];
+/// `text` reduced to its production code, with all whitespace removed.
+///
+/// Comment lines and every item under a bare `#[cfg(test)]` are dropped. A
+/// test-only item is found by layout, which `cargo fmt --check` keeps stable:
+/// its body closes on a line that holds only `}` (or `};`) at the attribute's
+/// own indentation. Removing whitespace makes the search indifferent to how a
+/// call is wrapped. A constructor reached through a renamed import is not
+/// recognised; the runtime tests above are what cover the paths that matter.
+fn production_source(text: &str) -> String {
+    let lines: Vec<&str> = text.lines().collect();
+    let mut kept = String::new();
+    let mut index = 0;
+    while index < lines.len() {
+        let line = lines[index];
+        let trimmed = line.trim_start();
+        if trimmed != "#[cfg(test)]" {
+            if !trimmed.starts_with("//") {
+                kept.extend(
+                    trimmed
+                        .chars()
+                        .filter(|character| !character.is_whitespace()),
+                );
+            }
+            index += 1;
+            continue;
+        }
+
+        let indent = &line[..line.len() - trimmed.len()];
+        let mut end = index + 1;
+        // Further attributes on the same item.
+        while end < lines.len() && lines[end].trim_start().starts_with("#[") {
+            end += 1;
+        }
+        // The line that ends the item's head: `{` opens a body, anything else
+        // listed here ends an item that has none.
+        while end < lines.len() {
+            let tail = lines[end].trim_end();
+            if tail.ends_with('{')
+                || tail.ends_with(';')
+                || tail.ends_with('}')
+                || tail.ends_with(',')
+            {
+                break;
+            }
+            end += 1;
+        }
+        if end < lines.len() && lines[end].trim_end().ends_with('{') {
+            let closing = format!("{indent}}}");
+            let closing_statement = format!("{indent}}};");
+            while end < lines.len() && lines[end] != closing && lines[end] != closing_statement {
+                end += 1;
+            }
+        }
+        index = end + 1;
+    }
+    kept
+}
+
+fn provider_less_constructors_in(text: &str) -> Vec<&'static str> {
+    let production = production_source(text);
+    PROVIDER_LESS_CONSTRUCTORS
+        .into_iter()
+        .filter(|pattern| production.contains(pattern))
+        .collect()
+}
 
 #[test]
 fn production_code_names_its_rustls_provider() {
     // With both of rustls's providers linked, a provider-less constructor
     // panics unless a process default was installed. The gateway binary always
     // installs one, but the library must not depend on that, so every
-    // constructor in production code names its provider. The runtime test
-    // above covers the verifier paths; this covers the rest (log sinks, health
-    // probes, ACME) by construction.
+    // constructor in production code names its provider. The runtime tests
+    // above cover the verifier and Kubernetes paths; this covers the rest (log
+    // sinks, health probes, ACME) by construction. Inline `#[cfg(test)]`
+    // modules are exempt: they install a default first.
     let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let mut found: Vec<(String, usize)> = Vec::new();
+    let mut offenders: Vec<String> = Vec::new();
+    let mut scanned = 0usize;
     let mut pending = vec![root.join("src")];
     while let Some(dir) = pending.pop() {
         for entry in std::fs::read_dir(&dir)
@@ -1133,41 +1267,114 @@ fn production_code_names_its_rustls_provider() {
             if path.extension().and_then(|extension| extension.to_str()) != Some("rs") {
                 continue;
             }
+            scanned += 1;
             let text = std::fs::read_to_string(&path).expect("read a source file");
-            let uses: usize = text
-                .lines()
-                .map(str::trim_start)
-                .filter(|line| !line.starts_with("//"))
-                .map(|line| {
-                    PROVIDER_LESS_CONSTRUCTORS
-                        .iter()
-                        .filter(|pattern| line.contains(**pattern))
-                        .count()
-                })
-                .sum();
-            if uses > 0 {
+            for pattern in provider_less_constructors_in(&text) {
                 let relative = path
                     .strip_prefix(&root)
                     .expect("the file is under the repository root")
                     .to_string_lossy()
                     .replace('\\', "/");
-                found.push((relative, uses));
+                offenders.push(format!("{relative}: {pattern}"));
             }
         }
     }
-    found.sort();
-
-    let expected: Vec<(String, usize)> = INLINE_TEST_PROVIDER_LESS_USES
-        .iter()
-        .map(|(file, uses)| ((*file).to_string(), *uses))
-        .collect();
-    assert_eq!(
-        found, expected,
-        "a rustls constructor under src/ reads the process-default provider. Name the provider \
+    offenders.sort();
+    assert!(scanned > 100, "the scan did not reach the source tree");
+    assert!(
+        offenders.is_empty(),
+        "production code under src/ reads rustls's process-default provider. Name the provider \
          instead (`builder_with_provider`, or `tls::backend_client_config_builder(None)` for a \
-         client that takes the build defaults). Only an inline test module that installs a \
-         default first belongs in INLINE_TEST_PROVIDER_LESS_USES."
+         client that takes the build defaults): {offenders:#?}"
     );
+}
+
+#[test]
+fn the_provider_guard_rejects_the_forms_it_exists_for() {
+    // The guard is only worth having if it sees what it claims to see.
+    let caught = |source: &str| provider_less_constructors_in(source);
+
+    assert_eq!(
+        caught(
+            "fn build() {\n    let config = rustls::ClientConfig::builder()\n        .with_root_certificates(roots);\n}\n"
+        ),
+        ["ClientConfig::builder()"]
+    );
+    assert_eq!(
+        caught(
+            "fn build() {\n    rustls::ServerConfig::builder_with_protocol_versions(&[&TLS13])\n}\n"
+        ),
+        ["ServerConfig::builder_with_protocol_versions("]
+    );
+    assert_eq!(
+        caught(
+            "fn build() {\n    ClientConfig::builder_with_protocol_versions(\n        versions,\n    )\n}\n"
+        ),
+        ["ClientConfig::builder_with_protocol_versions("]
+    );
+    // However the call is wrapped.
+    assert_eq!(
+        caught(
+            "fn build() {\n    let verifier = WebPkiClientVerifier::builder(\n        roots,\n    );\n}\n"
+        ),
+        ["WebPkiClientVerifier::builder("]
+    );
+    assert_eq!(
+        caught("fn build() {\n    rustls::ServerConfig::\n        builder ( )\n}\n"),
+        ["ServerConfig::builder()"]
+    );
+    assert_eq!(
+        caught(
+            "fn build() {\n    HttpsConnectorBuilder::new()\n        .try_with_platform_verifier()\n}\n"
+        ),
+        ["HttpsConnectorBuilder::new().try_with_platform_verifier()"]
+    );
+
+    // Naming the provider is what the guard asks for.
+    assert!(
+        caught("fn build() {\n    rustls::ClientConfig::builder_with_provider(provider)\n}\n")
+            .is_empty()
+    );
+    assert!(
+        caught(
+            "fn build() {\n    WebPkiClientVerifier::builder_with_provider(roots, provider)\n}\n"
+        )
+        .is_empty()
+    );
+    assert!(
+        caught(
+            "fn build() {\n    HttpsConnectorBuilder::new().with_provider_and_platform_verifier(provider)\n}\n"
+        )
+        .is_empty()
+    );
+    assert_eq!(
+        caught("fn build() {\n    HttpsConnectorBuilder::new().with_native_roots()\n}\n"),
+        ["HttpsConnectorBuilder::new().with_native_roots()"]
+    );
+    // Comments are not code.
+    assert!(
+        caught("/// Unlike `ClientConfig::builder()`, this names its provider.\nfn build() {}\n")
+            .is_empty()
+    );
+
+    // An inline test module is exempt, and only the module: production code
+    // before it, after it, and beside a test-only item inside an `impl` is not.
+    let inline_tests = "fn build() {}\n\n#[cfg(test)]\nmod tests {\n    use super::*;\n\n    #[test]\n    fn it_builds() {\n        let config = rustls::ServerConfig::builder();\n    }\n}\n";
+    assert!(caught(inline_tests).is_empty());
+    let production_after_tests =
+        format!("{inline_tests}\nfn late() {{\n    rustls::ClientConfig::builder()\n}}\n");
+    assert_eq!(caught(&production_after_tests), ["ClientConfig::builder()"]);
+    let production_before_tests =
+        format!("fn early() {{\n    rustls::ClientConfig::builder()\n}}\n\n{inline_tests}");
+    assert_eq!(
+        caught(&production_before_tests),
+        ["ClientConfig::builder()"]
+    );
+    let test_only_method = "impl Sink {\n    #[cfg(test)]\n    fn for_test() -> Self {\n        rustls::ServerConfig::builder()\n    }\n\n    fn real(&self) {\n        rustls::ClientConfig::builder()\n    }\n}\n";
+    assert_eq!(caught(test_only_method), ["ClientConfig::builder()"]);
+    // A test-only item with no body hides nothing that follows it.
+    let test_only_import = "#[cfg(test)]\nuse std::sync::Once;\n\nfn real() {\n    rustls::ClientConfig::builder()\n}\n";
+    assert_eq!(caught(test_only_import), ["ClientConfig::builder()"]);
 }
 
 // ── The ordinary profile's two providers, exercised for real ────────────────

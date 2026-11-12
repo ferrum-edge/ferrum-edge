@@ -819,7 +819,19 @@ pub async fn try_default_kube_client() -> Result<kube::Client, String> {
 /// parse error raised on any later request (including a token refresh) reaches
 /// callers and logs as fixed text. A construction error is rendered through
 /// [`redacted_kube_config_error`].
+///
+/// It also makes sure a rustls process-default provider exists first.
+/// kube-client builds its TLS configuration with the provider-less
+/// `rustls::ClientConfig::builder()`, which reads that default and, when none
+/// is installed, the provider rustls's crate features name. The ordinary build
+/// links both of rustls's providers, so that fallback is ambiguous and the call
+/// panics. The gateway installs a provider at bootstrap, but `ferrum-cni
+/// await-cleanup` reaches this constructor with no bootstrap at all, so the
+/// constructor installs the build's baseline provider itself when none is
+/// present.
 pub fn build_kube_client_from_config(config: kube::Config) -> Result<kube::Client, String> {
+    crate::fips::ensure_internal_client_crypto_provider()
+        .map_err(|error| format!("failed to build Kubernetes client: {error}"))?;
     let builder = kube::client::ClientBuilder::try_from(with_ferrum_client_defaults(config))
         .map_err(|error| {
             format!(

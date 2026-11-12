@@ -121,6 +121,11 @@ AWS_LC_FEATURE_MARKERS = ("aws-lc", "aws_lc", "fips")
 # `rustls/aws_lc_rs` in `crypto-ring` does not name the `aws-lc-rs` crate — it
 # is a feature of rustls — so it is not an exception to this table. The
 # feature-name checks in `check_manifest_text` are what bound it.
+#
+# Those feature-name checks now refuse everything this table refuses as well
+# (an entry that names `aws-lc-rs` carries an AWS-LC marker, and `dep:ring`
+# carries the ring token), so this is a second line of defence, and emptying it
+# alone is the one policy mutation the self-test cannot tell apart.
 BACKEND_CRATE_PREFIXES = {
     "crypto-ring": ("aws-lc-rs", "aws_lc_rs", "aws-lc-fips-sys", "aws-lc-sys"),
     "fips": ("ring",),
@@ -672,7 +677,8 @@ def _without_feature_entry(manifest: str, feature: str, entry: str) -> str:
     """Return `manifest` with `entry` removed from one `[features]` list."""
 
     start = manifest.index(f"{feature} = [\n")
-    end = manifest.index("\n]", start)
+    # Up to and including the newline that ends the list's last entry.
+    end = manifest.index("\n]", start) + 1
     line = f'    "{entry}",\n'
     block = manifest[start:end]
     if block.count(line) != 1:
@@ -755,10 +761,98 @@ _PINNED_REQUIRED_RESOLVED_FIPS = frozenset({
     ("rustls", "fips"),
 })
 
+# The same second copy for the manifest policy, so a pair, a default-features
+# requirement or an inline rule removed from a live table still has a mutation
+# that expects the check it carried.
+_PINNED_FEATURE_PAIRS = (
+    ("rustls/ring", "rustls/fips"),
+    ("tokio-rustls/ring", "tokio-rustls/fips"),
+    ("tonic/tls-ring", "tonic/tls-aws-lc"),
+    ("quinn/rustls-ring", "quinn/rustls-aws-lc-rs-fips"),
+    ("sqlx/tls-rustls-ring", "sqlx/tls-rustls-aws-lc-rs"),
+    ("ldap3/tls-rustls-ring", "ldap3/tls-rustls-aws-lc-rs"),
+    ("rcgen/ring", "rcgen/fips"),
+    ("x509-parser/verify", "x509-parser/verify-aws"),
+    ("reqwest/__rustls-ring", "reqwest/__rustls-aws-lc-rs"),
+    ("hyper-rustls?/ring", "hyper-rustls?/fips"),
+    ("instant-acme?/ring", "instant-acme?/fips"),
+    ("kube/ring", "kube/aws-lc-rs"),
+    ("mongodb/rustls-tls", "mongodb/rustls-tls-aws-lc"),
+)
+_PINNED_REQUIRED_FIPS_ONLY = ("aws-lc-rs/fips",)
+_PINNED_REQUIRED_RING_ONLY = ("dep:ring", "rustls/aws_lc_rs")
+_PINNED_DEFAULT_FEATURES_OFF = ("kube", "mongodb", "quinn", "rcgen", "rustls", "tokio-rustls")
+_PINNED_FORBIDDEN_INLINE = (
+    ("rustls", "ring"),
+    ("rustls", "aws_lc_rs"),
+    ("rustls", "aws-lc-rs"),
+    ("rustls", "fips"),
+    ("tokio-rustls", "ring"),
+    ("tokio-rustls", "aws_lc_rs"),
+    ("tokio-rustls", "aws-lc-rs"),
+    ("tokio-rustls", "fips"),
+    ("tonic", "tls-ring"),
+    ("tonic", "tls-aws-lc"),
+    ("sqlx", "runtime-tokio-rustls"),
+    ("sqlx", "tls-rustls"),
+    ("sqlx", "tls-rustls-ring"),
+    ("ldap3", "tls-rustls-ring"),
+    ("ldap3", "tls-rustls-aws-lc-rs"),
+    ("hyper-rustls", "ring"),
+    ("hyper-rustls", "aws-lc-rs"),
+    ("hyper-rustls", "fips"),
+    ("instant-acme", "ring"),
+    ("instant-acme", "aws-lc-rs"),
+    ("instant-acme", "fips"),
+    ("kube", "ring"),
+    ("kube", "aws-lc-rs"),
+    ("mongodb", "rustls-tls"),
+    ("mongodb", "rustls-tls-aws-lc"),
+    ("x509-parser", "verify"),
+    ("x509-parser", "verify-aws"),
+    ("jsonwebtoken", "rust_crypto"),
+    ("reqwest", "rustls"),
+)
+_PINNED_REQUIRED_INLINE = (("jsonwebtoken", "aws_lc_rs"),)
+
 # Paired aws-lc arms the ordinary graph has always resolved next to their ring
 # counterparts, through dimpl. They are the only pair-table arms that
 # FORBIDDEN_RESOLVED_RING may leave out.
 _RING_GRAPH_PAIRED_ARM_EXCEPTIONS = frozenset({("x509-parser", "verify-aws")})
+
+
+def _dependency_line_span(manifest: str, dep: str) -> tuple[int, int]:
+    """Start and end offsets of one dependency's own line."""
+
+    match = re.search(rf'^{re.escape(dep)} = (\{{.*?\}}|"[^"]*")$', manifest, re.M)
+    if match is None:
+        raise ValueError(f"dependency {dep!r} is not declared on its own line")
+    return match.start(), match.end()
+
+
+def _with_dependency_line(manifest: str, dep: str, old: str, new: str) -> str:
+    """Return `manifest` with one substring of `dep`'s own line replaced."""
+
+    start, end = _dependency_line_span(manifest, dep)
+    line = manifest[start:end]
+    if line.count(old) != 1:
+        raise ValueError(f"the {dep!r} line does not contain {old!r} exactly once")
+    return manifest[:start] + line.replace(old, new, 1) + manifest[end:]
+
+
+def _with_inline_feature(manifest: str, dep: str, feature: str) -> str:
+    """Return `manifest` with `feature` added to `dep`'s inline feature list."""
+
+    start, end = _dependency_line_span(manifest, dep)
+    line = manifest[start:end]
+    if "features = [" in line:
+        mutated = line.replace("features = [", f'features = ["{feature}", ', 1)
+    elif line.endswith(" }"):
+        mutated = line[: -len(" }")] + f', features = ["{feature}"] }}'
+    else:
+        version = line.split(" = ", 1)[1]
+        mutated = f'{dep} = {{ version = {version}, features = ["{feature}"] }}'
+    return manifest[:start] + mutated + manifest[end:]
 
 
 def _resolved_row(edge: str) -> tuple[str, str]:
@@ -846,14 +940,109 @@ def self_test() -> list[str]:
             lambda: _with_feature_entry(manifest, "fips", allowed),
         ),
     )
-    for label, mutate in manifest_mutations:
+    # Every pinned manifest rule gets a mutation only that rule refuses, so a
+    # row dropped from REQUIRED_FEATURE_PAIRS, REQUIRE_DEFAULT_FEATURES_OFF or
+    # the inline tables is caught here even though nothing else changed.
+    pinned_manifest_mutations: list[tuple[str, object]] = [
+        (
+            "the default feature set gains a second feature",
+            lambda: manifest.replace(
+                'default = ["crypto-ring"]', 'default = ["crypto-ring", "acme"]', 1
+            ),
+        ),
+        (
+            "sha2 becomes a production dependency",
+            lambda: manifest.replace("[dependencies]\n", '[dependencies]\nsha2 = "0.10"\n', 1),
+        ),
+    ]
+    for ring_edge, fips_edge in _PINNED_FEATURE_PAIRS:
+        pinned_manifest_mutations += [
+            (
+                f"crypto-ring drops {ring_edge}",
+                lambda edge=ring_edge: _without_feature_entry(manifest, "crypto-ring", edge),
+            ),
+            (
+                f"fips drops {fips_edge}",
+                lambda edge=fips_edge: _without_feature_entry(manifest, "fips", edge),
+            ),
+            (
+                f"fips adds the ring arm {ring_edge}",
+                lambda edge=ring_edge: _with_feature_entry(manifest, "fips", edge),
+            ),
+            (
+                f"crypto-ring adds the aws-lc arm {fips_edge}",
+                lambda edge=fips_edge: _with_feature_entry(manifest, "crypto-ring", edge),
+            ),
+        ]
+    for edge in _PINNED_REQUIRED_FIPS_ONLY:
+        pinned_manifest_mutations.append((
+            f"fips drops {edge}",
+            lambda edge=edge: _without_feature_entry(manifest, "fips", edge),
+        ))
+    for edge in _PINNED_REQUIRED_RING_ONLY:
+        pinned_manifest_mutations.append((
+            f"crypto-ring drops {edge}",
+            lambda edge=edge: _without_feature_entry(manifest, "crypto-ring", edge),
+        ))
+    for dep in _PINNED_DEFAULT_FEATURES_OFF:
+        pinned_manifest_mutations.append((
+            f"{dep} keeps its default features",
+            lambda dep=dep: _with_dependency_line(
+                manifest, dep, "default-features = false", "default-features = true"
+            ),
+        ))
+    for dep, feature in _PINNED_FORBIDDEN_INLINE:
+        pinned_manifest_mutations.append((
+            f"{dep} selects {feature} inline",
+            lambda dep=dep, feature=feature: _with_inline_feature(manifest, dep, feature),
+        ))
+    for dep, feature in _PINNED_REQUIRED_INLINE:
+        pinned_manifest_mutations.append((
+            f"{dep} drops its inline {feature}",
+            lambda dep=dep, feature=feature: _with_dependency_line(
+                manifest, dep, f', "{feature}"', ""
+            ),
+        ))
+
+    for label, mutate in list(manifest_mutations) + pinned_manifest_mutations:
         try:
             mutated = mutate()
         except ValueError as error:
             failures.append(f"self-test could not build the mutation {label!r}: {error}")
             continue
+        if mutated == manifest:
+            failures.append(f"self-test: the mutation {label!r} did not change the manifest")
+            continue
         if not check_manifest_text(mutated):
             failures.append(f"self-test: the manifest check accepted a manifest where {label}")
+
+    # A live manifest table that has grown must grow its pinned copy too.
+    for label, live, pinned in (
+        ("REQUIRED_FEATURE_PAIRS", set(REQUIRED_FEATURE_PAIRS), set(_PINNED_FEATURE_PAIRS)),
+        ("REQUIRED_FIPS_ONLY", set(REQUIRED_FIPS_ONLY), set(_PINNED_REQUIRED_FIPS_ONLY)),
+        ("REQUIRED_RING_ONLY", set(REQUIRED_RING_ONLY), set(_PINNED_REQUIRED_RING_ONLY)),
+        (
+            "REQUIRE_DEFAULT_FEATURES_OFF",
+            set(REQUIRE_DEFAULT_FEATURES_OFF),
+            set(_PINNED_DEFAULT_FEATURES_OFF),
+        ),
+        (
+            "FORBIDDEN_INLINE_DECLARATIONS",
+            {(dep, f) for dep, fs in FORBIDDEN_INLINE_DECLARATIONS.items() for f in fs},
+            set(_PINNED_FORBIDDEN_INLINE),
+        ),
+        (
+            "REQUIRED_INLINE_DECLARATIONS",
+            {(dep, f) for dep, fs in REQUIRED_INLINE_DECLARATIONS.items() for f in fs},
+            set(_PINNED_REQUIRED_INLINE),
+        ),
+    ):
+        unpinned = sorted(live - pinned)
+        if unpinned:
+            failures.append(
+                f"self-test: {label} has entries the self-test does not pin: {unpinned}; add "
+                "them to the pinned copy so each keeps a rejection case"
+            )
 
     ordinary = set(REQUIRED_RESOLVED_RING)
     fips = set(REQUIRED_RESOLVED_FIPS)
