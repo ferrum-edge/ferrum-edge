@@ -411,8 +411,9 @@ start cannot use up the minimum. Arms that share an image settle once, and the
 start uses the image with default arguments (Envoy with stream limit 100,
 `ferrum` without an experiment arm's environment): the host reacts to an
 image's first start, and a second container from an image that had already run
-showed no burst (0 of 6). An image already settled on the host since boot
-(iteration 2 onwards) is not held again.
+showed no burst (0 of 6). The reaction is usual, not certain: it fell inside
+the hold in 23 of 24 `ferrum` and Envoy settle starts. An image already settled
+on the host since boot (iteration 2 onwards) is not held again.
 
 The settle is best effort and cannot fail a run. Each start runs in a subshell
 of its own that removes what it started however it ends and writes nothing
@@ -542,9 +543,10 @@ For the full `http1-tls` matrix (direct + five gateways, five sizes), budget
 planning envelope allocates 15 seconds overhead per call and five minutes fixed
 headroom; slow starts, warmups, or failures can still exceed it. The first-start
 settle adds about 30 seconds per distinct image once per job: about three
-minutes for direct plus five gateways, inside that headroom, and up to about 70
-seconds per image (seven minutes) on a host that never goes quiet, which is
-not. Keep at least ten
+minutes for direct plus five gateways, which fits inside that headroom. On a
+host that never goes quiet each hold runs to its cap, about 70 seconds per
+image and seven minutes in all, which exceeds that headroom by two minutes.
+Keep at least ten
 minutes below the frozen 75-minute step. The frozen dispatcher cannot set pairs
 or adaptive flags and therefore uses **2 pairs, adaptive off**.
 
@@ -573,17 +575,29 @@ or adaptive flags and therefore uses **2 pairs, adaptive off**.
   request the full-matrix extension; its real-world frequency remains unmeasured.
 - Unmodelled order effects: equal mean position does not model drift or varying
   separation between compared arms; ratio noise can still vary across pairs.
-- Host disturbance after the first-start settle: the settle holds only each
-  image's first start, and nothing later in a run is prevented or flagged. Two
-  kinds were seen in six identical-code validation jobs. One job had a dip of
-  up to two seconds every 60 seconds through both pairs: gateway and backend
-  CPU drop together by about 20% in the `process_usage` timeline, whichever
-  arm is running. In another job one arm's 10 KiB sample read 17% low with a
-  normal-looking timeline: the same CPU time, but gateway and backend CPU
-  seconds per request both about 20% higher than for the same arm in the
-  other pair, with identical system calls per request. Neither cause is
-  established. Compare CPU per request across pairs before trusting a
-  two-pair average.
+- Host disturbance outside the settle: the settle holds only each image's
+  first start, and nothing later in a run is prevented or flagged. Twelve
+  identical-code validation jobs (an in-run build against its own published
+  image) showed three kinds, two of them tied to the runner's CPU model:
+  - On all three AMD EPYC 7763 runners, gateway and backend CPU dropped
+    together by about 20% for up to two seconds every 60 seconds, whichever
+    arm was running. In exactly those jobs a settle hold recorded
+    `hv_kvp_daemon` using about 0.8 CPU-seconds (at most 0.17 in the other
+    nine jobs). It was not sampled during a measured cell.
+  - On all three AMD EPYC 9V45 runners the two identical arms differed by 4%,
+    10% and 17% in at least one pair with no dip in the timeline: gateway and
+    backend CPU seconds per request moved together, by up to 20% between two
+    samples of the same arm, with identical system calls per request. The
+    cause is not established.
+  - In one job (EPYC 9V74) the provisioner did not react during `ferrum`'s
+    settle start (`host_settle.json` shows no burst for that arm) and that
+    arm's first measured cell had a 2.5-second dip: the pair read 5% low.
+
+  The other five jobs, on EPYC 9V74 and Xeon 6973P-C/6975P-C runners, read
+  within 1.1% between the two identical arms at 10 KiB. Before trusting a
+  two-pair average, check the job's CPU model, `host_settle.json` for an arm
+  without a burst, the `process_usage` timelines for dips, and CPU per request
+  across pairs.
 
 #### Window, client and revision inputs (#6038, #6022)
 
