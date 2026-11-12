@@ -7204,17 +7204,19 @@ mod tests {
             }
         }
 
-        // Timers created now and first polled a second later: each has
-        // already expired at its first poll.
+        // A timer created now and first polled a second later has already
+        // expired at its first poll. `probe` checks that premise; `stale` is
+        // the first timer the driver gets. Every later one is an ordinary
+        // pending timer, so the driver does not spin.
         tokio::time::pause();
-        let mut expired_timers: Vec<std::pin::Pin<Box<tokio::time::Sleep>>> = (0..256)
-            .map(|_| Box::pin(tokio::time::sleep(std::time::Duration::from_millis(1))))
-            .collect();
+        let probe = Box::pin(tokio::time::sleep(std::time::Duration::from_millis(1)));
+        let mut stale = Some(Box::pin(tokio::time::sleep(
+            std::time::Duration::from_millis(1),
+        )));
         tokio::time::advance(std::time::Duration::from_secs(1)).await;
         assert!(
-            futures_util::FutureExt::now_or_never(expired_timers.pop().expect("a prepared timer"))
-                .is_some(),
-            "a prepared timer is ready at its first poll"
+            futures_util::FutureExt::now_or_never(probe).is_some(),
+            "a timer created before the clock advanced is ready at its first poll"
         );
 
         let limit = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -7229,22 +7231,27 @@ mod tests {
                 &mut conn,
                 |conn| conn.limit.load(std::sync::atomic::Ordering::Relaxed),
                 &driver_published,
-                move || expired_timers.pop().expect("a prepared timer"),
+                move || match stale.take() {
+                    Some(timer) => timer,
+                    None => Box::pin(tokio::time::sleep(std::time::Duration::from_secs(3600))),
+                },
             )
             .await;
         });
 
-        // Run the driver past its eager sampling window, so only the
-        // re-sample timer can make it sample again.
-        for _ in 0..(PEER_MAX_STREAMS_EAGER_POLLS * 2) {
+        // The driver's first poll publishes the limit and is handed the
+        // expired timer. Only the wake-up it then asks for gets it polled
+        // again, to arm a timer that can actually fire.
+        for _ in 0..8 {
             tokio::task::yield_now().await;
         }
         assert_eq!(published.load(std::sync::atomic::Ordering::Relaxed), 0);
 
+        // The limit rises. No request and no wake-up from the connection
+        // arrives: the paused clock runs on to the driver's next timer, if
+        // the driver armed one.
         limit.store(7, std::sync::atomic::Ordering::Relaxed);
-        for _ in 0..(PEER_MAX_STREAMS_SAMPLE_INTERVAL / 2) {
-            tokio::task::yield_now().await;
-        }
+        tokio::time::sleep(std::time::Duration::from_secs(7200)).await;
         assert_eq!(
             published.load(std::sync::atomic::Ordering::Relaxed),
             7,
