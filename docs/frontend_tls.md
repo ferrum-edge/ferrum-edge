@@ -1584,8 +1584,9 @@ TLS record-layer cipher suites: backend=aws-lc, requested=auto, reason=cpu-quali
 `apple-target`, `operator-override` or `fips-build`. INFO is hidden at the default
 `FERRUM_LOG_LEVEL=warn`; `FERRUM_LOG_LEVEL=warn,ferrum_edge::fips::aead_backend=info`
 shows this record alone. A process that never ran the gateway's provider
-bootstrap, such as a test or an embedding, writes no record; its selection
-reads `not-bootstrapped` and its provider is ring's.
+bootstrap, such as a test or an embedding, writes no record; on the ordinary
+build its selection reads `not-bootstrapped` and its provider is ring's, and on
+a FIPS build it reads `fips-build` as it always does.
 
 Because the provider is installed before `ferrum.conf` is read, the variable
 must be set in the process environment. A value that appears only in

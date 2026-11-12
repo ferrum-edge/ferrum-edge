@@ -1175,102 +1175,212 @@ const PROVIDER_LESS_CONSTRUCTORS: [&str; 10] = [
     "HttpsConnectorBuilder::new().with_webpki_roots()",
 ];
 
-/// Reported in place of a constructor when a `#[cfg(test)]` item's end could
-/// not be found, so the file fails the guard instead of passing unread.
-const UNDELIMITED_SOURCE: &str = "a #[cfg(test)] item or block comment whose end was not found";
+/// The attribute that makes an item test-only, as `cargo fmt` writes it.
+const TEST_ONLY_ATTRIBUTE: &str = "#[cfg(test)]";
+
+/// Reported in place of a constructor when a file could not be read to its
+/// end, so the file fails the guard instead of passing unread.
+const UNDELIMITED_SOURCE: &str =
+    "a comment, a literal or a #[cfg(test)] item whose end was not found";
 
 /// `text` reduced to its production code, with all whitespace removed, or
-/// `None` when a test-only item or a block comment could not be delimited.
+/// `None` when a comment, a literal or a test-only item never ends.
 ///
-/// Comments and every item under a bare `#[cfg(test)]` are dropped. A block
-/// comment that runs over lines is dropped whole, so a `#[cfg(test)]` line
-/// inside one starts no item. A test-only item is found by layout, which
-/// `cargo fmt --check` keeps stable: its body closes on a line that starts
-/// with `}` at the attribute's own indentation and carries nothing after it
-/// but `;` or a comment. If no such line follows, the answer is `None` rather
-/// than a guess: skipping to the end of the file would hide whatever
-/// production code came after. Removing whitespace makes the search
-/// indifferent to how a call is wrapped.
+/// Comments are dropped and string and character literals emptied first, so
+/// nothing written inside one can pass for code, for an attribute or for a
+/// delimiter. Every item under a bare `#[cfg(test)]` is then dropped by
+/// matching its delimiters, whatever its layout. Removing whitespace makes the
+/// search indifferent to how a call is wrapped.
 ///
-/// Two forms are not recognised: a constructor reached through a renamed
-/// import, and a line reading exactly `#[cfg(test)]` inside a multi-line
-/// string literal, which is taken for an attribute. The runtime tests above
-/// are what cover the paths that matter.
+/// Where the scan cannot be exact it reads test code as production code, never
+/// the reverse: an attribute that is not the bare `#[cfg(test)]` (such as
+/// `#[cfg(all(test, unix))]`) exempts nothing, and a test-only item can end
+/// early (see `after_test_only_item`). What it does not see is a constructor
+/// reached through a renamed import or written by a macro; the runtime tests
+/// above are what cover the paths that matter.
 fn production_source(text: &str) -> Option<String> {
-    let lines: Vec<&str> = text.lines().collect();
-    let mut kept = String::new();
-    let mut index = 0;
-    while index < lines.len() {
-        let line = lines[index];
-        let trimmed = line.trim_start();
-        if trimmed.starts_with("/*") && !trimmed.contains("*/") {
-            index += 1;
-            while index < lines.len() && !lines[index].contains("*/") {
-                index += 1;
-            }
-            let (_, after_comment) = lines.get(index)?.split_once("*/")?;
-            kept.extend(
-                after_comment
-                    .chars()
-                    .filter(|character| !character.is_whitespace()),
-            );
-            index += 1;
-            continue;
-        }
-        if trimmed != "#[cfg(test)]" {
-            if !trimmed.starts_with("//") {
-                kept.extend(
-                    trimmed
-                        .chars()
-                        .filter(|character| !character.is_whitespace()),
-                );
-            }
-            index += 1;
-            continue;
-        }
-
-        let indent = &line[..line.len() - trimmed.len()];
-        let mut end = index + 1;
-        // Further attributes on the same item.
-        while end < lines.len() && lines[end].trim_start().starts_with("#[") {
-            end += 1;
-        }
-        // The line that ends the item's head: `{` opens a body, anything else
-        // listed here ends an item that has none.
-        while end < lines.len() {
-            let tail = lines[end].trim_end();
-            if tail.ends_with('{')
-                || tail.ends_with(';')
-                || tail.ends_with('}')
-                || tail.ends_with(',')
-            {
-                break;
-            }
-            end += 1;
-        }
-        if end < lines.len() && lines[end].trim_end().ends_with('{') {
-            let closing = format!("{indent}}}");
-            end += 1;
-            while end < lines.len() && !closes_item(lines[end], &closing) {
-                end += 1;
-            }
-            if end == lines.len() {
-                return None;
-            }
-        }
-        index = end + 1;
+    let code = code_only(text)?;
+    let mut production = String::with_capacity(code.len());
+    let mut rest = code.as_str();
+    while let Some((before, after)) = rest.split_once(TEST_ONLY_ATTRIBUTE) {
+        production.push_str(before);
+        rest = after_test_only_item(after)?;
     }
-    Some(kept)
+    production.push_str(rest);
+    production.retain(|character| !character.is_whitespace());
+    Some(production)
 }
 
-/// `true` when `line` is the closing brace of an item whose brace sits at
-/// `closing`'s indentation: `}`, `};`, and either followed by a comment.
-fn closes_item(line: &str, closing: &str) -> bool {
-    let Some(rest) = line.strip_prefix(closing) else {
-        return false;
-    };
-    let rest = rest.strip_prefix(';').unwrap_or(rest).trim_start();
-    rest.is_empty() || rest.starts_with("//")
+/// `text` with its comments removed and its string and character literals
+/// emptied, or `None` when one of them never ends.
+fn code_only(text: &str) -> Option<String> {
+    let chars: Vec<char> = text.chars().collect();
+    let mut code = String::with_capacity(text.len());
+    let mut index = 0;
+    while let Some(&current) = chars.get(index) {
+        let next = chars.get(index + 1).copied();
+        match current {
+            '/' if next == Some('/') => {
+                while chars.get(index).is_some_and(|&character| character != '\n') {
+                    index += 1;
+                }
+            }
+            '/' if next == Some('*') => {
+                index = end_of_block_comment(&chars, index + 2)?;
+                code.push(' ');
+            }
+            '"' => {
+                index = match raw_string_hashes(&chars, index) {
+                    Some(hashes) => end_of_raw_string(&chars, index + 1, hashes)?,
+                    None => end_of_quoted(&chars, index + 1, '"')?,
+                };
+                code.push_str("\"\"");
+            }
+            // A character literal. Any other `'` starts a lifetime or a label.
+            '\'' if next == Some('\\') => {
+                index = end_of_quoted(&chars, index + 1, '\'')?;
+                code.push_str("''");
+            }
+            '\'' if chars.get(index + 2) == Some(&'\'') => {
+                index += 3;
+                code.push_str("''");
+            }
+            _ => {
+                code.push(current);
+                index += 1;
+            }
+        }
+    }
+    Some(code)
+}
+
+/// The index after the block comment whose text starts at `start`. Block
+/// comments nest.
+fn end_of_block_comment(chars: &[char], start: usize) -> Option<usize> {
+    let mut depth = 1usize;
+    let mut index = start;
+    while depth > 0 {
+        match (*chars.get(index)?, chars.get(index + 1).copied()) {
+            ('/', Some('*')) => {
+                depth += 1;
+                index += 2;
+            }
+            ('*', Some('/')) => {
+                depth -= 1;
+                index += 2;
+            }
+            _ => index += 1,
+        }
+    }
+    Some(index)
+}
+
+/// The index after the closing `delimiter` of a string or character literal
+/// whose contents start at `start`. A backslash escapes the next character.
+fn end_of_quoted(chars: &[char], start: usize, delimiter: char) -> Option<usize> {
+    let mut index = start;
+    loop {
+        match *chars.get(index)? {
+            '\\' => index += 2,
+            character if character == delimiter => return Some(index + 1),
+            _ => index += 1,
+        }
+    }
+}
+
+/// The number of `#`s when the `"` at `quote` opens a raw string. An
+/// identifier directly before a string can only be a literal prefix in this
+/// edition, so an `r` there (alone, or after `b` or `c`) means a raw string.
+fn raw_string_hashes(chars: &[char], quote: usize) -> Option<usize> {
+    let hashes = chars[..quote]
+        .iter()
+        .rev()
+        .take_while(|&&character| character == '#')
+        .count();
+    (chars[..quote - hashes].last() == Some(&'r')).then_some(hashes)
+}
+
+/// The index after the raw string whose contents start at `start` and which
+/// closes with `"` followed by `hashes` `#`s.
+fn end_of_raw_string(chars: &[char], start: usize, hashes: usize) -> Option<usize> {
+    let mut index = start;
+    loop {
+        let end = index + 1 + hashes;
+        if *chars.get(index)? == '"'
+            && chars
+                .get(index + 1..end)?
+                .iter()
+                .all(|&character| character == '#')
+        {
+            return Some(end);
+        }
+        index += 1;
+    }
+}
+
+/// What follows the item that a `#[cfg(test)]` attribute applies to, given the
+/// code right after that attribute; `None` when the item never ends.
+///
+/// The item ends at the first `;` or `,` outside its own brackets, at the
+/// brace that closes its first block (an `else` continues it), or where the
+/// enclosing block or list closes. None of those lies beyond the item, so
+/// production code after it is never skipped. A comma between generic
+/// arguments, which is not inside brackets, can end the item early; the rest
+/// of that test-only item is then read as production code.
+fn after_test_only_item(source: &str) -> Option<&str> {
+    let mut item = source.trim_start();
+    // Further attributes on the same item.
+    while item.starts_with("#[") {
+        item = after_attribute(item)?.trim_start();
+    }
+    let mut depth = 0usize;
+    for (offset, character) in item.char_indices() {
+        match character {
+            '(' | '[' | '{' => depth += 1,
+            ')' | ']' | '}' if depth == 0 => return Some(&item[offset..]),
+            ')' | ']' => depth -= 1,
+            '}' => {
+                depth -= 1;
+                let after = &item[offset + 1..];
+                if depth == 0 && !continues_with_else(after) {
+                    let next = after.trim_start();
+                    return Some(next.strip_prefix([';', ',']).unwrap_or(after));
+                }
+            }
+            ';' | ',' if depth == 0 => return Some(&item[offset + 1..]),
+            _ => {}
+        }
+    }
+    None
+}
+
+/// What follows the attribute that `source` starts with; `None` when its
+/// bracket never closes.
+fn after_attribute(source: &str) -> Option<&str> {
+    let mut depth = 0usize;
+    for (offset, character) in source.char_indices() {
+        match character {
+            '[' => depth += 1,
+            ']' => {
+                depth = depth.checked_sub(1)?;
+                if depth == 0 {
+                    return Some(&source[offset + 1..]);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// `true` when the code after a closing brace goes on with an `else` branch.
+fn continues_with_else(after_brace: &str) -> bool {
+    after_brace
+        .trim_start()
+        .strip_prefix("else")
+        .is_some_and(|rest| {
+            !rest.starts_with(|character: char| character.is_alphanumeric() || character == '_')
+        })
 }
 
 /// The provider-less constructors in `text`'s production code, or a marker
@@ -1293,7 +1403,7 @@ fn production_code_names_its_rustls_provider() {
     // constructor in production code names its provider. The runtime tests
     // above cover the verifier and Kubernetes paths; this covers the rest (log
     // sinks, health probes, ACME) by construction. Inline `#[cfg(test)]`
-    // modules are exempt: they install a default first.
+    // items are exempt: they install a default first.
     let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let mut offenders: Vec<String> = Vec::new();
     let mut scanned = 0usize;
@@ -1424,8 +1534,38 @@ fn the_provider_guard_rejects_the_forms_it_exists_for() {
         caught(commented_statement_close),
         ["ServerConfig::builder()"]
     );
-    // A test-only item that cannot be delimited fails the guard; it is never
-    // read as "the rest of the file is test code".
+    // Nor does a comment after a test-only item that has no body, or a block
+    // comment after a closing brace.
+    let commented_bodyless = "#[cfg(test)]\nconst FIXTURE: u8 = 0; // used only by tests\n\nfn real() {\n    let _ = rustls::ClientConfig::builder();\n}\n";
+    assert_eq!(caught(commented_bodyless), ["ClientConfig::builder()"]);
+    let block_commented_close = "#[cfg(test)]\nmod tests {\n    fn test_only() {}\n} /* end tests */\n\nfn real() {\n    rustls::ClientConfig::builder()\n}\n";
+    assert_eq!(caught(block_commented_close), ["ClientConfig::builder()"]);
+    // A test-only statement, field or branch ends where it ends, however the
+    // code around it is laid out.
+    let test_only_statement = "fn real() {\n    #[cfg(test)]\n    let hook = make_hook(|| {\n        rustls::ServerConfig::builder();\n    });\n    let config = rustls::ClientConfig::builder();\n    if ready {\n        go();\n    }\n}\n";
+    assert_eq!(caught(test_only_statement), ["ClientConfig::builder()"]);
+    let test_only_field = "struct Sink {\n    #[cfg(test)]\n    hook: Hook,\n}\n\nfn real() {\n    rustls::ServerConfig::builder()\n}\n";
+    assert_eq!(caught(test_only_field), ["ServerConfig::builder()"]);
+    let test_only_branch = "fn real() {\n    #[cfg(test)]\n    if hooked {\n        first();\n    } else {\n        rustls::ServerConfig::builder();\n    }\n    rustls::ClientConfig::builder();\n}\n";
+    assert_eq!(caught(test_only_branch), ["ClientConfig::builder()"]);
+    // Text inside a literal is not code: a brace or an attribute spelled in
+    // one changes nothing, and a constructor spelled in one is not a call.
+    let brace_in_string = "#[cfg(test)]\nfn fixture() -> &'static str {\n    \"{\"\n}\n\nfn real() {\n    rustls::ClientConfig::builder()\n}\n";
+    assert_eq!(caught(brace_in_string), ["ClientConfig::builder()"]);
+    let brace_in_character = "#[cfg(test)]\nfn fixture() -> char {\n    '{'\n}\n\nfn real() {\n    rustls::ClientConfig::builder()\n}\n";
+    assert_eq!(caught(brace_in_character), ["ClientConfig::builder()"]);
+    let attribute_in_string = "const TEMPLATE: &str = r#\"\n#[cfg(test)]\nmod tests {\n\"#;\n\nfn real() {\n    rustls::ClientConfig::builder()\n}\n";
+    assert_eq!(caught(attribute_in_string), ["ClientConfig::builder()"]);
+    assert!(
+        caught("fn hint() -> &'static str {\n    \"prefer ClientConfig::builder() with a provider\"\n}\n")
+            .is_empty()
+    );
+    // A file that cannot be read to its end fails the guard; it is never read
+    // as "the rest of the file is test code".
+    assert_eq!(
+        caught("fn real() {\n    let text = \"never closed;\n}\n"),
+        [UNDELIMITED_SOURCE]
+    );
     let undelimited = "#[cfg(test)]\nmod tests {\n    #[test]\n    fn test_only() {\n        rustls::ClientConfig::builder();\n    }\n";
     assert_eq!(caught(undelimited), [UNDELIMITED_SOURCE]);
 

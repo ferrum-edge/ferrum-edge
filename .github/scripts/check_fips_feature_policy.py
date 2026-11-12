@@ -1163,6 +1163,10 @@ def self_test() -> list[str]:
 
     # Each production-crate pattern must flag the one line written for it.
     for sample in _FORBIDDEN_SOURCE_SAMPLES:
+        if not source_uses_forbidden_crate(sample):
+            failures.append(
+                f"self-test: source_uses_forbidden_crate accepted the forbidden line {sample!r}"
+            )
         matching = [
             pattern for pattern in FORBIDDEN_PRODUCTION_CRATE_PATTERNS if pattern.search(sample)
         ]
