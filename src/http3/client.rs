@@ -2192,7 +2192,7 @@ impl PoolManager for Http3PoolManager {
     // manager.
     async fn create(&self, _key: &str, _proxy: &Proxy) -> Result<Self::Connection> {
         Err(anyhow::anyhow!(
-            "Http3ConnectionPool uses GenericPool::create_or_get_existing_owned for creation"
+            "Http3ConnectionPool uses GenericPool::create_or_get_existing_owned_sampled_as for creation"
         ))
     }
 

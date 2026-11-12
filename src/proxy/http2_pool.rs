@@ -1697,11 +1697,12 @@ pub(crate) struct Http1Lanes {
     lanes: DashMap<String, Arc<Http1Lane>>,
     max_idle_per_host: usize,
     counters: Arc<Http1PoolCounters>,
-    /// Bumped by every drain ([`Self::clear`], [`Self::retain_keys`]) before
-    /// it retires a lane. A checkout samples it before it reads the SVID
-    /// generation its lane key carries, and a lane enters the map only while
-    /// the value is unchanged (see [`Self::lane_for_key`]). Written only by
-    /// drains, so the sample is a shared read.
+    /// Bumped by every pass that retires lanes ([`Self::clear`],
+    /// [`Self::retain_keys`]) before it retires one. A checkout samples it
+    /// before it reads the SVID generation its lane key carries, and a lane
+    /// enters the map only while the value is unchanged (see
+    /// [`Self::lane_for_key`]). Written only by those passes, so the sample is
+    /// a shared read.
     drain_epoch: AtomicU64,
 }
 
@@ -1827,8 +1828,16 @@ impl Http1Lanes {
 
     /// Retire the lanes whose key `keep` rejects. Checkouts already under way
     /// are fenced as in [`Self::clear`], for every key that has no lane yet:
-    /// a selective drain is rare, and a checkout it fences needlessly only
+    /// a selective pass is rare, and a checkout it fences needlessly only
     /// loses the reuse of one connection. Cold path.
+    ///
+    /// Two callers: a generation drain, which the fence makes complete, and
+    /// the config-publication prune of withdrawn backends
+    /// (`retain_live_from_config`). The prune gets the same fence for a
+    /// checkout that straddles it, but no more than that: a request still
+    /// running on the previous config can start a checkout afterwards and
+    /// open a withdrawn backend's lane, which the idle sweep closes, as
+    /// before.
     fn retain_keys(&self, mut keep: impl FnMut(&str) -> bool) {
         self.drain_epoch.fetch_add(1, Ordering::AcqRel);
         self.lanes.retain(|key, lane| {
