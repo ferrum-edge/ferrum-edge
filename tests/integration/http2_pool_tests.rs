@@ -1047,8 +1047,13 @@ async fn test_http2_pool_reuses_connection() {
         .await
         .expect("Failed to start H2 backend");
 
+    // One shard: with more, the second request's round-robin shard is missing
+    // and the pool widens in the background (covered by the width tests).
     let pool = Http2ConnectionPool::new(
-        PoolConfig::default(),
+        PoolConfig {
+            http2_connections_per_host: 1,
+            ..PoolConfig::default()
+        },
         ferrum_edge::config::EnvConfig::default(),
         create_dns_cache(),
         None,
@@ -1078,6 +1083,7 @@ async fn test_http2_pool_reuses_connection() {
         "Pool size should not increase on reuse (was {}, now {})",
         size_after_first, size_after_second
     );
+    assert_eq!(pool.shard_fills_in_flight(), 0);
 }
 
 #[tokio::test]
@@ -1323,18 +1329,16 @@ enum H2TlsBackendScript {
     /// The first connection advertises `SETTINGS_MAX_CONCURRENT_STREAMS` of 0
     /// (a draining instance); later ones serve normally.
     FirstAllowsNoStreams,
+    /// Hold the TLS handshake of every connection, the first included, while
+    /// the gate is closed.
+    GateAll,
 }
 
-/// TLS + HTTP/2 backend following `script`. Returns the port, the
-/// accepted-connection count and the gate (`true` holds
-/// [`H2TlsBackendScript::GateLater`] dials).
-async fn start_scripted_h2_tls_backend(
-    script: H2TlsBackendScript,
-) -> (u16, Arc<AtomicUsize>, tokio::sync::watch::Sender<bool>) {
-    let listener = tokio::net::TcpListener::bind_test("127.0.0.1:0")
-        .await
-        .expect("bind h2 tls backend");
-    let port = listener.local_addr().expect("backend addr").port();
+/// Handles to a scripted backend's live connections, oldest first. Aborting
+/// one closes that connection, as a GOAWAY or connection-age close would.
+type BackendConnections = Arc<std::sync::Mutex<Vec<tokio::task::AbortHandle>>>;
+
+fn test_h2_tls_acceptor() -> tokio_rustls::TlsAcceptor {
     let certs: Vec<_> = CertificateDer::pem_slice_iter(include_bytes!("../certs/server.crt"))
         .filter_map(|cert| cert.ok())
         .collect();
@@ -1348,11 +1352,39 @@ async fn start_scripted_h2_tls_backend(
         .with_single_cert(certs, private_key)
         .expect("backend certificate");
     tls_config.alpn_protocols = vec![b"h2".to_vec()];
-    let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(tls_config));
+    tokio_rustls::TlsAcceptor::from(Arc::new(tls_config))
+}
+
+/// TLS + HTTP/2 backend following `script`. Returns the port, the
+/// accepted-connection count and the gate (`true` holds
+/// [`H2TlsBackendScript::GateLater`] dials).
+async fn start_scripted_h2_tls_backend(
+    script: H2TlsBackendScript,
+) -> (u16, Arc<AtomicUsize>, tokio::sync::watch::Sender<bool>) {
+    let (port, accepted, gate, _connections) =
+        start_scripted_h2_tls_backend_with_connections(script).await;
+    (port, accepted, gate)
+}
+
+async fn start_scripted_h2_tls_backend_with_connections(
+    script: H2TlsBackendScript,
+) -> (
+    u16,
+    Arc<AtomicUsize>,
+    tokio::sync::watch::Sender<bool>,
+    BackendConnections,
+) {
+    let listener = tokio::net::TcpListener::bind_test("127.0.0.1:0")
+        .await
+        .expect("bind h2 tls backend");
+    let port = listener.local_addr().expect("backend addr").port();
+    let acceptor = test_h2_tls_acceptor();
 
     let accepted = Arc::new(AtomicUsize::new(0));
+    let connections: BackendConnections = Arc::new(std::sync::Mutex::new(Vec::new()));
     let (gate, _) = tokio::sync::watch::channel(false);
     let task_accepted = Arc::clone(&accepted);
+    let task_connections = Arc::clone(&connections);
     let task_gate = gate.clone();
     tokio::spawn(async move {
         while let Ok((socket, _)) = listener.accept().await {
@@ -1363,8 +1395,9 @@ async fn start_scripted_h2_tls_backend(
             }
             let acceptor = acceptor.clone();
             let mut held = task_gate.subscribe();
-            tokio::spawn(async move {
-                if !first && held.wait_for(|hold| !*hold).await.is_err() {
+            let gated = !first || matches!(script, H2TlsBackendScript::GateAll);
+            let served = tokio::spawn(async move {
+                if gated && held.wait_for(|hold| !*hold).await.is_err() {
                     return;
                 }
                 let Ok(tls_stream) = acceptor.accept(socket).await else {
@@ -1381,9 +1414,12 @@ async fn start_scripted_h2_tls_backend(
                     .serve_connection(TokioIo::new(tls_stream), service)
                     .await;
             });
+            if let Ok(mut connections) = task_connections.lock() {
+                connections.push(served.abort_handle());
+            }
         }
     });
-    (port, accepted, gate)
+    (port, accepted, gate, connections)
 }
 
 fn direct_h2_pool(shards: usize) -> Http2ConnectionPool {
@@ -1607,6 +1643,8 @@ async fn test_http2_pool_backs_off_a_shard_whose_background_create_failed() {
     wait_for_direct_h2_fills_to_finish(&pool).await;
 
     // While the shard is cooling down, requests borrow without redialling.
+    // The cooldown clock is frozen so a slow runner cannot let it lapse.
+    tokio::time::pause();
     let attempts = accepted.load(Ordering::Relaxed);
     for _ in 0..16 {
         let sender = pool.get_sender(&proxy).await.expect("borrowed sender");
@@ -1718,6 +1756,205 @@ async fn test_http2_pool_drain_discards_a_connection_still_being_established() {
     assert!(!sender.is_closed());
     assert_eq!(pool.pool_size(), 1);
     assert_eq!(accepted.load(Ordering::Relaxed), 3);
+}
+
+#[tokio::test]
+async fn test_http2_pool_refills_a_closed_preferred_shard_in_the_background() {
+    use ferrum_edge::proxy::frontend_affinity::FrontendConnectionAffinity;
+    use futures_util::FutureExt;
+
+    let (port, accepted, _gate, connections) =
+        start_scripted_h2_tls_backend_with_connections(H2TlsBackendScript::GateLater).await;
+    let pool = direct_h2_pool(4);
+    let proxy = direct_h2_proxy(port);
+    let table = affinity_slot_table();
+
+    // Shard 0 for the first frontend connection, and a healthy sibling shard 1
+    // for a second one.
+    let first = FrontendConnectionAffinity::with_table(&table);
+    let first_stream = first.open_stream();
+    let sender = first_stream
+        .run(pool.get_sender(&proxy))
+        .await
+        .expect("first affinity sender");
+    let second = FrontendConnectionAffinity::with_table(&table);
+    let second_stream = second.open_stream();
+    second_stream
+        .run(pool.get_sender(&proxy))
+        .await
+        .expect("second affinity sender");
+    wait_for_direct_h2_pool_size(&pool, 2).await;
+    wait_for_direct_h2_fills_to_finish(&pool).await;
+    assert_eq!(accepted.load(Ordering::Relaxed), 2);
+
+    // Close only shard 0's backend connection (the first one accepted), as a
+    // GOAWAY or connection-age close would.
+    connections
+        .lock()
+        .expect("connection handles")
+        .first()
+        .expect("first backend connection")
+        .abort();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !sender.is_closed() {
+        assert!(
+            Instant::now() < deadline,
+            "backend close was never observed"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    // The ready sibling serves the request without waiting on a redial, and
+    // the closed preferred shard is recreated in the background.
+    let borrowed = first_stream
+        .run(pool.get_sender(&proxy))
+        .now_or_never()
+        .expect("the closed shard is not redialled on the request path")
+        .expect("borrowed sender");
+    assert!(!borrowed.is_closed());
+    wait_for_affinity_accepts(&accepted, 3).await;
+    wait_for_direct_h2_pool_size(&pool, 2).await;
+    wait_for_direct_h2_fills_to_finish(&pool).await;
+    let replacement = first_stream
+        .run(pool.get_sender(&proxy))
+        .await
+        .expect("recreated affinity sender");
+    assert!(!replacement.is_closed());
+    assert_eq!(accepted.load(Ordering::Relaxed), 3);
+}
+
+#[tokio::test]
+async fn test_http2_pool_cancelled_cold_create_recovers_without_waiting_for_cooldown() {
+    use ferrum_edge::proxy::frontend_affinity::FrontendConnectionAffinity;
+
+    let (port, accepted, gate) = start_scripted_h2_tls_backend(H2TlsBackendScript::GateAll).await;
+    let pool = direct_h2_pool(4);
+    let mut proxy = direct_h2_proxy(port);
+    proxy.backend_connect_timeout_ms = 30_000;
+    let connection = FrontendConnectionAffinity::with_table(&affinity_slot_table());
+    let stream = connection.open_stream();
+
+    // The cold pool's first create stalls in its TLS handshake and its
+    // request is cancelled (a client reset, a deadline).
+    gate.send_replace(true);
+    let mut creator = Box::pin(stream.run(pool.get_sender(&proxy)));
+    tokio::select! {
+        result = &mut creator => panic!("create should stall: {result:?}"),
+        _ = wait_for_affinity_accepts(&accepted, 1) => {}
+    }
+    drop(creator);
+    assert_eq!(
+        pool.shard_create_backoff_len(),
+        1,
+        "the cancelled create put its shard on cooldown"
+    );
+
+    // No sibling is ready, so the same shard is dialled again at once.
+    gate.send_replace(false);
+    tokio::time::timeout(Duration::from_secs(1), stream.run(pool.get_sender(&proxy)))
+        .await
+        .expect("a cold pool must retry immediately")
+        .expect("fresh sender");
+    assert_eq!(accepted.load(Ordering::Relaxed), 2);
+    assert_eq!(pool.pool_size(), 1);
+}
+
+#[tokio::test]
+async fn test_http2_pool_under_a_connection_cap_borrows_without_redialling() {
+    use ferrum_edge::proxy::frontend_affinity::FrontendConnectionAffinity;
+
+    let (_backend, port, accepted) = start_counting_h2_tls_backend().await;
+    let limiter = Arc::new(BackendConnectionLimiter::new());
+    let pool = direct_h2_pool(4);
+    pool.attach_backend_conn_limit(Arc::clone(&limiter));
+    let mut proxy = direct_h2_proxy(port);
+    let mut overrides = HashMap::new();
+    overrides.insert(
+        port,
+        ResolvedPortOverride {
+            max_connections: Some(1),
+            ..Default::default()
+        },
+    );
+    proxy.dispatch_port_overrides = Some(overrides);
+    let table = affinity_slot_table();
+
+    let first = FrontendConnectionAffinity::with_table(&table);
+    first
+        .open_stream()
+        .run(pool.get_sender(&proxy))
+        .await
+        .expect("first affinity sender");
+
+    // DestinationRule `maxConnections: 1` with 4 shards: the second frontend
+    // connection's own shard can never be created. Its requests are served by
+    // the admitted connection, and after the first refusal they stop
+    // re-attempting the create.
+    let second = FrontendConnectionAffinity::with_table(&table);
+    let stream = second.open_stream();
+    for _ in 0..10 {
+        stream
+            .run(pool.get_sender(&proxy))
+            .await
+            .expect("capped destination keeps serving on the admitted connection");
+    }
+    wait_for_direct_h2_fills_to_finish(&pool).await;
+    assert_eq!(pool.shard_create_backoff_len(), 1);
+    tokio::time::pause();
+    for _ in 0..10 {
+        stream
+            .run(pool.get_sender(&proxy))
+            .await
+            .expect("borrowed sender during backoff");
+    }
+    assert_eq!(pool.shard_fills_in_flight(), 0);
+    assert_eq!(accepted.load(Ordering::Relaxed), 1);
+    assert_eq!(limiter.current("localhost", port), 1);
+    assert_eq!(pool.pool_size(), 1);
+}
+
+#[tokio::test]
+async fn test_http2_pool_spills_a_heavy_frontend_connection_and_widens() {
+    use ferrum_edge::proxy::frontend_affinity::{
+        AFFINITY_MAX_OPEN_STREAMS, FrontendConnectionAffinity,
+    };
+
+    let (_backend, port, accepted) = start_counting_h2_tls_backend().await;
+    let pool = direct_h2_pool(4);
+    let proxy = direct_h2_proxy(port);
+    let heavy = FrontendConnectionAffinity::with_table(&affinity_slot_table());
+
+    // Over the bound, requests spill round-robin and create the missing
+    // shards, so one busy client connection is not pinned to one backend
+    // connection.
+    let streams: Vec<_> = (0..=AFFINITY_MAX_OPEN_STREAMS)
+        .map(|_| heavy.open_stream())
+        .collect();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while pool.pool_size() < 4 {
+            streams[0]
+                .run(pool.get_sender(&proxy))
+                .await
+                .expect("spilled sender");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("spilled requests widened the pool");
+    wait_for_direct_h2_fills_to_finish(&pool).await;
+    assert_eq!(accepted.load(Ordering::Relaxed), 4);
+
+    // Back under the bound, requests return to the connection's shard.
+    drop(streams);
+    let stream = heavy.open_stream();
+    for _ in 0..4 {
+        stream
+            .run(pool.get_sender(&proxy))
+            .await
+            .expect("affinity sender");
+    }
+    assert_eq!(accepted.load(Ordering::Relaxed), 4);
+    assert_eq!(pool.shard_fills_in_flight(), 0);
 }
 
 // ============================================================================

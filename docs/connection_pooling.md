@@ -201,7 +201,7 @@ An open HTTP/2 sender always reports ready however many streams it carries, so t
 The direct HTTP/2 pool (plain HTTPS traffic to an HTTP/2-capable backend) keeps up to `FERRUM_POOL_HTTP2_CONNECTIONS_PER_HOST` connections (shards) per backend host and TLS identity, and selects among them the way the gRPC pool does:
 
 - **An HTTP/2 frontend connection** with at most 32 open streams, and no more than its shard's backend allows, keeps its requests on its own shard (`slot % shards`, the same slot the gRPC pool uses). Beyond that bound, further requests take the round-robin shard.
-- **Every other request** (HTTP/1.x and HTTP/3 frontends, spawned work) takes the per-host round-robin shard.
+- **Every other request** (HTTP/1.x frontends and work with no frontend connection in scope) takes the per-host round-robin shard. HTTP/3 frontends never reach this pool: their non-native traffic is dispatched through reqwest. A pool with more than 64 shards does not use affinity; all of its requests take the round-robin shard.
 - **A missing or closed preferred shard is filled in the background.** A ready sibling serves the request at once and the shard is created on a detached task, at most one per shard, drawing on the pool's background-create budget (a quarter of its request-path creation permits, capped at 4). No request waits on a dial. Only a pool with no ready shard creates one on the request path. A shard whose create failed or was cancelled is borrowed around for 2 seconds without another dial when a ready sibling exists (a DestinationRule `maxConnections` below the shard count, or a backend refusing new connections).
 - **The startup capability probe never widens the pool.** It opens or reuses one connection; request traffic opens the rest.
 
