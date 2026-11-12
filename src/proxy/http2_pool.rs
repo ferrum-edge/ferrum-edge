@@ -974,6 +974,39 @@ impl Http2ConnectionPool {
         )
     }
 
+    /// BENCH EXPERIMENT (never merge): create the missing start shard `key`
+    /// on a detached task while a ready sibling serves the current request.
+    fn bench_spawn_shard_fill(&self, proxy: &Proxy, svid_generation: Option<u64>, key: &str) {
+        if self.pool.has_pending_creation(key) {
+            return;
+        }
+        let Some(permit) = self.pool.try_background_create_permit() else {
+            return;
+        };
+        let pool = Arc::clone(&self.pool);
+        let proxy = proxy.clone();
+        let key = key.to_owned();
+        tokio::spawn(async move {
+            let manager = Arc::clone(pool.manager());
+            let filled: Result<Http2Sender, Http2PoolError> = pool
+                .create_or_get_existing_owned_in_background(
+                    key,
+                    permit,
+                    PoolCreateCaller::Request,
+                    |_| {},
+                    |_| {},
+                    |_| None,
+                    |_key, _attempt| async move {
+                        manager.create_connection(&proxy, svid_generation).await
+                    },
+                )
+                .await;
+            if let Err(error) = filled {
+                debug!("http2_pool: background shard create failed: {}", error);
+            }
+        });
+    }
+
     pub async fn get_sender(&self, proxy: &Proxy) -> Result<Http2Sender, Http2PoolError> {
         let future = self.get_sender_unprofiled(proxy, PoolCreateCaller::Request);
         #[cfg(feature = "bench-pool-profile")]
@@ -1036,7 +1069,13 @@ impl Http2ConnectionPool {
                 // the atomic counter wraps around. `AtomicUsize::fetch_add(1,
                 // Relaxed)` is wait-free after the seed — the seed only matters
                 // for the first `shard_count` picks per host on this gateway.
-                let start = crate::profile_pool_sync!(Rr, {
+                // BENCH EXPERIMENT (never merge): 0 = legacy probe (first ready
+                // shard wins, a missing start shard is never created while a
+                // sibling is ready), 1 = round-robin start with background
+                // fill of a missing start shard, 2 = frontend-connection
+                // affinity start with background fill.
+                let bench_mode = *BENCH_H2_POOL_MODE;
+                let rr_start = || {
                     let rr = get_or_seed_rr_counter(
                         &self.rr_counters,
                         &key_buf[..base_len],
@@ -1044,7 +1083,21 @@ impl Http2ConnectionPool {
                         &self.pool.manager().backend_svid_generation,
                     );
                     rr.fetch_add(1, Ordering::Relaxed) % shard_count
+                };
+                let (start, fill_missing) = crate::profile_pool_sync!(Rr, {
+                    match bench_mode {
+                        2 => match crate::proxy::frontend_affinity::shard_start(shard_count) {
+                            crate::proxy::frontend_affinity::ShardStart::Affinity {
+                                shard,
+                                ..
+                            } => (shard, true),
+                            _ => (rr_start(), true),
+                        },
+                        1 => (rr_start(), true),
+                        _ => (rr_start(), false),
+                    }
                 });
+                let mut fill_start = false;
 
                 // Cheap probe pass — any shard whose cached sender is
                 // immediately ready wins. `now_or_never` never awaits, so this
@@ -1064,10 +1117,17 @@ impl Http2ConnectionPool {
                         )) {
                             Some(Ok(())) => {
                                 crate::profile_pool_event!(WarmHit);
+                                if fill_start {
+                                    Self::write_shard_key_inplace(key_buf, base_len, start);
+                                    self.bench_spawn_shard_fill(proxy, svid_generation, key_buf);
+                                }
                                 return Phase1::Hit(sender);
                             }
                             Some(Err(_)) => {
                                 self.pool.invalidate(key_buf);
+                                if offset == 0 && fill_missing {
+                                    fill_start = true;
+                                }
                             }
                             // Shard exists but is mid-send. Previously we
                             // stashed the first such sender and `timeout(5ms,
@@ -1088,6 +1148,8 @@ impl Http2ConnectionPool {
                                 }
                             }
                         }
+                    } else if offset == 0 && fill_missing {
+                        fill_start = true;
                     }
                 }
 
@@ -1914,6 +1976,15 @@ impl Http2ConnectionPool {
         self.h1.stats()
     }
 }
+
+/// BENCH EXPERIMENT (never merge): direct-H2 shard selection mode, read once.
+static BENCH_H2_POOL_MODE: std::sync::LazyLock<u8> = std::sync::LazyLock::new(|| {
+    match std::env::var("FERRUM_BENCH_H2_POOL_MODE").as_deref() {
+        Ok("rr") => 1,
+        Ok("affinity") => 2,
+        _ => 0,
+    }
+});
 
 /// Outcome of the synchronous phase-1 sweep in `get_sender`.
 enum Phase1 {

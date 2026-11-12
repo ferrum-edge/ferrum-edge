@@ -75,6 +75,9 @@ struct BackendStats {
     h2_tls_accepted: AtomicU64,
     /// Of those, TLS handshakes that completed.
     h2_tls_handshakes: AtomicU64,
+    /// BENCH EXPERIMENT: HTTPS/H2 connections whose driver has ended, so
+    /// `h2_tls_handshakes - h2_tls_closed` is the number still open.
+    h2_tls_closed: AtomicU64,
     /// TCP connections accepted on the gRPC+TLS listener (50053). Tonic owns
     /// that TLS handshake, so this counts accepts, not completed handshakes.
     grpcs_accepted: AtomicU64,
@@ -97,6 +100,7 @@ struct BackendStats {
 static STATS: BackendStats = BackendStats {
     h2_tls_accepted: AtomicU64::new(0),
     h2_tls_handshakes: AtomicU64::new(0),
+    h2_tls_closed: AtomicU64::new(0),
     grpcs_accepted: AtomicU64::new(0),
     http_echo_requests: AtomicU64::new(0),
     grpc_echo_requests: AtomicU64::new(0),
@@ -111,6 +115,7 @@ fn stats_json() -> Bytes {
         serde_json::json!({
             "h2_tls_accepted": STATS.h2_tls_accepted.load(Ordering::Relaxed),
             "h2_tls_handshakes": STATS.h2_tls_handshakes.load(Ordering::Relaxed),
+            "h2_tls_closed": STATS.h2_tls_closed.load(Ordering::Relaxed),
             "grpcs_accepted": STATS.grpcs_accepted.load(Ordering::Relaxed),
             "http_echo_requests": STATS.http_echo_requests.load(Ordering::Relaxed),
             "grpc_echo_requests": STATS.grpc_echo_requests.load(Ordering::Relaxed),
@@ -449,6 +454,7 @@ async fn run_h2_tls_server(
                 .max_concurrent_streams(1000)
                 .serve_connection(io, hyper::service::service_fn(handle_http))
                 .await;
+            STATS.h2_tls_closed.fetch_add(1, Ordering::Relaxed);
             observer.record(
                 connection_id,
                 None,

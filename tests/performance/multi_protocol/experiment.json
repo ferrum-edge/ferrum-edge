@@ -1,21 +1,10 @@
 {
-  "enabled": false,
-  "name": "5588-h2-grpc-adaptive-observation",
-  "protocol": ["http2", "grpcs"],
-  "h2_campaign": {
-    "pairs": 4,
-    "duration": 15,
-    "concurrency": 200,
-    "payload_sizes": {"http2": [71680], "grpcs": [10240, 71680]}
-  },
+  "enabled": true,
+  "name": "h2-direct-pool-width",
+  "protocol": ["http2"],
   "arms": [
-    {
-      "gateway": "ferrum",
-      "FERRUM_EXTRA_ENV": "FERRUM_POOL_HTTP2_ADAPTIVE_WINDOW=true FERRUM_LOG_LEVEL=warn,ferrum_h2_observe=debug FERRUM_METRICS_ALLOWED_CIDRS=127.0.0.1/32 FERRUM_ADMIN_HTTP_PORT=9000"
-    },
-    {
-      "gateway": "ferrum-exp-fixed",
-      "FERRUM_EXTRA_ENV": "FERRUM_POOL_HTTP2_ADAPTIVE_WINDOW=false FERRUM_LOG_LEVEL=warn,ferrum_h2_observe=debug FERRUM_METRICS_ALLOWED_CIDRS=127.0.0.1/32 FERRUM_ADMIN_HTTP_PORT=9000"
-    }
+    {"gateway": "ferrum", "FERRUM_EXTRA_ENV": "FERRUM_BENCH_H2_POOL_MODE=legacy"},
+    {"gateway": "ferrum-exp-rr", "FERRUM_EXTRA_ENV": "FERRUM_BENCH_H2_POOL_MODE=rr"},
+    {"gateway": "ferrum-exp-affinity", "FERRUM_EXTRA_ENV": "FERRUM_BENCH_H2_POOL_MODE=affinity"}
   ]
 }
