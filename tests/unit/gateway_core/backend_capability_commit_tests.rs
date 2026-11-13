@@ -11,6 +11,14 @@
 //! `BackendCapabilityRegistry::snapshot_for_probe` + `commit_probe` close that
 //! window: a probe result replaces the entry only while the entry is still the
 //! exact version the probe was computed against.
+//!
+//! An HTTPS target is published in two stages — the HTTP/2 verdict as soon as
+//! that probe answers, the HTTP/3 verdict when its (often much slower) probe
+//! finishes — through `begin_probe_commit`, which chains the same
+//! compare-and-commit: the second stage must replace exactly the record the
+//! first one published. The `staged_*` tests below pin that chain;
+//! `tests/integration/backend_capability_staged_commit_tests.rs` drives it
+//! through the real probes with the HTTP/3 probe held open.
 
 use chrono::Utc;
 use ferrum_edge::config::types::{
@@ -475,12 +483,19 @@ fn periodic_refresh_write_back_uses_compare_and_commit() {
         .expect("bounded refresh body");
 
     assert!(
-        refresh.contains("snapshot_for_probe("),
-        "the refresh must take a pre-probe snapshot"
+        refresh.contains("begin_probe_commit("),
+        "the refresh must open the staged write-back, which takes the one \
+         pre-probe snapshot"
     );
     assert!(
-        refresh.contains("commit_probe("),
-        "the refresh must write back through compare-and-commit"
+        refresh.contains("commit_capability_probe_stage("),
+        "the refresh must write back through the compare-and-commit chain"
+    );
+    assert!(
+        !refresh.contains("snapshot_for_probe(") && !refresh.contains(".commit_probe("),
+        "the refresh must not pair its own snapshot with a bare commit: a \
+         final commit compared against the pre-probe snapshot would lose to \
+         the HTTP/2 verdict this same probe published early"
     );
     assert!(
         !refresh.contains(".upsert("),
@@ -521,12 +536,349 @@ fn probe_merges_against_the_callers_snapshot_without_re_reading() {
         .expect("bounded probe body");
 
     assert!(
-        probe.contains("previous.previous()"),
-        "the probe must merge against the snapshot the caller will commit with"
+        probe.contains("commit.expected().previous()"),
+        "the probe must merge against the snapshot its first commit is compared with"
     );
     assert!(
-        !probe.contains("get_by_key("),
+        !probe.contains("get_by_key(") && !probe.contains("snapshot_for_probe("),
         "a second pre-probe read would produce a merge input that no longer \
          matches the commit expectation"
+    );
+}
+
+#[test]
+fn https_probe_publishes_the_h2_verdict_before_awaiting_the_h3_probe() {
+    let source = include_str!("../../../src/proxy/mod.rs");
+    let probe = source
+        .split("async fn probe_backend_capabilities(")
+        .nth(1)
+        .expect("probe_backend_capabilities")
+        .split("async fn probe_h2c(")
+        .next()
+        .expect("bounded probe body");
+
+    assert!(
+        !probe.contains("tokio::join!(h2_fut, h3_fut)"),
+        "joining the two probes holds the HTTP/2 verdict until the HTTP/3 \
+         probe finishes or times out"
+    );
+    let early = probe
+        .find("commit_capability_probe_stage(target, commit, h2_verdict)")
+        .expect("the HTTP/2 verdict must be published through the commit chain");
+    let h3_wait = probe
+        .find("h3_fut.await")
+        .expect("the HTTP/3 probe must still be awaited to completion");
+    assert!(
+        early < h3_wait,
+        "the HTTP/2 verdict must be published before the HTTP/3 probe is awaited"
+    );
+    assert!(
+        probe.contains("h2_verdict.plain_http.h3 = previous_h3"),
+        "the early stage must leave HTTP/3 at its pre-probe value, never at a \
+         verdict the HTTP/3 probe has not produced yet"
+    );
+    assert!(
+        !probe.contains(".upsert(") && !probe.contains(".commit_probe("),
+        "the early stage must go through the chain, not a blind or unchained write"
+    );
+}
+
+// ── Staged commit (`begin_probe_commit`) ────────────────────────────────────
+
+/// The early-stage record a refresh publishes for an HTTPS target: the fresh
+/// HTTP/2 verdict with HTTP/3 left at `h3_before`.
+fn h2_stage(h2_tls: ProtocolSupport, h3_before: ProtocolSupport) -> BackendCapabilityRecord {
+    caps(h3_before, h2_tls, UNKNOWN)
+}
+
+#[test]
+fn staged_commit_publishes_each_stage_against_the_previous_one() {
+    let proxy = minimal_proxy();
+    let key = capability_key(&proxy);
+    let registry = BackendCapabilityRegistry::new();
+
+    let mut commit = registry.begin_probe_commit(&key);
+    assert!(
+        commit.expected().was_vacant(),
+        "the opening expectation is the pre-probe snapshot"
+    );
+    assert_eq!(commit.published_stages(), 0);
+
+    // Stage 1: the HTTP/2 verdict, HTTP/3 not classified yet.
+    let first = match commit.commit(h2_stage(SUPPORTED, UNKNOWN)) {
+        CapabilityCommitOutcome::Committed(first) => first,
+        rejected => panic!("nothing raced the first stage; got {}", rejected.reason()),
+    };
+    assert_eq!(commit.published_stages(), 1);
+    let published = registry.get(&proxy, None).expect("stage 1 must be visible");
+    assert!(std::sync::Arc::ptr_eq(&first, &published));
+    assert_eq!(published.plain_http.h2_tls, SUPPORTED);
+    assert_eq!(
+        published.plain_http.h3, UNKNOWN,
+        "stage 1 must not claim an HTTP/3 verdict"
+    );
+    assert!(
+        commit
+            .expected()
+            .previous()
+            .is_some_and(|expected| std::ptr::eq(expected, std::sync::Arc::as_ptr(&first))),
+        "the next stage must be compared against the record stage 1 published"
+    );
+
+    // Stage 2: the HTTP/3 verdict merged onto the same classification.
+    let second = commit.commit(caps(SUPPORTED, SUPPORTED, UNKNOWN));
+    assert!(
+        second.is_committed(),
+        "an untouched stage 1 must accept stage 2, got {}",
+        second.reason()
+    );
+    assert_eq!(commit.published_stages(), 2);
+    let merged = registry.get(&proxy, None).expect("entry must exist");
+    assert_eq!(merged.plain_http.h3, SUPPORTED);
+    assert_eq!(merged.plain_http.h2_tls, SUPPORTED);
+}
+
+#[test]
+fn staged_h3_downgrade_between_stages_beats_the_second_stage() {
+    let proxy = minimal_proxy();
+    let key = capability_key(&proxy);
+    // A re-probe: HTTP/3 was proven earlier and stays `Supported` in stage 1.
+    let registry = registry_with(&key, caps(SUPPORTED, UNKNOWN, UNKNOWN));
+
+    let mut commit = registry.begin_probe_commit(&key);
+    assert!(commit.commit(h2_stage(SUPPORTED, SUPPORTED)).is_committed());
+
+    // Native HTTP/3 dispatch fails while the HTTP/3 probe is still in flight.
+    registry.mark_h3_unsupported(&proxy, None);
+
+    // The probe finishes and still believes the backend speaks HTTP/3.
+    let second = commit.commit(caps(SUPPORTED, SUPPORTED, UNKNOWN));
+    assert!(
+        matches!(second, CapabilityCommitOutcome::RejectedStale),
+        "the HTTP/3 stage must lose to a downgrade recorded after stage 1, got {}",
+        second.reason()
+    );
+    assert_eq!(commit.published_stages(), 1);
+
+    let fetched = registry.get(&proxy, None).expect("entry must exist");
+    assert_eq!(
+        fetched.plain_http.h3, UNSUPPORTED,
+        "the stale HTTP/3 verdict must not resurrect native H3 dispatch"
+    );
+    assert_eq!(
+        fetched.plain_http.h2_tls, SUPPORTED,
+        "the HTTP/2 verdict published in stage 1 stays under the downgrade"
+    );
+}
+
+#[test]
+fn staged_h2_tls_downgrade_between_stages_beats_the_second_stage() {
+    let proxy = minimal_proxy();
+    let key = capability_key(&proxy);
+    let registry = BackendCapabilityRegistry::new();
+
+    let mut commit = registry.begin_probe_commit(&key);
+    assert!(commit.commit(h2_stage(SUPPORTED, UNKNOWN)).is_committed());
+
+    // Stage 1 made the key occupied, so the request-path downgrade now lands
+    // even without a backend SNI override.
+    assert!(
+        registry.mark_h2_tls_unsupported(&proxy, None),
+        "precondition: the live downgrade must mutate the stage-1 record"
+    );
+
+    // Stage 2 still carries the probe's `h2_tls: Supported`.
+    let second = commit.commit(caps(SUPPORTED, SUPPORTED, UNKNOWN));
+    assert!(matches!(second, CapabilityCommitOutcome::RejectedStale));
+
+    let fetched = registry.get(&proxy, None).expect("entry must exist");
+    assert_eq!(fetched.plain_http.h2_tls, UNSUPPORTED);
+    assert_eq!(fetched.grpc_transport.h2_tls, UNSUPPORTED);
+    assert_eq!(fetched.plain_http.h1, SUPPORTED);
+    assert_eq!(
+        fetched.plain_http.h3, UNKNOWN,
+        "the whole second stage is dropped, so HTTP/3 keeps its stage-1 value \
+         and native H3 dispatch stays off until the next refresh"
+    );
+}
+
+#[test]
+fn staged_first_stage_loses_to_a_downgrade_recorded_during_the_h2_probe() {
+    let proxy = minimal_proxy();
+    let key = capability_key(&proxy);
+    let registry = registry_with(&key, caps(SUPPORTED, SUPPORTED, UNKNOWN));
+
+    let mut commit = registry.begin_probe_commit(&key);
+    registry.mark_h3_unsupported(&proxy, None);
+
+    let first = commit.commit(h2_stage(SUPPORTED, SUPPORTED));
+    assert!(
+        matches!(first, CapabilityCommitOutcome::RejectedStale),
+        "stage 1 carries the pre-probe HTTP/3 value, so it must not overwrite \
+         a downgrade it did not observe"
+    );
+    assert_eq!(commit.published_stages(), 0);
+    assert_eq!(
+        registry
+            .get(&proxy, None)
+            .expect("entry must exist")
+            .plain_http
+            .h3,
+        UNSUPPORTED
+    );
+}
+
+#[test]
+fn a_lost_stage_closes_the_chain_even_if_the_key_is_vacant_again() {
+    // First probe: the opening expectation is "vacant". A live insert beats
+    // stage 1, then a reload prunes the key. A second stage compared against
+    // "vacant" again would re-add a target the config no longer references.
+    let proxy = minimal_proxy();
+    let key = capability_key(&proxy);
+    let registry = BackendCapabilityRegistry::new();
+
+    let mut commit = registry.begin_probe_commit(&key);
+    registry.mark_hbone_unsupported(&proxy, None);
+
+    let first = commit.commit(h2_stage(SUPPORTED, UNKNOWN));
+    assert!(matches!(first, CapabilityCommitOutcome::RejectedStale));
+
+    registry.retain_keys(&HashSet::new());
+    assert!(registry.get(&proxy, None).is_none());
+
+    let second = commit.commit(caps(SUPPORTED, SUPPORTED, UNKNOWN));
+    assert!(
+        matches!(second, CapabilityCommitOutcome::RejectedStale),
+        "a closed chain must repeat its rejection, got {}",
+        second.reason()
+    );
+    assert!(
+        registry.get(&proxy, None).is_none(),
+        "a closed chain must not write, even onto a key that matches its \
+         opening expectation again"
+    );
+    assert_eq!(commit.published_stages(), 0);
+}
+
+#[test]
+fn staged_eviction_between_stages_rejects_the_second_stage() {
+    let proxy = minimal_proxy();
+    let key = capability_key(&proxy);
+    let registry = BackendCapabilityRegistry::new();
+
+    let mut commit = registry.begin_probe_commit(&key);
+    assert!(commit.commit(h2_stage(SUPPORTED, UNKNOWN)).is_committed());
+
+    // A reload dropped this backend from the config mid-probe.
+    registry.retain_keys(&HashSet::new());
+
+    let second = commit.commit(caps(SUPPORTED, SUPPORTED, UNKNOWN));
+    assert!(
+        matches!(second, CapabilityCommitOutcome::RejectedEvicted),
+        "an evicted key must be reported distinctly, got {}",
+        second.reason()
+    );
+    assert!(
+        registry.get(&proxy, None).is_none(),
+        "the HTTP/3 stage must not re-add a target the config no longer references"
+    );
+
+    // The rejection is sticky and keeps its kind.
+    let third = commit.commit(caps(SUPPORTED, SUPPORTED, UNKNOWN));
+    assert!(matches!(third, CapabilityCommitOutcome::RejectedEvicted));
+    assert!(registry.get(&proxy, None).is_none());
+}
+
+#[test]
+fn staged_second_stage_does_not_fall_back_to_the_pre_probe_snapshot() {
+    // After stage 1 the pre-probe record is no longer published. A writer
+    // that republishes a record field-identical to stage 1 still supersedes
+    // it: the token is the published `Arc`, at every stage.
+    let proxy = minimal_proxy();
+    let key = capability_key(&proxy);
+    let registry = registry_with(&key, caps(UNKNOWN, UNKNOWN, UNKNOWN));
+
+    let mut commit = registry.begin_probe_commit(&key);
+    assert!(commit.commit(h2_stage(SUPPORTED, UNKNOWN)).is_committed());
+
+    registry.upsert(key.clone(), h2_stage(SUPPORTED, UNKNOWN));
+
+    let second = commit.commit(caps(SUPPORTED, SUPPORTED, UNKNOWN));
+    assert!(
+        matches!(second, CapabilityCommitOutcome::RejectedStale),
+        "a republished record is a new version even when its fields match stage 1"
+    );
+    assert_eq!(
+        registry
+            .get(&proxy, None)
+            .expect("entry must exist")
+            .plain_http
+            .h3,
+        UNKNOWN
+    );
+}
+
+#[test]
+fn a_no_op_downgrade_between_stages_does_not_strand_the_second_stage() {
+    // `mark_h3_unsupported` on an already-Unsupported entry republishes
+    // nothing, so a backend that recovered can still be re-probed back to
+    // `Supported` by the HTTP/3 stage.
+    let proxy = minimal_proxy();
+    let key = capability_key(&proxy);
+    let registry = registry_with(&key, caps(UNSUPPORTED, UNKNOWN, UNKNOWN));
+
+    let mut commit = registry.begin_probe_commit(&key);
+    assert!(
+        commit
+            .commit(h2_stage(SUPPORTED, UNSUPPORTED))
+            .is_committed()
+    );
+
+    registry.mark_h3_unsupported(&proxy, None);
+
+    let second = commit.commit(caps(SUPPORTED, SUPPORTED, UNKNOWN));
+    assert!(
+        second.is_committed(),
+        "a no-op live-learning call must not invalidate the chain, got {}",
+        second.reason()
+    );
+    assert_eq!(
+        registry
+            .get(&proxy, None)
+            .expect("entry must exist")
+            .plain_http
+            .h3,
+        SUPPORTED
+    );
+}
+
+#[test]
+fn a_single_stage_chain_behaves_like_commit_probe() {
+    // Plain-HTTP targets (and an HTTPS target whose HTTP/3 probe answers
+    // first) publish once, through the same chain.
+    let proxy = minimal_proxy();
+    let key = capability_key(&proxy);
+    let registry = registry_with(&key, caps(SUPPORTED, SUPPORTED, UNKNOWN));
+
+    let mut commit = registry.begin_probe_commit(&key);
+    assert_eq!(
+        commit
+            .expected()
+            .previous()
+            .map(|entry| entry.plain_http.h3),
+        Some(SUPPORTED),
+        "the chain exposes the observed record for probe merging"
+    );
+    registry.mark_h3_unsupported(&proxy, None);
+
+    let only = commit.commit(caps(SUPPORTED, SUPPORTED, UNKNOWN));
+    assert!(matches!(only, CapabilityCommitOutcome::RejectedStale));
+    assert_eq!(
+        registry
+            .get(&proxy, None)
+            .expect("entry must exist")
+            .plain_http
+            .h3,
+        UNSUPPORTED
     );
 }

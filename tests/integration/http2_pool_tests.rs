@@ -4740,6 +4740,188 @@ async fn test_direct_h1_checkin_after_a_drain_closes_the_connection() {
     drop(held);
 }
 
+/// Wait until a checked-out connection's dispatcher is idle, so a check-in
+/// goes straight to its lane instead of waiting off the request path.
+async fn wait_until_h1_ready(checkout: &mut ferrum_edge::proxy::http2_pool::Http1Checkout) {
+    tokio::time::timeout(Duration::from_secs(5), checkout.sender.ready())
+        .await
+        .expect("dispatcher ready in time")
+        .expect("dispatcher ready");
+}
+
+/// A drain that lands after a checkout has taken its place relative to
+/// drains, and before it looks its lane up, finds no lane to retire. The
+/// checkout must not open one afterwards: its connection serves its request
+/// and is closed at check-in, and the next checkout dials and is pooled.
+#[tokio::test]
+async fn test_direct_h1_drain_before_the_lane_lookup_keeps_the_checkout_out_of_the_pool() {
+    use ferrum_edge::_test_support::checkout_direct_h1_with_lane_lookup_seam;
+
+    let proxy = direct_h1_proxy(holding_backend().await);
+    let pool = create_default_pool();
+
+    let mut straddling = checkout_direct_h1_with_lane_lookup_seam(
+        &pool,
+        &proxy,
+        false,
+        Duration::from_secs(2),
+        false,
+        || pool.force_drain_all(),
+    )
+    .await
+    .expect("a checkout that straddles a drain still dials");
+    assert!(!straddling.reused());
+    wait_until_h1_ready(&mut straddling).await;
+    straddling.checkin();
+    assert_eq!(
+        pool.h1_idle_connections(),
+        0,
+        "a checkout that began before the drain must not pool its connection after it"
+    );
+    let stats = pool.h1_pool_stats();
+    assert_eq!(stats.connections_opened, 1);
+    assert_eq!(stats.evicted_retired, 0, "nothing was idle at the drain");
+    assert_eq!(
+        stats.evicted_ceiling, 0,
+        "a fenced check-in is not a ceiling eviction"
+    );
+
+    // A checkout that starts after the drain opens the lane and is pooled.
+    let later = ready_checkout(&pool, &proxy).await;
+    assert!(!later.reused(), "nothing was pooled for it to reuse");
+    later.checkin();
+    assert_eq!(pool.h1_idle_connections(), 1);
+    let reused = pool
+        .checkout_h1(&proxy, false, Duration::from_secs(2), false)
+        .await
+        .expect("checkout");
+    assert!(reused.reused());
+}
+
+/// An SVID rotation advances the generation and then force-drains the
+/// outgoing one. A TLS checkout that read the outgoing generation just before
+/// that, and looks its lane up just after, must not pool its connection under
+/// the drained generation's key, where no later checkout would find it.
+///
+/// The drain stays per lane: a checkout that already held the drained lane is
+/// refused at check-in as before, and a lane the drain did not select still
+/// takes its checkout back.
+#[tokio::test]
+async fn test_direct_h1_generation_drain_before_the_lane_lookup_keeps_the_checkout_out_of_the_pool()
+{
+    use ferrum_edge::_test_support::checkout_direct_h1_with_lane_lookup_seam;
+
+    const OUTGOING: u64 = 4;
+
+    let listener = tokio::net::TcpListener::bind_test("127.0.0.1:0")
+        .await
+        .expect("bind backend");
+    let port = listener.local_addr().expect("backend addr").port();
+    let accepted = Arc::new(AtomicUsize::new(0));
+    let _backend = start_tls_backend_on_counted(
+        listener,
+        include_str!("../certs/server.crt"),
+        include_str!("../certs/server.key"),
+        vec![b"http/1.1".to_vec()],
+        Some(Arc::clone(&accepted)),
+    )
+    .await
+    .expect("start HTTP/1.1 TLS backend");
+
+    // The gateway SVID the proxy presents: its lane key carries the SVID
+    // generation only when the proxy's client certificate is that file.
+    let svid_dir = TempDir::new().expect("SVID directory");
+    let ca = generate_ca("direct-h1-svid-ca");
+    let svid = generate_signed_cert(&ca, "gateway", &["gateway.test"]);
+    let cert_path = svid_dir.path().join("svid.pem");
+    let key_path = svid_dir.path().join("svid.key");
+    std::fs::write(&cert_path, &svid.cert_pem).expect("write SVID certificate");
+    std::fs::write(&key_path, &svid.key_pem).expect("write SVID key");
+    let cert_path = cert_path.to_string_lossy().into_owned();
+    let key_path = key_path.to_string_lossy().into_owned();
+
+    let generation = Arc::new(AtomicU64::new(OUTGOING));
+    let pool = Http2ConnectionPool::new_with_svid_generation(
+        PoolConfig::default(),
+        ferrum_edge::config::EnvConfig {
+            gateway_svid_cert_path: Some(cert_path.clone()),
+            gateway_svid_key_path: Some(key_path.clone()),
+            ..Default::default()
+        },
+        create_dns_cache(),
+        None,
+        Arc::new(Vec::new()),
+        Arc::clone(&generation),
+    );
+    let mut proxy = create_test_proxy();
+    proxy.backend_host = "localhost".to_string();
+    proxy.backend_port = port;
+    proxy.resolved_tls.client_cert_path = Some(cert_path);
+    proxy.resolved_tls.client_key_path = Some(key_path);
+    let connect_timeout = Duration::from_secs(5);
+
+    // Two checkouts already hold lanes when the rotation lands: one on the
+    // outgoing generation's TLS lane, one on a plaintext lane to another
+    // backend, whose key carries no generation.
+    let mut held = pool
+        .checkout_h1(&proxy, true, connect_timeout, false)
+        .await
+        .expect("checkout on the outgoing generation");
+    wait_until_h1_ready(&mut held).await;
+    let plain_proxy = direct_h1_proxy(holding_backend().await);
+    let bystander = ready_checkout(&pool, &plain_proxy).await;
+
+    let mut straddling = checkout_direct_h1_with_lane_lookup_seam(
+        &pool,
+        &proxy,
+        true,
+        connect_timeout,
+        false,
+        || {
+            generation.store(OUTGOING + 1, Ordering::Release);
+            pool.force_drain_svid_generation(OUTGOING);
+        },
+    )
+    .await
+    .expect("a checkout that straddles a generation drain still dials");
+    assert!(!straddling.reused());
+    wait_until_h1_ready(&mut straddling).await;
+    straddling.checkin();
+    assert_eq!(
+        pool.h1_idle_connections(),
+        0,
+        "a connection keyed on the drained generation must not be pooled"
+    );
+
+    held.checkin();
+    assert_eq!(
+        pool.h1_idle_connections(),
+        0,
+        "a checkout that held the drained lane is still refused at check-in"
+    );
+    bystander.checkin();
+    assert_eq!(
+        pool.h1_idle_connections(),
+        1,
+        "a lane the generation drain did not select takes its checkout back"
+    );
+
+    // The next TLS checkout reads the new generation, dials, and is pooled.
+    let mut next = pool
+        .checkout_h1(&proxy, true, connect_timeout, false)
+        .await
+        .expect("checkout on the new generation");
+    assert!(!next.reused());
+    wait_until_h1_ready(&mut next).await;
+    next.checkin();
+    assert_eq!(pool.h1_idle_connections(), 2);
+    assert_eq!(accepted.load(Ordering::Relaxed), 3);
+    let stats = pool.h1_pool_stats();
+    assert_eq!(stats.connections_opened, 4);
+    assert_eq!(stats.evicted_retired, 0, "nothing was idle at the drain");
+    assert_eq!(stats.evicted_ceiling, 0);
+}
+
 /// The production direct HTTP/1.1 handoff gate (GHSA-xcg4-wj3x-gjj2). A
 /// checked-out connection whose request bound elapsed before the handoff never
 /// carried the request, so the gate refuses it and returns it to the idle set

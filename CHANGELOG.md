@@ -645,11 +645,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   configuration it had started with, and later requests could reuse it. A
   create that had entered the pool before the drain, or a request that waited
   on one and dialled after it, now hands its connection to its own caller
-  only. Two older, narrower windows are not yet covered: the HTTP/3 pool
-  reads its TLS configuration and SVID generation just before entering the
-  pool, and the direct HTTP/1.1 pool's idle lanes sit outside this fence, so
-  a create or checkout that straddles a drain at exactly that point can still
-  be pooled.
+  only. So does an HTTP/3 request that read its TLS configuration or SVID
+  generation just before the drain and entered the pool just after it. A
+  direct HTTP/1.1 checkout that read the outgoing SVID generation just before
+  a generation drain used to pool its connection under the drained
+  generation's key, where it sat unused until idle expiry; that connection is
+  now closed when its request finishes.
 - An `api_chargeback_sink` with `clickhouse.tls.verify_hostname: false` and
   neither `clickhouse.tls.ca_file` nor `clickhouse.tls.insecure_skip_verify:
   true` is now refused at admission with a message naming both remedies. It
@@ -2186,6 +2187,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `CONTRIBUTING.md` correctly and list every operating mode (#7309).
 
 ### Performance
+- **The HTTP/2 capability verdict for an HTTPS backend is published before
+  its HTTP/3 probe finishes.** The capability refresh probed HTTP/2 over TLS
+  and HTTP/3 together and wrote one registry record when both were done.
+  Against a backend with no QUIC listener the HTTP/3 probe ends only at its
+  timeout (up to 5 s), so for that long after every start and reload the
+  target read `unknown`: plain HTTPS requests used the reqwest fallback
+  instead of the direct HTTP/2 pool, and the direct HTTP/1.1 pool, which
+  needs a proven `h2_tls = unsupported`, was not used either. The refresh now
+  commits the HTTP/2 verdict as soon as it has one, leaving `plain_http.h3`
+  at its previous value (`unknown` on a first probe), and merges the HTTP/3
+  verdict in a second compare-and-commit when that probe finishes. Native
+  HTTP/3 dispatch still requires a completed HTTP/3 probe, the HTTP/3 probe
+  timeout is unchanged, and a request-path downgrade recorded between the two
+  stages is never overwritten. `GET /backend-capabilities` can show an entry
+  between the stages during a background refresh; startup warmup and
+  `POST /backend-capabilities/refresh` still return only after both.
 - **The direct HTTP/2 pool now reaches `FERRUM_POOL_HTTP2_CONNECTIONS_PER_HOST`.**
   The pool took the first ready shard, and an open HTTP/2 connection always
   reports ready, so every request used the first connection the pool ever

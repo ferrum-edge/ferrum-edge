@@ -639,6 +639,15 @@ the test must verify:
   Warmup-enabled starts likewise defer synchronous pool warmup until required
   listeners bind, while still completing warmup before `/health` becomes
   ready.
+- A background capability refresh publishes an HTTPS target in two stages:
+  the HTTP/2-over-TLS verdict first, the HTTP/3 verdict when its probe
+  finishes (up to the 5 s probe timeout when nothing answers QUIC). With
+  warmup off, a test that waits for the registry entry to exist, or for
+  `h2_tls`, can therefore still read the previous `plain_http.h3` value
+  (`unknown` on a first probe). Poll for the exact field the test depends on.
+  `ScriptedH3BackendBuilder::hold_handshakes` holds the HTTP/3 probe open
+  until `release_handshakes`, for tests that need to observe the window
+  between the stages.
 - The file-mode YAML loader's strict-loading rules apply identically:
   `version`, `proxies`, and `plugin_configs` are required even if empty
   (`consumers` and `upstreams` default to empty). The helpers in

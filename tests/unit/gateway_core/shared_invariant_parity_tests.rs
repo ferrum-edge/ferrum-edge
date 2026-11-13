@@ -2155,9 +2155,12 @@ async fn every_pool_family_key_is_drained_by_the_svid_generation_matcher() {
 // can hold a `maxConnections` slot the current generation needs.
 //
 // Siblings: the direct HTTP/2 and gRPC request paths, both pools' detached
-// shard fills, and `GenericPool::get_with` (the reqwest pool). The HTTP/3
-// pool reads its dial inputs before it enters the pool and is NOT covered;
-// `docs/connection_pooling.md` states that limit.
+// shard fills, `GenericPool::get_with` (the reqwest pool), every HTTP/3
+// checkout (which also reads its TLS configuration before it enters the
+// pool, so the sample precedes that read too) with the capability probe that
+// warms the HTTP/3 pool, and the direct HTTP/1.1 checkout, whose lanes have
+// an epoch of their own. The HBONE inner pool and the Unix-socket pool bind
+// each lease to their own drain generation and are pinned by their own tests.
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -2194,6 +2197,20 @@ fn every_generation_keyed_acquisition_samples_the_drain_epoch_first() {
             "self.drain_epoch()",
             "self.lookup_or_build_key(build_key)",
         ),
+        (
+            "src/proxy/http2_pool.rs",
+            "    pub(crate) async fn checkout_h1_seamed<",
+            "self.h1.drain_epoch()",
+            "svid_generation_for_proxy(proxy)",
+        ),
+        // The capability probe reads the TLS configuration it hands to
+        // `Http3ConnectionPool::warmup_connection`, so it takes the sample.
+        (
+            "src/proxy/mod.rs",
+            "    async fn probe_backend_capabilities(",
+            "self.h3_pool.drain_epoch()",
+            ".get_tls_config_for_backend(&probe_proxy)",
+        ),
     ];
     for (file, signature, sample, read) in sites {
         let text = source(file);
@@ -2208,6 +2225,214 @@ fn every_generation_keyed_acquisition_samples_the_drain_epoch_first() {
             sampled_at < read_at,
             "{file}: `{signature}` must sample the drain epoch before it reads the SVID \
              generation, or a rotation between the two publishes under the retired key"
+        );
+    }
+}
+
+/// The method of `text` that contains byte offset `at`, from the end of the
+/// method before it through its own closing brace. Methods sit at one level of
+/// indentation, so each ends at the first `\n    }\n`.
+fn enclosing_method(text: &str, at: usize) -> &str {
+    const END: &str = "\n    }\n";
+    let start = text[..at].rfind(END).map_or(0, |end| end + END.len());
+    let end = text[at..]
+        .find(END)
+        .unwrap_or_else(|| panic!("the method at byte {at} must close at one level of indent"));
+    &text[start..at + end + END.len()]
+}
+
+fn without_whitespace(text: &str) -> String {
+    text.chars().filter(|c| !c.is_whitespace()).collect()
+}
+
+/// The earliest of `needles` in `body`.
+fn first_of(body: &str, needles: &[&str]) -> Option<usize> {
+    needles.iter().filter_map(|needle| body.find(needle)).min()
+}
+
+/// Every HTTP/3 checkout reads the SVID generation its pool key carries AND
+/// the backend TLS configuration before it reaches the pool's create path, so
+/// it samples the drain epoch before both and hands the sample to the create.
+///
+/// The checkouts are discovered rather than listed: every pool method that
+/// takes the caller's TLS configuration closure is one, so an entry point
+/// added later is held to the same order without being added to a table.
+#[test]
+fn every_http3_checkout_samples_the_drain_epoch_before_its_generation_and_tls_reads() {
+    const SAMPLE: &str = "let drain_epoch = self.drain_epoch();";
+    const TLS_READ: &str = "tls_config_fn()";
+    const TLS_PARAMETER: &str = "tls_config_fn: impl FnOnce() -> TlsFut,";
+    const GENERATION_READS: [&str; 3] = [
+        "self.svid_generation_for_proxy(proxy)",
+        "self.pool_key_with_current_generation(",
+        "self.pool_key_for_target_with_current_generation(",
+    ];
+    const CREATES: [&str; 4] = [
+        ".create_or_get_proxy_sender(",
+        ".create_or_get_target_sender(",
+        ".create_or_get_proxy_sender_with_connect_deadline(",
+        ".create_or_get_target_sender_with_connect_deadline(",
+    ];
+
+    let client = source("src/http3/client.rs");
+    let checkouts: Vec<&str> = client
+        .match_indices(TLS_PARAMETER)
+        .map(|(at, _)| enclosing_method(&client, at))
+        .collect();
+    assert!(
+        checkouts.len() >= 10,
+        "expected the ten HTTP/3 pool checkouts, found {}",
+        checkouts.len()
+    );
+    for body in checkouts {
+        let name = body
+            .split("async fn ")
+            .nth(1)
+            .and_then(|rest| rest.split(['<', '(']).next())
+            .unwrap_or("an HTTP/3 checkout");
+        let sampled_at = body
+            .find(SAMPLE)
+            .unwrap_or_else(|| panic!("`{name}` must sample the pool's drain epoch"));
+        let generation_at = first_of(body, &GENERATION_READS)
+            .unwrap_or_else(|| panic!("`{name}` must read the SVID generation for its pool key"));
+        let tls_at = body
+            .find(TLS_READ)
+            .unwrap_or_else(|| panic!("`{name}` must read its TLS configuration"));
+        assert!(
+            sampled_at < generation_at,
+            "`{name}` must sample the drain epoch before it reads the SVID generation"
+        );
+        assert!(
+            sampled_at < tls_at,
+            "`{name}` must sample the drain epoch before it reads its TLS configuration"
+        );
+        let compact = without_whitespace(body);
+        let creates: usize = CREATES
+            .iter()
+            .map(|create| compact.matches(create).count())
+            .sum();
+        let sampled_creates: usize = CREATES
+            .iter()
+            .map(|create| {
+                compact
+                    .matches(&format!("{create}key,drain_epoch,"))
+                    .count()
+            })
+            .sum();
+        assert!(creates > 0, "`{name}` must reach the pool's create path");
+        assert_eq!(
+            creates, sampled_creates,
+            "`{name}` must hand its drain-epoch sample to every create"
+        );
+    }
+
+    // The probe's sample comes from its caller, which read the TLS
+    // configuration (pinned in the table above); the generation is read here.
+    let warmup = item_body(&client, "    pub async fn warmup_connection(", "\n    }\n");
+    assert!(warmup.contains("drain_epoch: u64,"));
+    let warmup = without_whitespace(warmup);
+    let probe_creates = warmup.matches(".create_or_get_probe_sender(").count();
+    assert!(
+        probe_creates > 0,
+        "`warmup_connection` must reach the pool through the probe create"
+    );
+    assert_eq!(
+        probe_creates,
+        warmup
+            .matches(".create_or_get_probe_sender(primary_key,drain_epoch,")
+            .count()
+            + warmup
+                .matches(".create_or_get_probe_sender(key,drain_epoch,")
+                .count(),
+        "every probe create must carry the caller's drain-epoch sample"
+    );
+
+    // One way into the shared pool: the create that takes a sample. A create
+    // that sampled inside the pool would be late for every caller above.
+    let production = without_cfg_test_items(&client);
+    let pool_creates = production.matches(".create_or_get_existing_owned").count();
+    assert!(
+        pool_creates > 0,
+        "the HTTP/3 pool must create through the shared pool's sampled entry point"
+    );
+    assert_eq!(
+        pool_creates,
+        production
+            .matches(".create_or_get_existing_owned_sampled_as(key, drain_epoch, caller,")
+            .count(),
+        "the HTTP/3 pool must create only through the sampled entry point"
+    );
+}
+
+/// The direct HTTP/1.1 lane map carries the same fence in its own terms: a
+/// drain bumps the lane epoch before it retires a lane, and a checkout whose
+/// sample predates a drain is not given a lane in the map.
+#[test]
+fn the_direct_http1_lane_map_fences_a_checkout_that_straddles_a_drain() {
+    let pool = source("src/proxy/http2_pool.rs");
+
+    // The checkout: sample, then the generation, then the seam the
+    // integration tests drain through, then the lane lookup with the sample.
+    let checkout = item_body(
+        &pool,
+        "    pub(crate) async fn checkout_h1_seamed<",
+        "\n    }\n",
+    );
+    let order = [
+        "self.h1.drain_epoch()",
+        "svid_generation_for_proxy(proxy)",
+        "before_lane_lookup();",
+        "self.h1.lane_for_key(&buf, drain_epoch)",
+    ];
+    let mut previous = 0;
+    for step in order {
+        let at = checkout
+            .find(step)
+            .unwrap_or_else(|| panic!("`checkout_h1_seamed` must contain `{step}`"));
+        assert!(
+            previous <= at,
+            "`checkout_h1_seamed` must run `{step}` in order: sample, generation, seam, lookup"
+        );
+        previous = at;
+    }
+    let entry = item_body(&pool, "    pub fn checkout_h1(", "\n    }\n");
+    assert!(
+        entry.contains("self.checkout_h1_seamed(proxy, tls, connect_timeout, fresh, || {})"),
+        "production checkout must be the seamed body with a hook that does nothing"
+    );
+
+    let lanes = pool
+        .split("\nimpl Http1Lanes {")
+        .nth(1)
+        .expect("Http1Lanes impl");
+    let lookup = item_body(lanes, "    fn lane_for_key(", "\n    }\n");
+    let checked_at = lookup
+        .find("self.drain_epoch.load(Ordering::Acquire) != drain_epoch")
+        .expect("a lane insert must compare the epoch with the checkout's sample");
+    let inserted_at = lookup
+        .find("vacant.insert(")
+        .expect("lane_for_key must insert a missing lane");
+    assert!(
+        checked_at < inserted_at,
+        "the epoch must be compared, under the shard lock, before a lane is inserted"
+    );
+    let lookup = without_whitespace(lookup);
+    assert!(
+        lookup.contains("retired:AtomicBool::new(fenced)")
+            && lookup.contains("if!fenced{vacant.insert(Arc::clone(&lane));}"),
+        "a fenced checkout's lane must be retired from birth and must not enter the map"
+    );
+    for drain in ["    fn clear(&self) {", "    fn retain_keys("] {
+        let body = item_body(lanes, drain, "\n    }\n");
+        let bumped_at = body
+            .find("self.drain_epoch.fetch_add(1, Ordering::AcqRel)")
+            .unwrap_or_else(|| panic!("`{drain}` must bump the lane map's drain epoch"));
+        let retired_at = body
+            .find("self.lanes.retain(")
+            .unwrap_or_else(|| panic!("`{drain}` must retire lanes"));
+        assert!(
+            bumped_at < retired_at,
+            "`{drain}` must bump the epoch before its removal pass"
         );
     }
 }
@@ -4570,6 +4795,49 @@ fn every_functional_gateway_spawner_launches_the_harness_selected_binary() {
     );
     let path = item_body(&harness, "pub fn gateway_binary_path()", "\n}\n");
     assert!(path.contains("locate_binary(false)"));
+}
+
+// The feature-gated suites (`secrets_functional`, `service_integration`) are
+// outside that harness rule on purpose: they spawn the gateway Cargo built
+// with THEIR features, through the compile-time `CARGO_BIN_EXE_ferrum-edge`.
+// The secrets startup smoke used a third spelling, walking up from its own
+// executable to a sibling `ferrum-edge`. That depends on Cargo's target
+// directory layout: Cargo 1.100 moved test executables out of
+// `target/<profile>/deps/`, the walk found nothing, and all four smokes failed
+// on `main` as "binary not found".
+//
+// The scan covers the files inside the two suite directories only. Both suites
+// also compile the shared `tests/scaffolding` helpers through `#[path]`, and
+// those legitimately re-execute the test executable for their child fixtures;
+// they stay out of the scan. No file inside either suite directory has that
+// reason, so one that reads the test executable's path is that spelling again.
+// The match is textual and deliberately broad (a comment trips it too): if a
+// suite-local test ever needs to re-execute itself, exempt that file here by
+// name rather than loosening the rule for the gateway locator.
+
+const FEATURE_SUITE_SOURCES: [&str; 2] = ["tests/secrets_functional", "tests/service_integration"];
+const SECRETS_STARTUP_SMOKE: &str = "tests/secrets_functional/startup_smoke.rs";
+
+#[test]
+fn feature_suite_gateway_spawners_use_the_binary_cargo_built_for_them() {
+    let offenders: Vec<String> = rust_sources_under(&FEATURE_SUITE_SOURCES)
+        .into_iter()
+        .filter(|(_, text)| text.contains("current_exe("))
+        .map(|(path, _)| path)
+        .collect();
+    assert!(
+        offenders.is_empty(),
+        "resolve the gateway with env!(\"CARGO_BIN_EXE_ferrum-edge\"), not from the test \
+         executable's own location, which follows Cargo's target layout (a suite-local \
+         self re-exec needs a named exemption in this test): {offenders:#?}"
+    );
+
+    let smoke = source(SECRETS_STARTUP_SMOKE);
+    let locate = item_body(&smoke, "fn locate_binary()", "\n}\n");
+    assert!(
+        locate.contains("env!(\"CARGO_BIN_EXE_ferrum-edge\")"),
+        "the secrets startup smoke must spawn the binary Cargo built with its features"
+    );
 }
 
 // ---------------------------------------------------------------------------
