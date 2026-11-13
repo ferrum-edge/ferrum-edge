@@ -42,7 +42,7 @@ STEPS = {
     "acme-dns": "Run ACME DNS-01 hook cancellation regressions",
     "acme-renewal": "Run ACME renewal crash-recovery regressions",
 }
-# The optional `acme` feature compiles the library a second time, so its four
+# The optional `acme` feature compiles the library a second time, so its five
 # phases live in their own path-gated job (`test-acme`) instead of extending
 # the monolithic Unit Tests critical path on every pull request.
 # Steps that only one shard executes carry exactly this condition line

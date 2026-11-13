@@ -1701,6 +1701,111 @@ def artifact_gate_wiring_errors(
     return errors
 
 
+PKCS11_JOB = "test-pkcs11-softhsm"
+PKCS11_PRECOMPILE_STEP = "Precompile PKCS#11 signer and pairing test binaries"
+PKCS11_SIGNER_STEP = "Run PKCS#11 signer smoke test"
+PKCS11_PAIRING_STEP = "Run PKCS#11 certificate-pairing tests"
+# Both PKCS#11 libtest binaries are built before either filter runs, one Cargo
+# invocation each. In a single invocation the library test harness and the
+# plain library that unit_tests links compile side by side, and that pair of
+# whole-crate rustc runs has exhausted the hosted runner. The step's executable
+# lines (comments and blank lines aside) are pinned exactly, so an appended
+# target, a commented or echoed build, or a suppressed failure is rejected.
+PKCS11_PRECOMPILE_LINES = (
+    f"- name: {PKCS11_PRECOMPILE_STEP}",
+    "run: |",
+    "set -euo pipefail",
+    "cargo test --features pkcs11 --lib --no-run",
+    "cargo test --features pkcs11 --test unit_tests --no-run",
+    "env:",
+    "RUST_BACKTRACE: 1",
+)
+_WORKFLOW_STEP_BOUNDARY_RE = re.compile(r"(?m)^(?=      - )")
+
+
+def _executable_step_lines(step: str) -> list[str]:
+    return [
+        line.strip()
+        for line in step.splitlines()
+        if line.strip() and not line.lstrip().startswith("#")
+    ]
+
+
+def pkcs11_precompile_errors(ci_yml: str) -> list[str]:
+    """Require the PKCS#11 binaries to be built, separately, before any filter."""
+
+    try:
+        steps = _WORKFLOW_STEP_BOUNDARY_RE.split(extract_job_body(ci_yml, PKCS11_JOB))
+    except RuntimeError as error:
+        return [str(error)]
+    positions: dict[str, list[int]] = {}
+    for index, step in enumerate(steps):
+        for name in (PKCS11_PRECOMPILE_STEP, PKCS11_SIGNER_STEP, PKCS11_PAIRING_STEP):
+            if step.startswith(f"      - name: {name}\n"):
+                positions.setdefault(name, []).append(index)
+    precompile = positions.get(PKCS11_PRECOMPILE_STEP, [])
+    signer = positions.get(PKCS11_SIGNER_STEP, [])
+    pairing = positions.get(PKCS11_PAIRING_STEP, [])
+    if not (
+        len(precompile) == len(signer) == len(pairing) == 1
+        and precompile[0] < signer[0] < pairing[0]
+        and _executable_step_lines(steps[precompile[0]]) == list(PKCS11_PRECOMPILE_LINES)
+    ):
+        return [
+            f"jobs.{PKCS11_JOB} must precompile the pkcs11 lib harness and the "
+            "unit_tests binary, one Cargo invocation each under "
+            "`set -euo pipefail`, before running either filter"
+        ]
+    return []
+
+
+def pkcs11_precompile_self_test(ci_yml: str) -> list[str]:
+    """Mutations of the real workflow that must fail the PKCS#11 contract."""
+
+    failures: list[str] = []
+    if pkcs11_precompile_errors(ci_yml):
+        return failures  # The repository check itself reports the failure.
+    lib_build = "          cargo test --features pkcs11 --lib --no-run\n"
+    unit_build = "          cargo test --features pkcs11 --test unit_tests --no-run\n"
+    body = extract_job_body(ci_yml, PKCS11_JOB)
+    steps = _WORKFLOW_STEP_BOUNDARY_RE.split(body)
+    precompile = next(
+        step for step in steps
+        if step.startswith(f"      - name: {PKCS11_PRECOMPILE_STEP}\n")
+    )
+    signer = next(
+        step for step in steps
+        if step.startswith(f"      - name: {PKCS11_SIGNER_STEP}\n")
+    )
+    reordered_body = body.replace(precompile, "", 1).replace(signer, signer + precompile, 1)
+    mutations = {
+        "combined invocation": (
+            lib_build + unit_build,
+            "          cargo test --features pkcs11 --lib --test unit_tests --no-run\n",
+        ),
+        "appended unit_tests target": (
+            lib_build,
+            "          cargo test --features pkcs11 --lib --no-run --test unit_tests\n",
+        ),
+        "commented lib build": (lib_build, "          # cargo test --features pkcs11 --lib --no-run\n"),
+        "echoed unit build": (unit_build, "          echo cargo test --features pkcs11 --test unit_tests --no-run\n"),
+        "suppressed failure": (unit_build, unit_build.rstrip("\n") + " || true\n"),
+        "missing pipefail": ("          set -euo pipefail\n          cargo test --features pkcs11 --lib", "          cargo test --features pkcs11 --lib"),
+        "disabled step": (
+            f"      - name: {PKCS11_PRECOMPILE_STEP}\n",
+            f"      - name: {PKCS11_PRECOMPILE_STEP}\n        if: false\n",
+        ),
+        "precompile after signer": (body, reordered_body),
+    }
+    for label, (before, after) in mutations.items():
+        if before not in ci_yml:
+            failures.append(f"PKCS#11 precompile self-test fixture is stale: {label}")
+            continue
+        if not pkcs11_precompile_errors(ci_yml.replace(before, after, 1)):
+            failures.append(f"PKCS#11 precompile contract accepted mutation: {label}")
+    return failures
+
+
 def main() -> int:
     ci_path = Path(".github/workflows/ci.yml")
     ci_yml = ci_path.read_text(encoding="utf-8")
@@ -1734,31 +1839,9 @@ def main() -> int:
     planner_errors.extend(unit_ci_contract_errors())
     planner_errors.extend(unit_ci_self_test())
 
-    # Both PKCS#11 libtest binaries are built before either filter runs, one
-    # Cargo invocation each: in a single invocation the library test harness
-    # and the plain library that unit_tests links compile side by side, and
-    # that pair of whole-crate rustc runs has exhausted the hosted runner.
-    pkcs11_body = extract_job_body(ci_yml, "test-pkcs11-softhsm")
-    pkcs11_precompile = "Precompile PKCS#11 signer and pairing test binaries"
-    pkcs11_lib_build = "cargo test --features pkcs11 --lib --no-run"
-    pkcs11_unit_build = "cargo test --features pkcs11 --test unit_tests --no-run"
-    pkcs11_signer = "Run PKCS#11 signer smoke test"
-    pkcs11_pairing = "Run PKCS#11 certificate-pairing tests"
-    if not (
-        pkcs11_body.count(pkcs11_lib_build) == 1
-        and pkcs11_body.count(pkcs11_unit_build) == 1
-        and "--features pkcs11 --lib --test unit_tests" not in pkcs11_body
-        and 0 <= pkcs11_body.find(pkcs11_precompile)
-        < pkcs11_body.find(pkcs11_lib_build)
-        < pkcs11_body.find(pkcs11_unit_build)
-        < pkcs11_body.find(pkcs11_signer)
-        < pkcs11_body.find(pkcs11_pairing)
-    ):
-        planner_errors.append(
-            "jobs.test-pkcs11-softhsm must precompile the pkcs11 lib harness and "
-            "the unit_tests binary, one Cargo invocation each, before running "
-            "either filter"
-        )
+    planner_errors.extend(pkcs11_precompile_errors(ci_yml))
+    planner_errors.extend(pkcs11_precompile_self_test(ci_yml))
+
     for job in sorted(REQUIRED_JOBS):
         if f"needs.{job}.result" not in aggregate_body:
             planner_errors.append(
