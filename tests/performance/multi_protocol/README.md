@@ -408,12 +408,12 @@ size, and waits through `host_settle.py` until at least 25 seconds have passed
 since the arm was up and the host has been quiet (under 0.2 cores busy) for
 three seconds, capped at 60 seconds. The clock starts when the start returns,
 so an image pull or a slow start cannot use up the minimum. The load is that
-long because the reaction needs it: in measured cells it began up to about 20
-seconds after an arm's first start, and with a three-second load it had not
-come by the release in 3 of 14 starts of one run and landed in pair 1 after
-all. With 20 seconds it came during the settle in all 15 `ferrum` and Envoy
-starts of a full-matrix run (3.3 to 6.0 CPU-seconds each), and no lane showed
-the dip in pair 1. Some images cost far more: Tyk's start drew 14 to 22
+long because the reaction needs it: in measured cells, under continuous load,
+the burst had run its course within about 20 seconds of an arm's first start,
+whereas with a three-second load it had not begun by the release in 3 of 14
+starts of one run and landed in pair 1 after all. With 20 seconds it came during the settle in all 21 `ferrum` and Envoy
+starts of two dispatches (3.3 to 6.0 CPU-seconds each), and none of their
+eleven lanes showed the dip in pair 1. Some images cost far more: Tyk's start drew 14 to 22
 CPU-seconds, which runs past the load and extends that hold to as much as 30
 seconds. Arms that share an image settle once, and the start uses the image with
 default arguments (Envoy with stream limit 100, `ferrum` without an experiment
@@ -424,10 +424,13 @@ again.
 
 The settle is best effort and cannot fail a run. Each start runs in a subshell
 of its own that removes what it started however it ends and writes nothing
-into the run directory; an arm that cannot start or be held is logged as
+into the run directory. An arm that cannot start or be held is logged as
 `[settle] <arm> was not settled`, skipped, and left for the measured pair to
-report. `host_settle.json` in the run directory records, per arm, how long the
-hold lasted and which processes used CPU. `host_processes_since_before_start`
+report. An interrupt during the hold takes the arm down at once; one during a
+start or the discarded load is acted on when that command returns, about 20
+seconds for the load and 90 at its timeout. `host_settle.json` in the run
+directory records, per arm, how long the hold lasted and which processes used
+CPU. `host_processes_since_before_start`
 covers the start, the load and the hold, and lists only processes that were
 already running before the arm started, so the provisioner's reaction shows
 there as `provjobd<digits>` with its CPU-seconds whether it came during the
@@ -590,10 +593,10 @@ or adaptive flags and therefore uses **2 pairs, adaptive off**.
 - Unmodelled order effects: equal mean position does not model drift or varying
   separation between compared arms; ratio noise can still vary across pairs.
 - Host disturbance outside the settle: the settle holds only each image's
-  first start, and nothing later in a run is prevented or flagged. In 28
+  first start, and nothing later in a run is prevented or flagged. In 31
   identical-code validation jobs (an in-run build against its own published
   image) two kinds were tied to the runner's CPU model:
-  - On all seven AMD EPYC 7763 runners, gateway and backend CPU dropped
+  - On all ten AMD EPYC 7763 runners, gateway and backend CPU dropped
     together by about 20% for up to two seconds every 60 seconds, whichever
     arm was running. `hv_kvp_daemon` is the likely cause: settle records on
     those runners show it using 0.8 to 1.3 CPU-seconds within one arm's
@@ -601,18 +604,18 @@ or adaptive flags and therefore uses **2 pairs, adaptive off**.
     sampled during a measured cell.
   - On five of six AMD EPYC 9V45 runners the two identical arms differed by
     between 4% and 25% in at least one pair with no dip in the timeline:
-    gateway and backend CPU seconds per request moved together, by up to 20%
-    between two samples of the same arm, with identical system calls per
-    request. The cause is not established.
+    gateway and backend CPU seconds per request moved together, by up to about
+    a third between two samples of the same arm, with the same number of system
+    calls per request. The cause is not established.
 
   A single sample can show the second kind on other runners too: one cell on a
   Xeon Platinum 8370C runner used 8% more gateway and backend CPU per request
   than the same arm's other pair, cause unknown. The two arms of that
   comparison are also separate builds of one commit, not one binary, so a
   consistent difference of a percent or two in one protocol can be real. In
-  the full-matrix run with the 20-second load the in-run arm read within 1.6%
-  of the image arm in four of eight lanes, +2.2% and +2.6% in two, and -3.4%
-  and -4.4% in two (the Xeon 8370C lane and an EPYC 7763 lane). Before
+  the eleven lanes run with the 20-second load the in-run arm read within 2%
+  of the image arm in seven, +2.2% and +2.6% in two, and -3.4% and -4.4% in
+  two (the Xeon 8370C lane and an EPYC 7763 lane). Before
   trusting a two-pair average, check the job's CPU model,
   `host_settle.json` for an arm the host did not react to, the `process_usage`
   timelines for dips, and CPU per request across pairs.

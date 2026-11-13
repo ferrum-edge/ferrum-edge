@@ -9,9 +9,9 @@ cell measured in that window loses 20-25% of its CPU. It hit whichever arm ran
 an image first, so always the same arms in pair 1.
 
 The runner therefore starts every distinct binary/image once before the first
-measured pair, drives a discarded load for as long as the reaction has been
-seen to take to begin, and calls this helper to wait, with the arm idle, until
-the host is quiet. The helper only reads `/proc`; it starts and stops nothing.
+measured pair, drives a discarded load for as long as the reaction took to run
+its course in measured cells, and calls this helper to wait, with the arm idle,
+until the host is quiet. The helper only reads `/proc`; it starts and stops nothing.
 
 Times are counted from `--since`: the moment the arm was up, taken by the
 runner after the start returned, so an image pull or a slow start cannot use
@@ -33,6 +33,7 @@ short for that host.
 
 import argparse
 import json
+import math
 import os
 import sys
 import time
@@ -181,14 +182,16 @@ def used_since_baseline(path, processes):
             baseline = json.load(handle)
         before = baseline["processes"]
         taken = float(baseline["unix"])
-        if not isinstance(before, dict):
+        if not isinstance(before, dict) or not math.isfinite(taken):
             raise ValueError("unexpected baseline")
     except (OSError, ValueError, KeyError, TypeError):
         return None
     used = {}
     for (pid, started), (comm, total) in processes.items():
         earlier = before.get(f"{pid}:{started}")
-        if not isinstance(earlier, list) or len(earlier) != 2:
+        # A baseline this helper did not write must not cost the hold its
+        # record: an entry that is not [comm, integer ticks] is skipped.
+        if not isinstance(earlier, list) or len(earlier) != 2 or type(earlier[1]) is not int:
             continue
         delta = total - earlier[1]
         if delta > 0:

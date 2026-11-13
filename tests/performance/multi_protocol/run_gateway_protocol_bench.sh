@@ -1445,11 +1445,12 @@ run_bench() {
 }
 
 # ── First-start settle ──────────────────────────────────────────────────────
-# Seconds of discarded load per first start. The host's reaction began up to
-# about 20 s into an arm's first measured cells, and with only a short load it
-# sometimes had not come by the time the arm was released (3 of 14 starts in
-# one run) and landed in pair 1 after all. The arm therefore carries traffic,
-# as it will in the measured cells, for that whole window.
+# Seconds of discarded load per first start. In measured cells, under
+# continuous load, the host's reaction began 2-12 s after an arm's first start
+# and had run its course within about 20 s. With only a short load it had
+# sometimes not begun by the time the arm was released (3 of 14 starts in one
+# run) and landed in pair 1 after all. The arm therefore carries traffic, as
+# it will in the measured cells, for that whole window.
 SETTLE_LOAD_SECONDS=20
 
 # Discarded client run against the arm that is currently up. Uses run_bench's

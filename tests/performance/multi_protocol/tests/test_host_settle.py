@@ -198,12 +198,35 @@ class WaitTests(unittest.TestCase):
             output = Path(temporary) / "host_settle.json"
             foreign = Path(temporary) / "foreign.json"
             foreign.write_text('{"processes": []}')
-            for baseline in (Path(temporary) / "absent.json", foreign):
+            timeless = Path(temporary) / "timeless.json"
+            timeless.write_text('{"unix": NaN, "processes": {}}')
+            for baseline in (Path(temporary) / "absent.json", foreign, timeless):
                 record = host_settle.wait(
                     self.arguments(root, output, baseline=str(baseline)), sleep=self.fail,
                     now=lambda: 1.0)
                 self.assertEqual(record["reason"], "quiet")
                 self.assertNotIn("host_processes_since_before_start", record)
+
+    def test_a_baseline_entry_of_the_wrong_shape_is_skipped_and_the_record_survives(self):
+        ticks = host_settle.clock_ticks()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "proc"
+            root.mkdir()
+            self.write_stat(root, 0, {77: ("provjobd123", 8 * ticks), 78: ("dockerd", 3 * ticks),
+                                      79: ("containerd", 2 * ticks)})
+            output = Path(temporary) / "host_settle.json"
+            baseline = Path(temporary) / "foreign.json"
+            # Ticks as text, as a boolean and as a float; one well-formed entry.
+            baseline.write_text(json.dumps({"unix": 0.5, "processes": {
+                "77:1": ["provjobd123", "500"], "78:1": ["dockerd", True],
+                "79:1": ["containerd", ticks]}}))
+            record = host_settle.wait(
+                self.arguments(root, output, baseline=str(baseline)), sleep=self.fail,
+                now=lambda: 1.0)
+            self.assertEqual(record["reason"], "quiet")
+            self.assertEqual(record["host_processes_since_before_start"],
+                             [{"comm": "containerd", "cpu_seconds": 1.0}])
+            self.assertEqual(json.loads(output.read_text())["arms"], [record])
 
     def test_proc_lost_during_the_hold_is_not_reported_as_observed(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -344,8 +367,9 @@ class RunnerContractTests(unittest.TestCase):
         self.assertNotRegex(section, r"pkill|killall|xargs")
 
     def test_the_discarded_load_covers_the_window_in_which_the_reaction_begins(self):
-        # Under measured load the reaction began up to about 20 s after an
-        # arm's first start; a 3 s load let 3 of 14 starts reach pair 1.
+        # Under measured load the reaction had run its course within about
+        # 20 s of an arm's first start; with a 3 s load it had not begun by
+        # the release in 3 of 14 starts and reached pair 1.
         seconds = int(re.search(r"^SETTLE_LOAD_SECONDS=(\d+)$", self.source, flags=re.MULTILINE).group(1))
         self.assertGreaterEqual(seconds, 20)
         load = self.source.split("settle_load() {", 1)[1].split("\n}\n", 1)[0]
