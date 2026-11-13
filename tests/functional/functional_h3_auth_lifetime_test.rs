@@ -357,7 +357,11 @@ async fn wait_for_h3_supported(harness: &GatewayHarness, timeout: Duration) -> O
 
 /// Wait until an H2/TLS-only backend is ready for the cross-protocol bridge.
 /// `unknown` and `unsupported` both keep native-H3 backend dispatch disabled;
-/// requiring H2/TLS support proves the capability refresh itself has settled.
+/// requiring H2/TLS support proves the refresh's HTTP/2 probe has finished, so
+/// the refresh opens no further TCP connection to the backend. Its HTTP/3
+/// probe may still be waiting out its timeout against the unbound UDP port
+/// (the HTTP/2 verdict is published first); that can only move `h3` from
+/// `unknown` to `unsupported`, never enable native HTTP/3.
 async fn wait_for_h2_bridge_ready(harness: &GatewayHarness, timeout: Duration) -> Option<Value> {
     let deadline = std::time::Instant::now() + timeout;
     loop {

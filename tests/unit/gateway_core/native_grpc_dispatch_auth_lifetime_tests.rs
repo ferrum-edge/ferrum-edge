@@ -2302,7 +2302,10 @@ fn native_h3_cold_connect_bound_keeps_dns_outside_and_quic_h3_readiness_inside()
         // Whitespace-insensitive: rustfmt puts a short creation closure on
         // one line (`boxed_h3_future(|| self.create_connection(..))`).
         assert!(compact_code(body).contains("boxed_h3_future(||"));
-        assert!(body.contains("self.create_or_get_sender(key, connect_at, create).await"));
+        assert!(
+            compact_code(body)
+                .contains("self.create_or_get_sender(key,drain_epoch,connect_at,create).await")
+        );
     }
     assert_eq!(
         client

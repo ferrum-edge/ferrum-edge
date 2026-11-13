@@ -276,6 +276,7 @@ shares.
   as a hit. Match the request line instead
   (`functional_graceful_shutdown_test.rs::is_client_request`).
 - Keep warmup true when tests require the capability registry to have a `Supported` entry before traffic, such as native H3 or direct H2 routing.
+- With warmup off, an HTTPS target's registry entry appears as soon as its HTTP/2 probe answers, with `plain_http.h3` still at its previous value (`unknown` on a first probe) until the HTTP/3 probe finishes. Poll for the exact field a test needs, never for "an entry exists" or for `h2_tls` as a proxy for "the refresh has settled". To hold the HTTP/3 probe open deterministically use `ScriptedH3BackendBuilder::hold_handshakes` / `release_handshakes` (`backend_capability_staged_commit_tests.rs`).
 
 ## Fuzz / property lane
 
