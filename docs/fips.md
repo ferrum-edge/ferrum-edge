@@ -54,20 +54,20 @@ The ordinary profile has one more AWS-LC edge, and it is a performance
 selection rather than a provider switch. `crypto-ring` enables
 `rustls/aws_lc_rs`, which compiles rustls's AWS-LC cipher suites next to its
 `ring` ones, and `src/fips/aead_backend.rs` installs one set or the other for
-the TLS record layer when the provider is bootstrapped: AWS-LC's on the x86-64
-CPUs where its AVX-512 AES-GCM measurably beats `ring`'s AVX2 one, `ring`'s
-everywhere else, or whichever `FERRUM_TLS_AEAD_BACKEND` names
+the record layer of TLS over TCP when the provider is bootstrapped: AWS-LC's on
+the x86-64 CPUs where its AVX-512 AES-GCM measurably beats `ring`'s AVX2 one,
+`ring`'s everywhere else, or whichever `FERRUM_TLS_AEAD_BACKEND` names
 ([details](frontend_tls.md#record-layer-cipher-suite-backend)). Key exchange,
-signature verification, the key provider and every dependency's own provider
-arm stay on `ring`, and no library is added: `aws-lc-sys` was already in this
+signature verification, the key provider, QUIC packet protection and every
+dependency's own provider arm stay on `ring`, and no library is added: `aws-lc-sys` was already in this
 profile through jsonwebtoken and dimpl. None of this is a validated-module
 claim. It is non-FIPS AWS-LC on a build whose `BUILD_CAPABLE` is `false`, and
 `FERRUM_FIPS_MODE=enforce` is refused on it exactly as before.
 
 **The FIPS profile is unchanged by that edge.** It still declares no `ring` arm
 on any dependency, its resolved graph is still audited for one, every cipher
-suite still comes from the AWS-LC FIPS module, and there is no second
-implementation to select between. `FERRUM_TLS_AEAD_BACKEND=auto` and `aws-lc`
+suite still comes from the AWS-LC FIPS module, QUIC packet protection
+included, and there is no second implementation to select between. `FERRUM_TLS_AEAD_BACKEND=auto` and `aws-lc`
 are no-ops on a FIPS build; `ring` is refused at startup and by `validate`
 rather than ignored, because the build cannot honour it.
 

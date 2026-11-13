@@ -9,11 +9,43 @@
 //! ordinary build links rustls's AWS-LC cipher suites **beside** `ring`'s and
 //! chooses between them once, at process bootstrap, from the CPU it runs on.
 //!
-//! Only the provider's `cipher_suites` are replaced — the record-layer AEAD and
-//! the HKDF/PRF hash each suite carries, including the QUIC packet and header
-//! keys a TLS 1.3 suite supplies. Key-exchange groups, signature verification,
-//! the key provider, the secure random source, and the session ticketer stay on
-//! `ring`, exactly as before.
+//! Only the provider's `cipher_suites` are replaced, and only the part of each
+//! that serves TLS over TCP: the record-layer AEAD and the HKDF/PRF hash the
+//! suite carries. Key-exchange groups, signature verification, the key
+//! provider, the secure random source, and the session ticketer stay on `ring`,
+//! exactly as before.
+//!
+//! # QUIC packet protection stays on `ring`
+//!
+//! A TLS 1.3 suite also names the implementation that protects QUIC packets
+//! (the packet AEAD and the header-protection cipher). On the ordinary build
+//! that part is always `ring`'s, whatever the selection and whatever
+//! `FERRUM_TLS_AEAD_BACKEND` asks for. When AWS-LC is selected, each TLS 1.3
+//! suite the provider carries is AWS-LC's record layer with `ring`'s QUIC
+//! algorithm in place of AWS-LC's (`ordinary_profile_provider` builds them).
+//!
+//! The reason is a measurement, not a principle. QUIC packets are about
+//! 1.2 KiB, and on the two CPUs where it was measured with six paired samples
+//! per job (AMD Zen 4 and Zen 5, both selected by `auto`) HTTP/3 through
+//! AWS-LC's packet protection was 2-4% slower than through `ring`'s, while
+//! every TCP protocol was faster on AWS-LC. `docs/frontend_tls.md` records the
+//! runs. Because the rule lives in the suites, it reaches every QUIC user
+//! without any of them choosing a provider:
+//!
+//! - the HTTP/3 frontend listener: proxied requests, the CONNECT-UDP tunnels
+//!   that ride it, and the QUIC server configuration a certificate reload
+//!   rebuilds;
+//! - the HTTP/3 backend connection pool: proxied requests, pool warmup, and
+//!   backend capability probes, in every mode that proxies, mesh included;
+//! - `tls::validate_backend_tls_policy_for_quic`, which builds a QUIC client
+//!   configuration to check a backend TLS policy.
+//!
+//! The UDP stream proxy forwards QUIC datagrams without decrypting them, and
+//! DTLS runs on `dimpl`, so neither is a QUIC user in this sense.
+//!
+//! What still follows the selection inside a QUIC connection is the TLS 1.3
+//! handshake's key schedule and transcript hash, which run once per connection
+//! (and per key update), not per packet.
 //!
 //! This is a performance selection on a build that makes no validation claim.
 //! It does not touch the `fips` profile: there every suite already comes from
@@ -121,8 +153,8 @@ impl AeadBackendRequest {
 pub enum AeadBackend {
     /// `ring`'s cipher suites (ordinary build).
     Ring,
-    /// AWS-LC's cipher suites beside `ring`'s key exchange and signatures
-    /// (ordinary build).
+    /// AWS-LC's record layer beside `ring`'s key exchange, signatures, and
+    /// QUIC packet protection (ordinary build).
     AwsLc,
     /// The AWS-LC FIPS module, which serves every suite on a `fips` build.
     AwsLcFips,
@@ -507,6 +539,19 @@ impl AeadSelection {
     pub fn forces_aws_lc_against_auto(&self) -> bool {
         self.backend == AeadBackend::AwsLc && self.auto.backend != AeadBackend::AwsLc
     }
+
+    /// The implementation that protects QUIC packets in this process.
+    ///
+    /// On the ordinary build this is `ring` whatever [`Self::backend`] is: the
+    /// selection moves the TLS-over-TCP record layer only (see the module
+    /// documentation). On the `fips` profile it is the AWS-LC FIPS module, the
+    /// only implementation that build links.
+    pub fn quic_packet_protection(&self) -> AeadBackend {
+        match self.backend {
+            AeadBackend::Ring | AeadBackend::AwsLc => AeadBackend::Ring,
+            AeadBackend::AwsLcFips => AeadBackend::AwsLcFips,
+        }
+    }
 }
 
 /// A request this build cannot honour.
@@ -687,24 +732,90 @@ pub fn verify_resolved_request(resolved: AeadBackendRequest) -> Result<(), Strin
 
 /// Build the ordinary profile's provider with the given record-layer backend.
 ///
-/// [`AeadBackend::AwsLc`] replaces each of `ring`'s cipher suites with AWS-LC's
-/// implementation of the same suite, in place, so the suite set and its order
-/// are unchanged and only the implementation differs. Everything else in the
-/// provider is `ring`'s.
+/// [`AeadBackend::AwsLc`] replaces each of `ring`'s cipher suites, in place, so
+/// the suite set and its order are unchanged and only the implementation
+/// differs:
+///
+/// - a TLS 1.2 suite becomes AWS-LC's implementation of the same suite;
+/// - a TLS 1.3 suite becomes AWS-LC's record layer with `ring`'s QUIC packet
+///   protection (see [`aws_lc_tls13_suites_with_ring_quic`]).
+///
+/// Everything else in the provider is `ring`'s.
 #[cfg(all(feature = "crypto-ring", not(feature = "fips")))]
 pub(super) fn ordinary_profile_provider(backend: AeadBackend) -> CryptoProvider {
     let mut provider = rustls::crypto::ring::default_provider();
     if backend == AeadBackend::AwsLc {
         for suite in provider.cipher_suites.iter_mut() {
-            if let Some(replacement) = rustls::crypto::aws_lc_rs::ALL_CIPHER_SUITES
-                .iter()
-                .find(|candidate| candidate.suite() == suite.suite())
-            {
-                *suite = *replacement;
-            }
+            *suite = aws_lc_record_layer_suite(*suite);
         }
     }
     provider
+}
+
+/// The suite that serves `ring_suite`'s identifier when AWS-LC is selected.
+///
+/// A suite AWS-LC does not implement is returned unchanged; with the suite
+/// tables rustls ships, every `ring` suite has an AWS-LC counterpart.
+#[cfg(all(feature = "crypto-ring", not(feature = "fips")))]
+fn aws_lc_record_layer_suite(
+    ring_suite: rustls::SupportedCipherSuite,
+) -> rustls::SupportedCipherSuite {
+    let id = ring_suite.suite();
+    match ring_suite {
+        // Never AWS-LC's own TLS 1.3 suite object: that one carries AWS-LC's
+        // QUIC packet protection.
+        rustls::SupportedCipherSuite::Tls13(_) => aws_lc_tls13_suites_with_ring_quic()
+            .iter()
+            .find(|suite| suite.common.suite == id)
+            .map_or(ring_suite, rustls::SupportedCipherSuite::Tls13),
+        _ => rustls::crypto::aws_lc_rs::ALL_CIPHER_SUITES
+            .iter()
+            .find(|candidate| candidate.suite() == id)
+            .copied()
+            .unwrap_or(ring_suite),
+    }
+}
+
+/// The TLS 1.3 suites the ordinary build serves when AWS-LC is selected:
+/// AWS-LC's record layer with `ring`'s QUIC packet protection.
+///
+/// A `rustls::Tls13CipherSuite` names four implementations: the transcript
+/// hash, the HKDF, the record-layer AEAD (`aead_alg`, used by TLS over TCP),
+/// and the QUIC algorithm (`quic`, which makes the packet and
+/// header-protection keys a QUIC connection uses). The first three are taken
+/// from AWS-LC's suite and the fourth from `ring`'s suite of the same
+/// identifier. rustls derives the QUIC key material with the suite's HKDF and
+/// hands the raw key bytes to the QUIC algorithm, so the two halves need not
+/// come from the same library, and a peer cannot tell: the bytes on the wire
+/// are those of the suite either way.
+///
+/// Built once and kept for the life of the process, because rustls refers to a
+/// suite by `&'static` reference.
+#[cfg(all(feature = "crypto-ring", not(feature = "fips")))]
+fn aws_lc_tls13_suites_with_ring_quic() -> &'static [rustls::Tls13CipherSuite] {
+    static SUITES: OnceLock<Vec<rustls::Tls13CipherSuite>> = OnceLock::new();
+    SUITES.get_or_init(|| {
+        rustls::crypto::ring::ALL_CIPHER_SUITES
+            .iter()
+            .filter_map(|ring_suite| {
+                let ring = ring_suite.tls13()?;
+                let aws_lc = rustls::crypto::aws_lc_rs::ALL_CIPHER_SUITES
+                    .iter()
+                    .find(|candidate| candidate.suite() == ring.common.suite)?
+                    .tls13()?;
+                Some(rustls::Tls13CipherSuite {
+                    common: rustls::CipherSuiteCommon {
+                        suite: aws_lc.common.suite,
+                        hash_provider: aws_lc.common.hash_provider,
+                        confidentiality_limit: aws_lc.common.confidentiality_limit,
+                    },
+                    hkdf_provider: aws_lc.hkdf_provider,
+                    aead_alg: aws_lc.aead_alg,
+                    quic: ring.quic,
+                })
+            })
+            .collect()
+    })
 }
 
 /// Build a provider with an explicit record-layer backend, independent of the
@@ -733,8 +844,12 @@ pub fn crypto_provider_with_backend(backend: AeadBackend) -> Option<CryptoProvid
 }
 
 /// Emit the startup record of the selection: one `info!` with the choice, the
-/// reason, and the CPU facts behind it, plus a `warn!` when an explicit request
-/// forces AWS-LC onto a CPU where `auto` keeps `ring`.
+/// reason, the CPU facts behind it, and the implementation that protects QUIC
+/// packets, plus a `warn!` when an explicit request forces AWS-LC onto a CPU
+/// where `auto` keeps `ring`.
+///
+/// `quic_packet_protection` is last so the leading `backend=…, requested=…,
+/// reason=…` run reads as it did before the field existed.
 ///
 /// Called once from gateway startup, after tracing is initialised. Every
 /// rendered value is from a fixed set or is a CPUID number. The requested value
@@ -746,7 +861,8 @@ pub fn log_startup_selection() {
         crate::secrets::report_env_field(TLS_AEAD_BACKEND_ENV, selection.request.as_str());
     tracing::info!(
         "TLS record-layer cipher suites: backend={}, requested={}, reason={}, target={}, \
-         cpu_vendor={}, cpu_family={}, cpu_model={}, avx512_aes_gcm_features={}",
+         cpu_vendor={}, cpu_family={}, cpu_model={}, avx512_aes_gcm_features={}, \
+         quic_packet_protection={}",
         selection.backend.as_str(),
         requested,
         selection.reason.as_str(),
@@ -759,13 +875,15 @@ pub fn log_startup_selection() {
         } else {
             "absent"
         },
+        selection.quic_packet_protection().as_str(),
     );
     if selection.forces_aws_lc_against_auto() {
         tracing::warn!(
             "`{TLS_AEAD_BACKEND_ENV}` forces the AWS-LC TLS record-layer cipher suites on a CPU \
              where `auto` keeps ring (auto_reason={}). AWS-LC is faster than ring only where its \
              AVX-512 AES-GCM runs and does not lower the clock; elsewhere it measured slower. \
-             Unset the variable to return to the CPU-based default.",
+             Unset the variable to return to the CPU-based default. QUIC packet protection is \
+             not affected: it stays on ring.",
             selection.auto.reason.as_str(),
         );
     }

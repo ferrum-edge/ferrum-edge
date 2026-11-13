@@ -1469,23 +1469,26 @@ openssl s_client -connect localhost:8443 -cipher 'ALL' -tls1_2
 ### Record-layer cipher-suite backend
 
 The ordinary (non-FIPS) build links two implementations of every TLS cipher
-suite, `ring`'s and AWS-LC's, and picks one of them once per process. The
-choice is about speed only: the suites, their order, the negotiated protocol
-and everything on the wire are identical either way, and the settings above
-apply unchanged.
+suite, `ring`'s and AWS-LC's, and picks one of them for TLS over TCP once per
+process. The choice is about speed only: the suites, their order, the
+negotiated protocol and everything on the wire are identical either way, and
+the settings above apply unchanged. QUIC packet protection is not part of the
+choice: it always runs on `ring` (see [QUIC stays on `ring`](#quic-stays-on-ring)).
 
-The selection covers every TLS configuration Ferrum builds (proxy and admin
-listeners, HTTP/3, backend connections, health probes, CP/DP and mesh, log
+The selection covers every TLS-over-TCP configuration Ferrum builds (proxy and
+admin listeners, backend connections, health probes, CP/DP and mesh, log
 sinks) and every library client that takes rustls's process-default provider.
+HTTP/3 is built from the same provider, but its packets are not protected by
+the selected implementation.
 A dependency that names its own provider keeps `ring`'s suites regardless; the
 SQL config-database client (sqlx) is one.
 
-Only the record layer moves: the AEAD and the HKDF/PRF hash a suite carries,
-which for TLS 1.3 includes the QUIC packet and header-protection keys HTTP/3
-uses. Key exchange, signature verification, the private-key provider, the
-random source and the session ticketer stay on `ring`. DTLS is unaffected (it
-runs on `dimpl`), and so is a kTLS-offloaded TCP+TLS leg after its handshake,
-because the kernel then does the record layer.
+Only the record layer of TLS over TCP moves: the AEAD and the HKDF/PRF hash a
+suite carries. Key exchange, signature verification, the private-key provider,
+the random source and the session ticketer stay on `ring`, and so do the QUIC
+packet and header-protection keys HTTP/3 uses. DTLS is unaffected (it runs on
+`dimpl`), and so is a kTLS-offloaded TCP+TLS leg after its handshake, because
+the kernel then does the record layer.
 
 **Why it is chosen per CPU.** `ring` implements AES-GCM on x86-64 with VAES
 over 256-bit (AVX2) vectors. AWS-LC has an AVX-512 implementation instead and
@@ -1498,7 +1501,7 @@ therefore faster on some CPUs and clearly slower on others.
 |-------|-----------|
 | `auto` (default) | AWS-LC when **all** of these hold, `ring` otherwise: the target is x86-64 and neither Windows nor macOS (AWS-LC does not use its AVX-512 AES-GCM on either); the CPU and OS expose VAES, VPCLMULQDQ and AVX-512 F, DQ, BW and VL (the features AWS-LC itself requires before it uses that code); and the CPU is on the allow-list: AMD family 19h with those features (Zen 4) and family 1Ah (Zen 5), Intel Sapphire Rapids, Emerald Rapids, Granite Rapids and Granite Rapids-D |
 | `ring` | Always `ring` |
-| `aws-lc` | Always AWS-LC. Honoured even where `auto` keeps `ring`, with a startup `WARN`, because it is expected to be slower there |
+| `aws-lc` | Always AWS-LC for TLS over TCP. Honoured even where `auto` keeps `ring`, with a startup `WARN`, because it is expected to be slower there. It does not move QUIC, which stays on `ring` |
 
 The feature bits alone are not enough, which is why there is an allow-list.
 Intel Ice Lake reports every feature above and showed no net gain when measured
@@ -1520,7 +1523,9 @@ Each row is one job that ran the same binary on one runner with `ring` forced
 and with `aws-lc` forced. The figures are AWS-LC relative to `ring`, for gateway
 CPU per request and for throughput, at 10 KiB / 70 KiB / 512 KiB / 1 MiB / 5 MiB
 payloads. In the rows where `auto` keeps `ring`, they are what forcing `aws-lc`
-would cost.
+would cost. The HTTP/3 measurements are in their own table under
+[QUIC stays on `ring`](#quic-stays-on-ring), because they describe a build in
+which QUIC still followed the selection.
 
 | Runner CPU | `auto` | Protocol | CPU per request | Throughput |
 |------------|--------|----------|-----------------|------------|
@@ -1529,16 +1534,13 @@ would cost.
 | AMD EPYC 9V45 (Zen 5) | AWS-LC | gRPC | −2% / −6% / −8% / −9% / −7% | +6% / +2% / +3% / +3% / +1% |
 | AMD EPYC 9V45 (Zen 5) | AWS-LC | gRPC | −1% / −6% / −7% / −9% / −11% | +4% / +3% / +2% / +4% / +6% |
 | AMD EPYC 9V74 (Zen 4) | AWS-LC | gRPC | +1% / −3% / −5% / −6% / −7% | +3% / +1% / 0% / +1% / +2% |
-| AMD EPYC 9V74 (Zen 4) | AWS-LC | HTTP/3 | +2% / +2% / −1% / −3% / 0% | +1% / −1% / +1% / +4% / +1% |
 | Intel Xeon 6975P-C (Granite Rapids) | AWS-LC | TCP+TLS | −4% / −6% / −8% / −8% / −9% | +2% / +7% / +3% / +2% / +3% |
 | Intel Xeon 8573C (Emerald Rapids) | AWS-LC | HTTP/1.1 over TLS | −1% / −4% / −7% / −7% / −9% | +6% / +2% / +3% / +2% / +3% |
 | Intel Xeon 8573C (Emerald Rapids) | AWS-LC | HTTP/2 | +1% / −1% / −4% / −4% / −4% | −1% / +4% / +1% / +1% / +3% |
-| AMD EPYC 9V74, AVX-512 hidden from the VM | `ring` | HTTP/3 | +9% / +12% / +14% / +14% / +14% | −6% / −6% / −8% / −7% / −8% |
 | AMD EPYC 7763 (Zen 3, no AVX-512) | `ring` | TCP+TLS | +17% / +28% / +30% / +33% / +40% | +1% / −14% / −10% / −12% / −11% |
 | AMD EPYC 7763 (Zen 3, no AVX-512) | `ring` | HTTP/1.1 over TLS | +8% / +18% / +30% / +36% / +39% | +2% / −9% / −12% / −17% / −13% |
 | AMD EPYC 7763 (Zen 3, no AVX-512) | `ring` | HTTP/1.1 over TLS | +8% / +17% / +32% / +32% / +35% | 0% / −8% / −13% / −12% / −11% |
 | AMD EPYC 7763 (Zen 3, no AVX-512) | `ring` | HTTP/2 | +11% / +19% / +26% / +28% / +30% | −1% / −9% / −10% / −13% / −12% |
-| AMD EPYC 7763 (Zen 3, no AVX-512) | `ring` | HTTP/3 | +9% / +16% / +19% / +17% / +15% | −5% / −5% / −12% / −10% / −11% |
 | Intel Xeon 8370C (Ice Lake) | `ring` | TCP+TLS (earlier run) | +4% / −6% / −5% / −4% / −3% | −5% / +5% / −1% / −2% / −4% |
 
 Every job except the Ice Lake one also ran a third arm with `auto`. It selected
@@ -1555,31 +1557,32 @@ running the same code differed by up to about 5% in single cells of these runs
   the 10 KiB HTTP and gRPC results are within noise except on Zen 5, where
   HTTP/2 used about 5% less CPU. The handshake, framing and syscalls dominate at
   that size and those do not move.
-- It made no measurable difference to HTTP/3 on the one qualifying CPU it was
-  measured on (Zen 4). QUIC packets are about 1.2 KB, too small for the 512-bit
-  path to matter. HTTP/3 follows the same selection anyway, so a process has
-  one implementation, not two.
+- It does not apply to HTTP/3. QUIC packet protection stays on `ring` on every
+  CPU, because AWS-LC's measured slower there even where it wins for TCP (next
+  section).
 - On Ice Lake the CPU saving did not turn into throughput, which was lower at
   four of the five sizes, so `auto` keeps `ring` there.
-- Without AVX-512 AWS-LC is slower at every size and on every protocol,
-  HTTP/3 included: 8–40% more gateway CPU per request and up to 17% less
-  throughput on Zen 3. That is the case `auto` exists to avoid and the reason
-  `aws-lc` logs a warning there.
+- Without AVX-512 AWS-LC is slower at every size and on every TCP protocol:
+  8–40% more gateway CPU per request and up to 17% less throughput on Zen 3.
+  That is the case `auto` exists to avoid and the reason `aws-lc` logs a
+  warning there.
 - The CPU model is not enough on its own. One runner reported an EPYC 9V74 with
   the AVX-512 features absent, because the VM did not expose them, and AWS-LC
-  cost 9–14% more CPU per request there. `auto` reads the features the process
-  can actually use, so it kept `ring` on that machine and chose AWS-LC on the
-  other 9V74s.
+  cost 9–14% more CPU per request there (an HTTP/3 job, from when QUIC followed
+  the selection). `auto` reads the features the process can actually use, so it
+  kept `ring` on that machine and chose AWS-LC on the other 9V74s.
 - Nothing changes on non-x86-64 targets, on Windows or on macOS.
 
 The selection is made once, when the crypto provider is installed, and cannot
 change without a restart. It is recorded at startup at INFO:
 
 ```
-TLS record-layer cipher suites: backend=aws-lc, requested=auto, reason=cpu-qualified, target=x86_64, cpu_vendor=amd, cpu_family=26, cpu_model=2, avx512_aes_gcm_features=present
+TLS record-layer cipher suites: backend=aws-lc, requested=auto, reason=cpu-qualified, target=x86_64, cpu_vendor=amd, cpu_family=26, cpu_model=2, avx512_aes_gcm_features=present, quic_packet_protection=ring
 ```
 
-`reason` is one of `cpu-qualified`, `cpu-features-missing`,
+`backend` is what serves TLS over TCP. `quic_packet_protection` is what
+protects QUIC packets: `ring` on the ordinary build whatever `backend` says,
+and `aws-lc-fips` on a FIPS build. `reason` is one of `cpu-qualified`, `cpu-features-missing`,
 `intel-pre-sapphire-rapids`, `cpu-not-listed`, `not-x86-64`, `windows-target`,
 `apple-target`, `operator-override` or `fips-build`. INFO is hidden at the default
 `FERRUM_LOG_LEVEL=warn`; `FERRUM_LOG_LEVEL=warn,ferrum_edge::fips::aead_backend=info`
@@ -1600,9 +1603,49 @@ exits before the provider is bootstrapped and builds its probe client on the
 build's baseline provider (`ring` on the ordinary build), so the variable,
 valid or not, has no effect on it.
 
-On a FIPS build every cipher suite comes from the AWS-LC FIPS module and `ring`
-is not linked. `auto` and `aws-lc` change nothing there, and `ring` is refused.
-See [FIPS mode](fips.md).
+On a FIPS build every cipher suite comes from the AWS-LC FIPS module, QUIC
+packet protection included, and `ring` is not linked. `auto` and `aws-lc`
+change nothing there, and `ring` is refused. See [FIPS mode](fips.md).
+
+#### QUIC stays on `ring`
+
+On the ordinary build QUIC packets are always protected by `ring`: the packet
+AEAD and the header-protection cipher. `FERRUM_TLS_AEAD_BACKEND` does not
+change that, and neither does an explicit `aws-lc`; no setting moves QUIC to
+AWS-LC. It covers every QUIC connection the gateway makes or accepts:
+
+- the HTTP/3 frontend listener: proxied requests, the CONNECT-UDP tunnels that
+  ride it, and the QUIC configuration a certificate reload rebuilds;
+- HTTP/3 backend connections: proxied requests, pool warmup and backend
+  capability probes, in every mode that proxies, mesh included.
+
+The UDP stream proxy forwards QUIC datagrams without decrypting them, so it is
+not affected either way.
+
+The reason is a measurement. QUIC packets are about 1.2 KiB, and on the CPUs
+where `auto` selects AWS-LC, HTTP/3 was slower with AWS-LC's packet protection
+than with `ring`'s, while every TCP protocol was faster. The first HTTP/3 job
+(two paired samples, Zen 4) read as no change; two jobs with six paired
+samples each resolved it. Each row is one job on one runner, the same binary
+with `auto` (QUIC on AWS-LC at the time) against `ring`, mean of the paired
+ratio at 10 KiB / 70 KiB / 512 KiB / 1 MiB / 5 MiB:
+
+| Runner CPU | QUIC packet protection compared | CPU per request | Throughput |
+|------------|---------------------------------|-----------------|------------|
+| AMD EPYC 9V74 (Zen 4) | AWS-LC against `ring` | +5.3% / +4.0% / +3.8% / +3.4% / +2.8% | −3.8% / −2.8% / −3.0% / −2.6% / −1.8% |
+| AMD EPYC 9V45 (Zen 5) | AWS-LC against `ring` | +2.3% / +1.7% / +3.6% / +4.5% / +3.9% | −1.9% / −0.9% / −3.0% / −3.9% / −3.1% |
+| AMD EPYC 9V74, AVX-512 hidden from the VM | `ring` against `ring` (control) | within ±1.3% | within ±0.6% |
+| AMD EPYC 7763 (Zen 3, no AVX-512) | `ring` against `ring` (control) | within ±1.3% | within ±0.6% |
+
+The standard error of each cell in the first two rows is 0.5 to 1.3 points.
+Earlier two-pair jobs with `aws-lc` forced showed the same direction on
+CPUs without AVX-512: 9–19% more CPU per request on a Zen 3 and on a Zen 4
+whose VM hid AVX-512. Intel CPUs on the allow-list were not measured for
+HTTP/3. Where in QUIC the extra cost arises was not profiled.
+
+What still follows the selection inside a QUIC connection is the TLS 1.3
+handshake's key schedule and transcript hash, which run once per connection
+and per key update, not per packet.
 
 ## Integration with Load Balancers
 
