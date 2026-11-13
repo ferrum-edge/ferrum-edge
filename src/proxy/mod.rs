@@ -12496,6 +12496,12 @@ impl ProxyState {
                 // Without this, a backend with slow TLS + slow QUIC would
                 // double the per-target wall-clock; `for_each_concurrent`
                 // only parallelizes *across* targets, not within one.
+                //
+                // The H3 pool's drain epoch is sampled before the TLS
+                // configuration is read, so a drain between this read and
+                // the probe's create fences it (see
+                // `Http3ConnectionPool::drain_epoch`).
+                let h3_drain_epoch = self.h3_pool.drain_epoch();
                 let tls_config_result = self
                     .connection_pool
                     .get_tls_config_for_backend(&probe_proxy)
@@ -12517,6 +12523,7 @@ impl ProxyState {
                     &probe_proxy,
                     probe_timeout,
                     tls_config_result,
+                    h3_drain_epoch,
                     host,
                     port,
                     previous_h3,
@@ -12850,11 +12857,14 @@ impl ProxyState {
     /// downgrade or a preserved-but-stale record, and both are worth seeing in
     /// `GET /backend-capabilities`. Expected "this backend has no QUIC
     /// listener" outcomes stay silent (see `probe_backend_capabilities`).
+    #[allow(clippy::too_many_arguments)]
     async fn probe_h3(
         h3_pool: &Arc<Http3ConnectionPool>,
         probe_proxy: &Proxy,
         probe_timeout: Duration,
         tls_config_result: Result<Arc<rustls::ClientConfig>, anyhow::Error>,
+        // `h3_pool.drain_epoch()` sampled before `tls_config_result` was read.
+        drain_epoch: u64,
         host: &str,
         port: u16,
         previous_h3: Option<ProtocolSupport>,
@@ -12878,7 +12888,7 @@ impl ProxyState {
 
         match tokio::time::timeout(
             probe_timeout,
-            h3_pool.warmup_connection(probe_proxy, &tls_config),
+            h3_pool.warmup_connection(probe_proxy, &tls_config, drain_epoch),
         )
         .await
         {

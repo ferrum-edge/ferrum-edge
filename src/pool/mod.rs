@@ -1137,38 +1137,26 @@ impl<M: PoolManager> GenericPool<M> {
         let drain_epoch = self.drain_epoch();
         match self.lookup_or_build_key(build_key) {
             LookupOutcome::Hit(conn) => Ok(conn),
-            LookupOutcome::Miss(key) => self.create_for_built_key(key, drain_epoch, create).await,
+            LookupOutcome::Miss(key) => {
+                self.create_or_get_existing_owned_sampled_as(
+                    key,
+                    drain_epoch,
+                    PoolCreateCaller::Request,
+                    create,
+                )
+                .await
+            }
             LookupOutcome::Unhealthy(key) => {
                 self.invalidate(&key);
-                self.create_for_built_key(key, drain_epoch, create).await
+                self.create_or_get_existing_owned_sampled_as(
+                    key,
+                    drain_epoch,
+                    PoolCreateCaller::Request,
+                    create,
+                )
+                .await
             }
         }
-    }
-
-    /// The cache-miss half of [`Self::get_with`]: a request-path create whose
-    /// drain-epoch sample predates the key build.
-    async fn create_for_built_key<C, Fut, E>(
-        &self,
-        key: String,
-        drain_epoch: u64,
-        create: C,
-    ) -> std::result::Result<M::Connection, E>
-    where
-        C: FnOnce(String) -> Fut,
-        Fut: std::future::Future<Output = std::result::Result<M::Connection, E>>,
-        E: ShareablePoolCreateError + From<SharedPoolCreateError>,
-    {
-        self.create_or_get_existing_owned_budgeted(
-            key,
-            CreateBudget::Request,
-            Some(drain_epoch),
-            PoolCreateCaller::Request,
-            |_| {},
-            |_| {},
-            |_| None,
-            |key, _attempt| create(key),
-        )
-        .await
     }
 
     /// Specialized cache-miss path for pools that need extra per-call
@@ -1214,6 +1202,37 @@ impl<M: PoolManager> GenericPool<M> {
             key,
             CreateBudget::Request,
             None,
+            caller,
+            |_| {},
+            |_| {},
+            |_| None,
+            |key, _attempt| create(key),
+        )
+        .await
+    }
+
+    /// As [`Self::create_or_get_existing_owned_as`], for a caller that read a
+    /// dial input a drain retires before it reached the pool: the SVID
+    /// generation `key` was built from, or a backend TLS configuration its
+    /// `create` closure already holds. `drain_epoch` is the
+    /// [`Self::drain_epoch`] sample it took before the first such read, so a
+    /// drain between that read and this call fences the create.
+    pub(crate) async fn create_or_get_existing_owned_sampled_as<C, Fut, E>(
+        &self,
+        key: String,
+        drain_epoch: u64,
+        caller: PoolCreateCaller,
+        create: C,
+    ) -> std::result::Result<M::Connection, E>
+    where
+        C: FnOnce(String) -> Fut,
+        Fut: std::future::Future<Output = std::result::Result<M::Connection, E>>,
+        E: ShareablePoolCreateError + From<SharedPoolCreateError>,
+    {
+        self.create_or_get_existing_owned_budgeted(
+            key,
+            CreateBudget::Request,
+            Some(drain_epoch),
             caller,
             |_| {},
             |_| {},

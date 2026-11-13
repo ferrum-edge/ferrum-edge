@@ -611,11 +611,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   configuration it had started with, and later requests could reuse it. A
   create that had entered the pool before the drain, or a request that waited
   on one and dialled after it, now hands its connection to its own caller
-  only. Two older, narrower windows are not yet covered: the HTTP/3 pool
-  reads its TLS configuration and SVID generation just before entering the
-  pool, and the direct HTTP/1.1 pool's idle lanes sit outside this fence, so
-  a create or checkout that straddles a drain at exactly that point can still
-  be pooled.
+  only. So does an HTTP/3 request that read its TLS configuration or SVID
+  generation just before the drain and entered the pool just after it. A
+  direct HTTP/1.1 checkout that read the outgoing SVID generation just before
+  a generation drain used to pool its connection under the drained
+  generation's key, where it sat unused until idle expiry; that connection is
+  now closed when its request finishes.
 - An `api_chargeback_sink` with `clickhouse.tls.verify_hostname: false` and
   neither `clickhouse.tls.ca_file` nor `clickhouse.tls.insecure_skip_verify:
   true` is now refused at admission with a message naming both remedies. It
