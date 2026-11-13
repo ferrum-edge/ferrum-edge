@@ -478,16 +478,62 @@ class PeriodicRule(unittest.TestCase):
         self.assertEqual(marked, [0, 1.5, 60, 120])
 
     def test_gaps_must_stay_within_the_tolerance_of_the_period(self):
+        # The looser tolerance lets an event join a series; it never makes one.
         self.assertEqual(self.periodic([0, 63, 126]), (None, []))
+        self.assertEqual(self.periodic([0, 56.6, 113.2]), (None, []))
         self.assertEqual(self.periodic([])[0], None)
 
-    def test_a_period_that_wanders_is_followed_gap_by_gap_and_fitted(self):
+    def test_sampler_times_that_are_not_finite_are_skipped_not_fatal(self):
+        timeline = series()
+        timeline[6]["unix_secs"] = float("nan")
+        row = host_disturbance.analyse_sample(*sample_with(timeline))
+        self.assertEqual(row["flags"], [])
+        self.assertIn("gateway_cpu_us_per_request", row)
+
+    def test_a_period_that_wanders_is_followed_from_event_to_event(self):
         # Start times from a hosted EPYC 7763 run: gaps of 59.1 to 62.4 s, the
         # last event 2.4 s late against a fixed 60 s comb from the first.
         found, marked = self.periodic([15.9, 195.7, 254.8, 315.4, 375.9, 438.3])
         self.assertEqual((found["events"], found["consecutive_periods"]), (6, 5))
-        self.assertAlmostEqual(found["fitted_period_seconds"], 60.2, delta=0.1)
         self.assertEqual(len(marked), 6)
+        # Bursts from another hosted run. The second is 3.5 s early for the
+        # third, but one period after the first, which is two before the third.
+        found, marked = self.periodic([0, 61.985, 118.513, 179.1, 238.21])
+        self.assertEqual((found["events"], found["consecutive_periods"]), (5, 5))
+        self.assertEqual(len(marked), 5)
+        # And another: the fourth is 62.7 s after the third, too far to be
+        # "one period later" on the strict test that establishes a series, but
+        # within the looser one that lets an event join an established series.
+        times = [0, 60.07, 120.37, 183.09, 239.61]
+        found, marked = self.periodic(times)
+        self.assertEqual((found["events"], found["consecutive_periods"]), (5, 5))
+        self.assertEqual(marked, times)
+        # Gaps alternating 57.5 and 62.5 s: no straight comb fits them all,
+        # and every one of them is a period after the last.
+        times = [0, 57.5, 115, 172.5, 235, 297.5, 360]
+        found, marked = self.periodic(times)
+        self.assertEqual((found["events"], found["consecutive_periods"]), (7, 7))
+        self.assertEqual(marked, times)
+
+    def test_an_extra_disturbance_beside_a_series_does_not_hide_it(self):
+        # 0, 60 and 122 recur. A second disturbance at 58 s, two seconds
+        # before the one at 60, must not take its place and break the chain.
+        found, marked = self.periodic([0, 60, 122])
+        self.assertEqual(found["events"], 3)
+        found, marked = self.periodic([0, 58, 60, 122])
+        self.assertEqual((found["events"], found["consecutive_periods"]), (3, 3))
+        self.assertEqual(marked, [0, 58, 60, 122])
+
+    def test_a_series_member_is_not_taken_for_a_late_provisioner_reaction(self):
+        # Older run, no host CPU: direct's settle saw no reaction and its first
+        # cell dips, but the dip is the first of a 60-second series.
+        times = [0, 57.5, 115, 172.5, 235, 297.5, 360]
+        samples = {("direct", 10240, index + 1): dict(
+            flags=["cpu_dip"], host_cpu_recorded=False,
+            cpu_dips=[dict(start_unix_secs=BASE + time)]) for index, time in enumerate(times)}
+        self.assertIsNotNone(host_disturbance.periodic_activity(samples))
+        host_disturbance.flag_suspected_provisioner_bursts(samples, {"direct": 0.1}, ["direct"], [10240])
+        self.assertEqual(samples["direct", 10240, 1]["flags"], ["cpu_dip", "periodic_60s"])
 
     def test_an_unrelated_event_beside_a_periodic_series_is_left_unmarked(self):
         _, marked = self.periodic([10, 70, 95, 130, 190])

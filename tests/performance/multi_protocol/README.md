@@ -470,12 +470,13 @@ flags only: nothing measured changes and no sample is dropped or re-run.
 | `cpu_dip` | Gateway plus backend CPU fell under 88% of the sample's plateau (its upper-quartile level) for a second or more. | The benchmark's own processes. With `host_cpu_burst` it is the burst's effect. Without it, on a run that recorded host CPU, the host showed no burst above its own floor and the dip is most likely the arm's own. |
 | `provisioner_burst` | The provisioner's first-start reaction reached the measurement: its job daemon used a CPU-second or more while the sample's sampler ran, and the measured window has a host burst. | `provjobd<digits>` in `host_processes`, which covers the client's warm-up and drain too; `provisioner_cpu_seconds` is recorded even when the window was untouched and the flag is not set. |
 | `provisioner_burst_suspected` | The same, inferred: the settle saw no reaction to the arm's first start (its image, or the harness binaries for `direct`) and one of the arm's first two cells in its first pair dipped. | Only for runs that did not record host CPU. It names the likeliest cause; nothing saw the provisioner. |
-| `periodic_60s` | The sample's dip or burst belongs to a series that recurs every 60 seconds. | At least three consecutive periods each show an event, the gap between successive events within 2.5 seconds of a whole number of periods. `periodic_activity` in `host_disturbance.json` gives the count and the fitted period. |
+| `periodic_60s` | The sample's dip or burst belongs to a series that recurs every 60 seconds. | Three events, each one period after the last within 2.5 seconds, establish the series; every event a whole number of periods from one of its members, within 3.5 seconds, belongs to it. `periodic_activity` in `host_disturbance.json` gives the count. |
 | `cpu_per_request_drift` | For this arm and payload, gateway and backend CPU per request are both at least 6% higher in one pair than in another. Every compared pair of the arm is marked: nothing says which one is right. | CPU inside the measured window over the requests completed. Payloads of 512 KiB and above, and samples of fewer than 20,000 requests, are not compared. |
 
-The thresholds were set on 37 hosted jobs and are not guarantees. The drift
-threshold in particular has no margin: arms that nothing else disturbed agree
-across pairs within 5.8%, and the mildest case marked is at 6.2%.
+The thresholds were set on 31 hosted jobs, checked on six more, and are not
+guarantees. The drift threshold in particular has no margin: arms that nothing
+else disturbed agree across pairs within 5.8%, and the mildest case marked is
+at 6.2%.
 
 `manifest.json` records the runner's CPU model (`runner_cpu_model`), which
 decides what to expect: see the known limitations below. The flags are on by
@@ -657,11 +658,14 @@ or adaptive flags and therefore uses **2 pairs, adaptive off**.
   2% of the image arm in seven, +2.2% and +2.6% in two, and -3.4% and -4.4% in
   two (the Xeon 8370C lane and an EPYC 7763 lane).
 - What the flags do not catch: a drift under 6%, or at payloads of 512 KiB and
-  above, which are not compared because a sample completes too few requests
-  (quiet runners differ by up to 9% there); a dip of a single 0.5-second tick;
-  and, in a run that did not record host CPU, the difference between a host
-  burst and an arm's own stall (Envoy at 5 MiB in the HTTP/3 lane dips on its
-  own). They can also mark too much: a move near the drift threshold falls on
+  above, which are not compared: the gateway arms complete too few requests
+  there for CPU per request to be steady, and undisturbed pairs at that size
+  differ by more than the 6% threshold; a dip of a single 0.5-second tick;
+  a provisioner reaction spread too thin to make a host burst, which is
+  recorded in `provisioner_cpu_seconds` but not flagged; and, in a run that
+  did not record host CPU, the difference between a host burst and an arm's
+  own stall (Envoy at 5 MiB in the HTTP/3 lane dips on its own). They can also
+  mark too much: a move near the drift threshold falls on
   either side of it by chance, and a run with a dozen unrelated disturbances
   lines three of them up as a 60-second series about one time in ten. Nor can
   they see

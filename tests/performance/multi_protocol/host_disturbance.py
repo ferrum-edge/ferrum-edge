@@ -12,8 +12,8 @@ have been seen to move a sample without the gateway under test changing:
 - the provisioner's first-start reaction comes late and lands in a measured
   cell although the first-start settle ran.
 
-This flags them. The thresholds below were set on 37 hosted jobs; they are
-where the evidence put them, not guarantees. It changes nothing that is measured, drops nothing and
+This flags them. The thresholds below were set on 31 hosted jobs and checked
+on six more; they are where the evidence put them, not guarantees. It changes nothing that is measured, drops nothing and
 re-runs nothing: it reads what a run recorded and writes what it found into
 each sample, each paired comparison and `host_disturbance.json`.
 
@@ -62,21 +62,24 @@ SETTLE_REACTION_CPU_SECONDS = 1.0
 # 5.8% at 10 KiB and 70 KiB, and the mildest case worth marking is at 6.2%.
 # A move near the threshold can land on either side of it.
 DRIFT_RATIO = 1.06
-# Payloads from this size up are not compared: a sample completes too few
-# requests for CPU per request to be that steady, and pairs on quiet runners
-# differ by up to 9%.
+# Payloads from this size up are not compared: the gateway arms complete too
+# few requests there for CPU per request to be steady, and undisturbed pairs
+# at that size differ by more than the threshold (up to 11%). `direct` does
+# complete enough requests at 512 KiB, so the request floor alone would not
+# leave it out.
 DRIFT_PAYLOAD_LIMIT_BYTES = 512000
 # Nor is any sample with fewer requests than this, whatever its payload (a
 # slow arm, a short run).
 DRIFT_MIN_REQUESTS = 20000
-# Known periodic host activity, in seconds, and how far the gap between two
-# successive events may be from a whole number of periods for them to count
-# as recurring. hv_kvp_daemon's gaps were 59 to 62.5 seconds.
+# Known periodic host activity, in seconds. hv_kvp_daemon's bursts came 56.5 to
+# 62.7 seconds apart. Two tolerances on how far a gap may be from a whole
+# number of periods: the strict one for the three consecutive periods that
+# establish a series, the loose one for linking further events to a series
+# that is already established. Loosening the first doubles how often unrelated
+# events are taken for a series; loosening the second only marks a few more.
 PERIODS = (60.0,)
 PERIOD_TOLERANCE = 2.5
-# Once recurrence is established, how far from the fitted comb an event may be
-# and still be marked as part of it.
-PERIOD_MEMBER_TOLERANCE = 3.0
+PERIOD_MEMBER_TOLERANCE = 3.5
 # Consecutive periods that must each show an event before the run is said to
 # have periodic activity. Sharing a phase is not enough: unrelated events two
 # or three periods apart share one by chance.
@@ -157,6 +160,8 @@ def intervals(timeline, window):
     for before, after in zip(timeline, timeline[1:]):
         try:
             start, end = before["unix_secs"], after["unix_secs"]
+            if not is_number(start) or not is_number(end):
+                continue
             elapsed = end - start
             if elapsed < MIN_INTERVAL_SECONDS:
                 continue
@@ -423,42 +428,31 @@ def longest_consecutive(numbers):
     return best
 
 
-def periodic_series(times, period):
-    """The longest series of event times whose successive gaps are whole periods.
+def whole_periods(gap, period, tolerance):
+    """How many periods a gap between two events spans, or None if it is not a whole number.
 
-    Returns [(period index, time)], one entry per period, or None unless
-    PERIOD_MIN_EVENTS consecutive periods each hold an event. Each event is
-    judged against the one before it, so a period that wanders by a second
-    does not accumulate into a miss; an event within the tolerance of the last
-    one is the same period's and is not counted again.
+    0 means the two belong to the same period: a second disturbance within the
+    tolerance of the first.
     """
-    best = None
-    for first in range(len(times)):
-        series = [(0, times[first])]
-        for time in times[first + 1:]:
-            index, last = series[-1]
-            gap = time - last
-            if gap <= PERIOD_TOLERANCE:
-                continue
-            steps = round(gap / period)
-            if steps >= 1 and abs(gap - steps * period) <= PERIOD_TOLERANCE:
-                series.append((index + steps, time))
-        if longest_consecutive([index for index, _ in series]) >= PERIOD_MIN_EVENTS \
-                and (best is None or len(series) > len(best)):
-            best = series
-    return best
+    if gap <= tolerance:
+        return 0
+    count = round(gap / period)
+    return count if count >= 1 and abs(gap - count * period) <= tolerance else None
 
 
 def periodic_activity(samples):
     """Dips or bursts that recur on a known period across the whole run.
 
-    Two steps. A series of events one period apart, PERIOD_MIN_EVENTS periods
-    in a row, establishes that the run has periodic activity: events that
-    merely line up several periods apart do not, and a period without an
-    event (it fell between two cells) does not undo it. Then a comb is fitted
-    to that series and every event within PERIOD_MEMBER_TOLERANCE of a tooth
-    is marked, including one the strict series skipped for arriving a little
-    early or late.
+    The run has periodic activity when three events are each one period after
+    the last, within PERIOD_TOLERANCE: PERIOD_MIN_EVENTS consecutive periods
+    that each hold one. Events that merely line up several periods apart do
+    not establish it. Once it is established, every event a whole number of
+    periods from a member of the series, within PERIOD_MEMBER_TOLERANCE, joins
+    it, and so on from the events that joined: a period without an event (it
+    fell between two cells) does not cut the series, and neither does an extra
+    disturbance beside one of its events. Each event is judged against other
+    events and not against a fixed comb, because the period wanders by a few
+    seconds.
     """
     events = []
     for key, row in samples.items():
@@ -467,30 +461,38 @@ def periodic_activity(samples):
         for event in row.get("host_cpu_bursts") or row.get("cpu_dips") or []:
             events.append((event["start_unix_secs"], key))
     events.sort(key=lambda event: event[0])
+    times = [time for time, _ in events]
     for period in PERIODS:
-        series = periodic_series([time for time, _ in events], period)
-        if series is None:
+        links = {index: [] for index in range(len(times))}
+        runs = {index: 1 for index in links}
+        for later in range(len(times)):
+            for earlier in range(later):
+                gap = times[later] - times[earlier]
+                count = whole_periods(gap, period, PERIOD_MEMBER_TOLERANCE)
+                if count is not None:
+                    links[earlier].append((later, count))
+                    links[later].append((earlier, -count))
+                if whole_periods(gap, period, PERIOD_TOLERANCE) == 1:
+                    # `earlier` is final by now: events are in time order.
+                    runs[later] = max(runs[later], runs[earlier] + 1)
+        seed = next((index for index in runs if runs[index] >= PERIOD_MIN_EVENTS), None)
+        if seed is None:
             continue
-        # Least-squares comb through the series: its own period and phase.
-        count = len(series)
-        mean_index = sum(index for index, _ in series) / count
-        mean_time = sum(time for _, time in series) / count
-        spread = sum((index - mean_index) ** 2 for index, _ in series)
-        fitted = sum((index - mean_index) * (time - mean_time) for index, time in series) / spread
-        origin = mean_time - fitted * mean_index
-        periods, members = set(), []
-        for time, key in events:
-            index = round((time - origin) / fitted)
-            if abs(time - origin - index * fitted) <= PERIOD_MEMBER_TOLERANCE:
-                periods.add(index)
-                members.append((time, key))
-        for _, key in members:
+        placed, pending = {seed: 0}, [seed]
+        while pending:
+            index = pending.pop()
+            for other, count in links[index]:
+                if other not in placed:
+                    placed[other] = placed[index] + count
+                    pending.append(other)
+        for index in placed:
             flag = f"periodic_{int(period)}s"
-            if flag not in samples[key]["flags"]:
-                samples[key]["flags"].append(flag)
-        return dict(period_seconds=period, fitted_period_seconds=round(fitted, 2),
-                    events=len(periods), consecutive_periods=longest_consecutive(periods),
-                    seconds_spanned=round(members[-1][0] - members[0][0], 1))
+            if flag not in samples[events[index][1]]["flags"]:
+                samples[events[index][1]]["flags"].append(flag)
+        marked = [times[index] for index in placed]
+        return dict(period_seconds=period, events=len(set(placed.values())),
+                    consecutive_periods=longest_consecutive(placed.values()),
+                    seconds_spanned=round(max(marked) - min(marked), 1))
     return None
 
 
