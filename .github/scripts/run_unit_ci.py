@@ -20,7 +20,7 @@ from pathlib import Path
 
 PHASES = (
     "default-build", "default-lib", "default-unit",
-    "acme-build", "acme-outbound", "acme-dns", "acme-renewal",
+    "acme-lib-build", "acme-build", "acme-outbound", "acme-dns", "acme-renewal",
 )
 COMPILERS = {"cargo", "rustc", "sccache", "cc", "gcc", "clang", "clang++", "ld", "ld.lld", "rust-lld", "collect2"}
 

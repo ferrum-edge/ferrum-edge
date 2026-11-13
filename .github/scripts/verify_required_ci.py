@@ -1734,22 +1734,30 @@ def main() -> int:
     planner_errors.extend(unit_ci_contract_errors())
     planner_errors.extend(unit_ci_self_test())
 
+    # Both PKCS#11 libtest binaries are built before either filter runs, one
+    # Cargo invocation each: in a single invocation the library test harness
+    # and the plain library that unit_tests links compile side by side, and
+    # that pair of whole-crate rustc runs has exhausted the hosted runner.
     pkcs11_body = extract_job_body(ci_yml, "test-pkcs11-softhsm")
     pkcs11_precompile = "Precompile PKCS#11 signer and pairing test binaries"
+    pkcs11_lib_build = "cargo test --features pkcs11 --lib --no-run"
+    pkcs11_unit_build = "cargo test --features pkcs11 --test unit_tests --no-run"
     pkcs11_signer = "Run PKCS#11 signer smoke test"
     pkcs11_pairing = "Run PKCS#11 certificate-pairing tests"
     if not (
-        pkcs11_body.count(
-            "cargo test --features pkcs11 --lib --test unit_tests --no-run"
-        )
-        == 1
+        pkcs11_body.count(pkcs11_lib_build) == 1
+        and pkcs11_body.count(pkcs11_unit_build) == 1
+        and "--features pkcs11 --lib --test unit_tests" not in pkcs11_body
         and 0 <= pkcs11_body.find(pkcs11_precompile)
+        < pkcs11_body.find(pkcs11_lib_build)
+        < pkcs11_body.find(pkcs11_unit_build)
         < pkcs11_body.find(pkcs11_signer)
         < pkcs11_body.find(pkcs11_pairing)
     ):
         planner_errors.append(
-            "jobs.test-pkcs11-softhsm must precompile the pkcs11 lib and "
-            "unit_tests binaries together before running either filter"
+            "jobs.test-pkcs11-softhsm must precompile the pkcs11 lib harness and "
+            "the unit_tests binary, one Cargo invocation each, before running "
+            "either filter"
         )
     for job in sorted(REQUIRED_JOBS):
         if f"needs.{job}.result" not in aggregate_body:
