@@ -2587,7 +2587,11 @@ mod tests {
             probes.spawn(async move { finished });
             probes.spawn(std::future::pending::<Duration>());
             let started = tokio::time::Instant::now();
-            let latency = drain_event_loop_probes(probes, budget).await;
+            // Bounded, so a drain that never gives up fails instead of hanging.
+            let latency =
+                tokio::time::timeout(10 * budget, drain_event_loop_probes(probes, budget))
+                    .await
+                    .expect("the drain must give up on a running probe at its budget");
             assert!(
                 started.elapsed() >= budget,
                 "the drain must wait out the budget before giving up on a running probe"
