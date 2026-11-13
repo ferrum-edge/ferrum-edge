@@ -1663,6 +1663,10 @@ fn health_request_tls(
     // before the global `CryptoProvider::install_default()` call. Build the
     // ClientConfig with an explicit provider so we don't depend on (or panic
     // on) a globally installed one.
+    //
+    // No bootstrap also means no record-layer selection: this is the build's
+    // baseline provider (`ring` on the ordinary build), and
+    // `FERRUM_TLS_AEAD_BACKEND` is deliberately not read here, as documented.
     let provider = Arc::new(crate::fips::base_crypto_provider());
 
     let mut root_store = rustls::RootCertStore::empty();

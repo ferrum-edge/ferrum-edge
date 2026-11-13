@@ -3810,6 +3810,15 @@ pub struct EnvConfig {
     /// Pinning it means a future build that changed integrations cannot
     /// silently satisfy an existing FIPS deployment contract.
     pub fips_required_provider: String,
+    /// Requested TLS record-layer cipher-suite backend on the ordinary build:
+    /// "auto" (default), "ring", or "aws-lc".
+    ///
+    /// `auto` chooses by CPU: AWS-LC's suites where its AVX-512 AES-GCM
+    /// measurably wins, `ring`'s everywhere else. Like the FIPS request, it is
+    /// acted on at provider bootstrap, before `ferrum.conf` is readable, so it
+    /// must be supplied through the process environment. See
+    /// `crate::fips::aead_backend`.
+    pub tls_aead_backend: String,
 
     // TLS Hardening
     /// Minimum TLS version: "1.2" or "1.3" (default: "1.2")
@@ -4758,6 +4767,7 @@ impl Default for EnvConfig {
             adaptive_batch_limit_default: 6_000,
             fips_mode: "off".into(),
             fips_required_provider: crate::fips::SUPPORTED_PROVIDER_ID.into(),
+            tls_aead_backend: "auto".into(),
             tls_min_version: "1.2".into(),
             tls_max_version: "1.3".into(),
             tls_cipher_suites: None,
@@ -5423,6 +5433,7 @@ impl EnvConfig {
             adaptive_batch_limit_default: usize = "FERRUM_ADAPTIVE_BATCH_LIMIT_DEFAULT" => 6_000usize, max(1usize);
             fips_mode: String = "FERRUM_FIPS_MODE" => "off".to_string();
             fips_required_provider: String = "FERRUM_FIPS_REQUIRED_PROVIDER" => crate::fips::SUPPORTED_PROVIDER_ID.to_string();
+            tls_aead_backend: String = "FERRUM_TLS_AEAD_BACKEND" => "auto".to_string();
             tls_min_version: String = "FERRUM_TLS_MIN_VERSION" => "1.2".to_string();
             tls_max_version: String = "FERRUM_TLS_MAX_VERSION" => "1.3".to_string();
             tls_cipher_suites: Option<String> = "FERRUM_TLS_CIPHER_SUITES";
@@ -6306,6 +6317,7 @@ impl EnvConfig {
             adaptive_batch_limit_default,
             fips_mode,
             fips_required_provider,
+            tls_aead_backend,
             tls_min_version,
             tls_max_version,
             tls_cipher_suites,
@@ -8270,6 +8282,18 @@ impl EnvConfig {
         let fips_mode = crate::fips::FipsMode::parse(&self.fips_mode)?;
         crate::fips::verify_resolved_mode(fips_mode)?;
         crate::fips::policy::check_env_config(self)?;
+
+        // ── TLS record-layer backend ────────────────────────────────────
+        //
+        // Same two steps as the FIPS request above, for the same reason: the
+        // backend is fixed when the provider is installed, before `ferrum.conf`
+        // is readable. A malformed value is a configuration error; a value
+        // this build cannot honour (`ring` on the FIPS profile), or one that
+        // arrived after bootstrap and differs from what bootstrap selected,
+        // is refused rather than ignored.
+        let tls_aead_backend =
+            crate::fips::aead_backend::AeadBackendRequest::parse(&self.tls_aead_backend)?;
+        crate::fips::aead_backend::verify_resolved_request(tls_aead_backend)?;
 
         // Validate TLS version settings
         match self.tls_min_version.as_str() {

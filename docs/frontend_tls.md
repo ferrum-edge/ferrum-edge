@@ -1466,6 +1466,144 @@ openssl s_client -connect localhost:8443 -tls1_3
 openssl s_client -connect localhost:8443 -cipher 'ALL' -tls1_2
 ```
 
+### Record-layer cipher-suite backend
+
+The ordinary (non-FIPS) build links two implementations of every TLS cipher
+suite, `ring`'s and AWS-LC's, and picks one of them once per process. The
+choice is about speed only: the suites, their order, the negotiated protocol
+and everything on the wire are identical either way, and the settings above
+apply unchanged.
+
+The selection covers every TLS configuration Ferrum builds (proxy and admin
+listeners, HTTP/3, backend connections, health probes, CP/DP and mesh, log
+sinks) and every library client that takes rustls's process-default provider.
+A dependency that names its own provider keeps `ring`'s suites regardless; the
+SQL config-database client (sqlx) is one.
+
+Only the record layer moves: the AEAD and the HKDF/PRF hash a suite carries,
+which for TLS 1.3 includes the QUIC packet and header-protection keys HTTP/3
+uses. Key exchange, signature verification, the private-key provider, the
+random source and the session ticketer stay on `ring`. DTLS is unaffected (it
+runs on `dimpl`), and so is a kTLS-offloaded TCP+TLS leg after its handshake,
+because the kernel then does the record layer.
+
+**Why it is chosen per CPU.** `ring` implements AES-GCM on x86-64 with VAES
+over 256-bit (AVX2) vectors. AWS-LC has an AVX-512 implementation instead and
+no AVX2 VAES one, so without AVX-512 it falls back to plain AES-NI. AWS-LC is
+therefore faster on some CPUs and clearly slower on others.
+
+`FERRUM_TLS_AEAD_BACKEND` selects the backend:
+
+| Value | Behaviour |
+|-------|-----------|
+| `auto` (default) | AWS-LC when **all** of these hold, `ring` otherwise: the target is x86-64 and neither Windows nor macOS (AWS-LC does not use its AVX-512 AES-GCM on either); the CPU and OS expose VAES, VPCLMULQDQ and AVX-512 F, DQ, BW and VL (the features AWS-LC itself requires before it uses that code); and the CPU is on the allow-list: AMD family 19h with those features (Zen 4) and family 1Ah (Zen 5), Intel Sapphire Rapids, Emerald Rapids, Granite Rapids and Granite Rapids-D |
+| `ring` | Always `ring` |
+| `aws-lc` | Always AWS-LC. Honoured even where `auto` keeps `ring`, with a startup `WARN`, because it is expected to be slower there |
+
+The feature bits alone are not enough, which is why there is an allow-list.
+Intel Ice Lake reports every feature above and showed no net gain when measured
+(see the table below). BoringSSL avoids 512-bit registers on Ice Lake and Tiger
+Lake because of downclocking and allows them again from Sapphire Rapids, and
+`auto` follows the same line. Rocket Lake also has the features and has not
+been measured, so it keeps `ring` too, as does any other CPU that is not on the
+list.
+
+The allow-list is the CPUs with hosted measurements behind them (AMD Zen 4 and
+Zen 5, Intel Emerald Rapids and Granite Rapids; see the table below) plus two
+close relatives that have none of their own: Sapphire Rapids, which shares
+Emerald Rapids' core design, and Granite Rapids-D, which uses Granite Rapids'
+cores. If one of those two turns out not to benefit,
+`FERRUM_TLS_AEAD_BACKEND=ring` restores the previous behaviour.
+
+**Where it helps and where it does not.** Hosted benchmark, TLS on both legs.
+Each row is one job that ran the same binary on one runner with `ring` forced
+and with `aws-lc` forced. The figures are AWS-LC relative to `ring`, for gateway
+CPU per request and for throughput, at 10 KiB / 70 KiB / 512 KiB / 1 MiB / 5 MiB
+payloads. In the rows where `auto` keeps `ring`, they are what forcing `aws-lc`
+would cost.
+
+| Runner CPU | `auto` | Protocol | CPU per request | Throughput |
+|------------|--------|----------|-----------------|------------|
+| AMD EPYC 9V45 (Zen 5) | AWS-LC | TCP+TLS | −10% / −13% / −13% / −16% / −15% | +7% / +13% / +8% / +10% / +8% |
+| AMD EPYC 9V45 (Zen 5) | AWS-LC | HTTP/2 | −5% / −7% / −8% / −7% / −9% | +8% / +3% / +4% / 0% / +2% |
+| AMD EPYC 9V45 (Zen 5) | AWS-LC | gRPC | −2% / −6% / −8% / −9% / −7% | +6% / +2% / +3% / +3% / +1% |
+| AMD EPYC 9V45 (Zen 5) | AWS-LC | gRPC | −1% / −6% / −7% / −9% / −11% | +4% / +3% / +2% / +4% / +6% |
+| AMD EPYC 9V74 (Zen 4) | AWS-LC | gRPC | +1% / −3% / −5% / −6% / −7% | +3% / +1% / 0% / +1% / +2% |
+| AMD EPYC 9V74 (Zen 4) | AWS-LC | HTTP/3 | +2% / +2% / −1% / −3% / 0% | +1% / −1% / +1% / +4% / +1% |
+| Intel Xeon 6975P-C (Granite Rapids) | AWS-LC | TCP+TLS | −4% / −6% / −8% / −8% / −9% | +2% / +7% / +3% / +2% / +3% |
+| Intel Xeon 8573C (Emerald Rapids) | AWS-LC | HTTP/1.1 over TLS | −1% / −4% / −7% / −7% / −9% | +6% / +2% / +3% / +2% / +3% |
+| Intel Xeon 8573C (Emerald Rapids) | AWS-LC | HTTP/2 | +1% / −1% / −4% / −4% / −4% | −1% / +4% / +1% / +1% / +3% |
+| AMD EPYC 9V74, AVX-512 hidden from the VM | `ring` | HTTP/3 | +9% / +12% / +14% / +14% / +14% | −6% / −6% / −8% / −7% / −8% |
+| AMD EPYC 7763 (Zen 3, no AVX-512) | `ring` | TCP+TLS | +17% / +28% / +30% / +33% / +40% | +1% / −14% / −10% / −12% / −11% |
+| AMD EPYC 7763 (Zen 3, no AVX-512) | `ring` | HTTP/1.1 over TLS | +8% / +18% / +30% / +36% / +39% | +2% / −9% / −12% / −17% / −13% |
+| AMD EPYC 7763 (Zen 3, no AVX-512) | `ring` | HTTP/1.1 over TLS | +8% / +17% / +32% / +32% / +35% | 0% / −8% / −13% / −12% / −11% |
+| AMD EPYC 7763 (Zen 3, no AVX-512) | `ring` | HTTP/2 | +11% / +19% / +26% / +28% / +30% | −1% / −9% / −10% / −13% / −12% |
+| AMD EPYC 7763 (Zen 3, no AVX-512) | `ring` | HTTP/3 | +9% / +16% / +19% / +17% / +15% | −5% / −5% / −12% / −10% / −11% |
+| Intel Xeon 8370C (Ice Lake) | `ring` | TCP+TLS (earlier run) | +4% / −6% / −5% / −4% / −3% | −5% / +5% / −1% / −2% / −4% |
+
+Every job except the Ice Lake one also ran a third arm with `auto`. It selected
+the backend shown and tracked the faster of the two forced arms. Two arms
+running the same code differed by up to about 5% in single cells of these runs
+(7% in one), so a smaller difference in the table is not evidence either way.
+
+- It helps bulk transfer most on Zen 5: 10–16% less gateway CPU per request and
+  7–13% more throughput for TCP+TLS, and 6–11% less CPU for HTTP/2 and gRPC from
+  70 KiB up. The gain is smaller on Zen 4 (3–7% for gRPC from 70 KiB up),
+  Emerald Rapids (4–9% for HTTP/1.1 over TLS from 70 KiB up, about 4% for HTTP/2
+  from 512 KiB up) and Granite Rapids (4–9% for TCP+TLS).
+- It does little for small responses. On the CPUs where `auto` selects AWS-LC,
+  the 10 KiB HTTP and gRPC results are within noise except on Zen 5, where
+  HTTP/2 used about 5% less CPU. The handshake, framing and syscalls dominate at
+  that size and those do not move.
+- It made no measurable difference to HTTP/3 on the one qualifying CPU it was
+  measured on (Zen 4). QUIC packets are about 1.2 KB, too small for the 512-bit
+  path to matter. HTTP/3 follows the same selection anyway, so a process has
+  one implementation, not two.
+- On Ice Lake the CPU saving did not turn into throughput, which was lower at
+  four of the five sizes, so `auto` keeps `ring` there.
+- Without AVX-512 AWS-LC is slower at every size and on every protocol,
+  HTTP/3 included: 8–40% more gateway CPU per request and up to 17% less
+  throughput on Zen 3. That is the case `auto` exists to avoid and the reason
+  `aws-lc` logs a warning there.
+- The CPU model is not enough on its own. One runner reported an EPYC 9V74 with
+  the AVX-512 features absent, because the VM did not expose them, and AWS-LC
+  cost 9–14% more CPU per request there. `auto` reads the features the process
+  can actually use, so it kept `ring` on that machine and chose AWS-LC on the
+  other 9V74s.
+- Nothing changes on non-x86-64 targets, on Windows or on macOS.
+
+The selection is made once, when the crypto provider is installed, and cannot
+change without a restart. It is recorded at startup at INFO:
+
+```
+TLS record-layer cipher suites: backend=aws-lc, requested=auto, reason=cpu-qualified, target=x86_64, cpu_vendor=amd, cpu_family=26, cpu_model=2, avx512_aes_gcm_features=present
+```
+
+`reason` is one of `cpu-qualified`, `cpu-features-missing`,
+`intel-pre-sapphire-rapids`, `cpu-not-listed`, `not-x86-64`, `windows-target`,
+`apple-target`, `operator-override` or `fips-build`. INFO is hidden at the default
+`FERRUM_LOG_LEVEL=warn`; `FERRUM_LOG_LEVEL=warn,ferrum_edge::fips::aead_backend=info`
+shows this record alone. A process that never ran the gateway's provider
+bootstrap, such as a test or an embedding, writes no record; on the ordinary
+build its selection reads `not-bootstrapped` and its provider is ring's, and on
+a FIPS build it reads `fips-build` as it always does.
+
+Because the provider is installed before `ferrum.conf` is read, the variable
+must be set in the process environment. `ring` or `aws-lc` that appears only in
+`ferrum.conf`, or only through an external secret source, is refused at startup
+and by `ferrum-edge validate` with a message that says so; it is never silently
+ignored. `auto` there is accepted, because it asks for what the process already
+did.
+
+`ferrum-edge health` is the one command that does not read the variable. It
+exits before the provider is bootstrapped and builds its probe client on the
+build's baseline provider (`ring` on the ordinary build), so the variable,
+valid or not, has no effect on it.
+
+On a FIPS build every cipher suite comes from the AWS-LC FIPS module and `ring`
+is not linked. `auto` and `aws-lc` change nothing there, and `ring` is refused.
+See [FIPS mode](fips.md).
+
 ## Integration with Load Balancers
 
 When using load balancers:

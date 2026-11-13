@@ -22931,10 +22931,14 @@ mod build_h3_quinn_server_config_mtls_tests {
         let private_key =
             PrivateKeyDer::from_pem_slice(key_pem.as_bytes()).expect("read private key");
         Arc::new(
-            rustls::ServerConfig::builder()
-                .with_no_client_auth()
-                .with_single_cert(certs, private_key)
-                .expect("server cert"),
+            rustls::ServerConfig::builder_with_provider(std::sync::Arc::new(
+                crate::fips::base_crypto_provider(),
+            ))
+            .with_safe_default_protocol_versions()
+            .expect("rustls default protocol versions")
+            .with_no_client_auth()
+            .with_single_cert(certs, private_key)
+            .expect("server cert"),
         )
     }
 
@@ -23125,13 +23129,17 @@ mod h3_crl_resumption_tests {
                 .signed_by(&server_key, &issuer)
                 .expect("server cert");
             let frontend = Arc::new(
-                rustls::ServerConfig::builder()
-                    .with_no_client_auth()
-                    .with_single_cert(
-                        vec![server_cert.der().clone()],
-                        PrivatePkcs8KeyDer::from(server_key.serialize_der()).into(),
-                    )
-                    .expect("frontend config"),
+                rustls::ServerConfig::builder_with_provider(std::sync::Arc::new(
+                    crate::fips::base_crypto_provider(),
+                ))
+                .with_safe_default_protocol_versions()
+                .expect("rustls default protocol versions")
+                .with_no_client_auth()
+                .with_single_cert(
+                    vec![server_cert.der().clone()],
+                    PrivatePkcs8KeyDer::from(server_key.serialize_der()).into(),
+                )
+                .expect("frontend config"),
             );
             let client_key =
                 rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).expect("client key");
@@ -23191,14 +23199,17 @@ mod h3_crl_resumption_tests {
         fn client(&self) -> Arc<rustls::ClientConfig> {
             let mut roots = rustls::RootCertStore::empty();
             roots.add(self.ca_der.clone()).expect("root");
-            let mut config =
-                rustls::ClientConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
-                    .with_root_certificates(roots)
-                    .with_client_auth_cert(
-                        self.client_chain.clone(),
-                        PrivatePkcs8KeyDer::from(self.client_key.clone()).into(),
-                    )
-                    .expect("client auth cert");
+            let mut config = rustls::ClientConfig::builder_with_provider(std::sync::Arc::new(
+                crate::fips::base_crypto_provider(),
+            ))
+            .with_protocol_versions(&[&rustls::version::TLS13])
+            .expect("TLS 1.3 is supported")
+            .with_root_certificates(roots)
+            .with_client_auth_cert(
+                self.client_chain.clone(),
+                PrivatePkcs8KeyDer::from(self.client_key.clone()).into(),
+            )
+            .expect("client auth cert");
             config.alpn_protocols = vec![b"h3".to_vec()];
             Arc::new(config)
         }
@@ -23364,9 +23375,13 @@ mod h3_ocsp_staple_tests {
         }
 
         let resolver = crate::tls::acme::AcmeTlsAlpnResolver::new(Arc::new(certified_key));
-        let config = rustls::ServerConfig::builder()
-            .with_no_client_auth()
-            .with_cert_resolver(Arc::new(resolver));
+        let config = rustls::ServerConfig::builder_with_provider(std::sync::Arc::new(
+            crate::fips::base_crypto_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .expect("rustls default protocol versions")
+        .with_no_client_auth()
+        .with_cert_resolver(Arc::new(resolver));
         Arc::new(config)
     }
 

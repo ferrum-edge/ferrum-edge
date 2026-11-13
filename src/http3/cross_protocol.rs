@@ -16747,11 +16747,14 @@ mod tests {
             let key_der = rustls::pki_types::PrivateKeyDer::from_pem_slice(key_pem.as_bytes())
                 .expect("read private key");
 
-            let mut server_crypto =
-                rustls::ServerConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
-                    .with_no_client_auth()
-                    .with_single_cert(vec![cert_der.clone()], key_der)
-                    .expect("server TLS config");
+            let mut server_crypto = rustls::ServerConfig::builder_with_provider(
+                std::sync::Arc::new(crate::fips::base_crypto_provider()),
+            )
+            .with_protocol_versions(&[&rustls::version::TLS13])
+            .expect("TLS 1.3 is supported")
+            .with_no_client_auth()
+            .with_single_cert(vec![cert_der.clone()], key_der)
+            .expect("server TLS config");
             server_crypto.alpn_protocols = vec![b"h3".to_vec()];
             let quic_server = quinn::crypto::rustls::QuicServerConfig::try_from(server_crypto)
                 .expect("QUIC server config");
@@ -16775,10 +16778,13 @@ mod tests {
 
             let mut roots = rustls::RootCertStore::empty();
             roots.add(cert_der).expect("trust the certificate");
-            let mut client_crypto =
-                rustls::ClientConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
-                    .with_root_certificates(roots)
-                    .with_no_client_auth();
+            let mut client_crypto = rustls::ClientConfig::builder_with_provider(
+                std::sync::Arc::new(crate::fips::base_crypto_provider()),
+            )
+            .with_protocol_versions(&[&rustls::version::TLS13])
+            .expect("TLS 1.3 is supported")
+            .with_root_certificates(roots)
+            .with_no_client_auth();
             client_crypto.alpn_protocols = vec![b"h3".to_vec()];
             let quic_client = quinn::crypto::rustls::QuicClientConfig::try_from(client_crypto)
                 .expect("QUIC client config");

@@ -26,7 +26,7 @@
 //!
 //! | Feature | Backend | [`BUILD_CAPABLE`] |
 //! |---|---|---|
-//! | `crypto-ring` (default) | `ring` / `rustls/ring` | `false` |
+//! | `crypto-ring` (default) | `ring` / `rustls/ring`, plus rustls's AWS-LC cipher suites for the TLS record layer where [`aead_backend`] selects them | `false` |
 //! | `fips` | `aws-lc-fips-sys` via `aws-lc-rs/fips` and `rustls/fips` | `true` |
 //!
 //! Selecting both or neither is a compile error, because "additively enable
@@ -34,6 +34,13 @@
 //! switched while `sqlx-core`, `quinn-proto`, `tonic`, `ldap3`, and
 //! `hyper-rustls` still route through their ring arm. Every one of those crates
 //! gates its aws-lc arm on the absence of its ring arm.
+//!
+//! That hazard runs in one direction only: `ring` left in control of a build
+//! that claims the validated module. The ordinary profile makes no such claim,
+//! so it may link rustls's own AWS-LC arm (`rustls/aws_lc_rs`) beside `ring` and
+//! pick the faster record-layer implementation for the CPU at bootstrap — see
+//! [`aead_backend`]. Nothing about the `fips` profile changes: it still links no
+//! `ring` arm at all, and the feature-policy check still refuses one.
 //!
 //! On a `crypto-ring` build, `FERRUM_FIPS_MODE=enforce` fails closed with
 //! [`BootstrapError::BuildNotCapable`] rather than degrading into "run anyway
@@ -57,6 +64,7 @@
 //! what makes the swap reviewable rather than a sprawl, and it is independently
 //! useful: provider selection is auditable in one place.
 
+pub mod aead_backend;
 pub mod approved;
 pub mod inventory;
 pub mod keys;
@@ -306,9 +314,15 @@ pub fn is_enforcing() -> bool {
 /// mesh, DTLS signing, SPIFFE, plugin sinks, and the `health` subcommand —
 /// builds from this one function, so provider selection is a single auditable
 /// switch rather than fifty-odd call sites that each have to remember.
+///
+/// On the ordinary build the provider is `ring`'s, with its cipher suites
+/// replaced by AWS-LC's implementations of the same suites when
+/// [`aead_backend::selection`] says so. That selection is fixed once at
+/// bootstrap, so every call in a process returns the same provider; where
+/// bootstrap never ran (library consumers, external tests) it is plain `ring`.
 #[cfg(all(feature = "crypto-ring", not(feature = "fips")))]
 pub fn base_crypto_provider() -> CryptoProvider {
-    rustls::crypto::ring::default_provider()
+    aead_backend::ordinary_profile_provider(aead_backend::selection().backend)
 }
 
 /// Base rustls crypto provider for this build.
@@ -320,6 +334,23 @@ pub fn base_crypto_provider() -> CryptoProvider {
 #[cfg(feature = "fips")]
 pub fn base_crypto_provider() -> CryptoProvider {
     rustls::crypto::aws_lc_rs::default_provider()
+}
+
+/// The provider bootstrap installs for a resolved record-layer selection.
+///
+/// Built from the selection itself rather than through
+/// [`base_crypto_provider`], which reads the *published* selection: bootstrap
+/// publishes only after rustls has accepted this provider.
+#[cfg(all(feature = "crypto-ring", not(feature = "fips")))]
+fn bootstrap_provider(selection: &aead_backend::AeadSelection) -> CryptoProvider {
+    aead_backend::ordinary_profile_provider(selection.backend)
+}
+
+/// The provider bootstrap installs. The FIPS profile has one provider whatever
+/// the record-layer selection says.
+#[cfg(feature = "fips")]
+fn bootstrap_provider(_selection: &aead_backend::AeadSelection) -> CryptoProvider {
+    base_crypto_provider()
 }
 
 /// The process-default crypto provider is not the one an enforcing FIPS
@@ -354,7 +385,8 @@ impl std::error::Error for ProviderMismatch {}
 /// directly, though, and reqwest's provider-neutral feature intentionally has
 /// no fallback of its own. Installing the same compile-time-selected provider
 /// here keeps those constructors provider-neutral without adding `ring` to a
-/// FIPS graph or AWS-LC to the ordinary graph.
+/// FIPS graph or moving the ordinary build's key exchange and signatures off
+/// `ring`.
 ///
 /// # Fail-closed behaviour
 ///
@@ -559,6 +591,10 @@ pub enum BootstrapError {
     ProviderNotApproved,
     /// Another crypto provider was already installed process-wide.
     ProviderAlreadyInstalled,
+    /// `FERRUM_TLS_AEAD_BACKEND` did not parse.
+    InvalidAeadBackend(String),
+    /// The requested TLS record-layer backend is not linked into this build.
+    AeadBackendUnavailable(aead_backend::AeadSelectionError),
 }
 
 impl std::fmt::Display for BootstrapError {
@@ -590,6 +626,8 @@ impl std::fmt::Display for BootstrapError {
                 "failed to install the rustls crypto provider: a process-default provider was \
                  already installed"
             ),
+            Self::InvalidAeadBackend(detail) => write!(f, "{detail}"),
+            Self::AeadBackendUnavailable(reason) => write!(f, "{reason}"),
         }
     }
 }
@@ -618,7 +656,11 @@ pub fn install_crypto_provider() -> Result<FipsState, BootstrapError> {
         return Err(BootstrapError::SelfTestFailed(reason));
     }
 
-    let provider = base_crypto_provider();
+    // Resolve the TLS record-layer backend and build the provider from that
+    // value directly. On a FIPS build this only refuses a request for `ring`;
+    // the suites are the module's either way.
+    let aead_selection = aead_backend::resolve_bootstrap_selection()?;
+    let provider = bootstrap_provider(&aead_selection);
     let provider_is_fips = provider.fips();
 
     if mode.is_enforcing() && !provider_is_fips {
@@ -627,6 +669,11 @@ pub fn install_crypto_provider() -> Result<FipsState, BootstrapError> {
 
     CryptoProvider::install_default(provider)
         .map_err(|_| BootstrapError::ProviderAlreadyInstalled)?;
+
+    // Published only now that rustls accepted the provider, so the process
+    // default and every later `base_crypto_provider()` call are the same
+    // provider, and a refused bootstrap leaves no selection behind.
+    aead_backend::publish_bootstrap_selection(aead_selection);
 
     let resolved = FipsState {
         mode,

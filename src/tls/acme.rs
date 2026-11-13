@@ -4689,8 +4689,11 @@ pub mod client {
         dns_cache: DnsCache,
     ) -> Result<Box<dyn HttpClient>, AcmeClientError> {
         let connector = ScreenedAcmeConnector::new(dns_cache);
+        // The provider is named rather than left to rustls's process-default
+        // lookup, which panics when both of its providers are linked and no
+        // default was installed.
         let https = HttpsConnectorBuilder::new()
-            .try_with_platform_verifier()
+            .with_provider_and_platform_verifier(crate::fips::base_crypto_provider())
             .map_err(|error| AcmeClientError::Client(error.to_string()))?
             .https_only()
             .enable_http1()

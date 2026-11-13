@@ -634,6 +634,98 @@ async fn h2_alpn_fallback_downgrades_capability() {
     assert_eq!(r2.body_text(), "ok");
 }
 
+// ────────────────────────────────────────────────────────────────────────────
+// AWS-LC record-layer cipher suites, selected explicitly
+// ────────────────────────────────────────────────────────────────────────────
+//
+// `FERRUM_TLS_AEAD_BACKEND=auto` selects AWS-LC's cipher suites only on
+// AVX-512 CPUs, which most hosted runners are not, so without an explicit
+// selection the real binary would rarely run on them here. Forcing the backend
+// makes every run cover the bootstrap selection, its startup record, and a
+// backend TLS leg built on those suites carrying a body that spans many
+// records. The scripted backend negotiates with its own (ring) provider, so
+// this is also AWS-LC interoperating with another implementation.
+//
+// The ordinary build only: on a FIPS build there is no selection to make.
+#[cfg(not(feature = "fips"))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn forced_aws_lc_record_layer_serves_backend_tls() {
+    let ca = TestCa::new("scripted-aead-root").expect("ca");
+    let (cert, key) = ca.valid().expect("leaf");
+
+    let reservation = reserve_port().await.expect("reserve port");
+    let backend_port = reservation.port;
+    // 256 KiB: sixteen full TLS records, and not a repeating block.
+    let body: String = (0..256 * 1024usize)
+        .map(|index| char::from(b'a' + ((index * 7 + index / 26) % 26) as u8))
+        .collect();
+    let mut response = format!(
+        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    )
+    .into_bytes();
+    response.extend_from_slice(body.as_bytes());
+    let backend = ScriptedTlsBackend::builder(
+        reservation.into_listener(),
+        TlsConfig::new(cert, key).with_alpn(vec![b"http/1.1".to_vec()]),
+    )
+    .step(TcpStep::ReadUntil(b"\r\n\r\n".to_vec()))
+    .step(TcpStep::Write(response))
+    .step(TcpStep::Drop)
+    .spawn()
+    .expect("spawn backend");
+
+    let yaml = file_mode_yaml_for_backend_with(
+        backend_port,
+        json!({
+            "backend_scheme": "https",
+            "backend_host": "127.0.0.1",
+            "backend_tls_verify_server_cert": false,
+        }),
+    );
+    let harness = GatewayHarness::builder()
+        .mode_binary()
+        .file_config(yaml)
+        .log_level("info")
+        .env("FERRUM_TLS_NO_VERIFY", "true")
+        .env("FERRUM_POOL_WARMUP_ENABLED", "true")
+        .env("FERRUM_TLS_AEAD_BACKEND", "aws-lc")
+        .capture_output()
+        .spawn()
+        .await
+        .expect("spawn gateway");
+
+    // The selection is fixed at bootstrap and recorded once tracing exists.
+    let logs = harness
+        .wait_for_log_contains(
+            |logs| logs.contains("TLS record-layer cipher suites"),
+            Duration::from_secs(10),
+        )
+        .await;
+    assert!(
+        logs.contains("backend=aws-lc, requested=aws-lc, reason=operator-override"),
+        "the startup record must name the forced backend and why; logs:\n{logs}"
+    );
+
+    let client = harness.http_client().expect("client");
+    let resp = client
+        .get(&harness.proxy_url("/api/bulk"))
+        .await
+        .expect("response");
+    assert_eq!(resp.status, StatusCode::OK);
+    assert!(
+        resp.body_text() == body,
+        "the proxied body must match what the TLS backend sent ({} bytes received, {} expected)",
+        resp.body_bytes.len(),
+        body.len()
+    );
+    assert!(
+        backend.handshakes_completed() >= 1,
+        "the gateway must have completed a TLS handshake with the backend"
+    );
+}
+
 /// Poll `GET /backend-capabilities` until exactly one entry exists AND its
 /// `plain_http.h2_tls` field is `"unsupported"`. Returns the entry on
 /// success, `None` on timeout. Mirrors the helper in
