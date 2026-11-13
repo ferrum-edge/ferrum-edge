@@ -1237,6 +1237,44 @@ validation at its exact SHA before any justified retry. Production release
 recovery is separate: inspect the version-tag release workflow and its artifacts;
 a main-CI rerun cannot finish a version release.
 
+### Feature precompiles run one job at a time
+
+The ACME and PKCS#11 jobs each compile `ferrum-edge` with an extra feature,
+and their precompile steps set a step-level `CARGO_BUILD_JOBS: "1"`. One such
+`ferrum-edge` rustc needs about 15 GB, which is the hosted runner's whole RAM,
+so any second Cargo job overlaps two of them. Measured on hosted runners
+(throwaway run 43492921531, warm `ci-debug` cache, 12 GiB extra swap):
+
+| Precompile | Jobs | Peak RAM + swap | Major page faults | Wall time |
+|---|---|---|---|---|
+| ACME | 3 | 23.9 GB | 1.56 M | 1,322 s (EPYC 7763) |
+| ACME | 2 | 23.9 GB | 1.55 M | 1,309 s (EPYC 7763) |
+| ACME | 1 | 16.3 GB | 0.06 M | 1,364 s (EPYC 9V74) |
+| PKCS#11 | 3 | 23.9 GB | 1.30 M | 1,197 s (EPYC 9V74) |
+| PKCS#11 | 2 | 23.5 GB | 1.63 M | 1,368 s (EPYC 7763) |
+| PKCS#11 | 1 | 16.1 GB | 0.16 M | 1,693 s (EPYC 9V74) |
+
+At two or three jobs the VM ran at its RAM plus swap ceiling, and both jobs
+intermittently lost their runner during the precompile ("The hosted runner lost
+communication with the server"), twice in a row for ACME on one `main` commit.
+Two jobs do not help, because two jobs are already enough to overlap two of
+these compiles. One job removes the overlap and nearly all paging. On one CPU
+model the PKCS#11 precompile took about 40% longer; the ACME runs landed on
+different CPU models, so their times are not comparable.
+
+The job-level `CARGO_BUILD_JOBS: "3"` stays on both jobs. rust-cache keys the
+shared `ci-debug` lane on job env when it restores, so a job-level change would
+move these jobs off that lane; a step-level value only reaches the step's Cargo
+process, and the job count is not part of Cargo's fingerprints.
+`.github/scripts/test_unit_ci.py` pins the ACME step's env, and
+`.github/scripts/verify_required_ci.py` requires the PKCS#11 step's.
+
+The same ceiling likely affects other single-crate feature compiles, which this
+does not change: the Coverage shards already run at two jobs (`#4368`,
+pinned by `verify_coverage_workflow.py`) and the `mesh-routing` shard lost its
+runner twice in November 2026, and the eBPF live-kernel test build was once
+killed with exit 143.
+
 ### Jobs
 
 #### 1. CI Plan Static Checks
@@ -1292,14 +1330,17 @@ cargo test --test "$UNIT_TARGET"                   # every other shard
 
 # test-acme (path-gated: src/tls/, tests/acme_dns01/, tests/unit/tls/, build
 # graph): the optional feature compiles the library a second time, so it has
-# its own job instead of extending the Unit Tests critical path.
+# its own job instead of extending the Unit Tests critical path. The precompile
+# runs with a step-level CARGO_BUILD_JOBS=1 (see "Feature precompiles run one
+# job at a time" below).
 cargo test --features acme --lib --test acme_dns01_tests --no-run
 cargo test --features acme --lib tls::acme::client::tests
 cargo test --features acme --test acme_dns01_tests
 cargo test --features acme --lib tls::acme_renewal_resume_tests
 
 # test-pkcs11-softhsm: compile both libtest binaries before either filtered
-# invocation, then exercise the signer and certificate-pairing contracts.
+# invocation, then exercise the signer and certificate-pairing contracts. The
+# precompile runs with a step-level CARGO_BUILD_JOBS=1.
 cargo test --features pkcs11 --lib --test unit_tests --no-run
 cargo test --features pkcs11 --lib \
   tls::pkcs11::tests::signer_loads_configured_token_and_signs -- --ignored

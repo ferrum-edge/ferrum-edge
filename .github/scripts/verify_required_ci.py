@@ -1751,6 +1751,21 @@ def main() -> int:
             "jobs.test-pkcs11-softhsm must precompile the pkcs11 lib and "
             "unit_tests binaries together before running either filter"
         )
+    # Each `--features pkcs11` ferrum-edge rustc needs about the runner's whole
+    # RAM, so the precompile step runs one job at a time; at three jobs two of
+    # them overlapped and the hosted runner was lost. The job-level value stays
+    # because rust-cache keys the shared lane on job env.
+    pkcs11_precompile_step = ""
+    precompile_at = pkcs11_body.find(pkcs11_precompile)
+    if precompile_at >= 0:
+        rest = pkcs11_body[precompile_at:]
+        next_step = re.search(r"\n      - ", rest)
+        pkcs11_precompile_step = rest[: next_step.start()] if next_step else rest
+    if not re.search(r'(?m)^          CARGO_BUILD_JOBS: "1"$', pkcs11_precompile_step):
+        planner_errors.append(
+            "jobs.test-pkcs11-softhsm must compile its precompile step with a "
+            'step-level CARGO_BUILD_JOBS: "1"'
+        )
     for job in sorted(REQUIRED_JOBS):
         if f"needs.{job}.result" not in aggregate_body:
             planner_errors.append(

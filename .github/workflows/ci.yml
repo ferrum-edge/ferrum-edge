@@ -835,6 +835,17 @@ jobs:
           python3 .github/scripts/run_unit_ci.py acme-build
         env:
           RUST_BACKTRACE: 1
+          # One job for this step only. A single `--features acme` ferrum-edge
+          # rustc needs about 15 GB, the runner's whole RAM, so any second job
+          # overlaps two of them: at 3 or 2 jobs this compile peaked at 23.9 GB
+          # of RAM plus swap with 1.55M major faults and lost the runner twice
+          # in a row on main (run 43468167896); at 1 job it peaked at 16.3 GB
+          # with 62k faults (bench run 43492921531). Wall time was 1,364 s at
+          # 1 job on an EPYC 9V74 against 1,322 s at 3 jobs on an EPYC 7763; on
+          # one CPU model the PKCS#11 compile below took about 40% longer at 1
+          # job. The job-level "3" stays, because rust-cache keys the shared
+          # `ci-debug` lane on job env.
+          CARGO_BUILD_JOBS: "1"
 
       - name: Run ACME outbound-boundary regressions
         run: |
@@ -1090,6 +1101,14 @@ jobs:
         run: cargo test --features pkcs11 --lib --test unit_tests --no-run
         env:
           RUST_BACKTRACE: 1
+          # One job for this step only, as in test-acme: each `--features pkcs11`
+          # ferrum-edge rustc needs about 15 GB, so a second job overlaps two.
+          # At 3 jobs this compile peaked at 23.9 GB of RAM plus swap with 1.30M
+          # major faults and lost the runner on main (run 43462384779); at 1 job
+          # it peaked at 16.1 GB with 155k faults, at the cost of about eight
+          # minutes (bench run 43492921531, same CPU model: 1,693 s against
+          # 1,197 s). The job-level "3" stays for the shared rust-cache key.
+          CARGO_BUILD_JOBS: "1"
 
       - name: Run PKCS#11 signer smoke test
         run: cargo test --features pkcs11 --lib tls::pkcs11::tests::signer_loads_configured_token_and_signs -- --ignored

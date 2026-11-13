@@ -49,6 +49,14 @@ STEP_CONDITIONS = {
     "default-lib": "if: matrix.shard == 'lib'",
     "default-unit": "if: matrix.shard != 'lib'",
 }
+# Step env beyond `RUST_BACKTRACE: 1`, in order. A single `--features acme`
+# ferrum-edge rustc needs about the hosted runner's whole RAM, so the ACME
+# precompile runs one job at a time; at three jobs two of them overlapped and
+# the runner was lost. The job-level value stays because rust-cache keys the
+# shared `ci-debug` lane on job env.
+STEP_EXTRA_ENV = {
+    "acme-build": ['CARGO_BUILD_JOBS: "1"'],
+}
 STEP_JOBS = {
     "default-build": "test-unit",
     "default-lib": "test-unit",
@@ -92,6 +100,7 @@ def contract_errors(workflow: str, manifest: str, tls_modules: str) -> list[str]
             f"python3 .github/scripts/run_unit_ci.py {phase}",
             "env:",
             "RUST_BACKTRACE: 1",
+            *STEP_EXTRA_ENV.get(phase, []),
         ]
         if phase.endswith("-build"):
             command_index = expected.index(next(line for line in expected if "/usr/bin/time" in line))
@@ -293,6 +302,17 @@ class ContractTests(unittest.TestCase):
         ):
             with self.subTest(replacement=after):
                 self.assertTrue(self.check(workflow=self.workflow.replace(before, after)))
+
+    def test_acme_precompile_job_cap_cannot_be_dropped_or_raised(self):
+        cap = '          CARGO_BUILD_JOBS: "1"\n'
+        step = self.workflow[self.workflow.index(f"      - name: {STEPS['acme-build']}\n"):]
+        step = step[: step.index(f"      - name: {STEPS['acme-outbound']}\n")]
+        self.assertIn(cap, step)
+        for after in ("", '          CARGO_BUILD_JOBS: "3"\n', '          CARGO_BUILD_JOBS: "2"\n'):
+            with self.subTest(replacement=after):
+                mutated = self.workflow.replace(step, step.replace(cap, after), 1)
+                self.assertNotEqual(mutated, self.workflow)
+                self.assertTrue(self.check(workflow=mutated))
 
     def test_monolith_rebuild_missing_target_or_feature_gate_are_rejected(self):
         self.assertTrue(self.check(workflow=self.workflow.replace("--test acme_dns01_tests", "--test unit_tests")))
