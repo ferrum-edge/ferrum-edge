@@ -32,7 +32,7 @@ Interpret the measurements carefully:
   paging counters. Their change over a phase measures runner paging, not just
   one compiler. Available memory and free swap are also runner-wide.
 - GNU time supplies wall time, maximum child RSS, and child major/minor faults
-  for each of the seven required phases. Maximum child RSS is distinct from
+  for each of the eight required phases. Maximum child RSS is distinct from
   simultaneous RSS. The timed Cargo interval excludes sampler cleanup/upload.
 - The sampler exits on its shell's termination or after two hours, and ordinary
   successful compilation explicitly stops and joins it. Cargo and log-pipeline

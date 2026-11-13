@@ -817,10 +817,36 @@ jobs:
         with:
           shared-key: "ci-debug"
 
+      - name: Precompile ACME library test harness
+        # The library test harness (about 15 GB at peak on its own) and the
+        # plain library that acme_dns01_tests links (about 12 GB) are two
+        # rustc runs of the whole ferrum_edge crate. One Cargo invocation ran
+        # them side by side: about 23 GB on this 16 GB runner, 8-10 GB of it in
+        # swap and 16-19 GB paged out per compile, and the hosted runner was
+        # lost mid-compile (main runs 43267754898 and 43468167896). Build the
+        # harness alone first so the next step only builds the plain library
+        # and the DNS hook target.
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/unit-ci"
+          python3 .github/scripts/run_unit_ci.py acme-lib-build --sample-parent "$$" &
+          unit_sampler_pid=$!
+          trap 'kill "$unit_sampler_pid" 2>/dev/null || true; wait "$unit_sampler_pid" || true' EXIT
+          /usr/bin/time --format='wall_seconds=%e max_child_rss_kib=%M major_faults=%F minor_faults=%R exit_status=%x' --output="$RUNNER_TEMP/unit-ci/acme-lib-build.time" cargo test --features acme --lib --no-run --timings 2>&1 | tee "$RUNNER_TEMP/unit-ci/acme-lib-build.log"
+          kill "$unit_sampler_pid" 2>/dev/null || true
+          wait "$unit_sampler_pid"
+          trap - EXIT
+          cp target/cargo-timings/cargo-timing.html "$RUNNER_TEMP/unit-ci/acme-lib-build.cargo-timing.html"
+          python3 .github/scripts/run_unit_ci.py acme-lib-build
+        env:
+          RUST_BACKTRACE: 1
+
       - name: Precompile ACME library and DNS hook test binaries
         # Keep inline ACME coverage, but compile only the two-test DNS target
         # alongside it: enabling ACME must not rebuild monolithic unit_tests.
         # Default suites above retain their full target graph and test counts.
+        # The library test harness is already built by the step above, so
+        # this builds the plain library and the DNS hook target.
         run: |
           set -euo pipefail
           mkdir -p "$RUNNER_TEMP/unit-ci"
@@ -1085,9 +1111,17 @@ jobs:
 
       - name: Precompile PKCS#11 signer and pairing test binaries
         # Both later filters execute in separate libtest binaries. Compile the
-        # pair together so the certificate-pairing phase cannot trigger a
-        # second full ferrum-edge compile after the signer smoke test passes.
-        run: cargo test --features pkcs11 --lib --test unit_tests --no-run
+        # pair before running either so the certificate-pairing phase cannot
+        # trigger a second full ferrum-edge compile after the signer smoke
+        # test passes. Use two Cargo invocations: the library test harness
+        # and the plain library that unit_tests links are two rustc runs of
+        # the whole crate, and one invocation runs them side by side, which
+        # needs most of the runner's RAM plus swap and has lost the hosted
+        # runner mid-compile (main run 43462384779, PR run 43393438747).
+        run: |
+          set -euo pipefail
+          cargo test --features pkcs11 --lib --no-run
+          cargo test --features pkcs11 --test unit_tests --no-run
         env:
           RUST_BACKTRACE: 1
 

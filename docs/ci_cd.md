@@ -1292,15 +1292,21 @@ cargo test --test "$UNIT_TARGET"                   # every other shard
 
 # test-acme (path-gated: src/tls/, tests/acme_dns01/, tests/unit/tls/, build
 # graph): the optional feature compiles the library a second time, so it has
-# its own job instead of extending the Unit Tests critical path.
+# its own job instead of extending the Unit Tests critical path. The library
+# test harness compiles alone first: in one Cargo invocation with the plain
+# library that acme_dns01_tests links, the two whole-crate rustc runs overlap
+# (about 23 GB on the 16 GB runner) and have cost the hosted runner.
+cargo test --features acme --lib --no-run
 cargo test --features acme --lib --test acme_dns01_tests --no-run
 cargo test --features acme --lib tls::acme::client::tests
 cargo test --features acme --test acme_dns01_tests
 cargo test --features acme --lib tls::acme_renewal_resume_tests
 
 # test-pkcs11-softhsm: compile both libtest binaries before either filtered
-# invocation, then exercise the signer and certificate-pairing contracts.
-cargo test --features pkcs11 --lib --test unit_tests --no-run
+# invocation (one Cargo invocation each, for the same reason as test-acme),
+# then exercise the signer and certificate-pairing contracts.
+cargo test --features pkcs11 --lib --no-run
+cargo test --features pkcs11 --test unit_tests --no-run
 cargo test --features pkcs11 --lib \
   tls::pkcs11::tests::signer_loads_configured_token_and_signs -- --ignored
 cargo test --features pkcs11 --test unit_tests tls::pkcs11 \
@@ -1380,8 +1386,11 @@ or release-SHA proof.
 
 Each phase streams its Cargo output; successful phases write a step summary
 with wall time (including Cargo), libtest counts/execution time, and GNU time
-maximum child RSS. This measures child RSS, not aggregate process-tree or
-whole-runner RAM/swap usage; there is no runner sampler. Detailed phase logs and
+maximum child RSS. GNU time sees only processes Cargo waits for, and library
+compiles that the sccache server runs fall outside it, so each precompile phase
+also runs a 5 s procfs sampler
+(`<phase>.samples.jsonl`: per-compiler RSS and swap by crate name, runner
+`MemAvailable`, `SwapFree` and swap traffic). Detailed phase logs, samples and
 GNU time reports remain under `$RUNNER_TEMP/unit-ci/`. Missing/malformed timing
 or nonzero child status fails validation. Compare precompile/execution
 measurements only on the exact pushed-head CI run and
