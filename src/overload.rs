@@ -1108,11 +1108,7 @@ pub fn raise_fd_limit() -> RaiseFdLimitResult {
 /// single-task probe.
 ///
 /// `budget` bounds how long the probes are awaited (see
-/// [`event_loop_probe_budget`]). A probe still queued when it expires has
-/// waited at least `budget`, so the result is at least `budget`: with the
-/// budget equal to `loop_critical_us`, a stall that reaches the critical
-/// threshold reports at least the threshold and trips it (fail closed), and
-/// shorter stalls report their measured latency (issue #7197).
+/// [`event_loop_probe_budget`] and [`drain_event_loop_probes`]).
 async fn measure_event_loop_latency(budget: Duration) -> Duration {
     let num_workers = tokio::runtime::Handle::current().metrics().num_workers();
 
@@ -1131,7 +1127,21 @@ async fn measure_event_loop_latency(budget: Duration) -> Duration {
             start.elapsed()
         });
     }
+    drain_event_loop_probes(probes, budget).await
+}
 
+/// Waits up to `budget` for the probe tasks and returns the largest latency
+/// they report.
+///
+/// A probe still queued when the budget expires has waited at least `budget`,
+/// so the result is then at least `budget`, and the probes still running are
+/// aborted. With the budget equal to `loop_critical_us`, a stall that reaches
+/// the critical threshold reports at least the threshold and trips it (fail
+/// closed), and shorter stalls report their measured latency (issue #7197).
+async fn drain_event_loop_probes(
+    mut probes: tokio::task::JoinSet<Duration>,
+    budget: Duration,
+) -> Duration {
     let mut max_latency = Duration::ZERO;
     let drain_result = tokio::time::timeout(budget, async {
         while let Some(result) = probes.join_next().await {
@@ -2546,7 +2556,8 @@ mod tests {
     /// This checks the value the probe reports, not which branch produced it.
     /// With every worker blocked nothing drives the runtime's timer, so the
     /// budget timer can fire only once the workers are released, and the
-    /// probe tasks may finish first with their own, larger, measurement.
+    /// probe tasks may finish first with their own, larger, measurement. The
+    /// expiry itself is covered by the `drain_event_loop_probes_*` tests.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn measure_event_loop_latency_reports_at_least_the_budget_on_timeout() {
         let budget = Duration::from_millis(40);
@@ -2556,6 +2567,58 @@ mod tests {
         assert!(
             latency >= budget,
             "a probe starved past its budget must report at least the budget, got {latency:?}"
+        );
+    }
+
+    /// When the budget expires with a probe still running, the drain reports
+    /// at least the budget, or the larger latency a finished probe measured.
+    /// The finished probes here report fixed values and one never finishes,
+    /// so only the expiry can produce the budget. On the paused clock the
+    /// runtime is idle while that probe waits, and the clock moves straight
+    /// to the deadline: nothing depends on how the threads are scheduled.
+    #[tokio::test(start_paused = true)]
+    async fn drain_event_loop_probes_reports_at_least_the_budget_when_it_expires() {
+        let budget = Duration::from_millis(40);
+        for (finished, expected) in [
+            (Duration::from_millis(3), budget),
+            (Duration::from_millis(60), Duration::from_millis(60)),
+        ] {
+            let mut probes = tokio::task::JoinSet::new();
+            probes.spawn(async move { finished });
+            probes.spawn(std::future::pending::<Duration>());
+            let started = tokio::time::Instant::now();
+            // Bounded, so a drain that never gives up fails instead of hanging.
+            let latency =
+                tokio::time::timeout(10 * budget, drain_event_loop_probes(probes, budget))
+                    .await
+                    .expect("the drain must give up on a running probe at its budget");
+            assert!(
+                started.elapsed() >= budget,
+                "the drain must wait out the budget before giving up on a running probe"
+            );
+            assert_eq!(
+                latency, expected,
+                "a probe that finished in {finished:?} and one still running past the \
+                 {budget:?} budget must report {expected:?}"
+            );
+        }
+    }
+
+    /// When every probe finishes within the budget, the drain reports the
+    /// largest latency they measured, not the budget.
+    #[tokio::test(start_paused = true)]
+    async fn drain_event_loop_probes_reports_the_largest_measurement_when_all_finish() {
+        let budget = Duration::from_millis(40);
+        let mut probes = tokio::task::JoinSet::new();
+        for millis in [3, 17, 9] {
+            probes.spawn(async move { Duration::from_millis(millis) });
+        }
+        let started = tokio::time::Instant::now();
+        let latency = drain_event_loop_probes(probes, budget).await;
+        assert_eq!(latency, Duration::from_millis(17));
+        assert!(
+            started.elapsed() < budget,
+            "finished probes must not wait for the budget"
         );
     }
 
