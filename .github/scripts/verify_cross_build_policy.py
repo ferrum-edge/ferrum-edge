@@ -12393,7 +12393,24 @@ def workflow_generation_digest(contents: str) -> str | None:
 # RETIREMENT: once each destination is on `main`, delete that tuple. See
 # `docs/ci_cd.md` → "Admitted CI job SHA-256 generation transitions".
 CI_JOB_GENERATION_TRANSITIONS: tuple[tuple[str, str, str], ...] = (
-    # Empty: no CI job generation transition is currently admitted.
+    # The 12 GiB runner swap step for `ebpf-live` and `netns-capture-live`
+    # (branch `fix/ci-live-jobs-swap`). Both jobs build the ~15 GB
+    # `ferrum_edge` library test harness with only the image's 3 GB swap
+    # behind it; the eBPF job was killed mid-compile with exit 143 (main run
+    # 43401343362). For each job the only admitted change is the exact
+    # current-main block to that block plus one `/mnt/ferrum-swapfile` step
+    # after checkout. These job-bound, one-way pairs admit nothing else;
+    # retire them once both destinations are main's live jobs.
+    (
+        "ebpf-live",
+        "b308f2291f14fe2e714177e0d14e176db1c7b912769f031bb87414c2df7b3754",
+        "369264dc3dcd652011d4cd7fbafd195a826121d6fdc4d04d279f948e056300bd",
+    ),
+    (
+        "netns-capture-live",
+        "e1b827fd0953966ceb99298e67240a272c5816ab70eb5438d548d29796c9a47f",
+        "47de1186ced084df6851d7bc44c2d769a59e57bf4b6a7be75591b2565441f571",
+    ),
     #
     # PR #3913's `ci-plan` / `test` pairs are retired: its destination is on
     # `main`, so the admission is permanently unreachable.
