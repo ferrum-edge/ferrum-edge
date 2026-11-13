@@ -1643,6 +1643,19 @@ CPUs without AVX-512: 9–19% more CPU per request on a Zen 3 and on a Zen 4
 whose VM hid AVX-512. Intel CPUs on the allow-list were not measured for
 HTTP/3. Where in QUIC the extra cost arises was not profiled.
 
+With QUIC kept on `ring`, the same comparison (`auto` against `ring`, six
+paired samples per job) shows no HTTP/3 loss, and TCP keeps its gain. The
+figures are means of the per-job results, ± their standard error, at the same
+five sizes:
+
+| Jobs | Protocol | CPU per request | Throughput |
+|------|----------|-----------------|------------|
+| 5 (two Zen 4, three Zen 5) | HTTP/3 | −1.2% / −0.9% / −1.1% / −1.0% / −0.5% (±0.4 to 1.4) | +1.5% / +1.0% / +1.5% / +1.0% / +0.4% (±0.5 to 1.7) |
+| 3 (Zen 4) | TCP+TLS | −2.6% / −5.9% / −7.4% / −7.7% / −8.8% (±0.0 to 0.9) | +1.0% / +2.4% / +3.0% / +2.8% / +2.9% (±0.2 to 1.2) |
+
+The largest HTTP/3 difference, about 1% in `auto`'s favour at 10 and 70 KiB, is
+about two standard errors from zero and is not claimed as a gain.
+
 What still follows the selection inside a QUIC connection is the TLS 1.3
 handshake's key schedule and transcript hash, which run once per connection
 and per key update, not per packet.
