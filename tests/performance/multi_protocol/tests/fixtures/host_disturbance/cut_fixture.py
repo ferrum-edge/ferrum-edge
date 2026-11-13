@@ -8,8 +8,11 @@
 directory is tens of megabytes; the fixture keeps what host_disturbance.py
 reads and nothing else: per sample the request count, the measured window and
 the cumulative gateway and backend CPU at each sampler tick near that window,
-plus the settle record's process lists. `expand` in test_host_disturbance.py
-turns it back into a run directory.
+plus the settle record's process lists. A run recorded with the sampler's
+`--host-cpu` also keeps, per tick, the client's CPU and the host's busy CPU,
+and per sample the processes outside the benchmark that used a tenth of a
+CPU-second or more. `expand` in test_host_disturbance.py turns it back into a
+run directory.
 """
 
 import argparse
@@ -45,19 +48,29 @@ def cut(run_dir, lane, gateways, sizes):
                     if not start - MARGIN_SECONDS <= time <= start + seconds + MARGIN_SECONDS:
                         continue
                     used = {"gateway": 0.0, "backend": 0.0}
+                    client = None
                     for process in point["processes"]:
                         if process["role"] in used:
                             used[process["role"]] += process["cpu_seconds"]
-                    series.append([time, round(used["gateway"], 2), round(used["backend"], 2)])
-                samples.append(dict(gateway=gateway, payload_size=size, pair=pair,
-                                    order_position=sample["order_position"],
-                                    total_requests=sample["total_requests"],
-                                    measurement=[start, seconds], series=series))
+                        elif process["role"] == "client":
+                            client = round((client or 0.0) + process["cpu_seconds"], 2)
+                    row = [time, round(used["gateway"], 2), round(used["backend"], 2)]
+                    if "host" in point:
+                        row += [client, round(point["host"]["busy_cpu_seconds"], 2)]
+                    series.append(row)
+                kept = dict(gateway=gateway, payload_size=size, pair=pair,
+                            order_position=sample["order_position"],
+                            total_requests=sample["total_requests"],
+                            measurement=[start, seconds], series=series)
+                if "host_processes" in usage:
+                    kept["host_processes"] = [
+                        dict(comm=process["comm"], cpu_seconds=process["cpu_seconds"])
+                        for process in usage["host_processes"] if process["cpu_seconds"] >= 0.1]
+                samples.append(kept)
     origin = int(origin) - 10
     for sample in samples:
         sample["measurement"][0] = round(sample["measurement"][0] - origin, 3)
-        sample["series"] = [[round(time - origin, 3), gateway, backend]
-                            for time, gateway, backend in sample["series"]]
+        sample["series"] = [[round(row[0] - origin, 3)] + row[1:] for row in sample["series"]]
     settle = []
     path = run_dir / "host_settle.json"
     if path.exists():

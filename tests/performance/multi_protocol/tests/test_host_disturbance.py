@@ -46,13 +46,22 @@ def expand(fixture, directory):
             rps=sample["total_requests"] / seconds, sample_schema=2,
             phases=dict(measurement_start_unix_secs=BASE + start, measurement_secs=seconds))))
         timeline = []
-        for time, gateway, backend in sample["series"]:
+        for time, gateway, backend, *host in sample["series"]:
             processes = [dict(pid=1, start_ticks=1, role="backend", cpu_seconds=backend)]
             if sample["gateway"] != "direct":
                 processes.append(dict(pid=2, start_ticks=1, role="gateway", cpu_seconds=gateway))
-            timeline.append(dict(unix_secs=BASE + time, processes=processes))
+            point = dict(unix_secs=BASE + time, processes=processes)
+            if host:
+                client, busy = host
+                if client is not None:
+                    processes.append(dict(pid=3, start_ticks=1, role="client", cpu_seconds=client))
+                point["host"] = dict(busy_cpu_seconds=busy)
+            timeline.append(point)
+        usage = dict(timeline=timeline)
+        if "host_processes" in sample:
+            usage["host_processes"] = sample["host_processes"]
         (folder / "diagnostics" / f"{sample['gateway']}_{sample['payload_size']}_process_usage.json"
-         ).write_text(json.dumps(dict(timeline=timeline)))
+         ).write_text(json.dumps(usage))
     benchmark_plan.write_summaries(directory, lane, fixture["gateways"], fixture["payload_sizes"],
                                    fixture["pairs"])
 
@@ -92,6 +101,34 @@ class ReplayedHostedRuns(Replay):
         # periodic activity is not mistaken for a late first-start reaction.
         self.assertGreater(report["settle_provisioner_cpu_seconds"]["ferrum"], 5)
         self.assertNotIn("provisioner_burst_suspected", report["summary"]["by_flag"])
+
+    def test_with_host_cpu_recorded_the_periodic_dips_are_bursts_of_a_named_process(self):
+        # The first hosted run made with the sampler's --host-cpu, on an EPYC
+        # 7763 runner: what the older runs could only show as a dip is the host
+        # busy outside the benchmark, and the process is hv_kvp_daemon.
+        _, _, report, flagged = self.replay("host_cpu_periodic_60s_epyc_7763.json")
+        self.assertTrue(report["host_cpu_recorded"])
+        self.assertEqual(report["summary"]["by_flag"],
+                         {"cpu_dip": 7, "host_cpu_burst": 7, "periodic_60s": 7})
+        self.assertEqual(report["periodic_activity"]["events"], 7)
+        for row in flagged.values():
+            self.assertEqual(row["flags"], ["cpu_dip", "host_cpu_burst", "periodic_60s"])
+            burst = row["host_cpu_bursts"][0]
+            self.assertGreater(burst["excess_cpu_seconds"], 0.9)
+            self.assertLess(burst["excess_cpu_seconds"], 1.5)
+            named = row["host_processes"][0]
+            self.assertEqual(named["comm"], "hv_kvp_daemon")
+            self.assertGreater(named["cpu_seconds"], 1.1)
+            self.assertLess(named["cpu_seconds"], 1.35)
+            # The provisioner's idle background is recorded by the sampler but
+            # is neither named beside the sample nor taken for its reaction.
+            self.assertNotIn("provisioner_cpu_seconds", row)
+        # Every unflagged sample saw the host quiet as well.
+        self.assertFalse(any("host_cpu_bursts" in row for row in report["samples"] if not row["flags"]))
+        output = io.StringIO()
+        host_disturbance.print_report(report, output)
+        self.assertNotIn("host CPU was not recorded", output.getvalue())
+        self.assertIn("busiest outside the benchmark: hv_kvp_daemon 1.2", output.getvalue())
 
     def test_cpu_per_request_drift_on_an_epyc_9v45_runner_marks_both_pairs_of_the_arm(self):
         _, _, report, flagged = self.replay("cpu_per_request_drift_epyc_9v45.json")
@@ -286,9 +323,11 @@ class HostCpuRules(unittest.TestCase):
         self.assertEqual(self.analyse(series(dip=(20.0, 21.0, 2.0)))["flags"], [])
 
     def test_provisioner_cpu_under_a_second_is_its_idle_background(self):
-        row = self.analyse(series(), host_processes=[dict(comm="provjobd1", pid=9, cpu_seconds=0.4)])
+        row = self.analyse(series(), host_processes=[dict(comm="provjobd1", pid=9, cpu_seconds=0.7),
+                                                     dict(comm="provjobd1", pid=9, cpu_seconds=0.2)])
         self.assertEqual(row["flags"], [])
-        self.assertEqual(row["host_processes"], [dict(comm="provjobd1", cpu_seconds=0.4)])
+        # Named beside the sample only from half a CPU-second up.
+        self.assertEqual(row["host_processes"], [dict(comm="provjobd1", cpu_seconds=0.7)])
 
     def test_a_short_or_missing_series_is_reported_as_not_analysed(self):
         self.assertEqual(self.analyse([])["unavailable"], "no sampler series")

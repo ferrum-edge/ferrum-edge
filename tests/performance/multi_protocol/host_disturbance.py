@@ -69,8 +69,10 @@ PERIOD_MIN_EVENTS = 3
 MIN_INTERVAL_SECONDS = 0.1
 # Fewer usable intervals than this and a median means nothing.
 MIN_INTERVALS = 8
-# Processes below this are not worth naming.
-NAMED_PROCESS_CPU_SECONDS = 0.2
+# Processes below this are not worth naming beside a sample: the provisioner's
+# idle background over one cell is 0.15-0.4 CPU-seconds, hv_kvp_daemon's burst
+# is over one. The sampler's own report keeps every process it saw.
+NAMED_PROCESS_CPU_SECONDS = 0.5
 BENCHMARK_ROLES = ("gateway", "backend")
 
 THRESHOLDS = {
@@ -585,7 +587,7 @@ def main(argv=None):
         command.add_argument("--pairs", help="pair count (default: manifest.json)")
     args = parser.parse_args(argv)
     if args.command == "record-host":
-        print(f"[flags] runner CPU: {record_host(args.manifest) or 'unknown'}")
+        print(f"[flags] recorded the runner's CPU model: {record_host(args.manifest) or 'unknown'}")
         return 0
     gateways, sizes, pairs = run_shape(args.directory, args.gateways, args.payload_sizes, args.pairs)
     if args.command == "annotate":

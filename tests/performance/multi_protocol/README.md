@@ -625,21 +625,23 @@ or adaptive flags and therefore uses **2 pairs, adaptive off**.
 - Host disturbance outside the settle: the settle holds only each image's
   first start, and nothing later in a run is prevented. It is flagged (see
   "Host-disturbance flags" above); the flags mark a sample, they do not
-  correct it. In 31 identical-code validation jobs (an in-run build against
-  its own published image) two kinds were tied to the runner's CPU model:
-  - On all ten AMD EPYC 7763 runners, gateway and backend CPU dropped
+  correct it. In 37 identical-code validation jobs (an in-run build against
+  its own published image) two kinds stood out:
+  - On all twelve AMD EPYC 7763 runners, gateway and backend CPU dropped
     together by about 20% for up to two seconds every 60 seconds, whichever
-    arm was running. `hv_kvp_daemon` is the likely cause: settle records on
-    those runners show it using 0.8 to 1.3 CPU-seconds within one arm's
-    settle, against at most a quarter of a second elsewhere. Flagged as
-    `cpu_dip` and `periodic_60s` in all ten, and in none of the other 21.
-  - On five of six AMD EPYC 9V45 runners the two identical arms differed by
-    between 4% and 25% in at least one pair with no dip in the timeline:
-    gateway and backend CPU seconds per request moved together, by up to about
-    a third between two samples of the same arm, with the same number of system
-    calls per request. The cause is not established. Flagged as
-    `cpu_per_request_drift` on a gateway arm in four of the five; in the
-    fifth, the mildest (pairs +4.0% and -2.4%), only `direct` crossed the 6%
+    arm was running. The cause is `hv_kvp_daemon`: in the two jobs that
+    recorded host CPU it used 1.1 to 1.3 CPU-seconds in every flagged sample,
+    and the host was busy outside the benchmark by that much for those
+    seconds. Flagged as `periodic_60s` in all twelve, and in none of the
+    other 25.
+  - Gateway and backend CPU seconds per request moved together between two
+    samples of the same arm, by up to about a third, with the same number of
+    system calls per request and no dip in the timeline, so the two identical
+    arms differed by between 4% and 25% in at least one pair. This was on five
+    of six AMD EPYC 9V45 runners and on one of twelve EPYC 9V74 runners (pairs
+    +2.9% and -12.0%). The cause is not established. Flagged as
+    `cpu_per_request_drift` on a gateway arm in five of those six jobs; in the
+    sixth, the mildest (pairs +4.0% and -2.4%), only `direct` crossed the 6%
     threshold.
 
   A single sample can show the second kind on other runners too: one cell on a
@@ -654,8 +656,12 @@ or adaptive flags and therefore uses **2 pairs, adaptive off**.
   above where a sample completes too few requests to compare (quiet runners
   differ by up to 9% there); a dip of a single 0.5-second tick; and, in a run
   that did not record host CPU, the difference between a host burst and an
-  arm's own stall (Envoy and Kong at 5 MiB dip on their own). A comparison
-  with no flags is not thereby proven clean.
+  arm's own stall (Envoy and Kong at 5 MiB dip on their own). Nor can they see
+  a difference between two arms that holds in every pair: that is what the
+  benchmark reports, and only an identical-code run shows when it is not the
+  code. One such run on an EPYC 9V74 runner read the in-run arm 3.4% and 8.1%
+  above the image arm in its two pairs with no flag, each arm agreeing with
+  itself across pairs. A comparison with no flags is not thereby proven clean.
 
 #### Window, client and revision inputs (#6038, #6022)
 
