@@ -393,6 +393,65 @@ baseline. Two pairs are a budget-conscious diagnostic default (Student-t with
 one degree of freedom); predeclare at least **four** pairs for performance claims
 and budget that experiment separately.
 
+**First-start settle.** On GitHub-hosted runners the provisioner's job daemon
+(`/tmp/provjobd<digits>`) uses about one core for four to five seconds the first
+time a new binary or container image runs in a job, starting 2 to 12 seconds
+after that start. The runner has four vCPUs and the benchmark saturates them, so
+a cell measured in that window showed gateway and backend CPU 20-25% lower for
+those seconds. It hit whichever arm ran an image first: `direct` at the start of
+the job, `ferrum` about a minute in (18 of 18 jobs), Envoy about two minutes in
+(11 of 12), always in pair 1 and never in pair 2. That is roughly 5% off a
+two-pair 10 KiB average for `ferrum`, a bias in the same direction every run.
+Before the first measured pair the runner therefore starts every distinct
+binary/image once, drives 20 seconds of discarded load at the first payload
+size, and waits through `host_settle.py` until at least 25 seconds have passed
+since the arm was up and the host has been quiet (under 0.2 cores busy) for
+three seconds, capped at 60 seconds. The clock starts when the start returns,
+so an image pull or a slow start cannot use up the minimum. The load is that
+long because the reaction needs it: in measured cells, under continuous load,
+the burst had run its course within about 20 seconds of an arm's first start,
+whereas with a three-second load it had not begun by the release in 3 of 14
+starts of one run and landed in pair 1 after all. With 20 seconds it came
+during the settle in all 21 `ferrum` and Envoy starts of two dispatches (3.3 to
+6.0 CPU-seconds each), and none of their eleven lanes showed the dip in pair 1.
+Some images cost far more: Tyk's start drew 14 to 22 CPU-seconds, which runs
+past the load and extends that hold to as much as 30 seconds. Arms that share
+an image settle once, and the start uses the image with default arguments
+(Envoy with stream limit 100, `ferrum` without an experiment arm's
+environment): the host reacts to an image's first start, and a second container
+from an image that had already run showed no burst (0 of 6). An image already
+settled on the host since boot (iteration 2 onwards) is not held again.
+
+The settle is best effort and cannot fail a run. Each start runs in a subshell
+of its own that removes what it started however it ends and writes nothing
+into the run directory. An arm that cannot start or be held is logged as
+`[settle] <arm> was not settled`, skipped, and left for the measured pair to
+report. An interrupt during the hold takes the arm down at once; one during a
+start or the discarded load is acted on when that command returns, about 20
+seconds for the load and 90 at its timeout. `host_settle.json` in the run
+directory records, per arm, how long the hold lasted and which processes used
+CPU. `host_processes_since_before_start`
+covers the start, the load and the hold, and lists only processes that were
+already running before the arm started, so the provisioner's reaction shows
+there as `provjobd<digits>` with its CPU-seconds whether it came during the
+load or after it. `top_processes`, `busy_cpu_seconds` and the burst times
+(`first_burst_since_start_seconds`, `last_burst_since_start_seconds`) cover
+only the hold after the load. An arm with no record was not settled. An arm
+whose record shows no `provjobd` CPU beyond a few tenths of a second was not
+reacted to and may still get the burst in its first measured cell; that is
+normal for an image whose binary the host has already seen (`ferrum-baseline`
+after `ferrum`). `reason: max_wait` means the host never went quiet, and a
+burst that ends within a few seconds of the release means the 25-second minimum
+is too short for that host. In each of those cases read pair 1 with the CPU
+timelines beside it.
+
+The settle is on by default for the comparison lanes, the HTTP/3 budget lane
+included, on hosts with `/proc`. It is off for the profile, trace and
+H2-observation lanes, which keep their own fixed process accounting;
+`--settle` and `--no-settle` override the default. It removes the first-start
+window only. Later disturbances are not detected (see the known limitations
+below), so the per-sample diagnostics remain the check for a single odd sample.
+
 For a revision experiment, make both images available on the **same hosted
 runner**, pin their digests, and run, for example:
 
@@ -499,7 +558,12 @@ this echo experiment. See the audit for evidence and keep/reject dispositions.
 For the full `http1-tls` matrix (direct + five gateways, five sizes), budget
 `iterations × pairs × 30 × (duration + 15) / 60 + 5` minutes. This conservative
 planning envelope allocates 15 seconds overhead per call and five minutes fixed
-headroom; slow starts, warmups, or failures can still exceed it. Keep at least ten
+headroom; slow starts, warmups, or failures can still exceed it. The first-start
+settle adds about 30 seconds per distinct image once per job: about three
+minutes for direct plus five gateways, which fits inside that headroom. On a
+host that never goes quiet each hold runs to its cap, about 70 seconds per
+image and seven minutes in all, which exceeds that headroom by two minutes.
+Keep at least ten
 minutes below the frozen 75-minute step. The frozen dispatcher cannot set pairs
 or adaptive flags and therefore uses **2 pairs, adaptive off**.
 
@@ -528,6 +592,33 @@ or adaptive flags and therefore uses **2 pairs, adaptive off**.
   request the full-matrix extension; its real-world frequency remains unmeasured.
 - Unmodelled order effects: equal mean position does not model drift or varying
   separation between compared arms; ratio noise can still vary across pairs.
+- Host disturbance outside the settle: the settle holds only each image's
+  first start, and nothing later in a run is prevented or flagged. In 31
+  identical-code validation jobs (an in-run build against its own published
+  image) two kinds were tied to the runner's CPU model:
+  - On all ten AMD EPYC 7763 runners, gateway and backend CPU dropped
+    together by about 20% for up to two seconds every 60 seconds, whichever
+    arm was running. `hv_kvp_daemon` is the likely cause: settle records on
+    those runners show it using 0.8 to 1.3 CPU-seconds within one arm's
+    settle, against at most a quarter of a second elsewhere. It was not
+    sampled during a measured cell.
+  - On five of six AMD EPYC 9V45 runners the two identical arms differed by
+    between 4% and 25% in at least one pair with no dip in the timeline:
+    gateway and backend CPU seconds per request moved together, by up to about
+    a third between two samples of the same arm, with the same number of system
+    calls per request. The cause is not established.
+
+  A single sample can show the second kind on other runners too: one cell on a
+  Xeon Platinum 8370C runner used 8% more gateway and backend CPU per request
+  than the same arm's other pair, cause unknown. The two arms of that
+  comparison are also separate builds of one commit, not one binary, so a
+  consistent difference of a percent or two in one protocol can be real. In
+  the eleven lanes run with the 20-second load the in-run arm read within 2%
+  of the image arm in seven, +2.2% and +2.6% in two, and -3.4% and -4.4% in
+  two (the Xeon 8370C lane and an EPYC 7763 lane). Before
+  trusting a two-pair average, check the job's CPU model,
+  `host_settle.json` for an arm the host did not react to, the `process_usage`
+  timelines for dips, and CPU per request across pairs.
 
 #### Window, client and revision inputs (#6038, #6022)
 

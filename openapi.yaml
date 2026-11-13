@@ -2845,6 +2845,14 @@ paths:
         failures — see
         `docs/admin_api.md#backend-capability-registry` for the full model.
 
+        An HTTPS target is published in two stages: its HTTP/2-over-TLS
+        verdict as soon as that probe answers, its HTTP/3 verdict when the
+        HTTP/3 probe finishes or times out. While a background refresh is
+        between the two, an entry carries the new `h2_tls` classification
+        next to the previous `plain_http.h3` value (`unknown` for a target
+        never classified before). `POST /backend-capabilities/refresh`
+        returns only after both stages.
+
         The endpoint exposes **only** protocol classifications and probe
         timestamps — no credentials, payloads, or TLS private material.
       tags: [Backend Capabilities]

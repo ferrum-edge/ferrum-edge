@@ -16,7 +16,7 @@ worker's report without checking the repository and GitHub state yourself.
 `alibaba-token-plan/deepseek-v4.1-flash`; it now pins the 1017 snapshot and retains
 its `deepseek-pro-agents` name so existing invocations still resolve. It
 dispatches no DeepSeek V4 Pro model. It differs from `deepseek-flash-agents`, which pins
-`alibaba-token-plan/deepseek-v4-flash-0731`. When a user asks for "DeepSeek Pro" workers, tell them
+`alibaba-token-plan/deepseek-v4.1-flash-1017`. When a user asks for "DeepSeek Pro" workers, tell them
 which model they will get before dispatching.
 
 The fleet uses this lane for tasks that need careful invariant reasoning — fail-closed security paths, protocol correctness, concurrency and ordering
