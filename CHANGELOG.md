@@ -595,6 +595,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   benchmark caches are restore-only (`save-if: "false"`) (#7285).
 
 ### Fixed
+- **The hosted protocol benchmark holds each arm's first start out of the
+  measured pairs.** On GitHub-hosted runners the provisioner's job
+  daemon uses about one core for four to five seconds the first time a new
+  binary or container image runs in a job. On the saturated 4-vCPU runner the
+  cell measured then lost 20-25% of its CPU, and it was always the same cells:
+  `ferrum`'s first cells in pair 1 (18 of 18 jobs inspected) and Envoy's (11 of
+  12), about 5% off `ferrum`'s two-pair 10 KiB average.
+  `run_gateway_protocol_bench.sh` now starts every distinct binary/image once
+  before the first measured pair, drives 20 seconds of discarded load, and
+  waits until the host is quiet (`host_settle.py`, at least 25 seconds, at
+  most 60);
+  what each hold saw is written to `host_settle.json`. The settle is best
+  effort: an arm that cannot start or be held is skipped and the run
+  continues. It is on by default for the comparison lanes (`--no-settle` turns
+  it off) and off for the profile, trace and H2-observation lanes. It covers
+  the first-start window only; other host disturbances later in a run are not
+  detected. Earlier runs' second-pair samples are unaffected by this bias;
+  their pair-1 samples and two-pair averages carry it.
 - **A pooled gRPC backend connection that advertised
   `SETTINGS_MAX_CONCURRENT_STREAMS` of 0 is used again once the backend
   raises the limit.** The pool skips such a connection while a sibling is
