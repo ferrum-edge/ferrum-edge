@@ -2,6 +2,12 @@
 
 CPU is a per-PID delta, never host utilization. Raw time series retain phase
 boundaries; setup/warmup/drain costs remain visible beside measurement costs.
+
+`--host-cpu` adds what the host as a whole was doing, for host_disturbance.py:
+each sample carries the host's cumulative CPU seconds by state, and the report
+lists the processes outside the benchmark that used the most CPU while the
+sampler ran. That costs one read of `/proc/stat` per sample and two passes
+over the process table per cell.
 """
 
 import argparse
@@ -106,6 +112,72 @@ def capture(pid, ticks, page_size, *, scheduler=False):
     return state
 
 
+HOST_STATES = ("user", "nice", "system", "idle", "iowait", "irq", "softirq", "steal")
+HOST_BUSY_STATES = ("user", "nice", "system", "irq", "softirq")
+HOST_PROCESS_LIMIT = 8
+
+
+def parse_host_cpu(contents, ticks):
+    """Cumulative host CPU seconds from the aggregate `cpu` line of /proc/stat."""
+    for line in contents.splitlines():
+        fields = line.split()
+        if fields and fields[0] == "cpu":
+            values = [int(value) / ticks for value in fields[1:1 + len(HOST_STATES)]]
+            if len(values) < len(HOST_STATES):
+                raise ValueError("short aggregate cpu line")
+            states = dict(zip(HOST_STATES, values))
+            return {"busy_cpu_seconds": sum(states[name] for name in HOST_BUSY_STATES),
+                    "idle_cpu_seconds": states["idle"], "iowait_cpu_seconds": states["iowait"],
+                    "steal_cpu_seconds": states["steal"]}
+    raise ValueError("no aggregate cpu line")
+
+
+def capture_host_cpu(ticks, proc_root=Path("/proc")):
+    try:
+        return parse_host_cpu((proc_root / "stat").read_text(), ticks)
+    except (OSError, ValueError):
+        return None
+
+
+def process_table(ticks, proc_root=Path("/proc")):
+    """{(pid, start ticks): (comm, cpu seconds)} for every readable process."""
+    table = {}
+    try:
+        entries = [entry for entry in os.listdir(proc_root) if entry.isdecimal()]
+    except OSError:
+        return table
+    for entry in entries:
+        try:
+            contents = (proc_root / entry / "stat").read_text()
+            start, end = contents.index("("), contents.rindex(")")
+            fields = contents[end + 2:].split()
+            table[int(entry), int(fields[19])] = (
+                contents[start + 1:end], (int(fields[11]) + int(fields[12])) / ticks)
+        except (OSError, ValueError, IndexError):
+            continue
+    return table
+
+
+def host_process_usage(before, after, excluded_pids, limit=HOST_PROCESS_LIMIT):
+    """CPU used between two process tables by processes outside the benchmark.
+
+    A process absent from `before` was born in between and is charged its whole
+    CPU. One that exited in between is not seen: this names the long-lived
+    processes that took CPU, it is not a complete account of the host.
+    """
+    used = []
+    for (pid, started), (comm, cpu) in after.items():
+        if pid in excluded_pids:
+            continue
+        earlier = before.get((pid, started))
+        delta = cpu - (earlier[1] if earlier else 0.0)
+        if delta > 0:
+            used.append(dict(comm=comm, pid=pid, cpu_seconds=round(delta, 3),
+                             started_during_capture=earlier is None))
+    used.sort(key=lambda row: (-row["cpu_seconds"], row["pid"]))
+    return used[:limit]
+
+
 def measurement_usage(usage, phases):
     """Bracket the common measured interval; expose sampling uncertainty."""
     start = phases.get("measurement_start_unix_secs")
@@ -199,7 +271,7 @@ def client_pids(parent, proc_root=Path("/proc")):
 def sample_processes(backend, gateway_pids, output, interval, parent_pid=None, stop_file=None,
                      *, http3=False, envoy=False, h2_gauges=False, h1_profile=False,
                      pool_profile=False, udp_profile=False, scheduler_counters=False,
-                     h1_runtime=None, h1_container_id=None):
+                     h1_runtime=None, h1_container_id=None, host_cpu=False):
     """Observe processes until signalled; never launch or control the client."""
     if not math.isfinite(interval) or interval <= 0:
         raise ValueError("sampling interval must be positive and finite")
@@ -233,6 +305,7 @@ def sample_processes(backend, gateway_pids, output, interval, parent_pid=None, s
             identity_error = "owned gateway runtime unavailable or mismatched"
     started = time.monotonic()
     sampler_cpu_start = time.process_time() if pool_profile else None
+    host_processes_before = process_table(ticks) if host_cpu else None
 
     def write_pool_capture(document):
         # Atomic replacement retains the previous checkpoint on interruption.
@@ -263,6 +336,10 @@ def sample_processes(backend, gateway_pids, output, interval, parent_pid=None, s
             record["cpu_seconds"] = state["cpu_seconds"] - record["first_cpu_seconds"]
             record["peak_rss_bytes"] = max(record["peak_rss_bytes"], state["rss_bytes"])
             snapshot["processes"].append(dict(state, pid=pid, role=role))
+        if host_cpu:
+            host = capture_host_cpu(ticks)
+            if host is not None:
+                snapshot["host"] = host
         if http3:
             snapshot["threads"] = [dict(thread, role=role)
                                    for pid, role in roles.items() if role != "client"
@@ -321,6 +398,12 @@ def sample_processes(backend, gateway_pids, output, interval, parent_pid=None, s
         }
         if h1_profile:
             report["h1_gateway"] = owned_gateway
+        if host_cpu:
+            # The benchmark's own processes and this sampler are not "the host".
+            report["host_processes"] = host_process_usage(
+                host_processes_before, process_table(ticks), set(roles) | {os.getpid()})
+            report["host_processes_scope"] = (
+                "sampler lifetime; processes outside the benchmark that were alive at its end")
         if pool_profile:
             report["sampler_lifetime_cpu_secs"] = time.process_time() - sampler_cpu_start
             write_pool_capture(report)
@@ -344,6 +427,7 @@ if __name__ == "__main__":
     parser.add_argument("--pool-profile", action="store_true")
     parser.add_argument("--udp-profile", action="store_true")
     parser.add_argument("--scheduler-counters", action="store_true")
+    parser.add_argument("--host-cpu", action="store_true")
     parser.add_argument("--h1-runtime")
     parser.add_argument("--h1-container-id")
     parser.add_argument("--parent-pid", type=int)
@@ -355,4 +439,4 @@ if __name__ == "__main__":
                      h2_gauges=args.h2_gauges, h1_profile=args.h1_profile,
                      h1_runtime=args.h1_runtime, h1_container_id=args.h1_container_id,
                      pool_profile=args.pool_profile, udp_profile=args.udp_profile,
-                     scheduler_counters=args.scheduler_counters)
+                     scheduler_counters=args.scheduler_counters, host_cpu=args.host_cpu)

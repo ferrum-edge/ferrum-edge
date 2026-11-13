@@ -452,6 +452,36 @@ H2-observation lanes, which keep their own fixed process accounting;
 window only. Later disturbances are not detected (see the known limitations
 below), so the per-sample diagnostics remain the check for a single odd sample.
 
+**Host-disturbance flags.** A shared runner takes CPU for its own housekeeping
+and sometimes does less work per CPU-second, and either moves a sample without
+the gateway changing. The runner marks the samples this touched. With
+`process_usage.py --host-cpu` the sampler records the host's CPU beside the
+benchmark's own processes at every tick, and names the processes outside the
+benchmark that used the most CPU during the sample. After the last pair,
+`host_disturbance.py` reads every sample and writes its findings into each
+sample's JSON (`host_disturbance`), into each summary and each row of
+`paired_comparisons.json` (the flags of every sample the row uses), and into
+`host_disturbance.json`, and prints a table at the end of the run log. It
+flags only: nothing measured changes and no sample is dropped or re-run.
+
+| Flag | Meaning | Evidence |
+|---|---|---|
+| `host_cpu_burst` | The host was busy outside the benchmark: at least 0.25 cores above the sample's own floor (its lower-quartile level) for a second or more. | Host CPU minus the sampled gateway, backend and client; `host_processes` names what ran. |
+| `cpu_dip` | Gateway plus backend CPU fell under 88% of the sample's plateau (its upper-quartile level) for a second or more. | The benchmark's own processes. With `host_cpu_burst` it is the burst's effect; without it, on a run that recorded host CPU, the arm's own CPU dipped while the host was idle. |
+| `provisioner_burst` | The provisioner's job daemon used a CPU-second or more during the sample: its first-start reaction reached a measured cell. | `provjobd<digits>` in `host_processes`. |
+| `provisioner_burst_suspected` | The same, inferred: the settle saw no reaction for the arm's image and one of the arm's first two cells in its first pair dipped. | Only for runs that did not record host CPU. |
+| `periodic_60s` | The sample's dip or burst is one of at least three that recur 60 seconds apart across the run. | `periodic_activity` in `host_disturbance.json` gives the count. |
+| `cpu_per_request_drift` | For this arm and payload, gateway and backend CPU per request are both at least 6% higher in one pair than in another. Every pair of the arm is marked: nothing says which one is right. | CPU inside the measured window over the requests completed. Only samples of 20,000 requests or more are compared. |
+
+`manifest.json` records the runner's CPU model (`runner_cpu_model`), which
+decides what to expect: see the known limitations below. The flags are on by
+default for the comparison lanes and off for the profile, trace and
+H2-observation lanes, whose sampler arguments and manifest are fixed;
+`--host-flags` and `--no-host-flags` override that. `host_disturbance.py
+report <run directory> <protocol>` prints the same table for any earlier run
+and writes nothing; a run from before host CPU was recorded gets the flags that
+need only the benchmark's own processes, and the table says so.
+
 For a revision experiment, make both images available on the **same hosted
 runner**, pin their digests, and run, for example:
 
@@ -593,32 +623,39 @@ or adaptive flags and therefore uses **2 pairs, adaptive off**.
 - Unmodelled order effects: equal mean position does not model drift or varying
   separation between compared arms; ratio noise can still vary across pairs.
 - Host disturbance outside the settle: the settle holds only each image's
-  first start, and nothing later in a run is prevented or flagged. In 31
-  identical-code validation jobs (an in-run build against its own published
-  image) two kinds were tied to the runner's CPU model:
+  first start, and nothing later in a run is prevented. It is flagged (see
+  "Host-disturbance flags" above); the flags mark a sample, they do not
+  correct it. In 31 identical-code validation jobs (an in-run build against
+  its own published image) two kinds were tied to the runner's CPU model:
   - On all ten AMD EPYC 7763 runners, gateway and backend CPU dropped
     together by about 20% for up to two seconds every 60 seconds, whichever
     arm was running. `hv_kvp_daemon` is the likely cause: settle records on
     those runners show it using 0.8 to 1.3 CPU-seconds within one arm's
-    settle, against at most a quarter of a second elsewhere. It was not
-    sampled during a measured cell.
+    settle, against at most a quarter of a second elsewhere. Flagged as
+    `cpu_dip` and `periodic_60s` in all ten, and in none of the other 21.
   - On five of six AMD EPYC 9V45 runners the two identical arms differed by
     between 4% and 25% in at least one pair with no dip in the timeline:
     gateway and backend CPU seconds per request moved together, by up to about
     a third between two samples of the same arm, with the same number of system
-    calls per request. The cause is not established.
+    calls per request. The cause is not established. Flagged as
+    `cpu_per_request_drift` on a gateway arm in four of the five; in the
+    fifth, the mildest (pairs +4.0% and -2.4%), only `direct` crossed the 6%
+    threshold.
 
   A single sample can show the second kind on other runners too: one cell on a
   Xeon Platinum 8370C runner used 8% more gateway and backend CPU per request
-  than the same arm's other pair, cause unknown. The two arms of that
-  comparison are also separate builds of one commit, not one binary, so a
-  consistent difference of a percent or two in one protocol can be real. In
-  the eleven lanes run with the 20-second load the in-run arm read within 2%
-  of the image arm in seven, +2.2% and +2.6% in two, and -3.4% and -4.4% in
-  two (the Xeon 8370C lane and an EPYC 7763 lane). Before
-  trusting a two-pair average, check the job's CPU model,
-  `host_settle.json` for an arm the host did not react to, the `process_usage`
-  timelines for dips, and CPU per request across pairs.
+  than the same arm's other pair, cause unknown, and is flagged. The two arms
+  of that comparison are also separate builds of one commit, not one binary,
+  so a consistent difference of a percent or two in one protocol can be real.
+  In the eleven lanes run with the 20-second load the in-run arm read within
+  2% of the image arm in seven, +2.2% and +2.6% in two, and -3.4% and -4.4% in
+  two (the Xeon 8370C lane and an EPYC 7763 lane).
+- What the flags do not catch: a drift under 6%, or at payloads of 512 KiB and
+  above where a sample completes too few requests to compare (quiet runners
+  differ by up to 9% there); a dip of a single 0.5-second tick; and, in a run
+  that did not record host CPU, the difference between a host burst and an
+  arm's own stall (Envoy and Kong at 5 MiB dip on their own). A comparison
+  with no flags is not thereby proven clean.
 
 #### Window, client and revision inputs (#6038, #6022)
 
