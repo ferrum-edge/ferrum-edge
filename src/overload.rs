@@ -2464,9 +2464,9 @@ mod tests {
     /// blocked, keeps the workers blocked for `blocked_after_queue` after the
     /// probe has queued its tasks, and returns the latency the probe reports.
     ///
-    /// The release is tied to the probe's first poll and not to a clock. A
-    /// start counter followed by fixed sleeps only proved historical
-    /// saturation: CI could delay the probe until all sleeps ended.
+    /// The hold is counted from the probe's first poll, not from before the
+    /// probe ran. A start counter followed by fixed sleeps only proved
+    /// historical saturation: CI could delay the probe until all sleeps ended.
     async fn probe_latency_with_every_worker_blocked(
         budget: Duration,
         blocked_after_queue: Duration,
@@ -2515,11 +2515,16 @@ mod tests {
 
     /// A probe that cannot be scheduled within its budget reports at least
     /// the budget, so the critical threshold it was sized from trips.
+    ///
+    /// This checks the value the probe reports, not which branch produced it.
+    /// With every worker blocked nothing drives the runtime's timer, so the
+    /// budget timer can fire only once the workers are released, and the
+    /// probe tasks may finish first with their own, larger, measurement.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn measure_event_loop_latency_reports_at_least_the_budget_on_timeout() {
         let budget = Duration::from_millis(40);
         // The workers stay blocked for five budgets after the probe queues, so
-        // its tasks are still queued when the budget runs out.
+        // its tasks wait well past the budget before any worker can run them.
         let latency = probe_latency_with_every_worker_blocked(budget, 5 * budget).await;
         assert!(
             latency >= budget,
