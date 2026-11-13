@@ -467,11 +467,15 @@ flags only: nothing measured changes and no sample is dropped or re-run.
 | Flag | Meaning | Evidence |
 |---|---|---|
 | `host_cpu_burst` | The host was busy outside the benchmark: at least 0.25 cores above the sample's own floor (its lower-quartile level) for a second or more. | Host CPU minus the sampled gateway, backend and client; `host_processes` names what ran. |
-| `cpu_dip` | Gateway plus backend CPU fell under 88% of the sample's plateau (its upper-quartile level) for a second or more. | The benchmark's own processes. With `host_cpu_burst` it is the burst's effect; without it, on a run that recorded host CPU, the arm's own CPU dipped while the host was idle. |
-| `provisioner_burst` | The provisioner's job daemon used a CPU-second or more during the sample: its first-start reaction reached a measured cell. | `provjobd<digits>` in `host_processes`. |
-| `provisioner_burst_suspected` | The same, inferred: the settle saw no reaction for the arm's image and one of the arm's first two cells in its first pair dipped. | Only for runs that did not record host CPU. |
-| `periodic_60s` | The sample's dip or burst is one of at least three that recur 60 seconds apart across the run. | `periodic_activity` in `host_disturbance.json` gives the count. |
-| `cpu_per_request_drift` | For this arm and payload, gateway and backend CPU per request are both at least 6% higher in one pair than in another. Every pair of the arm is marked: nothing says which one is right. | CPU inside the measured window over the requests completed. Only samples of 20,000 requests or more are compared. |
+| `cpu_dip` | Gateway plus backend CPU fell under 88% of the sample's plateau (its upper-quartile level) for a second or more. | The benchmark's own processes. With `host_cpu_burst` it is the burst's effect. Without it, on a run that recorded host CPU, the host showed no burst above its own floor and the dip is most likely the arm's own. |
+| `provisioner_burst` | The provisioner's first-start reaction reached the measurement: its job daemon used a CPU-second or more while the sample's sampler ran, and the measured window has a host burst. | `provjobd<digits>` in `host_processes`, which covers the client's warm-up and drain too; `provisioner_cpu_seconds` is recorded even when the window was untouched and the flag is not set. |
+| `provisioner_burst_suspected` | The same, inferred: the settle saw no reaction to the arm's first start (its image, or the harness binaries for `direct`) and one of the arm's first two cells in its first pair dipped. | Only for runs that did not record host CPU. It names the likeliest cause; nothing saw the provisioner. |
+| `periodic_60s` | The sample's dip or burst belongs to a series that recurs every 60 seconds. | At least three consecutive periods each show an event, the gap between successive events within 2.5 seconds of a whole number of periods. `periodic_activity` in `host_disturbance.json` gives the count and the fitted period. |
+| `cpu_per_request_drift` | For this arm and payload, gateway and backend CPU per request are both at least 6% higher in one pair than in another. Every compared pair of the arm is marked: nothing says which one is right. | CPU inside the measured window over the requests completed. Payloads of 512 KiB and above, and samples of fewer than 20,000 requests, are not compared. |
+
+The thresholds were set on 37 hosted jobs and are not guarantees. The drift
+threshold in particular has no margin: arms that nothing else disturbed agree
+across pairs within 5.8%, and the mildest case marked is at 6.2%.
 
 `manifest.json` records the runner's CPU model (`runner_cpu_model`), which
 decides what to expect: see the known limitations below. The flags are on by
@@ -629,20 +633,20 @@ or adaptive flags and therefore uses **2 pairs, adaptive off**.
   its own published image) two kinds stood out:
   - On all twelve AMD EPYC 7763 runners, gateway and backend CPU dropped
     together by about 20% for up to two seconds every 60 seconds, whichever
-    arm was running. The cause is `hv_kvp_daemon`: in the two jobs that
-    recorded host CPU it used 1.1 to 1.3 CPU-seconds in every flagged sample,
+    arm was running. In the two jobs that recorded host CPU the cause is
+    `hv_kvp_daemon`: it used 1.1 to 1.3 CPU-seconds in every flagged sample,
     and the host was busy outside the benchmark by that much for those
-    seconds. Flagged as `periodic_60s` in all twelve, and in none of the
-    other 25.
+    seconds. The ten earlier jobs show the same dips without that record.
+    Flagged as `periodic_60s` in all twelve, and in none of the other 25.
   - Gateway and backend CPU seconds per request moved together between two
     samples of the same arm, by up to about a third, with the same number of
     system calls per request and no dip in the timeline, so the two identical
-    arms differed by between 4% and 25% in at least one pair. This was on five
-    of six AMD EPYC 9V45 runners and on one of twelve EPYC 9V74 runners (pairs
-    +2.9% and -12.0%). The cause is not established. Flagged as
-    `cpu_per_request_drift` on a gateway arm in five of those six jobs; in the
-    sixth, the mildest (pairs +4.0% and -2.4%), only `direct` crossed the 6%
-    threshold.
+    arms differed by between 4% and 25% in at least one pair. Six jobs showed
+    it: five of the six on AMD EPYC 9V45 runners, and one of the twelve on
+    EPYC 9V74 runners (pairs +2.9% and -12.0%). The cause is not established.
+    Five of those six jobs are flagged as `cpu_per_request_drift` on a gateway
+    arm; in the other, the mildest (EPYC 9V45, pairs +4.0% and -2.4%), only
+    `direct` crossed the 6% threshold.
 
   A single sample can show the second kind on other runners too: one cell on a
   Xeon Platinum 8370C runner used 8% more gateway and backend CPU per request
@@ -653,10 +657,14 @@ or adaptive flags and therefore uses **2 pairs, adaptive off**.
   2% of the image arm in seven, +2.2% and +2.6% in two, and -3.4% and -4.4% in
   two (the Xeon 8370C lane and an EPYC 7763 lane).
 - What the flags do not catch: a drift under 6%, or at payloads of 512 KiB and
-  above where a sample completes too few requests to compare (quiet runners
-  differ by up to 9% there); a dip of a single 0.5-second tick; and, in a run
-  that did not record host CPU, the difference between a host burst and an
-  arm's own stall (Envoy and Kong at 5 MiB dip on their own). Nor can they see
+  above, which are not compared because a sample completes too few requests
+  (quiet runners differ by up to 9% there); a dip of a single 0.5-second tick;
+  and, in a run that did not record host CPU, the difference between a host
+  burst and an arm's own stall (Envoy at 5 MiB in the HTTP/3 lane dips on its
+  own). They can also mark too much: a move near the drift threshold falls on
+  either side of it by chance, and a run with a dozen unrelated disturbances
+  lines three of them up as a 60-second series about one time in ten. Nor can
+  they see
   a difference between two arms that holds in every pair: that is what the
   benchmark reports, and only an identical-code run shows when it is not the
   code. One such run on an EPYC 9V74 runner read the in-run arm 3.4% and 8.1%

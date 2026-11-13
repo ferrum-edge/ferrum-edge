@@ -86,6 +86,7 @@ class ReplayedHostedRuns(Replay):
         self.assertEqual(report["runner_cpu_model"], "AMD EPYC 7763 64-Core Processor")
         self.assertEqual(report["periodic_activity"]["period_seconds"], 60.0)
         self.assertEqual(report["periodic_activity"]["events"], 6)
+        self.assertGreaterEqual(report["periodic_activity"]["consecutive_periods"], 3)
         self.assertEqual(report["summary"]["by_flag"], {"cpu_dip": 6, "periodic_60s": 6})
         # Whichever arm is running: direct, the image arm, Envoy and ferrum.
         self.assertEqual({gateway for _, gateway, _ in flagged},
@@ -243,10 +244,18 @@ class WhatAnnotateWrites(Replay):
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual({path: path.read_text() for path in Path(temporary).rglob("*.json")}, before)
         lines = result.stdout.splitlines()
+        # The run itself prints through annotate: the two tables are the same.
+        with tempfile.TemporaryDirectory() as temporary:
+            expand(fixture, temporary)
+            printed = io.StringIO()
+            host_disturbance.print_report(host_disturbance.annotate(
+                temporary, fixture["lane"], fixture["gateways"], fixture["payload_sizes"],
+                fixture["pairs"]), printed)
+        self.assertEqual(printed.getvalue().splitlines(), lines)
         self.assertEqual(lines[0], "[flags] runner CPU: AMD EPYC 7763 64-Core Processor")
         self.assertIn("[flags] host CPU was not recorded in this run", lines[1])
-        self.assertEqual(lines[2], "[flags] 6 of 40 samples flagged")
-        self.assertEqual(lines[3], "[flags] host activity every 60 s: 6 events over 422.4 s")
+        self.assertEqual(lines[2], "[flags] 6 of 40 samples flagged; 11 of 25 comparisons touched")
+        self.assertEqual(lines[3], "[flags] host activity every 60 s: seen in 6 periods over 422.4 s")
         self.assertEqual(len(lines), 10)
         self.assertRegex(lines[4], r"^\[flags\] pair 1 direct +10240  cpu_dip periodic_60s  \(dip to 0\.7\d for 1\.5")
 
@@ -293,6 +302,7 @@ class HostCpuRules(unittest.TestCase):
             series(dip=(13.0, 15.0, 1.0), burst=(13.0, 15.0, 1.0)),
             host_processes=[dict(comm="provjobd4157412", pid=900, cpu_seconds=2.1),
                             dict(comm="containerd", pid=901, cpu_seconds=0.05)])
+        self.assertNotIn("unavailable", row)
         self.assertTrue(row["host_cpu_recorded"])
         self.assertEqual(row["flags"], ["cpu_dip", "host_cpu_burst", "provisioner_burst"])
         burst = row["host_cpu_bursts"][0]
@@ -322,6 +332,30 @@ class HostCpuRules(unittest.TestCase):
         self.assertEqual(self.analyse(series(dip=(9.0, 10.0, 2.0)))["flags"], [])
         self.assertEqual(self.analyse(series(dip=(20.0, 21.0, 2.0)))["flags"], [])
 
+    def test_a_provisioner_reaction_outside_the_measured_window_is_recorded_but_not_flagged(self):
+        # The sampler's process list covers the client's warm-up and drain. Two
+        # CPU-seconds of the provisioner there, with the measured window steady,
+        # did not touch the measurement.
+        for burst in ((9.0, 10.0, 2.0), (20.0, 21.0, 2.0)):
+            with self.subTest(burst=burst):
+                row = self.analyse(series(burst=burst),
+                                   host_processes=[dict(comm="provjobd7", pid=9, cpu_seconds=2.0)])
+                self.assertEqual(row["flags"], [])
+                self.assertEqual(row["provisioner_cpu_seconds"], 2.0)
+                self.assertEqual(row["host_processes"], [dict(comm="provjobd7", cpu_seconds=2.0)])
+
+    def test_figures_that_are_not_finite_numbers_are_not_used(self):
+        self.assertFalse(host_disturbance.is_number(float("nan")))
+        self.assertFalse(host_disturbance.is_number(float("inf")))
+        self.assertFalse(host_disturbance.is_number(True))
+        self.assertFalse(host_disturbance.is_number(10 ** 400))
+        self.assertTrue(host_disturbance.is_number(0))
+        row = self.analyse(series(), requests=float("nan"))
+        self.assertNotIn("gateway_cpu_us_per_request", row)
+        self.assertIsNone(row["requests"])
+        self.assertEqual(host_disturbance.provisioner_cpu(
+            [dict(comm="provjobd1", cpu_seconds=float("nan")), dict(comm="provjobd1", cpu_seconds=0.5)]), 0.5)
+
     def test_provisioner_cpu_under_a_second_is_its_idle_background(self):
         row = self.analyse(series(), host_processes=[dict(comm="provjobd1", pid=9, cpu_seconds=0.7),
                                                      dict(comm="provjobd1", pid=9, cpu_seconds=0.2)])
@@ -332,10 +366,12 @@ class HostCpuRules(unittest.TestCase):
     def test_a_short_or_missing_series_is_reported_as_not_analysed(self):
         self.assertEqual(self.analyse([])["unavailable"], "no sampler series")
         self.assertEqual(host_disturbance.analyse_sample({}, None)["flags"], [])
-        # Too few samples for a median to mean anything: no flags, no figures.
+        # Too few ticks in the window for a plateau to mean anything: no flags,
+        # no figures, and counted as not analysed instead of as clean.
         row = self.analyse(series(seconds=3.0, dip=(10.0, 11.5, 2.0)))
         self.assertEqual(row["flags"], [])
         self.assertNotIn("gateway_cpu_us_per_request", row)
+        self.assertEqual(row["unavailable"], "too few sampler ticks inside the measured window")
 
     def test_cpu_per_request_comes_from_the_measured_window(self):
         row = self.analyse(series(), requests=50000)
@@ -384,10 +420,102 @@ class CpuPerRequestRules(unittest.TestCase):
         self.assertEqual(self.flags({1: (64.6, 19.7, 355000)}), {1: []})
         self.assertEqual(self.flags({1: (64.6, 19.7, 355000), 2: (None, None, 294000)}), {1: [], 2: []})
 
-    def test_with_more_pairs_the_cheapest_and_dearest_decide(self):
+    def test_with_more_pairs_any_two_that_disagree_mark_the_arm(self):
         flags = self.flags({1: (100.0, 50.0, 90000), 2: (101.0, 50.5, 90000),
                             3: (112.0, 56.0, 90000), 4: (100.5, 50.2, 90000)})
         self.assertTrue(all(value == ["cpu_per_request_drift"] for value in flags.values()))
+        # The backend's dearest pair is not the one whose gateway moved with
+        # it: pair 2 against pair 1 is the joint rise, pair 3 is backend alone.
+        group = arm({1: (100.0, 50.0, 90000), 2: (120.0, 55.0, 90000),
+                     3: (100.0, 60.0, 90000), 4: (100.0, 50.0, 90000)})
+        host_disturbance.flag_cpu_per_request_drift(group)
+        self.assertTrue(all(row["flags"] == ["cpu_per_request_drift"] for row in group.values()))
+        self.assertEqual(group[1]["cpu_per_request_drift"],
+                         dict(backend_percent=10.0, gateway_percent=20.0, high_pair=2, low_pair=1))
+
+    def test_pairs_under_the_request_floor_do_not_silence_the_ones_above_it(self):
+        # An adaptive extension doubles the duration: pairs 3 and 4 clear the
+        # floor that pairs 1 and 2 missed, and they disagree by 20%.
+        flags = self.flags({1: (100.0, 50.0, 19000), 2: (100.0, 50.0, 19000),
+                            3: (100.0, 50.0, 38000), 4: (120.0, 60.0, 38000)})
+        self.assertEqual(flags, {1: [], 2: [], 3: ["cpu_per_request_drift"], 4: ["cpu_per_request_drift"]})
+        # One compared pair is not a comparison.
+        self.assertEqual(self.flags({1: (100.0, 50.0, 19000), 2: (120.0, 60.0, 38000)}), {1: [], 2: []})
+
+
+def dips_at(times):
+    """{key: row} with one dip per given start time, as analyse_run builds them."""
+    return {index: dict(flags=["cpu_dip"], cpu_dips=[dict(start_unix_secs=BASE + time)])
+            for index, time in enumerate(times)}
+
+
+class PeriodicRule(unittest.TestCase):
+    def periodic(self, times):
+        samples = dips_at(times)
+        found = host_disturbance.periodic_activity(samples)
+        marked = [times[index] for index, row in samples.items() if "periodic_60s" in row["flags"]]
+        return found, marked
+
+    def test_three_consecutive_periods_establish_it_and_a_missed_one_does_not_undo_it(self):
+        found, marked = self.periodic([38, 99, 219, 279, 339, 397])
+        # The event at 159 fell between two cells; 219 to 397 are four in a row.
+        self.assertEqual((found["events"], found["consecutive_periods"]), (6, 4))
+        self.assertEqual(marked, [38, 99, 219, 279, 339, 397])
+        found, marked = self.periodic([0, 60.5, 119.5])
+        self.assertEqual((found["events"], found["consecutive_periods"], found["seconds_spanned"]),
+                         (3, 3, 119.5))
+
+    def test_sharing_a_phase_several_periods_apart_is_not_recurrence(self):
+        # Six unrelated disturbances; 30.4, 153.6 and 273.4 share a phase with
+        # gaps of about 120 s. Nothing here recurs every 60 s.
+        self.assertEqual(self.periodic([30.4, 63.4, 136.0, 153.6, 225.1, 273.4]), (None, []))
+        self.assertEqual(self.periodic([0, 61, 300, 361]), (None, []))
+
+    def test_two_events_in_one_period_do_not_count_as_two_periods(self):
+        self.assertEqual(self.periodic([0, 2, 122]), (None, []))
+        found, marked = self.periodic([0, 1.5, 60, 120])
+        self.assertEqual(found["events"], 3)
+        self.assertEqual(marked, [0, 1.5, 60, 120])
+
+    def test_gaps_must_stay_within_the_tolerance_of_the_period(self):
+        self.assertEqual(self.periodic([0, 63, 126]), (None, []))
+        self.assertEqual(self.periodic([])[0], None)
+
+    def test_a_period_that_wanders_is_followed_gap_by_gap_and_fitted(self):
+        # Start times from a hosted EPYC 7763 run: gaps of 59.1 to 62.4 s, the
+        # last event 2.4 s late against a fixed 60 s comb from the first.
+        found, marked = self.periodic([15.9, 195.7, 254.8, 315.4, 375.9, 438.3])
+        self.assertEqual((found["events"], found["consecutive_periods"]), (6, 5))
+        self.assertAlmostEqual(found["fitted_period_seconds"], 60.2, delta=0.1)
+        self.assertEqual(len(marked), 6)
+
+    def test_an_unrelated_event_beside_a_periodic_series_is_left_unmarked(self):
+        _, marked = self.periodic([10, 70, 95, 130, 190])
+        self.assertEqual(marked, [10, 70, 130, 190])
+
+
+class DriftScope(Replay):
+    def test_payloads_of_512_kib_and_above_are_not_compared(self):
+        # direct completes more than 20,000 requests at 512 KiB, so the request
+        # floor alone would compare it; pairs on quiet runners differ by up to
+        # 9% at that size.
+        fixture = json.loads((FIXTURES / "periodic_60s_epyc_7763.json").read_text())
+        direct = [sample for sample in fixture["samples"]
+                  if sample["gateway"] == "direct" and sample["payload_size"] == 512000]
+        self.assertTrue(all(sample["total_requests"] > 20000 for sample in direct))
+        for sample in direct:
+            if sample["pair"] == 2:  # the same CPU for 12% fewer requests
+                sample["total_requests"] = int(sample["total_requests"] * 0.88)
+        with tempfile.TemporaryDirectory() as temporary:
+            expand(fixture, temporary)
+            report = host_disturbance.analyse_run(temporary, fixture["lane"], fixture["gateways"],
+                                                  fixture["payload_sizes"], fixture["pairs"])
+        rows = {row["pair"]: row for row in report["samples"]
+                if row["gateway"] == "direct" and row["payload_size"] == 512000}
+        self.assertGreater(rows[2]["backend_cpu_us_per_request"],
+                           1.1 * rows[1]["backend_cpu_us_per_request"])
+        self.assertFalse(any("cpu_per_request_drift" in row["flags"] for row in rows.values()))
+        self.assertNotIn("cpu_per_request_drift", report["summary"]["by_flag"])
 
 
 class SettleRecords(unittest.TestCase):
@@ -450,7 +578,7 @@ class ReportTable(unittest.TestCase):
             host_disturbance.print_report(report, output)
         self.assertEqual(report["summary"], dict(samples=1, flagged=0, not_analysed=1, by_flag={}))
         self.assertIn("[flags] runner CPU: not recorded", output.getvalue())
-        self.assertIn("[flags] 1 samples could not be analysed: no sampler series", output.getvalue())
+        self.assertIn("[flags] 1 samples could not be analysed: no usable sampler series", output.getvalue())
 
     def test_shape_comes_from_the_manifest_unless_given(self):
         with tempfile.TemporaryDirectory() as temporary:

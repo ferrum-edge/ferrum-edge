@@ -12,7 +12,8 @@ have been seen to move a sample without the gateway under test changing:
 - the provisioner's first-start reaction comes late and lands in a measured
   cell although the first-start settle ran.
 
-This flags them. It changes nothing that is measured, drops nothing and
+This flags them. The thresholds below were set on 37 hosted jobs; they are
+where the evidence put them, not guarantees. It changes nothing that is measured, drops nothing and
 re-runs nothing: it reads what a run recorded and writes what it found into
 each sample, each paired comparison and `host_disturbance.json`.
 
@@ -26,6 +27,7 @@ CPU dip is the only evidence, and the flags say so.
 
 import argparse
 import json
+import math
 import os
 import sys
 from pathlib import Path
@@ -47,22 +49,37 @@ BURST_CORES = 0.25
 BURST_MIN_SAMPLES = 2
 # The provisioner's job daemon is `/tmp/provjobd<digits>`.
 PROVISIONER_PREFIX = "provjobd"
-# CPU-seconds of it inside one cell that count as its first-start reaction.
-# The reaction is 2-6; its idle background over a cell is under 0.2.
+# CPU-seconds of it while one cell's sampler ran that count as its first-start
+# reaction. The reaction is 2-6; its idle background over a cell is under 0.5.
+# The sampler's process list covers warm-up and drain too, so the flag also
+# needs a host burst inside the measured window.
 PROVISIONER_CPU_SECONDS = 1.0
 # A settle record below this did not see the reaction (see host_settle.py).
 SETTLE_REACTION_CPU_SECONDS = 1.0
 # Gateway AND backend CPU per request both this much higher in one pair than
-# in another, for one arm and payload. On runners without the effect the two
-# pairs agree within 5% at 10 KiB and 70 KiB.
+# in another, for one arm and payload. There is no clear gap to aim at: over
+# 37 hosted jobs the pairs of arms that nothing else disturbed agree within
+# 5.8% at 10 KiB and 70 KiB, and the mildest case worth marking is at 6.2%.
+# A move near the threshold can land on either side of it.
 DRIFT_RATIO = 1.06
-# Samples with fewer requests than this are not compared: at 512 KiB and above
-# a sample completes too few for CPU per request to be that steady, and pairs
-# on quiet runners differ by up to 9%.
+# Payloads from this size up are not compared: a sample completes too few
+# requests for CPU per request to be that steady, and pairs on quiet runners
+# differ by up to 9%.
+DRIFT_PAYLOAD_LIMIT_BYTES = 512000
+# Nor is any sample with fewer requests than this, whatever its payload (a
+# slow arm, a short run).
 DRIFT_MIN_REQUESTS = 20000
-# Known periodic host activity, in seconds, and how loosely events must line up.
+# Known periodic host activity, in seconds, and how far the gap between two
+# successive events may be from a whole number of periods for them to count
+# as recurring. hv_kvp_daemon's gaps were 59 to 62.5 seconds.
 PERIODS = (60.0,)
-PERIOD_TOLERANCE = 3.0
+PERIOD_TOLERANCE = 2.5
+# Once recurrence is established, how far from the fitted comb an event may be
+# and still be marked as part of it.
+PERIOD_MEMBER_TOLERANCE = 3.0
+# Consecutive periods that must each show an event before the run is said to
+# have periodic activity. Sharing a phase is not enough: unrelated events two
+# or three periods apart share one by chance.
 PERIOD_MIN_EVENTS = 3
 # An interval shorter than this cannot resolve CPU ticks; the sampler's first
 # two samples are a millisecond apart.
@@ -81,8 +98,11 @@ THRESHOLDS = {
     "provisioner_cpu_seconds": PROVISIONER_CPU_SECONDS,
     "settle_reaction_cpu_seconds": SETTLE_REACTION_CPU_SECONDS,
     "drift_ratio": DRIFT_RATIO, "drift_min_requests": DRIFT_MIN_REQUESTS,
+    "drift_payload_limit_bytes": DRIFT_PAYLOAD_LIMIT_BYTES,
     "periods_seconds": list(PERIODS),
-    "period_tolerance_seconds": PERIOD_TOLERANCE, "period_min_events": PERIOD_MIN_EVENTS,
+    "period_tolerance_seconds": PERIOD_TOLERANCE,
+    "period_member_tolerance_seconds": PERIOD_MEMBER_TOLERANCE,
+    "period_min_events": PERIOD_MIN_EVENTS,
 }
 
 
@@ -103,7 +123,13 @@ def write_json(path, document):
 
 
 def is_number(value):
-    return isinstance(value, (int, float)) and not isinstance(value, bool)
+    """A finite JSON number; `true` and NaN are not measurements."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return False
+    try:
+        return math.isfinite(value)
+    except OverflowError:
+        return False
 
 
 def measurement_window(sample):
@@ -284,6 +310,9 @@ def analyse_sample(sample, usage):
         result["unavailable"] = "no sampler series"
         return result
     rows = intervals(timeline, measurement_window(sample))
+    if len(rows) < MIN_INTERVALS:
+        result["unavailable"] = "too few sampler ticks inside the measured window"
+        return result
     result["host_cpu_recorded"] = any(row["other"] is not None for row in rows)
     dips, bursts = cpu_dips(rows), host_bursts(rows)
     if dips:
@@ -300,8 +329,11 @@ def analyse_sample(sample, usage):
                                     for row in processes]
     provisioner = provisioner_cpu(processes)
     if provisioner >= PROVISIONER_CPU_SECONDS:
+        # Recorded either way; a reaction that fell wholly in the client's
+        # warm-up or drain did not touch what was measured and is not flagged.
         result["provisioner_cpu_seconds"] = round(provisioner, 3)
-        result["flags"].append("provisioner_burst")
+        if bursts:
+            result["flags"].append("provisioner_burst")
     for role in BENCHMARK_ROLES:
         value = cpu_per_request(sample, rows, role)
         if value is not None:
@@ -312,33 +344,47 @@ def analyse_sample(sample, usage):
 
 
 def flag_cpu_per_request_drift(group):
-    """Mark every sample of one arm and payload when its pairs disagree.
+    """Mark the compared samples of one arm and payload when two pairs disagree.
 
     The backend does the same work per request whatever the pair, and so does
-    the gateway. When both cost more in the same pair, the host changed, not
-    the code; nothing says which pair is the true one, so all are marked.
+    the gateway. When both cost more in one pair than in another, the host
+    changed, not the code; nothing says which pair is the true one, so every
+    compared pair is marked. Samples under the request floor are left out of
+    the comparison and unmarked.
     """
-    if any((row.get("requests") or 0) < DRIFT_MIN_REQUESTS for row in group.values()):
+    eligible = {pair: row for pair, row in group.items()
+                if (row.get("requests") or 0) >= DRIFT_MIN_REQUESTS
+                and row.get("backend_cpu_us_per_request")}
+    strongest = None
+    for high, dearer in eligible.items():
+        for low, cheaper in eligible.items():
+            if high == low:
+                continue
+            backend = dearer["backend_cpu_us_per_request"] / cheaper["backend_cpu_us_per_request"]
+            if backend < DRIFT_RATIO:
+                continue
+            above, below = (dearer.get("gateway_cpu_us_per_request"),
+                            cheaper.get("gateway_cpu_us_per_request"))
+            if above and below:
+                # Same two pairs, same direction: a gateway that merely differs
+                # between pairs while the backend drifts the other way is not this.
+                gateway = above / below
+                if gateway < DRIFT_RATIO:
+                    continue
+            elif above or below:
+                continue
+            else:
+                gateway = None  # direct: there is no gateway to agree with
+            strength = backend if gateway is None else min(backend, gateway)
+            if strongest is None or strength > strongest[0]:
+                strongest = (strength, high, low, backend, gateway)
+    if strongest is None:
         return
-    backend = {pair: row.get("backend_cpu_us_per_request") for pair, row in group.items()}
-    gateway = {pair: row.get("gateway_cpu_us_per_request") for pair, row in group.items()}
-    backend = {pair: value for pair, value in backend.items() if value}
-    gateway = {pair: value for pair, value in gateway.items() if value}
-    if len(backend) < 2:
-        return
-    high, low = max(backend, key=backend.get), min(backend, key=backend.get)
-    if backend[high] < DRIFT_RATIO * backend[low]:
-        return
-    detail = dict(backend_percent=round(100 * (backend[high] / backend[low] - 1), 1),
-                  high_pair=high, low_pair=low)
-    if gateway:
-        # Same two pairs, same direction: a gateway that merely differs between
-        # pairs while the backend drifts the other way is not this.
-        if high not in gateway or low not in gateway \
-                or gateway[high] < DRIFT_RATIO * gateway[low]:
-            return
-        detail["gateway_percent"] = round(100 * (gateway[high] / gateway[low] - 1), 1)
-    for row in group.values():
+    _, high, low, backend, gateway = strongest
+    detail = dict(backend_percent=round(100 * (backend - 1), 1), high_pair=high, low_pair=low)
+    if gateway is not None:
+        detail["gateway_percent"] = round(100 * (gateway - 1), 1)
+    for row in eligible.values():
         row["cpu_per_request_drift"] = detail
         row["flags"].append("cpu_per_request_drift")
 
@@ -346,9 +392,11 @@ def flag_cpu_per_request_drift(group):
 def flag_suspected_provisioner_bursts(samples, reactions, gateways, sizes):
     """Older runs: no host CPU, so infer a late first-start reaction.
 
-    The settle saw no reaction for the arm's image and the arm's first cells of
-    its first pair, where the reaction would land, show a dip that is not part
-    of the run's periodic activity.
+    The settle saw no reaction to the arm's first start (its image, or for
+    `direct` the harness binaries) and the arm's first cells of its first
+    pair, where the reaction would land, show a dip that is not part of the
+    run's periodic activity. An inference: it names the likeliest cause of the
+    dip, it did not see the provisioner.
     """
     for gateway in gateways:
         reaction = reactions.get(settle_arm(gateway))
@@ -365,32 +413,85 @@ def flag_suspected_provisioner_bursts(samples, reactions, gateways, sizes):
                 row["flags"].append("provisioner_burst_suspected")
 
 
+def longest_consecutive(numbers):
+    """Length of the longest run of consecutive integers in `numbers`."""
+    best = current = 0
+    previous = None
+    for number in sorted(set(numbers)):
+        current = current + 1 if previous is not None and number == previous + 1 else 1
+        best, previous = max(best, current), number
+    return best
+
+
+def periodic_series(times, period):
+    """The longest series of event times whose successive gaps are whole periods.
+
+    Returns [(period index, time)], one entry per period, or None unless
+    PERIOD_MIN_EVENTS consecutive periods each hold an event. Each event is
+    judged against the one before it, so a period that wanders by a second
+    does not accumulate into a miss; an event within the tolerance of the last
+    one is the same period's and is not counted again.
+    """
+    best = None
+    for first in range(len(times)):
+        series = [(0, times[first])]
+        for time in times[first + 1:]:
+            index, last = series[-1]
+            gap = time - last
+            if gap <= PERIOD_TOLERANCE:
+                continue
+            steps = round(gap / period)
+            if steps >= 1 and abs(gap - steps * period) <= PERIOD_TOLERANCE:
+                series.append((index + steps, time))
+        if longest_consecutive([index for index, _ in series]) >= PERIOD_MIN_EVENTS \
+                and (best is None or len(series) > len(best)):
+            best = series
+    return best
+
+
 def periodic_activity(samples):
-    """Dips or bursts that recur on a known period across the whole run."""
+    """Dips or bursts that recur on a known period across the whole run.
+
+    Two steps. A series of events one period apart, PERIOD_MIN_EVENTS periods
+    in a row, establishes that the run has periodic activity: events that
+    merely line up several periods apart do not, and a period without an
+    event (it fell between two cells) does not undo it. Then a comb is fitted
+    to that series and every event within PERIOD_MEMBER_TOLERANCE of a tooth
+    is marked, including one the strict series skipped for arriving a little
+    early or late.
+    """
     events = []
     for key, row in samples.items():
         # A burst names the cause; a dip is what is left when host CPU was not
         # recorded or the burst stayed under the burst threshold.
         for event in row.get("host_cpu_bursts") or row.get("cpu_dips") or []:
             events.append((event["start_unix_secs"], key))
-    best = None
+    events.sort(key=lambda event: event[0])
     for period in PERIODS:
-        for anchor, _ in events:
-            members = [(time, key) for time, key in events
-                       if min((time - anchor) % period, (anchor - time) % period) <= PERIOD_TOLERANCE]
-            span = max(time for time, _ in members) - min(time for time, _ in members)
-            if len(members) >= PERIOD_MIN_EVENTS and span >= 2 * period - PERIOD_TOLERANCE \
-                    and (best is None or len(members) > len(best[1])):
-                best = (period, members)
-    if best is None:
-        return None
-    period, members = best
-    for _, key in members:
-        flag = f"periodic_{int(period)}s"
-        if flag not in samples[key]["flags"]:
-            samples[key]["flags"].append(flag)
-    return dict(period_seconds=period, events=len(members),
-                seconds_spanned=round(max(t for t, _ in members) - min(t for t, _ in members), 1))
+        series = periodic_series([time for time, _ in events], period)
+        if series is None:
+            continue
+        # Least-squares comb through the series: its own period and phase.
+        count = len(series)
+        mean_index = sum(index for index, _ in series) / count
+        mean_time = sum(time for _, time in series) / count
+        spread = sum((index - mean_index) ** 2 for index, _ in series)
+        fitted = sum((index - mean_index) * (time - mean_time) for index, time in series) / spread
+        origin = mean_time - fitted * mean_index
+        periods, members = set(), []
+        for time, key in events:
+            index = round((time - origin) / fitted)
+            if abs(time - origin - index * fitted) <= PERIOD_MEMBER_TOLERANCE:
+                periods.add(index)
+                members.append((time, key))
+        for _, key in members:
+            flag = f"periodic_{int(period)}s"
+            if flag not in samples[key]["flags"]:
+                samples[key]["flags"].append(flag)
+        return dict(period_seconds=period, fitted_period_seconds=round(fitted, 2),
+                    events=len(periods), consecutive_periods=longest_consecutive(periods),
+                    seconds_spanned=round(members[-1][0] - members[0][0], 1))
+    return None
 
 
 def analyse_run(directory, protocol, gateways, sizes, pairs):
@@ -411,6 +512,8 @@ def analyse_run(directory, protocol, gateways, sizes, pairs):
                 samples[gateway, size, pair] = row
     for gateway in gateways:
         for size in sizes:
+            if size >= DRIFT_PAYLOAD_LIMIT_BYTES:
+                continue
             group = {pair: samples[gateway, size, pair] for pair in range(1, pairs + 1)
                      if (gateway, size, pair) in samples}
             flag_cpu_per_request_drift(group)
@@ -423,7 +526,7 @@ def analyse_run(directory, protocol, gateways, sizes, pairs):
     for row in ordered:
         for flag in row["flags"]:
             counts[flag] = counts.get(flag, 0) + 1
-    return dict(
+    report = dict(
         schema=SCHEMA, thresholds=THRESHOLDS,
         runner_cpu_model=manifest.get("runner_cpu_model") if isinstance(manifest, dict) else None,
         host_cpu_recorded=any(row["host_cpu_recorded"] for row in ordered),
@@ -432,6 +535,21 @@ def analyse_run(directory, protocol, gateways, sizes, pairs):
         summary=dict(samples=len(ordered), flagged=sum(1 for row in ordered if row["flags"]),
                      not_analysed=sum(1 for row in ordered if "unavailable" in row),
                      by_flag=dict(sorted(counts.items()))))
+    comparisons = comparison_rows(load(directory / "paired_comparisons.json"))
+    if comparisons is not None:
+        report["summary"]["comparisons"] = len(comparisons)
+        report["summary"]["comparisons_flagged"] = sum(
+            1 for row in comparisons
+            if comparison_note(report, row["baseline"], row["candidate"], row.get("payload_size"))["flags"])
+    return report
+
+
+def comparison_rows(comparisons):
+    """The rows of paired_comparisons.json that name two arms, or None without the file."""
+    if not isinstance(comparisons, list):
+        return None
+    return [row for row in comparisons
+            if isinstance(row, dict) and "baseline" in row and "candidate" in row]
 
 
 def sample_note(row):
@@ -481,16 +599,11 @@ def annotate(directory, protocol, gateways, sizes, pairs):
             write_json(path, summary)
     path = directory / "paired_comparisons.json"
     comparisons = load(path)
-    if isinstance(comparisons, list):
-        for row in comparisons:
-            if isinstance(row, dict) and "baseline" in row and "candidate" in row:
-                row["host_disturbance"] = comparison_note(
-                    report, row["baseline"], row["candidate"], row.get("payload_size"))
+    if comparison_rows(comparisons) is not None:
+        for row in comparison_rows(comparisons):
+            row["host_disturbance"] = comparison_note(
+                report, row["baseline"], row["candidate"], row.get("payload_size"))
         write_json(path, comparisons)
-        report["summary"]["comparisons"] = len(comparisons)
-        report["summary"]["comparisons_flagged"] = sum(
-            1 for row in comparisons
-            if isinstance(row, dict) and (row.get("host_disturbance") or {}).get("flags"))
     write_json(directory / "host_disturbance.json", report)
     return report
 
@@ -524,11 +637,11 @@ def print_report(report, stream=sys.stdout):
           + (f"; {summary['comparisons_flagged']} of {summary['comparisons']} comparisons touched"
              if "comparisons" in summary else ""))
     if summary["not_analysed"]:
-        write(f"{summary['not_analysed']} samples could not be analysed: no sampler series")
+        write(f"{summary['not_analysed']} samples could not be analysed: no usable sampler series")
     periodic = report.get("periodic_activity")
     if periodic:
-        write(f"host activity every {int(periodic['period_seconds'])} s: {periodic['events']} events "
-              f"over {periodic['seconds_spanned']} s")
+        write(f"host activity every {int(periodic['period_seconds'])} s: seen in {periodic['events']} "
+              f"periods over {periodic['seconds_spanned']} s")
     for row in report["samples"]:
         if row["flags"]:
             write(f"pair {row['pair']} {row['gateway']:<16} {row['payload_size']:>8}  "
