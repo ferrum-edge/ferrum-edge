@@ -62,17 +62,21 @@ fn mint_provider_secret() -> String {
     SpawnedGatewayIdentity::mint("secrets-smoke").jwt_secret
 }
 
-/// Locate the freshly-built `ferrum-edge` binary next to the test runner.
+/// Locate the `ferrum-edge` binary Cargo built alongside this test target.
+///
+/// Cargo builds the package's `ferrum-edge` bin target with this target's
+/// features before it builds the test, and records the path at compile time,
+/// so each provider-gated smoke spawns a gateway that has its provider
+/// compiled in (`vault_backend`'s CLI regressions resolve it the same way).
+///
+/// Do not derive the path from where the test executable itself lives. Cargo
+/// 1.100 moved test executables from `target/<profile>/deps/` to
+/// `target/<profile>/build/<package>/<hash>/out/`; a walk up from the test
+/// executable then found no binary, and every smoke failed as "binary not
+/// found" under `FERRUM_SECRETS_STARTUP_SMOKE_REQUIRED=1`.
 fn locate_binary() -> Option<PathBuf> {
-    let exe = std::env::current_exe().ok()?;
-    // exe is .../target/<profile>/deps/secrets_functional-<hash>
-    for ancestor in exe.ancestors().skip(1).take(3) {
-        let candidate = ancestor.join("ferrum-edge");
-        if candidate.is_file() {
-            return Some(candidate);
-        }
-    }
-    None
+    let built = PathBuf::from(env!("CARGO_BIN_EXE_ferrum-edge"));
+    built.is_file().then_some(built)
 }
 
 /// A spawned gateway whose ownership of its admin port has been proven.
