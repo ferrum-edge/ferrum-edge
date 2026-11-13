@@ -7075,20 +7075,6 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Extend runner swap for the library test harness compile
-        run: |
-          set -euo pipefail
-          # `cargo test --features ebpf --lib` builds the library test harness,
-          # one rustc run of the whole ferrum_edge crate that peaks at about
-          # 15.3 GB on this 16 GB runner. Only the image's 3 GB swap backed it,
-          # leaving under 1 GB of RAM free, and the runner was killed
-          # mid-compile with exit 143 (main run 43401343362).
-          sudo fallocate -l 12G /mnt/ferrum-swapfile
-          sudo chmod 600 /mnt/ferrum-swapfile
-          sudo mkswap /mnt/ferrum-swapfile
-          sudo swapon /mnt/ferrum-swapfile
-          free -h
-
       - name: Install nightly Rust with rust-src
         uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # nightly
         with:
@@ -7198,20 +7184,6 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-
-      - name: Extend runner swap for the library test harness compile
-        run: |
-          set -euo pipefail
-          # `cargo test --lib` builds the library test harness, one rustc run
-          # of the whole ferrum_edge crate that peaks above 15 GB on this
-          # 16 GB runner. With only the image's 3 GB swap behind the same
-          # compile, the eBPF live-kernel job was killed mid-compile with
-          # exit 143 (main run 43401343362).
-          sudo fallocate -l 12G /mnt/ferrum-swapfile
-          sudo chmod 600 /mnt/ferrum-swapfile
-          sudo mkswap /mnt/ferrum-swapfile
-          sudo swapon /mnt/ferrum-swapfile
-          free -h
 
       - uses: ./.github/actions/setup-rust-ci
         with:
