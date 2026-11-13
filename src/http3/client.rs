@@ -2194,11 +2194,12 @@ impl PoolManager for Http3PoolManager {
     }
 
     // HTTP/3 request paths establish new connections through
-    // `GenericPool::create_or_get_existing_owned()` because QUIC setup needs
-    // per-call TLS and H3 config objects that are not part of the manager.
+    // `GenericPool::create_or_get_existing_owned_sampled_as()` because QUIC
+    // setup needs per-call TLS and H3 config objects that are not part of the
+    // manager.
     async fn create(&self, _key: &str, _proxy: &Proxy) -> Result<Self::Connection> {
         Err(anyhow::anyhow!(
-            "Http3ConnectionPool uses GenericPool::create_or_get_existing_owned for creation"
+            "Http3ConnectionPool uses GenericPool::create_or_get_existing_owned_sampled_as for creation"
         ))
     }
 
@@ -2320,6 +2321,21 @@ impl Http3ConnectionPool {
 
     pub fn force_drain_all(&self) {
         self.pool.clear();
+    }
+
+    /// This pool's drain epoch (see [`GenericPool::drain_epoch`]).
+    ///
+    /// A checkout reads two dial inputs before it reaches the pool's create
+    /// path: the SVID generation its pool key carries, and the backend TLS
+    /// configuration its create closure holds. It therefore samples the epoch
+    /// FIRST, before either read, and hands the sample to the create. A drain
+    /// retires both inputs before it bumps the epoch (the generation counter
+    /// has advanced, the TLS configuration cache is cleared), so an input
+    /// read after the sample is either current, or the drain's bump comes
+    /// after the sample and the connection is not published. One shared
+    /// atomic load per checkout, warm or cold.
+    pub(crate) fn drain_epoch(&self) -> u64 {
+        self.pool.drain_epoch()
     }
 
     fn current_svid_generation(&self) -> u64 {
@@ -2517,22 +2533,34 @@ impl Http3ConnectionPool {
 
     /// Use one typed failure adapter for both H3 creation paths so the pool
     /// publishes transport facts before notifying any coalesced waiter.
+    ///
+    /// `drain_epoch` is the [`Self::drain_epoch`] sample the checkout took
+    /// before it read the SVID generation in `key` and the TLS configuration
+    /// `create` dials with.
     async fn create_or_get_sender<F>(
         &self,
         key: String,
+        drain_epoch: u64,
         connect_at: Option<&OnceLock<tokio::time::Instant>>,
         create: F,
     ) -> Result<H3PooledConnection, anyhow::Error>
     where
         F: std::future::Future<Output = Result<H3PooledConnection, anyhow::Error>>,
     {
-        self.create_or_get_sender_as(key, connect_at, PoolCreateCaller::Request, create)
-            .await
+        self.create_or_get_sender_as(
+            key,
+            drain_epoch,
+            connect_at,
+            PoolCreateCaller::Request,
+            create,
+        )
+        .await
     }
 
     async fn create_or_get_sender_as<F>(
         &self,
         key: String,
+        drain_epoch: u64,
         connect_at: Option<&OnceLock<tokio::time::Instant>>,
         caller: PoolCreateCaller,
         create: F,
@@ -2541,7 +2569,7 @@ impl Http3ConnectionPool {
         F: std::future::Future<Output = Result<H3PooledConnection, anyhow::Error>>,
     {
         self.pool
-            .create_or_get_existing_owned_as(key, caller, |_| async move {
+            .create_or_get_existing_owned_sampled_as(key, drain_epoch, caller, |_| async move {
                 create
                     .await
                     .map_err(|error| H3ConnectionCreateError::capture(error, connect_at))
@@ -2586,7 +2614,11 @@ impl Http3ConnectionPool {
     where
         F: std::future::Future<Output = anyhow::Error>,
     {
-        let create = self.create_or_get_sender(key, Some(connect_at), async { Err(failure.await) });
+        // No generation or TLS read precedes this create.
+        let drain_epoch = self.drain_epoch();
+        let create = self.create_or_get_sender(key, drain_epoch, Some(connect_at), async {
+            Err(failure.await)
+        });
         await_h3_connection_checkout(
             H3Authorization::new(client_at, plan),
             connect_at,
@@ -2612,12 +2644,18 @@ impl Http3ConnectionPool {
     async fn create_or_get_proxy_sender(
         &self,
         key: String,
+        drain_epoch: u64,
         proxy: &Proxy,
         tls_config: Arc<rustls::ClientConfig>,
         h3_config: super::config::Http3ServerConfig,
     ) -> Result<H3PooledConnection, anyhow::Error> {
         self.create_or_get_proxy_sender_with_connect_deadline(
-            key, proxy, tls_config, h3_config, None,
+            key,
+            drain_epoch,
+            proxy,
+            tls_config,
+            h3_config,
+            None,
         )
         .await
     }
@@ -2628,6 +2666,7 @@ impl Http3ConnectionPool {
     async fn create_or_get_probe_sender(
         &self,
         key: String,
+        drain_epoch: u64,
         proxy: &Proxy,
         tls_config: Arc<rustls::ClientConfig>,
         h3_config: super::config::Http3ServerConfig,
@@ -2635,13 +2674,20 @@ impl Http3ConnectionPool {
         let create = async {
             boxed_h3_future(|| self.create_connection(proxy, &tls_config, &h3_config, None)).await
         };
-        self.create_or_get_sender_as(key, None, PoolCreateCaller::CapabilityProbe, create)
-            .await
+        self.create_or_get_sender_as(
+            key,
+            drain_epoch,
+            None,
+            PoolCreateCaller::CapabilityProbe,
+            create,
+        )
+        .await
     }
 
     async fn create_or_get_proxy_sender_with_connect_deadline(
         &self,
         key: String,
+        drain_epoch: u64,
         proxy: &Proxy,
         tls_config: Arc<rustls::ClientConfig>,
         h3_config: super::config::Http3ServerConfig,
@@ -2653,7 +2699,8 @@ impl Http3ConnectionPool {
             boxed_h3_future(|| self.create_connection(proxy, &tls_config, &h3_config, connect_at))
                 .await
         };
-        self.create_or_get_sender(key, connect_at, create).await
+        self.create_or_get_sender(key, drain_epoch, connect_at, create)
+            .await
     }
 
     /// `policy_port` is the DestinationRule policy port for this dispatch; see
@@ -2663,13 +2710,20 @@ impl Http3ConnectionPool {
     async fn create_or_get_target_sender(
         &self,
         key: String,
+        drain_epoch: u64,
         proxy: &Proxy,
         target: H3ConnectionTarget<'_>,
         tls_config: Arc<rustls::ClientConfig>,
         h3_config: super::config::Http3ServerConfig,
     ) -> Result<H3PooledConnection, anyhow::Error> {
         self.create_or_get_target_sender_with_connect_deadline(
-            key, proxy, target, tls_config, h3_config, None,
+            key,
+            drain_epoch,
+            proxy,
+            target,
+            tls_config,
+            h3_config,
+            None,
         )
         .await
     }
@@ -2678,6 +2732,7 @@ impl Http3ConnectionPool {
     async fn create_or_get_target_sender_with_connect_deadline(
         &self,
         key: String,
+        drain_epoch: u64,
         proxy: &Proxy,
         target: H3ConnectionTarget<'_>,
         tls_config: Arc<rustls::ClientConfig>,
@@ -2698,7 +2753,8 @@ impl Http3ConnectionPool {
             })
             .await
         };
-        self.create_or_get_sender(key, connect_at, create).await
+        self.create_or_get_sender(key, drain_epoch, connect_at, create)
+            .await
     }
 
     /// Recover from a create the destination's `maxConnections` ceiling refused
@@ -2759,10 +2815,15 @@ impl Http3ConnectionPool {
     /// the capability probe and must succeed; additional shards are best-effort
     /// so one slow parallel connection does not mark an H3-capable backend
     /// unsupported.
+    ///
+    /// The caller read `tls_config` before this call, so it also supplies
+    /// `drain_epoch`: the pool's drain epoch as it sampled it before that
+    /// read. The SVID generation is read below, after the sample.
     pub async fn warmup_connection(
         &self,
         proxy: &Proxy,
         tls_config: &Arc<rustls::ClientConfig>,
+        drain_epoch: u64,
     ) -> Result<(), anyhow::Error> {
         let conns_per_backend =
             Self::warmup_shard_indices(proxy, self.connections_per_backend).len();
@@ -2773,6 +2834,7 @@ impl Http3ConnectionPool {
             let _ = self
                 .create_or_get_probe_sender(
                     primary_key,
+                    drain_epoch,
                     proxy,
                     tls_config.clone(),
                     h3_config.clone(),
@@ -2795,7 +2857,7 @@ impl Http3ConnectionPool {
                     }
 
                     if let Err(err) = self
-                        .create_or_get_probe_sender(key, proxy, tls_config, h3_config)
+                        .create_or_get_probe_sender(key, drain_epoch, proxy, tls_config, h3_config)
                         .await
                     {
                         debug!(
@@ -2850,6 +2912,8 @@ impl Http3ConnectionPool {
             .pool_http3_connections_per_backend
             .unwrap_or(self.connections_per_backend)
             .max(1);
+        // Before the generation and TLS reads below: see `Self::drain_epoch`.
+        let drain_epoch = self.drain_epoch();
         let start = self.conn_counter.fetch_add(1, Ordering::Relaxed) as usize % conns_per_backend;
 
         // Snapshot the SVID generation once at the top of the request so all
@@ -2982,7 +3046,7 @@ impl Http3ConnectionPool {
         // multiplexing. Only a cap refusal takes that path — see
         // `reuse_shard_after_max_connections`.
         let pooled = match self
-            .create_or_get_proxy_sender(key, proxy, tls_config, h3_config)
+            .create_or_get_proxy_sender(key, drain_epoch, proxy, tls_config, h3_config)
             .await
         {
             Ok(pooled) => pooled,
@@ -3043,6 +3107,8 @@ impl Http3ConnectionPool {
             .pool_http3_connections_per_backend
             .unwrap_or(self.connections_per_backend)
             .max(1);
+        // Before the generation and TLS reads below: see `Self::drain_epoch`.
+        let drain_epoch = self.drain_epoch();
         let start = self.conn_counter.fetch_add(1, Ordering::Relaxed) as usize % conns_per_backend;
         // Snapshot the SVID generation once; see `request()` for rationale —
         // pinning across the cache probe + retry-shard fan-out prevents a
@@ -3134,6 +3200,7 @@ impl Http3ConnectionPool {
         let pooled = match self
             .create_or_get_target_sender(
                 key,
+                drain_epoch,
                 proxy,
                 H3ConnectionTarget {
                     host: target_host,
@@ -3984,6 +4051,8 @@ impl Http3ConnectionPool {
             .pool_http3_connections_per_backend
             .unwrap_or(self.connections_per_backend)
             .max(1);
+        // Before the generation and TLS reads below: see `Self::drain_epoch`.
+        let drain_epoch = self.drain_epoch();
         let start = self.conn_counter.fetch_add(1, Ordering::Relaxed) as usize % conns_per_backend;
         let key = self.pool_key_with_current_generation(proxy, start);
 
@@ -4030,6 +4099,7 @@ impl Http3ConnectionPool {
         let connect_at = OnceLock::new();
         let create = self.create_or_get_proxy_sender_with_connect_deadline(
             key,
+            drain_epoch,
             proxy,
             tls_config,
             h3_config,
@@ -4091,6 +4161,8 @@ impl Http3ConnectionPool {
             .pool_http3_connections_per_backend
             .unwrap_or(self.connections_per_backend)
             .max(1);
+        // Before the generation and TLS reads below: see `Self::drain_epoch`.
+        let drain_epoch = self.drain_epoch();
         let start = self.conn_counter.fetch_add(1, Ordering::Relaxed) as usize % conns_per_backend;
         let key = self.pool_key_for_target_with_current_generation(
             proxy,
@@ -4135,6 +4207,7 @@ impl Http3ConnectionPool {
         let connect_at = OnceLock::new();
         let create = self.create_or_get_target_sender_with_connect_deadline(
             key,
+            drain_epoch,
             proxy,
             H3ConnectionTarget {
                 host: target_host,
@@ -4426,6 +4499,8 @@ impl Http3ConnectionPool {
             .pool_http3_connections_per_backend
             .unwrap_or(self.connections_per_backend)
             .max(1);
+        // Before the generation and TLS reads below: see `Self::drain_epoch`.
+        let drain_epoch = self.drain_epoch();
         let start = self.conn_counter.fetch_add(1, Ordering::Relaxed) as usize % conns_per_backend;
 
         // No thread-local fast path for streaming body. A post-wire failure may
@@ -4487,6 +4562,7 @@ impl Http3ConnectionPool {
         let connect_at = OnceLock::new();
         let create = self.create_or_get_proxy_sender_with_connect_deadline(
             key,
+            drain_epoch,
             proxy,
             tls_config,
             h3_config,
@@ -4555,6 +4631,8 @@ impl Http3ConnectionPool {
             .pool_http3_connections_per_backend
             .unwrap_or(self.connections_per_backend)
             .max(1);
+        // Before the generation and TLS reads below: see `Self::drain_epoch`.
+        let drain_epoch = self.drain_epoch();
         let start = self.conn_counter.fetch_add(1, Ordering::Relaxed) as usize % conns_per_backend;
         let key = self.pool_key_with_current_generation(proxy, start);
 
@@ -4609,6 +4687,7 @@ impl Http3ConnectionPool {
         let connect_at = OnceLock::new();
         let create = self.create_or_get_proxy_sender_with_connect_deadline(
             key,
+            drain_epoch,
             proxy,
             tls_config,
             h3_config,
@@ -4700,6 +4779,8 @@ impl Http3ConnectionPool {
             .pool_http3_connections_per_backend
             .unwrap_or(self.connections_per_backend)
             .max(1);
+        // Before the generation and TLS reads below: see `Self::drain_epoch`.
+        let drain_epoch = self.drain_epoch();
         let start = self.conn_counter.fetch_add(1, Ordering::Relaxed) as usize % conns_per_backend;
         let key = self.pool_key_for_target_with_current_generation(
             proxy,
@@ -4758,6 +4839,7 @@ impl Http3ConnectionPool {
         let connect_at = OnceLock::new();
         let create = self.create_or_get_target_sender_with_connect_deadline(
             key,
+            drain_epoch,
             proxy,
             H3ConnectionTarget {
                 host: target_host,
@@ -4845,6 +4927,8 @@ impl Http3ConnectionPool {
             .pool_http3_connections_per_backend
             .unwrap_or(self.connections_per_backend)
             .max(1);
+        // Before the generation and TLS reads below: see `Self::drain_epoch`.
+        let drain_epoch = self.drain_epoch();
         let start = self.conn_counter.fetch_add(1, Ordering::Relaxed) as usize % conns_per_backend;
         let key = self.pool_key_for_target_with_current_generation(
             proxy,
@@ -4903,6 +4987,7 @@ impl Http3ConnectionPool {
         let connect_at = OnceLock::new();
         let create = self.create_or_get_target_sender_with_connect_deadline(
             key,
+            drain_epoch,
             proxy,
             H3ConnectionTarget {
                 host: target_host,
@@ -4977,6 +5062,8 @@ impl Http3ConnectionPool {
             .pool_http3_connections_per_backend
             .unwrap_or(self.connections_per_backend)
             .max(1);
+        // Before the generation and TLS reads below: see `Self::drain_epoch`.
+        let drain_epoch = self.drain_epoch();
         let start = self.conn_counter.fetch_add(1, Ordering::Relaxed) as usize % conns_per_backend;
 
         // Snapshot the SVID generation once for the whole request. See
@@ -5093,6 +5180,7 @@ impl Http3ConnectionPool {
         let connect_at = OnceLock::new();
         let create = self.create_or_get_proxy_sender_with_connect_deadline(
             key,
+            drain_epoch,
             proxy,
             tls_config,
             h3_config,
@@ -5157,6 +5245,8 @@ impl Http3ConnectionPool {
             .pool_http3_connections_per_backend
             .unwrap_or(self.connections_per_backend)
             .max(1);
+        // Before the generation and TLS reads below: see `Self::drain_epoch`.
+        let drain_epoch = self.drain_epoch();
         let start = self.conn_counter.fetch_add(1, Ordering::Relaxed) as usize % conns_per_backend;
         // Pin the SVID generation across cache probe + retry shards. See
         // `request()` for the rationale.
@@ -5243,6 +5333,7 @@ impl Http3ConnectionPool {
         let connect_at = OnceLock::new();
         let create = self.create_or_get_target_sender_with_connect_deadline(
             key,
+            drain_epoch,
             proxy,
             H3ConnectionTarget {
                 host: target_host,
@@ -5349,6 +5440,7 @@ impl Http3ConnectionPool {
             measure(|pool, proxy, tls, cfg, _, at| {
                 pool.create_or_get_proxy_sender_with_connect_deadline(
                     String::new(),
+                    0,
                     proxy,
                     tls.clone(),
                     cfg.clone(),
@@ -5358,6 +5450,7 @@ impl Http3ConnectionPool {
             measure(|pool, proxy, tls, cfg, _, at| {
                 pool.create_or_get_target_sender_with_connect_deadline(
                     String::new(),
+                    0,
                     proxy,
                     H3ConnectionTarget {
                         host: &proxy.backend_host,

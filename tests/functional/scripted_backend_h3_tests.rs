@@ -709,6 +709,34 @@ async fn wait_for_capability_entry(
     }
 }
 
+/// Wait for the single capability entry to report `plain_http.h3 ==
+/// "supported"`, i.e. for the gateway to be ready to dispatch natively over
+/// HTTP/3.
+///
+/// "An entry exists" is not that: a background refresh (warmup off) publishes
+/// an HTTPS target's HTTP/2 verdict as soon as that probe answers, with
+/// `plain_http.h3` still `unknown`, and merges the HTTP/3 verdict when its
+/// probe finishes. At the deadline this returns whatever entry is published
+/// (or `None`) instead of failing here, so that the caller's `h3` assertion
+/// reports the state it found. Every caller must therefore assert
+/// `plain_http.h3` on the result; none may discard it.
+async fn wait_for_h3_supported_entry(
+    harness: &GatewayHarness,
+    timeout: Duration,
+) -> Result<Option<Value>, Box<dyn std::error::Error + Send + Sync>> {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        let entry = fetch_capability_entry(harness).await?;
+        let h3_supported = entry
+            .as_ref()
+            .is_some_and(|entry| entry["plain_http"]["h3"].as_str() == Some("supported"));
+        if h3_supported || std::time::Instant::now() >= deadline {
+            return Ok(entry);
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
 /// Wait for the single capability entry's H3 class to match `expected`.
 async fn wait_for_h3_class(
     harness: &GatewayHarness,
@@ -1178,7 +1206,7 @@ async fn h3_backend_connection_close_mid_request_downgrades_capability() {
         spawn_h3_harness_with_explicit_https_port(backend_port, true, None).await;
 
     // Wait for initial probe to populate h3=Supported.
-    let pre = wait_for_capability_entry(&harness, Duration::from_secs(15))
+    let pre = wait_for_h3_supported_entry(&harness, Duration::from_secs(15))
         .await
         .expect("fetch pre-entry")
         .expect("registry populated within timeout");
@@ -1301,7 +1329,7 @@ async fn h3_non_graceful_close_downgrades_via_connection_error_false_path() {
     let (harness, _ca_pem, _https_port) =
         spawn_h3_harness_with_explicit_https_port(backend_port, true, None).await;
 
-    let pre = wait_for_capability_entry(&harness, Duration::from_secs(15))
+    let pre = wait_for_h3_supported_entry(&harness, Duration::from_secs(15))
         .await
         .expect("pre-entry")
         .expect("registry populated");
@@ -1504,7 +1532,7 @@ async fn h3_frontend_to_h3_backend_failure_downgrades_from_server_path() {
     let (harness, _ca_pem, _https_port) =
         spawn_h3_harness_with_explicit_https_port(backend_port, true, None).await;
 
-    let pre = wait_for_capability_entry(&harness, Duration::from_secs(15))
+    let pre = wait_for_h3_supported_entry(&harness, Duration::from_secs(15))
         .await
         .expect("pre-entry")
         .expect("registry populated");
@@ -2033,9 +2061,15 @@ async fn h3_native_pool_synthesizes_host_from_upstream_target_not_proxy_backend_
 
     // Wait for capability classification — gateway must see h3=supported
     // before it'll route via the native H3 pool.
-    let _ = wait_for_capability_entry(&harness, Duration::from_secs(15))
+    let entry = wait_for_h3_supported_entry(&harness, Duration::from_secs(15))
         .await
-        .expect("registry populated");
+        .expect("fetch capability entry")
+        .expect("registry populated within timeout");
+    assert_eq!(
+        entry["plain_http"]["h3"].as_str(),
+        Some("supported"),
+        "expected h3=supported so the request uses the native H3 backend path; entry: {entry:#?}"
+    );
 
     // H3 client sends only `:authority` (no explicit Host). Mimics curl,
     // Chromium, Firefox, reqwest defaults.
@@ -2145,7 +2179,7 @@ async fn h1_frontend_to_native_h3_backend_uses_frontend_forwarding_metadata() {
         .await
         .expect("spawn gateway");
 
-    let entry = wait_for_capability_entry(&harness, Duration::from_secs(15))
+    let entry = wait_for_h3_supported_entry(&harness, Duration::from_secs(15))
         .await
         .expect("fetch capability entry")
         .expect("registry populated within timeout");
@@ -2247,7 +2281,7 @@ async fn h1_frontend_to_native_h3_strips_spoofed_client_forwarded() {
         .await
         .expect("spawn gateway");
 
-    let entry = wait_for_capability_entry(&harness, Duration::from_secs(15))
+    let entry = wait_for_h3_supported_entry(&harness, Duration::from_secs(15))
         .await
         .expect("fetch capability entry")
         .expect("registry populated within timeout");
@@ -2436,7 +2470,7 @@ async fn transformer_added_stream_marker_reclassifies_h3_capable_dispatch() {
         .await
         .expect("spawn gateway");
 
-    let entry = wait_for_capability_entry(&harness, Duration::from_secs(15))
+    let entry = wait_for_h3_supported_entry(&harness, Duration::from_secs(15))
         .await
         .expect("capability entry")
         .expect("registry populated");
@@ -2565,7 +2599,7 @@ async fn bodyless_native_h3_sse_response_is_governed() {
         .await
         .expect("spawn gateway");
 
-    let entry = wait_for_capability_entry(&harness, Duration::from_secs(15))
+    let entry = wait_for_h3_supported_entry(&harness, Duration::from_secs(15))
         .await
         .expect("capability entry")
         .expect("registry populated");
@@ -2724,7 +2758,7 @@ async fn h2_frontend_streaming_h3_recovers_graceful_goaway_after_complete_body()
         .await
         .expect("spawn gateway");
 
-    let entry = wait_for_capability_entry(&harness, Duration::from_secs(15))
+    let entry = wait_for_h3_supported_entry(&harness, Duration::from_secs(15))
         .await
         .expect("fetch capability entry")
         .expect("registry populated within timeout");
@@ -3083,7 +3117,7 @@ async fn spawn_h3_streaming_harness_with_config(
     }
     let harness = builder.spawn().await.expect("spawn gateway");
 
-    let entry = wait_for_capability_entry(&harness, Duration::from_secs(15))
+    let entry = wait_for_h3_supported_entry(&harness, Duration::from_secs(15))
         .await
         .expect("fetch capability entry")
         .expect("registry populated within timeout");
@@ -3136,7 +3170,7 @@ async fn spawn_h3_frontend_refined_buffering_harness(
     )
     .await;
 
-    let entry = wait_for_capability_entry(&harness, Duration::from_secs(15))
+    let entry = wait_for_h3_supported_entry(&harness, Duration::from_secs(15))
         .await
         .expect("fetch capability entry")
         .expect("registry populated within timeout");
@@ -4052,7 +4086,7 @@ async fn h3_native_grpc_unary_preserves_body_and_trailers() {
     let (harness, _ca_pem, _https_port) =
         spawn_h3_harness_with_explicit_https_port(backend_port, false, Some(1)).await;
 
-    let entry = wait_for_capability_entry(&harness, Duration::from_secs(15))
+    let entry = wait_for_h3_supported_entry(&harness, Duration::from_secs(15))
         .await
         .expect("fetch capability entry")
         .expect("registry populated within timeout");
@@ -4162,7 +4196,7 @@ async fn h3_native_grpc_bidi_server_responds_before_client_half_close() {
 
     let (harness, _ca_pem, https_port) =
         spawn_h3_harness_with_explicit_https_port(backend_port, false, Some(1)).await;
-    let entry = wait_for_capability_entry(&harness, Duration::from_secs(15))
+    let entry = wait_for_h3_supported_entry(&harness, Duration::from_secs(15))
         .await
         .expect("fetch capability entry")
         .expect("registry populated within timeout");
@@ -4264,7 +4298,7 @@ async fn assert_h3_native_grpc_trailers_only_preserves_terminal_metadata(remove_
     let config = file_mode_yaml_for_h3_with_terminal_security(backend_port, remove_terminal);
     let (harness, _ca_pem, _https_port) =
         spawn_h3_harness_with_explicit_https_port_and_config(config, false, Some(1)).await;
-    let entry = wait_for_capability_entry(&harness, Duration::from_secs(15))
+    let entry = wait_for_h3_supported_entry(&harness, Duration::from_secs(15))
         .await
         .expect("fetch capability entry")
         .expect("registry populated within timeout");
@@ -4449,7 +4483,7 @@ async fn h3_native_grpc_server_streaming_preserves_frames_and_trailers() {
     let (harness, _ca_pem, _https_port) =
         spawn_h3_harness_with_explicit_https_port(backend_port, false, Some(1)).await;
 
-    let entry = wait_for_capability_entry(&harness, Duration::from_secs(15))
+    let entry = wait_for_h3_supported_entry(&harness, Duration::from_secs(15))
         .await
         .expect("fetch capability entry")
         .expect("registry populated within timeout");
@@ -4592,7 +4626,7 @@ async fn h3_native_grpc_streaming_governs_application_metadata_only() {
     )
     .await;
 
-    let entry = wait_for_capability_entry(&harness, Duration::from_secs(15))
+    let entry = wait_for_h3_supported_entry(&harness, Duration::from_secs(15))
         .await
         .expect("fetch capability entry")
         .expect("registry populated within timeout");
@@ -4709,7 +4743,7 @@ async fn h3_frontend_mid_body_stream_reset_downgrades_and_bridges() {
     let (harness, _ca_pem, https_port) =
         spawn_h3_harness_with_explicit_https_port(backend_port, true, None).await;
 
-    let pre = wait_for_capability_entry(&harness, Duration::from_secs(15))
+    let pre = wait_for_h3_supported_entry(&harness, Duration::from_secs(15))
         .await
         .expect("pre-entry")
         .expect("registry populated");
@@ -4814,7 +4848,7 @@ async fn h3_frontend_mid_body_graceful_goaway_keeps_capability_supported() {
     let (harness, _ca_pem, _https_port) =
         spawn_h3_harness_with_explicit_https_port(backend_port, true, None).await;
 
-    let pre = wait_for_capability_entry(&harness, Duration::from_secs(15))
+    let pre = wait_for_h3_supported_entry(&harness, Duration::from_secs(15))
         .await
         .expect("pre-entry")
         .expect("registry populated");
@@ -5074,7 +5108,7 @@ async fn h3_buffered_auth_logging_plugins_preserve_backend_trailers() {
     let (harness, _ca_pem, https_port) =
         spawn_h3_harness_with_explicit_https_port_and_config(yaml, true, None).await;
 
-    let pre = wait_for_capability_entry(&harness, Duration::from_secs(15))
+    let pre = wait_for_h3_supported_entry(&harness, Duration::from_secs(15))
         .await
         .expect("pre-entry")
         .expect("registry populated");
@@ -5344,7 +5378,7 @@ async fn spawn_h3_trailer_policy_harness_with_trailers(
     let (harness, _ca_pem, https_port) =
         spawn_h3_harness_with_explicit_https_port_and_config(yaml, true, None).await;
 
-    let pre = wait_for_capability_entry(&harness, Duration::from_secs(15))
+    let pre = wait_for_h3_supported_entry(&harness, Duration::from_secs(15))
         .await
         .expect("pre-entry")
         .expect("registry populated");

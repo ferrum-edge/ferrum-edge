@@ -5648,6 +5648,30 @@ pub mod _test_support {
         .await
     }
 
+    /// Drive the production direct HTTP/1.1 checkout with a hook run AFTER it
+    /// has sampled the lane map's drain epoch and read the SVID generation its
+    /// lane key carries, and BEFORE it looks its lane up.
+    ///
+    /// That is the one interleaving the lane map's drain fence exists for: a
+    /// checkout that read a generation, or found no lane, just before a drain
+    /// and would open a lane just after it. The stretch is synchronous, so
+    /// only this hook can place a drain there. Production `checkout_h1` is
+    /// this same function with a hook that does nothing.
+    pub async fn checkout_direct_h1_with_lane_lookup_seam<F>(
+        pool: &crate::proxy::http2_pool::Http2ConnectionPool,
+        proxy: &crate::config::types::Proxy,
+        tls: bool,
+        connect_timeout: std::time::Duration,
+        fresh: bool,
+        before_lane_lookup: F,
+    ) -> Result<crate::proxy::http2_pool::Http1Checkout, crate::proxy::http2_pool::Http2PoolError>
+    where
+        F: FnOnce(),
+    {
+        pool.checkout_h1_seamed(proxy, tls, connect_timeout, fresh, before_lane_lookup)
+            .await
+    }
+
     /// Drive the production HTTP/1.1 checkout with a hook awaited AFTER the
     /// client handshake and BEFORE the connection's driver is registered with
     /// the pool's shutdown tracker (issue #3764).
