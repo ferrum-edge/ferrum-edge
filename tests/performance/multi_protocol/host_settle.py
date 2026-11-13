@@ -9,21 +9,26 @@ cell measured in that window loses 20-25% of its CPU. It hit whichever arm ran
 an image first, so always the same arms in pair 1.
 
 The runner therefore starts every distinct binary/image once before the first
-measured pair, drives a short discarded load, and calls this helper to wait,
-with the arm idle, until the host is quiet. The helper only reads `/proc`; it
-starts and stops nothing.
+measured pair, drives a discarded load for as long as the reaction has been
+seen to take to begin, and calls this helper to wait, with the arm idle, until
+the host is quiet. The helper only reads `/proc`; it starts and stops nothing.
 
 Times are counted from `--since`: the moment the arm was up, taken by the
 runner after the start returned, so an image pull or a slow start cannot use
-up the minimum hold. Sampling begins when the helper is called, after the
-discarded load, so a burst that began and ended during that load is covered by
-the minimum hold but is not in the record.
+up the minimum hold. `wait` samples from the moment it is called, after the
+discarded load. The reaction usually falls inside that load, where the
+benchmark's own processes keep the host busy, so `snapshot` records every
+process's CPU before the arm starts and `wait --baseline` reports what the
+processes that were already running then used across the start, the load and
+the hold. The arm's own processes are born later and are left out.
 
-`wait` appends one record per arm to a JSON file so a run shows what the hold
-saw: how long it waited, how much CPU other processes used meanwhile, when
-that burst began and ended relative to `--since`, and which processes those
-were. A burst that ends close to the release time means the minimum hold is
-too short for that host.
+`wait` appends one record per arm to a JSON file so a run shows what the
+first start cost: how long the hold waited, how much CPU the host used during
+it, when a burst inside the hold began and ended relative to `--since`, and
+which processes used CPU, both during the hold and since before the start. An
+arm whose record shows no reaction may still be owed one in its first measured
+cell. A burst that ends close to the release time means the minimum hold is too
+short for that host.
 """
 
 import argparse
@@ -143,6 +148,54 @@ class Settle:
         return None
 
 
+def write_json(path, document):
+    temporary = f"{path}.tmp"
+    with open(temporary, "w") as handle:
+        json.dump(document, handle, indent=2)
+        handle.write("\n")
+    os.replace(temporary, path)
+
+
+def snapshot(args, now=time.time):
+    """Record every process's CPU so far, for `wait --baseline`."""
+    table = read_processes(args.proc_root)
+    write_json(
+        args.output,
+        {
+            "schema": SCHEMA,
+            "unix": now(),
+            "processes": {f"{pid}:{started}": [comm, ticks] for (pid, started), (comm, ticks) in table.items()},
+        },
+    )
+    return len(table)
+
+
+def used_since_baseline(path, processes):
+    """(seconds field source, ticks by comm) for processes already in the baseline.
+
+    A process is matched by pid and start time, so a pid reused by the arm is
+    not mistaken for a host process. None when the baseline cannot be read.
+    """
+    try:
+        with open(path) as handle:
+            baseline = json.load(handle)
+        before = baseline["processes"]
+        taken = float(baseline["unix"])
+        if not isinstance(before, dict):
+            raise ValueError("unexpected baseline")
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+    used = {}
+    for (pid, started), (comm, total) in processes.items():
+        earlier = before.get(f"{pid}:{started}")
+        if not isinstance(earlier, list) or len(earlier) != 2:
+            continue
+        delta = total - earlier[1]
+        if delta > 0:
+            used[comm] = used.get(comm, 0) + delta
+    return taken, used
+
+
 def append_record(path, settings, record):
     try:
         with open(path) as handle:
@@ -153,11 +206,7 @@ def append_record(path, settings, record):
         document = {"schema": SCHEMA, "arms": []}
     document.update(settings)
     document["arms"].append(record)
-    temporary = f"{path}.tmp"
-    with open(temporary, "w") as handle:
-        json.dump(document, handle, indent=2)
-        handle.write("\n")
-    os.replace(temporary, path)
+    write_json(path, document)
 
 
 def wait(args, sleep=time.sleep, now=time.time):
@@ -225,6 +274,19 @@ def wait(args, sleep=time.sleep, now=time.time):
         last_burst_since_start_seconds=None if last_burst is None else round(last_burst, 3),
         top_processes=[{"comm": comm, "cpu_seconds": round(value / ticks, 3)} for comm, value in top],
     )
+    since_baseline = used_since_baseline(args.baseline, processes) if args.baseline else None
+    if since_baseline is not None:
+        taken, host_used = since_baseline
+        host_top = sorted(host_used.items(), key=lambda item: -item[1])[: args.top]
+        record.update(
+            # From before the arm started to the release: the start, the
+            # discarded load and the hold. Only processes already running at
+            # the baseline, so the arm's own processes are not in it.
+            seconds_since_before_start=round(previous_time - taken, 3),
+            host_processes_since_before_start=[
+                {"comm": comm, "cpu_seconds": round(value / ticks, 3)} for comm, value in host_top
+            ],
+        )
     append_record(args.output, settings, record)
     return record
 
@@ -244,6 +306,9 @@ def build_parser():
     noter.add_argument("--image", required=True)
     noter.add_argument("--reason", required=True, choices=["already_started"])
     noter.add_argument("--output", required=True)
+    shooter = commands.add_parser("snapshot", help="record per-process CPU before an arm starts")
+    shooter.add_argument("--output", required=True)
+    shooter.add_argument("--proc-root", default="/proc")
     waiter = commands.add_parser("wait", help="hold until the host is quiet, then record what was seen")
     waiter.add_argument("--arm", required=True)
     waiter.add_argument("--image", required=True)
@@ -256,6 +321,7 @@ def build_parser():
     waiter.add_argument("--burst-cores", type=float, default=0.4)
     waiter.add_argument("--interval", type=float, default=0.5)
     waiter.add_argument("--top", type=int, default=3)
+    waiter.add_argument("--baseline", help="snapshot taken before the arm started")
     waiter.add_argument("--proc-root", default="/proc")
     return parser
 
@@ -265,16 +331,23 @@ def main(argv=None):
     if args.command == "note":
         note(args)
         return 0
+    if args.command == "snapshot":
+        snapshot(args)
+        return 0
     for name in ("min_hold", "quiet_seconds", "quiet_cores", "burst_cores"):
         if getattr(args, name) < 0:
             raise SystemExit(f"--{name.replace('_', '-')} must not be negative")
     if args.interval <= 0 or args.max_wait <= 0:
         raise SystemExit("--interval and --max-wait must be positive")
     record = wait(args)
+    since_before = ", ".join(
+        f"{p['comm']} {p['cpu_seconds']}s" for p in record.get("host_processes_since_before_start", [])
+    )
     print(
         f"[settle] {record['arm']}: {record['reason']} after {record.get('held_since_start_seconds', 0)}s"
         f" (host CPU used during the hold {record.get('busy_cpu_seconds', 0)}s,"
-        f" busiest: {', '.join(p['comm'] for p in record.get('top_processes', [])) or 'n/a'})"
+        f" busiest: {', '.join(p['comm'] for p in record.get('top_processes', [])) or 'n/a'};"
+        f" host processes since before the start: {since_before or 'n/a'})"
     )
     return 0
 

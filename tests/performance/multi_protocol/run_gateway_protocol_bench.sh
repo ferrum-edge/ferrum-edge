@@ -42,7 +42,7 @@
 # in a job, 2-12 s after that start. Measured cells in that window lost 20-25%
 # of their CPU, always for the arms that ran an image first in pair 1. Before the
 # first measured pair the runner therefore starts every distinct binary/image
-# once, drives a short discarded load, and waits (host_settle.py) until the host
+# once, drives a discarded load, and waits (host_settle.py) until the host
 # is quiet. What each hold saw is recorded in host_settle.json. Best effort: an
 # arm that cannot start or be held is skipped and the run continues.
 #
@@ -1445,9 +1445,12 @@ run_bench() {
 }
 
 # ── First-start settle ──────────────────────────────────────────────────────
-# Seconds of discarded load per first start, so the host sees the arm's
-# processes carrying traffic as they will in the measured cells.
-SETTLE_LOAD_SECONDS=3
+# Seconds of discarded load per first start. The host's reaction began up to
+# about 20 s into an arm's first measured cells, and with only a short load it
+# sometimes had not come by the time the arm was released (3 of 14 starts in
+# one run) and landed in pair 1 after all. The arm therefore carries traffic,
+# as it will in the measured cells, for that whole window.
+SETTLE_LOAD_SECONDS=20
 
 # Discarded client run against the arm that is currently up. Uses run_bench's
 # target and its workload flags for the comparison lanes, records nothing and
@@ -1532,6 +1535,10 @@ settle_arm() {
         trap settle_teardown EXIT
         SETTLE_SCRATCH=$(mktemp -d "${TMPDIR:-/tmp}/ferrum-bench-settle.XXXXXX") || exit 1
         OUTPUT_DIR="$SETTLE_SCRATCH"
+        # Per-process CPU before anything of this arm exists, so the record
+        # can show what the host's own processes used during the load too.
+        python3 "$SCRIPT_DIR/host_settle.py" snapshot \
+            --output "$SETTLE_SCRATCH/before_start.json" || true
         start_backend || exit 1
         case "$gw" in
             direct) ;;
@@ -1550,7 +1557,8 @@ settle_arm() {
         # In the background so a signal ends the hold at once: bash runs a
         # trap only after a foreground command returns.
         python3 "$SCRIPT_DIR/host_settle.py" wait --arm "$gw" --image "$image" \
-            --since "$since" --output "$record" &
+            --since "$since" --baseline "$SETTLE_SCRATCH/before_start.json" \
+            --output "$record" &
         SETTLE_HELPER_PID=$!
         wait "$SETTLE_HELPER_PID" || exit $?
         SETTLE_HELPER_PID=""

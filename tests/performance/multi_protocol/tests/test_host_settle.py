@@ -106,7 +106,7 @@ class WaitTests(unittest.TestCase):
     def arguments(self, root, output, **overrides):
         values = dict(arm="ferrum", image="ferrum-edge:bench", since=0.0, output=str(output),
                       min_hold=0.0, quiet_seconds=0.0, max_wait=60.0, quiet_cores=0.2,
-                      burst_cores=0.4, interval=0.5, top=3, proc_root=str(root))
+                      burst_cores=0.4, interval=0.5, top=3, baseline=None, proc_root=str(root))
         values.update(overrides)
         return argparse.Namespace(**values)
 
@@ -161,6 +161,49 @@ class WaitTests(unittest.TestCase):
             self.assertAlmostEqual(record["busy_cpu_seconds"], 4.0, places=1)
             self.assertEqual(record["top_processes"][0]["comm"], "provjobd123")
             self.assertAlmostEqual(record["top_processes"][0]["cpu_seconds"], 4.0, places=1)
+
+    def test_host_cpu_during_the_load_is_reported_from_the_snapshot_without_the_arm(self):
+        # The reaction usually falls inside the discarded load, before `wait`
+        # samples anything. The snapshot taken before the arm started makes it
+        # visible; the arm's own processes are born later and are left out.
+        ticks = host_settle.clock_ticks()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "proc"
+            root.mkdir()
+            output = Path(temporary) / "host_settle.json"
+            baseline = Path(temporary) / "before_start.json"
+            self.write_stat(root, 0, {77: ("provjobd123", 5 * ticks), 78: ("dockerd", ticks)})
+            self.assertEqual(host_settle.main(
+                ["snapshot", "--output", str(baseline), "--proc-root", str(root)]), 0)
+            # During the start and the load: the provisioner uses 3 CPU-seconds,
+            # and the arm's gateway and client appear and use far more.
+            self.write_stat(root, 30 * ticks, {
+                77: ("provjobd123", 8 * ticks), 78: ("dockerd", ticks),
+                90: ("ferrum-edge", 50 * ticks), 91: ("proto_bench", 20 * ticks)})
+            record = host_settle.wait(
+                self.arguments(root, output, baseline=str(baseline)), sleep=self.fail,
+                now=lambda: time.time() + 21.0)
+            self.assertEqual(record["host_processes_since_before_start"],
+                             [{"comm": "provjobd123", "cpu_seconds": 3.0}])
+            self.assertGreater(record["seconds_since_before_start"], 20.0)
+            # The hold itself saw nothing: without the snapshot this start
+            # would read as one the host never reacted to.
+            self.assertEqual(record["top_processes"], [])
+
+    def test_a_missing_or_foreign_baseline_only_drops_the_extra_fields(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "proc"
+            root.mkdir()
+            self.write_stat(root, 0, {})
+            output = Path(temporary) / "host_settle.json"
+            foreign = Path(temporary) / "foreign.json"
+            foreign.write_text('{"processes": []}')
+            for baseline in (Path(temporary) / "absent.json", foreign):
+                record = host_settle.wait(
+                    self.arguments(root, output, baseline=str(baseline)), sleep=self.fail,
+                    now=lambda: 1.0)
+                self.assertEqual(record["reason"], "quiet")
+                self.assertNotIn("host_processes_since_before_start", record)
 
     def test_proc_lost_during_the_hold_is_not_reported_as_observed(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -299,6 +342,14 @@ class RunnerContractTests(unittest.TestCase):
         for forbidden in ("run_bench", "pairs/", "benchmark_plan.py"):
             self.assertNotIn(forbidden, load + self.settle.split("\n}\n", 1)[0])
         self.assertNotRegex(section, r"pkill|killall|xargs")
+
+    def test_the_discarded_load_covers_the_window_in_which_the_reaction_begins(self):
+        # Under measured load the reaction began up to about 20 s after an
+        # arm's first start; a 3 s load let 3 of 14 starts reach pair 1.
+        seconds = int(re.search(r"^SETTLE_LOAD_SECONDS=(\d+)$", self.source, flags=re.MULTILINE).group(1))
+        self.assertGreaterEqual(seconds, 20)
+        load = self.source.split("settle_load() {", 1)[1].split("\n}\n", 1)[0]
+        self.assertIn('--duration "$SETTLE_LOAD_SECONDS"', load)
 
     def test_cleanup_takes_down_a_settle_in_progress(self):
         cleanup = self.source.split("\ncleanup() {\n", 1)[1].split("\n}\n", 1)[0]
@@ -465,6 +516,18 @@ class SettleBehaviourTests(unittest.TestCase):
         waits = [line.split() for line in events if line.startswith("helper wait")]
         self.assertEqual([words[words.index("--arm") + 1] for words in waits],
                          ["direct", "ferrum", "envoy", "ferrum-baseline"])
+        # Host CPU is snapshotted before anything of the arm exists, and the
+        # hold is told where that snapshot is; it lives outside the results.
+        steps = [" ".join(line.split()[:2]) for line in events]
+        self.assertEqual([step for step in steps if step in ("helper snapshot", "start_backend gw=direct",
+                                                              "start_backend gw=ferrum")][:4],
+                         ["helper snapshot", "start_backend gw=direct",
+                          "helper snapshot", "start_backend gw=ferrum"])
+        for words in waits:
+            baseline = Path(words[words.index("--baseline") + 1])
+            self.assertNotIn(self.run_dir, baseline.parents)
+        self.assertEqual(len([line for line in events if line.startswith("load ")]), 4)
+        self.assertTrue(all("--duration 20" in line for line in events if line.startswith("load ")))
         # Every arm is taken down before the next starts and before pair 1.
         order = [line.split()[0] for line in events
                  if line.split()[0] in ("start_backend", "stop_gateway", "measured")]

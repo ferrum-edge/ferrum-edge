@@ -403,30 +403,40 @@ the job, `ferrum` about a minute in (18 of 18 jobs), Envoy about two minutes in
 (11 of 12), always in pair 1 and never in pair 2. That is roughly 5% off a
 two-pair 10 KiB average for `ferrum`, a bias in the same direction every run.
 Before the first measured pair the runner therefore starts every distinct
-binary/image once, drives three seconds of discarded load, and waits through
-`host_settle.py` until at least 25 seconds have passed since the arm was up and
-the host has been quiet (under 0.2 cores busy) for three seconds, capped at 60
-seconds. The clock starts when the start returns, so an image pull or a slow
-start cannot use up the minimum. Arms that share an image settle once, and the
-start uses the image with default arguments (Envoy with stream limit 100,
-`ferrum` without an experiment arm's environment): the host reacts to an
-image's first start, and a second container from an image that had already run
-showed no burst (0 of 6). The reaction is usual, not certain: it fell inside
-the hold in 23 of 24 `ferrum` and Envoy settle starts. An image already settled
-on the host since boot (iteration 2 onwards) is not held again.
+binary/image once, drives 20 seconds of discarded load at the first payload
+size, and waits through `host_settle.py` until at least 25 seconds have passed
+since the arm was up and the host has been quiet (under 0.2 cores busy) for
+three seconds, capped at 60 seconds. The clock starts when the start returns,
+so an image pull or a slow start cannot use up the minimum. The load is that
+long because the reaction needs it: in measured cells it began up to about 20
+seconds after an arm's first start, and with a three-second load it had not
+come by the release in 3 of 14 starts of one run and landed in pair 1 after
+all. Arms that share an image settle once, and the start uses the image with
+default arguments (Envoy with stream limit 100, `ferrum` without an experiment
+arm's environment): the host reacts to an image's first start, and a second
+container from an image that had already run showed no burst (0 of 6). An
+image already settled on the host since boot (iteration 2 onwards) is not held
+again.
 
 The settle is best effort and cannot fail a run. Each start runs in a subshell
 of its own that removes what it started however it ends and writes nothing
 into the run directory; an arm that cannot start or be held is logged as
 `[settle] <arm> was not settled`, skipped, and left for the measured pair to
 report. `host_settle.json` in the run directory records, per arm, how long the
-hold lasted, how much CPU the host used meanwhile, when that burst began and
-ended relative to the arm being up (`first_burst_since_start_seconds`,
-`last_burst_since_start_seconds`), and which processes used it. An arm with no
-record was not settled. `reason: max_wait` means the host never went quiet, and
-a burst that ends within a few seconds of the release means the 25-second
-minimum is too short for that host; in each of those cases read pair 1 with the
-CPU timelines beside it.
+hold lasted and which processes used CPU. `host_processes_since_before_start`
+covers the start, the load and the hold, and lists only processes that were
+already running before the arm started, so the provisioner's reaction shows
+there as `provjobd<digits>` with its CPU-seconds whether it came during the
+load or after it. `top_processes`, `busy_cpu_seconds` and the burst times
+(`first_burst_since_start_seconds`, `last_burst_since_start_seconds`) cover
+only the hold after the load. An arm with no record was not settled. An arm
+whose record shows no `provjobd` CPU beyond a few tenths of a second was not
+reacted to and may still get the burst in its first measured cell; that is
+normal for an image whose binary the host has already seen (`ferrum-baseline`
+after `ferrum`). `reason: max_wait` means the host never went quiet, and a
+burst that ends within a few seconds of the release means the 25-second minimum
+is too short for that host. In each of those cases read pair 1 with the CPU
+timelines beside it.
 
 The settle is on by default for the comparison lanes, the HTTP/3 budget lane
 included, on hosts with `/proc`. It is off for the profile, trace and

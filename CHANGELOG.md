@@ -603,8 +603,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `ferrum`'s first cells in pair 1 (18 of 18 jobs inspected) and Envoy's (11 of
   12), about 5% off `ferrum`'s two-pair 10 KiB average.
   `run_gateway_protocol_bench.sh` now starts every distinct binary/image once
-  before the first measured pair, drives a short discarded load, and waits
-  until the host is quiet (`host_settle.py`, at least 25 seconds, at most 60);
+  before the first measured pair, drives 20 seconds of discarded load, and
+  waits until the host is quiet (`host_settle.py`, at least 25 seconds, at
+  most 60);
   what each hold saw is written to `host_settle.json`. The settle is best
   effort: an arm that cannot start or be held is skipped and the run
   continues. It is on by default for the comparison lanes (`--no-settle` turns
