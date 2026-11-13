@@ -449,8 +449,8 @@ The settle is on by default for the comparison lanes, the HTTP/3 budget lane
 included, on hosts with `/proc`. It is off for the profile, trace and
 H2-observation lanes, which keep their own fixed process accounting;
 `--settle` and `--no-settle` override the default. It removes the first-start
-window only. Later disturbances are not detected (see the known limitations
-below), so the per-sample diagnostics remain the check for a single odd sample.
+window only. It neither prevents nor detects later disturbances; the
+host-disturbance flags described next mark the samples they touch.
 
 **Host-disturbance flags.** A shared runner takes CPU for its own housekeeping
 and sometimes does less work per CPU-second, and either moves a sample without
@@ -668,7 +668,7 @@ or adaptive flags and therefore uses **2 pairs, adaptive off**.
   mark too much: a move near the drift threshold falls on
   either side of it by chance; a run with a dozen unrelated disturbances
   lines three of them up as a 60-second series about one time in ten; and
-  beside a real series, about one unrelated event in eight happens to share
+  beside a real series, about one unrelated event in seven happens to share
   its phase and is marked with it. Nor can they see
   a difference between two arms that holds in every pair: that is what the
   benchmark reports, and only an identical-code run shows when it is not the

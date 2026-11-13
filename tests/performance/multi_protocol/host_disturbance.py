@@ -642,7 +642,7 @@ def print_report(report, stream=sys.stdout):
     periodic = report.get("periodic_activity")
     if periodic:
         write(f"host activity every {int(periodic['period_seconds'])} s: {periodic['events']} events over "
-              f"{periodic['seconds_spanned']} s, {periodic['consecutive_periods']} periods in a row")
+              f"{periodic['seconds_spanned']} s, {periodic['consecutive_periods']} of them in consecutive periods")
     for row in report["samples"]:
         if row["flags"]:
             write(f"pair {row['pair']} {row['gateway']:<16} {row['payload_size']:>8}  "

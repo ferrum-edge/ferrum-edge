@@ -255,7 +255,7 @@ class WhatAnnotateWrites(Replay):
         self.assertEqual(lines[0], "[flags] runner CPU: AMD EPYC 7763 64-Core Processor")
         self.assertIn("[flags] host CPU was not recorded in this run", lines[1])
         self.assertEqual(lines[2], "[flags] 6 of 40 samples flagged; 11 of 25 comparisons touched")
-        self.assertEqual(lines[3], "[flags] host activity every 60 s: 6 events over 422.4 s, 5 periods in a row")
+        self.assertEqual(lines[3], "[flags] host activity every 60 s: 6 events over 422.4 s, 5 of them in consecutive periods")
         self.assertEqual(len(lines), 10)
         self.assertRegex(lines[4], r"^\[flags\] pair 1 direct +10240  cpu_dip periodic_60s  \(dip to 0\.7\d for 1\.5")
 
@@ -623,7 +623,7 @@ class PeriodicRule(unittest.TestCase):
         # A bad tick elsewhere in the window must not cost a real dip its flag:
         # a NaN rate would poison the plateau the dip is measured against.
         timeline = series(dip=(13.0, 15.0, 1.0))
-        timeline[18]["unix_secs"] = float("nan")
+        timeline[12]["unix_secs"] = float("nan")
         self.assertEqual(host_disturbance.analyse_sample(*sample_with(timeline))["flags"], ["cpu_dip"])
 
 
