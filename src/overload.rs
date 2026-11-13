@@ -2406,46 +2406,121 @@ mod tests {
         );
     }
 
-    /// A probe that cannot be scheduled within its budget reports at least
-    /// the budget, so the critical threshold it was sized from trips.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn measure_event_loop_latency_reports_at_least_the_budget_on_timeout() {
-        let handle = tokio::runtime::Handle::current();
-        let num_workers = handle.metrics().num_workers();
-        let budget = Duration::from_millis(40);
+    /// How long a fixture step may take before the test fails instead of
+    /// hanging.
+    const FIXTURE_TIMEOUT: Duration = Duration::from_secs(10);
+
+    /// Parks one blocking task on every runtime worker and returns, once each
+    /// worker is inside its blocker, the senders that release them and the
+    /// blockers' join handles.
+    ///
+    /// Call it from the test body, which `#[tokio::test]` runs on the test
+    /// thread and not on a worker. The blockers are spawned one at a time,
+    /// each only after the previous one has reported from its worker. A
+    /// blocker signals and then blocks with no await in between, so a worker
+    /// that has reported cannot poll anything else, and the next blocker can
+    /// only be taken by a worker that is still free.
+    ///
+    /// Spawning them together does not guarantee one per worker. Tasks spawned
+    /// from outside a worker go to the runtime's injection queue, and a worker
+    /// with nothing local takes a batch of `len / workers + 1` from it: with
+    /// two blockers and two workers, one worker can take both. It runs the
+    /// first and keeps the second in its local queue, where only the other
+    /// worker's steal can reach it. If the other worker looked for work while
+    /// the batch was between the two queues, it has already parked, and the
+    /// worker that took the batch wakes nobody unless it had been searching.
+    /// It then blocks in the first blocker for the whole fixture timeout with
+    /// the second queued behind it, which CI reported once as "every runtime
+    /// worker must be occupied".
+    fn occupy_every_worker(
+        num_workers: usize,
+    ) -> (
+        Vec<std::sync::mpsc::Sender<()>>,
+        Vec<tokio::task::JoinHandle<()>>,
+    ) {
         let (started_tx, started_rx) = std::sync::mpsc::channel();
         let mut releases = Vec::with_capacity(num_workers);
         let mut blockers = Vec::with_capacity(num_workers);
         for _ in 0..num_workers {
-            let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
             releases.push(release_tx);
             let started_tx = started_tx.clone();
             blockers.push(tokio::spawn(async move {
-                started_tx.send(()).expect("probe observes worker entry");
-                let _ = release_rx.recv_timeout(Duration::from_secs(10));
+                started_tx.send(()).expect("fixture observes worker entry");
+                // No await between the signal and this blocking receive: the
+                // worker cannot poll another task until it is released.
+                release_rx
+                    .recv_timeout(FIXTURE_TIMEOUT)
+                    .expect("fixture releases every worker");
             }));
+            started_rx
+                .recv_timeout(FIXTURE_TIMEOUT)
+                .expect("every runtime worker must be occupied");
         }
-        drop(started_tx);
-        let probe_thread = std::thread::spawn(move || {
-            for _ in 0..num_workers {
-                started_rx
-                    .recv_timeout(Duration::from_secs(10))
-                    .expect("every runtime worker must be occupied");
+        (releases, blockers)
+    }
+
+    /// Runs the production probe with `budget` while every runtime worker is
+    /// blocked, keeps the workers blocked for `blocked_after_queue` after the
+    /// probe has queued its tasks, and returns the latency the probe reports.
+    ///
+    /// The release is tied to the probe's first poll and not to a clock. A
+    /// start counter followed by fixed sleeps only proved historical
+    /// saturation: CI could delay the probe until all sleeps ended.
+    async fn probe_latency_with_every_worker_blocked(
+        budget: Duration,
+        blocked_after_queue: Duration,
+    ) -> Duration {
+        let handle = tokio::runtime::Handle::current();
+        let (releases, blockers) = occupy_every_worker(handle.metrics().num_workers());
+        let (queued_tx, queued_rx) = std::sync::mpsc::channel();
+
+        let release_thread = std::thread::spawn(move || {
+            // Release even if the probe panics or fails to queue, so cleanup
+            // never relies on a blocked runtime making forward progress.
+            let queued = queued_rx.recv_timeout(FIXTURE_TIMEOUT);
+            if queued.is_ok() {
+                std::thread::sleep(blocked_after_queue);
             }
-            let release_thread = std::thread::spawn(move || {
-                std::thread::sleep(Duration::from_millis(200));
-                for release in releases {
-                    let _ = release.send(());
-                }
-            });
-            let latency = handle.block_on(measure_event_loop_latency(budget));
-            release_thread.join().expect("release thread");
-            latency
+            for release in releases {
+                let _ = release.send(());
+            }
+            queued.expect("production probe must queue before worker release");
         });
+        let probe_thread = std::thread::spawn(move || {
+            handle.block_on(async move {
+                let mut probe = std::pin::pin!(measure_event_loop_latency(budget));
+                let mut queued_tx = Some(queued_tx);
+                std::future::poll_fn(|cx| {
+                    let result = std::future::Future::poll(probe.as_mut(), cx);
+                    if let Some(queued_tx) = queued_tx.take() {
+                        assert!(result.is_pending(), "occupied workers must queue probes");
+                        queued_tx.send(()).expect("release thread waits for probe");
+                    }
+                    result
+                })
+                .await
+            })
+        });
+
         for blocker in blockers {
             blocker.await.expect("worker blocker should not panic");
         }
         let latency = probe_thread.join().expect("latency probe should not panic");
+        release_thread
+            .join()
+            .expect("worker release should not panic");
+        latency
+    }
+
+    /// A probe that cannot be scheduled within its budget reports at least
+    /// the budget, so the critical threshold it was sized from trips.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn measure_event_loop_latency_reports_at_least_the_budget_on_timeout() {
+        let budget = Duration::from_millis(40);
+        // The workers stay blocked for five budgets after the probe queues, so
+        // its tasks are still queued when the budget runs out.
+        let latency = probe_latency_with_every_worker_blocked(budget, 5 * budget).await;
         assert!(
             latency >= budget,
             "a probe starved past its budget must report at least the budget, got {latency:?}"
@@ -2478,74 +2553,15 @@ mod tests {
         );
     }
 
-    /// Keep every worker occupied until the production probe has actually
-    /// queued its tasks. A start counter followed by fixed sleeps only proved
-    /// historical saturation: CI could delay the probe until all sleeps ended.
+    /// Every worker stays occupied until the production probe has actually
+    /// queued its tasks, and for a while after: the probe must report that
+    /// wait even though it is well inside the budget.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn measure_event_loop_latency_detects_saturated_workers() {
-        let handle = tokio::runtime::Handle::current();
-        let num_workers = handle.metrics().num_workers();
-        const FIXTURE_TIMEOUT: Duration = Duration::from_secs(10);
         const BLOCKED_AFTER_QUEUE: Duration = Duration::from_millis(50);
-        let (started_tx, started_rx) = std::sync::mpsc::channel();
-        let (queued_tx, queued_rx) = std::sync::mpsc::channel();
-        let mut releases = Vec::with_capacity(num_workers);
-        let mut blockers = Vec::with_capacity(num_workers);
-        for _ in 0..num_workers {
-            let (release_tx, release_rx) = std::sync::mpsc::channel();
-            releases.push(release_tx);
-            let started_tx = started_tx.clone();
-            blockers.push(tokio::spawn(async move {
-                started_tx.send(()).expect("probe observes worker entry");
-                // No await between the signal and this blocking receive: the
-                // worker cannot poll another task until it is released.
-                release_rx
-                    .recv_timeout(FIXTURE_TIMEOUT)
-                    .expect("fixture releases every worker");
-            }));
-        }
-        drop(started_tx);
-
-        let release_thread = std::thread::spawn(move || {
-            // Release even if the probe panics or fails to queue, so cleanup
-            // never relies on a blocked runtime making forward progress.
-            let queued = queued_rx.recv_timeout(FIXTURE_TIMEOUT);
-            if queued.is_ok() {
-                std::thread::sleep(BLOCKED_AFTER_QUEUE);
-            }
-            for release in releases {
-                let _ = release.send(());
-            }
-            queued.expect("production probe must queue before worker release");
-        });
-        let probe_thread = std::thread::spawn(move || {
-            for _ in 0..num_workers {
-                started_rx
-                    .recv_timeout(FIXTURE_TIMEOUT)
-                    .expect("every runtime worker must be occupied");
-            }
-            handle.block_on(async move {
-                let mut probe = std::pin::pin!(measure_event_loop_latency(DEFAULT_PROBE_BUDGET));
-                let mut queued_tx = Some(queued_tx);
-                std::future::poll_fn(|cx| {
-                    let result = std::future::Future::poll(probe.as_mut(), cx);
-                    if let Some(queued_tx) = queued_tx.take() {
-                        assert!(result.is_pending(), "occupied workers must queue probes");
-                        queued_tx.send(()).expect("release thread waits for probe");
-                    }
-                    result
-                })
-                .await
-            })
-        });
-
-        for blocker in blockers {
-            blocker.await.expect("worker blocker should not panic");
-        }
-        let latency = probe_thread.join().expect("latency probe should not panic");
-        release_thread
-            .join()
-            .expect("worker release should not panic");
+        let latency =
+            probe_latency_with_every_worker_blocked(DEFAULT_PROBE_BUDGET, BLOCKED_AFTER_QUEUE)
+                .await;
         assert!(
             latency >= Duration::from_millis(25),
             "expected probe to surface ≥25ms saturation, got {:?} \
