@@ -2199,10 +2199,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Everything else
   keeps `ring`, including Intel Ice Lake, Tiger Lake and Rocket Lake (they have
   the features; Ice Lake showed no net gain when measured) and any CPU not on
-  the list. Only the cipher
-  suites change (the AEAD and the suite's HKDF/PRF hash, including the QUIC
-  packet keys); key exchange, signature verification and the key provider stay
-  on `ring`, and the suites offered and negotiated are the same.
+  the list. Only the record layer of TLS over TCP changes (the AEAD and the
+  suite's HKDF/PRF hash); key exchange, signature verification, the key
+  provider and QUIC packet protection stay on `ring`, and the suites offered
+  and negotiated are the same.
   On the hosted protocol benchmark (same binary and runner per comparison, TLS
   on both legs, payloads from 10 KiB to 5 MiB) gateway CPU per request fell
   10–16% for TCP+TLS, with 7–13% more throughput, and 6–11% for HTTP/2 and gRPC
@@ -2210,17 +2210,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   EPYC 9V74 (Zen 4); 4–9% for HTTP/1.1 over TLS from 70 KiB up on a Xeon 8573C
   (Emerald Rapids); and 4–9% for TCP+TLS on a Xeon 6975P-C (Granite Rapids).
   **Where it does not help:** on those CPUs 10 KiB HTTP and gRPC responses are
-  within run-to-run noise except on Zen 5; HTTP/3 showed no measurable change
-  on the one qualifying CPU it was measured on (Zen 4), because QUIC packets
-  are too small for the 512-bit path to matter; an Ice Lake Xeon 8370C showed
-  no net gain; and without AVX-512 (an EPYC 7763, or a VM that hides the
-  features of a newer CPU) AWS-LC cost 8–40% more CPU per request and up to
-  17% of throughput on every protocol, which is why `auto` keeps `ring`
-  there. The per-job figures are in
+  within run-to-run noise except on Zen 5; HTTP/3 is not moved at all,
+  because with AWS-LC's QUIC packet protection it measured 1–4% less
+  throughput and 2–5% more gateway CPU per request than with `ring`'s on Zen 4
+  and Zen 5, so QUIC packets stay on `ring` on every CPU and no setting
+  changes that; an Ice Lake Xeon 8370C showed no net gain; and without AVX-512
+  (an EPYC 7763, or a VM that hides the features of a newer CPU) AWS-LC cost
+  8–40% more CPU per request and up to 17% of throughput on every TCP
+  protocol, which is why `auto` keeps `ring` there. The per-job figures are in
   [frontend_tls.md](docs/frontend_tls.md#record-layer-cipher-suite-backend). Non-x86-64 targets, Windows and macOS are unchanged.
   **Operator action:** none. The choice is logged once at startup at
-  INFO with its reason; `FERRUM_TLS_AEAD_BACKEND=ring` restores the previous
-  behaviour everywhere. Set it in the environment: like `FERRUM_FIPS_MODE` it
+  INFO with its reason and with what protects QUIC packets
+  (`quic_packet_protection=ring`); `FERRUM_TLS_AEAD_BACKEND=ring` restores the
+  previous behaviour everywhere. Set it in the environment: like `FERRUM_FIPS_MODE` it
   is acted on before `ferrum.conf` is read, and `ring` or `aws-lc` set only
   there is refused at startup (`auto` there asks for what already happened and
   is accepted). The FIPS build is unchanged (every suite already comes

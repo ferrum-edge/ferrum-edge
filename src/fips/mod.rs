@@ -315,11 +315,13 @@ pub fn is_enforcing() -> bool {
 /// builds from this one function, so provider selection is a single auditable
 /// switch rather than fifty-odd call sites that each have to remember.
 ///
-/// On the ordinary build the provider is `ring`'s, with its cipher suites
-/// replaced by AWS-LC's implementations of the same suites when
-/// [`aead_backend::selection`] says so. That selection is fixed once at
-/// bootstrap, so every call in a process returns the same provider; where
-/// bootstrap never ran (library consumers, external tests) it is plain `ring`.
+/// On the ordinary build the provider is `ring`'s, with the TLS-over-TCP record
+/// layer of its cipher suites replaced by AWS-LC's when
+/// [`aead_backend::selection`] says so. QUIC packet protection stays `ring`'s
+/// in either case, so a QUIC configuration built from this provider needs no
+/// provider choice of its own. That selection is fixed once at bootstrap, so
+/// every call in a process returns the same provider; where bootstrap never
+/// ran (library consumers, external tests) it is plain `ring`.
 #[cfg(all(feature = "crypto-ring", not(feature = "fips")))]
 pub fn base_crypto_provider() -> CryptoProvider {
     aead_backend::ordinary_profile_provider(aead_backend::selection().backend)

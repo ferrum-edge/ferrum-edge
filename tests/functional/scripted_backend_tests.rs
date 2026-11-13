@@ -707,6 +707,11 @@ async fn forced_aws_lc_record_layer_serves_backend_tls() {
         logs.contains("backend=aws-lc, requested=aws-lc, reason=operator-override"),
         "the startup record must name the forced backend and why; logs:\n{logs}"
     );
+    // Forcing AWS-LC moves TLS over TCP only: QUIC packets stay on ring.
+    assert!(
+        logs.contains("quic_packet_protection=ring"),
+        "the startup record must say QUIC packet protection stayed on ring; logs:\n{logs}"
+    );
 
     let client = harness.http_client().expect("client");
     let resp = client

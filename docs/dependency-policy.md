@@ -1204,8 +1204,9 @@ Rules:
   This is the whole reason the features are exclusive rather than layered.
 - **The ordinary profile carries exactly one AWS-LC edge, `rustls/aws_lc_rs`.**
   It links rustls's AWS-LC cipher suites beside its ring ones so
-  `src/fips/aead_backend.rs` can use whichever is faster for the TLS record
-  layer on the CPU it runs on (`FERRUM_TLS_AEAD_BACKEND`, default `auto`). It
+  `src/fips/aead_backend.rs` can use whichever is faster for the record layer
+  of TLS over TCP on the CPU it runs on (`FERRUM_TLS_AEAD_BACKEND`, default
+  `auto`); QUIC packet protection stays on ring. It
   is safe in this direction because the profile claims no validated module,
   rustls keeps `ring` for key exchange and signatures, and no dependency
   changes arm: the resolved-graph audit requires `rustls/ring` and

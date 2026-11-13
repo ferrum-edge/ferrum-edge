@@ -9,10 +9,11 @@
 //!    reconciliation, which needs a process of its own because the selection
 //!    and the rustls process-default provider are both set exactly once;
 //! 3. real TLS 1.2 / TLS 1.3 handshakes with bulk data, the secret extraction
-//!    the kTLS path depends on, and QUIC key derivation, all with the AWS-LC
-//!    suites selected explicitly. `auto` only picks them on AVX-512 CPUs, so
-//!    without the explicit selection a runner without AVX-512 would never
-//!    execute that code path.
+//!    the kTLS path depends on, QUIC key derivation and a QUIC connection over
+//!    loopback, all with AWS-LC selected explicitly. `auto` only picks it on
+//!    AVX-512 CPUs, so without the explicit selection a runner without AVX-512
+//!    would never execute that code path. QUIC packet protection is checked
+//!    to stay on ring under that selection.
 //!
 //! Assertions that depend on the build profile are `cfg`-gated on the `fips`
 //! feature, so the file is meaningful under both `--features crypto-ring` (the
@@ -664,6 +665,53 @@ fn fips_profile_never_selects_ring_whatever_is_requested() {
     assert!(rendered.contains(fips::SUPPORTED_PROVIDER_ID), "{rendered}");
     assert!(rendered.contains("docs/fips.md"), "{rendered}");
     assert!(rendered.len() < 1024, "diagnostic stays bounded");
+}
+
+#[test]
+fn quic_packet_protection_never_follows_the_record_layer_to_aws_lc() {
+    // The selection moves the TLS-over-TCP record layer only. On the ordinary
+    // build QUIC packets are protected by ring whatever was selected or asked
+    // for, on every CPU; on the FIPS profile by the FIPS module, the only
+    // implementation that build links.
+    for cpu in [zen5(), zen3(), ice_lake_server(), CpuFacts::UNKNOWN] {
+        for request in [
+            AeadBackendRequest::Auto,
+            AeadBackendRequest::Ring,
+            AeadBackendRequest::AwsLc,
+        ] {
+            let selection = aead_backend::select(request, &cpu, false)
+                .expect("every request is available on the ordinary build");
+            assert_eq!(
+                selection.quic_packet_protection(),
+                AeadBackend::Ring,
+                "{request:?} on {cpu:?}"
+            );
+        }
+        for request in [AeadBackendRequest::Auto, AeadBackendRequest::AwsLc] {
+            let selection = aead_backend::select(request, &cpu, true)
+                .expect("the FIPS module satisfies auto and aws-lc");
+            assert_eq!(
+                selection.quic_packet_protection(),
+                AeadBackend::AwsLcFips,
+                "{request:?} on {cpu:?}"
+            );
+        }
+    }
+
+    // The case the rule exists for: `auto` moves the record layer to AWS-LC on
+    // this CPU and QUIC does not go with it.
+    let selection = aead_backend::select(AeadBackendRequest::Auto, &zen5(), false)
+        .expect("auto is always available");
+    assert_eq!(selection.backend, AeadBackend::AwsLc);
+    assert_eq!(selection.quic_packet_protection(), AeadBackend::Ring);
+
+    // And the process this test runs in, which never bootstrapped.
+    let expected = if fips::build_capable() {
+        AeadBackend::AwsLcFips
+    } else {
+        AeadBackend::Ring
+    };
+    assert_eq!(aead_backend::selection().quic_packet_protection(), expected);
 }
 
 #[test]
@@ -1611,30 +1659,104 @@ mod ordinary_profile {
             .any(|candidate| suite_address(*candidate) == suite_address(suite))
     }
 
-    fn is_aws_lc_suite(suite: SupportedCipherSuite) -> bool {
-        is_from(suite, rustls::crypto::aws_lc_rs::ALL_CIPHER_SUITES)
-    }
-
     fn is_ring_suite(suite: SupportedCipherSuite) -> bool {
         is_from(suite, rustls::crypto::ring::ALL_CIPHER_SUITES)
     }
 
-    /// Every suite in `provider` comes from the implementation `backend` names.
+    /// Whether `table` supplies the part of `suite` that serves TLS over TCP.
+    ///
+    /// A TLS 1.2 suite is one object. A TLS 1.3 suite names its transcript
+    /// hash, HKDF and record-layer AEAD separately, and when AWS-LC is selected
+    /// the provider's TLS 1.3 suites are built from parts, so they are compared
+    /// part by part.
+    fn record_layer_is_from(
+        suite: SupportedCipherSuite,
+        table: &'static [SupportedCipherSuite],
+    ) -> bool {
+        let Some(inner) = suite.tls13() else {
+            return is_from(suite, table);
+        };
+        table
+            .iter()
+            .filter_map(|candidate| candidate.tls13())
+            .any(|candidate| {
+                std::ptr::addr_eq(
+                    std::ptr::from_ref(inner.aead_alg),
+                    std::ptr::from_ref(candidate.aead_alg),
+                ) && std::ptr::addr_eq(
+                    std::ptr::from_ref(inner.hkdf_provider),
+                    std::ptr::from_ref(candidate.hkdf_provider),
+                ) && std::ptr::addr_eq(
+                    std::ptr::from_ref(inner.common.hash_provider),
+                    std::ptr::from_ref(candidate.common.hash_provider),
+                )
+            })
+    }
+
+    /// Whether `table` supplies the QUIC packet protection of `suite`.
+    /// `false` for a TLS 1.2 suite, which has none.
+    fn quic_is_from(suite: SupportedCipherSuite, table: &'static [SupportedCipherSuite]) -> bool {
+        let Some(quic) = suite.tls13().and_then(|inner| inner.quic) else {
+            return false;
+        };
+        table
+            .iter()
+            .filter_map(|candidate| candidate.tls13())
+            .filter_map(|candidate| candidate.quic)
+            .any(|candidate| {
+                std::ptr::addr_eq(std::ptr::from_ref(quic), std::ptr::from_ref(candidate))
+            })
+    }
+
+    fn record_layer_is_aws_lc(suite: SupportedCipherSuite) -> bool {
+        record_layer_is_from(suite, rustls::crypto::aws_lc_rs::ALL_CIPHER_SUITES)
+    }
+
+    fn record_layer_is_ring(suite: SupportedCipherSuite) -> bool {
+        record_layer_is_from(suite, rustls::crypto::ring::ALL_CIPHER_SUITES)
+    }
+
+    fn quic_is_ring(suite: SupportedCipherSuite) -> bool {
+        quic_is_from(suite, rustls::crypto::ring::ALL_CIPHER_SUITES)
+    }
+
+    fn quic_is_aws_lc(suite: SupportedCipherSuite) -> bool {
+        quic_is_from(suite, rustls::crypto::aws_lc_rs::ALL_CIPHER_SUITES)
+    }
+
+    /// Every suite in `provider` is the one `backend` names: for
+    /// [`AeadBackend::Ring`], ring's own suite objects; for
+    /// [`AeadBackend::AwsLc`], AWS-LC's record layer with ring's QUIC packet
+    /// protection.
     pub(super) fn assert_provider_matches_backend(provider: &CryptoProvider, backend: AeadBackend) {
         assert!(!provider.cipher_suites.is_empty());
         for suite in &provider.cipher_suites {
+            let id = suite.suite();
             match backend {
                 AeadBackend::AwsLc => {
                     assert!(
-                        is_aws_lc_suite(*suite),
-                        "{:?} is not AWS-LC's",
-                        suite.suite()
+                        record_layer_is_aws_lc(*suite),
+                        "{id:?}: record layer is not AWS-LC's"
                     );
-                    assert!(!is_ring_suite(*suite), "{:?} is ring's", suite.suite());
+                    assert!(
+                        !record_layer_is_ring(*suite),
+                        "{id:?}: record layer is ring's"
+                    );
+                    assert!(!is_ring_suite(*suite), "{id:?} is ring's suite");
+                    if suite.tls13().is_some() {
+                        assert!(quic_is_ring(*suite), "{id:?}: QUIC is not ring's");
+                        assert!(!quic_is_aws_lc(*suite), "{id:?}: QUIC is AWS-LC's");
+                    }
                 }
                 AeadBackend::Ring => {
-                    assert!(is_ring_suite(*suite), "{:?} is not ring's", suite.suite());
-                    assert!(!is_aws_lc_suite(*suite), "{:?} is AWS-LC's", suite.suite());
+                    assert!(is_ring_suite(*suite), "{id:?} is not ring's");
+                    assert!(
+                        !record_layer_is_aws_lc(*suite),
+                        "{id:?}: record layer is AWS-LC's"
+                    );
+                    if suite.tls13().is_some() {
+                        assert!(quic_is_ring(*suite), "{id:?}: QUIC is not ring's");
+                    }
                 }
                 AeadBackend::AwsLcFips => panic!("the ordinary build has no FIPS module"),
             }
@@ -1886,12 +2008,12 @@ mod ordinary_profile {
             assert_eq!(client_suite.suite(), suite, "{label}");
             assert_eq!(server.protocol_version(), Some(version.version), "{label}");
             assert_eq!(
-                is_aws_lc_suite(server_suite),
+                record_layer_is_aws_lc(server_suite),
                 server_backend == AeadBackend::AwsLc,
                 "{label}: server implementation"
             );
             assert_eq!(
-                is_aws_lc_suite(client_suite),
+                record_layer_is_aws_lc(client_suite),
                 client_backend == AeadBackend::AwsLc,
                 "{label}: client implementation"
             );
@@ -2133,11 +2255,72 @@ mod ordinary_profile {
     }
 
     #[test]
-    fn quic_keys_derived_from_aws_lc_suites_interoperate() {
+    fn quic_packet_protection_stays_on_ring_when_aws_lc_is_selected() {
+        // HTTP/3 measured 2-4% slower through AWS-LC's QUIC packet protection
+        // on the CPUs where `auto` selects AWS-LC, so the selection moves the
+        // TLS-over-TCP record layer only. Every TLS 1.3 suite of the AWS-LC
+        // selection must therefore carry ring's QUIC algorithm, the very object
+        // ring's own suite carries, beside AWS-LC's record layer.
+        let selected = provider(AeadBackend::AwsLc);
+        let (tls13, tls12): (Vec<SupportedCipherSuite>, Vec<SupportedCipherSuite>) = selected
+            .cipher_suites
+            .iter()
+            .copied()
+            .partition(|suite| suite.tls13().is_some());
+        assert_eq!(tls13.len(), TLS13_SUITES.len(), "every TLS 1.3 suite");
+        for suite in &tls12 {
+            // A TLS 1.2 suite has no QUIC half.
+            assert!(!quic_is_ring(*suite) && !quic_is_aws_lc(*suite));
+        }
+        for suite in &tls13 {
+            let id = suite.suite();
+            assert!(quic_is_ring(*suite), "{id:?}: QUIC must be ring's");
+            assert!(!quic_is_aws_lc(*suite), "{id:?}: QUIC must not be AWS-LC's");
+            assert!(
+                record_layer_is_aws_lc(*suite),
+                "{id:?}: the record layer must still be AWS-LC's"
+            );
+            // Paired by identifier, not merely "some ring algorithm".
+            let ring_suite = rustls::crypto::ring::ALL_CIPHER_SUITES
+                .iter()
+                .find(|candidate| candidate.suite() == id)
+                .and_then(|candidate| candidate.tls13())
+                .expect("ring implements every TLS 1.3 suite");
+            let selected_quic = suite.tls13().and_then(|inner| inner.quic).expect("QUIC");
+            let ring_quic = ring_suite.quic.expect("ring's suite supports QUIC");
+            assert!(
+                std::ptr::addr_eq(
+                    std::ptr::from_ref(selected_quic),
+                    std::ptr::from_ref(ring_quic)
+                ),
+                "{id:?}: QUIC must be the algorithm of ring's suite of the same identifier"
+            );
+        }
+
+        // The suite lookups the TLS policy is built on resolve through the same
+        // provider, so a narrowed provider keeps the rule.
+        for suite in TLS13_SUITES {
+            let narrowed = single_suite(AeadBackend::AwsLc, suite);
+            assert!(quic_is_ring(narrowed.cipher_suites[0]), "{suite:?}");
+        }
+
+        // Repeated construction hands out the same suite objects: rustls holds
+        // a suite by `&'static` reference, and resumption compares suites.
+        let again = provider(AeadBackend::AwsLc);
+        for (first, second) in selected.cipher_suites.iter().zip(&again.cipher_suites) {
+            assert_eq!(suite_address(*first), suite_address(*second));
+        }
+    }
+
+    #[test]
+    fn quic_keys_under_the_aws_lc_selection_interoperate() {
         // HTTP/3 builds its QUIC configuration from the same provider, and
         // quinn takes its packet and header-protection keys from the negotiated
-        // TLS 1.3 suite. Derive them with AWS-LC's suites and check they open
-        // what the peer seals, against AWS-LC and against ring.
+        // TLS 1.3 suite. Under the AWS-LC selection that suite derives the key
+        // material with AWS-LC's HKDF and hands it to ring's QUIC algorithm.
+        // Check the keys open what the peer seals, against the same selection
+        // and against plain ring: if the two libraries disagreed on a single
+        // derived byte, the peer could not open the packet.
         let peer = Peer::ecdsa();
         for suite in TLS13_SUITES {
             for (server_backend, client_backend) in BACKEND_PAIRS {
@@ -2177,10 +2360,10 @@ mod ordinary_profile {
     }
 
     #[test]
-    fn quinn_accepts_a_configuration_built_on_aws_lc_suites() {
+    fn quinn_accepts_a_configuration_built_on_the_aws_lc_selection() {
         // quinn requires the provider to carry a QUIC-capable
         // TLS13_AES_128_GCM_SHA256 for its Initial keys and refuses the
-        // configuration otherwise. The swapped provider must still satisfy it.
+        // configuration otherwise. The selected provider must still satisfy it.
         let peer = Peer::ecdsa();
         let mut server = peer.server(provider(AeadBackend::AwsLc), &rustls::version::TLS13);
         server.alpn_protocols = vec![b"h3".to_vec()];
@@ -2188,8 +2371,140 @@ mod ordinary_profile {
         client.alpn_protocols = vec![b"h3".to_vec()];
 
         quinn::crypto::rustls::QuicServerConfig::try_from(server)
-            .expect("quinn accepts the AWS-LC-suite server configuration");
+            .expect("quinn accepts the AWS-LC-selection server configuration");
         quinn::crypto::rustls::QuicClientConfig::try_from(client)
-            .expect("quinn accepts the AWS-LC-suite client configuration");
+            .expect("quinn accepts the AWS-LC-selection client configuration");
+    }
+
+    /// `backend`'s provider with `suite` preferred. quinn derives its Initial
+    /// keys from TLS13_AES_128_GCM_SHA256, so that suite stays in the provider
+    /// behind the one under test.
+    fn quic_provider(backend: AeadBackend, suite: CipherSuite) -> CryptoProvider {
+        let base = provider(backend);
+        let mut wanted = vec![suite];
+        if suite != CipherSuite::TLS13_AES_128_GCM_SHA256 {
+            wanted.push(CipherSuite::TLS13_AES_128_GCM_SHA256);
+        }
+        let cipher_suites: Vec<SupportedCipherSuite> = wanted
+            .into_iter()
+            .filter_map(|wanted| {
+                base.cipher_suites
+                    .iter()
+                    .copied()
+                    .find(|candidate| candidate.suite() == wanted)
+            })
+            .collect();
+        CryptoProvider {
+            cipher_suites,
+            ..base
+        }
+    }
+
+    /// A loopback QUIC endpoint, serving with `server` when one is given.
+    /// Must be called inside a Tokio runtime.
+    fn quic_endpoint(server: Option<rustls::ServerConfig>) -> quinn::Endpoint {
+        let server = server.map(|config| {
+            quinn::ServerConfig::with_crypto(Arc::new(
+                quinn::crypto::rustls::QuicServerConfig::try_from(config)
+                    .expect("QUIC server configuration"),
+            ))
+        });
+        let socket = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind a UDP socket");
+        socket
+            .set_nonblocking(true)
+            .expect("set the UDP socket nonblocking");
+        quinn::Endpoint::new(
+            quinn::EndpointConfig::default(),
+            server,
+            socket,
+            quinn::default_runtime().expect("a Tokio runtime"),
+        )
+        .expect("QUIC endpoint")
+    }
+
+    /// Connect two quinn endpoints over loopback and echo `data` on one stream.
+    async fn echo_over_quic(
+        server_tls: rustls::ServerConfig,
+        client_tls: rustls::ClientConfig,
+        data: &[u8],
+    ) -> Vec<u8> {
+        let server = quic_endpoint(Some(server_tls));
+        let address = server.local_addr().expect("server address");
+        let mut client = quic_endpoint(None);
+        client.set_default_client_config(quinn::ClientConfig::new(Arc::new(
+            quinn::crypto::rustls::QuicClientConfig::try_from(client_tls)
+                .expect("QUIC client configuration"),
+        )));
+
+        let accepting = server.clone();
+        let echo = tokio::spawn(async move {
+            let connection = accepting
+                .accept()
+                .await
+                .expect("an incoming connection")
+                .await
+                .expect("server handshake");
+            let (mut send, mut receive) = connection.accept_bi().await.expect("accept a stream");
+            let request = receive
+                .read_to_end(usize::MAX)
+                .await
+                .expect("read the request");
+            send.write_all(&request).await.expect("write the echo");
+            send.finish().expect("finish the echo");
+            // Hold the connection until the client has read the echo and closed.
+            let _ = connection.closed().await;
+        });
+
+        let connection = client
+            .connect(address, HOST)
+            .expect("start the client handshake")
+            .await
+            .expect("client handshake");
+        let (mut send, mut receive) = connection.open_bi().await.expect("open a stream");
+        send.write_all(data).await.expect("write the request");
+        send.finish().expect("finish the request");
+        let echoed = receive
+            .read_to_end(usize::MAX)
+            .await
+            .expect("read the echo");
+
+        connection.close(0u32.into(), b"done");
+        echo.await.expect("echo task");
+        echoed
+    }
+
+    #[tokio::test]
+    async fn a_quic_connection_carries_data_under_the_aws_lc_selection() {
+        // The tests above stop at rustls. This one runs the stack HTTP/3 runs
+        // on: two quinn endpoints over loopback UDP, a real handshake, and a
+        // payload of a few hundred full-size packets each way, with the AWS-LC
+        // selection on both sides and against plain ring in each direction.
+        let peer = Peer::ecdsa();
+        // Not a multiple of the packet payload size or the AES block size.
+        let data = payload(256 * 1024 + 13);
+        for suite in TLS13_SUITES {
+            for (server_backend, client_backend) in BACKEND_PAIRS {
+                let label =
+                    format!("{suite:?} server={server_backend:?} client={client_backend:?}");
+                let mut server_tls = peer.server(
+                    quic_provider(server_backend, suite),
+                    &rustls::version::TLS13,
+                );
+                server_tls.alpn_protocols = vec![b"h3".to_vec()];
+                let mut client_tls = peer.client(
+                    quic_provider(client_backend, suite),
+                    &rustls::version::TLS13,
+                );
+                client_tls.alpn_protocols = vec![b"h3".to_vec()];
+
+                let echoed = tokio::time::timeout(
+                    std::time::Duration::from_secs(30),
+                    echo_over_quic(server_tls, client_tls, &data),
+                )
+                .await
+                .unwrap_or_else(|_| panic!("{label}: the QUIC exchange timed out"));
+                assert!(echoed == data, "{label}: echoed payload differs");
+            }
+        }
     }
 }
