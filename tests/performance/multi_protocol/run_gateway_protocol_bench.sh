@@ -24,6 +24,8 @@
 #   --no-process-usage          (diagnostic only; paired comparisons invalid)
 #   --settle | --no-settle      (first-start settle before pair 1; default on for the
 #                                comparison lanes, off for profile/trace/observation lanes)
+#   --host-flags | --no-host-flags (record host CPU beside each sample and flag the
+#                                samples a host disturbance touched; same default)
 #   --pool-profile calibration|profile (separate fixed-window H2/gRPC lane)
 #   --h1-profile calibration|cutoff|diagnostic (separate manual H1 lane; see docs/h1_internal_profile.md)
 #   --h2-window default|64k     (http2/grpcs only; default $BENCH_H2_WINDOW or `default`)
@@ -45,6 +47,13 @@
 # once, drives a discarded load, and waits (host_settle.py) until the host
 # is quiet. What each hold saw is recorded in host_settle.json. Best effort: an
 # arm that cannot start or be held is skipped and the run continues.
+#
+# Host-disturbance flags: a shared runner takes CPU for its own housekeeping
+# and sometimes does less work per CPU-second. The sampler records host CPU
+# beside each sample (process_usage.py --host-cpu) and, after the last pair,
+# host_disturbance.py marks the samples and paired comparisons such a
+# disturbance touched and prints them. Flagging only: nothing measured changes
+# and no sample is dropped.
 #
 # All gateways (including Ferrum) run in Docker with --network host so no gateway
 # has a native-binary advantage. proto_backend and proto_bench run natively
@@ -94,6 +103,9 @@ WALLCLOCK_BUDGET=4200
 PROCESS_USAGE=true
 # auto = on for the plain comparison lane, off for profile/trace/observation lanes.
 SETTLE=auto
+# auto = the same lanes: profile, trace and observation lanes keep their own
+# fixed sampler arguments and manifest.
+HOST_FLAGS=auto
 BASELINE_IMAGE="${FERRUM_BASELINE_IMAGE:-}"
 PAIR=0
 ORDER_POSITION=0
@@ -131,6 +143,8 @@ while [[ $# -gt 0 ]]; do
         --no-process-usage) PROCESS_USAGE=false; shift ;;
         --settle) SETTLE=true; shift ;;
         --no-settle) SETTLE=false; shift ;;
+        --host-flags) HOST_FLAGS=true; shift ;;
+        --no-host-flags) HOST_FLAGS=false; shift ;;
         --h1-profile) H1_PROFILE="$2"; shift 2 ;;
         --h2-profile) H2_CPU_PROFILE="$2"; shift 2 ;;
         --profile-builds) H1_TRACE_BUILDS="$2"; shift 2 ;;
@@ -1269,6 +1283,9 @@ run_bench() {
         sampler_args+=(--http3)
         case "$gateway" in envoy|envoy-limit-4) sampler_args+=(--envoy) ;; esac
     fi
+    if [ "$HOST_FLAGS" = true ]; then
+        sampler_args+=(--host-cpu)
+    fi
     if [ "$PROCESS_USAGE" = true ]; then
         : > "$usage"
         # /proc/<container-pid>/io requires ptrace read permission across UIDs.
@@ -1719,6 +1736,18 @@ with open(sys.argv[1], "w") as manifest:
                "baseline_image": sys.argv[16] or None,
                "sample_schema": 2}, manifest)
 PYEOF
+    if [ "$HOST_FLAGS" = auto ]; then
+        if [ -n "$H1_PROFILE$POOL_PROFILE$UDP_PROFILE$H2_CPU_PROFILE" ] \
+            || [ "$H1_TRACE" != none ] || [ "$H2_OBSERVE" -eq 1 ]; then
+            HOST_FLAGS=false
+        else
+            HOST_FLAGS=true
+        fi
+    fi
+    if [ "$HOST_FLAGS" = true ]; then
+        # The runner's CPU model decides which disturbances to expect.
+        python3 "$SCRIPT_DIR/host_disturbance.py" record-host "$root_output/manifest.json" || true
+    fi
     if [ "$H3_BUDGET" -ne 0 ]; then
         cp "${H3_EXPERIMENT_MANIFEST:-$SCRIPT_DIR/h3_experiment.json}" "$root_output/h3_experiment.json"
     fi
@@ -1902,6 +1931,14 @@ plan.update(pairs=int(sys.argv[2]), adaptive_extension=sys.argv[3] == "true")
 with open(path, "w") as f:
     json.dump(plan, f, indent=2)
 PYEOF
+    if [ "$HOST_FLAGS" = true ]; then
+        # After the last summary: it annotates the files the summary wrote.
+        # Reporting only, so a failure here must not fail a finished run.
+        python3 "$SCRIPT_DIR/host_disturbance.py" annotate "$OUTPUT_DIR" "$PROTOCOL" \
+            --gateways "$expected_gateways" --payload-sizes "$PAYLOAD_SIZES" \
+            --pairs "$final_pairs" \
+            || echo "[flags] host-disturbance flags could not be computed; samples are unmarked"
+    fi
     # The diagnostic supervisor reports only AFTER bounded cleanup and records
     # truthful termination status even if this runner never reaches this point.
     echo "[main] done. results in $OUTPUT_DIR"

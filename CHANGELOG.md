@@ -595,6 +595,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   benchmark caches are restore-only (`save-if: "false"`) (#7285).
 
 ### Fixed
+- **The hosted protocol benchmark flags the samples a host disturbance
+  touched.** A shared runner takes CPU for its own housekeeping and sometimes
+  does less work per CPU-second, and either moves a sample without the gateway
+  changing. The sampler now records host CPU beside each sample
+  (`process_usage.py --host-cpu`), `manifest.json` records the runner's CPU
+  model, and after the last pair `host_disturbance.py` marks each sample, each
+  summary and each row of `paired_comparisons.json` with what it found: a
+  burst of host CPU outside the benchmark and the processes behind it, a dip
+  in the benchmark's own CPU, the provisioner's first-start reaction reaching
+  a measured cell, activity that recurs every 60 seconds, and gateway and
+  backend CPU per request that disagree between pairs of one arm. It prints
+  the flagged samples at the end of the run log and writes
+  `host_disturbance.json`. Flagging only: nothing measured changes and no
+  sample is dropped. On by default for the comparison lanes
+  (`--no-host-flags` turns it off). `host_disturbance.py report` prints the
+  same table for an earlier run.
 - **The hosted protocol benchmark holds each arm's first start out of the
   measured pairs.** On GitHub-hosted runners the provisioner's job
   daemon uses about one core for four to five seconds the first time a new
