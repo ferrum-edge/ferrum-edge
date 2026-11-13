@@ -2422,39 +2422,43 @@ mod tests {
     /// thread and not on a worker. tokio assumes a task does not block its
     /// worker, so it does not promise that a queued task reaches an idle
     /// worker while another worker is blocked. Two things make that happen
-    /// here; without either, a blocker has been left waiting behind a blocked
-    /// worker for the whole fixture timeout ("every runtime worker must be
-    /// occupied").
+    /// here; without either, a blocker has been left unstarted for the whole
+    /// fixture timeout ("every runtime worker must be occupied").
     ///
     /// The blockers are spawned one at a time, each only after the previous
     /// one has reported from its worker. A blocker signals and then blocks
     /// with no await in between, so a worker that has reported cannot poll
-    /// anything else. Spawned together, two blockers can be taken by one
-    /// worker: tasks spawned from outside a worker go to the injection queue,
-    /// and a worker with nothing local takes a batch of `len / workers + 1`
-    /// from it, runs the first and keeps the second in its local queue, where
-    /// only another worker's steal can reach it.
+    /// anything else, and no worker can ever hold two blockers. Spawned
+    /// together, two blockers can be taken by one worker: tasks spawned from
+    /// outside a worker go to the injection queue, and a worker with nothing
+    /// local can take a batch of up to `len / workers + 1` from it, run the
+    /// first and keep the second in its local queue, where only another
+    /// worker's steal can reach it.
     ///
     /// While it waits for a blocker to report, the fixture spawns an empty
-    /// task every [`WAKE_RETRY_INTERVAL`]. A spawn wakes a worker only if one
-    /// is counted as parked, and a worker on its way to park is still counted
-    /// as awake; it looks at the queues once more before it sleeps only if it
-    /// was the last worker searching. A blocker spawned in that window stays
-    /// in the injection queue with the free worker asleep. The next spawn
-    /// finds that worker parked and wakes it.
+    /// task every [`WAKE_RETRY_INTERVAL`], because one spawn does not always
+    /// get a queued task to the free worker. A spawn wakes a worker only if
+    /// one is counted as parked and none is searching. A worker that gave up
+    /// looking for work while the other worker was still searching is counted
+    /// as awake until it has parked, and it parks without looking at the
+    /// queues again: only the last searching worker does that. If the other
+    /// worker has taken the previous blocker in the meantime, the blocker
+    /// spawned next wakes nobody and stays in the injection queue with the
+    /// free worker asleep. A retry made after that worker is recorded as
+    /// parked wakes it, and the fixture keeps retrying until the blocker
+    /// reports or the fixture timeout runs out.
     fn occupy_every_worker(
         num_workers: usize,
     ) -> (
         Vec<std::sync::mpsc::Sender<()>>,
         Vec<tokio::task::JoinHandle<()>>,
     ) {
-        let (started_tx, started_rx) = std::sync::mpsc::channel();
         let mut releases = Vec::with_capacity(num_workers);
         let mut blockers = Vec::with_capacity(num_workers);
         for _ in 0..num_workers {
+            let (started_tx, started_rx) = std::sync::mpsc::channel();
             let (release_tx, release_rx) = std::sync::mpsc::channel();
             releases.push(release_tx);
-            let started_tx = started_tx.clone();
             blockers.push(tokio::spawn(async move {
                 started_tx.send(()).expect("fixture observes worker entry");
                 // No await between the signal and this blocking receive: the
@@ -2474,6 +2478,8 @@ mod tests {
                         // on whichever worker is free, now or after release.
                         tokio::spawn(async {});
                     }
+                    // Out of time, or the blocker was dropped before it
+                    // reported: this blocker holds the only sender.
                     Err(error) => panic!("every runtime worker must be occupied: {error:?}"),
                 }
             }
