@@ -2171,22 +2171,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `CONTRIBUTING.md` correctly and list every operating mode (#7309).
 
 ### Performance
-- **Proxied requests no longer copy their backend-attempt future, and HTTP/2
-  streams no longer carry a 6.5 KiB task.** A request dispatched through the
-  generic HTTP path (HTTP/1.1 and HTTP/2; native gRPC already boxed its
-  dispatch) copied its backend-attempt state, about 18 KiB, into the request
-  handler. Each HTTP/2 stream, native gRPC included, had a service future of
-  about 6.5 KiB that hyper and the runtime copied when they spawned the
-  stream's task, and the runtime wrote a value of the same size again when the
-  task finished. The attempt is now built in place, and the frontend future is
-  boxed, which leaves the stream task under 1 KiB and costs one allocation of
-  about 2 KiB per request. On the Gateways Protocol Benchmark, with both builds
-  measured in the same job, gateway CPU per request at 10 KiB fell 3.2–4.2% for
-  HTTP/2 (EPYC 9V45, EPYC 9V74) and 1.4–4.2% for gRPC (EPYC 9V45, Xeon 8370C);
-  on the EPYC 7763 it fell 1.7–1.8% for HTTP/2 and 0.1–1.0% for gRPC. HTTP/2 at
-  70 KiB fell 0.8–3.2%. HTTP/1.1 did not change measurably (between 1.8% lower
-  and 1.7% higher at 10 KiB over four jobs). No configuration or behaviour
-  changes.
 - **The HTTP/2 capability verdict for an HTTPS backend is published before
   its HTTP/3 probe finishes.** The capability refresh probed HTTP/2 over TLS
   and HTTP/3 together and wrote one registry record when both were done.
@@ -2203,6 +2187,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   stages is never overwritten. `GET /backend-capabilities` can show an entry
   between the stages during a background refresh; startup warmup and
   `POST /backend-capabilities/refresh` still return only after both.
+- **Proxied requests no longer copy their backend-attempt future, and HTTP/2
+  streams no longer carry a 6.5 KiB task.** A request dispatched through the
+  generic HTTP path (HTTP/1.1 and HTTP/2; native gRPC already boxed its
+  dispatch) copied its backend-attempt state, about 18 KiB, into the request
+  handler. Each HTTP/2 stream, native gRPC included, had a service future of
+  about 6.5 KiB that hyper and the runtime copied when they spawned the
+  stream's task, and the runtime wrote a value of the same size again when the
+  task finished. The attempt is now built in place, and the frontend future is
+  boxed, which leaves the stream task under 1 KiB and costs one allocation of
+  about 2 KiB per request. On the Gateways Protocol Benchmark, with both builds
+  measured in the same job, gateway CPU per request at 10 KiB fell 3.2–4.2% for
+  HTTP/2 (EPYC 9V45, EPYC 9V74) and 1.4–4.2% for gRPC (EPYC 9V45, Xeon 8370C);
+  on the EPYC 7763 it fell 1.7–1.8% for HTTP/2 and 0.1–1.0% for gRPC. HTTP/2 at
+  70 KiB fell 0.8–3.2%. HTTP/1.1 did not change measurably (between 1.8% lower
+  and 1.7% higher at 10 KiB over four jobs). No configuration or behaviour
+  changes.
 - **The direct HTTP/2 pool now reaches `FERRUM_POOL_HTTP2_CONNECTIONS_PER_HOST`.**
   The pool took the first ready shard, and an open HTTP/2 connection always
   reports ready, so every request used the first connection the pool ever
