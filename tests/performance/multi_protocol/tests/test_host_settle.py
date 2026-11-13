@@ -213,13 +213,13 @@ class WaitTests(unittest.TestCase):
             root = Path(temporary) / "proc"
             root.mkdir()
             self.write_stat(root, 0, {77: ("provjobd123", 8 * ticks), 78: ("dockerd", 3 * ticks),
-                                      79: ("containerd", 2 * ticks)})
+                                      79: ("containerd", 2 * ticks), 80: ("systemd", 4 * ticks)})
             output = Path(temporary) / "host_settle.json"
             baseline = Path(temporary) / "foreign.json"
             # Ticks as text, as a boolean and as a float; one well-formed entry.
             baseline.write_text(json.dumps({"unix": 0.5, "processes": {
                 "77:1": ["provjobd123", "500"], "78:1": ["dockerd", True],
-                "79:1": ["containerd", ticks]}}))
+                "80:1": ["systemd", 1.5], "79:1": ["containerd", ticks]}}))
             record = host_settle.wait(
                 self.arguments(root, output, baseline=str(baseline)), sleep=self.fail,
                 now=lambda: 1.0)

@@ -411,16 +411,16 @@ so an image pull or a slow start cannot use up the minimum. The load is that
 long because the reaction needs it: in measured cells, under continuous load,
 the burst had run its course within about 20 seconds of an arm's first start,
 whereas with a three-second load it had not begun by the release in 3 of 14
-starts of one run and landed in pair 1 after all. With 20 seconds it came during the settle in all 21 `ferrum` and Envoy
-starts of two dispatches (3.3 to 6.0 CPU-seconds each), and none of their
-eleven lanes showed the dip in pair 1. Some images cost far more: Tyk's start drew 14 to 22
-CPU-seconds, which runs past the load and extends that hold to as much as 30
-seconds. Arms that share an image settle once, and the start uses the image with
-default arguments (Envoy with stream limit 100, `ferrum` without an experiment
-arm's environment): the host reacts to an image's first start, and a second
-container from an image that had already run showed no burst (0 of 6). An
-image already settled on the host since boot (iteration 2 onwards) is not held
-again.
+starts of one run and landed in pair 1 after all. With 20 seconds it came
+during the settle in all 21 `ferrum` and Envoy starts of two dispatches (3.3 to
+6.0 CPU-seconds each), and none of their eleven lanes showed the dip in pair 1.
+Some images cost far more: Tyk's start drew 14 to 22 CPU-seconds, which runs
+past the load and extends that hold to as much as 30 seconds. Arms that share
+an image settle once, and the start uses the image with default arguments
+(Envoy with stream limit 100, `ferrum` without an experiment arm's
+environment): the host reacts to an image's first start, and a second container
+from an image that had already run showed no burst (0 of 6). An image already
+settled on the host since boot (iteration 2 onwards) is not held again.
 
 The settle is best effort and cannot fail a run. Each start runs in a subshell
 of its own that removes what it started however it ends and writes nothing
