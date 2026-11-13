@@ -3088,6 +3088,8 @@ Ferrum Edge classifies each HTTP-family backend target's protocol support (HTTP/
 
 Plaintext HTTP backends are still probed for prior-knowledge h2c because gRPC is a runtime flavor, not a scheme — a single `http` origin may carry native gRPC. That probe uses the same pool handshake as live gRPC, but with explicit capability-probe context: an expected HTTP/1.1 classification miss (`h2c handshake failed`) is a debug-level event, including on SIGHUP refresh, and does not emit `WARN` at the documented default `FERRUM_LOG_LEVEL=warn`. Request-time gRPC establishment failures, probe dial timeouts, port exhaustion, and unexpected candidate connection/handshake failures remain `WARN`/`ERROR`. Secrets and credential metadata are never included in these lines.
 
+An HTTPS target's entry is published in two stages. The HTTP/2-over-TLS verdict (`plain_http.h2_tls`, `grpc_transport.h2_tls`, `plain_http.h1`) is written as soon as that probe answers; the HTTP/3 verdict follows when its probe finishes, which against a backend with no QUIC listener is the probe timeout (`backend_connect_timeout_ms`, capped at 5 s). While a background refresh is between the two, `GET /backend-capabilities` shows the new HTTP/2 classification next to the **previous** `plain_http.h3` value — `"unknown"` for a target that has never been classified. Poll for the field you need rather than for the entry's existence. Startup warmup and `POST /backend-capabilities/refresh` return only after both stages, so the state they leave is complete.
+
 Two JWT-authenticated endpoints let operators inspect and force-refresh the registry at runtime.
 
 ### `GET /backend-capabilities`

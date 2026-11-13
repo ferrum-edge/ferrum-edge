@@ -1574,6 +1574,10 @@ struct Http1Lane {
     /// cannot repopulate the pool with a connection it meant to retire. Per
     /// lane, so a reload or SVID rotation that withdraws one backend does not
     /// discard every other backend's in-flight connections.
+    ///
+    /// Also set from birth on the lane handed to a checkout that straddled a
+    /// drain before its lane existed (see [`Http1Lanes::lane_for_key`]): that
+    /// lane never enters the map and refuses its one check-in.
     retired: AtomicBool,
 }
 
@@ -1693,6 +1697,13 @@ pub(crate) struct Http1Lanes {
     lanes: DashMap<String, Arc<Http1Lane>>,
     max_idle_per_host: usize,
     counters: Arc<Http1PoolCounters>,
+    /// Bumped by every pass that retires lanes ([`Self::clear`],
+    /// [`Self::retain_keys`]) before it retires one. A checkout samples it
+    /// before it reads the SVID generation its lane key carries, and a lane
+    /// enters the map only while the value is unchanged (see
+    /// [`Self::lane_for_key`]). Written only by those passes, so the sample is
+    /// a shared read.
+    drain_epoch: AtomicU64,
 }
 
 impl Http1Lanes {
@@ -1701,21 +1712,58 @@ impl Http1Lanes {
             lanes: DashMap::with_shard_amount(shards),
             max_idle_per_host: max_idle_per_host.max(1),
             counters: Arc::new(Http1PoolCounters::default()),
+            drain_epoch: AtomicU64::new(0),
         }
     }
 
-    fn lane_for_key(&self, key: &str) -> Arc<Http1Lane> {
+    /// The current drain epoch. A checkout samples this FIRST, before it
+    /// reads the SVID generation its lane key carries: a drain runs after
+    /// what it retires has advanced and bumps the epoch before it retires a
+    /// lane, so a generation read after the sample is either current or the
+    /// drain's bump comes after the sample. One shared atomic load.
+    fn drain_epoch(&self) -> u64 {
+        self.drain_epoch.load(Ordering::Acquire)
+    }
+
+    /// The lane for `key`, for a checkout whose [`Self::drain_epoch`] sample,
+    /// taken before it read the SVID generation in `key`, is `drain_epoch`.
+    ///
+    /// A lane already in the map is returned as it is. A drain retires the
+    /// lanes it withdraws under their own lock, so a connection checked in to
+    /// one is refused however its checkout raced the drain; and no lane a
+    /// drain withdrew can be found here afterwards, because only a checkout
+    /// that sampled after that drain can have put one back.
+    ///
+    /// A lane that is not in the map is inserted only if no drain has run
+    /// since the sample. Otherwise this checkout straddled a drain: the drain
+    /// retired the lanes that existed, and a lane inserted now would pool
+    /// this checkout's connection under a key the drain may just have
+    /// withdrawn (an SVID generation no later checkout asks for). It gets a
+    /// lane that is retired from birth and never enters the map, so its
+    /// connection serves this one request and is closed at check-in. The
+    /// epoch is read under the map's shard lock, which a drain's removal pass
+    /// takes after its bump: an insert that still saw the old epoch is seen,
+    /// and retired, by that pass.
+    fn lane_for_key(&self, key: &str, drain_epoch: u64) -> Arc<Http1Lane> {
         if let Some(lane) = self.lanes.get(key) {
             return Arc::clone(&lane);
         }
-        Arc::clone(&self.lanes.entry(key.to_owned()).or_insert_with(|| {
-            Arc::new(Http1Lane {
-                idle: std::sync::Mutex::new(Vec::new()),
-                max_idle: self.max_idle_per_host,
-                counters: Arc::clone(&self.counters),
-                retired: AtomicBool::new(false),
-            })
-        }))
+        match self.lanes.entry(key.to_owned()) {
+            dashmap::mapref::entry::Entry::Occupied(occupied) => Arc::clone(occupied.get()),
+            dashmap::mapref::entry::Entry::Vacant(vacant) => {
+                let fenced = self.drain_epoch.load(Ordering::Acquire) != drain_epoch;
+                let lane = Arc::new(Http1Lane {
+                    idle: std::sync::Mutex::new(Vec::new()),
+                    max_idle: self.max_idle_per_host,
+                    counters: Arc::clone(&self.counters),
+                    retired: AtomicBool::new(fenced),
+                });
+                if !fenced {
+                    vacant.insert(Arc::clone(&lane));
+                }
+                lane
+            }
+        }
     }
 
     /// Pool a connection whose exchange completed. A sender that is not ready
@@ -1768,14 +1816,30 @@ impl Http1Lanes {
         }
     }
 
+    /// Retire every lane. The epoch bump comes BEFORE the removal pass (see
+    /// [`Self::lane_for_key`]). Cold path.
     fn clear(&self) {
+        self.drain_epoch.fetch_add(1, Ordering::AcqRel);
         self.lanes.retain(|_, lane| {
             lane.retire();
             false
         });
     }
 
+    /// Retire the lanes whose key `keep` rejects. Checkouts already under way
+    /// are fenced as in [`Self::clear`], for every key that has no lane yet:
+    /// a selective pass is rare, and a checkout it fences needlessly only
+    /// loses the reuse of one connection. Cold path.
+    ///
+    /// Two callers: a generation drain, which the fence makes complete, and
+    /// the config-publication prune of withdrawn backends
+    /// (`retain_live_from_config`). The prune gets the same fence for a
+    /// checkout that straddles it, but no more than that: a request still
+    /// running on the previous config can start a checkout afterwards and
+    /// open a withdrawn backend's lane, which the idle sweep closes, as
+    /// before.
     fn retain_keys(&self, mut keep: impl FnMut(&str) -> bool) {
+        self.drain_epoch.fetch_add(1, Ordering::AcqRel);
         self.lanes.retain(|key, lane| {
             let kept = keep(key);
             if !kept {
@@ -2154,13 +2218,39 @@ impl Http2ConnectionPool {
     /// (`resolve_backend_connection_proxy_for_target`). With `fresh`, the idle
     /// set is skipped: used once to replay a request whose reused connection
     /// closed before the request reached the wire.
-    pub async fn checkout_h1(
+    ///
+    /// Not an `async fn`: it hands back the seamed checkout's future itself,
+    /// with a hook that does nothing, so the seam adds no state and no poll
+    /// to a request's checkout.
+    pub fn checkout_h1(
         &self,
         proxy: &Proxy,
         tls: bool,
         connect_timeout: Duration,
         fresh: bool,
-    ) -> Result<Http1Checkout, Http2PoolError> {
+    ) -> impl std::future::Future<Output = Result<Http1Checkout, Http2PoolError>> {
+        self.checkout_h1_seamed(proxy, tls, connect_timeout, fresh, || {})
+    }
+
+    /// The production HTTP/1.1 checkout body, with one test seam: a hook run
+    /// after the drain-epoch sample and the SVID generation read, and BEFORE
+    /// the lane lookup.
+    ///
+    /// Everything between the sample and the lookup is synchronous, so a drain
+    /// can only land there from another thread and no test can place one
+    /// there by timing. Production passes a hook that does nothing, so a test
+    /// through here exercises the production path rather than a parallel one.
+    pub(crate) async fn checkout_h1_seamed<F>(
+        &self,
+        proxy: &Proxy,
+        tls: bool,
+        connect_timeout: Duration,
+        fresh: bool,
+        before_lane_lookup: F,
+    ) -> Result<Http1Checkout, Http2PoolError>
+    where
+        F: FnOnce(),
+    {
         // A refused destination's TLS lane fails before the idle set and the
         // bounded TLS build queue. Its plaintext lane is unaffected.
         if tls {
@@ -2168,11 +2258,18 @@ impl Http2ConnectionPool {
                 .map_err(backend_tls_config_error)?;
         }
         let manager = self.pool.manager();
+        // The lane map's drain epoch is sampled BEFORE the SVID generation is
+        // read: a rotation advances the generation before it drains, so a
+        // generation read here is either current when the drain runs, or the
+        // drain's bump comes after this sample and `lane_for_key` keeps this
+        // checkout's lane out of the map.
+        let drain_epoch = self.h1.drain_epoch();
         let svid_generation = if tls {
             manager.svid_generation_for_proxy(proxy)
         } else {
             None
         };
+        before_lane_lookup();
         let enable_keepalive = proxy
             .pool_enable_http_keep_alive
             .unwrap_or(manager.global_pool_config.enable_http_keep_alive);
@@ -2196,7 +2293,7 @@ impl Http2ConnectionPool {
                 manager.effective_client_key_path(proxy),
                 svid_generation,
             );
-            self.h1.lane_for_key(&buf)
+            self.h1.lane_for_key(&buf, drain_epoch)
         });
         if !fresh {
             let now = std::time::Instant::now();
