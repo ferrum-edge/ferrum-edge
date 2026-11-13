@@ -470,7 +470,7 @@ flags only: nothing measured changes and no sample is dropped or re-run.
 | `cpu_dip` | Gateway plus backend CPU fell under 88% of the sample's plateau (its upper-quartile level) for a second or more. | The benchmark's own processes. With `host_cpu_burst` it is the burst's effect. Without it, on a run that recorded host CPU, the host showed no burst above its own floor and the dip is most likely the arm's own. |
 | `provisioner_burst` | The provisioner's first-start reaction reached the measurement: its job daemon used a CPU-second or more while the sample's sampler ran, and the measured window has a host burst. | `provjobd<digits>` in `host_processes`, which covers the client's warm-up and drain too; `provisioner_cpu_seconds` is recorded even when the window was untouched and the flag is not set. |
 | `provisioner_burst_suspected` | The same, inferred: the settle saw no reaction to the arm's first start (its image, or the harness binaries for `direct`) and one of the arm's first two cells in its first pair dipped. | Only for runs that did not record host CPU. It names the likeliest cause; nothing saw the provisioner. |
-| `periodic_60s` | The sample's dip or burst belongs to a series that recurs every 60 seconds. | Three events, each one period after the last within 2.5 seconds, establish the series; every event a whole number of periods from one of its members, within 3.5 seconds, belongs to it. `periodic_activity` in `host_disturbance.json` gives the count. |
+| `periodic_60s` | The sample's dip or burst belongs to a series that recurs every 60 seconds. | Three or more events, each one period after the last within 2.5 seconds, are a series; an event a whole number of periods from one of them, within 3.5 seconds, belongs to it too. `periodic_activity` in `host_disturbance.json` gives the number of events marked and the longest run of consecutive periods. |
 | `cpu_per_request_drift` | For this arm and payload, gateway and backend CPU per request are both at least 6% higher in one pair than in another. Every compared pair of the arm is marked: nothing says which one is right. | CPU inside the measured window over the requests completed. Payloads of 512 KiB and above, and samples of fewer than 20,000 requests, are not compared. |
 
 The thresholds were set on 31 hosted jobs, checked on six more, and are not
@@ -666,9 +666,10 @@ or adaptive flags and therefore uses **2 pairs, adaptive off**.
   did not record host CPU, the difference between a host burst and an arm's
   own stall (Envoy at 5 MiB in the HTTP/3 lane dips on its own). They can also
   mark too much: a move near the drift threshold falls on
-  either side of it by chance, and a run with a dozen unrelated disturbances
-  lines three of them up as a 60-second series about one time in ten. Nor can
-  they see
+  either side of it by chance; a run with a dozen unrelated disturbances
+  lines three of them up as a 60-second series about one time in ten; and
+  beside a real series, about one unrelated event in eight happens to share
+  its phase and is marked with it. Nor can they see
   a difference between two arms that holds in every pair: that is what the
   benchmark reports, and only an identical-code run shows when it is not the
   code. One such run on an EPYC 9V74 runner read the in-run arm 3.4% and 8.1%

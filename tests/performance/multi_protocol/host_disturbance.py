@@ -418,16 +418,6 @@ def flag_suspected_provisioner_bursts(samples, reactions, gateways, sizes):
                 row["flags"].append("provisioner_burst_suspected")
 
 
-def longest_consecutive(numbers):
-    """Length of the longest run of consecutive integers in `numbers`."""
-    best = current = 0
-    previous = None
-    for number in sorted(set(numbers)):
-        current = current + 1 if previous is not None and number == previous + 1 else 1
-        best, previous = max(best, current), number
-    return best
-
-
 def whole_periods(gap, period, tolerance):
     """How many periods a gap between two events spans, or None if it is not a whole number.
 
@@ -443,16 +433,21 @@ def whole_periods(gap, period, tolerance):
 def periodic_activity(samples):
     """Dips or bursts that recur on a known period across the whole run.
 
-    The run has periodic activity when three events are each one period after
-    the last, within PERIOD_TOLERANCE: PERIOD_MIN_EVENTS consecutive periods
-    that each hold one. Events that merely line up several periods apart do
-    not establish it. Once it is established, every event a whole number of
-    periods from a member of the series, within PERIOD_MEMBER_TOLERANCE, joins
-    it, and so on from the events that joined: a period without an event (it
-    fell between two cells) does not cut the series, and neither does an extra
-    disturbance beside one of its events. Each event is judged against other
-    events and not against a fixed comb, because the period wanders by a few
-    seconds.
+    A chain is a sequence of events, each one period after the last within
+    PERIOD_TOLERANCE. Events on a chain of PERIOD_MIN_EVENTS or more are the
+    core: that many consecutive periods each held an event, which events that
+    merely line up several periods apart never achieve. Every core event is
+    marked, and so is any other event a whole number of periods from a core
+    event within PERIOD_MEMBER_TOLERANCE: one that arrived a little early or
+    late, one on the far side of a period that fell between two cells, or an
+    extra disturbance beside a core event. Membership does not spread further
+    than that, so an event is never more than the tolerance out of phase with
+    the core.
+
+    Every chain is found, whatever its phase and wherever it starts, and
+    nothing depends on the order events are visited in. Events are judged
+    against each other and not against a fixed comb, because the period
+    wanders by a few seconds.
     """
     events = []
     for key, row in samples.items():
@@ -462,36 +457,40 @@ def periodic_activity(samples):
             events.append((event["start_unix_secs"], key))
     events.sort(key=lambda event: event[0])
     times = [time for time, _ in events]
+    count = len(times)
     for period in PERIODS:
-        links = {index: [] for index in range(len(times))}
-        runs = {index: 1 for index in links}
-        for later in range(len(times)):
+        def follows(earlier, later):
+            return whole_periods(times[later] - times[earlier], period, PERIOD_TOLERANCE) == 1
+
+        # Longest chain ending at each event, and longest starting at it.
+        # Events are in time order, so each side is final when it is used.
+        ending = [1] * count
+        for later in range(count):
             for earlier in range(later):
-                gap = times[later] - times[earlier]
-                count = whole_periods(gap, period, PERIOD_MEMBER_TOLERANCE)
-                if count is not None:
-                    links[earlier].append((later, count))
-                    links[later].append((earlier, -count))
-                if whole_periods(gap, period, PERIOD_TOLERANCE) == 1:
-                    # `earlier` is final by now: events are in time order.
-                    runs[later] = max(runs[later], runs[earlier] + 1)
-        seed = next((index for index in runs if runs[index] >= PERIOD_MIN_EVENTS), None)
-        if seed is None:
+                if follows(earlier, later):
+                    ending[later] = max(ending[later], ending[earlier] + 1)
+        starting = [1] * count
+        for earlier in range(count - 1, -1, -1):
+            for later in range(earlier + 1, count):
+                if follows(earlier, later):
+                    starting[earlier] = max(starting[earlier], starting[later] + 1)
+        through = [ending[index] + starting[index] - 1 for index in range(count)]
+        core = [index for index in range(count) if through[index] >= PERIOD_MIN_EVENTS]
+        if not core:
             continue
-        placed, pending = {seed: 0}, [seed]
-        while pending:
-            index = pending.pop()
-            for other, count in links[index]:
-                if other not in placed:
-                    placed[other] = placed[index] + count
-                    pending.append(other)
-        for index in placed:
+        members = set(core)
+        for index in range(count):
+            if index not in members and any(
+                    whole_periods(abs(times[index] - times[other]), period,
+                                  PERIOD_MEMBER_TOLERANCE) is not None for other in core):
+                members.add(index)
+        for index in members:
             flag = f"periodic_{int(period)}s"
             if flag not in samples[events[index][1]]["flags"]:
                 samples[events[index][1]]["flags"].append(flag)
-        marked = [times[index] for index in placed]
-        return dict(period_seconds=period, events=len(set(placed.values())),
-                    consecutive_periods=longest_consecutive(placed.values()),
+        marked = [times[index] for index in members]
+        return dict(period_seconds=period, events=len(members),
+                    consecutive_periods=max(through[index] for index in core),
                     seconds_spanned=round(max(marked) - min(marked), 1))
     return None
 
@@ -642,8 +641,8 @@ def print_report(report, stream=sys.stdout):
         write(f"{summary['not_analysed']} samples could not be analysed: no usable sampler series")
     periodic = report.get("periodic_activity")
     if periodic:
-        write(f"host activity every {int(periodic['period_seconds'])} s: seen in {periodic['events']} "
-              f"periods over {periodic['seconds_spanned']} s")
+        write(f"host activity every {int(periodic['period_seconds'])} s: {periodic['events']} events over "
+              f"{periodic['seconds_spanned']} s, {periodic['consecutive_periods']} periods in a row")
     for row in report["samples"]:
         if row["flags"]:
             write(f"pair {row['pair']} {row['gateway']:<16} {row['payload_size']:>8}  "
