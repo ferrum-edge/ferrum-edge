@@ -244,9 +244,9 @@ use crate::util::http_headers::{
 
 use self::backend_capabilities::{
     BackendCapabilityProbeTarget, BackendCapabilityRecord, BackendCapabilityRefreshOutcome,
-    BackendCapabilityRegistry, BackendCapabilitySnapshot, CapabilityCommitOutcome, ProtocolSupport,
-    RefreshCoalescer, RefreshRole, RefreshRunnerGuard, SharedBackendCapabilityRegistry,
-    SharedRefreshCoalescer,
+    BackendCapabilityRegistry, CapabilityCommitOutcome, ProtocolSupport, RefreshCoalescer,
+    RefreshRole, RefreshRunnerGuard, SharedBackendCapabilityRegistry, SharedRefreshCoalescer,
+    StagedProbeCommit,
 };
 pub use self::body::ProxyBody;
 use self::grpc_proxy::{
@@ -1002,10 +1002,10 @@ const HBONE_INNER_IDENTITY_BAGGAGE_PREFIXES: &[&str] = &[
 ];
 
 /// Partial outcome of a single H3 capability probe. `probe_h2_tls` writes
-/// directly into `record` (it owns `&mut record`), but `probe_h3` runs in
-/// parallel via `tokio::join!` so it can't simultaneously alias that borrow.
+/// directly into `record` (it owns `&mut record`), but `probe_h3` is polled
+/// concurrently on the same task so it can't simultaneously alias that borrow.
 /// Instead it returns this struct; `apply()` merges the result into the
-/// shared record + error list when the join completes.
+/// shared record + error list once the H2 probe has released the record.
 struct H3ProbeOutcome {
     h3: ProtocolSupport,
     error: Option<String>,
@@ -1303,6 +1303,29 @@ fn append_probe_error(record: &mut BackendCapabilityRecord, msg: String) {
             record.last_probe_error = Some(msg);
         }
     }
+}
+
+/// Publish one stage of a target's probe through its compare-and-commit chain
+/// and warn about any `Supported` protocol that stage took away.
+///
+/// The regression check compares the published record with the record it
+/// replaced (the chain's expectation before the commit). A target published
+/// in two stages therefore reports an HTTP/2 regression when the HTTP/2
+/// verdict becomes visible and an HTTP/3 regression when the HTTP/3 verdict
+/// does; a rejected stage published nothing and reports nothing.
+fn commit_capability_probe_stage(
+    target: &BackendCapabilityProbeTarget,
+    commit: &mut StagedProbeCommit<'_>,
+    record: BackendCapabilityRecord,
+) -> CapabilityCommitOutcome {
+    let replaced = commit.expected().clone();
+    let outcome = commit.commit(record);
+    if let (CapabilityCommitOutcome::Committed(published), Some(previous)) =
+        (&outcome, replaced.previous())
+    {
+        warn_capability_supported_regression(target, previous, published);
+    }
+    outcome
 }
 
 fn warn_capability_supported_regression(
@@ -1624,7 +1647,7 @@ fn collect_reqwest_warmup_candidates_for_proxy(
 /// exceeds `pool_warmup_concurrency`. Without the shared semaphore, two
 /// `tokio::join!`-ed batches each independently respecting that limit
 /// would burst to ~2× (or more, since per-HTTPS-target probes also
-/// `tokio::join!` H2 + H3 internally) — overloading backends and
+/// run H2 + H3 concurrently) — overloading backends and
 /// triggering avoidable startup timeouts in large configs.
 ///
 /// `polling_buffer` is the configured `pool_warmup_concurrency` cap, NOT
@@ -12447,15 +12470,21 @@ impl ProxyState {
 
     /// Probe one target and build its fresh record.
     ///
-    /// `previous` is the caller's pre-probe snapshot, taken once via
-    /// `BackendCapabilityRegistry::snapshot_for_probe` and reused as the
-    /// compare expectation when the result is committed. Re-reading the
-    /// registry here would split the merge input from the commit expectation
-    /// and reopen the window this design closes.
+    /// `commit` is the caller's staged write-back for this target, opened via
+    /// `BackendCapabilityRegistry::begin_probe_commit`. Its opening
+    /// expectation is the ONE pre-probe observation: the `previous_*` merge
+    /// input here and the compare expectation of the first commit. Re-reading
+    /// the registry here would split the merge input from the commit
+    /// expectation and reopen the window this design closes.
+    ///
+    /// The returned record is the complete classification; the caller commits
+    /// it as the chain's last stage. An HTTPS target whose HTTP/2 probe
+    /// finishes while its HTTP/3 probe is still in flight also publishes that
+    /// HTTP/2 verdict from here, as an earlier stage (see the `Https` arm).
     async fn probe_backend_capabilities(
         &self,
         target: &BackendCapabilityProbeTarget,
-        previous: &BackendCapabilitySnapshot,
+        commit: &mut StagedProbeCommit<'_>,
     ) -> BackendCapabilityRecord {
         let scheme = target.scheme();
         let mut record = BackendCapabilityRecord::default();
@@ -12471,7 +12500,7 @@ impl ProxyState {
         let probe_timeout = Duration::from_millis(probe_proxy.backend_connect_timeout_ms);
         let host = target.host();
         let port = target.port();
-        let previous = previous.previous();
+        let previous = commit.expected().previous();
         let previous_hbone = previous.map(|record| record.hbone);
         let previous_h2_tls = previous.map(|record| record.plain_http.h2_tls);
         let previous_grpc_h2_tls = previous.map(|record| record.grpc_transport.h2_tls);
@@ -12506,18 +12535,6 @@ impl ProxyState {
                     .connection_pool
                     .get_tls_config_for_backend(&probe_proxy)
                     .await;
-                let h2_fut = self.probe_h2_tls(
-                    H2TlsProbeTarget {
-                        probe_proxy: &probe_proxy,
-                        probe_timeout,
-                        host,
-                        port,
-                        previous_h2_tls,
-                        previous_grpc_h2_tls,
-                        previous_h1,
-                    },
-                    &mut record,
-                );
                 let h3_fut = Self::probe_h3(
                     &self.h3_pool,
                     &probe_proxy,
@@ -12528,7 +12545,66 @@ impl ProxyState {
                     port,
                     previous_h3,
                 );
-                let (_, h3_outcome) = tokio::join!(h2_fut, h3_fut);
+                tokio::pin!(h3_fut);
+                // Drive both probes on this task and learn which one answers
+                // first. `biased` polls HTTP/2 first, so a tie takes the
+                // early-publication path below, which costs one extra commit
+                // and nothing else: the HTTP/3 await is then already ready.
+                // Neither future is dropped unfinished — the arm that loses
+                // the race is awaited to completion right after.
+                let h3_outcome_before_h2 = {
+                    let h2_fut = self.probe_h2_tls(
+                        H2TlsProbeTarget {
+                            probe_proxy: &probe_proxy,
+                            probe_timeout,
+                            host,
+                            port,
+                            previous_h2_tls,
+                            previous_grpc_h2_tls,
+                            previous_h1,
+                        },
+                        &mut record,
+                    );
+                    tokio::pin!(h2_fut);
+                    tokio::select! {
+                        biased;
+                        _ = &mut h2_fut => None,
+                        h3_outcome = &mut h3_fut => {
+                            h2_fut.await;
+                            Some(h3_outcome)
+                        }
+                    }
+                };
+                let h3_outcome = match h3_outcome_before_h2 {
+                    // HTTP/3 answered first, so both verdicts are in hand and
+                    // the caller's commit publishes them together.
+                    Some(h3_outcome) => h3_outcome,
+                    None => {
+                        // The HTTP/2 verdict is in and HTTP/3 is still
+                        // probing. Against a backend with no QUIC listener
+                        // that probe ends only at its timeout, and until the
+                        // record exists every request to this target reads
+                        // `Unknown`: plain HTTPS rides reqwest instead of the
+                        // direct HTTP/2 pool, and the direct HTTP/1.1 pool,
+                        // which needs a proven `Unsupported`, stays off too.
+                        // Publish the HTTP/2 verdict now, with HTTP/3 left
+                        // exactly as it was before this probe (`Unknown` on a
+                        // first probe), so native HTTP/3 dispatch still
+                        // requires a completed HTTP/3 probe. `record` already
+                        // carries any HTTP/2 probe error.
+                        //
+                        // A rejection needs no handling here: the chain is
+                        // closed, so the caller's final commit reports the
+                        // same rejection and the discard is counted once.
+                        let mut h2_verdict = record.clone();
+                        if let Some(previous_h3) = previous_h3 {
+                            h2_verdict.plain_http.h3 = previous_h3;
+                        }
+                        h2_verdict.last_probe_at_unix_secs = backend_capabilities::now_unix_secs();
+                        let _ = commit_capability_probe_stage(target, commit, h2_verdict);
+                        h3_fut.await
+                    }
+                };
                 h3_outcome.apply(&mut record, &mut errors);
             }
             BackendScheme::Tcp | BackendScheme::Tcps | BackendScheme::Udp | BackendScheme::Dtls => {
@@ -12570,8 +12646,8 @@ impl ProxyState {
 
         record.last_probe_at_unix_secs = backend_capabilities::now_unix_secs();
         // `probe_h2_tls` writes its own errors into `record.last_probe_error`
-        // directly (it owns `&mut record` alongside the join!-running H3
-        // future). `probe_h3`'s errors come back via the outcome struct in
+        // directly (it owns `&mut record` alongside the concurrently polled
+        // H3 future). `probe_h3`'s errors come back via the outcome struct in
         // `errors`. Merge both sources here.
         if !errors.is_empty() {
             let joined = errors.join("; ");
@@ -12669,9 +12745,10 @@ impl ProxyState {
             Ok(Err(err)) => {
                 // We need to collect this error for `last_probe_error`, but
                 // the outer function writes `errors` and we can't borrow it
-                // through the join! Thread the message via
-                // `record.last_probe_error` directly instead — the outer
-                // function merges this into the combined error string.
+                // while the H3 probe is polled alongside. Thread the message
+                // via `record.last_probe_error` directly instead — the outer
+                // function merges this into the combined error string, and
+                // the early HTTP/2 stage publishes it as is.
                 let class = http2_pool::classify_http2_pool_error(&err);
                 // Same reasoning as the H3 probe: a `maxConnections` refusal is
                 // a gateway-side ceiling, not evidence the backend lost H2. This
@@ -12841,8 +12918,8 @@ impl ProxyState {
     /// the outer `errors` vec. Takes `&Arc<Http3ConnectionPool>` plus a
     /// pre-computed `tls_config_result` so the synchronous TLS-config build
     /// (a real error case) is folded in without duplicating the timeout
-    /// handling. Written as an associated fn so it can be polled via
-    /// `tokio::join!` alongside `probe_h2_tls` (which borrows `&mut record`)
+    /// handling. Written as an associated fn so it can be polled
+    /// concurrently with `probe_h2_tls` (which borrows `&mut record`)
     /// without aliasing `self`.
     ///
     /// Transient DNS/connect/refused/timeout failures preserve an existing
@@ -13009,6 +13086,12 @@ impl ProxyState {
         // Probes whose write-back lost to newer registry state (a request-path
         // downgrade, or a `retain_keys` eviction) during the probe window.
         let conflicts = Arc::new(AtomicU64::new(0));
+        // The subset of `conflicts` that had already published an early
+        // HTTP/2 verdict when the live state superseded them. That verdict was
+        // visible (and may still be, under the downgrade that replaced it),
+        // but the target is not in the protocol tallies: those describe
+        // complete classifications only.
+        let conflicts_after_early_stage = Arc::new(AtomicU64::new(0));
 
         stream::iter(targets)
             .for_each_concurrent(buffer, |target| {
@@ -13019,6 +13102,7 @@ impl ProxyState {
                 let h2c_supported = h2c_supported.clone();
                 let hbone_supported = hbone_supported.clone();
                 let conflicts = conflicts.clone();
+                let conflicts_after_early_stage = conflicts_after_early_stage.clone();
                 let semaphore = semaphore.clone();
                 async move {
                     // Same rule as `run_warmup_task_batch`: prefer
@@ -13037,41 +13121,53 @@ impl ProxyState {
                             return;
                         }
                     };
-                    // ONE pre-probe observation, used both as the merge input
-                    // (`previous_*` classifications inside the probe) and as
-                    // the compare expectation for the write-back below. A
-                    // second independent read would leave exactly the window
-                    // this protocol closes.
+                    // ONE pre-probe observation, taken when the staged
+                    // write-back is opened. It is both the merge input
+                    // (`previous_*` classifications inside the probe) and the
+                    // compare expectation of the first commit. A second
+                    // independent read would leave exactly the window this
+                    // protocol closes.
                     let registry = &state.backend_capabilities;
-                    let snapshot = registry.snapshot_for_probe(&target.key);
-                    let record = state.probe_backend_capabilities(&target, &snapshot).await;
-                    // Compare-and-commit: the probe may replace only the
-                    // version it was computed against. A request-path
+                    let mut commit = registry.begin_probe_commit(&target.key);
+                    let record = state
+                        .probe_backend_capabilities(&target, &mut commit)
+                        .await;
+                    // Compare-and-commit: a stage may replace only the
+                    // version it was computed against — the pre-probe
+                    // snapshot, or the HTTP/2 verdict this same probe
+                    // published early for an HTTPS target. A request-path
                     // downgrade (`mark_h3_unsupported` /
                     // `mark_h2_tls_unsupported` / `mark_hbone_unsupported`)
-                    // landing during the probe window publishes a new `Arc`,
-                    // so this write loses and the newer live record survives.
-                    let outcome = registry.commit_probe(target.key.clone(), &snapshot, record);
+                    // landing anywhere in the probe window publishes a new
+                    // `Arc`, so this write loses and the newer live record
+                    // survives.
+                    let outcome = commit_capability_probe_stage(&target, &mut commit, record);
                     let committed = match outcome {
                         CapabilityCommitOutcome::Committed(committed) => committed,
                         rejected => {
-                            // Counters and the summary line describe committed
-                            // registry state only — a discarded probe must not
-                            // be reported as this target's classification.
+                            // The protocol tallies describe complete
+                            // classifications only — a probe whose final
+                            // commit lost must not be reported as this
+                            // target's classification. `published_stages` is
+                            // 1 when its HTTP/2 verdict went out before the
+                            // live state superseded it; that case is counted
+                            // on its own so the summary does not claim the
+                            // refresh published nothing for the target.
                             conflicts.fetch_add(1, Ordering::Relaxed);
+                            if commit.published_stages() > 0 {
+                                conflicts_after_early_stage.fetch_add(1, Ordering::Relaxed);
+                            }
                             debug!(
                                 proxy_id = %target.proxy.id,
                                 backend_host = %target.host(),
                                 backend_port = target.port(),
                                 reason = rejected.reason(),
+                                published_stages = commit.published_stages(),
                                 "Backend capability probe result discarded; live registry state is newer"
                             );
                             return;
                         }
                     };
-                    if let Some(previous) = snapshot.previous() {
-                        warn_capability_supported_regression(&target, previous, &committed);
-                    }
                     if committed.plain_http.h2_tls.is_supported() {
                         h2_supported.fetch_add(1, Ordering::Relaxed);
                     }
@@ -13089,19 +13185,23 @@ impl ProxyState {
             })
             .await;
 
-        // Every tally below is drawn from records this refresh actually
-        // committed. Targets whose probe lost the compare-and-commit are
-        // reported separately as `discarded` — they keep the newer live
-        // classification, so folding them into the protocol counts would
-        // misreport the registry.
+        // Every protocol tally below is drawn from the complete record a
+        // probe committed as its last stage. Targets whose probe lost the
+        // compare-and-commit are reported separately as `discarded` — they
+        // keep the newer live classification, so folding them into the
+        // protocol counts would misreport the registry. A discarded HTTPS
+        // probe may still have published its HTTP/2 verdict as an early
+        // stage before it was superseded; those are called out so "discarded"
+        // is not read as "published nothing".
         info!(
-            "Backend capability refresh complete: {} backends classified (h2_tls={}, h3={}, h2c={}, hbone={}), {} probe results discarded in favor of newer live state",
+            "Backend capability refresh complete: {} backends classified (h2_tls={}, h3={}, h2c={}, hbone={}), {} probe results discarded in favor of newer live state ({} of them after publishing an early HTTP/2 verdict)",
             refreshed.load(Ordering::Relaxed),
             h2_supported.load(Ordering::Relaxed),
             h3_supported.load(Ordering::Relaxed),
             h2c_supported.load(Ordering::Relaxed),
             hbone_supported.load(Ordering::Relaxed),
             conflicts.load(Ordering::Relaxed),
+            conflicts_after_early_stage.load(Ordering::Relaxed),
         );
     }
 
@@ -13275,7 +13375,7 @@ impl ProxyState {
         // semaphore. Without this, each `for_each_concurrent` would
         // independently honour `pool_warmup_concurrency` and the joined
         // batches would burst to ~2× (or more, since per-HTTPS-target
-        // probes also `tokio::join!` H2 + H3 internally) — overloading
+        // probes also run H2 + H3 concurrently) — overloading
         // backends and breaking the operator-set cap.
         let warmup_semaphore = Arc::new(Semaphore::new(concurrency));
         let upstream_map: HashMap<(&str, &str), &crate::config::types::Upstream> = config
