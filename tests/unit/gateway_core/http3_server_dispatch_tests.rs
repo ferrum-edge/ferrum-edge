@@ -1505,7 +1505,7 @@ fn h1_h2_request_plugin_awaits_and_body_hook_clones_preserve_deadline_provenance
     // `run_buffered_request_body_hook_round_trip_for_test` executes it.
     assert!(
         proxy
-            .matches("ctx.adopt_final_request_body_hook_context(body_hook_ctx)")
+            .matches("ctx.adopt_final_request_body_hook_context(*body_hook_ctx)")
             .count()
             >= 5,
         "every final-body compatibility-clone merge must use the shared hand-back"
