@@ -2410,28 +2410,38 @@ mod tests {
     /// hanging.
     const FIXTURE_TIMEOUT: Duration = Duration::from_secs(10);
 
+    /// How often the fixture repeats the scheduler's wake-up while it waits for
+    /// a blocker to reach a worker.
+    const WAKE_RETRY_INTERVAL: Duration = Duration::from_millis(10);
+
     /// Parks one blocking task on every runtime worker and returns, once each
     /// worker is inside its blocker, the senders that release them and the
     /// blockers' join handles.
     ///
     /// Call it from the test body, which `#[tokio::test]` runs on the test
-    /// thread and not on a worker. The blockers are spawned one at a time,
-    /// each only after the previous one has reported from its worker. A
-    /// blocker signals and then blocks with no await in between, so a worker
-    /// that has reported cannot poll anything else, and the next blocker can
-    /// only be taken by a worker that is still free.
+    /// thread and not on a worker. tokio assumes a task does not block its
+    /// worker, so it does not promise that a queued task reaches an idle
+    /// worker while another worker is blocked. Two things make that happen
+    /// here; without either, a blocker has been left waiting behind a blocked
+    /// worker for the whole fixture timeout ("every runtime worker must be
+    /// occupied").
     ///
-    /// Spawning them together does not guarantee one per worker. Tasks spawned
-    /// from outside a worker go to the runtime's injection queue, and a worker
-    /// with nothing local takes a batch of `len / workers + 1` from it: with
-    /// two blockers and two workers, one worker can take both. It runs the
-    /// first and keeps the second in its local queue, where only the other
-    /// worker's steal can reach it. If the other worker looked for work while
-    /// the batch was between the two queues, it has already parked, and the
-    /// worker that took the batch wakes nobody unless it had been searching.
-    /// It then blocks in the first blocker for the whole fixture timeout with
-    /// the second queued behind it, which CI reported once as "every runtime
-    /// worker must be occupied".
+    /// The blockers are spawned one at a time, each only after the previous
+    /// one has reported from its worker. A blocker signals and then blocks
+    /// with no await in between, so a worker that has reported cannot poll
+    /// anything else. Spawned together, two blockers can be taken by one
+    /// worker: tasks spawned from outside a worker go to the injection queue,
+    /// and a worker with nothing local takes a batch of `len / workers + 1`
+    /// from it, runs the first and keeps the second in its local queue, where
+    /// only another worker's steal can reach it.
+    ///
+    /// While it waits for a blocker to report, the fixture spawns an empty
+    /// task every [`WAKE_RETRY_INTERVAL`]. A spawn wakes a worker only if one
+    /// is counted as parked, and a worker on its way to park is still counted
+    /// as awake; it looks at the queues once more before it sleeps only if it
+    /// was the last worker searching. A blocker spawned in that window stays
+    /// in the injection queue with the free worker asleep. The next spawn
+    /// finds that worker parked and wakes it.
     fn occupy_every_worker(
         num_workers: usize,
     ) -> (
@@ -2453,9 +2463,20 @@ mod tests {
                     .recv_timeout(FIXTURE_TIMEOUT)
                     .expect("fixture releases every worker");
             }));
-            started_rx
-                .recv_timeout(FIXTURE_TIMEOUT)
-                .expect("every runtime worker must be occupied");
+            let deadline = std::time::Instant::now() + FIXTURE_TIMEOUT;
+            loop {
+                match started_rx.recv_timeout(WAKE_RETRY_INTERVAL) {
+                    Ok(()) => break,
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+                        if std::time::Instant::now() < deadline =>
+                    {
+                        // Still queued: repeat the wake-up. The empty task runs
+                        // on whichever worker is free, now or after release.
+                        tokio::spawn(async {});
+                    }
+                    Err(error) => panic!("every runtime worker must be occupied: {error:?}"),
+                }
+            }
         }
         (releases, blockers)
     }
