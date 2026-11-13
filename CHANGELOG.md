@@ -2227,6 +2227,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `maxConnections` for that width, or set
   `FERRUM_POOL_HTTP2_CONNECTIONS_PER_HOST=1`. See
   [Direct HTTP/2 Pool Width](docs/connection_pooling.md#direct-http2-pool-width).
+- **HTTP/2 requests to a backend no longer spawn tasks the size of the whole
+  backend connection.** hyper's HTTP/2 client hands its executor one enum for
+  three futures: the per-connection task and two per-request ones (the
+  response waiter, spawned for every request, and the request-body writer,
+  spawned when the body cannot be written at once). The enum held the
+  connection task inline, so each per-request task was allocated and copied at
+  the size of the connection task: about 2.5 KiB on the direct HTTP/2 pool
+  over TLS, where its own state is a few hundred bytes. On the HTTP/2 10 KiB
+  benchmark those copies were 0.5–1.4% of gateway user CPU. The vendored hyper
+  now boxes the connection task (patch 009, one allocation per connection).
+  The change reaches every user of hyper's HTTP/2 client in the gateway. Among
+  them are the proxy's backend paths (the direct HTTP/2 pool, the gRPC pool
+  including gRPC nested in HBONE, mesh mTLS and Unix-socket HTTP/2 backends,
+  HTTP/2 through the shared reqwest client) and the tonic-based gRPC clients
+  (gRPC health probes, the control-plane and mesh configuration channels).
+  No configuration or behaviour change.
 - **A cold DNS miss sends the SRV and A/AAAA queries together.** Under an
   order that starts with `SRV` followed by `A` or `AAAA` (the default
   `CACHE,SRV,A,CNAME`), a hostname with no recorded answering type used to

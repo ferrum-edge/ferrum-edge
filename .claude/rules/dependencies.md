@@ -26,7 +26,7 @@ Full policy: `docs/dependency-policy.md`. These are the load-bearing rules.
   `[patch.crates-io]` in `Cargo.toml`: `sqlx-core 0.8.6`, `reqwest 0.13.4`,
   `h3 0.0.8`, `h3-quinn 0.0.10`, `tungstenite 0.29.0`,
   `tokio-tungstenite 0.29.0`, `dimpl 0.6.1`, `hyper-util 0.1.21`
-  (patches 001–002), `hyper 1.10.0` (patches 001–008), and `h2 0.4.20` (coalescing,
+  (patches 001–002), `hyper 1.10.0` (patches 001–009), and `h2 0.4.20` (coalescing,
   assigned-send-capacity, and reset-origin patches).
 - Each patch has a retirement plan under `docs/upstream-*-patches/` and a row in
   the inventory table in `docs/dependency-policy.md` plus a matching entry in

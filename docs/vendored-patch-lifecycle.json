@@ -1062,6 +1062,37 @@
       ]
     },
     {
+      "id": "hyper-009-h2-client-conn-task-box",
+      "label": "hyper HTTP/2 client boxes its connection task so per-request futures stay small",
+      "crate": "hyper",
+      "vendored_version": "1.10.0",
+      "vendor_path": "vendor/hyper-1.10.0-ferrum-patched",
+      "docs_path": "docs/upstream-hyper-patches/009-h2-client-conn-task-box/",
+      "owner": "Ferrum Edge maintainers",
+      "owner_github": null,
+      "reason": "hyper's HTTP/2 client spawns its per-request futures (Pipe, Send) and its per-connection task (Task) through one enum, H2ClientFuture, which is as large as its largest variant. Task owned the h2 Connection inline, so every per-request future was as large as the connection task: about 2.5 KiB on Ferrum's direct HTTP/2 pool over TLS, where its own state is a few hundred bytes. The executor allocated and copied that for each spawned future (0.5-1.4% of gateway user CPU on the HTTP/2 10 KiB benchmark). Task now holds Pin<Box<ConnTask>>: one allocation per connection, no API or behaviour change.",
+      "upstream": {
+        "filing": "deliberate_fork_unfiled",
+        "github_repo": "hyperium/hyper",
+        "pr_number": null,
+        "issue_number": null,
+        "fork_ref": null
+      },
+      "reaffirmation": null,
+      "retirement": {
+        "trigger": "hyper stops sizing its per-request HTTP/2 client futures by the connection task (for example by boxing ConnTask or spawning it through a separate executor bound), or the vendored hyper is retired.",
+        "co_retirement_group": null,
+        "compatible_release_test": {
+          "status": "not_started",
+          "notes": null
+        }
+      },
+      "regression_tests": [
+        "vendor/hyper-1.10.0-ferrum-patched (proto::h2::client::ferrum_client_conn_task_box_tests)",
+        "tests/integration/http2_pool_tests.rs"
+      ]
+    },
+    {
       "id": "h2-001-coalesce-data-frame-writes",
       "label": "h2 writes several DATA frames per write call",
       "crate": "h2",
