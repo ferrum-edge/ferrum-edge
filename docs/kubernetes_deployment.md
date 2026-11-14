@@ -596,7 +596,7 @@ dependency-aware readiness.
 
 | Workload | Liveness / startup default | Readiness default |
 | --- | --- | --- |
-| `controlPlane`, `ca` | `ferrum-edge health --live` against the admin listener | `ferrum-edge health` (503 while starting/unavailable; ready-but-degraded stays HTTP 200 with JSON `status: "degraded"`) |
+| `controlPlane` | `ferrum-edge health --live` against the admin listener | `ferrum-edge health` (503 while starting/unavailable; ready-but-degraded stays HTTP 200 with JSON `status: "degraded"`) |
 | `ambient` | same admin `--live` exec against the ambient admin port | same admin `/health` exec. With the ambient admin HTTP port set to `0` there is no computed handler, so every **enabled** ambient probe fails render: supply `ambient.probes.<probe>.override` or set `ambient.probes.<probe>.enabled=false`. NodeWaypoint additionally refuses a `0` ambient admin port outright |
 | `nodeAgent` | same admin `--live` exec when `nodeAgent.admin.enabled` and an admin port is available (the plaintext port, or the HTTPS port with `--tls` when plaintext is `0`) | same admin `/health` exec. The computed probe is omitted (not refused) when node-agent admin is disabled or has no usable port, unless an `override` handler is set. An HTTPS-only admin that requires client certificates (`tls.clientCaKey`) fails render while any enabled probe still uses the computed handler |
 | `injector` | `tcpSocket` on the `webhook` port | `tcpSocket` on the `webhook` port |
@@ -610,11 +610,11 @@ built-in `ferrum-edge health` command evaluates HTTP status). Per-probe
 `override` maps replace only that probe's handler; a shared `probes.override`
 is rejected by `values.schema.json`.
 
-Serving mesh workloads (`controlPlane`, `ca`, `eastWest`, `ambient`) also render
+Serving mesh workloads (`controlPlane`, `eastWest`, `ambient`) also render
 the gateway chart's graceful-shutdown contract: `FERRUM_SHUTDOWN_DRAIN_SECONDS`,
 optional `FERRUM_SHUTDOWN_PREDRAIN_SECONDS`, native `preStop.sleep`, and
 `terminationGracePeriodSeconds` sized for the full additive budget in
-[graceful_shutdown.md](graceful_shutdown.md). `controlPlane` and `ca` run `cp`
+[graceful_shutdown.md](graceful_shutdown.md). `controlPlane` runs `cp`
 mode, which honors the pre-drain window on its admin and CP-gRPC accept loops,
 so the `<1.29` remediation (`shutdownPreStopSeconds: 0` plus a raised
 `shutdownPreDrainSeconds`) is a real contract there and not just a rendered env.
@@ -631,7 +631,7 @@ connection-refused and fails pod CREATE cluster-wide. The **node-agent** renders
 preStop sleep would only delay node drains.
 
 Restricted-compatible `securityContext` and non-empty `resources` defaults
-apply to control plane, CA, and east-west. Ambient keeps its host-network
+apply to control plane and east-west. Ambient keeps its host-network
 datapath capabilities after dropping ALL; its `securityContext` accepts only
 `allowPrivilegeEscalation`, `readOnlyRootFilesystem`, `capabilities.drop`, and
 `capabilities.add`, so an unsupported key is rejected rather than ignored.
@@ -640,8 +640,8 @@ container, not only on the UDP preflight.
 
 Each workload's `admin.bindAddress` must be an IP literal and its
 `admin.allowedCidrs` (and `observability.metrics.allowedCidrs`) is validated
-entry-for-entry against the runtime's strict CIDR parser. For `controlPlane` and
-`ca` a full-family allowlist (`0.0.0.0/0`, `::/0`, an IPv4-mapped `/96`, or a
+entry-for-entry against the runtime's strict CIDR parser. For `controlPlane` a
+full-family allowlist (`0.0.0.0/0`, `::/0`, an IPv4-mapped `/96`, or a
 covering union) is not accepted as plaintext-admin protection. While the
 computed exec probes are enabled, the chart predicts the probe's source address
 from the bind: wildcard and loopback IPv4 binds (`""`, `*`, `0.0.0.0`, and any
@@ -681,7 +681,7 @@ scrape carries no credential and may stay on plaintext `admin-http`.
 Admin HTTPS uses one shape on every mesh workload —
 `<component>.admin.httpsPort` (default `0`) plus `<component>.admin.tls`
 (`enabled`, `secretName`, `mountPath`, `certKey`, `keyKey`, optional
-`clientCaKey` / `crlKey`) for `controlPlane`, `ca`, `eastWest`, and `ambient`,
+`clientCaKey` / `crlKey`) for `controlPlane`, `eastWest`, and `ambient`,
 and the pre-existing `nodeAgent.admin.httpsPort` / `nodeAgent.admin.tls`. The
 chart mounts the Secret read-only and renders `FERRUM_ADMIN_HTTPS_PORT` with the
 matching `FERRUM_ADMIN_TLS_*` paths; setting `admin.httpPort: 0` alongside it

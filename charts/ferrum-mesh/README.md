@@ -233,14 +233,13 @@ spreads pods across `kubernetes.io/hostname` (`ScheduleAnyway`). Set
 **Explicit non-HA defaults** (PDB skipped — `minAvailable: 1` would block drains):
 
 - `controlPlane.replicas: 1` — single-node lab installs (`examples/development-values.yaml`). Raise to `>= 2` before production control planes.
-- `ca` — hard-coded to one replica in the template.
 
 Set any data-path workload to `replicas: 1` only as a deliberate lab choice; the
 PDB is omitted automatically.
 
 ## Graceful shutdown
 
-Serving workloads (`controlPlane`, `ca`, `eastWest`, `ambient`) ship the same
+Serving workloads (`controlPlane`, `eastWest`, `ambient`) ship the same
 additive drain contract as `ferrum-gateway` (`docs/graceful_shutdown.md`):
 
 - `FERRUM_SHUTDOWN_DRAIN_SECONDS` / `FERRUM_SHUTDOWN_PREDRAIN_SECONDS`
@@ -250,7 +249,7 @@ additive drain contract as `ferrum-gateway` (`docs/graceful_shutdown.md`):
 Render fails when the grace period is under budget. On Kubernetes &lt;1.29 set
 `shutdownPreStopSeconds: 0` and raise `shutdownPreDrainSeconds` to at least
 readiness `failureThreshold × periodSeconds`. That remediation is real for every
-serving workload here, `controlPlane` and `ca` included: `cp` mode honors
+serving workload here, `controlPlane` included: `cp` mode honors
 `FERRUM_SHUTDOWN_PREDRAIN_SECONDS` (its admin and CP-gRPC accept loops close on
 the same broadcast the window delays, while `/health` already reports
 `ready: false`). One-shot hooks/jobs (CNI uninstall) do not receive this
@@ -310,7 +309,7 @@ instead of CrashLooping the pod:
   are rejected — `EnvConfig::validate()` exits on them.
 - `allowedCidrs` is parsed entry-for-entry like `CidrSet::parse_strict`: bare
   IPv4/IPv6 addresses or CIDRs, no brackets, prefixes in family range.
-- For `controlPlane` and `ca` (which run `cp` mode and hard-fail on a
+- For `controlPlane` (which runs `cp` mode and hard-fails on a
   non-loopback plaintext admin listener), a **full-family** allowlist —
   `0.0.0.0/0`, `::/0`, an IPv4-mapped `/96`, or a union that covers a whole
   family — does not count as protection. Use a narrower allowlist, keep the
@@ -328,7 +327,7 @@ parses `FERRUM_METRICS_ALLOWED_CIDRS` with the same strict parser.
 
 ## Pod security and resources
 
-`controlPlane`, `ca`, and `eastWest` default to restricted-compatible
+`controlPlane` and `eastWest` default to restricted-compatible
 PodSecurity (non-root 65532, drop ALL, no privilege escalation, read-only root,
 RuntimeDefault seccomp, `/tmp` emptyDir) with non-empty CPU/memory requests and
 limits. Their `podSecurityContext` / `securityContext` are free-form and
@@ -386,7 +385,7 @@ and the chart **fails render** when:
   so the scrape verifies the admin certificate;
 - `tlsConfig.insecureSkipVerify: true` is combined with a bearer credential.
 
-Admin HTTPS is available on `controlPlane`, `ca`, `eastWest`, `ambient`, and
+Admin HTTPS is available on `controlPlane`, `eastWest`, `ambient`, and
 `nodeAgent` through the same shape: `admin.httpsPort` (default `0`, so existing
 HTTP-only installs are unchanged) plus `admin.tls`
 (`enabled`, `secretName`, `mountPath`, `certKey`, `keyKey`, optional
