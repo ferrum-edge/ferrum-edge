@@ -2555,11 +2555,11 @@ SHA-256. When a reviewed change has to rewrite one of those jobs, the trusted
 policy admits an exact retired→adopted pair instead of relaxing the scan
 (`CI_JOB_GENERATION_TRANSITIONS` in `.github/scripts/verify_cross_build_policy.py`).
 
-The table currently admits two pairs: `ebpf-live` and `netns-capture-live`,
-each from main's current job to the same job plus the 12 GiB
-`/mnt/ferrum-swapfile` step (branch `fix/ci-live-jobs-swap`; both jobs build the
-~15 GB library test harness with only the image's 3 GB swap). Retire both once
-that change is on `main`. Every earlier pair is retired:
+The table is currently **empty**. Every pair it has held is retired:
+
+- PR #7365's `ebpf-live` / `netns-capture-live` pairs, which admitted the
+  12 GiB `/mnt/ferrum-swapfile` step PR #7366 added (both jobs build the ~15 GB
+  library test harness): each destination is main's live job text.
 
 - PR #3911's `performance-regression` pair (issue #3906): the job has moved out
   of `ci.yml` into `performance-regression.yml`, so the pair can never match a

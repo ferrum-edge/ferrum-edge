@@ -1088,15 +1088,11 @@ Current admissions:
 
 - `fips-build.yml`: none. The #3889, #3950 and issue #4018 whole-file
   admissions are spent and the verifier no longer carries the mechanism.
-- Cross-sensitive `ci.yml` jobs (`CI_JOB_GENERATION_TRANSITIONS`): two open
-  pairs, `ebpf-live` and `netns-capture-live`, each from main's current job to
-  the same job plus the 12 GiB `/mnt/ferrum-swapfile` step (branch
-  `fix/ci-live-jobs-swap`). Retire both once that change is on `main`. Earlier
-  pairs, including the issue #6573 BoringCache retirement pairs, are spent and
-  retired.
-- Local composite actions (`LOCAL_ACTION_GENERATION_TRANSITIONS`): empty. Its
-  pairs, including the `setup-rust-ci` #3889→#3911 chain, are spent and
-  retired.
+- Cross-sensitive `ci.yml` jobs (`CI_JOB_GENERATION_TRANSITIONS`) and local
+  composite actions (`LOCAL_ACTION_GENERATION_TRANSITIONS`): both tables are
+  currently empty. Their pairs, including the `setup-rust-ci` #3889→#3911
+  chain, the issue #6573 BoringCache retirement pairs and the PR #7365
+  `ebpf-live` / `netns-capture-live` swap-step pairs, are spent and retired.
 
 Details: `docs/ci_cd.md` → "`fips-build.yml` generation transitions (none
 open)", "Admitted CI job SHA-256 generation transitions", and "Admitted
