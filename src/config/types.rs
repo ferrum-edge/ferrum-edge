@@ -8715,9 +8715,10 @@ impl Proxy {
     /// Admission-only errors for `allowed_ws_origins` beyond empty-string
     /// checks: CORS-style `"*"` and entries that are not a literal origin.
     ///
-    /// Load paths (file/database/CP/DP `validate_all_fields`) must not treat
-    /// these as rejecting errors — existing rows keep loading with a warning
-    /// from [`Self::warn_legacy_allowed_ws_origins`].
+    /// Admin API writes, restore, and file-mode load/reload (issue #7218)
+    /// reject these. Database/CP/DP loads (`validate_all_fields`) must not
+    /// treat them as rejecting errors: stored rows keep loading with a warning
+    /// from [`Self::warn_legacy_allowed_ws_origins`] (#5454).
     pub fn allowed_ws_origins_admission_errors(&self) -> Vec<String> {
         let mut errors = Vec::new();
         for (i, origin) in self.allowed_ws_origins.iter().enumerate() {
@@ -8763,7 +8764,9 @@ impl Proxy {
     }
 
     /// Warn once when a loaded proxy still carries the CORS-style `"*"`
-    /// footgun or a non-origin `allowed_ws_origins` entry. Never fails the load.
+    /// footgun or a non-origin `allowed_ws_origins` entry. Never fails the load
+    /// by itself; file mode refuses the document separately in
+    /// `file_loader` (issue #7218).
     pub fn warn_legacy_allowed_ws_origins(&self) {
         let has_legacy_entry = self.allowed_ws_origins.iter().any(|origin| {
             let trimmed = origin.trim();
@@ -8779,8 +8782,8 @@ impl Proxy {
             crate::startup::sanitize_startup_cause(
                 format!(
                     "Proxy {:?} `allowed_ws_origins` contains `*` or a non-origin entry; {}; \
-                     existing config is still loaded. Admin API writes and `ferrum-edge validate` \
-                     reject this value.",
+                     stored database/control-plane config is still loaded. Admin API writes, \
+                     file-mode loads, and `ferrum-edge validate` reject this value.",
                     self.id, ALLOWED_WS_ORIGINS_STAR_GUIDANCE
                 ),
                 &[]
@@ -9408,9 +9411,9 @@ impl Proxy {
 
         // Allowed WebSocket origins validation. Empty strings are a hard
         // error on every path. CORS-style `"*"` and non-origin entries are
-        // admission-only (`validate_fields` / Admin / `ferrum-edge validate`);
-        // load snapshots warn via `warn_legacy_allowed_ws_origins` instead of
-        // failing startup.
+        // admission-only (`validate_fields` / Admin / file-mode load and
+        // `ferrum-edge validate`); database/CP/DP load snapshots warn via
+        // `warn_legacy_allowed_ws_origins` instead of failing startup.
         for (i, origin) in self.allowed_ws_origins.iter().enumerate() {
             if origin.trim().is_empty() {
                 errors.push(format!("allowed_ws_origins[{}] must not be empty", i));
@@ -11517,8 +11520,9 @@ impl ServiceDiscoveryConfig {
 
 impl GatewayConfig {
     /// Admission-only `allowed_ws_origins` errors across every proxy (`*` and
-    /// non-origin entries). Load snapshots must not use this as a rejecting
-    /// gate; they warn via [`Proxy::warn_legacy_allowed_ws_origins`] instead.
+    /// non-origin entries). Restore and file-mode load/reload reject on it;
+    /// database/CP/DP load snapshots must not use this as a rejecting gate and
+    /// warn via [`Proxy::warn_legacy_allowed_ws_origins`] instead.
     pub fn allowed_ws_origins_admission_errors(&self) -> Vec<String> {
         let mut errors = Vec::new();
         for proxy in &self.proxies {
@@ -11611,8 +11615,9 @@ impl GatewayConfig {
                 }
             }
             // Grandfather existing `"*"` / non-origin rows: never fail a
-            // file/database/CP/DP load for this (issue #5454). Admission
-            // rejects the same values through `validate_fields`.
+            // database/CP/DP load for this (issue #5454). Admission rejects
+            // the same values through `validate_fields`, and file mode
+            // refuses them in `file_loader` (issue #7218).
             proxy.warn_legacy_allowed_ws_origins();
             proxy.warn_unreachable_regex_path_parameters();
         }

@@ -646,9 +646,11 @@ def check_claimed_profiles_declared(manifest: str | None = None) -> list[str]:
 
     declared = set(_FEATURE_NAME_RE.findall(table.group(1)))
     # `default` is the profile selector; `crypto-ring`/`fips` are the backends
-    # themselves; `fuzzing` compiles no cryptography and is never shipped;
-    # `cloud-secrets` is the umbrella over the individual `secrets-*` features.
-    exempt = {"default", "crypto-ring", "fips", "fuzzing"}
+    # themselves; `fuzzing` and `test-support` (test-only fault injection and
+    # hooks, enabled only through the self dev-dependency, issue #7122) compile
+    # no cryptography and are never shipped; `cloud-secrets` is the umbrella
+    # over the individual `secrets-*` features.
+    exempt = {"default", "crypto-ring", "fips", "fuzzing", "test-support"}
     covered = {
         feature
         for _, features, _ in claimed_profiles()

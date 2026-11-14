@@ -413,11 +413,15 @@
       "owner_github": null,
       "reason": "Stock h3 0.0.8 parks on the DECLARED payload length of a non-DATA frame and accumulates QUIC chunks into an unbounded BufList; QUIC flow control caps only bytes in flight because every read re-grants credit, so one unauthenticated stream declaring 2^62-1 bytes drives the process to OOM. The unknown-frame skip arm and the peer control stream have the same shape.",
       "upstream": {
-        "filing": "deliberate_fork_unfiled",
+        "filing": "reported_privately",
         "github_repo": "hyperium/h3",
         "pr_number": null,
         "issue_number": null,
-        "fork_ref": null
+        "fork_ref": null,
+        "private_report": {
+          "channel": "security_advisory",
+          "reported_on": "2026-11-14"
+        }
       },
       "reaffirmation": null,
       "retirement": {

@@ -1986,8 +1986,22 @@ fn proxy_ws_origin_star_is_rejected_on_admin_and_validate_admission() {
         .next()
         .unwrap_or(cli);
     assert!(
-        execute_validate.contains("allowed_ws_origins_admission_errors()"),
-        "ferrum-edge validate must reject '*' after loading the file spec"
+        execute_validate.contains("file_loader::load_config_from_file("),
+        "ferrum-edge validate must load the file spec through the file-mode loader"
+    );
+    // Issue #7218: file mode refuses '*' at load and reload, so `validate`
+    // inherits the refusal from the loader it shares with startup.
+    let file_loader = include_str!("../../../src/config/file_loader.rs");
+    let core = file_loader
+        .split("fn decode_and_validate_document(")
+        .nth(1)
+        .expect("file-mode decode core")
+        .split("/// Load and validate an owned file-mode candidate")
+        .next()
+        .unwrap_or(file_loader);
+    assert!(
+        core.contains("config.allowed_ws_origins_admission_errors()"),
+        "file-mode load/reload (and so `ferrum-edge validate`) must reject '*'"
     );
 }
 

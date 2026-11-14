@@ -2632,7 +2632,8 @@ fn test_proxy_allowed_ws_origins_star_does_not_fail_load_validation() {
     };
     assert!(
         config.validate_all_fields(30).is_ok(),
-        "file/database/CP load must keep serving proxies whose stored allow-list is '*'"
+        "database/CP/DP load validation must keep serving proxies whose stored allow-list is '*' \
+         (file mode refuses it separately in file_loader, issue #7218)"
     );
 }
 

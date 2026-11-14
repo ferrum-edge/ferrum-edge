@@ -784,6 +784,25 @@ impl ActiveUnhealthyTargets {
     }
 }
 
+/// Fixed `DashMap` shard count for the per-proxy passive-health maps
+/// ([`PassiveUnhealthyTargets`] and `ProxyHealthState.states`), issue #7207.
+///
+/// These maps are the deliberate exception to the `pool_shard_amount` rule:
+/// one pair exists per proxy with a passive policy and holds that proxy's
+/// targets only, so the default `4 × cores` (or the rule's ≥ 64) cache-padded
+/// shards cost about 16 KiB per proxy on 16 cores and make the 1 s passive
+/// recovery sweep and `/metrics` walk visit mostly empty shards. A response
+/// takes only a shard read lock; writes happen on a target's first sighting
+/// and its ejection transitions, so eight shards is enough lock spread for one
+/// proxy's target set (the trade-off: a very hot single proxy shares fewer
+/// shard locks).
+pub const PER_PROXY_PASSIVE_HEALTH_SHARD_AMOUNT: usize = 8;
+const _: () = assert!(
+    PER_PROXY_PASSIVE_HEALTH_SHARD_AMOUNT.is_power_of_two()
+        && PER_PROXY_PASSIVE_HEALTH_SHARD_AMOUNT > 1,
+    "DashMap requires a power-of-two shard count greater than one"
+);
+
 /// Per-proxy passive ejection set: `"host:port"` → [`PassiveEjection`].
 ///
 /// Wraps the `DashMap` with two atomics the selection hot path reads instead
@@ -797,7 +816,7 @@ impl ActiveUnhealthyTargets {
 /// `Release` AFTER the map change; readers load it with `Acquire` BEFORE
 /// probing the map, so a racing write always leaves the counter ahead of the
 /// snapshot it may have been missed by.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct PassiveUnhealthyTargets {
     map: DashMap<String, PassiveEjection>,
     len: std::sync::atomic::AtomicUsize,
@@ -834,10 +853,16 @@ impl Drop for PassiveEjectionMut<'_> {
     }
 }
 
+impl Default for PassiveUnhealthyTargets {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl PassiveUnhealthyTargets {
     pub fn new() -> Self {
         Self {
-            map: DashMap::new(),
+            map: DashMap::with_shard_amount(PER_PROXY_PASSIVE_HEALTH_SHARD_AMOUNT),
             len: std::sync::atomic::AtomicUsize::new(0),
             generation: AtomicU64::new(0),
         }
@@ -1000,7 +1025,7 @@ impl ProxyHealthState {
     fn new() -> Self {
         Self {
             unhealthy: PassiveUnhealthyTargets::new(),
-            states: DashMap::new(),
+            states: DashMap::with_shard_amount(PER_PROXY_PASSIVE_HEALTH_SHARD_AMOUNT),
             id: PROXY_HEALTH_STATE_IDS.fetch_add(1, Ordering::Relaxed),
         }
     }
