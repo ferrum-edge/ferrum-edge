@@ -1720,6 +1720,7 @@ fn prepare_normalized_gateway_config_for_mesh(
     // under the service-port key or dial-port key their dispatch path uses.
     // Topology-aware: Ambient emits HBONE routes; Sidecar emits SVID-mTLS routes.
     materialize_mesh_outbound_proxies(&mut config, runtime, mesh_slice);
+    bind_carried_http_routes_to_node_waypoint_transport(&mut config, runtime, mesh_slice);
     let refused_destination_routes =
         scope_request_auth_to_node_waypoint_destinations(&mut config, runtime, mesh_slice);
     scope_request_auth_refusal_to_inbound_routes(&mut config, runtime, &refused_destination_routes);
@@ -4376,6 +4377,353 @@ fn decode_http_route_set(
         ));
     }
     Ok((proxies, upstreams, plugin_configs))
+}
+
+/// Where a carried VirtualService destination host lives, from the NodeWaypoint's
+/// own slice view.
+enum CarriedRouteHost {
+    /// A Service in the slice: `(namespace, name)`.
+    Service(String, String),
+    /// A cluster Service host (`*.svc[.<cluster domain>]`, or a short name) the
+    /// slice does not model.
+    UnmodeledService,
+    /// Anything else: an external host.
+    External,
+}
+
+/// Index of the Service host names a NodeWaypoint slice models.
+struct CarriedRouteHostIndex {
+    qualified: HashMap<String, (String, String)>,
+    short: HashSet<(String, String)>,
+    svc_suffix: String,
+}
+
+impl CarriedRouteHostIndex {
+    fn new(mesh_slice: &MeshSlice, cluster_domain: &str) -> Self {
+        let cluster_domain = cluster_domain.trim_matches('.').to_ascii_lowercase();
+        let mut qualified = HashMap::new();
+        let mut short = HashSet::new();
+        for service in &mesh_slice.services {
+            short.insert((service.namespace.clone(), service.name.to_ascii_lowercase()));
+            for host in
+                mesh_service_host_variants(&service.name, &service.namespace, &cluster_domain)
+                    .into_iter()
+                    .skip(1)
+            {
+                qualified.insert(
+                    host.to_ascii_lowercase(),
+                    (service.namespace.clone(), service.name.clone()),
+                );
+            }
+        }
+        Self {
+            qualified,
+            short,
+            svc_suffix: format!(".svc.{cluster_domain}"),
+        }
+    }
+
+    /// Classify `host` as written on a route in `namespace`.
+    fn classify(&self, namespace: &str, host: &str) -> CarriedRouteHost {
+        let host = host.trim().trim_end_matches('.').to_ascii_lowercase();
+        if !host.contains('.') {
+            return if self.short.contains(&(namespace.to_string(), host.clone())) {
+                CarriedRouteHost::Service(namespace.to_string(), host)
+            } else {
+                CarriedRouteHost::UnmodeledService
+            };
+        }
+        if let Some((namespace, name)) = self.qualified.get(&host) {
+            return CarriedRouteHost::Service(namespace.clone(), name.clone());
+        }
+        if host.ends_with(".svc") || host.ends_with(&self.svc_suffix) {
+            CarriedRouteHost::UnmodeledService
+        } else {
+            CarriedRouteHost::External
+        }
+    }
+}
+
+/// Rebind the VirtualService HTTP routes a NodeWaypoint slice carries onto the
+/// NodeWaypoint mesh transport (issue #7233).
+///
+/// The translator's routes dial Service DNS names over plain HTTP. Served as
+/// they are, a carried route would replace the materialized Service route's
+/// pinned, node-to-node HBONE targets with a plaintext dial. So every in-mesh
+/// destination is rebound onto the Service port's materialized upstream
+/// (`materialize_mesh_outbound_proxies` keeps those upstreams even when a
+/// carried route shadows the Service's own route):
+///
+/// * a direct backend (the route's own, or a `mesh_route_dispatch` rule's)
+///   becomes that upstream's id;
+/// * a weighted-split upstream's Service targets become the Service's
+///   workload targets, each leg's weight divided across its workloads, with
+///   the Service attribution kept on every target. DestinationRule policy
+///   therefore applies per Service route, never across a split.
+///
+/// A route with a destination that is an in-cluster Service the slice does not
+/// model, or a modeled Service port with no materialized upstream, is dropped
+/// with its plugins, fail-closed; its host then gets the materialized Service
+/// route. External hosts are left as they are.
+fn bind_carried_http_routes_to_node_waypoint_transport(
+    config: &mut GatewayConfig,
+    runtime: &MeshRuntimeConfig,
+    mesh_slice: &MeshSlice,
+) {
+    use crate::config::types::{
+        UPSTREAM_TARGET_SERVICE_NAME_TAG, UPSTREAM_TARGET_SERVICE_NAMESPACE_TAG,
+        UPSTREAM_TARGET_SERVICE_PORT_TAG,
+    };
+    if runtime.topology != MeshTopology::NodeWaypoint || mesh_slice.http_routes.is_empty() {
+        return;
+    }
+    let hosts = CarriedRouteHostIndex::new(mesh_slice, &runtime.cluster_domain);
+    // The materialized upstream for a modeled Service port, if any.
+    let service_upstream = |config: &GatewayConfig, namespace: &str, name: &str, port: u16| {
+        let id = mesh_outbound_upstream_id(namespace, name, port);
+        config
+            .upstreams
+            .iter()
+            .any(|upstream| upstream.namespace == namespace && upstream.id == id)
+            .then_some(id)
+    };
+
+    // 1. Weighted splits.
+    let split_ids: Vec<(String, String)> = config
+        .upstreams
+        .iter()
+        .filter(|upstream| {
+            upstream
+                .id
+                .starts_with(slice::VIRTUAL_SERVICE_HTTP_ROUTE_UPSTREAM_ID_PREFIX)
+        })
+        .map(|upstream| (upstream.namespace.clone(), upstream.id.clone()))
+        .collect();
+    let mut failed_splits: HashSet<(String, String)> = HashSet::new();
+    for (namespace, id) in split_ids {
+        let Some(split) = config
+            .upstreams
+            .iter()
+            .find(|upstream| upstream.namespace == namespace && upstream.id == id)
+        else {
+            continue;
+        };
+        let mut targets = Vec::new();
+        let mut rebound = true;
+        for target in &split.targets {
+            match hosts.classify(&namespace, &target.host) {
+                CarriedRouteHost::External => targets.push(target.clone()),
+                CarriedRouteHost::UnmodeledService => rebound = false,
+                CarriedRouteHost::Service(service_namespace, service_name) => {
+                    let Some(service_upstream_id) =
+                        service_upstream(config, &service_namespace, &service_name, target.port)
+                    else {
+                        rebound = false;
+                        continue;
+                    };
+                    let Some(service_upstream) = config.upstreams.iter().find(|upstream| {
+                        upstream.namespace == service_namespace.as_str()
+                            && upstream.id == service_upstream_id
+                    }) else {
+                        rebound = false;
+                        continue;
+                    };
+                    let workloads =
+                        u32::try_from(service_upstream.targets.len().max(1)).unwrap_or(u32::MAX);
+                    let weight = (target.weight.saturating_mul(1000) / workloads)
+                        .clamp(1, crate::config::types::MAX_TARGET_WEIGHT);
+                    for workload_target in &service_upstream.targets {
+                        let mut rebound_target = workload_target.clone();
+                        rebound_target.weight = weight;
+                        rebound_target.service_port_policy_key = Some(target.port);
+                        rebound_target.tags.insert(
+                            UPSTREAM_TARGET_SERVICE_NAMESPACE_TAG.to_string(),
+                            service_namespace.clone(),
+                        );
+                        rebound_target.tags.insert(
+                            UPSTREAM_TARGET_SERVICE_NAME_TAG.to_string(),
+                            service_name.clone(),
+                        );
+                        rebound_target.tags.insert(
+                            UPSTREAM_TARGET_SERVICE_PORT_TAG.to_string(),
+                            target.port.to_string(),
+                        );
+                        targets.push(rebound_target);
+                    }
+                }
+            }
+        }
+        if !rebound || targets.is_empty() {
+            failed_splits.insert((namespace, id));
+            continue;
+        }
+        let weighted = targets
+            .first()
+            .is_some_and(|first| targets.iter().any(|target| target.weight != first.weight));
+        if let Some(split) = config
+            .upstreams
+            .iter_mut()
+            .find(|upstream| upstream.namespace == namespace && upstream.id == id)
+        {
+            split.targets = targets;
+            if weighted {
+                split.algorithm = LoadBalancerAlgorithm::WeightedRoundRobin;
+            }
+        }
+    }
+
+    // 2. Route proxies and their dispatch rules.
+    let mut dropped: HashSet<(String, String)> = HashSet::new();
+    let mut upstream_updates: Vec<(usize, String)> = Vec::new();
+    let mut rule_updates: Vec<(usize, usize, String)> = Vec::new();
+    for index in 0..config.proxies.len() {
+        let proxy = &config.proxies[index];
+        if !config::is_virtual_service_http_route_proxy_id(&proxy.id) {
+            continue;
+        }
+        let namespace = proxy.namespace.clone();
+        let proxy_id = proxy.id.clone();
+        let backend_host = proxy.backend_host.clone();
+        let backend_port = proxy.backend_port;
+        let mut keep = true;
+        let mut proxy_upstream: Option<String> = None;
+        match proxy.upstream_id.as_deref() {
+            Some(upstream_id) => {
+                if failed_splits.contains(&(namespace.clone(), upstream_id.to_string())) {
+                    keep = false;
+                }
+            }
+            None if !backend_host.is_empty() && backend_port != 0 => {
+                match hosts.classify(&namespace, &backend_host) {
+                    CarriedRouteHost::External => {}
+                    CarriedRouteHost::UnmodeledService => keep = false,
+                    CarriedRouteHost::Service(service_namespace, service_name) => {
+                        match service_upstream(
+                            config,
+                            &service_namespace,
+                            &service_name,
+                            backend_port,
+                        ) {
+                            Some(id) => proxy_upstream = Some(id),
+                            None => keep = false,
+                        }
+                    }
+                }
+            }
+            None => {}
+        }
+        let dispatch_ids: Vec<String> = proxy
+            .plugins
+            .iter()
+            .map(|association| association.plugin_config_id.clone())
+            .collect();
+        let mut rule_rewrites: Vec<(usize, usize, String)> = Vec::new();
+        for plugin_index in 0..config.plugin_configs.len() {
+            let plugin = &config.plugin_configs[plugin_index];
+            if plugin.plugin_name != "mesh_route_dispatch"
+                || plugin.namespace != namespace
+                || !dispatch_ids.contains(&plugin.id)
+            {
+                continue;
+            }
+            for (rule_index, rule) in plugin
+                .config
+                .get("rules")
+                .and_then(serde_json::Value::as_array)
+                .into_iter()
+                .flatten()
+                .enumerate()
+            {
+                let Some(destination) = rule.get("destination") else {
+                    continue;
+                };
+                if let Some(upstream_id) = destination
+                    .get("upstream_id")
+                    .and_then(serde_json::Value::as_str)
+                {
+                    if failed_splits.contains(&(namespace.clone(), upstream_id.to_string())) {
+                        keep = false;
+                    }
+                    continue;
+                }
+                let host = destination
+                    .get("backend_host")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or(backend_host.as_str());
+                let port = destination
+                    .get("backend_port")
+                    .and_then(serde_json::Value::as_u64)
+                    .and_then(|port| u16::try_from(port).ok())
+                    .unwrap_or(backend_port);
+                if host.is_empty() || port == 0 {
+                    continue;
+                }
+                match hosts.classify(&namespace, host) {
+                    CarriedRouteHost::External => {}
+                    CarriedRouteHost::UnmodeledService => keep = false,
+                    CarriedRouteHost::Service(service_namespace, service_name) => {
+                        match service_upstream(config, &service_namespace, &service_name, port) {
+                            Some(id) => rule_rewrites.push((plugin_index, rule_index, id)),
+                            None => keep = false,
+                        }
+                    }
+                }
+            }
+        }
+        if !keep {
+            dropped.insert((namespace, proxy_id));
+            continue;
+        }
+        if let Some(upstream_id) = proxy_upstream {
+            upstream_updates.push((index, upstream_id));
+        }
+        rule_updates.extend(rule_rewrites);
+    }
+    for (index, upstream_id) in upstream_updates {
+        if let Some(proxy) = config.proxies.get_mut(index) {
+            proxy.upstream_id = Some(upstream_id);
+        }
+    }
+    for (plugin_index, rule_index, upstream_id) in rule_updates {
+        let Some(destination) = config
+            .plugin_configs
+            .get_mut(plugin_index)
+            .and_then(|plugin| plugin.config.get_mut("rules"))
+            .and_then(serde_json::Value::as_array_mut)
+            .and_then(|rules| rules.get_mut(rule_index))
+            .and_then(|rule| rule.get_mut("destination"))
+            .and_then(serde_json::Value::as_object_mut)
+        else {
+            continue;
+        };
+        destination.remove("backend_host");
+        destination.remove("backend_port");
+        destination.remove("backend_tls");
+        destination.insert(
+            "upstream_id".to_string(),
+            serde_json::Value::String(upstream_id),
+        );
+    }
+    if dropped.is_empty() {
+        return;
+    }
+    warn!(
+        routes = dropped.len(),
+        "NodeWaypoint VirtualService routes refused: a destination is an in-cluster Service \
+         this waypoint cannot reach over its mesh transport; their hosts use the materialized \
+         Service routes"
+    );
+    config
+        .proxies
+        .retain(|proxy| !dropped.contains(&(proxy.namespace.clone(), proxy.id.clone())));
+    config.plugin_configs.retain(|plugin| {
+        plugin.proxy_id.as_deref().is_none_or(|proxy_id| {
+            !dropped.contains(&(plugin.namespace.clone(), proxy_id.to_string()))
+        })
+    });
+    // Re-run materialization so the hosts the dropped routes shadowed get
+    // their Service routes back.
+    materialize_mesh_outbound_proxies(config, runtime, mesh_slice);
 }
 
 /// Resolve Istio `sourceLabels` / `sourceNamespace` as Sidecar-applicability
@@ -8066,7 +8414,12 @@ fn materialize_mesh_outbound_proxies(
             // this service's own per-port siblings, grouped by the router) and
             // are skipped only for re-materialization idempotency. Stream proxies
             // route by `listen_port` and are skipped.
-            if config.proxies.iter().any(|p| {
+            //
+            // A NodeWaypoint still materializes the shadowed Service's UPSTREAM
+            // (not its route): the VirtualService routes its slice carries are
+            // rebound onto these secured per-workload targets
+            // (`bind_carried_http_routes_to_node_waypoint_transport`, #7233).
+            let shadowed = config.proxies.iter().any(|p| {
                 if (p.namespace == proxy.namespace && p.id == proxy.id)
                     || p.dispatch_kind.is_stream()
                     || is_mesh_outbound_route_id(&p.id)
@@ -8079,12 +8432,15 @@ fn materialize_mesh_outbound_proxies(
                         .as_deref()
                         .is_some_and(|lp| lp.starts_with('~'));
                 shadows_or_collides && crate::config::types::hosts_overlap(&p.hosts, &proxy.hosts)
-            }) {
+            });
+            if shadowed {
                 debug!(
                     proxy_id = %sanitize_startup_scalar(proxy.id.to_string()),
                     "Skipping outbound route materialization; an existing operator proxy already routes this host/path"
                 );
-                continue;
+                if transport != MeshEgressTransport::NodeWaypointCapturedService {
+                    continue;
+                }
             }
             // Name the upstream with the service FQDN (not the internal id) so a
             // DestinationRule keyed on the service host matches it
@@ -8115,6 +8471,9 @@ fn materialize_mesh_outbound_proxies(
                 *existing = upstream;
             } else {
                 config.upstreams.push(upstream);
+            }
+            if shadowed {
+                continue;
             }
             if let Some(existing) = config
                 .proxies

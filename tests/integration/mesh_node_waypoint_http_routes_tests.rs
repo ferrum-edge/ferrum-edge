@@ -497,3 +497,155 @@ fn mesh_config_binding_rejects_a_non_route_proxy_id() {
         "a binding may only name VirtualService HTTP route proxies"
     );
 }
+
+fn destination_rule(name: &str, host: &str, simple_lb: &str) -> K8sObject {
+    let mut object = virtual_service(
+        name,
+        json!({
+            "host": host,
+            "trafficPolicy": {"loadBalancer": {"simple": simple_lb}}
+        }),
+    );
+    object.kind = "DestinationRule".to_string();
+    object
+}
+
+fn carried_route_proxies(config: &GatewayConfig) -> Vec<&ferrum_edge::config::types::Proxy> {
+    config
+        .proxies
+        .iter()
+        .filter(|proxy| proxy.id.starts_with("istio-vs-") && !proxy.id.starts_with("istio-vs-l4_"))
+        .collect()
+}
+
+/// Review finding sol F1: a carried split must dial the destination workloads
+/// over the NodeWaypoint mesh transport, like the materialized Service route it
+/// shadows, never the Service DNS name over plain HTTP.
+#[test]
+fn carried_split_dials_the_service_workloads_not_the_service_dns_name() {
+    let config = translated_config(&[virtual_service("split", split_spec(json!({})))]);
+    let runtime = node_waypoint_runtime();
+    let slice = node_waypoint_slice(&config, &runtime);
+    let split_id = carried_ids(&slice.http_routes.upstreams).remove(0);
+    let prepared =
+        prepare_gateway_config_from_mesh_slice(&slice, &runtime).expect("slice materializes");
+    let split = prepared
+        .upstreams
+        .iter()
+        .find(|upstream| upstream.id == split_id)
+        .expect("split upstream served");
+    let mut hosts: Vec<&str> = split
+        .targets
+        .iter()
+        .map(|target| target.host.as_str())
+        .collect();
+    hosts.sort_unstable();
+    assert_eq!(hosts, vec!["10.0.0.11", "10.0.0.12"]);
+    for target in &split.targets {
+        assert!(
+            target
+                .tags
+                .contains_key(ferrum_edge::config::types::UPSTREAM_TARGET_SERVICE_NAME_TAG),
+            "each rebound target keeps its Service attribution"
+        );
+        assert_eq!(target.service_port_policy_key, Some(8080));
+    }
+}
+
+/// Review finding sol F1: a single-destination route uses the Service port's
+/// materialized upstream.
+#[test]
+fn carried_direct_route_uses_the_materialized_service_upstream() {
+    let config = translated_config(&[virtual_service(
+        "direct",
+        json!({
+            "hosts": ["reviews.default.svc.cluster.local"],
+            "http": [{
+                "route": [{
+                    "destination": {
+                        "host": "reviews.default.svc.cluster.local",
+                        "port": {"number": 8080}
+                    }
+                }]
+            }]
+        }),
+    )]);
+    let runtime = node_waypoint_runtime();
+    let slice = node_waypoint_slice(&config, &runtime);
+    assert!(!slice.http_routes.proxies.is_empty());
+    let prepared =
+        prepare_gateway_config_from_mesh_slice(&slice, &runtime).expect("slice materializes");
+    let routes = carried_route_proxies(&prepared);
+    assert!(!routes.is_empty(), "the VirtualService route is served");
+    for route in routes {
+        let upstream_id = route
+            .upstream_id
+            .as_deref()
+            .expect("the route is bound to an upstream");
+        assert!(upstream_id.starts_with("__mesh-out"), "got {upstream_id:?}");
+        assert!(upstream_id.contains("reviews"));
+    }
+}
+
+/// Review finding sol F1 / dsf F3: a destination the waypoint cannot reach
+/// over its mesh transport refuses the route instead of dialing it in the
+/// clear, and the Service keeps its materialized route.
+#[test]
+fn a_route_to_an_unmodeled_cluster_service_is_refused() {
+    let config = translated_config(&[virtual_service(
+        "missing",
+        json!({
+            "hosts": ["reviews.default.svc.cluster.local"],
+            "http": [{
+                "route": [{
+                    "destination": {
+                        "host": "missing.default.svc.cluster.local",
+                        "port": {"number": 8080}
+                    }
+                }]
+            }]
+        }),
+    )]);
+    let runtime = node_waypoint_runtime();
+    let slice = node_waypoint_slice(&config, &runtime);
+    assert!(!slice.http_routes.proxies.is_empty());
+    let prepared =
+        prepare_gateway_config_from_mesh_slice(&slice, &runtime).expect("slice materializes");
+    assert!(carried_route_proxies(&prepared).is_empty());
+    assert!(
+        prepared.proxies.iter().any(|proxy| {
+            proxy
+                .upstream_id
+                .as_deref()
+                .is_some_and(|id| id.starts_with("__mesh-out") && id.contains("reviews"))
+        }),
+        "the Service route is materialized again"
+    );
+}
+
+/// Review finding dsf F2: a split across two Services with different
+/// DestinationRules is served, not refused as an unrepresentable upstream.
+#[test]
+fn a_split_across_services_with_their_own_destination_rules_is_served() {
+    let config = translated_config(&[
+        virtual_service("split", split_spec(json!({}))),
+        destination_rule("reviews-dr", "reviews.default.svc.cluster.local", "RANDOM"),
+        destination_rule(
+            "ratings-dr",
+            "ratings.default.svc.cluster.local",
+            "ROUND_ROBIN",
+        ),
+    ]);
+    let runtime = node_waypoint_runtime();
+    let slice = node_waypoint_slice(&config, &runtime);
+    assert_eq!(slice.destination_rules.len(), 2);
+    let split_id = carried_ids(&slice.http_routes.upstreams).remove(0);
+    let prepared = prepare_gateway_config_from_mesh_slice(&slice, &runtime)
+        .expect("a split over two DestinationRule-governed Services materializes");
+    assert!(
+        prepared
+            .upstreams
+            .iter()
+            .any(|upstream| upstream.id == split_id)
+    );
+}
