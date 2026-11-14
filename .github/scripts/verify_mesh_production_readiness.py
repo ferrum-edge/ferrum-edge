@@ -14,14 +14,12 @@ from pathlib import Path
 
 SERVING = (
     ("ferrum-mesh-control-plane", "Deployment"),
-    ("ferrum-mesh-ca", "Deployment"),
     ("ferrum-mesh-east-west", "Deployment"),
     ("ferrum-mesh-ambient", "DaemonSet"),
 )
 
 RESTRICTED = (
     "ferrum-mesh-control-plane",
-    "ferrum-mesh-ca",
     "ferrum-mesh-east-west",
 )
 
@@ -32,7 +30,6 @@ RESTRICTED = (
 # is being removed.
 PULL_SECRET_WORKLOADS = (
     ("ferrum-mesh-control-plane", "Deployment"),
-    ("ferrum-mesh-ca", "Deployment"),
     ("ferrum-mesh-east-west", "Deployment"),
     ("ferrum-mesh-injector", "Deployment"),
     ("ferrum-mesh-ambient", "DaemonSet"),
@@ -591,7 +588,6 @@ def validate_observability(results_dir: Path) -> None:
     )
     for svc_name in (
         "ferrum-mesh-control-plane-metrics",
-        "ferrum-mesh-ca-metrics",
         "ferrum-mesh-east-west-metrics",
     ):
         svc = resource_document(rendered, svc_name, "Service")
@@ -621,31 +617,6 @@ def validate_observability(results_dir: Path) -> None:
         "Admin published on east-west Service",
         "east-west Service must stay tls-passthru only; scrape via the dedicated metrics Service",
     )
-    # The standalone mesh CA is reachable (#7298): a gRPC Service that targets
-    # the CA's named grpc container port, which the chart binds the CP gRPC
-    # listener to. Admin stays on the dedicated metrics Service.
-    ca_svc = resource_document(rendered, "ferrum-mesh-ca", "Service")
-    require_text(
-        ca_svc,
-        "targetPort: grpc",
-        "Mesh CA Service port missing",
-        "ferrum-mesh-ca Service must target the CA container port grpc",
-    )
-    forbid_text(
-        ca_svc,
-        "admin-http",
-        "Admin published on mesh CA Service",
-        "ferrum-mesh-ca Service must stay gRPC-only; scrape via the dedicated metrics Service",
-    )
-    ca_deploy = resource_document(rendered, "ferrum-mesh-ca", "Deployment")
-    for needle, detail in (
-        ("- name: grpc", "the CA Deployment must declare a named grpc container port"),
-        (
-            'value: "0.0.0.0:50051"',
-            "the CA Deployment must bind FERRUM_CP_GRPC_LISTEN_ADDR to ca.grpcPort",
-        ),
-    ):
-        require_text(ca_deploy, needle, "Mesh CA gRPC listener missing", detail)
     ambient_pm = resource_document(
         rendered, "ferrum-mesh-ambient-metrics", "PodMonitor"
     )
@@ -719,7 +690,6 @@ def validate_metrics_bearer_https(results_dir: Path) -> None:
     )
     for svc_name in (
         "ferrum-mesh-control-plane-metrics",
-        "ferrum-mesh-ca-metrics",
         "ferrum-mesh-east-west-metrics",
     ):
         svc = resource_document(rendered, svc_name, "Service")
@@ -884,13 +854,12 @@ def validate_strict_admin_validation(results_dir: Path) -> None:
         ("127.0.0.1/32", "source 127.0.0.1"),
         "Mapped IPv4 loopback probe-source refusal missing",
     )
-    for component in ("controlPlane", "ca"):
-        require_stderr(
-            results_dir,
-            f"mesh-prod-{component}-mapped-bind.err",
-            ("non-loopback plaintext listener", "allowInsecureHttp"),
-            f"{component} mapped IPv4 loopback bind refusal missing",
-        )
+    require_stderr(
+        results_dir,
+        "mesh-prod-controlPlane-mapped-bind.err",
+        ("non-loopback plaintext listener", "allowInsecureHttp"),
+        "controlPlane mapped IPv4 loopback bind refusal missing",
+    )
     require_stderr(
         results_dir,
         "mesh-prod-ambient-admin-port0.err",
