@@ -1562,7 +1562,8 @@ impl MeshRuntimeConfig {
 
 /// Prepare a gateway snapshot the way a mesh data plane receives it.
 ///
-/// No serving path calls this; it is the test convenience for the two halves
+/// Test-only (`test-support`); no serving path calls this. It is the test
+/// convenience for the two halves
 /// production runs on either side of the wire. The snapshot is admitted and
 /// projected into this runtime's [`MeshSlice`] exactly as a control plane
 /// does ([`MeshSlice::from_gateway_config`] with
@@ -1571,6 +1572,7 @@ impl MeshRuntimeConfig {
 /// Anything a slice does not carry (operator proxies, upstreams, plugin
 /// configs, consumers, gateway settings) does not reach the result, just as it
 /// never reaches a mesh data plane (issue #7233).
+#[cfg(any(test, feature = "test-support"))]
 pub fn prepare_gateway_config_via_mesh_slice(
     mut config: GatewayConfig,
     runtime: &MeshRuntimeConfig,
@@ -1605,6 +1607,7 @@ pub fn prepare_gateway_config_via_mesh_slice(
 /// policy) over a resource it controls. Translator-owned route resources
 /// (`istio-vs-*`, `gwapi-route-*`) are never added: whether a data plane gets
 /// one is the slice's decision (issue #7233). No serving path calls this.
+#[cfg(any(test, feature = "test-support"))]
 #[doc(hidden)]
 pub fn prepare_gateway_config_via_mesh_slice_with_fixtures(
     mut config: GatewayConfig,
