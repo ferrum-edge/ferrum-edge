@@ -6543,7 +6543,8 @@ jobs:
             -l kubernetes.io/service-name=ferrum-mesh-ca \
             -o jsonpath='{range .items[*]}{range .endpoints[?(@.conditions.ready==true)]}{"ready "}{end}{range .ports[*]}{.name}{"="}{.port}{" "}{end}{end}')"
           echo "ferrum-mesh-ca endpoints: ${ca_endpoint_ports}"
-          if [[ "$ca_endpoint_ports" != *"ready "* || "$ca_endpoint_ports" != *"grpc=50051"* ]]; then
+          if ! printf '%s\n' "$ca_endpoint_ports" | grep -Fq 'ready ' ||
+             ! printf '%s\n' "$ca_endpoint_ports" | grep -Fq 'grpc=50051'; then
             echo "::error title=Mesh CA unreachable::the ferrum-mesh-ca Service must publish a ready grpc endpoint on 50051"
             kubectl -n ferrum-dev get endpointslices -l kubernetes.io/service-name=ferrum-mesh-ca -o yaml
             exit 1
