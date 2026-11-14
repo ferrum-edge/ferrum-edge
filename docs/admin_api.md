@@ -2211,7 +2211,9 @@ target is the **bounded local audit retention file**
   records within `FERRUM_ADMIN_AUDIT_LOCAL_RETENTION_MAX_RECORDS` (default
   4096) and `FERRUM_ADMIN_AUDIT_LOCAL_RETENTION_MAX_BYTES` (default 16 MiB),
   dropping the oldest with a content-free `audit_local_retention_rotated`
-  warning. A replayed record (same event id) is not written twice.
+  warning. Lowering either bound takes effect on the next append, which
+  rotates the existing file down. A replayed record (same event id) is not
+  written twice.
 - `ferrum_admin_audit_evidence_lost` latches only when the retention write
   itself fails; a replayed record whose write fails stays durable in the spool
   and is retried like any delivery.

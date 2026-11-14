@@ -1893,6 +1893,55 @@ fn db_less_retention_is_idempotent_on_the_event_id() {
     assert_eq!(retained_ids(dir.path()), vec![event.id]);
 }
 
+/// Review of #7369 (sol F1, dsf F1): the byte bound is the rotation target,
+/// not the read ceiling. A file written under a larger bound is still read
+/// after the operator lowers `FERRUM_ADMIN_AUDIT_LOCAL_RETENTION_MAX_BYTES`,
+/// and the next append rotates it down instead of failing forever.
+#[test]
+fn db_less_retention_rotates_down_after_the_byte_bound_is_lowered() {
+    let dir = TempDir::new().expect("retention dir");
+    let lowered = LocalAuditRetentionBounds {
+        max_records: 1_000,
+        max_bytes: ferrum_edge::admin::audit::AUDIT_LOCAL_RETENTION_MAX_BYTES_MIN,
+    };
+    let larger = LocalAuditRetentionBounds {
+        max_bytes: lowered.max_bytes * 2,
+        ..lowered
+    };
+    let blob = "x".repeat(700_000);
+    let mut ids = Vec::new();
+    for _ in 0..5 {
+        let event = event_with(&Uuid::new_v4().to_string(), json!({ "blob": blob }));
+        ids.push(event.id.clone());
+        append_local_retention_event(dir.path(), larger, &event).expect("append, larger bound");
+    }
+    let size = std::fs::metadata(dir.path().join(RETENTION_FILE))
+        .expect("retention file exists")
+        .len();
+    assert!(
+        size > lowered.max_bytes,
+        "the file written under the larger bound ({size} bytes) exceeds the lowered one"
+    );
+
+    let event = event_with(&Uuid::new_v4().to_string(), json!({ "blob": blob }));
+    ids.push(event.id.clone());
+    assert_eq!(
+        append_local_retention_event(dir.path(), lowered, &event)
+            .expect("an append under a lowered bound rotates the existing file down"),
+        LocalRetentionAppend::Retained { rotated: 4 }
+    );
+    let retained: Vec<String> = list_local_retention_events(dir.path(), lowered)
+        .expect("list under the lowered bound")
+        .into_iter()
+        .map(|event| event.id)
+        .collect();
+    assert_eq!(retained, ids[4..].to_vec(), "the newest two fit in 2 MiB");
+    let size = std::fs::metadata(dir.path().join(RETENTION_FILE))
+        .expect("retention file exists")
+        .len();
+    assert!(size <= lowered.max_bytes, "file is {size} bytes");
+}
+
 #[test]
 fn db_less_retention_bounds_are_validated() {
     for (bounds, needle) in [

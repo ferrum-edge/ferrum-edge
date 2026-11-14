@@ -3658,9 +3658,11 @@ pub enum LocalRetentionAppend {
 /// The same hardened, locked, atomically published file as
 /// [`append_local_fallback_event`], rotated the same way (newest kept), but
 /// bounded by both `bounds.max_records` and `bounds.max_bytes`: the oldest
-/// events are dropped until the file fits. A replayed event (same id) is a
-/// no-op, so spool replay converges to one retained record. Errors only when
-/// the write itself fails (or one event alone exceeds the byte bound).
+/// events are dropped until the file fits. A file written under larger bounds
+/// is read (up to [`AUDIT_LOCAL_RETENTION_MAX_BYTES_MAX`]) and rotated down to
+/// these. A replayed event (same id) is a no-op, so spool replay converges to
+/// one retained record. Errors only when the write itself fails (or one event
+/// alone exceeds the byte bound).
 pub fn append_local_retention_event(
     dir: &Path,
     bounds: LocalAuditRetentionBounds,
@@ -3683,7 +3685,14 @@ struct LocalAuditStore {
     file_name: &'static str,
     lock_file_name: &'static str,
     max_records: usize,
+    /// Bound the published file is rotated to (and the write ceiling).
     max_bytes: usize,
+    /// Hard ceiling for reading the file already on disk. For the retention
+    /// file it is independent of the operator-configurable `max_bytes`, so a
+    /// file written under a larger bound is still read and rotated down to a
+    /// lowered one instead of blocking every later append (issue #7200
+    /// review).
+    read_max_bytes: usize,
     /// DB-less retention: also rotate by bytes, dedupe on the event id, and
     /// write compact JSON so the byte accounting is exact.
     retention: bool,
@@ -3695,6 +3704,7 @@ impl LocalAuditStore {
         lock_file_name: AUDIT_LOCAL_FALLBACK_LOCK_FILE_NAME,
         max_records: AUDIT_LOCAL_FALLBACK_CAPACITY,
         max_bytes: AUDIT_LOCAL_FALLBACK_MAX_BYTES,
+        read_max_bytes: AUDIT_LOCAL_FALLBACK_MAX_BYTES,
         retention: false,
     };
 
@@ -3704,6 +3714,10 @@ impl LocalAuditStore {
             lock_file_name: AUDIT_LOCAL_RETENTION_LOCK_FILE_NAME,
             max_records: usize::try_from(bounds.max_records.max(1)).unwrap_or(usize::MAX),
             max_bytes: usize::try_from(bounds.max_bytes).unwrap_or(usize::MAX),
+            read_max_bytes: usize::try_from(
+                AUDIT_LOCAL_RETENTION_MAX_BYTES_MAX.max(bounds.max_bytes),
+            )
+            .unwrap_or(usize::MAX),
             retention: true,
         }
     }
@@ -3721,7 +3735,7 @@ fn append_local_audit_event(
     let _cross_process = acquire_fallback_file_lock(&lock_path, deadline)?;
     let path = dir.join(store.file_name);
     reject_symlink_or_non_regular_file(&path, "audit local fallback data file")?;
-    let mut events = read_local_fallback_events_unlocked(&path, store.max_bytes)?;
+    let mut events = read_local_fallback_events_unlocked(&path, store.read_max_bytes)?;
     if store.retention && events.iter().any(|retained| retained.id == event.id) {
         return Ok(LocalRetentionAppend::AlreadyRetained);
     }
@@ -3793,7 +3807,7 @@ fn list_local_audit_events(
     let _cross_process = acquire_fallback_file_lock(&lock_path, deadline)?;
     let path = dir.join(store.file_name);
     reject_symlink_or_non_regular_file(&path, "audit local fallback data file")?;
-    read_local_fallback_events_unlocked(&path, store.max_bytes)
+    read_local_fallback_events_unlocked(&path, store.read_max_bytes)
 }
 
 fn local_fallback_lock_deadline() -> std::time::Instant {
