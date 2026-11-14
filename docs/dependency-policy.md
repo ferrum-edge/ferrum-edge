@@ -177,9 +177,11 @@ advisories against 0.4.20 manually.
 > `docs/upstream-*-patches/`, and the vendored-patch scripts are owned via
 > [`.github/CODEOWNERS`](../.github/CODEOWNERS) (`@jeremyjpj0916`). Upstream `h3`
 > work is staged from the `jeremyjpj0916/h3` fork: **h3-001** records a published
-> `fork_ref` for its filed upstream PR, while **h3-002** through **h3-005** have
+> `fork_ref` for its filed upstream PR, while **h3-002** through **h3-004** have
 > `fork_ref: null` in `docs/vendored-patch-lifecycle.json` pending maintainer
-> handoff. Every patch without an upstream PR is governed by the
+> handoff. **h3-005** also has `fork_ref: null`: it was reported privately to the
+> upstream maintainers instead (`upstream.filing: reported_privately`). Every
+> other patch without an upstream PR is governed by the
 > [Deliberate fork policy and SLA](#deliberate-fork-policy-and-sla) below.
 
 ### Deliberate fork policy and SLA
@@ -224,7 +226,10 @@ before the stable-release checkpoint below.
   upstream issue/PR and records the numbers in the inventory table, the per-patch
   `README.md` Status block, **and**
   [`docs/vendored-patch-lifecycle.json`](vendored-patch-lifecycle.json), or (b) leaves it as a conscious
-  re-affirmation that the fork is still the right call.
+  re-affirmation that the fork is still the right call. A
+  `reported_privately` patch is not fork-only and is not listed as
+  `NOT YET FILED`: the run prints its "reported privately to …" record, and the
+  owner follows the private report until the maintainers publish a fix.
 - **Hard checkpoint — no unfiled fork ships in a stable release.** A fork-only
   patch (no upstream PR link) may **not** survive the first tagged stable release
   (the schema-freeze milestone in
@@ -238,6 +243,13 @@ before the stable-release checkpoint below.
   is `filed`, so reaffirming a fork that shares a `README.md` with filed patches
   (as `tungstenite-002-frame-limit-origin` does) does not drag them in. This
   keeps "not yet filed" from silently becoming permanent in a released product.
+  A `reported_privately` patch is outside this checkpoint while its private
+  report is open: its recorded `upstream.private_report` (channel and date) and
+  the matching "reported privately to …" sentence in its `README.md` and
+  inventory row are its record, and CI refuses a reaffirmation or `pr_number`
+  on it. Once the maintainers publish, it moves to `filed` with the public
+  issue/PR, or, if they decline, to `deliberate_fork_unfiled` and this
+  checkpoint.
 - **Retirement is unchanged.** Whether upstreamed via PR or carried as a fork,
   each patch retires per its `README.md` retirement plan and the co-vendoring
   rule (all five h3 patches retire together — see the inventory `Removal
