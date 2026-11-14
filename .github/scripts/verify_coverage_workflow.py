@@ -165,7 +165,8 @@ FUNCTIONAL_STEP_TOKENS = (
     "if: matrix.kind == 'functional' && matrix.data_services == 'true'",
 )
 # The integration step must apply the remainder shards' filterset and hash
-# partition, or those rows would run the whole suite (or nothing) (#6377).
+# partition, or those rows would run the whole suite (or nothing) (#6377), and
+# must pool its per-process profiles the way the functional step does.
 INTEGRATION_STEP_TOKENS = (
     "if: matrix.kind == 'integration'",
     'nextest_args+=(-E "$INTEGRATION_FILTERSET")',
@@ -173,6 +174,7 @@ INTEGRATION_STEP_TOKENS = (
     "INTEGRATION_FILTERS: ${{ matrix.filters }}",
     "INTEGRATION_FILTERSET: ${{ matrix.filterset }}",
     "INTEGRATION_PARTITION: ${{ matrix.partition }}",
+    "LLVM_PROFILE_FILE_NAME: ferrum-edge-integration-%4m.profraw",
 )
 
 _NEXTEST_REMAINDER_FILTER_RE = re.compile(r"not test\(/(?P<regex>[A-Za-z0-9_:|()]+)/\)")
@@ -887,6 +889,7 @@ jobs:
           INTEGRATION_FILTERS: ${{ matrix.filters }}
           INTEGRATION_FILTERSET: ${{ matrix.filterset }}
           INTEGRATION_PARTITION: ${{ matrix.partition }}
+          LLVM_PROFILE_FILE_NAME: ferrum-edge-integration-%4m.profraw
       - if: matrix.kind == 'functional' && matrix.data_services == 'true'
         run: docker run -d mongo:7
       - if: matrix.kind == 'functional'
@@ -1035,6 +1038,11 @@ jobs:
             "INTEGRATION_PARTITION: ${{ matrix.partition }}",
             'INTEGRATION_PARTITION: ""',
             "integration remainder partition dropped",
+        ),
+        (
+            "LLVM_PROFILE_FILE_NAME: ferrum-edge-integration-%4m.profraw",
+            "LLVM_PROFILE_FILE_NAME: ferrum-edge-integration-%p.profraw",
+            "per-process integration profiles",
         ),
     ]
     for old, new, label in mutations:

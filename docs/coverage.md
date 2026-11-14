@@ -266,6 +266,20 @@ every declared module to reach exactly one of a scoped filter or the
 remainder. It also rejects a scoped filter that matches no registered module.
 Path-scoped plans never select the remainder shards.
 
+Every integration shard sets
+`LLVM_PROFILE_FILE_NAME=ferrum-edge-integration-%4m.profraw`, the same pooling
+the functional shards use. nextest runs each test in its own process, and
+cargo-llvm-cov's default `%p` name gave each one an ~11 MB profile:
+
+- 357 files and 3.7 GB on `mesh-routing`, and 881 files and 9.1 GB on
+  `integration-remainder-1`, all written within seconds of each other.
+- Those profiles were then copied again into the shard tar (6.9 GB and 12.4 GB).
+- `mesh-routing` lost its hosted runner twice in that window (2026-11-12/13).
+
+Pooled, every process of the test binary merges online into at most four files,
+about 41 MB per shard. The shard tar shrinks to the ~3.4 GB of instrumented
+binaries, and the shard's coverage totals are unchanged.
+
 ## Functional coverage shards
 
 Most of the code the in-process suites miss (the HTTP/3 server and
@@ -333,8 +347,9 @@ pre-merged.
 Raw profiles are the exception to shared-path overwriting (#6378). Their
 target-relative names can coincide across runners. cargo-llvm-cov's default
 `<package>-%p-%Nm.profraw` name repeats when two runners reuse a pid for the
-same binary signature. The functional shards' pooled
-`ferrum-edge-functional-%4m.profraw` name carries only the binary signature.
+same binary signature. The pooled `ferrum-edge-functional-%4m.profraw` and
+`ferrum-edge-integration-%4m.profraw` names carry only the binary signature, so
+they repeat across every shard of their kind.
 Right after each shard's tar is extracted, every `*.profraw` it produced is
 renamed in place to `<name>.fanin-<shard>.profraw`, before the next shard is
 extracted. An existing destination fails the step. `cargo llvm-cov report`
