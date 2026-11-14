@@ -15,7 +15,7 @@ use ferrum_edge::ConsumerIndex;
 use ferrum_edge::plugins::utils::jwks_cache::{cached_store, refresh_managed_jwks_stores};
 use ferrum_edge::plugins::utils::jwks_store::{
     JwksFailureClass, JwksKeyStore, JwksTrustState, canonical_managed_jwks_source,
-    validate_jwks_document,
+    check_managed_jwks_source, validate_jwks_document,
 };
 use ferrum_edge::plugins::{Plugin, PluginResult, jwks_auth::JwksAuth, validate_plugin_config};
 use ferrum_edge::tls::managed::{ManagedTlsRecord, ManagedTlsStore};
@@ -533,6 +533,63 @@ fn run_in_child_process(test_name: &str, env: &[(&str, &std::ffi::OsStr)]) {
     assert!(
         stdout.contains("1 passed"),
         "{test_name} child must run exactly that test"
+    );
+}
+
+/// A process managed TLS store that cannot be opened at first use (a torn or
+/// unparseable `managed-tls.json`) must not be latched for the process
+/// lifetime: once the document is repaired, the next read opens it, the
+/// presence check passes, and a managed key store regains trust without a
+/// restart (sol F1 / dsf F1 on #7373).
+#[tokio::test]
+async fn process_store_that_failed_to_open_is_reopened_after_repair() {
+    const CHILD_DIR_ENV: &str = "FERRUM_TEST_MANAGED_JWKS_STORE_RECOVERY_DIR";
+    const TEST_NAME: &str = "unit::plugins::jwks_auth_managed_source_tests::process_store_that_failed_to_open_is_reopened_after_repair";
+
+    let Some(dir) = std::env::var_os(CHILD_DIR_ENV) else {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("managed-tls.json"), b"{ not json")
+            .expect("write unparseable store document");
+        run_in_child_process(
+            TEST_NAME,
+            &[
+                (CHILD_DIR_ENV, dir.path().as_os_str()),
+                ("FERRUM_TLS_MANAGED_STORE_PATH", dir.path().as_os_str()),
+            ],
+        );
+        return;
+    };
+    let dir = std::path::PathBuf::from(dir);
+    let id = unique_id("reopen");
+    let source = format!("managed://jwks/{id}#jwks");
+
+    // First use: the document cannot be parsed, so the store cannot be opened.
+    ferrum_edge::tls::managed::global_store().expect_err("unparseable store document");
+    let error = check_managed_jwks_source(&source).expect_err("store is unavailable");
+    assert!(error.contains("could not be opened"), "{error}");
+    let keys = JwksKeyStore::new_managed(source.clone(), default_client());
+    keys.fetch_keys().await.expect_err("store is unavailable");
+    assert_eq!(
+        keys.health_snapshot().last_failure,
+        Some(JwksFailureClass::Transport)
+    );
+
+    // Repair: replace the document with a valid store holding the record.
+    std::fs::remove_file(dir.join("managed-tls.json")).expect("remove torn document");
+    let repaired = ManagedTlsStore::open_with_limits(&dir, 1024 * 1024, 64, None)
+        .expect("open repaired store");
+    let key = signing_key("after-repair");
+    upsert_jwks(&repaired, &id, jwks_document(&[&key]));
+
+    // The process store is opened again rather than reporting the cached
+    // failure, and every consumer recovers.
+    ferrum_edge::tls::managed::global_store().expect("repaired store opens");
+    assert_eq!(check_managed_jwks_source(&source), Ok(1));
+    assert_eq!(keys.fetch_keys().await, Ok(1));
+    assert_eq!(keys.health_snapshot().trust_state, JwksTrustState::Fresh);
+    assert!(
+        keys.trusted_keys()
+            .is_some_and(|trusted| trusted.contains_key("after-repair"))
     );
 }
 

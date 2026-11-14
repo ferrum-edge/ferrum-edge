@@ -1048,16 +1048,36 @@ fn validate_managed_id(id: &str) -> Result<(), ManagedTlsError> {
     validate_resource_id(id).map_err(ManagedTlsError::InvalidId)
 }
 
-static GLOBAL_MANAGED_TLS_STORE: OnceLock<Result<Arc<ManagedTlsStore>, String>> = OnceLock::new();
+/// Only a successfully opened store is cached. Opening reads and parses the
+/// authoritative document, so a failure (unreadable, torn, or oversized
+/// `managed-tls.json`, an unwritable store directory) must not be latched for
+/// the process lifetime: every consumer (managed JWKS key stores, `managed://`
+/// TLS sources, `/admin/tls/*`) would otherwise stay unavailable after the
+/// store is repaired, until a restart.
+static GLOBAL_MANAGED_TLS_STORE: OnceLock<Arc<ManagedTlsStore>> = OnceLock::new();
+/// Serializes open attempts so concurrent first callers open the store once.
+static GLOBAL_MANAGED_TLS_STORE_OPEN: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+/// The process managed TLS store (`FERRUM_TLS_MANAGED_STORE_PATH`).
+///
+/// The first successful open is cached; a failed open is retried by the next
+/// call, so a store that is repaired after a failure is picked up without a
+/// restart. Blocking: an open reads the store document.
 pub fn global_store() -> Result<Arc<ManagedTlsStore>, String> {
-    GLOBAL_MANAGED_TLS_STORE
-        .get_or_init(|| {
-            ManagedTlsStore::open(crate::tls::store_dir::managed_store_dir())
-                .map(Arc::new)
-                .map_err(|error| error.to_string())
-        })
-        .clone()
+    if let Some(store) = GLOBAL_MANAGED_TLS_STORE.get() {
+        return Ok(Arc::clone(store));
+    }
+    let _open = GLOBAL_MANAGED_TLS_STORE_OPEN
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(store) = GLOBAL_MANAGED_TLS_STORE.get() {
+        return Ok(Arc::clone(store));
+    }
+    let store = Arc::new(
+        ManagedTlsStore::open(crate::tls::store_dir::managed_store_dir())
+            .map_err(|error| error.to_string())?,
+    );
+    Ok(Arc::clone(GLOBAL_MANAGED_TLS_STORE.get_or_init(|| store)))
 }
 
 #[cfg(test)]
