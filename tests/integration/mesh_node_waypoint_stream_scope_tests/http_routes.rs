@@ -26,7 +26,7 @@ use ferrum_edge::plugins::{Plugin, PluginResult, RequestContext};
 use ferrum_edge::xds::carrier::{MeshSliceCarrier, build_slice_carriers};
 use serde_json::json;
 
-use super::mesh_test_support::{
+use super::super::mesh_test_support::{
     DEFAULT_NAMESPACE, policy_allow_principal, runtime_for_topology, service_for, workload_for,
 };
 

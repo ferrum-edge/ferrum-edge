@@ -1350,7 +1350,6 @@ jobs:
               integration::mesh_proxy_config_tests
               integration::mesh_outbound_registry_route_miss_tests
               integration::mesh_outbound_registry_stream_tests
-              integration::mesh_node_waypoint_http_routes_tests
               integration::mesh_node_waypoint_stream_scope_tests
               integration::mesh_node_waypoint_udp_scope_tests
               integration::mesh_node_waypoint_dtls_owner_tests
