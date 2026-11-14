@@ -9,7 +9,11 @@
 # baseline predates it).
 #
 # Inputs: REQUEST_VIEW_BASE_SHA (required, a full commit SHA that is an ancestor
-# of HEAD) and REQUEST_VIEW_ROUNDS (optional, 1-5, default 3).
+# of HEAD), REQUEST_VIEW_ROUNDS (optional, 1-5, default 3),
+# REQUEST_VIEW_EXPECTED_CANDIDATE (optional; when set, HEAD must be exactly
+# this commit, so a pull request run measures its head and never the
+# synthetic merge commit) and REQUEST_VIEW_EVENT_SHA (optional; recorded in
+# provenance.json).
 set -euo pipefail
 
 BENCH_NAME=plugin_request_view
@@ -30,6 +34,12 @@ fi
 git cat-file -e "${base_sha}^{commit}"
 git merge-base --is-ancestor "$base_sha" HEAD
 candidate_sha="$(git rev-parse HEAD)"
+expected_candidate="${REQUEST_VIEW_EXPECTED_CANDIDATE:-}"
+if [ -n "$expected_candidate" ] && [ "$candidate_sha" != "$expected_candidate" ]; then
+  echo "::error::checked-out HEAD $candidate_sha is not the expected candidate $expected_candidate"
+  exit 1
+fi
+event_sha="${REQUEST_VIEW_EVENT_SHA:-$candidate_sha}"
 
 output="$PWD/tests/performance/ci_results/plugin-request-view"
 if [ -e "$output" ]; then
@@ -49,8 +59,8 @@ export CARGO_TARGET_DIR="$work/target"
 rustc -Vv > "$output/rustc-version.txt"
 cargo -Vv > "$output/cargo-version.txt"
 lscpu --json > "$output/cpu.json" || true
-printf '{"candidate": "%s", "baseline": "%s", "rounds": %s}\n' \
-  "$candidate_sha" "$base_sha" "$rounds" > "$output/provenance.json"
+printf '{"candidate": "%s", "baseline": "%s", "event_sha": "%s", "rounds": %s}\n' \
+  "$candidate_sha" "$base_sha" "$event_sha" "$rounds" > "$output/provenance.json"
 
 for role in candidate baseline; do
   revision="$candidate_sha"

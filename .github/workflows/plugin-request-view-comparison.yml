@@ -65,6 +65,18 @@ jobs:
           set -euo pipefail
           bash -n .github/scripts/run_plugin_request_view_comparison.sh
           python3 .github/scripts/summarize_plugin_request_view_comparison.py self-test
+      - name: Runner refuses a candidate other than the expected head
+        run: |
+          set -euo pipefail
+          log="$RUNNER_TEMP/expected-candidate.log"
+          if REQUEST_VIEW_BASE_SHA="$(git rev-parse HEAD)" \
+             REQUEST_VIEW_EXPECTED_CANDIDATE=1111111111111111111111111111111111111111 \
+             bash .github/scripts/run_plugin_request_view_comparison.sh > "$log" 2>&1; then
+            echo '::error::the runner measured a HEAD that is not the expected candidate'
+            exit 1
+          fi
+          grep -q 'is not the expected candidate' "$log"
+          test ! -e tests/performance/ci_results/plugin-request-view
 
   compare:
     name: Paired request-view comparison
@@ -73,11 +85,18 @@ jobs:
     # Two uncached optimized builds of the root crate plus the rounds.
     timeout-minutes: 180
     env:
-      REQUEST_VIEW_BASE_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || inputs.baseline }}
+      # Pull requests: measure the PR HEAD (never the synthetic merge commit,
+      # which would also carry every main-side change merged since the PR
+      # forked) against the commit the head forked from.
+      REQUEST_VIEW_PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+      REQUEST_VIEW_EXPECTED_CANDIDATE: ${{ github.event.pull_request.head.sha }}
+      REQUEST_VIEW_EVENT_SHA: ${{ github.sha }}
+      REQUEST_VIEW_BASE_SHA: ${{ inputs.baseline }}
       REQUEST_VIEW_ROUNDS: ${{ inputs.rounds || '3' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
           # The baseline commit must be present for its worktree.
           fetch-depth: 0
           persist-credentials: false
@@ -92,10 +111,15 @@ jobs:
       - name: Resolve the baseline commit
         run: |
           set -euo pipefail
-          if [ -z "$REQUEST_VIEW_BASE_SHA" ]; then
+          if [ "$GITHUB_EVENT_NAME" = pull_request ]; then
+            # The fork point of the PR head, so the pair differs by exactly
+            # the PR's own commits.
+            REQUEST_VIEW_BASE_SHA="$(git merge-base "$REQUEST_VIEW_PR_BASE_SHA" HEAD)"
+          elif [ -z "$REQUEST_VIEW_BASE_SHA" ]; then
             REQUEST_VIEW_BASE_SHA="$(git merge-base origin/main HEAD)"
-            echo "REQUEST_VIEW_BASE_SHA=$REQUEST_VIEW_BASE_SHA" >> "$GITHUB_ENV"
           fi
+          echo "REQUEST_VIEW_BASE_SHA=$REQUEST_VIEW_BASE_SHA" >> "$GITHUB_ENV"
+          echo "Candidate: $(git rev-parse HEAD)"
           echo "Baseline: $REQUEST_VIEW_BASE_SHA"
       - name: Measure both revisions on this runner
         run: bash .github/scripts/run_plugin_request_view_comparison.sh
