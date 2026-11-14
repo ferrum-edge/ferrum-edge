@@ -1231,7 +1231,6 @@ install_ferrum() {
     --set image.tag="$IMAGE_TAG" \
     --set image.pullPolicy=IfNotPresent \
     --set injector.enabled=false \
-    --set ca.enabled=false \
     --set controlPlane.enabled=true \
     --set controlPlane.rbac.create=true \
     --set controlPlane.rbac.gatewayApi=false \

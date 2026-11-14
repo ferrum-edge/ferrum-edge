@@ -197,22 +197,23 @@ fn ambient_container_ports_follow_the_listen_addresses() {
     );
 }
 
-/// The CA Deployment runs `FERRUM_MODE=cp` from `ca.env`, which
-/// `EnvConfig::validate_cp_dp_grpc_transport_security` refuses at boot on a
-/// non-loopback plaintext CP gRPC bind (issue #7298). The chart must fail the
-/// render instead, accepting the same three escapes the runtime accepts.
+/// The control plane refuses a non-loopback plaintext CP gRPC bind at boot
+/// (`EnvConfig::validate_cp_dp_grpc_transport_security`), so the chart fails the
+/// render instead, accepting the same three escapes the runtime accepts
+/// (issue #7298). The guard reads the listen address the chart renders from
+/// `controlPlane.grpcPort`.
 #[test]
-fn ca_plaintext_cp_grpc_bind_fails_the_render() {
+fn control_plane_plaintext_cp_grpc_bind_fails_the_render() {
     let validation = read_chart("templates/validation.yaml");
-    let ca_block = &validation[validation
-        .find("{{- if .Values.ca.enabled -}}")
-        .expect("validation.yaml must validate the CA component")..];
-    let ca_block = &ca_block[..ca_block.find("{{- end -}}").expect("closed CA block")];
+    let cp_block = &validation[validation
+        .find("{{- if .Values.controlPlane.enabled -}}")
+        .expect("validation.yaml must validate the control plane")..];
+    let cp_block = &cp_block[..cp_block.find("{{- end -}}").expect("closed CP block")];
     assert!(
-        ca_block.contains(
-            "{{- include \"ferrum-mesh.validateCpGrpcTransport\" (dict \"label\" \"ca.env\" \"env\" .Values.ca.env \"defaultListenAddr\" (printf \"0.0.0.0:%v\" .Values.ca.grpcPort)) -}}"
+        cp_block.contains(
+            "{{- include \"ferrum-mesh.validateCpGrpcTransport\" (dict \"label\" \"controlPlane.env\" \"env\" .Values.controlPlane.env \"defaultListenAddr\" (printf \"0.0.0.0:%v\" .Values.controlPlane.grpcPort)) -}}"
         ),
-        "the CA component must run the CP gRPC transport guard over ca.env"
+        "the control plane must run the CP gRPC transport guard over controlPlane.env"
     );
 
     let helpers = read_chart("templates/_helpers.tpl");
@@ -248,78 +249,48 @@ fn ca_plaintext_cp_grpc_bind_fails_the_render() {
     );
 
     let dev = read_chart("examples/development-values.yaml");
-    let ca = &dev[dev
-        .find("\nca:\n")
-        .expect("development example has a ca block")..];
     assert!(
-        ca.contains("FERRUM_CP_DP_GRPC_ALLOW_PLAINTEXT: \"true\""),
-        "the development example must opt the CA into plaintext CP gRPC so \
-         `-f development-values.yaml --set ca.enabled=true` still renders"
+        dev.contains("FERRUM_CP_DP_GRPC_ALLOW_PLAINTEXT: \"true\""),
+        "the development example must opt the control plane into plaintext CP gRPC \
+         so `-f development-values.yaml` still renders"
     );
 }
 
-/// The standalone mesh CA must be reachable (issue #7298): `ca.grpcPort` moves
-/// the CP gRPC listener, the named `grpc` container port, and the
-/// `ferrum-mesh-ca` Service together, the way `controlPlane.grpcPort` does.
+/// The standalone `ca` component was removed (issue #7298): it ran a second
+/// `FERRUM_MODE=cp` process and issued no certificates. No template, value,
+/// schema entry or example may bring it back half-wired.
 #[test]
-fn ca_grpc_port_renders_listener_container_port_and_service() {
-    let template = read_chart("templates/ca-deployment.yaml");
+fn standalone_mesh_ca_component_is_gone() {
+    let chart = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("charts/ferrum-mesh");
     assert!(
-        template.contains("- name: grpc\n              containerPort: {{ .Values.ca.grpcPort }}"),
-        "the CA Deployment must declare a named grpc container port from ca.grpcPort"
+        !chart.join("templates/ca-deployment.yaml").exists(),
+        "templates/ca-deployment.yaml must stay deleted"
     );
-    assert!(
-        template.contains("{{- if not (hasKey $caEnv \"FERRUM_CP_GRPC_LISTEN_ADDR\") }}")
-            && template.contains("value: {{ printf \"0.0.0.0:%v\" .Values.ca.grpcPort | quote }}"),
-        "the chart must bind FERRUM_CP_GRPC_LISTEN_ADDR to ca.grpcPort unless ca.env sets it"
-    );
-    let service = &template[template
-        .find("kind: Service")
-        .expect("the CA template must render a Service")..];
-    for needle in [
-        "name: ferrum-mesh-ca",
-        "app.kubernetes.io/name: ferrum-mesh-ca",
-        "- name: grpc",
-        "port: {{ .Values.ca.grpcPort }}",
-        "targetPort: grpc",
-    ] {
-        assert!(
-            service.contains(needle),
-            "the ferrum-mesh-ca Service must expose the CA gRPC port: missing {needle}"
-        );
-    }
-    assert!(
-        !service.contains("admin-http"),
-        "admin stays off the CA gRPC Service; metrics use ferrum-mesh-ca-metrics"
-    );
-
-    // The CA ServiceAccount has no RBAC and mounts no API token, so the
-    // in-cluster defaults for the CRD controller and pod discovery would fail
-    // at startup. The chart turns them off unless ca.env sets them.
-    for name in [
-        "FERRUM_K8S_CONTROLLER_ENABLED",
-        "FERRUM_K8S_POD_DISCOVERY_ENABLED",
-    ] {
-        assert!(
-            template.contains(&format!("{{{{- if not (hasKey $caEnv \"{name}\") }}}}"))
-                && template.contains(&format!("- name: {name}\n              value: \"false\"")),
-            "the CA must default {name} to false unless ca.env sets it"
-        );
-    }
-
     let values = read_chart("values.yaml");
-    let ca = &values[values.find("\nca:\n").expect("values.yaml has a ca block")..];
     assert!(
-        ca.contains("grpcPort: 50051"),
-        "ca.grpcPort must default to 50051"
+        !values.contains("\nca:\n"),
+        "values.yaml must not declare a top-level ca block"
     );
     let schema = read_chart("values.schema.json");
-    let ca_schema = &schema[schema
-        .find("\"ca\": {")
-        .expect("values.schema.json describes ca")..];
     assert!(
-        ca_schema[..ca_schema.find("\"probes\"").expect("ca schema has probes")]
-            .contains("\"grpcPort\""),
-        "values.schema.json must declare ca.grpcPort"
+        !schema.contains("\n    \"ca\": {"),
+        "values.schema.json must not accept a top-level ca block"
     );
+    for rel in [
+        "templates/_helpers.tpl",
+        "templates/validation.yaml",
+        "templates/serviceaccount.yaml",
+        "templates/pdb.yaml",
+        "templates/metrics-servicemonitor.yaml",
+        "examples/development-values.yaml",
+        "examples/production-existing-secrets-values.yaml",
+    ] {
+        let text = read_chart(rel);
+        assert!(
+            !text.contains(".Values.ca.")
+                && !text.contains("ferrum-mesh-ca\"")
+                && !text.contains("\nca:\n"),
+            "{rel} must not reference the removed standalone CA"
+        );
+    }
 }

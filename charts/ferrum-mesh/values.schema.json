@@ -681,69 +681,6 @@
         }
       }
     },
-    "ca": {
-      "type": "object",
-      "description": "Mesh CA Deployment (shares controlPlane database/JWT contract when enabled).",
-      "additionalProperties": false,
-      "properties": {
-        "enabled": {
-          "type": "boolean"
-        },
-        "grpcPort": {
-          "type": "integer",
-          "description": "CP/DP gRPC port of the CA Deployment: the listen address, the grpc container port, and the ferrum-mesh-ca Service port.",
-          "minimum": 1,
-          "maximum": 65535
-        },
-        "env": {
-          "type": "object",
-          "description": "Free-form CA env map.",
-          "additionalProperties": {
-            "type": [
-              "string",
-              "number",
-              "integer",
-              "boolean"
-            ]
-          }
-        },
-        "probes": {
-          "$ref": "#/definitions/workloadProbes"
-        },
-        "admin": {
-          "$ref": "#/definitions/workloadAdmin"
-        },
-        "shutdownDrainSeconds": {
-          "$ref": "#/definitions/shutdownSeconds"
-        },
-        "shutdownPreStopSeconds": {
-          "$ref": "#/definitions/shutdownSeconds"
-        },
-        "shutdownPreDrainSeconds": {
-          "$ref": "#/definitions/shutdownSeconds"
-        },
-        "terminationGracePeriodSeconds": {
-          "type": "integer",
-          "minimum": 0
-        },
-        "podSecurityContext": {
-          "type": "object",
-          "description": "Free-form Kubernetes PodSecurityContext, rendered verbatim.",
-          "additionalProperties": true
-        },
-        "securityContext": {
-          "type": "object",
-          "description": "Free-form Kubernetes container SecurityContext, rendered verbatim.",
-          "additionalProperties": true
-        },
-        "resources": {
-          "$ref": "#/definitions/workloadResources"
-        },
-        "priorityClassName": {
-          "type": "string"
-        }
-      }
-    },
     "observability": {
       "type": "object",
       "additionalProperties": false,

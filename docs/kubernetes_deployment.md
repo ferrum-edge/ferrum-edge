@@ -307,7 +307,6 @@ disabled by default:
 
 - `controlPlane.enabled=false`
 - `injector.enabled=false`
-- `ca.enabled=false`
 
 This is intentional. In `cp` mode the runtime refuses to start without all of:
 
@@ -327,7 +326,7 @@ The Helm chart separately requires its two credential sources —
 `controlPlane.credentials.adminJwtSecret` and
 `controlPlane.credentials.cpDpGrpcJwtSecret` (each exactly one of `value`,
 `existingSecret.name`, or `valueFrom`, minimum 32 characters) — whenever
-`controlPlane.enabled=true` or `ca.enabled=true`. A runtime trust-bundle
+`controlPlane.enabled=true`. A runtime trust-bundle
 alternative to the legacy secret does not let the chart omit those credential
 fields. The chart validates these requirements during `helm template` and `helm
 install`. When
@@ -341,13 +340,17 @@ independent `ferrum-mesh` release in the same cluster must set a unique
 intentional, and a later release must not force-import or skip-create to share
 another release's class.
 
-The mesh CA Deployment (`ca.enabled=true`) runs `FERRUM_MODE=cp` from `ca.env`,
-so it is held to the CP gRPC transport check at render time: a non-loopback,
-non-zero `FERRUM_CP_GRPC_LISTEN_ADDR` (default `0.0.0.0:50051`) fails `helm
-template` unless `ca.env` sets both `FERRUM_CP_GRPC_TLS_CERT_PATH` and
+The control plane is held to the CP gRPC transport check at render time: a
+non-loopback, non-zero `FERRUM_CP_GRPC_LISTEN_ADDR` (default
+`0.0.0.0:<controlPlane.grpcPort>`) fails `helm template` unless
+`controlPlane.env` sets both `FERRUM_CP_GRPC_TLS_CERT_PATH` and
 `FERRUM_CP_GRPC_TLS_KEY_PATH` or `FERRUM_CP_DP_GRPC_ALLOW_PLAINTEXT: "true"`
 (the development example sets the opt-in). The binary refuses the same
 configuration at startup.
+
+The chart ships no certificate authority (the standalone `ca` component was
+removed): mesh workload identity comes from SPIRE (`FERRUM_MESH_CA_BACKEND=spire`),
+file SVIDs, or the dev-only in-process `internal` CA.
 
 ### Gateway API CRDs (required)
 

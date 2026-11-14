@@ -1,7 +1,7 @@
 # ferrum-mesh Helm chart
 
 Deploys Ferrum Edge service-mesh components: control plane, sidecar injector,
-east-west gateway, mesh CA, ambient/node-agent DaemonSets, and optional
+east-west gateway, ambient/node-agent DaemonSets, and optional
 observability assets. Core gateway modes (`database`, `file`, `cp`, `dp`) belong
 in the sibling [`ferrum-gateway`](../ferrum-gateway) chart — the two charts share
 naming, labelling, secret, and validation conventions.
@@ -11,7 +11,6 @@ naming, labelling, secret, and validation conventions.
 | Control plane | `controlPlane.enabled` | `false` | Requires DB + JWT secrets |
 | Injector webhook | `injector.enabled` | `false` | Requires TLS Secret **and** exactly one CA trust source (`injector.caBundle` or `injector.certManager.injectCaFrom`) |
 | East-west gateway | `eastWest.enabled` | `false` | Cross-cluster SNI passthrough |
-| Mesh CA | `ca.enabled` | `false` | Fixed one replica; gRPC Service `ferrum-mesh-ca` on `ca.grpcPort` (see [Mesh CA](#mesh-ca)) |
 | Ambient proxy | `ambient.enabled` | `false` | Requires `nodeAgent.enabled` |
 | Node agent | `nodeAgent.enabled` | `false` | eBPF capture manager |
 
@@ -26,31 +25,33 @@ its Service port, and the listener itself: the chart renders
 `FERRUM_CP_GRPC_LISTEN_ADDR`, in which case that value is used unchanged and must
 listen on the same port.
 
-## Mesh CA
+## Workload identity
 
-`ca.enabled=true` adds the `ferrum-mesh-ca` Deployment: one replica of the
-Ferrum binary in `FERRUM_MODE=cp`, sharing the control plane's database and
-JWT credentials. It serves the CP gRPC API (ConfigSync and MeshConfigSync) on
-`ca.grpcPort` (default `50051`) and is reachable in-cluster through the
-`ferrum-mesh-ca` Service at `ferrum-mesh-ca.<release namespace>.svc:<ca.grpcPort>`
-(port name `grpc`). The chart renders `FERRUM_CP_GRPC_LISTEN_ADDR=0.0.0.0:<ca.grpcPort>`
-unless `ca.env` sets it. Admin health and metrics stay off that Service: the
-admin listener backs the probes and, with observability enabled, the dedicated
-`ferrum-mesh-ca-metrics` Service.
+The chart deploys no certificate authority. Mesh data planes (sidecars, the
+ambient NodeWaypoint, the east-west gateway) get their SPIFFE identity from one
+of the supported sources, set through the component's `env`:
 
-The CA has no Kubernetes RBAC and mounts no API token, so the chart sets
-`FERRUM_K8S_CONTROLLER_ENABLED=false` and `FERRUM_K8S_POD_DISCOVERY_ENABLED=false`
-for it unless `ca.env` sets them; the control plane owns the Kubernetes watches.
-Like the control plane, the CA refuses a plaintext non-loopback CP gRPC bind, so
-the render fails unless `ca.env` sets `FERRUM_CP_GRPC_TLS_CERT_PATH` and
-`FERRUM_CP_GRPC_TLS_KEY_PATH` (mounted), binds a loopback
-`FERRUM_CP_GRPC_LISTEN_ADDR`, or opts into `FERRUM_CP_DP_GRPC_ALLOW_PLAINTEXT="true"`
-(development only; `examples/development-values.yaml` does this).
+- `FERRUM_MESH_CA_BACKEND=spire`: fetch the SVID from a SPIRE Agent over the
+  Workload API (`FERRUM_MESH_SPIRE_AGENT_SOCKET`). This is the production path;
+  see `docs/spire_deployment.md`.
+- File SVIDs: `FERRUM_GATEWAY_SVID_CERT_PATH`, `FERRUM_GATEWAY_SVID_KEY_PATH` and
+  `FERRUM_GATEWAY_SVID_TRUST_BUNDLE_PATH` from mounted Secrets.
+- `FERRUM_MESH_CA_BACKEND=internal`: Ferrum's in-process CA. It is dev-only
+  (`FERRUM_MESH_CA_BOOTSTRAP_DEV=true`, refused under
+  `FERRUM_MESH_PRODUCTION_MODE=true`) and process-local, so two processes using
+  it cannot mTLS each other.
 
-Workload identity does not come from this Deployment: mesh data planes get their
-SVIDs from `FERRUM_MESH_CA_BACKEND=spire` (SPIRE Agent), file SVIDs, or the
-process-local `internal` dev CA (see `docs/mesh.md`). Data planes that should
-reach the CA's CP gRPC API list it in `FERRUM_DP_CP_GRPC_URLS`.
+The earlier standalone `ca` component (`ca.enabled`) was removed: it ran a
+second `FERRUM_MODE=cp` process and issued no certificates. See
+`docs/upgrade_guide.md`.
+
+The control plane refuses a plaintext non-loopback CP gRPC bind at startup, and
+the chart fails the render in the same case: set
+`controlPlane.env.FERRUM_CP_GRPC_TLS_CERT_PATH` and
+`controlPlane.env.FERRUM_CP_GRPC_TLS_KEY_PATH` (mounted), bind a loopback
+`FERRUM_CP_GRPC_LISTEN_ADDR`, or set
+`controlPlane.env.FERRUM_CP_DP_GRPC_ALLOW_PLAINTEXT: "true"` (development only;
+`examples/development-values.yaml` does this).
 
 ## Container image tag
 
@@ -81,7 +82,7 @@ helm install ferrum ./charts/ferrum-mesh --namespace ferrum \
   --set 'image.pullSecrets[0]=regcred'
 ```
 
-The names are attached to **every** mesh pod spec — control plane, CA,
+The names are attached to **every** mesh pod spec — control plane,
 east-west gateway, injector, ambient DaemonSet, node agent, and both CNI
 uninstall-hook pods — including workloads that use the `nodeAgent.image` tag
 override. The uninstall-hook pods matter: they run the Ferrum image, so without
@@ -183,7 +184,7 @@ When `injector.enabled=true`, the rendered `MutatingWebhookConfiguration`:
 
 1. **Always** appends `kubernetes.io/metadata.name NotIn [<release namespace>]`
    to `namespaceSelector`, even when `injector.namespaceSelector` is overridden.
-   Pods in the release namespace (injector, control plane, mesh CA, east-west
+   Pods in the release namespace (injector, control plane, east-west
    gateway) are therefore never gated on the webhook.
 2. Sets `objectSelector` to `app.kubernetes.io/name NotIn [ferrum-mesh-injector]`
    so injector pods are excluded by label regardless of namespace.

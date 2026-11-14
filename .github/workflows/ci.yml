@@ -3342,7 +3342,11 @@ jobs:
             -f "$RUNNER_TEMP/ferrum-helm-results/mesh-extension-maps-values.yaml"
           # Development/example values must satisfy the exhaustive schema.
           helm lint ./charts/ferrum-mesh -f ./charts/ferrum-mesh/examples/development-values.yaml
-          helm lint ./charts/ferrum-mesh -f ./charts/ferrum-mesh/examples/production-existing-secrets-values.yaml
+          # The production example omits CP gRPC TLS material on purpose (operators
+          # mount their own), so the control-plane plaintext guard (#7298) needs
+          # the development opt-in to lint it.
+          helm lint ./charts/ferrum-mesh -f ./charts/ferrum-mesh/examples/production-existing-secrets-values.yaml \
+            --set-string controlPlane.env.FERRUM_CP_DP_GRPC_ALLOW_PLAINTEXT=true
           helm template ferrum ./charts/ferrum-mesh --namespace ferrum \
             > "$RUNNER_TEMP/ferrum-helm-results/default-rendered.yaml"
           helm template ferrum ./charts/ferrum-mesh --namespace ferrum \
@@ -4035,7 +4039,6 @@ jobs:
             --set injector.enabled=true \
             --set injector.caBundle="${INJECTOR_CA_BUNDLE}" \
             --set injector.tls.secretName=ferrum-mesh-injector-tls \
-            --set ca.enabled=true \
             --set eastWest.enabled=true \
             --set ambient.enabled=true \
             --set nodeAgent.enabled=true \
@@ -4062,10 +4065,6 @@ jobs:
             --set nodeAgent.probes.startup.enabled=false \
             --set nodeAgent.probes.liveness.enabled=false \
             --set nodeAgent.probes.readiness.enabled=false \
-            --set ca.enabled=true \
-            --set ca.probes.startup.enabled=false \
-            --set ca.probes.liveness.enabled=false \
-            --set ca.probes.readiness.enabled=false \
             > "$RUNNER_TEMP/ferrum-helm-results/mesh-probes-disabled.yaml"
           helm template ferrum ./charts/ferrum-mesh --namespace ferrum \
             -f ./charts/ferrum-mesh/examples/development-values.yaml \
@@ -4331,8 +4330,6 @@ jobs:
             --set injector.caBundle="${INJECTOR_CA_BUNDLE}" \
             --set injector.tls.secretName=ferrum-mesh-injector-tls \
             --set injector.probes.startup.override.exec.command[0]=/bin/startup-inj \
-            --set ca.enabled=true \
-            --set ca.probes.startup.override.exec.command[0]=/bin/startup-ca \
             --set eastWest.enabled=true \
             --set eastWest.probes.startup.override.exec.command[0]=/bin/startup-ew \
             --set ambient.enabled=true \
@@ -4446,7 +4443,6 @@ jobs:
           fi
           helm template ferrum ./charts/ferrum-mesh --namespace ferrum \
             -f ./charts/ferrum-mesh/examples/development-values.yaml \
-            --set ca.enabled=true \
             --set eastWest.enabled=true \
             --set ambient.enabled=true \
             --set nodeAgent.enabled=true \
@@ -4457,8 +4453,6 @@ jobs:
             --set-string 'observability.metrics.allowedCidrs=10.0.0.0/8\,127.0.0.1/32' \
             --set controlPlane.admin.bindAddress=0.0.0.0 \
             --set-string 'controlPlane.admin.allowedCidrs=10.0.0.0/8\,127.0.0.1/32' \
-            --set ca.admin.bindAddress=0.0.0.0 \
-            --set-string 'ca.admin.allowedCidrs=10.0.0.0/8\,127.0.0.1/32' \
             --set eastWest.admin.bindAddress=0.0.0.0 \
             --set ambient.admin.bindAddress=0.0.0.0 \
             --set nodeAgent.admin.bindAddress=0.0.0.0 \
@@ -4469,7 +4463,6 @@ jobs:
           # host-network, so a plaintext scrape leaks it on the node network.
           helm template ferrum ./charts/ferrum-mesh --namespace ferrum \
             -f ./charts/ferrum-mesh/examples/development-values.yaml \
-            --set ca.enabled=true \
             --set eastWest.enabled=true \
             --set ambient.enabled=true \
             --set nodeAgent.enabled=true \
@@ -4484,11 +4477,6 @@ jobs:
             --set controlPlane.admin.httpsPort=9443 \
             --set controlPlane.admin.tls.enabled=true \
             --set controlPlane.admin.tls.secretName=cp-admin-tls \
-            --set ca.admin.bindAddress=0.0.0.0 \
-            --set-string 'ca.admin.allowedCidrs=10.0.0.0/8\,127.0.0.1/32' \
-            --set ca.admin.httpsPort=9443 \
-            --set ca.admin.tls.enabled=true \
-            --set ca.admin.tls.secretName=ca-admin-tls \
             --set eastWest.admin.bindAddress=0.0.0.0 \
             --set eastWest.admin.httpsPort=9443 \
             --set eastWest.admin.tls.enabled=true \
@@ -4505,7 +4493,6 @@ jobs:
           # Bearer + plaintext-only admin must fail closed.
           if helm template ferrum ./charts/ferrum-mesh --namespace ferrum \
             -f ./charts/ferrum-mesh/examples/development-values.yaml \
-            --set ca.enabled=true \
             --set eastWest.enabled=true \
             --set ambient.enabled=true \
             --set nodeAgent.enabled=true \
@@ -4517,8 +4504,6 @@ jobs:
             --set observability.metrics.podMonitor.tlsConfig.ca.secret.key=ca.crt \
             --set controlPlane.admin.bindAddress=0.0.0.0 \
             --set-string 'controlPlane.admin.allowedCidrs=10.0.0.0/8\,127.0.0.1/32' \
-            --set ca.admin.bindAddress=0.0.0.0 \
-            --set-string 'ca.admin.allowedCidrs=10.0.0.0/8\,127.0.0.1/32' \
             --set eastWest.admin.bindAddress=0.0.0.0 \
             --set ambient.admin.bindAddress=0.0.0.0 \
             --set nodeAgent.admin.bindAddress=0.0.0.0 \
@@ -4726,14 +4711,9 @@ jobs:
             --set-string controlPlane.admin.bindAddress=0.0.0.0 \
             --set-string 'controlPlane.admin.allowedCidrs=::ffff:127.0.0.1/128' \
             > "$RUNNER_TEMP/ferrum-helm-results/mesh-prod-mapped-cidr-host.yaml"
-          for component in controlPlane ca; do
-            component_args=()
-            if [[ "$component" == "ca" ]]; then
-              component_args+=(--set ca.enabled=true)
-            fi
+          for component in controlPlane; do
             if helm template ferrum ./charts/ferrum-mesh --namespace ferrum \
               -f ./charts/ferrum-mesh/examples/development-values.yaml \
-              "${component_args[@]}" \
               --set-string "${component}.admin.bindAddress=::ffff:127.0.0.1" \
               > "$RUNNER_TEMP/ferrum-helm-results/mesh-prod-${component}-mapped-bind.yaml" \
               2> "$RUNNER_TEMP/ferrum-helm-results/mesh-prod-${component}-mapped-bind.err"; then
@@ -4823,7 +4803,6 @@ jobs:
             --set ambient.enabled=true \
             --set nodeAgent.enabled=true \
             --set nodeAgent.cni.enabled=true \
-            --set ca.enabled=true \
             --set eastWest.enabled=true \
             --set injector.enabled=true \
             --set injector.caBundle="${INJECTOR_CA_BUNDLE}" \
@@ -6529,34 +6508,13 @@ jobs:
           kubectl -n ferrum-dev create secret generic ferrum-mesh-dev-credentials \
             --from-literal=admin-jwt-secret="${admin_secret}" \
             --from-literal=cp-dp-grpc-jwt-secret="${grpc_secret}"
-          # The standalone mesh CA (#7298) rides the development install: it must
-          # become Ready and its gRPC Service must publish a ready endpoint.
           helm install ferrum-dev ./charts/ferrum-mesh -n ferrum-dev \
             -f ./charts/ferrum-mesh/examples/development-values.yaml \
             --set image.repository=ferrum-edge \
             --set image.tag=helm-chart-ci \
             --set image.pullPolicy=IfNotPresent \
-            --set ca.enabled=true \
             --set gatewayClass.name=ferrum-dev
           kubectl -n ferrum-dev rollout status deployment/ferrum-mesh-control-plane --timeout=180s
-          kubectl -n ferrum-dev rollout status deployment/ferrum-mesh-ca --timeout=180s
-          ca_endpoint_ports="$(kubectl -n ferrum-dev get endpointslices \
-            -l kubernetes.io/service-name=ferrum-mesh-ca \
-            -o jsonpath='{range .items[*]}{range .endpoints[?(@.conditions.ready==true)]}{"ready "}{end}{range .ports[*]}{.name}{"="}{.port}{" "}{end}{end}')"
-          echo "ferrum-mesh-ca endpoints: ${ca_endpoint_ports}"
-          if ! printf '%s\n' "$ca_endpoint_ports" | grep -Fq 'ready ' ||
-             ! printf '%s\n' "$ca_endpoint_ports" | grep -Fq 'grpc=50051'; then
-            echo "::error title=Mesh CA unreachable::the ferrum-mesh-ca Service must publish a ready grpc endpoint on 50051"
-            kubectl -n ferrum-dev get endpointslices -l kubernetes.io/service-name=ferrum-mesh-ca -o yaml
-            exit 1
-          fi
-          kubectl -n ferrum-dev logs deployment/ferrum-mesh-ca --all-containers --tail=1000 > "$RUNNER_TEMP/ferrum-helm-results/development-ca.log"
-          if grep -Fq "${admin_secret}" "$RUNNER_TEMP/ferrum-helm-results/development-ca.log" ||
-             grep -Fq "${grpc_secret}" "$RUNNER_TEMP/ferrum-helm-results/development-ca.log"; then
-            rm -f "$RUNNER_TEMP/ferrum-helm-results/development-ca.log"
-            echo "::error title=Secret leaked to logs::development mesh CA logs contained a JWT secret"
-            exit 1
-          fi
           kubectl -n ferrum-dev get pods -o wide > "$RUNNER_TEMP/ferrum-helm-results/development-pods.txt"
           kubectl -n ferrum-dev describe deployment/ferrum-mesh-control-plane > "$RUNNER_TEMP/ferrum-helm-results/development-control-plane-deployment.txt"
           kubectl -n ferrum-dev get events --sort-by=.lastTimestamp > "$RUNNER_TEMP/ferrum-helm-results/development-events.txt"
