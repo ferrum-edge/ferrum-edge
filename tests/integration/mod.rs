@@ -138,6 +138,7 @@ mod mesh_local_reload_observability_tests;
 mod mesh_mtls_pool_width_tests;
 mod mesh_multicluster_discovery_tests;
 mod mesh_node_waypoint_dtls_owner_tests;
+mod mesh_node_waypoint_http_routes_tests;
 mod mesh_node_waypoint_stream_scope_tests;
 mod mesh_node_waypoint_udp_scope_tests;
 mod mesh_outbound_registry_route_miss_tests;
