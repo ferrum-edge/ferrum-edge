@@ -3657,10 +3657,14 @@ pub enum LocalRetentionAppend {
 ///
 /// The same hardened, locked, atomically published file as
 /// [`append_local_fallback_event`], rotated the same way (newest kept), but
-/// bounded by both `bounds.max_records` and `bounds.max_bytes`: the oldest
-/// events are dropped until the file fits. A replayed event (same id) is a
-/// no-op, so spool replay converges to one retained record. Errors only when
-/// the write itself fails (or one event alone exceeds the byte bound).
+/// bounded by both `bounds.max_records` and `bounds.max_bytes`: the events
+/// with the oldest timestamps are dropped until the file fits, whatever order
+/// they were delivered in. A file written under larger bounds is read (up to
+/// [`AUDIT_LOCAL_RETENTION_MAX_BYTES_MAX`]) and rotated down to these. A
+/// replayed event (same id) changes nothing but re-syncs the directory before
+/// it is acknowledged, so spool replay converges to one durable record.
+/// Errors only when the write or sync itself fails (or one event alone
+/// exceeds the byte bound).
 pub fn append_local_retention_event(
     dir: &Path,
     bounds: LocalAuditRetentionBounds,
@@ -3683,9 +3687,17 @@ struct LocalAuditStore {
     file_name: &'static str,
     lock_file_name: &'static str,
     max_records: usize,
+    /// Bound the published file is rotated to (and the write ceiling).
     max_bytes: usize,
-    /// DB-less retention: also rotate by bytes, dedupe on the event id, and
-    /// write compact JSON so the byte accounting is exact.
+    /// Hard ceiling for reading the file already on disk. For the retention
+    /// file it is independent of the operator-configurable `max_bytes`, so a
+    /// file written under a larger bound is still read and rotated down to a
+    /// lowered one instead of blocking every later append (issue #7200
+    /// review).
+    read_max_bytes: usize,
+    /// DB-less retention: also rotate by bytes, dedupe on the event id, keep
+    /// the newest by event timestamp, and write compact JSON so the byte
+    /// accounting is exact.
     retention: bool,
 }
 
@@ -3695,6 +3707,7 @@ impl LocalAuditStore {
         lock_file_name: AUDIT_LOCAL_FALLBACK_LOCK_FILE_NAME,
         max_records: AUDIT_LOCAL_FALLBACK_CAPACITY,
         max_bytes: AUDIT_LOCAL_FALLBACK_MAX_BYTES,
+        read_max_bytes: AUDIT_LOCAL_FALLBACK_MAX_BYTES,
         retention: false,
     };
 
@@ -3704,6 +3717,10 @@ impl LocalAuditStore {
             lock_file_name: AUDIT_LOCAL_RETENTION_LOCK_FILE_NAME,
             max_records: usize::try_from(bounds.max_records.max(1)).unwrap_or(usize::MAX),
             max_bytes: usize::try_from(bounds.max_bytes).unwrap_or(usize::MAX),
+            read_max_bytes: usize::try_from(
+                AUDIT_LOCAL_RETENTION_MAX_BYTES_MAX.max(bounds.max_bytes),
+            )
+            .unwrap_or(usize::MAX),
             retention: true,
         }
     }
@@ -3721,11 +3738,25 @@ fn append_local_audit_event(
     let _cross_process = acquire_fallback_file_lock(&lock_path, deadline)?;
     let path = dir.join(store.file_name);
     reject_symlink_or_non_regular_file(&path, "audit local fallback data file")?;
-    let mut events = read_local_fallback_events_unlocked(&path, store.max_bytes)?;
+    let mut events = read_local_fallback_events_unlocked(&path, store.read_max_bytes)?;
     if store.retention && events.iter().any(|retained| retained.id == event.id) {
+        // The id can be visible only because an earlier attempt published
+        // the file and then failed (or crashed before) the directory sync.
+        // Re-establish that durability barrier before acknowledging, so a
+        // replayed delivery never settles its spool copy against a rename
+        // that a power loss could still roll back.
+        sync_directory(dir)?;
         return Ok(LocalRetentionAppend::AlreadyRetained);
     }
     events.push(event.clone());
+    if store.retention {
+        // Delivery order is not chronological (spool replay, queue overflow),
+        // so position is not age: keep the newest by event timestamp. The
+        // stable sort keeps file order, then arrival order, for equal
+        // timestamps. A replay older than the whole retained window is the
+        // record rotated out, never a newer one.
+        events.sort_by_key(|retained| retained.ts);
+    }
     let mut evicted = 0usize;
     if events.len() > store.max_records {
         let overflow = events.len() - store.max_records;
@@ -3793,7 +3824,7 @@ fn list_local_audit_events(
     let _cross_process = acquire_fallback_file_lock(&lock_path, deadline)?;
     let path = dir.join(store.file_name);
     reject_symlink_or_non_regular_file(&path, "audit local fallback data file")?;
-    read_local_fallback_events_unlocked(&path, store.max_bytes)
+    read_local_fallback_events_unlocked(&path, store.read_max_bytes)
 }
 
 fn local_fallback_lock_deadline() -> std::time::Instant {
@@ -4329,6 +4360,9 @@ fn write_temp_fallback_file(tmp: &Path, body: &[u8]) -> Result<(), anyhow::Error
 }
 
 fn sync_directory(dir: &Path) -> Result<(), anyhow::Error> {
+    if let Some(hook) = snapshot_local_audit_sync_hook_for_tests() {
+        hook(dir)?;
+    }
     #[cfg(unix)]
     {
         let dir_file = OpenOptions::new().read(true).open(dir)?;
@@ -4336,4 +4370,43 @@ fn sync_directory(dir: &Path) -> Result<(), anyhow::Error> {
     }
     let _ = dir;
     Ok(())
+}
+
+/// Test hook run before every local audit store directory sync; an `Err`
+/// fails the sync. The slot is process-global: a hook must pass every
+/// directory other than its own test's.
+type LocalAuditSyncHookForTests = Arc<dyn Fn(&Path) -> std::io::Result<()> + Send + Sync + 'static>;
+
+#[cfg(feature = "test-support")]
+fn local_audit_sync_hook_slot() -> &'static Mutex<Option<LocalAuditSyncHookForTests>> {
+    static HOOK: OnceLock<Mutex<Option<LocalAuditSyncHookForTests>>> = OnceLock::new();
+    HOOK.get_or_init(|| Mutex::new(None))
+}
+
+/// Install or clear the local audit store directory-sync hook.
+///
+/// Tests must clear the hook before finishing (including panic paths) and
+/// return `Ok` for every directory outside their own.
+#[cfg(feature = "test-support")]
+#[doc(hidden)]
+pub fn set_local_audit_sync_hook_for_tests(hook: Option<LocalAuditSyncHookForTests>) {
+    if let Ok(mut slot) = local_audit_sync_hook_slot().lock() {
+        *slot = hook;
+    }
+}
+
+#[cfg(feature = "test-support")]
+fn snapshot_local_audit_sync_hook_for_tests() -> Option<LocalAuditSyncHookForTests> {
+    local_audit_sync_hook_slot()
+        .lock()
+        .ok()
+        .and_then(|slot| slot.clone())
+}
+
+/// Without `test-support` no hook can be installed, so the check is a
+/// constant `None` the compiler folds away.
+#[cfg(not(feature = "test-support"))]
+#[inline(always)]
+fn snapshot_local_audit_sync_hook_for_tests() -> Option<LocalAuditSyncHookForTests> {
+    None
 }

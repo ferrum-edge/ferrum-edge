@@ -22,8 +22,8 @@ use ferrum_edge::admin::audit::{
     AuditWorker, LocalAuditRetentionBounds, LocalRetentionAppend, append_local_retention_event,
     audit_destination_identity, credential_update_diff, list_local_retention_events,
     new_request_slot, note_request_actor, record_without_database_with_pipeline,
-    sanitize_audit_namespace, sanitize_audit_path, scope_request, spawn_local_retention_worker,
-    update_diff,
+    sanitize_audit_namespace, sanitize_audit_path, scope_request,
+    set_local_audit_sync_hook_for_tests, spawn_local_retention_worker, update_diff,
 };
 use ferrum_edge::admin::audit_spool::{
     AUDIT_DIFF_OMITTED_MARKER, AUDIT_SPOOL_RECORD_VERSION, AuditSpool, RetainOutcome,
@@ -1891,6 +1891,156 @@ fn db_less_retention_is_idempotent_on_the_event_id() {
         LocalRetentionAppend::AlreadyRetained
     );
     assert_eq!(retained_ids(dir.path()), vec![event.id]);
+}
+
+/// Review of #7369 (sol F1, dsf F1): the byte bound is the rotation target,
+/// not the read ceiling. A file written under a larger bound is still read
+/// after the operator lowers `FERRUM_ADMIN_AUDIT_LOCAL_RETENTION_MAX_BYTES`,
+/// and the next append rotates it down instead of failing forever.
+#[test]
+fn db_less_retention_rotates_down_after_the_byte_bound_is_lowered() {
+    let dir = TempDir::new().expect("retention dir");
+    let lowered = LocalAuditRetentionBounds {
+        max_records: 1_000,
+        max_bytes: ferrum_edge::admin::audit::AUDIT_LOCAL_RETENTION_MAX_BYTES_MIN,
+    };
+    let larger = LocalAuditRetentionBounds {
+        max_bytes: lowered.max_bytes * 2,
+        ..lowered
+    };
+    let blob = "x".repeat(700_000);
+    let mut ids = Vec::new();
+    for _ in 0..5 {
+        let event = event_with(&Uuid::new_v4().to_string(), json!({ "blob": blob }));
+        ids.push(event.id.clone());
+        append_local_retention_event(dir.path(), larger, &event).expect("append, larger bound");
+    }
+    let size = std::fs::metadata(dir.path().join(RETENTION_FILE))
+        .expect("retention file exists")
+        .len();
+    assert!(
+        size > lowered.max_bytes,
+        "the file written under the larger bound ({size} bytes) exceeds the lowered one"
+    );
+
+    let event = event_with(&Uuid::new_v4().to_string(), json!({ "blob": blob }));
+    ids.push(event.id.clone());
+    assert_eq!(
+        append_local_retention_event(dir.path(), lowered, &event)
+            .expect("an append under a lowered bound rotates the existing file down"),
+        LocalRetentionAppend::Retained { rotated: 4 }
+    );
+    let retained: Vec<String> = list_local_retention_events(dir.path(), lowered)
+        .expect("list under the lowered bound")
+        .into_iter()
+        .map(|event| event.id)
+        .collect();
+    assert_eq!(retained, ids[4..].to_vec(), "the newest two fit in 2 MiB");
+    let size = std::fs::metadata(dir.path().join(RETENTION_FILE))
+        .expect("retention file exists")
+        .len();
+    assert!(size <= lowered.max_bytes, "file is {size} bytes");
+}
+
+/// Clears the process-global directory-sync hook, including on panic.
+struct ClearLocalAuditSyncHook;
+
+impl Drop for ClearLocalAuditSyncHook {
+    fn drop(&mut self) {
+        set_local_audit_sync_hook_for_tests(None);
+    }
+}
+
+/// Review of #7369 (sol F2): an earlier attempt can publish the event and
+/// then fail its directory sync. A replay that finds the id must redo the
+/// sync, and must not acknowledge (letting the spool copy be settled) while
+/// the sync still fails.
+#[test]
+fn db_less_retention_replay_resyncs_the_directory_before_acknowledging() {
+    let dir = TempDir::new().expect("retention dir");
+    let bounds = LocalAuditRetentionBounds::default();
+    let target = dir.path().to_path_buf();
+    let fail_next = Arc::new(AtomicBool::new(true));
+    let syncs = Arc::new(AtomicU64::new(0));
+    let hook_fail_next = Arc::clone(&fail_next);
+    let hook_syncs = Arc::clone(&syncs);
+    let _clear = ClearLocalAuditSyncHook;
+    set_local_audit_sync_hook_for_tests(Some(Arc::new(
+        move |synced: &Path| -> std::io::Result<()> {
+            if synced != target.as_path() {
+                return Ok(());
+            }
+            hook_syncs.fetch_add(1, Ordering::SeqCst);
+            if hook_fail_next.swap(false, Ordering::SeqCst) {
+                return Err(std::io::Error::other("injected directory sync failure"));
+            }
+            Ok(())
+        },
+    )));
+
+    let event = event();
+    append_local_retention_event(dir.path(), bounds, &event)
+        .expect_err("the first attempt fails its directory sync after publishing");
+    assert_eq!(
+        retained_ids(dir.path()),
+        vec![event.id.clone()],
+        "the rename is visible although its directory sync failed"
+    );
+
+    fail_next.store(true, Ordering::SeqCst);
+    append_local_retention_event(dir.path(), bounds, &event)
+        .expect_err("a replay must not acknowledge while the directory sync still fails");
+
+    assert_eq!(
+        append_local_retention_event(dir.path(), bounds, &event).expect("replay"),
+        LocalRetentionAppend::AlreadyRetained
+    );
+    assert_eq!(
+        syncs.load(Ordering::SeqCst),
+        3,
+        "every attempt, replays included, syncs the retention directory"
+    );
+    assert_eq!(retained_ids(dir.path()), vec![event.id]);
+}
+
+/// Review of #7369 (sol F3): delivery order is not age. A late replay of an
+/// older event never rotates a newer one out; the newest by timestamp stay.
+#[test]
+fn db_less_retention_keeps_the_newest_by_timestamp_not_delivery_order() {
+    let dir = TempDir::new().expect("retention dir");
+    let bounds = LocalAuditRetentionBounds {
+        max_records: 2,
+        ..LocalAuditRetentionBounds::default()
+    };
+    let now = Utc::now();
+    let at = |offset_secs: i64| {
+        let mut event = event();
+        event.ts = now + chrono::TimeDelta::seconds(offset_secs);
+        event
+    };
+    let (a, b, c, d) = (at(-1), at(0), at(1), at(2));
+
+    for event in [&b, &d] {
+        append_local_retention_event(dir.path(), bounds, event).expect("append");
+    }
+    assert_eq!(
+        append_local_retention_event(dir.path(), bounds, &a)
+            .expect("late replay of an older event"),
+        LocalRetentionAppend::Retained { rotated: 1 },
+        "the older replay is the record rotated out"
+    );
+    assert_eq!(
+        retained_ids(dir.path()),
+        vec![b.id.clone(), d.id.clone()],
+        "a late older event never evicts newer evidence"
+    );
+
+    append_local_retention_event(dir.path(), bounds, &c).expect("append out of order");
+    assert_eq!(
+        retained_ids(dir.path()),
+        vec![c.id, d.id],
+        "the oldest by timestamp is rotated out, and the file is in timestamp order"
+    );
 }
 
 #[test]
