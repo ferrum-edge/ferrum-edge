@@ -1286,6 +1286,7 @@ jobs:
               integration::audit_retention_tests
               integration::admin_backend_capabilities_tests
               integration::admin_backend_egress_policy_tests
+              integration::managed_jwks_consumer_tests
               integration::admin_batch_atomicity_tests
               integration::admin_batch_reference_check_tests
               integration::admin_plugin_graph_scope_tests

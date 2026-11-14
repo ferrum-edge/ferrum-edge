@@ -105,6 +105,7 @@ mod k8s_controller_watch_relist_tests;
 mod kafka_logging_broker_tests;
 mod log_schema_integration_tests;
 mod log_schema_registry_tests;
+mod managed_jwks_consumer_tests;
 mod mesh_app_probe_admission_tests;
 mod mesh_authz_e2e_tests;
 mod mesh_authz_negative_match_tests;
