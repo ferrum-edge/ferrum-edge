@@ -48,7 +48,7 @@ use tracing::info;
 use super::PluginHttpClient;
 use super::jwks_store::{
     DEFAULT_KID_MISS_REFRESH_COOLDOWN_SECONDS, JwksFailureClass, JwksKeyStore, JwksTrustState,
-    redacted_jwks_uri, register_trust_change_hook,
+    is_managed_jwks_source, redacted_jwks_uri, register_trust_change_hook,
 };
 
 /// Effective requirements contributed by one active shared-store consumer.
@@ -120,7 +120,8 @@ struct JwksCacheEntry {
 
 const RETIRED_STORE_REAP_INTERVAL: Duration = Duration::from_millis(100);
 
-/// Fixed-cardinality, redacted aggregate of active remote JWKS trust stores.
+/// Fixed-cardinality, redacted aggregate of active refreshable JWKS trust
+/// stores: remote endpoints and admin-managed records (issue #7277).
 ///
 /// Counts never include inline key material. Endpoints, credentials, `kid`
 /// values, tokens, claims, and key bytes never appear here.
@@ -623,7 +624,13 @@ pub fn get_or_create_jwks_store(
             "JWKS cache: creating shared store for {}",
             redacted_jwks_uri(jwks_uri)
         );
-        let store = JwksKeyStore::new(jwks_uri.to_string(), http_client.clone());
+        // A canonical `managed://jwks/<id>#jwks` key names an admin-managed
+        // record (issue #7277); every other key is a validated http(s) URL.
+        let store = if is_managed_jwks_source(jwks_uri) {
+            JwksKeyStore::new_managed(jwks_uri.to_string())
+        } else {
+            JwksKeyStore::new(jwks_uri.to_string(), http_client.clone())
+        };
         store.configure_trust_policy(requested.refresh_interval, requested.max_stale);
         store.configure_kid_miss_cooldown(requested.kid_miss_cooldown);
         let refresh_handle = store.start_background_refresh(requested.refresh_interval);
@@ -955,6 +962,33 @@ pub fn retire_jwks_store_if_unreferenced(jwks_uri: &str) {
         forget_discovered_jwks_uri(jwks_uri);
         republish_trust_health();
     }
+}
+
+/// Re-read every shared store backed by an admin-managed JWKS record, now.
+///
+/// Called by the admin API after a managed JWKS record is created, replaced,
+/// or deleted, and awaited before the response is sent: when the write returns,
+/// every JWKS consumer on this node already verifies with the new key set (or
+/// refuses, after a delete). Other nodes sharing the store directory pick the
+/// change up on their own re-read cadence. Returns the number of stores read.
+///
+/// Stores are collected first and read afterwards, so no `DashMap` guard is
+/// held across an await.
+pub async fn refresh_managed_jwks_stores() -> usize {
+    let stores: Vec<Arc<JwksKeyStore>> = match JWKS_CACHE.get() {
+        Some(cache) => cache
+            .iter()
+            .filter(|entry| entry.value().store.is_managed())
+            .map(|entry| Arc::clone(&entry.value().store))
+            .collect(),
+        None => Vec::new(),
+    };
+    for store in &stores {
+        // A withdrawn or unreadable record is recorded on the store itself;
+        // the admin write that triggered the read has already committed.
+        let _ = store.fetch_keys().await;
+    }
+    stores.len()
 }
 
 /// Return the current interval and task generation for diagnostics and tests.
