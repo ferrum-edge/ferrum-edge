@@ -325,10 +325,9 @@ No `ci.yml` job may request `id-token: write`, job-scoped or workflow-level
 (the trusted Cross policy's `nonpublishing_ci_errors`; the BoringCache backend
 that needed it was removed in issue #6573). OIDC is used only by `release.yml`
 and `main-latest-image.yml` for signing and attestation. A same-repository pull
-request can still add the permission to its own workflow copy for that run, so
-a token is only harmless when nothing trusts it: revoke the
-`ferrum-edge/ferrum-edge` Machine connection in the BoringCache Workspace
-`jeremy-j/ferrum-edge` if not already revoked.
+request can still add the permission to its own workflow copy for that run; no
+external service trusts this repository's OIDC tokens (the BoringCache Machine
+connection was revoked on 2026-11-14).
 
 ## CI runtime caching (production images and FIPS)
 

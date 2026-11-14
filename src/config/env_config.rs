@@ -2837,7 +2837,8 @@ pub struct EnvConfig {
     pub mesh_sidecar_enforced_dry_run: bool,
     /// When `true`, and only when `FERRUM_MESH_SIDECAR_ENFORCED=true`, the
     /// slice builder also narrows `workloads` to SPIFFE identities referenced
-    /// by admitted services. Default `false` for a one-release rollout window.
+    /// by admitted services. Default `true` (issue #7243); `false` is the
+    /// explicit off switch.
     pub mesh_sidecar_identity_narrowing: bool,
     /// CP-side: ordering domain this control plane advertises for authoritative
     /// mesh config revisions (`FERRUM_MESH_CONFIG_AUTHORITY_ID`, issue #2473).
@@ -4576,7 +4577,7 @@ impl Default for EnvConfig {
             mesh_outbound_registry_reject_status: 502,
             mesh_sidecar_enforced: false,
             mesh_sidecar_enforced_dry_run: false,
-            mesh_sidecar_identity_narrowing: false,
+            mesh_sidecar_identity_narrowing: true,
             mesh_config_authority_id: crate::modes::mesh::revision::DEFAULT_CONFIG_AUTHORITY_ID
                 .to_string(),
             mesh_config_k8s_authority_id: String::new(),
@@ -4983,6 +4984,12 @@ impl EnvConfig {
                 => crate::admin::audit::AUDIT_RETAINED_MAX_RECORDS_DEFAULT;
             admin_audit_max_delivery_attempts: u32 = "FERRUM_ADMIN_AUDIT_MAX_DELIVERY_ATTEMPTS"
                 => crate::admin::audit::AUDIT_MAX_DELIVERY_ATTEMPTS_DEFAULT;
+            admin_audit_local_retention_max_records: u64
+                = "FERRUM_ADMIN_AUDIT_LOCAL_RETENTION_MAX_RECORDS"
+                => crate::admin::audit::AUDIT_LOCAL_RETENTION_MAX_RECORDS_DEFAULT;
+            admin_audit_local_retention_max_bytes: u64
+                = "FERRUM_ADMIN_AUDIT_LOCAL_RETENTION_MAX_BYTES"
+                => crate::admin::audit::AUDIT_LOCAL_RETENTION_MAX_BYTES_DEFAULT;
             admin_require_namespace_claim: bool = "FERRUM_ADMIN_REQUIRE_NAMESPACE_CLAIM" => false;
             gateway_listener_failure_fails_readiness: bool
                 = "FERRUM_GATEWAY_LISTENER_FAILURE_FAILS_READINESS" => false;
@@ -5095,6 +5102,13 @@ impl EnvConfig {
             spool_max_records: admin_audit_spool_max_records,
             retained_max_records: admin_audit_retained_max_records,
             max_delivery_attempts: admin_audit_max_delivery_attempts,
+            // Resolved from `FERRUM_ADMIN_AUDIT_FALLBACK_PATH` at first write,
+            // like the backup fallback file it sits beside.
+            local_retention_dir: None,
+            local_retention: crate::admin::audit::LocalAuditRetentionBounds {
+                max_records: admin_audit_local_retention_max_records,
+                max_bytes: admin_audit_local_retention_max_bytes,
+            },
         };
         admin_audit_pipeline.validate()?;
         if resolve_var(conf, "FERRUM_DB_POLL_INTERVAL")
@@ -5232,7 +5246,7 @@ impl EnvConfig {
             mesh_outbound_registry_reject_status: u16 = "FERRUM_MESH_OUTBOUND_REGISTRY_REJECT_STATUS" => 502u16;
             mesh_sidecar_enforced: bool = "FERRUM_MESH_SIDECAR_ENFORCED" => false;
             mesh_sidecar_enforced_dry_run: bool = "FERRUM_MESH_SIDECAR_ENFORCED_DRY_RUN" => false;
-            mesh_sidecar_identity_narrowing: bool = "FERRUM_MESH_SIDECAR_IDENTITY_NARROWING" => false;
+            mesh_sidecar_identity_narrowing: bool = "FERRUM_MESH_SIDECAR_IDENTITY_NARROWING" => true;
             mesh_config_authority_id: String = "FERRUM_MESH_CONFIG_AUTHORITY_ID" => crate::modes::mesh::revision::DEFAULT_CONFIG_AUTHORITY_ID.to_string();
             mesh_config_k8s_authority_id: String = "FERRUM_MESH_CONFIG_K8S_AUTHORITY_ID" => String::new();
             mesh_config_revision_adopt_secs: u64 = "FERRUM_MESH_CONFIG_REVISION_ADOPT_SECS" => crate::modes::mesh::revision::DEFAULT_FOREIGN_AUTHORITY_ADOPT_SECS;

@@ -380,6 +380,13 @@ impl ServeHandles {
         let mut background_handles = self.background_handles;
         background_handles.extend(self.proxy_state.health_checker.take_active_check_handles());
         join_background_handles(background_handles, self.background_drain_timeout).await;
+        crate::admin::audit::shutdown_local_retention_delivery(Duration::from_secs(
+            self.proxy_state
+                .env_config
+                .shutdown_drain_seconds
+                .clamp(5, 60),
+        ))
+        .await;
         crate::observability_delivery::shutdown(Duration::from_millis(
             self.proxy_state.env_config.log_shutdown_drain_timeout_ms,
         ))
@@ -1173,6 +1180,10 @@ pub async fn serve(
     let gateway_listener_status =
         Arc::new(crate::proxy::gateway_listener_status::GatewayListenerStatus::new());
     crate::proxy::gateway_listener_status::install_for_metrics(&gateway_listener_status);
+    // No configuration database in this mode: durable admin audit records are
+    // retained in the bounded local retention file (issue #7200). Start the
+    // worker that adopts and drains the spool into it before admin traffic.
+    crate::admin::audit::start_local_retention_delivery(env_config.admin_audit_enabled);
     let admin_state = AdminState {
         db: None,
         jwt_manager,

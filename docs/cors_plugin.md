@@ -98,10 +98,11 @@ the proxy core (see [routing.md](routing.md#websocket-origin-admission)).
 These fields are independent: a strict CORS allowlist does **not** restrict WebSocket
 upgrades until `allowed_ws_origins` is populated. `*` is not a wildcard on
 `allowed_ws_origins` (unlike `cors.allowed_origins`); the empty list is the only
-allow-all, and Admin API / `ferrum-edge validate` reject `"*"`. At config load the
-gateway warns when a proxy has non-wildcard CORS but an empty `allowed_ws_origins`
-list, and also warns once per proxy whose loaded `allowed_ws_origins` still
-contains `*` or a non-origin entry.
+allow-all, and Admin API writes, file-mode loads (startup and SIGHUP reload), and
+`ferrum-edge validate` reject `"*"`. At config load the gateway warns when a proxy has
+non-wildcard CORS but an empty `allowed_ws_origins` list, and in database, CP and DP
+modes also warns once per proxy whose stored `allowed_ws_origins` still contains `*`
+or a non-origin entry.
 
 ## Usage Examples
 

@@ -9441,7 +9441,7 @@ async fn statsd_logging_schema_matches_strict_runtime_config_contract() {
             "docs/plugins.md statsd section missing `{key}`"
         );
     }
-    assert!(statsd_docs.contains("OptionalFailOpen"));
+    assert!(statsd_docs.contains("KeepLastKnownGood"));
     assert!(statsd_docs.contains("max_retries"));
     assert!(statsd_docs.contains("retry_delay_ms"));
 
@@ -15181,6 +15181,7 @@ fn oidc_relying_party_schema_matches_strict_runtime_surface() {
             "forward_access_token",
             "id_token_clock_skew_secs",
             "issuer",
+            "jwks_source",
             "jwks_uri",
             "logout_path",
             "max_age_secs",
@@ -15601,7 +15602,7 @@ fn ws_frame_logging_schema_matches_runtime_admission_contract() {
         .as_str()
         .expect("WsFrameLoggingConfig description");
     for contract in [
-        "OptionalFailOpen",
+        "KeepLastKnownGood",
         "FERRUM_LOG_LEVEL=warn",
         "HTTP 400",
         "stricter than `warn`",
@@ -15695,7 +15696,7 @@ fn ws_frame_logging_schema_matches_runtime_admission_contract() {
         "HTTP 400",
         "stricter than `warn`",
         "diagnostic can repeat",
-        "OptionalFailOpen",
+        "KeepLastKnownGood",
     ] {
         assert!(
             docs_section.contains(contract),
@@ -19299,6 +19300,12 @@ fn jwks_auth_schema_matches_runtime_admission() {
             "require_dpop": true,
             "dpop_replay_scope": "process"
         })),
+        // Issue #7277: an admin-managed JWKS record.
+        json!({"providers": [{"jwks_source": "managed://jwks/idp#jwks"}]}),
+        json!({"providers": [{
+            "jwks_source": "managed://jwks/idp#jwks",
+            "jwks_max_stale_seconds": 600
+        }]}),
     ];
     for config in &accepted {
         assert_component_validity(&spec, "JwksAuthConfig", config, true);
@@ -19328,6 +19335,10 @@ fn jwks_auth_schema_matches_runtime_admission() {
         json!({"providers": [{"jwks_uri": JWKS_URI}], "claim_headers_separator": ""}),
         remote(json!({"clock_skew_seconds": 301})),
         json!({"providers": [{"jwks_uri": JWKS_URI}], "clock_skew_seconds": 301}),
+        remote(json!({"jwks_source": "managed://jwks/idp#jwks"})),
+        local(json!({"jwks_source": "managed://jwks/idp#jwks"})),
+        json!({"providers": [{"jwks_source": "vault://secret/data/idp#jwks"}]}),
+        json!({"providers": [{"jwks_source": ""}]}),
     ];
     for config in &rejected {
         assert_component_validity(&spec, "JwksAuthConfig", config, false);

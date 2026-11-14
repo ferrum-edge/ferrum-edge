@@ -189,15 +189,17 @@ Context: root.
 {{/*
 Mirror EnvConfig::validate_cp_dp_grpc_transport_security (src/config/env_config.rs)
 for a pod that runs FERRUM_MODE=cp from `.env`: a non-loopback, non-zero
-FERRUM_CP_GRPC_LISTEN_ADDR (default 0.0.0.0:50051) with no
+FERRUM_CP_GRPC_LISTEN_ADDR (default `.defaultListenAddr`, the address the chart
+renders from the component's grpcPort, else 0.0.0.0:50051) with no
 FERRUM_CP_GRPC_TLS_CERT_PATH + FERRUM_CP_GRPC_TLS_KEY_PATH pair and no
 FERRUM_CP_DP_GRPC_ALLOW_PLAINTEXT=true exits at boot, so fail the render
 instead of shipping a crash-looping pod (issue #7298).
-Input: dict "label" <values path of the env map> "env" <env map>.
+Input: dict "label" <values path of the env map> "env" <env map>
+"defaultListenAddr" <optional chart-rendered listen address>.
 */}}
 {{- define "ferrum-mesh.validateCpGrpcTransport" -}}
 {{- $env := .env | default dict -}}
-{{- $addr := trim (toString (index $env "FERRUM_CP_GRPC_LISTEN_ADDR" | default "0.0.0.0:50051")) -}}
+{{- $addr := trim (toString (index $env "FERRUM_CP_GRPC_LISTEN_ADDR" | default (.defaultListenAddr | default "0.0.0.0:50051"))) -}}
 {{- $port := regexFind "[0-9]+$" $addr -}}
 {{- $host := trimSuffix (printf ":%s" $port) $addr -}}
 {{- $tls := and (trim (toString (index $env "FERRUM_CP_GRPC_TLS_CERT_PATH" | default ""))) (trim (toString (index $env "FERRUM_CP_GRPC_TLS_KEY_PATH" | default ""))) -}}

@@ -433,6 +433,23 @@ fn decode_and_validate_document(
         );
     }
 
+    // File mode is fatal on invalid local config (issue #7218): the CORS-style
+    // `allowed_ws_origins: ["*"]` footgun and non-origin entries are refused at
+    // load and SIGHUP reload, exactly as Admin API writes refuse them. Database,
+    // CP and DP loads keep #5454's grandfathering (warn-only through
+    // `Proxy::warn_legacy_allowed_ws_origins`): stored rows there are not
+    // operator-edited files and must not take a running gateway down. Every
+    // namespace in the file is checked, like the field-level validators above.
+    let ws_origin_errors = config.allowed_ws_origins_admission_errors();
+    if !ws_origin_errors.is_empty() {
+        anyhow::bail!(
+            "Configuration validation failed: {} invalid `allowed_ws_origins` \
+             entry(ies) found: {}",
+            ws_origin_errors.len(),
+            ws_origin_errors.join("; ")
+        );
+    }
+
     // Reject mesh-projected upstream fields on this operator-provided file load.
     // File config is operator-authored, so (like the admin write path) it must not
     // carry reserved `mesh.*` target tags or `Upstream.{port_overrides, source_locality, source_labels,

@@ -638,6 +638,12 @@ ca:
   # fixed at 1 in the template — an explicit non-HA choice; scale via separate
   # releases or out-of-band if you need CA redundancy.
   enabled: false
+  # CP/DP gRPC port of the CA Deployment: the chart renders
+  # FERRUM_CP_GRPC_LISTEN_ADDR=0.0.0.0:<grpcPort> (unless ca.env sets
+  # FERRUM_CP_GRPC_LISTEN_ADDR) and uses the same port for the `grpc` container
+  # port and the ferrum-mesh-ca Service, so the CA is reachable in-cluster at
+  # ferrum-mesh-ca.<release namespace>.svc:<grpcPort>.
+  grpcPort: 50051
   env:
     FERRUM_MESH_PRODUCTION_MODE: "true"
   # Same admin health semantics as controlPlane (CP mode).

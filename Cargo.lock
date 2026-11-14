@@ -2199,6 +2199,7 @@ dependencies = [
  "dimpl 0.6.1",
  "dimpl 0.8.0",
  "ferrum-ebpf-common",
+ "ferrum-edge",
  "flate2",
  "futures",
  "futures-util",

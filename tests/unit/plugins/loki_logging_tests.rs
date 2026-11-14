@@ -23,7 +23,8 @@ use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use super::plugin_utils::{
-    create_test_stream_transaction_summary, create_test_transaction_summary,
+    assert_ws_session_end_record, create_test_stream_transaction_summary,
+    create_test_transaction_summary, create_test_ws_disconnect_context,
     read_http11_request_headers,
 };
 
@@ -509,6 +510,37 @@ async fn test_loki_overlapping_plugin_generations_use_distinct_emitter_stream_la
         })
         .collect::<std::collections::HashSet<_>>();
     assert_eq!(emitters.len(), 2);
+}
+
+/// Issue #7144: `loki_logging` pushes the shared WebSocket session-end record
+/// from `on_ws_disconnect` as one log line.
+#[tokio::test]
+async fn test_loki_logging_delivers_ws_session_end_record() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/loki/api/v1/push"))
+        .respond_with(ResponseTemplate::new(204))
+        .mount(&server)
+        .await;
+    let plugin = LokiLogging::new(
+        &delivery_config(format!("{}/loki/api/v1/push", server.uri())),
+        default_client(),
+    )
+    .unwrap();
+    assert!(plugin.requires_ws_disconnect_hooks());
+    plugin.start_background_tasks().expect("live start");
+    plugin.commit_background_tasks();
+
+    plugin
+        .on_ws_disconnect(&create_test_ws_disconnect_context())
+        .await;
+
+    let requests = wait_for_requests(&server, 1).await;
+    let payload: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+    let values = payload["streams"][0]["values"].as_array().unwrap();
+    assert_eq!(values.len(), 1);
+    let line: serde_json::Value = serde_json::from_str(values[0][1].as_str().unwrap()).unwrap();
+    assert_ws_session_end_record(&line, "loki_logging");
 }
 
 #[tokio::test]

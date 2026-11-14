@@ -37,7 +37,7 @@
 
 use std::collections::HashMap;
 
-use ferrum_edge::config::types::{GatewayConfig, Upstream, UpstreamTarget};
+use ferrum_edge::config::types::{BackendScheme, GatewayConfig, Upstream, UpstreamTarget};
 use ferrum_edge::config_sources::k8s::{
     K8sMetadata, K8sObject, K8sTranslationOptions, translate_k8s_objects,
 };
@@ -1999,5 +1999,136 @@ fn an_unrelated_namespace_rule_never_reaches_the_synthesized_egress_upstream() {
     assert_eq!(
         upstream.backend_tls_sni, baseline_sni,
         "and it must not originate TLS on the owner's behalf either"
+    );
+}
+
+// ── EgressGateway: the DestinationRule drives the backend scheme ─────────
+//
+// Issue #7236, Istio semantics: an external `HTTP`, `HTTP2` or `GRPC`
+// ServiceEntry port is plaintext (gRPC dials h2c) unless a DestinationRule
+// `tls.mode` of `SIMPLE`, `MUTUAL` or `ISTIO_MUTUAL` asks the gateway to
+// originate TLS. `DISABLE` or no `tls` keeps it plaintext. A `TLS` port stays a
+// terminate-and-re-originate port whatever the rule says.
+
+/// The owner's DestinationRule for [`EXTERNAL_HOST`] with only a top-level
+/// `tls.mode`.
+fn external_tls_mode_rule(mode: MtlsMode) -> MeshDestinationRule {
+    let mut dr = rule(
+        EXTERNAL_HOST_OWNER,
+        "owner-tls",
+        EXTERNAL_HOST,
+        2222,
+        &["*"],
+    );
+    dr.traffic_policy = Some(MeshTrafficPolicy {
+        tls: Some(MeshTrafficPolicyTls {
+            mode,
+            ..MeshTrafficPolicyTls::default()
+        }),
+        ..MeshTrafficPolicy::default()
+    });
+    dr
+}
+
+/// The backend scheme of the egress proxy materialized for [`EXTERNAL_HOST`]
+/// when its ServiceEntry port declares `protocol`, under `rules`.
+fn egress_scheme_for(protocol: AppProtocol, rules: Vec<MeshDestinationRule>) -> BackendScheme {
+    let mut mesh = egress_gateway_mesh(EXTERNAL_HOST_OWNER, rules);
+    mesh.service_entries[0].ports[0].protocol = protocol;
+    let prepared = prepare_egress_gateway(mesh);
+    let upstream = prepared
+        .upstreams
+        .iter()
+        .find(|u| u.targets.iter().any(|t| t.host == EXTERNAL_HOST))
+        .expect("the egress gateway materializes an upstream for the ServiceEntry host");
+    prepared
+        .proxies
+        .iter()
+        .find(|p| p.upstream_id.as_deref() == Some(upstream.id.as_str()))
+        .expect("the materialized egress upstream has a referencing proxy")
+        .backend_scheme
+        .expect("an HTTP-family egress proxy carries a backend scheme")
+}
+
+#[test]
+fn egress_gateway_http2_and_grpc_ports_are_plaintext_without_a_destination_rule() {
+    for protocol in [AppProtocol::Http, AppProtocol::Http2, AppProtocol::Grpc] {
+        assert_eq!(
+            egress_scheme_for(protocol, Vec::new()),
+            BackendScheme::Http,
+            "{protocol:?}: an external port with no DestinationRule is plaintext (h2c for gRPC)"
+        );
+    }
+}
+
+#[test]
+fn egress_gateway_destination_rule_tls_mode_originates_tls() {
+    for protocol in [AppProtocol::Http, AppProtocol::Http2, AppProtocol::Grpc] {
+        assert_eq!(
+            egress_scheme_for(protocol, vec![external_tls_mode_rule(MtlsMode::Simple)]),
+            BackendScheme::Https,
+            "{protocol:?}: tls.mode SIMPLE originates TLS to the external backend"
+        );
+        assert_eq!(
+            egress_scheme_for(protocol, vec![external_tls_mode_rule(MtlsMode::Disable)]),
+            BackendScheme::Http,
+            "{protocol:?}: tls.mode DISABLE keeps the external port plaintext"
+        );
+    }
+}
+
+#[test]
+fn egress_gateway_port_level_tls_mode_overrides_the_top_level_mode() {
+    let port = 443;
+    let with_port_mode = |top: MtlsMode, per_port: MtlsMode| {
+        let mut dr = external_tls_mode_rule(top);
+        dr.port_level_settings.insert(
+            port,
+            MeshTrafficPolicy {
+                tls: Some(MeshTrafficPolicyTls {
+                    mode: per_port,
+                    ..MeshTrafficPolicyTls::default()
+                }),
+                ..MeshTrafficPolicy::default()
+            },
+        );
+        egress_scheme_for(AppProtocol::Grpc, vec![dr])
+    };
+    assert_eq!(
+        with_port_mode(MtlsMode::Disable, MtlsMode::Simple),
+        BackendScheme::Https,
+        "a SIMPLE portLevelSettings entry for the ServiceEntry port originates TLS"
+    );
+    assert_eq!(
+        with_port_mode(MtlsMode::Simple, MtlsMode::Disable),
+        BackendScheme::Http,
+        "a DISABLE portLevelSettings entry keeps that port plaintext"
+    );
+}
+
+#[test]
+fn egress_gateway_unrelated_namespace_rule_cannot_turn_on_tls_origination() {
+    let mut claimant = external_tls_mode_rule(MtlsMode::Simple);
+    claimant.namespace = "evil".to_string();
+    assert_eq!(
+        egress_scheme_for(AppProtocol::Grpc, vec![claimant]),
+        BackendScheme::Http,
+        "only a rule the lookup path admits for the host can change its scheme"
+    );
+}
+
+#[test]
+fn egress_gateway_tls_port_always_originates_tls() {
+    assert_eq!(
+        egress_scheme_for(AppProtocol::Tls, Vec::new()),
+        BackendScheme::Https
+    );
+    assert_eq!(
+        egress_scheme_for(
+            AppProtocol::Tls,
+            vec![external_tls_mode_rule(MtlsMode::Disable)]
+        ),
+        BackendScheme::Https,
+        "a TLS port is a terminate-and-re-originate port; DISABLE does not downgrade it"
     );
 }

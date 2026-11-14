@@ -324,9 +324,9 @@ pub struct ServicePort {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
     /// Kubernetes `Service.spec.ports[].targetPort` — the container port the
-    /// service forwards to, authoritative over the port name/number heuristic
-    /// when resolving the inbound backend. `IntOrString`: a numeric container
-    /// port or a named container port. Absent defaults to `port` (K8s rule).
+    /// service forwards to. `IntOrString`: a numeric container port or a named
+    /// container port. Absent means `port` on every path (K8s rule; see
+    /// [`resolve_service_backend_port`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target_port: Option<ServiceTargetPort>,
 }
@@ -343,10 +343,10 @@ pub enum ServiceTargetPort {
 /// Resolve a Service port's `targetPort` to a backend (container) port when it
 /// yields a usable one: a non-zero numeric targetPort, or a named targetPort
 /// that matches one of `workload_ports`. Returns `None` when no targetPort is
-/// declared, a numeric one is zero, or a named one doesn't resolve — leaving the
-/// caller to apply its own fallback (each dialing path differs: skip, the
-/// service port, the workload's first port, ...). Shared so every path that
-/// dials a workload/endpoint address honors `targetPort` consistently.
+/// declared, a numeric one is zero, or a named one doesn't resolve. Paths that
+/// resolve a Service port against a workload use
+/// [`resolve_service_backend_port`], which adds the absent-means-service-port
+/// rule; this lower-level form is for ServiceEntry ports with no workload.
 pub(crate) fn resolve_target_port(
     target_port: Option<&ServiceTargetPort>,
     workload_ports: &[WorkloadPort],
@@ -358,6 +358,41 @@ pub(crate) fn resolve_target_port(
             .find(|wp| wp.name.as_deref() == Some(name.as_str()))
             .map(|wp| wp.port),
         _ => None,
+    }
+}
+
+/// The ONE Kubernetes rule for the backend (container) port a Service port
+/// forwards to on a given workload (issue #7236). Every path that turns a
+/// Service port into a workload dial or a local backend uses it: outbound
+/// Sidecar/Ambient targets, raw-TCP by-workload upstreams, east-west and
+/// NodeWaypoint targets, mesh authz destination scopes, and Sidecar inbound.
+///
+/// - A DECLARED `targetPort` is authoritative: a non-zero number is used
+///   as-is (no matching `containerPort` is needed), a name resolves against
+///   `workload_ports`. One that does not yield a usable port returns `None`
+///   and the caller skips the workload (fail closed) rather than guessing.
+/// - An ABSENT `targetPort` means the service port, exactly as the Kubernetes
+///   API server defaults it. The workload's container-port names or numbers are
+///   never consulted.
+///
+/// `None` also covers a zero service port. The Kubernetes API always sets
+/// `targetPort`, so only native/file/xDS-authored services reach the absent arm.
+pub(crate) fn resolve_service_backend_port(
+    service_port: u16,
+    target_port: Option<&ServiceTargetPort>,
+    workload_ports: &[WorkloadPort],
+) -> Option<u16> {
+    match target_port {
+        Some(_) => resolve_target_port(target_port, workload_ports),
+        None => Some(service_port),
+    }
+    .filter(|port| *port != 0)
+}
+
+impl ServicePort {
+    /// [`resolve_service_backend_port`] for this Service port.
+    pub(crate) fn backend_port_for(&self, workload_ports: &[WorkloadPort]) -> Option<u16> {
+        resolve_service_backend_port(self.port, self.target_port.as_ref(), workload_ports)
     }
 }
 

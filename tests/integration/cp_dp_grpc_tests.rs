@@ -8577,3 +8577,150 @@ mod configsync_size_bounds {
         backend_task.abort();
     }
 }
+
+/// Managed JWKS material in CP/DP mode (issue #7277). The record itself never
+/// travels on ConfigSync: the CP distributes the `jwks_auth` config, which
+/// carries only the `managed://jwks/<id>#jwks` reference, and the DP resolves
+/// it from its own managed TLS store. CP and DP share one store volume — the
+/// supported multi-node deployment — which this in-process test models with
+/// the single process store. A rotation written on the CP side reaches the
+/// running DP plugin on its re-read cadence without a config change, and a
+/// deleted record withdraws the DP's keys.
+mod managed_jwks_distribution {
+    use super::*;
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use ferrum_edge::plugins::utils::jwks_cache::cached_store;
+    use ferrum_edge::plugins::utils::jwks_store::JwksTrustState;
+    use ferrum_edge::tls::managed::ManagedTlsRecord;
+
+    fn ec_jwks(kid: &str) -> String {
+        let key_pair =
+            rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).expect("P-256 key");
+        let point = key_pair.public_key_raw();
+        serde_json::json!({"keys": [{
+            "kty": "EC",
+            "crv": "P-256",
+            "alg": "ES256",
+            "use": "sig",
+            "kid": kid,
+            "x": URL_SAFE_NO_PAD.encode(&point[1..33]),
+            "y": URL_SAFE_NO_PAD.encode(&point[33..]),
+        }]})
+        .to_string()
+    }
+
+    fn write_record(id: &str, document: String) {
+        ferrum_edge::tls::managed::global_store()
+            .expect("process managed store")
+            .upsert(
+                ManagedTlsRecord::new_jwks(id.to_string(), id.to_string(), None, document),
+                true,
+            )
+            .expect("write managed JWKS");
+    }
+
+    async fn wait_for(description: &str, mut condition: impl FnMut() -> bool) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+        while !condition() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "timed out waiting for {description}"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    fn trusted_kids(source: &str) -> Vec<String> {
+        let Some(store) = cached_store(source) else {
+            return Vec::new();
+        };
+        let mut kids: Vec<String> = store
+            .trusted_keys()
+            .map(|keys| keys.keys().cloned().collect())
+            .unwrap_or_default();
+        kids.sort();
+        kids
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn dp_resolves_and_follows_a_managed_jwks_record_named_by_cp_config() {
+        let record_id = format!("cpdp-{}", uuid::Uuid::new_v4().simple());
+        let source = format!("managed://jwks/{record_id}#jwks");
+        write_record(&record_id, ec_jwks("cp-first"));
+
+        let mut cp_config = create_test_config(1);
+        cp_config.plugin_configs = vec![PluginConfig {
+            labels: Default::default(),
+            id: "managed-jwks-auth".to_string(),
+            namespace: ferrum_edge::config::types::default_namespace(),
+            plugin_name: "jwks_auth".to_string(),
+            config: serde_json::json!({
+                "jwks_refresh_interval_secs": 1,
+                "providers": [{
+                    "issuer": "https://cpdp.idp.example",
+                    "jwks_source": source,
+                }]
+            }),
+            scope: PluginScope::Global,
+            proxy_id: None,
+            enabled: true,
+            priority_override: None,
+            trigger: None,
+            api_spec_id: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        }];
+        let (addr, _update_tx, server_handle) = start_test_cp_server(cp_config).await;
+
+        let proxy_state = create_test_proxy_state();
+        let ps = proxy_state.clone();
+        let cp_url = format!("http://127.0.0.1:{}", addr.port());
+        let client_handle = tokio::spawn(async move {
+            dp_client::connect_and_subscribe(
+                &cp_url,
+                &test_secret(),
+                "managed-jwks-dp",
+                &ps,
+                None,
+                "ferrum",
+            )
+            .await
+        });
+
+        // The DP applies the distributed config verbatim and its jwks_auth
+        // reads the record from the node's managed store.
+        wait_for("the DP to read the managed record", || {
+            trusted_kids(&source) == vec!["cp-first".to_string()]
+        })
+        .await;
+        let applied = proxy_state.config.load();
+        assert_eq!(
+            applied.plugin_configs[0].config["providers"][0]["jwks_source"],
+            serde_json::json!(source),
+            "ConfigSync carries the reference, never the material"
+        );
+
+        // Rotation written through the CP's store (shared volume): the DP
+        // follows on its re-read cadence with no config change.
+        write_record(&record_id, ec_jwks("cp-second"));
+        wait_for("the DP to adopt the rotated key set", || {
+            trusted_kids(&source) == vec!["cp-second".to_string()]
+        })
+        .await;
+
+        // Deleting the record withdraws every key on the DP.
+        ferrum_edge::tls::managed::global_store()
+            .expect("process managed store")
+            .delete(&record_id)
+            .expect("delete record");
+        wait_for("the DP to withdraw the key set", || {
+            cached_store(&source)
+                .is_some_and(|store| store.health_snapshot().trust_state == JwksTrustState::Expired)
+        })
+        .await;
+        assert!(trusted_kids(&source).is_empty());
+
+        client_handle.abort();
+        server_handle.abort();
+    }
+}

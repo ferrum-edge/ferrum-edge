@@ -173,6 +173,18 @@ pub(crate) const PLUGIN_SCOPED_FIELDS: &[PluginScopedFields] = &[
         ],
         open_maps: &[],
     },
+    // Admin-managed JWKS records live in the gateway-wide managed TLS store,
+    // which a namespace-bounded operator may not reach (issue #7277).
+    PluginScopedFields {
+        plugin: "jwks_auth",
+        fields: &[tls("providers[].jwks_source", MaterialKind::Jwks)],
+        open_maps: &[],
+    },
+    PluginScopedFields {
+        plugin: "oidc_relying_party",
+        fields: &[tls("providers[].jwks_source", MaterialKind::Jwks)],
+        open_maps: &[],
+    },
     PluginScopedFields {
         plugin: "udp_logging",
         fields: &[

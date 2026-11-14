@@ -334,7 +334,7 @@ fn test_creation_defaults() {
     assert!(plugin.requires_ws_disconnect_hooks());
     assert_eq!(
         plugin_failure_policy("ws_frame_logging"),
-        Some(PluginFailurePolicy::OptionalFailOpen)
+        Some(PluginFailurePolicy::KeepLastKnownGood)
     );
 }
 

@@ -131,6 +131,21 @@ entry does **not** claim its listen port, so a following exact-host
 original-destination semantics for raw streams are not implemented; stream
 entries must declare exact hosts or use `resolution: STATIC` with `endpoints[]`.
 
+## EgressGateway backend scheme per ServiceEntry port
+
+The `EgressGateway` decides how it reaches an external `MESH_EXTERNAL`
+`ServiceEntry` port from the port protocol and the `DestinationRule` for the
+host, as Istio does (issue #7236). The effective `tls.mode` is a
+`portLevelSettings` entry for the ServiceEntry port, else the top-level
+`trafficPolicy.tls`.
+
+| ServiceEntry port `protocol` | No `DestinationRule` `tls`, or `tls.mode: DISABLE` | `tls.mode: SIMPLE` / `MUTUAL` / `ISTIO_MUTUAL` |
+|---|---|---|
+| `HTTP` | Plaintext HTTP/1.1 | TLS origination with the rule's CA, client certificate, SNI and SANs |
+| `HTTP2` | Plaintext (HTTP/1.1 for ordinary requests; gRPC requests over h2c) | TLS origination |
+| `GRPC` | Plaintext h2c | TLS origination |
+| `TLS` | TLS origination (verified); `DISABLE` does not downgrade it | TLS origination |
+
 ## Support boundaries, deferrals, and non-goals (the long tail)
 
 These items are off the GA path. Each is a **non-goal**, **deferred** (a field

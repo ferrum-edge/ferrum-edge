@@ -44,13 +44,11 @@ use crate::modes::mesh::access_log_filter::{
 
 use super::utils::log_schema::{SchemaCapabilities, SchemaView, SummarySchema, resolve_schema};
 use super::utils::sink_loss::{SinkLossReason, SinkLossSlot};
-use super::{
-    LATENCY_UNKNOWN_MS, Plugin, StreamTransactionSummary, TransactionSummary, WsDisconnectContext,
-};
+use super::{Plugin, StreamTransactionSummary, TransactionSummary, WsDisconnectContext};
 
-/// Metadata key the projected WebSocket session-end row carries so the record
-/// is locatable at the time the session ended, not only when it was admitted.
-pub const WS_SESSION_END_TIMESTAMP_METADATA_KEY: &str = "websocket.timestamp_disconnected";
+/// Re-exported from [`crate::plugins`], where the shared session-end
+/// projection ([`WsDisconnectContext::session_end_summary`]) lives.
+pub use super::WS_SESSION_END_TIMESTAMP_METADATA_KEY;
 
 /// Sampling resolution: `sampling.rate` resolves to whole records per million
 /// candidates, so the smallest accepted rate is `0.000001`.
@@ -216,7 +214,7 @@ impl StdoutLogging {
     /// method/status/original-path without going through stdout.
     #[doc(hidden)]
     pub fn project_ws_disconnect(ctx: &WsDisconnectContext) -> TransactionSummary {
-        transaction_summary_from_ws_disconnect(ctx)
+        ctx.session_end_summary()
     }
 
     /// Apply the configured HTTP-family predicates, then sampling, to a
@@ -323,56 +321,6 @@ impl StdoutLogging {
             return false;
         }
         !filter.errors_only || summary.error_class.is_some() || summary.connection_error.is_some()
-    }
-}
-
-/// Project a WebSocket session-end into the HTTP-family access-log schema.
-///
-/// Handshake `log()` already emitted the upgrade row (usually without
-/// `error_class`). In-session faults live on `WsDisconnectContext`; this
-/// conversion lets operators grep the same `error_class` key. Method, path,
-/// and status are the values captured at upgrade admission (`GET`/`101` for
-/// HTTP/1.1, `CONNECT`/`200` for RFC 8441/9220 Extended CONNECT) so a
-/// rewritten backend target cannot corrupt those fields. BASE schema only —
-/// this is not the `websocket_disconnect` capability family.
-///
-/// `timestamp_received` stays the admission time and `latency_total_ms` the
-/// session duration. A session has no request/response phase split, so every
-/// other latency is the [`LATENCY_UNKNOWN_MS`] "not observed" sentinel rather
-/// than a fabricated `0.0` or the session duration relabelled as gateway
-/// processing; the end of the session is carried in
-/// [`WS_SESSION_END_TIMESTAMP_METADATA_KEY`].
-fn transaction_summary_from_ws_disconnect(ctx: &WsDisconnectContext) -> TransactionSummary {
-    let mut metadata = ctx.metadata.clone();
-    metadata.insert(
-        WS_SESSION_END_TIMESTAMP_METADATA_KEY.to_string(),
-        ctx.timestamp_disconnected.clone(),
-    );
-    TransactionSummary {
-        namespace: ctx.namespace.clone(),
-        timestamp_received: ctx.timestamp_connected.clone(),
-        client_ip: ctx.client_ip.clone(),
-        consumer_username: ctx.consumer_username.clone(),
-        auth_method: ctx.auth_method,
-        http_method: ctx.http_method.clone(),
-        request_path: ctx.request_path.clone(),
-        proxy_id: Some(ctx.proxy_id.clone()),
-        proxy_name: ctx.proxy_name.clone(),
-        backend_target: Some(ctx.backend_target.clone()),
-        response_status_code: ctx.handshake_status_code,
-        latency_total_ms: ctx.duration_ms,
-        latency_gateway_processing_ms: LATENCY_UNKNOWN_MS,
-        latency_backend_ttfb_ms: LATENCY_UNKNOWN_MS,
-        latency_backend_total_ms: LATENCY_UNKNOWN_MS,
-        latency_plugin_execution_ms: LATENCY_UNKNOWN_MS,
-        latency_plugin_external_io_ms: LATENCY_UNKNOWN_MS,
-        latency_gateway_overhead_ms: LATENCY_UNKNOWN_MS,
-        bytes_sent: ctx.bytes_client_to_backend,
-        bytes_received: ctx.bytes_backend_to_client,
-        error_class: ctx.error_class,
-        metadata,
-        proxy_lifecycle_generation: ctx.proxy_lifecycle_generation,
-        ..TransactionSummary::default()
     }
 }
 
@@ -630,8 +578,7 @@ impl Plugin for StdoutLogging {
     }
 
     async fn on_ws_disconnect(&self, ctx: &WsDisconnectContext) {
-        let summary = transaction_summary_from_ws_disconnect(ctx);
-        self.log(&summary).await;
+        self.log(&ctx.session_end_summary()).await;
     }
 }
 
@@ -922,10 +869,11 @@ mod tests {
 
     #[test]
     fn ws_disconnect_summary_carries_error_class_and_path() {
-        let summary = transaction_summary_from_ws_disconnect(&ws_disconnect(
+        let summary = ws_disconnect(
             Some(ErrorClass::ProtocolError),
             "ws://backend.local:9000/chat",
-        ));
+        )
+        .session_end_summary();
         assert_eq!(summary.response_status_code, 101);
         assert_eq!(summary.http_method, "GET");
         assert_eq!(summary.request_path, "/chat");
@@ -944,12 +892,9 @@ mod tests {
             "filter": { "errors_only": true }
         }))
         .expect("plugin config");
-        let failed = transaction_summary_from_ws_disconnect(&ws_disconnect(
-            Some(ErrorClass::ConnectionReset),
-            "http://127.0.0.1:9/",
-        ));
-        let clean =
-            transaction_summary_from_ws_disconnect(&ws_disconnect(None, "http://127.0.0.1:9/"));
+        let failed = ws_disconnect(Some(ErrorClass::ConnectionReset), "http://127.0.0.1:9/")
+            .session_end_summary();
+        let clean = ws_disconnect(None, "http://127.0.0.1:9/").session_end_summary();
         assert!(plugin.should_log_transaction(&failed));
         assert!(!plugin.should_log_transaction(&clean));
     }

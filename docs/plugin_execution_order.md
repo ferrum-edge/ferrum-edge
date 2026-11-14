@@ -1889,11 +1889,11 @@ Given all built-in plugins enabled, the execution order is:
 | 66 | `stdout_logging` | 9000 | log, on_stream_disconnect, on_ws_disconnect |
 | 67 | `ws_frame_logging` | 9050 | on_ws_policy_close, prepare_ws_frame_delivery, emit_ws_frame_delivery, on_ws_disconnect |
 | 68 | `statsd_logging` | 9075 | log, on_stream_disconnect, on_ws_disconnect |
-| 69 | `http_logging` | 9100 | log, on_stream_disconnect |
-| 70 | `tcp_logging` | 9125 | log, on_stream_disconnect |
-| 71 | `kafka_logging` | 9150 | log, on_stream_disconnect |
-| 72 | `loki_logging` | 9155 | log, on_stream_disconnect |
-| 73 | `udp_logging` | 9160 | log, on_stream_disconnect |
+| 69 | `http_logging` | 9100 | log, on_stream_disconnect, on_ws_disconnect |
+| 70 | `tcp_logging` | 9125 | log, on_stream_disconnect, on_ws_disconnect |
+| 71 | `kafka_logging` | 9150 | log, on_stream_disconnect, on_ws_disconnect |
+| 72 | `loki_logging` | 9155 | log, on_stream_disconnect, on_ws_disconnect |
+| 73 | `udp_logging` | 9160 | log, on_stream_disconnect, on_ws_disconnect |
 | 74 | `ws_logging` | 9175 | log, on_stream_disconnect, on_ws_disconnect |
 | 75 | `transaction_debugger` | 9200 | on_request_received, before_proxy, on_final_request_body, after_proxy, on_final_response_body, log, on_stream_disconnect, on_ws_disconnect |
 | 76 | `proxy_alerts` | 9250 | log, on_stream_disconnect, on_ws_disconnect |

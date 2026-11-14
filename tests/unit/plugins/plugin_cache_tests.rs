@@ -3326,11 +3326,14 @@ fn test_optional_custom_plugin_validation_failure_is_omitted() {
     );
 }
 
+/// Issue #7144: `ws_frame_logging` is a log sink, so it is
+/// `KeepLastKnownGood` like every other log sink: an invalid config rejects the
+/// initial cache and a reload, and the previous generation keeps serving.
 #[test]
-fn test_ws_frame_logging_invalid_config_is_omitted_on_admission_and_reload() {
+fn test_ws_frame_logging_invalid_config_keeps_last_known_good_on_admission_and_reload() {
     assert_eq!(
         ferrum_edge::plugins::plugin_failure_policy("ws_frame_logging"),
-        Some(ferrum_edge::plugins::PluginFailurePolicy::OptionalFailOpen)
+        Some(ferrum_edge::plugins::PluginFailurePolicy::KeepLastKnownGood)
     );
 
     let invalid = make_config(
@@ -3343,15 +3346,9 @@ fn test_ws_frame_logging_invalid_config_is_omitted_on_admission_and_reload() {
             Some("p1"),
         )],
     );
-    let cache = PluginCache::new(&invalid)
-        .expect("OptionalFailOpen must admit snapshot despite bad config");
     assert!(
-        cache.get_plugins("ferrum", "p1").is_empty(),
-        "invalid ws_frame_logging must be omitted from published cache"
-    );
-    assert!(
-        !cache.requires_ws_frame_hooks("ferrum", "p1"),
-        "omitted logger must not force frame-hook selection"
+        PluginCache::new(&invalid).is_err(),
+        "an invalid ws_frame_logging must reject the initial cache"
     );
 
     let valid = make_config(
@@ -3397,12 +3394,17 @@ fn test_ws_frame_logging_invalid_config_is_omitted_on_admission_and_reload() {
             &delta.removed_proxy_ids,
             delta.global_plugin_configs_changed,
         )
-        .expect("OptionalFailOpen reload must publish by omitting the bad instance");
-    assert!(
-        cache.get_plugins("ferrum", "p1").is_empty(),
-        "reload must omit oversized payload_preview_bytes rather than clamp"
+        .expect_err("oversized payload_preview_bytes must reject the reload, not clamp");
+    assert_eq!(
+        cache
+            .get_plugins("ferrum", "p1")
+            .iter()
+            .map(|plugin| plugin.name())
+            .collect::<Vec<_>>(),
+        vec!["ws_frame_logging"],
+        "the rejected reload keeps the previously published logger"
     );
-    assert!(!cache.requires_ws_frame_hooks("ferrum", "p1"));
+    assert!(cache.requires_ws_frame_hooks("ferrum", "p1"));
 }
 
 #[test]

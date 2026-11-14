@@ -572,6 +572,44 @@ fn test_parse_auth_mode_unknown_is_rejected() {
     assert!(parse_auth_mode("").is_err());
 }
 
+/// Issue #7218 keeps #5454's grandfathering in database mode: a stored proxy
+/// row whose `allowed_ws_origins` holds the CORS-style `*` or a non-origin
+/// entry still loads (warn-only), while file mode refuses the same value.
+#[tokio::test]
+async fn database_mode_keeps_loading_stored_star_and_non_origin_allowed_ws_origins() {
+    let directory = tempfile::TempDir::new().unwrap();
+    let db_url = format!(
+        "sqlite:{}?mode=rwc",
+        directory.path().join("ws-origins.db").display()
+    );
+    let store = DatabaseStore::connect_with_pool_config("sqlite", &db_url, DbPoolConfig::default())
+        .await
+        .unwrap();
+    let mut proxy = make_http_proxy("ws-origins-7218");
+    let stored = vec![
+        "*".to_string(),
+        "not an origin".to_string(),
+        "https://app.example.com".to_string(),
+    ];
+    proxy.allowed_ws_origins = stored.clone();
+    assert!(
+        !proxy.allowed_ws_origins_admission_errors().is_empty(),
+        "the stored value is one admission and file mode refuse"
+    );
+    store.create_proxy(&proxy).await.unwrap();
+
+    let config = store
+        .load_full_config("ferrum")
+        .await
+        .expect("database mode must keep loading a grandfathered allowed_ws_origins row");
+    let loaded = config
+        .proxies
+        .iter()
+        .find(|candidate| candidate.id == "ws-origins-7218")
+        .expect("the grandfathered proxy is still served");
+    assert_eq!(loaded.allowed_ws_origins, stored);
+}
+
 /// Issue #7192: proxy columns that used to fall back to a default on a decode
 /// failure (or an unknown enum value) now reject the row, so the last good
 /// config stays live instead of serving plaintext / single-auth / streaming

@@ -15695,3 +15695,102 @@ fn snapshot_overflow_rows_use_the_accumulator_grpc_status_normalization() {
         "the accumulator identity must use the same normalization"
     );
 }
+
+/// Issue #7122: the billing spool's fault injection and its process-global
+/// spool hooks are compiled only with the never-shipped `test-support` cargo
+/// feature, which test builds get from the crate's self dev-dependency. This
+/// suite compiling and running the faulted constructors above proves the
+/// feature is on here; this pins that the production build cannot reach them.
+#[test]
+fn spool_fault_injection_and_hooks_exist_only_with_test_support() {
+    let manifest = include_str!("../../../Cargo.toml");
+    assert!(
+        manifest.contains("\ntest-support = []\n"),
+        "Cargo.toml must declare the empty `test-support` feature"
+    );
+    assert!(
+        manifest.contains("\ndefault = [\"crypto-ring\"]\n"),
+        "`test-support` must never be a default feature"
+    );
+    let dev_dependencies = manifest
+        .split("\n[dev-dependencies]\n")
+        .nth(1)
+        .expect("Cargo.toml has [dev-dependencies]");
+    let dev_dependencies = &dev_dependencies[..dev_dependencies
+        .find("\n[")
+        .unwrap_or(dev_dependencies.len())];
+    assert!(
+        dev_dependencies.contains(
+            "\nferrum-edge = { path = \".\", default-features = false, features = [\"test-support\"] }\n"
+        ),
+        "test builds must enable `test-support` through a self dev-dependency that leaves the \
+         crypto backend to the command line (a FIPS test build must not pull `crypto-ring` back in)"
+    );
+    let normal_dependencies = manifest
+        .split("\n[dependencies]\n")
+        .nth(1)
+        .expect("Cargo.toml has [dependencies]");
+    let normal_dependencies = &normal_dependencies[..normal_dependencies
+        .find("\n[")
+        .unwrap_or(normal_dependencies.len())];
+    assert!(
+        !normal_dependencies.contains("test-support"),
+        "no normal dependency edge may enable `test-support`"
+    );
+
+    let source = include_str!("../../../src/plugins/api_chargeback_sink.rs");
+    let gated = "#[cfg(feature = \"test-support\")]";
+    for item in [
+        "pub enum SpoolFsFault {",
+        "fn with_fault(fault: SpoolFsFault) -> Self {",
+        "fn fail_sync_spool_file(",
+        "fn fail_rename_spool_file(",
+        "fn fail_open_spool_dir(",
+        "fn fail_sync_spool_dir(",
+        "fn republish_final_path_as_peer(",
+        "pub const PEER_REPUBLISH_MARKER",
+        "pub fn for_tests_with_owner_and_faults(",
+        "pub fn for_tests_with_owner_faults_and_ages(",
+        "pub fn for_tests_with_owner_faults_ages_and_ceiling(",
+        "pub fn write_private_file_atomically_with_fault_for_tests(",
+        "pub async fn probe_shared_spool_batch_clone_for_tests(",
+        "fn spool_write_hook_slot()",
+        "pub fn set_spool_write_hook_for_tests(",
+        "fn spool_walk_hook_slot()",
+        "pub fn set_spool_walk_hook_for_tests(",
+        "fn spool_replay_hook_slot()",
+        "pub fn set_spool_replay_hook_for_tests(",
+    ] {
+        let at = source
+            .find(item)
+            .unwrap_or_else(|| panic!("`{item}` must exist in api_chargeback_sink.rs"));
+        // The item's own attribute/doc block: the contiguous `#[...]` and `//`
+        // lines directly above it.
+        let line_start = source[..at].rfind('\n').map_or(0, |newline| newline + 1);
+        let attributes: Vec<&str> = source[..line_start]
+            .lines()
+            .rev()
+            .map(str::trim_start)
+            .take_while(|line| line.starts_with("#[") || line.starts_with("//"))
+            .collect();
+        assert!(
+            attributes.contains(&gated),
+            "`{item}` must be compiled only with the `test-support` feature (#7122)"
+        );
+    }
+    for kind in ["write", "walk", "replay"] {
+        let stub = format!(
+            "#[cfg(not(feature = \"test-support\"))]\n#[inline(always)]\nfn snapshot_spool_{kind}_hook_for_tests()"
+        );
+        let at = source
+            .find(&stub)
+            .unwrap_or_else(|| panic!("the production `{kind}` hook snapshot stub must exist"));
+        let body = &source[at..];
+        let body = &body[..body.find("\n}\n").expect("stub body ends")];
+        assert!(
+            body.contains("    None") && !body.contains("lock()"),
+            "without `test-support` the `{kind}` hook snapshot must be a constant None that \
+             takes no lock"
+        );
+    }
+}

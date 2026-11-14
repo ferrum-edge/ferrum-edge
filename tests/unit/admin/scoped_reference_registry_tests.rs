@@ -325,3 +325,37 @@ fn kafka_native_producer_keys_are_never_tenant_safe() {
         );
     }
 }
+
+/// Issue #7277: a managed JWKS reference makes the gateway read its own,
+/// gateway-wide managed TLS store, so it is registered TLS material and a
+/// namespace-bounded operator may not introduce one.
+#[test]
+fn managed_jwks_sources_are_registered_tls_material() {
+    for plugin in ["jwks_auth", "oidc_relying_party"] {
+        let references = ferrum_edge::_test_support::plugin_scoped_references_for_test(
+            plugin,
+            &json!({"providers": [
+                {"jwks_source": "managed://jwks/corp-idp#jwks"},
+                {"jwks_uri": "https://idp.example.com/jwks.json"}
+            ]}),
+        );
+        assert_eq!(
+            references,
+            vec![(
+                "config.providers[0].jwks_source".to_string(),
+                "managed://jwks/corp-idp#jwks".to_string(),
+                "tls"
+            )],
+            "{plugin}"
+        );
+    }
+    assert_eq!(
+        ferrum_edge::tls::source::check_namespace_scoped_material_reference(
+            "managed://jwks/corp-idp#jwks",
+            ferrum_edge::tls::source::MaterialKind::Jwks,
+            "tenant-a",
+            &[],
+        ),
+        Err(ferrum_edge::tls::source::ScopedMaterialReferenceRefusal::GatewayCredentialStore)
+    );
+}

@@ -38,16 +38,27 @@ const CORPUS_CA_PEM: &str = concat!(
 
 pub(super) fn contract(name: &str) -> Option<PluginConfigContract> {
     Some(match name {
-        "jwks_auth" => PluginConfigContract::closed(vec![json!({
-            "claim_headers": { "sub": "x-jwt-subject" },
-            "providers": [{
-                "issuer": "https://issuer.example.com",
-                "jwks": { "keys": [] },
-                "from_headers": [{ "name": "x-jwt-assertion", "prefix": "Bearer " }],
-                "claim_headers": { "tenant": "x-jwt-tenant" },
-                "output_claim_headers": [{ "claim": "email", "header": "x-jwt-email" }]
-            }]
-        })])
+        "jwks_auth" => PluginConfigContract::closed(vec![
+            json!({
+                "claim_headers": { "sub": "x-jwt-subject" },
+                "providers": [{
+                    "issuer": "https://issuer.example.com",
+                    "jwks": { "keys": [] },
+                    "from_headers": [{ "name": "x-jwt-assertion", "prefix": "Bearer " }],
+                    "claim_headers": { "tenant": "x-jwt-tenant" },
+                    "output_claim_headers": [{ "claim": "email", "header": "x-jwt-email" }]
+                }]
+            }),
+            // An admin-managed JWKS record (issue #7277). Construction only
+            // validates the reference statically; it never reads the store.
+            json!({
+                "providers": [{
+                    "issuer": "https://managed.example.com",
+                    "jwks_source": "managed://jwks/corpus-idp#jwks",
+                    "jwks_max_stale_seconds": 3600
+                }]
+            }),
+        ])
         // Keys are operator-chosen JWT claim paths mapped to header names.
         .with_free_form_objects(&["claim_headers", "providers[].claim_headers"])
         // An inline RFC 7517 JWK Set: a foreign document whose JWK members

@@ -510,6 +510,40 @@ An HTTP call a plugin makes on behalf of the current request carries the request
 
 ## Logging Plugins
 
+### Log sink contract
+
+Every log sink — `stdout_logging`, `http_logging`, `tcp_logging`,
+`udp_logging`, `kafka_logging`, `loki_logging`, `statsd_logging`, `ws_logging`,
+and `ws_frame_logging` — follows one contract (issue #7144):
+
+- **WebSocket session end.** Each sink runs `on_ws_disconnect` and records every
+  upgraded session's end exactly once, after the handshake record its `log`
+  hook already wrote. The `TransactionSummary` sinks (`stdout_logging`,
+  `http_logging`, `tcp_logging`, `udp_logging`, `kafka_logging`,
+  `loki_logging`) all emit the same session-end record: a second HTTP-family
+  `TransactionSummary` carrying the session's `error_class`, the method, path,
+  and status captured at upgrade admission, `latency_total_ms` as the session
+  duration, every other `latency_*` field as the `-1.0` "not observed"
+  sentinel, and `metadata["websocket.timestamp_disconnected"]` (see
+  [`stdout_logging`](#stdout_logging) for the field rules). That record goes
+  through the sink's ordinary admission, byte budget, `schema` / `schema_ref`
+  projection, and loss accounting, exactly like a transaction record. Sinks with
+  their own session-end representation keep it: `statsd_logging` emits the
+  `websocket.session.*` metric families, `ws_logging` its
+  `websocket_disconnect` record, and `ws_frame_logging` its disconnect event.
+- **Failure policy.** Every log sink is `KeepLastKnownGood`: an access log is an
+  audit trail, so an invalid enabled log-sink config is refused by the Admin
+  API (`400`), fails `ferrum-edge validate`, file-mode startup, and
+  database-mode cold start, is rejected by control-plane admission, and makes a
+  reload keep the previous generation rather than publish one that silently
+  stops logging. Database mode does not quarantine a log-sink row. Fix the
+  config to unblock the reload. See
+  [Config admission and failure policy](#config-admission-and-failure-policy).
+
+`transaction_debugger`, `prometheus_metrics`, `otel_tracing`, and
+`proxy_alerts` are diagnostics, metrics, tracing, and alerting plugins rather
+than log sinks; they keep their own documented policies.
+
 ### Rejection and delivery diagnostics
 
 Selected rejection and delivery-failure diagnostics use a process-wide warning
@@ -660,7 +694,7 @@ config:
 
 ### `http_logging`
 
-**Priority:** 9100 · **Phases:** `log`, `on_stream_disconnect` · **Protocols:** HTTP, gRPC, WebSocket, TCP, UDP · **Failure policy:** `OptionalFailOpen`
+**Priority:** 9100 · **Phases:** `log`, `on_stream_disconnect`, `on_ws_disconnect` · **Protocols:** HTTP, gRPC, WebSocket, TCP, UDP · **Failure policy:** `KeepLastKnownGood`
 
 Sends transaction summaries as JSON to an external HTTP endpoint. Entries are buffered and sent in batches (as a JSON array) to reduce per-request HTTP overhead.
 
@@ -673,7 +707,7 @@ Also accepts the [common batching sink options](#common-batching-sink-options): 
 
 Hot-path admission reserves a queue slot and a provisional `max_entry_bytes` lease before serializing attacker-shaped summary fields, then shrinks that lease to the exact retained JSON size.
 
-Unknown top-level keys are rejected at construction (for example a misspelled `endpont_url` cannot silently leave logs undelivered). An invalid enabled config is handled per [`OptionalFailOpen`](#config-admission-and-failure-policy).
+Unknown top-level keys are rejected at construction (for example a misspelled `endpont_url` cannot silently leave logs undelivered). An invalid enabled config is handled per [`KeepLastKnownGood`](#config-admission-and-failure-policy): it is refused, and a reload keeps the previous generation. WebSocket session ends are sent as the shared session-end record (see [Log sink contract](#log-sink-contract)).
 
 Retries fire on transport errors and 5xx responses. A **4xx response other than 408 or 429 aborts the batch immediately** (retrying a malformed or unauthorized payload just delays the drop) — fix the endpoint URL, authorization header, or field schema rather than waiting through `max_retries × retry_delay_ms`. 408 (Request Timeout) and 429 (Too Many Requests) are transient throttling signals and are retried within the configured budget. Permanent 4xx discards increment `ferrum_plugin_log_sink_records_dropped_total{plugin="http_logging",reason="batch_discard"}` once per lost record; the counter is process-cumulative and is not reset by a plugin-cache reload.
 
@@ -735,11 +769,11 @@ config:
 
 ### `statsd_logging`
 
-**Priority:** 9075 · **Phases:** `log`, `on_stream_disconnect`, `on_ws_disconnect` · **Protocols:** HTTP, gRPC, WebSocket, TCP, UDP · **Failure policy:** `OptionalFailOpen`
+**Priority:** 9075 · **Phases:** `log`, `on_stream_disconnect`, `on_ws_disconnect` · **Protocols:** HTTP, gRPC, WebSocket, TCP, UDP · **Failure policy:** `KeepLastKnownGood`
 
 Sends transaction metrics to a StatsD-compatible server (StatsD, Datadog DogStatsD, Telegraf, etc.) over UDP. Extracts counters, timers, and gauges from each transaction summary and ships them in batched, newline-delimited StatsD line protocol.
 
-**Admission.** Top-level config keys are closed: unknown properties are rejected with the exact key name(s) in the error. Nested `global_tags` remains an intentionally open string map, but keys must match `[A-Za-z_][A-Za-z0-9_.-]*` (max 64 bytes) and must not collide with reserved or schema-renamed runtime tags. Registration policy is `OptionalFailOpen` — Admin create/update still returns HTTP 400 for invalid enabled configs, while file-mode load and plugin-cache rebuild warn and omit the plugin rather than aborting the gateway. Disabled plugin configs skip construction validation.
+**Admission.** Top-level config keys are closed: unknown properties are rejected with the exact key name(s) in the error. Nested `global_tags` remains an intentionally open string map, but keys must match `[A-Za-z_][A-Za-z0-9_.-]*` (max 64 bytes) and must not collide with reserved or schema-renamed runtime tags. Registration policy is `KeepLastKnownGood` (see [Log sink contract](#log-sink-contract)) — Admin create/update returns HTTP 400 for invalid enabled configs, file-mode load and `validate` fail, and a reload whose `statsd_logging` config cannot be constructed is refused so the previous generation keeps serving. Disabled plugin configs skip construction validation.
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
@@ -921,7 +955,7 @@ config:
 
 ### `tcp_logging`
 
-**Priority:** 9125 · **Phases:** `log`, `on_stream_disconnect` · **Protocols:** HTTP, gRPC, WebSocket, TCP, UDP · **Failure policy:** `KeepLastKnownGood`
+**Priority:** 9125 · **Phases:** `log`, `on_stream_disconnect`, `on_ws_disconnect` · **Protocols:** HTTP, gRPC, WebSocket, TCP, UDP · **Failure policy:** `KeepLastKnownGood`
 
 Sends transaction summaries as newline-delimited JSON (NDJSON) over a persistent TCP or TCP+TLS connection. Entries are buffered and flushed in batches, with automatic reconnection on failure. Ideal for shipping logs to Logstash, Fluentd, Vector, rsyslog, or any TCP-based log collector.
 
@@ -982,11 +1016,11 @@ input {
 
 ### `udp_logging`
 
-**Priority:** 9160 · **Phases:** `log`, `on_stream_disconnect` · **Protocols:** HTTP, gRPC, WebSocket, TCP, UDP · **Failure policy:** `OptionalFailOpen`
+**Priority:** 9160 · **Phases:** `log`, `on_stream_disconnect`, `on_ws_disconnect` · **Protocols:** HTTP, gRPC, WebSocket, TCP, UDP · **Failure policy:** `KeepLastKnownGood`
 
 Sends transaction summaries as JSON to an external UDP endpoint. Entries are buffered and sent in batches (as a JSON array) in a single UDP datagram. Supports both plain UDP and DTLS-encrypted transport.
 
-Unknown top-level keys are rejected at construction / Admin validation (OpenAPI `additionalProperties: false`). A typo such as `dtsl: true` fails admission instead of silently shipping plaintext. An invalid enabled config is handled per [`OptionalFailOpen`](#config-admission-and-failure-policy).
+Unknown top-level keys are rejected at construction / Admin validation (OpenAPI `additionalProperties: false`). A typo such as `dtsl: true` fails admission instead of silently shipping plaintext. An invalid enabled config is handled per [`KeepLastKnownGood`](#config-admission-and-failure-policy): it is refused, and a reload keeps the previous generation. WebSocket session ends are sent as the shared session-end record (see [Log sink contract](#log-sink-contract)).
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
@@ -1029,8 +1063,8 @@ config:
 For encrypted log shipping, enable DTLS. An ephemeral self-signed certificate is used by default when no client certificate is provided. Shared Admin / CP validation is shape-only and never opens node-local certificate, key, or CA paths. When `dtls: true`, the consuming node materializes those sources during construction and, where applicable, the mode-aware plugin file-dependency phase without network I/O. Parsed material is cached in the committed plugin generation so first flush and reconnect reuse it:
 
 - **File mode:** unusable DTLS material is fatal during config load.
-- **Database mode:** the file-dependency phase warns; construction still fails closed for that instance (`OptionalFailOpen` omits it).
-- **DP mode:** the shared file-dependency phase is skipped (node-local paths may differ); construction on the DP still materializes local sources and omits the instance on failure.
+- **Database mode:** the file-dependency phase warns; construction still fails closed, and because `udp_logging` is `KeepLastKnownGood` the load is rejected (cold start refuses to start; a reload keeps the previous generation).
+- **DP mode:** the shared file-dependency phase is skipped (node-local paths may differ); construction on the DP still materializes local sources, and a failure rejects the update so the previous generation keeps serving.
 
 Cached DTLS material is immutable for that plugin generation. Certificate/key/CA rotation, or making a previously missing source available, requires reapplying or reloading the configuration; transport and handshake failures do not repeatedly reopen source paths.
 
@@ -1047,7 +1081,7 @@ config:
 
 ### `kafka_logging`
 
-**Priority:** 9150 · **Phases:** `log`, `on_stream_disconnect` · **Protocols:** HTTP, gRPC, WebSocket, TCP, UDP · **Failure policy:** `KeepLastKnownGood`
+**Priority:** 9150 · **Phases:** `log`, `on_stream_disconnect`, `on_ws_disconnect` · **Protocols:** HTTP, gRPC, WebSocket, TCP, UDP · **Failure policy:** `KeepLastKnownGood`
 
 Produces transaction summaries as JSON messages to an Apache Kafka topic. Uses an async mpsc channel of pre-serialized records to decouple the proxy hot path from Kafka I/O, with librdkafka's `ThreadedProducer` handling batching, compression, delivery retries, and partition assignment.
 
@@ -1554,7 +1588,7 @@ request paths carry no per-instance lifecycle handle.
 
 ### `loki_logging`
 
-**Priority:** 9155 · **Phases:** `log`, `on_stream_disconnect` · **Protocols:** HTTP, gRPC, WebSocket, TCP, UDP · **Failure policy:** `OptionalFailOpen`
+**Priority:** 9155 · **Phases:** `log`, `on_stream_disconnect`, `on_ws_disconnect` · **Protocols:** HTTP, gRPC, WebSocket, TCP, UDP · **Failure policy:** `KeepLastKnownGood`
 
 Ships transaction logs to Grafana Loki via the push API (`POST /loki/api/v1/push`). Entries are batched asynchronously and grouped by label set for efficient ingestion. Supports gzip compression (enabled by default), static and dynamic labels, custom headers for multi-tenant Loki (`X-Scope-OrgID`), and authentication via `Authorization` header. Config admission is strict: unknown top-level fields and explicit `null` values are rejected. Nested `labels` and `custom_headers` remain dynamic maps.
 
@@ -2595,6 +2629,7 @@ When a provider sets `require_dpop`, the access token may be presented either as
 | `providers[].jwks_uri` | String | Direct URL to the IdP's JWKS endpoint. HTTPS is required except for a loopback IP-literal host (`127.0.0.0/8` or `[::1]`); the name `localhost` does not qualify, because DNS overrides and the resolver decide where a name connects. URL userinfo is rejected |
 | `providers[].discovery_url` | String | OIDC discovery URL (auto-discovers `jwks_uri`). HTTPS is required except for a loopback IP-literal host (not the name `localhost`), and URL userinfo is rejected. SSRF hardening: the discovered `jwks_uri` must use the **same origin** as the discovery URL (scheme, host, and effective port). For IdPs that serve JWKS from a different origin than discovery (e.g. Google `accounts.google.com` → `www.googleapis.com`, and some Azure AD / Okta / Auth0 setups), set `providers[].jwks_uri` directly instead of `discovery_url`. After the first successful resolution, discovery is re-run every `jwks_refresh_interval_secs`, so an IdP that moves its `jwks_uri` is followed without a reload; a changed endpoint is adopted only once its key set has usable keys, and a failed rediscovery keeps the current store |
 | `providers[].jwks` | String/Object (optional) | Inline JWKS JSON; useful for mesh-provided or static key sets |
+| `providers[].jwks_source` | String (optional) | Admin-managed JWKS record stored through `/admin/tls/jwks`: `managed://jwks/<id>#jwks`. Exactly one of `jwks_uri`, `discovery_url`, `jwks`, or `jwks_source` per provider. See [Managed JWKS records](#managed-jwks-records) |
 | `providers[].issuer` | String (optional; **required** with `require_dpop`) | Expected JWT `iss` claim — routes tokens to this provider. When set, the token MUST carry `iss` and it must match exactly (`set_issuer` alone rejects only a mismatching claim). When `require_dpop` is true this must be a nonblank exact issuer: it is the DPoP replay realm, so key-set or JWKS-source rotation cannot reopen a proof. Issuers are compared exactly (not URL-canonicalized). Providers in one policy that share this exact issuer share one replay realm and must agree on `require_dpop` (and, when DPoP is required, on replay scope and process capacity). A non-DPoP sibling for the same issuer is refused as a bearer-only bypass |
 | `providers[].audiences` | String[] (optional) | Accepted JWT `aud` values; OR-matched. When non-empty, the token MUST carry `aud` and at least one value must match. When empty, tokens without `aud` are accepted; a token that carries `aud` is rejected because no acceptable audience is configured (RFC 7519 §4.1.3) |
 | `providers[].from_headers` | Array (optional) | Header token locations, each `{ "name": "...", "prefix": "..." }`; empty prefix is treated as no prefix |
@@ -2616,7 +2651,7 @@ When a provider sets `require_dpop`, the access token may be presented either as
 | `providers[].dpop_clock_skew_secs` | u64 (optional) | DPoP proof clock skew in seconds, applied to `iat` (and to `exp` when a client sends one) (default: `30`, max: `300`) |
 | `providers[].dpop_replay_scope` | String (**required** with `require_dpop`) | `process` or `shared`. No default — see [Single-use replay protection](#single-use-replay-protection). Equivalent DPoP providers that share a replay domain must declare the same value; a mixed process/shared pair is refused even when Redis is configured, because the same proof would otherwise be claimable once in the process store and once in Redis |
 | `providers[].dpop_replay_max_entries` | usize (optional) | Capacity this `process` authority enforces against the shared replay lane (default: `100000`). At capacity only expired markers are reclaimed; if none can be, the request is refused. Repeated full-live refusals are O(1) until an expiry is actually due. An equivalent reload applies the new cap without forgetting live markers. Duplicate equivalent providers that share a replay domain must declare the same value |
-| `providers[].jwks_max_stale_seconds` | u64 (optional) | Per-provider maximum age of the last validated non-empty remote JWKS; overrides the plugin default (min `1`, max `86400`; remote sources only) |
+| `providers[].jwks_max_stale_seconds` | u64 (optional) | Per-provider maximum age of the last validated non-empty remote JWKS; overrides the plugin default (min `1`, max `86400`). Applies to `jwks_uri`, `discovery_url`, and `jwks_source` providers (for a managed record it bounds how long the last-read keys survive an unreadable store); rejected on an inline `jwks` provider |
 | `scope_claim` | String | Global scope claim path (default: `"scope"`) |
 | `role_claim` | String | Global role claim path (default: `"roles"`) |
 | `consumer_identity_claim` | String | Global JWT claim used as the external authenticated identity (default: `"sub"`). The identity is never resolved to a gateway Consumer |
@@ -2627,7 +2662,7 @@ When a provider sets `require_dpop`, the access token may be presented either as
 | `allow_missing_token` | Boolean | Istio `RequestAuthentication` semantics (default: `false`). When `true` and this is the only applicable auth plugin, a request that carries **no** token is forwarded **unauthenticated**; an invalid token is still rejected. Mesh mode sets this on its generated RequestAuthentication instance. Leave it `false` on a standalone gateway unless optional authentication is intended — the gateway logs a warning when a non-mesh instance enables it |
 | `require_exp` | Boolean | Global default for requiring an `exp` claim (default: `true`) |
 | `clock_skew_seconds` | u64 | JWT `exp`/`nbf` clock leeway in seconds for providers without their own override (default: `0`, max: `300`). The authenticated-stream deadline is `exp` plus the effective leeway |
-| `jwks_refresh_interval_secs` | u64 | JWKS key refresh interval in seconds (default: `900`, min: `1`, max: `86400`); must not exceed each remote provider's effective maximum-stale value. `discovery_url` providers also re-run OIDC discovery at this interval |
+| `jwks_refresh_interval_secs` | u64 | JWKS key refresh interval in seconds (default: `900`, min: `1`, max: `86400`); must not exceed each remote or managed provider's effective maximum-stale value. `discovery_url` providers also re-run OIDC discovery at this interval, and `jwks_source` providers re-read their managed record at it |
 | `sync_mode` | String | `local` or `redis` (default `local`). `redis` is required by, and only valid with, at least one provider declaring `dpop_replay_scope: shared` |
 | `redis_url`, `redis_tls`, `redis_key_prefix`, `redis_pool_size`, `redis_connect_timeout_seconds`, `redis_health_check_interval_seconds`, `redis_username`, `redis_password` | — | Shared Redis connectivity for the DPoP replay authority; see [Redis connection options](#redis-connection-options). The default key prefix is `{FERRUM_NAMESPACE}:jwks_auth:{plugin-config-id}` |
 | `jwks_max_stale_seconds` | u64 | Maximum age of the last validated non-empty remote JWKS (default: `3600`, max: `86400`). `0` is invalid and cannot disable fail-closed expiry |
@@ -2635,7 +2670,7 @@ When a provider sets `require_dpop`, the access token may be presented either as
 
 Claim values are auto-detected as space-delimited strings (OAuth2 standard), JSON arrays, or nested objects via dot-notation paths.
 Claim header fan-out refuses reserved hop-by-hop, authorization, host, and consumer identity headers.
-Unknown top-level, provider, and custom-header-location fields are rejected so misspelled authentication controls cannot silently fail open. For each remote provider, `jwks_refresh_interval_secs` must not exceed its effective `jwks_max_stale_seconds`. Shared stores use both the minimum refresh interval and the minimum maximum-stale value requested by active consumers. A newly added stricter consumer takes effect immediately; full or incremental publication deterministically reconciles the exact minima, so removing the strict consumer may relax policy without replacing the store or resetting key age. Discovery-backed reloads retain the last validated URI/store until rediscovery produces a usable replacement, but discovery success alone never refreshes key trust. A discovery-backed provider is never frozen into the publication snapshot; its current store is tracked only through a generation-owned contribution that rediscovery repoints, so a superseded `jwks_uri` leaves the active set (and readiness) as soon as the provider stops using it unless another consumer still does. A store an OIDC discovery task resolves *after* its generation was published joins the active refresh/maximum-stale arbitration and the trust aggregate at that moment rather than at the next reload, and leaves it when that generation retires or repoints to a different URI; a staged generation that is never published contributes nothing to readiness or metrics.
+Unknown top-level, provider, and custom-header-location fields are rejected so misspelled authentication controls cannot silently fail open. For each remote or managed provider, `jwks_refresh_interval_secs` must not exceed its effective `jwks_max_stale_seconds`. Shared stores use both the minimum refresh interval and the minimum maximum-stale value requested by active consumers. A newly added stricter consumer takes effect immediately; full or incremental publication deterministically reconciles the exact minima, so removing the strict consumer may relax policy without replacing the store or resetting key age. Discovery-backed reloads retain the last validated URI/store until rediscovery produces a usable replacement, but discovery success alone never refreshes key trust. A discovery-backed provider is never frozen into the publication snapshot; its current store is tracked only through a generation-owned contribution that rediscovery repoints, so a superseded `jwks_uri` leaves the active set (and readiness) as soon as the provider stops using it unless another consumer still does. A store an OIDC discovery task resolves *after* its generation was published joins the active refresh/maximum-stale arbitration and the trust aggregate at that moment rather than at the next reload, and leaves it when that generation retires or repoints to a different URI; a staged generation that is never published contributes nothing to readiness or metrics.
 
 Remote discovery documents are capped at 128 KiB and JWKS responses at 1 MiB/256 keys, with bounded key components. A valid non-empty JWKS atomically replaces the key map, refreshes the monotonic trust deadline, clears failure state, and can restore authentication after expiry. Empty 200 responses, malformed or oversized bodies, non-2xx status, and transport/DNS/TLS/timeout failures retain last-known-good material only for the finite grace window and use a bounded accelerated retry cadence; after the deadline, verification refuses the retained material without deleting diagnostic/recovery state. JWKs are accepted for signature verification only when `use` is absent or `sig` and `key_ops` is absent or includes `verify`; contradictory operation metadata is rejected. The JWK `alg` parameter is honoured per RFC 7517 §4.4: a key that declares an `alg` is admitted only when that value names a supported signature algorithm for its key type — `RS256`/`RS384`/`RS512`/`PS256`/`PS384`/`PS512` for RSA, `ES256`/`ES384` matching the key's `crv` for EC, and `EdDSA` for an `OKP` key with `crv: Ed25519` — and verification is then bound to exactly that algorithm, so a PSS key never verifies a PKCS#1 v1.5 token and vice versa. Keys declaring an encryption algorithm (`RSA-OAEP`, `RSA-OAEP-256`, `RSA1_5`), a key-agreement algorithm or curve (`ECDH-ES`, `X25519`, `X448`), `Ed448`, or an `alg` that contradicts the key type or curve are skipped as unsupported rather than silently treated as RS256/curve-derived verification keys. A key with no `alg` defaults to RS256 for RSA (an RSASSA-PSS issuer must publish `alg: PS256`/`PS384`/`PS512`), a curve-derived algorithm for EC, and `EdDSA` for Ed25519. Ed25519 public keys must be exactly 32 bytes, and `OKP` keys are skipped while FIPS mode is enforced. RSA signing keys must carry a modulus of at least 2048 bits; weaker keys are skipped rather than trusted. Signing keys without a non-empty `kid` are unusable, and a JWKS with duplicate usable `kid` values is rejected rather than choosing one by response order.
 
@@ -2645,7 +2680,25 @@ JWT header `kid` is required and binding. A missing `kid`, an empty `kid`, or a 
 
 A token naming a non-empty `kid` the trusted key set does not contain also triggers **at most one out-of-band JWKS fetch per `kid_miss_refresh_cooldown_seconds` window**, so an identity-provider key rotation recovers in seconds instead of waiting out `jwks_refresh_interval_secs`. The triggering request still fails closed — it never blocks on the fetch — and a later request verifies once the refreshed key set is published. A missing or empty `kid` triggers nothing, and the cooldown bounds tokens carrying random identifiers to one fetch per window. The out-of-band fetch is strictly additional: it never shortens the periodic refresh cadence or the empty-store retry backoff. Because `oidc_relying_party` and mesh `MeshRequestAuthentication` injection consume the same shared store, they inherit the behaviour without a knob of their own; a shared store honours the most restrictive cooldown among its active consumers (disabled wins, otherwise the longest window).
 
-Authenticated `/metrics` exposes only fixed-cardinality aggregate JWKS state for **active remote** stores: `fresh`, `grace`, or `expired`, maximum trust age per state, and closed refresh-failure classes. It never labels a series with a JWKS/discovery URL, `kid`, token, claim, or key material. Authenticated `/health`/`/status` mirror the same closed-set counts under `jwks_trust`; unauthenticated probes see only coarse readiness effects (grace → degraded+ready, expired → unavailable+not-ready, none → neutral) from an O(1) cached aggregate. Choose the maximum-stale window as an explicit availability-versus-revocation trade-off; production deployments should keep it short enough for emergency key removal to take effect within their incident-response objective.
+Authenticated `/metrics` exposes only fixed-cardinality aggregate JWKS state for **active remote** stores (and active managed-record stores, which count as `fresh` while present and `expired` once withdrawn): `fresh`, `grace`, or `expired`, maximum trust age per state, and closed refresh-failure classes. It never labels a series with a JWKS/discovery URL, `kid`, token, claim, or key material. Authenticated `/health`/`/status` mirror the same closed-set counts under `jwks_trust`; unauthenticated probes see only coarse readiness effects (grace → degraded+ready, expired → unavailable+not-ready, none → neutral) from an O(1) cached aggregate. Choose the maximum-stale window as an explicit availability-versus-revocation trade-off; production deployments should keep it short enough for emergency key removal to take effect within their incident-response objective.
+
+#### Managed JWKS records
+
+`providers[].jwks_source` reads the provider's key set from an admin-managed JWKS record instead of an endpoint (issue #7277). Store the document with `POST /admin/tls/jwks` and reference it as `managed://jwks/<id>#jwks`:
+
+```yaml
+providers:
+  - issuer: "https://idp.corp.example"
+    jwks_source: "managed://jwks/corp-idp#jwks"
+    audiences: ["orders-api"]
+```
+
+- **Grammar.** Only the `managed://` scheme is accepted. The generic managed spellings `managed://jwks/<id>`, `managed://<id>#jwks`, and the `#jwks-json` / `#jwks_json` fragment aliases are canonicalized to `managed://jwks/<id>#jwks`, so two spellings share one key store. A fragment or collection that selects other material (`managed://certificates/<id>#cert`, `managed://jwks/<id>#ca`), `?` options, a file path, inline material, or an invalid record id is a config error. These checks are static: they run in `ferrum-edge validate`, file-mode startup, and every admin write without reading the store.
+- **Presence.** An admin plugin write (single, `POST /batch`, `POST /restore`) referencing a record that does not exist, is of another kind, or holds no usable signing key returns `400`. File mode refuses to start without the record; database mode logs a warning and the provider fails closed. `DELETE /admin/tls/jwks/{id}` returns `409` while an enabled consumer references the record, and the TLS inventory lists each reference under `used_by` (`surface: jwks_auth`, `role: jwks`). Namespace-bounded operator tokens may not introduce a `managed://` reference (the managed store is gateway-wide).
+- **Trust.** The record is local, authoritative material, so the fresh/grace/expired model maps onto it differently from a fetched set. While the record is present and holds a usable key it is `fresh`; it never ages into grace on a timer. A record that is deleted, of another kind, oversized, malformed, or keyless withdraws every key at once and tokens are refused with the generic `401`, exactly like an expired remote set (`expired` in `jwks_trust`, readiness `unavailable`; the refresh-failure class is `empty`, `oversized`, `malformed`, or `unusable_keys`). Only a store that cannot be read (shared-volume I/O, lock, or document failure; class `transport`) keeps the last-read keys, in `grace`, for at most `jwks_max_stale_seconds`. A later read that finds a usable record restores trust; a withdrawn store retries on the 5/15/30-second failure backoff.
+- **Rotation.** The record is re-read every `jwks_refresh_interval_secs`, on a token naming an unknown `kid` (subject to `kid_miss_refresh_cooldown_seconds`), and, on the node that served the write, before a `/admin/tls/jwks` create, `PUT`, or delete returns. Rotating keys is therefore: `PUT` the document with the new key added, move signers to it, then `PUT` it again without the old key. On the writing node the old `kid` is refused as soon as the second `PUT` returns; other nodes sharing the store refuse it within one refresh interval, so choose the interval as the key-removal objective.
+- **Distribution.** Nothing about the record travels on ConfigSync: a CP distributes the plugin config, which carries only the reference, and every node resolves it from its own `FERRUM_TLS_MANAGED_STORE_PATH`, like every other `managed://` source. In CP/DP mode point the CP (where `/admin/tls/jwks` writes land) and every DP at one shared store volume; see [Managed TLS And ACME Across Multiple Replicas](frontend_tls.md#managed-tls-and-acme-across-multiple-replicas). A DP whose store lacks the record refuses that provider's tokens.
+- The DPoP replay realm and the external identity realm do not change with the key source beyond what the existing rules say: the DPoP realm is the exact `issuer`, and the identity realm binds the source reference like a `jwks_uri`.
 
 #### Single-use replay protection
 
@@ -2774,6 +2827,7 @@ Active in `on_request_received` (callback and logout paths), `authenticate` (ses
 | `providers[].authorization_endpoint` | String | Explicit authorization endpoint when discovery is not used |
 | `providers[].token_endpoint` | String | Explicit token endpoint when discovery is not used |
 | `providers[].jwks_uri` | String | Explicit JWKS URI when discovery is not used |
+| `providers[].jwks_source` | String | Admin-managed JWKS record (`managed://jwks/<id>#jwks`) used instead of `jwks_uri` with explicit endpoints; mutually exclusive with `jwks_uri` and `discovery_url`. Same grammar, trust, and propagation rules as [`jwks_auth`'s `jwks_source`](#managed-jwks-records), with a fixed 900-second re-read interval |
 | `providers[].userinfo_endpoint` | String (optional) | UserInfo endpoint used to enrich session claims; explicit values win over discovery |
 | `providers[].end_session_endpoint` | String (optional) | RP-initiated logout endpoint; explicit values win over discovery |
 | `providers[].post_logout_redirect_uri` | String (optional) | Absolute URI sent to the provider after RP-initiated logout |
@@ -7415,7 +7469,7 @@ config:
 
 ### `ws_frame_logging`
 
-**Priority:** 9050 · **Phases:** `on_ws_policy_close`, `prepare_ws_frame_delivery`, `emit_ws_frame_delivery`, `on_ws_disconnect` · **Protocols:** WebSocket · **Failure policy:** `OptionalFailOpen`
+**Priority:** 9050 · **Phases:** `on_ws_policy_close`, `prepare_ws_frame_delivery`, `emit_ws_frame_delivery`, `on_ws_disconnect` · **Protocols:** WebSocket · **Failure policy:** `KeepLastKnownGood`
 
 Logs metadata for every complete WebSocket message the shared H1/H2/H3 relay **successfully delivers** (post-plugin, post-control-frame guard), plus every gateway-published policy Close decision. Provides message-level observability without requiring packet captures. This plugin never transforms or drops frames — it is purely observational (`observes_ws_frame_decisions()`): the relay reports each final policy Close to it once through `on_ws_policy_close` (`outcome=policy_close`), after the full decision is known, so the record does not depend on this plugin's priority (an accepted `priority_override` that orders it before the rejecting plugin still records the rejection). Ordinary Text/Binary/Ping/Pong and peer Close frames are recorded only after the destination sink accepts the write (`outcome=delivered`), on the same success boundary as the per-direction `frames_*` / `bytes_*` counters. Cancelled or failed sends produce no frame event.
 
@@ -7459,7 +7513,7 @@ Privacy / retention: disconnect records carry endpoint identity and success-only
 
 **What filtering does and does not skip.** When the configured tracing level is filtered out, fingerprint computation and tracing event construction are skipped. Frame parsing, plugin selection (`requires_ws_frame_hooks()` is always true while this plugin is attached), `on_ws_frame` / `on_ws_policy_close` dispatch, delivery prepare/emit hooks, and disconnect-hook dispatch still occur. Consequently, attaching this plugin keeps the connection on the parsed WebSocket relay path and prevents the H1 raw-copy tunnel fast path even if every record is filtered.
 
-**Admission / failure policy.** `ws_frame_logging` is registered `OptionalFailOpen` (see [Config admission and failure policy](#config-admission-and-failure-policy)): the Admin API returns HTTP 400 for an invalid enabled config, and serving loads omit the instance. Invalid configs include unknown keys, out-of-range `payload_preview_bytes`, invalid `log_level`, wrong types, and explicit `null` fields.
+**Admission / failure policy.** `ws_frame_logging` is registered `KeepLastKnownGood` like every log sink (see [Log sink contract](#log-sink-contract)): the Admin API returns HTTP 400 for an invalid enabled config, file-mode load and `validate` fail, and a reload that cannot construct it keeps the previous generation. Invalid configs include unknown keys, out-of-range `payload_preview_bytes`, invalid `log_level`, wrong types, and explicit `null` fields.
 
 **Raw frame contents are never logged.** WebSocket payloads routinely carry credentials — bearer tokens, session cookies, API keys (for example a GraphQL-over-WS `connection_init` payload or a custom auth handshake). To honor the project's never-log-secrets invariant, `preview` contains only a keyed, non-reversible fingerprint of the form `hmac-sha256:<12 hex chars> len=<bytes>` (with a trailing `+` after the digest when only the first `payload_preview_bytes` of the payload were hashed). The key is generated per plugin instance and is not exposed in logs, so log access alone cannot confirm guessed payloads offline. The digest lets operators correlate identical payloads observed by that plugin instance without disclosing plaintext; the payload byte length is also always available as `size_bytes`. Close reasons are treated as application payload: only `close_code` and `close_reason_len` are logged.
 

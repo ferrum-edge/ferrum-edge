@@ -621,6 +621,31 @@ def validate_observability(results_dir: Path) -> None:
         "Admin published on east-west Service",
         "east-west Service must stay tls-passthru only; scrape via the dedicated metrics Service",
     )
+    # The standalone mesh CA is reachable (#7298): a gRPC Service that targets
+    # the CA's named grpc container port, which the chart binds the CP gRPC
+    # listener to. Admin stays on the dedicated metrics Service.
+    ca_svc = resource_document(rendered, "ferrum-mesh-ca", "Service")
+    require_text(
+        ca_svc,
+        "targetPort: grpc",
+        "Mesh CA Service port missing",
+        "ferrum-mesh-ca Service must target the CA container port grpc",
+    )
+    forbid_text(
+        ca_svc,
+        "admin-http",
+        "Admin published on mesh CA Service",
+        "ferrum-mesh-ca Service must stay gRPC-only; scrape via the dedicated metrics Service",
+    )
+    ca_deploy = resource_document(rendered, "ferrum-mesh-ca", "Deployment")
+    for needle, detail in (
+        ("- name: grpc", "the CA Deployment must declare a named grpc container port"),
+        (
+            'value: "0.0.0.0:50051"',
+            "the CA Deployment must bind FERRUM_CP_GRPC_LISTEN_ADDR to ca.grpcPort",
+        ),
+    ):
+        require_text(ca_deploy, needle, "Mesh CA gRPC listener missing", detail)
     ambient_pm = resource_document(
         rendered, "ferrum-mesh-ambient-metrics", "PodMonitor"
     )

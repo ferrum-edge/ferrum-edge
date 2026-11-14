@@ -21,9 +21,11 @@ Every governed surface lives on a path that .github/scripts/pr_ci_plan.py keeps
 on full CI, because the `dependency-audit` job that runs this checker is required
 to stay behind `mode == 'full'`.
 
-Upstream mode queries filed upstream PRs via the GitHub REST API and reports deliberate forks
-that still need filing or dated owner reaffirmation before the first stable
-release checkpoint (docs/dependency-policy.md).
+Upstream mode queries filed upstream PRs via the GitHub REST API, lists privately
+reported patches (filing=reported_privately: channel and date only, never the
+embargoed report identifier), and reports deliberate forks that still need
+filing or dated owner reaffirmation before the first stable release checkpoint
+(docs/dependency-policy.md).
 
 Every normal invocation runs synthetic self-tests first, then repository parity.
 --self-test runs only the synthetic fixtures and exits (no network, no repository
@@ -61,7 +63,17 @@ VENDOR_ROOT = ROOT / "vendor"
 COMPATIBLE_RELEASE_STATUSES = frozenset(
     {"not_started", "in_progress", "passed", "failed", "blocked"}
 )
-UPSTREAM_FILINGS = frozenset({"filed", "deliberate_fork_unfiled"})
+UPSTREAM_FILINGS = frozenset({"filed", "reported_privately", "deliberate_fork_unfiled"})
+# `reported_privately`: the defect was reported to the upstream maintainers
+# through a private channel and no public issue or PR exists yet. The private
+# report's identifier is deliberately NOT recorded (it is embargoed); only the
+# channel and the date are, as `upstream.private_report`. Once a public PR
+# exists the patch moves to `filed`.
+PRIVATE_REPORT_CHANNELS = {
+    "security_advisory": "security advisory report",
+    "security_email": "security email report",
+}
+PRIVATE_REPORT_FIELDS = frozenset({"channel", "reported_on"})
 REQUIRED_PATCH_STRING_FIELDS = (
     "id",
     "label",
@@ -364,6 +376,58 @@ def _is_github_repo(value: Any) -> bool:
     return all(segment.strip(".") for segment in str(value).split("/"))
 
 
+def private_report_shape_errors(prefix: str, report: Any) -> list[str]:
+    """Shape of `upstream.private_report` for filing=reported_privately."""
+    path = f"{prefix}.upstream.private_report"
+    if not isinstance(report, dict):
+        return [f"{path}: filing=reported_privately requires an object"]
+    errors: list[str] = []
+    if set(report) != PRIVATE_REPORT_FIELDS:
+        errors.append(f"{path}: must contain exactly {sorted(PRIVATE_REPORT_FIELDS)}")
+    if report.get("channel") not in PRIVATE_REPORT_CHANNELS:
+        errors.append(
+            f"{path}.channel: must be one of {sorted(PRIVATE_REPORT_CHANNELS)}"
+        )
+    reported_on = report.get("reported_on")
+    try:
+        if not ISO_DATE_RE.fullmatch(str(reported_on)):
+            raise ValueError("non-calendar date")
+        date.fromisoformat(str(reported_on))
+    except ValueError:
+        errors.append(f"{path}.reported_on: must be an ISO calendar date")
+    return errors
+
+
+def private_report_readme_errors(
+    pid: str, upstream: dict[str, Any], readme_text: str
+) -> list[str]:
+    """A privately reported patch's README records the report the same way."""
+    marker = private_report_marker(upstream)
+    if marker is None or marker.casefold() in readme_text.casefold():
+        return []
+    return [f"{pid}: README lacks private report record {marker!r}"]
+
+
+def private_report_marker(upstream: dict[str, Any]) -> str | None:
+    """The sentence a privately reported patch's README and policy row carry.
+
+    Names the upstream organisation, the channel and the date only, never the
+    embargoed report identifier. None when the record is not well formed (the
+    shape validator reports that).
+    """
+    report = upstream.get("private_report")
+    repo = upstream.get("github_repo")
+    if (
+        upstream.get("filing") != "reported_privately"
+        or private_report_shape_errors("p", report)
+        or not _is_github_repo(repo)
+    ):
+        return None
+    org = str(repo).split("/", 1)[0]
+    label = PRIVATE_REPORT_CHANNELS[report["channel"]]
+    return f"reported privately to {org} ({label}, {report['reported_on']})"
+
+
 def _require_nonempty_str(value: Any, path: str, errors: list[str]) -> None:
     if not _is_nonempty_str(value):
         errors.append(f"{path}: must be a non-empty string")
@@ -453,6 +517,21 @@ def validate_lifecycle_shape(data: Any) -> list[str]:
                     errors.append(
                         f"{prefix}: filing=deliberate_fork_unfiled must not carry a pr_number"
                     )
+            elif filing == "reported_privately":
+                if pr_number is not None:
+                    errors.append(
+                        f"{prefix}: filing=reported_privately must not carry a "
+                        "pr_number; a public upstream PR is filing=filed"
+                    )
+
+            private_report = upstream.get("private_report")
+            if filing == "reported_privately":
+                errors.extend(private_report_shape_errors(prefix, private_report))
+            elif private_report is not None:
+                errors.append(
+                    f"{prefix}.upstream.private_report: only "
+                    "filing=reported_privately carries a private report"
+                )
 
             issue_number = upstream.get("issue_number")
             if issue_number is not None and not _is_positive_int(issue_number):
@@ -712,6 +791,12 @@ def policy_reference_errors(
         upstream = patch.get("upstream")
         if not isinstance(upstream, dict):
             continue
+        marker = private_report_marker(upstream)
+        if marker is not None and marker.casefold() not in row.casefold():
+            errors.append(
+                f"{pid}: private report record {marker!r} missing from its "
+                "dependency-policy.md inventory row"
+            )
         repo = upstream.get("github_repo")
         if not _is_github_repo(repo):
             continue
@@ -848,6 +933,11 @@ def parity_errors(data: Any) -> list[str]:
                 patch["upstream"].get("filing"),
                 patch.get("reaffirmation"),
                 parse_readme_reaffirmation(readme),
+            )
+        )
+        errors.extend(
+            private_report_readme_errors(
+                pid, patch["upstream"], readme.read_text(encoding="utf-8")
             )
         )
 
@@ -1053,6 +1143,12 @@ def run_upstream_status(data: dict[str, Any], *, today: date | None = None) -> i
                     f"  ::warning::{patch['id']} is an unfiled deliberate fork without a "
                     "dated reaffirmation in the lifecycle inventory."
                 )
+        elif filing == "reported_privately" and pr is None:
+            marker = private_report_marker(upstream)
+            print(
+                f"- upstream: {marker}; no public issue or PR to poll until the "
+                "maintainers publish a fix"
+            )
         elif pr is not None:
             hold = patch["retirement"].get("merged_release_hold")
             state, reason = github_pr_state(
@@ -1614,6 +1710,121 @@ true
         "dot-only github_repo segments",
     )
 
+    # --- private upstream report -----------------------------------------
+    private_upstream = {
+        "filing": "reported_privately",
+        "pr_number": None,
+        "issue_number": None,
+        "private_report": {"channel": "security_advisory", "reported_on": "2026-11-14"},
+    }
+    expect_empty(
+        validate_lifecycle_shape(
+            {**base, "patches": [_valid_patch(upstream=private_upstream)]}
+        ),
+        "privately reported patch",
+    )
+    expect_contains(
+        validate_lifecycle_shape(
+            {
+                **base,
+                "patches": [_valid_patch(upstream={**private_upstream, "pr_number": 3})],
+            }
+        ),
+        "filing=reported_privately must not carry a pr_number",
+        "privately reported patch with a public PR",
+    )
+    expect_contains(
+        validate_lifecycle_shape(
+            {
+                **base,
+                "patches": [
+                    _valid_patch(upstream={**private_upstream, "private_report": None})
+                ],
+            }
+        ),
+        "filing=reported_privately requires an object",
+        "privately reported patch without a report record",
+    )
+    for bad_report, needle, label in (
+        (
+            {"channel": "security_advisory", "reported_on": "2026-02-30"},
+            "reported_on: must be an ISO calendar date",
+            "private report with an impossible date",
+        ),
+        (
+            {"channel": "::error::forged", "reported_on": "2026-11-14"},
+            "channel: must be one of",
+            "private report with an unknown channel",
+        ),
+        (
+            {
+                "channel": "security_advisory",
+                "reported_on": "2026-11-14",
+                "advisory_id": "GHSA-xxxx-xxxx-xxxx",
+            },
+            "must contain exactly",
+            "private report carrying an identifier",
+        ),
+    ):
+        expect_contains(
+            validate_lifecycle_shape(
+                {
+                    **base,
+                    "patches": [
+                        _valid_patch(
+                            upstream={**private_upstream, "private_report": bad_report}
+                        )
+                    ],
+                }
+            ),
+            needle,
+            label,
+        )
+    expect_contains(
+        validate_lifecycle_shape(
+            {
+                **base,
+                "patches": [
+                    _valid_patch(
+                        upstream={
+                            "private_report": private_upstream["private_report"]
+                        }
+                    )
+                ],
+            }
+        ),
+        "only filing=reported_privately carries a private report",
+        "filed patch carrying a private report",
+    )
+    private_marker = "reported privately to example (security advisory report, 2026-11-14)"
+    private_patch = _valid_patch(upstream={**private_upstream, "github_repo": "example/example"})
+    if private_report_marker(private_patch["upstream"]) != private_marker:
+        failures.append(
+            "private report marker: unexpected "
+            f"{private_report_marker(private_patch['upstream'])!r}"
+        )
+    expect_empty(
+        private_report_readme_errors(
+            "p", private_patch["upstream"], f"| Upstream | {private_marker.capitalize()} |"
+        ),
+        "README records the private report",
+    )
+    expect_contains(
+        private_report_readme_errors(
+            "p", private_patch["upstream"], "| Upstream | unfiled upstream |"
+        ),
+        "README lacks private report record",
+        "README missing the private report",
+    )
+    private_reaffirmation = {"date": "2026-07-01", "owner": "@owner", "reason": "fork"}
+    expect_contains(
+        reaffirmation_parity_errors(
+            "p", "reported_privately", private_reaffirmation, private_reaffirmation
+        ),
+        "reaffirmation is a deliberate-fork record",
+        "privately reported patch carrying a reaffirmation",
+    )
+
     # --- reaffirmation pairing -------------------------------------------
     readme_record = {"date": "2026-07-01", "owner": "@owner", "reason": "still right"}
     expect_empty(
@@ -1816,6 +2027,26 @@ true
         ),
         "upstream issue reference 'example/example#99' missing",
         "stale upstream issue number",
+    )
+    private_policy = "\n".join(
+        [
+            INVENTORY_HEADER,
+            "|---|---|---|---|---|---|---|---|---|",
+            _inventory_row(
+                "example-001",
+                upstream=f"**{private_marker.capitalize()}**",
+                docs_path="upstream-example-patches/001/README.md",
+            ),
+        ]
+    )
+    expect_empty(
+        policy_reference_errors(private_policy, [private_patch]),
+        "documented private report",
+    )
+    expect_contains(
+        policy_reference_errors(reference_policy, [private_patch]),
+        "private report record",
+        "private report missing from the inventory row",
     )
     expect_contains(
         policy_reference_errors("| no rows here |", [referenced_patch]),
