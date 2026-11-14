@@ -200,6 +200,108 @@ fn file_and_in_memory_decode_share_one_decode_and_validate_core() {
 // Basic Loading Tests
 // ============================================================================
 
+/// Issue #7218: file mode is fatal on invalid local config, so the CORS-style
+/// `allowed_ws_origins: ["*"]` footgun and non-origin entries fail startup and
+/// SIGHUP reload (database/CP/DP loads keep #5454's warn-only grandfathering).
+#[test]
+fn file_mode_refuses_star_and_non_origin_allowed_ws_origins_at_load_and_reload() {
+    let policy = ferrum_edge::config::BackendEgressPolicy::unrestricted();
+    let document = |namespace: &str, origins: serde_json::Value| {
+        serde_json::json!({
+            "version": "1",
+            "proxies": [{
+                "id": "ws-proxy",
+                "namespace": namespace,
+                "listen_path": "/ws",
+                "backend_scheme": "http",
+                "backend_host": "localhost",
+                "backend_port": 3000,
+                "allowed_ws_origins": origins
+            }],
+            "consumers": [],
+            "plugin_configs": []
+        })
+    };
+    let cases = [
+        ("star", "ferrum", serde_json::json!(["*"]), "is '*'"),
+        (
+            "star among literal origins",
+            "ferrum",
+            serde_json::json!(["https://app.example.com", " * "]),
+            "allowed_ws_origins[1] is '*'",
+        ),
+        (
+            "origin with a path",
+            "ferrum",
+            serde_json::json!(["https://app.example.com/path"]),
+            "scheme://host[:port]",
+        ),
+        (
+            "opaque null origin",
+            "ferrum",
+            serde_json::json!(["null"]),
+            "scheme://host[:port]",
+        ),
+        // Every namespace in the file is checked, like the other field-level
+        // validators, not only the namespace this gateway serves.
+        (
+            "star in another namespace",
+            "tenant-b",
+            serde_json::json!(["*"]),
+            "is '*'",
+        ),
+    ];
+    for (name, namespace, origins, expected) in cases {
+        for extension in [".json", ".yaml"] {
+            let doc = document(namespace, origins.clone());
+            let mut file = NamedTempFile::with_suffix(extension).unwrap();
+            let contents = if extension == ".json" {
+                serde_json::to_string(&doc).unwrap()
+            } else {
+                serde_yaml::to_string(&doc).unwrap()
+            };
+            write!(file, "{contents}").unwrap();
+            let path = file.path().to_str().unwrap();
+            for (operation, result) in [
+                ("load", load_config_from_file(path, 30, &policy, "ferrum")),
+                (
+                    "reload",
+                    reload_config_from_file(path, 30, &policy, "ferrum"),
+                ),
+            ] {
+                let error = format!("{:#}", result.expect_err(name));
+                assert!(
+                    error.contains("invalid `allowed_ws_origins` entry(ies)")
+                        && error.contains(expected)
+                        && error
+                            .contains(ferrum_edge::config::types::ALLOWED_WS_ORIGINS_STAR_GUIDANCE),
+                    "{name} {extension} {operation}: {error}"
+                );
+            }
+        }
+    }
+
+    // Literal origins (and the empty allow-all list) still load.
+    for origins in [
+        serde_json::json!(["https://app.example.com", "wss://ws.example.com:8443"]),
+        serde_json::json!([]),
+    ] {
+        let mut file = NamedTempFile::with_suffix(".json").unwrap();
+        write!(
+            file,
+            "{}",
+            serde_json::to_string(&document("ferrum", origins.clone())).unwrap()
+        )
+        .unwrap();
+        let config = load_config_from_file(file.path().to_str().unwrap(), 30, &policy, "ferrum")
+            .unwrap_or_else(|error| panic!("{origins}: {error:#}"));
+        assert_eq!(
+            serde_json::to_value(&config.proxies[0].allowed_ws_origins).unwrap(),
+            origins
+        );
+    }
+}
+
 #[test]
 fn test_load_yaml_without_consumers_key() {
     let yaml = r#"

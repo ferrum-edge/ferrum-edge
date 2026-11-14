@@ -396,11 +396,12 @@ receive **403 Forbidden** with body `{"error":"WebSocket Origin not allowed"}` b
 backend dispatch. When `allowed_ws_origins` is **empty** (the default), no Origin check
 runs and any browser origin may upgrade. Entries are literal origins of the form
 `scheme://host[:port]`. The opaque origin `null` and `*` are rejected by Admin API
-create/update (POST/PUT/PATCH proxies, batch, restore) and `ferrum-edge validate` because
-unrelated sandboxed and local documents can all produce `Origin: null`, while `*` is not
-a wildcard. The validation error states empty list = allow all origins. Existing
-file/database/CP rows that still contain unsupported entries keep loading and emit one
-warning per proxy; neither `null` nor `*` authorizes an origin at runtime.
+create/update (POST/PUT/PATCH proxies, batch, restore), by file-mode loads (startup and
+SIGHUP reload), and by `ferrum-edge validate` because unrelated sandboxed and local
+documents can all produce `Origin: null`, while `*` is not a wildcard. The validation
+error states empty list = allow all origins. Existing database/CP rows that still
+contain unsupported entries keep loading and emit one warning per proxy; neither `null`
+nor `*` authorizes an origin at runtime.
 
 Operators who configure a strict `cors` allowlist on a proxy that also serves WebSocket
 traffic should set `allowed_ws_origins` to the same origin set. The gateway logs a

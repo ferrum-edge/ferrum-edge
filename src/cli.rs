@@ -969,15 +969,10 @@ pub fn execute_validate(args: &ValidateArgs) -> Result<(), String> {
             )
         })?;
 
-        // File-mode run still loads existing `"*"` rows (warn-only). Validate
-        // is the operator admission gate and must reject the CORS footgun.
-        let ws_origin_errors = config.allowed_ws_origins_admission_errors();
-        if !ws_origin_errors.is_empty() {
-            return Err(format!(
-                "Spec validation failed: {}",
-                ws_origin_errors.join("; ")
-            ));
-        }
+        // The CORS-style `allowed_ws_origins: ["*"]` footgun and non-origin
+        // entries are refused by `load_config_from_file` above (file mode is
+        // fatal on them, issue #7218), so `validate` reports them as a spec
+        // validation failure with no separate check here.
 
         // Validate stream proxy port conflicts
         let reserved_ports = env_config.reserved_gateway_ports();

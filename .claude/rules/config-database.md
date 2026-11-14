@@ -60,6 +60,26 @@ paths:
 - Add unit tests under `tests/unit/config/` and update `openapi.yaml` when admin-exposed.
 - During build-out, required-field changes update the current schema, config examples, and validation directly. Document the breaking change; do not add legacy transforms, startup schema repairs/backfills, or compatibility tracking tables. Recreate development databases after a baseline change.
 - Check parent structs for `#[serde(deny_unknown_fields)]` before adding fields.
+- Deliberate exception to the no-legacy-shims policy (issue #7218): the
+  security read paths keep tolerating pre-contract stored Consumer credential
+  shapes — a single-object (non-array) `jwt` / `hmac_auth` / `mtls_auth` value,
+  and extra fields on the `SINGLE_FIELD_CREDENTIAL_TYPES` entries. That covers
+  `jwt_credential_secret_values` (JWT secret ownership counts a stored secret
+  whatever its shape), the credential redaction projection
+  (`redact_consumer_credentials*`), `preserve_response_hidden_consumer_credentials`,
+  and `canonicalize_consumer_credentials_for_backup`. They are security
+  fail-closed reads: the JWT ownership check counts a secret whatever its
+  stored shape (defence in depth against two consumers sharing a JWT secret),
+  and the redaction, response-hidden preservation and backup paths keep
+  treating an old row's secret as a secret instead of losing or mis-projecting
+  it. Removing them would make such a row's secret invisible to those checks
+  rather than refuse it. Admission still accepts only the current shapes. Keep
+  them; do not add new legacy-shape writers.
+- `allowed_ws_origins` `*` / non-origin entries are refused by Admin API
+  writes, restore, and file-mode load/reload (`file_loader`, fatal like any
+  invalid local config); database, CP and DP loads keep #5454's grandfathering
+  and only warn (`Proxy::warn_legacy_allowed_ws_origins`), so a stored row
+  never takes a running gateway down (issue #7218).
 
 ## Database Backends
 
