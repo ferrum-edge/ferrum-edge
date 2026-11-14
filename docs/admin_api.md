@@ -2208,10 +2208,12 @@ target is the **bounded local audit retention file**
   directly before the response returns.
 - The file is hardened, locked, and atomically published like the backup
   fallback file beside it, and rotates the same way: it keeps the newest
-  records within `FERRUM_ADMIN_AUDIT_LOCAL_RETENTION_MAX_RECORDS` (default
-  4096) and `FERRUM_ADMIN_AUDIT_LOCAL_RETENTION_MAX_BYTES` (default 16 MiB),
-  dropping the oldest with a content-free `audit_local_retention_rotated`
-  warning. Lowering either bound takes effect on the next append, which
+  records by event timestamp within
+  `FERRUM_ADMIN_AUDIT_LOCAL_RETENTION_MAX_RECORDS` (default 4096) and
+  `FERRUM_ADMIN_AUDIT_LOCAL_RETENTION_MAX_BYTES` (default 16 MiB), dropping the
+  oldest with a content-free `audit_local_retention_rotated` warning. Delivery
+  order does not matter: a late replay of an older record never rotates a
+  newer one out. Lowering either bound takes effect on the next append, which
   rotates the existing file down. A replayed record (same event id) is not
   written twice; the retention directory is synced again before the replay is
   acknowledged.

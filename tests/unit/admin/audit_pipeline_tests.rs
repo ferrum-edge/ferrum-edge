@@ -2008,6 +2008,46 @@ fn db_less_retention_replay_resyncs_the_directory_before_acknowledging() {
     assert_eq!(retained_ids(dir.path()), vec![event.id]);
 }
 
+/// Review of #7369 (sol F3): delivery order is not age. A late replay of an
+/// older event never rotates a newer one out; the newest by timestamp stay.
+#[test]
+fn db_less_retention_keeps_the_newest_by_timestamp_not_delivery_order() {
+    let dir = TempDir::new().expect("retention dir");
+    let bounds = LocalAuditRetentionBounds {
+        max_records: 2,
+        ..LocalAuditRetentionBounds::default()
+    };
+    let now = Utc::now();
+    let at = |offset_secs: i64| {
+        let mut event = event();
+        event.ts = now + chrono::TimeDelta::seconds(offset_secs);
+        event
+    };
+    let (a, b, c, d) = (at(-1), at(0), at(1), at(2));
+
+    for event in [&b, &d] {
+        append_local_retention_event(dir.path(), bounds, event).expect("append");
+    }
+    assert_eq!(
+        append_local_retention_event(dir.path(), bounds, &a)
+            .expect("late replay of an older event"),
+        LocalRetentionAppend::Retained { rotated: 1 },
+        "the older replay is the record rotated out"
+    );
+    assert_eq!(
+        retained_ids(dir.path()),
+        vec![b.id.clone(), d.id.clone()],
+        "a late older event never evicts newer evidence"
+    );
+
+    append_local_retention_event(dir.path(), bounds, &c).expect("append out of order");
+    assert_eq!(
+        retained_ids(dir.path()),
+        vec![c.id, d.id],
+        "the oldest by timestamp is rotated out, and the file is in timestamp order"
+    );
+}
+
 #[test]
 fn db_less_retention_bounds_are_validated() {
     for (bounds, needle) in [

@@ -3657,13 +3657,14 @@ pub enum LocalRetentionAppend {
 ///
 /// The same hardened, locked, atomically published file as
 /// [`append_local_fallback_event`], rotated the same way (newest kept), but
-/// bounded by both `bounds.max_records` and `bounds.max_bytes`: the oldest
-/// events are dropped until the file fits. A file written under larger bounds
-/// is read (up to [`AUDIT_LOCAL_RETENTION_MAX_BYTES_MAX`]) and rotated down to
-/// these. A replayed event (same id) changes nothing but re-syncs the
-/// directory before it is acknowledged, so spool replay converges to one
-/// durable record. Errors only when the write or sync itself fails (or one
-/// event alone exceeds the byte bound).
+/// bounded by both `bounds.max_records` and `bounds.max_bytes`: the events
+/// with the oldest timestamps are dropped until the file fits, whatever order
+/// they were delivered in. A file written under larger bounds is read (up to
+/// [`AUDIT_LOCAL_RETENTION_MAX_BYTES_MAX`]) and rotated down to these. A
+/// replayed event (same id) changes nothing but re-syncs the directory before
+/// it is acknowledged, so spool replay converges to one durable record.
+/// Errors only when the write or sync itself fails (or one event alone
+/// exceeds the byte bound).
 pub fn append_local_retention_event(
     dir: &Path,
     bounds: LocalAuditRetentionBounds,
@@ -3694,8 +3695,9 @@ struct LocalAuditStore {
     /// lowered one instead of blocking every later append (issue #7200
     /// review).
     read_max_bytes: usize,
-    /// DB-less retention: also rotate by bytes, dedupe on the event id, and
-    /// write compact JSON so the byte accounting is exact.
+    /// DB-less retention: also rotate by bytes, dedupe on the event id, keep
+    /// the newest by event timestamp, and write compact JSON so the byte
+    /// accounting is exact.
     retention: bool,
 }
 
@@ -3747,6 +3749,14 @@ fn append_local_audit_event(
         return Ok(LocalRetentionAppend::AlreadyRetained);
     }
     events.push(event.clone());
+    if store.retention {
+        // Delivery order is not chronological (spool replay, queue overflow),
+        // so position is not age: keep the newest by event timestamp. The
+        // stable sort keeps file order, then arrival order, for equal
+        // timestamps. A replay older than the whole retained window is the
+        // record rotated out, never a newer one.
+        events.sort_by_key(|retained| retained.ts);
+    }
     let mut evicted = 0usize;
     if events.len() > store.max_records {
         let overflow = events.len() - store.max_records;
