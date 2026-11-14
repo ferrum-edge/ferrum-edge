@@ -263,6 +263,16 @@ jobs:
           INTEGRATION_FILTERS: ${{ matrix.filters }}
           INTEGRATION_FILTERSET: ${{ matrix.filterset }}
           INTEGRATION_PARTITION: ${{ matrix.partition }}
+          # Same pooling as the functional step below. nextest runs every test
+          # in its own process, and cargo-llvm-cov's default `%p` name gave each
+          # one an ~11 MB profile, all copied again into the shard tar:
+          # mesh-routing wrote 357 (3.7 GB) in under 20 s and lost its hosted
+          # runner during that burst and while writing its 6.9 GB tar. Pooled,
+          # each instrumented binary's processes merge into at most four files
+          # (~41 MB for integration_tests; a shard that also runs the
+          # ferrum-cni binary gets four more), and the tar shrinks to the
+          # ~3.4 GB of instrumented binaries.
+          LLVM_PROFILE_FILE_NAME: ferrum-edge-integration-%4m.profraw
           RUST_BACKTRACE: 1
 
       - name: Start functional data-plane service containers
