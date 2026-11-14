@@ -22,8 +22,8 @@ use ferrum_edge::admin::audit::{
     AuditWorker, LocalAuditRetentionBounds, LocalRetentionAppend, append_local_retention_event,
     audit_destination_identity, credential_update_diff, list_local_retention_events,
     new_request_slot, note_request_actor, record_without_database_with_pipeline,
-    sanitize_audit_namespace, sanitize_audit_path, scope_request, spawn_local_retention_worker,
-    update_diff,
+    sanitize_audit_namespace, sanitize_audit_path, scope_request,
+    set_local_audit_sync_hook_for_tests, spawn_local_retention_worker, update_diff,
 };
 use ferrum_edge::admin::audit_spool::{
     AUDIT_DIFF_OMITTED_MARKER, AUDIT_SPOOL_RECORD_VERSION, AuditSpool, RetainOutcome,
@@ -1940,6 +1940,72 @@ fn db_less_retention_rotates_down_after_the_byte_bound_is_lowered() {
         .expect("retention file exists")
         .len();
     assert!(size <= lowered.max_bytes, "file is {size} bytes");
+}
+
+/// Clears the process-global directory-sync hook, including on panic.
+struct ClearLocalAuditSyncHook;
+
+impl Drop for ClearLocalAuditSyncHook {
+    fn drop(&mut self) {
+        set_local_audit_sync_hook_for_tests(None);
+    }
+}
+
+/// Review of #7369 (sol F2): an earlier attempt can publish the event and
+/// then fail its directory sync. A replay that finds the id must redo the
+/// sync, and must not acknowledge (letting the spool copy be settled) while
+/// the sync still fails.
+#[test]
+fn db_less_retention_replay_resyncs_the_directory_before_acknowledging() {
+    let dir = TempDir::new().expect("retention dir");
+    let bounds = LocalAuditRetentionBounds::default();
+    let target = dir.path().to_path_buf();
+    let failures = Arc::new(AtomicU64::new(1));
+    let syncs = Arc::new(AtomicU64::new(0));
+    let hook_failures = Arc::clone(&failures);
+    let hook_syncs = Arc::clone(&syncs);
+    let _clear = ClearLocalAuditSyncHook;
+    set_local_audit_sync_hook_for_tests(Some(Arc::new(
+        move |synced: &Path| -> std::io::Result<()> {
+            if synced != target.as_path() {
+                return Ok(());
+            }
+            hook_syncs.fetch_add(1, Ordering::SeqCst);
+            if hook_failures
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
+                    left.checked_sub(1)
+                })
+                .is_ok()
+            {
+                return Err(std::io::Error::other("injected directory sync failure"));
+            }
+            Ok(())
+        },
+    )));
+
+    let event = event();
+    append_local_retention_event(dir.path(), bounds, &event)
+        .expect_err("the first attempt fails its directory sync after publishing");
+    assert_eq!(
+        retained_ids(dir.path()),
+        vec![event.id.clone()],
+        "the rename is visible although its directory sync failed"
+    );
+
+    failures.store(1, Ordering::SeqCst);
+    append_local_retention_event(dir.path(), bounds, &event)
+        .expect_err("a replay must not acknowledge while the directory sync still fails");
+
+    assert_eq!(
+        append_local_retention_event(dir.path(), bounds, &event).expect("replay"),
+        LocalRetentionAppend::AlreadyRetained
+    );
+    assert_eq!(
+        syncs.load(Ordering::SeqCst),
+        3,
+        "every attempt, replays included, syncs the retention directory"
+    );
+    assert_eq!(retained_ids(dir.path()), vec![event.id]);
 }
 
 #[test]
