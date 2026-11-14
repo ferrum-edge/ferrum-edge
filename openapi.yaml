@@ -1756,7 +1756,12 @@ paths:
       description: |
         Managed TLS record IDs are globally unique across material kinds. Create
         with `allow_overwrite=true` rejects a cross-kind ID collision with
-        `409 Conflict`.
+        `409 Conflict`. `jwks_auth` and `oidc_relying_party` read the record
+        through `providers[].jwks_source: managed://jwks/{id}#jwks`. Before the
+        response is sent, every key store on this node backed by a managed JWKS
+        record is re-read, so the new key set is in effect locally when the
+        write returns; other nodes sharing `FERRUM_TLS_MANAGED_STORE_PATH`
+        re-read on their own cadence.
       tags: [TLS]
       requestBody:
         required: true
@@ -1817,6 +1822,10 @@ paths:
       summary: Rotate an admin-managed JWKS document
       description: |
         Same-kind replacement only. Cross-kind ID collisions return `409 Conflict`.
+        Key rotation: before the response is sent every managed-JWKS-backed key
+        store on this node is re-read, so a `kid` added by the replacement is
+        accepted and a removed one is refused by this node's consumers when the
+        write returns.
       tags: [TLS]
       parameters:
         - $ref: "#/components/parameters/ResourceId"
@@ -1854,6 +1863,12 @@ paths:
     delete:
       operationId: deleteManagedTlsJwks
       summary: Delete an unreferenced admin-managed JWKS document
+      description: |
+        Returns `409 Conflict` while an enabled `jwks_auth` or
+        `oidc_relying_party` config (or any other inventory reference) still
+        names the record. A record removed anyway (another node sharing the
+        store, or an out-of-band edit) withdraws every key from its consumers,
+        which then refuse tokens until it is restored.
       tags: [TLS]
       parameters:
         - $ref: "#/components/parameters/ResourceId"
@@ -10449,7 +10464,15 @@ components:
           type: string
         jwks_json:
           type: string
-          description: JSON Web Key Set document. Must contain a non-empty `keys` array.
+          description: >-
+            JSON Web Key Set document. Admitted only when a JWKS consumer could
+            verify with it: at most 1 MiB and 256 keys, no duplicate usable
+            `kid`, and at least one usable signing key (non-empty `kid`, `use`
+            absent or `sig`, `key_ops` absent or including `verify`, a supported
+            RS*/PS*/ES256/ES384/EdDSA key of approved strength; EdDSA is refused
+            under FIPS enforcement). Unusable keys beside a usable one are
+            skipped. Referenced from `jwks_auth` / `oidc_relying_party` as
+            `providers[].jwks_source: managed://jwks/<id>#jwks`.
         allow_overwrite:
           type: boolean
           default: false
@@ -17765,7 +17788,9 @@ components:
       type: object
       description: |
         Authenticated `/health`/`/status` aggregate of **active remote** JWKS
-        trust stores (issue #3739). Counts and ages are fixed-cardinality only —
+        trust stores and active admin-managed JWKS stores (`jwks_source`,
+        issue #7277; fresh while the record is present, expired once it is
+        withdrawn) (issue #3739). Counts and ages are fixed-cardinality only —
         never JWKS/discovery URLs, `kid` values, tokens, claims, credentials,
         or key material. Inactive/retired cache entries and inline JWKS are
         excluded. Unauthenticated probes never receive this object; they see
@@ -24615,6 +24640,7 @@ components:
               - required: [jwks]
                 not:
                   required: [jwks_max_stale_seconds]
+              - required: [jwks_source]
             allOf:
               - if:
                   required: [require_dpop]
@@ -24635,7 +24661,7 @@ components:
                 type: string
                 format: uri
                 pattern: "^\\s*(https://[^\\s/?#@]+([/?#]\\S*)?|http://(127\\.[0-9.]+|\\[[0-9A-Fa-f:.]+\\])(:[0-9]+)?([/?#]\\S*)?)\\s*$"
-                description: Direct URL to the IdP's JWKS endpoint. HTTPS is required except for a loopback IP-literal host (127.0.0.0/8 or [::1]); the name localhost does not qualify, because DNS overrides and the resolver decide where a name connects. URL userinfo is rejected. Exactly one of jwks_uri, discovery_url, or jwks may be configured per provider.
+                description: Direct URL to the IdP's JWKS endpoint. HTTPS is required except for a loopback IP-literal host (127.0.0.0/8 or [::1]); the name localhost does not qualify, because DNS overrides and the resolver decide where a name connects. URL userinfo is rejected. Exactly one of jwks_uri, discovery_url, jwks, or jwks_source may be configured per provider.
               discovery_url:
                 type: string
                 format: uri
@@ -24657,6 +24683,31 @@ components:
                   - type: string
                   - type: object
                 description: Inline JWKS JSON string or object
+              jwks_source:
+                type: string
+                minLength: 1
+                pattern: "^managed://"
+                description: >-
+                  Admin-managed JWKS record: `managed://jwks/<id>#jwks` (also
+                  accepted: `managed://jwks/<id>`, `managed://<id>#jwks`, and the
+                  `#jwks-json` / `#jwks_json` fragment aliases), stored through
+                  `/admin/tls/jwks`. Exactly one of jwks_uri, discovery_url,
+                  jwks, or jwks_source may be configured per provider. Only the
+                  `managed://` scheme is accepted; a fragment or collection that
+                  selects other material, `?` options, and an invalid record id
+                  are refused at config load. The record is read from this
+                  node's managed TLS store (`FERRUM_TLS_MANAGED_STORE_PATH`):
+                  while it is present and holds a usable signing key the key set
+                  is fresh; once it is deleted, of another kind, or keyless every
+                  key is withdrawn and tokens are refused (like an expired remote
+                  set); a store that cannot be read keeps the last-read keys in
+                  grace for at most jwks_max_stale_seconds. The record is re-read
+                  every jwks_refresh_interval_secs, on an unknown kid (subject to
+                  kid_miss_refresh_cooldown_seconds), and immediately after a
+                  local `/admin/tls/jwks` write. Admin writes refuse a reference
+                  to a record that does not exist; file mode refuses to start
+                  without it; database mode warns. Namespace-bounded operator
+                  tokens may not introduce one.
               issuer:
                 type: string
                 minLength: 1
@@ -24934,8 +24985,10 @@ components:
                   Per-provider maximum monotonic age of the last validated
                   non-empty remote JWKS. Overrides the plugin default. Zero is
                   invalid and cannot disable bounded stale-key expiry. Applies
-                  only to jwks_uri and discovery_url sources; supplying it on an
-                  inline jwks provider is rejected. jwks_refresh_interval_secs
+                  to jwks_uri, discovery_url, and jwks_source sources (for a
+                  managed record it bounds how long the last-read keys survive
+                  an unreadable store); supplying it on an inline jwks provider
+                  is rejected. jwks_refresh_interval_secs
                   must not exceed this value — a cross-field rule JSON Schema
                   cannot express, enforced at config load.
               clock_skew_seconds:
@@ -25570,6 +25623,8 @@ components:
                     type: "null"
                   jwks_uri:
                     type: "null"
+                  jwks_source:
+                    type: "null"
               - required: [authorization_endpoint, token_endpoint, jwks_uri]
                 properties:
                   authorization_endpoint:
@@ -25578,6 +25633,20 @@ components:
                     type: string
                   jwks_uri:
                     type: string
+                  jwks_source:
+                    type: "null"
+                  discovery_url:
+                    type: "null"
+              - required: [authorization_endpoint, token_endpoint, jwks_source]
+                properties:
+                  authorization_endpoint:
+                    type: string
+                  token_endpoint:
+                    type: string
+                  jwks_source:
+                    type: string
+                  jwks_uri:
+                    type: "null"
                   discovery_url:
                     type: "null"
             properties:
@@ -25608,6 +25677,26 @@ components:
               jwks_uri:
                 type: [string, "null"]
                 minLength: 1
+              jwks_source:
+                type: [string, "null"]
+                minLength: 1
+                pattern: "^managed://"
+                description: >-
+                  Admin-managed JWKS record used to verify ID tokens instead of
+                  fetching jwks_uri: `managed://jwks/<id>#jwks` (also accepted:
+                  `managed://jwks/<id>`, `managed://<id>#jwks`), stored through
+                  `/admin/tls/jwks`. Only with explicit authorization_endpoint
+                  and token_endpoint; mutually exclusive with jwks_uri and
+                  discovery_url. The fragment and collection must select JWKS
+                  material and `?` options are refused. The record is read from
+                  this node's managed TLS store (`FERRUM_TLS_MANAGED_STORE_PATH`):
+                  fresh while it is present, every key withdrawn (ID tokens
+                  refused) once it is deleted or holds no usable signing key,
+                  re-read every 900 seconds, on an unknown kid, and immediately
+                  after a local `/admin/tls/jwks` write. Admin writes refuse a
+                  reference to a record that does not exist; file mode refuses
+                  to start without it. Namespace-bounded operator tokens may not
+                  introduce one.
               end_session_endpoint:
                 type: [string, "null"]
                 minLength: 1

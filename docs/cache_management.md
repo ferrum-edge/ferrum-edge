@@ -256,7 +256,7 @@ at construction without disclosing credentials.
 
 ### JWKS Cache
 
-**What it stores:** JWKS key sets fetched from remote JWKS endpoints, shared across all `jwks_auth` plugin instances.
+**What it stores:** JWKS key sets fetched from remote JWKS endpoints, or read from admin-managed JWKS records (`jwks_source: managed://jwks/<id>#jwks`, keyed by that canonical reference), shared across all `jwks_auth` and `oidc_relying_party` plugin instances. A managed entry re-reads its record at the same refresh interval and immediately after a local `/admin/tls/jwks` write; it is fresh while the record is present and drops every key once the record is withdrawn (see [plugins.md](plugins.md#managed-jwks-records)).
 
 **Default limit:** No hard entry cap -- bounded by the number of configured JWKS provider URLs (typically 1-3 per plugin instance).
 
