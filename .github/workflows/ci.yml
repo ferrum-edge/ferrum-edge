@@ -6529,13 +6529,34 @@ jobs:
           kubectl -n ferrum-dev create secret generic ferrum-mesh-dev-credentials \
             --from-literal=admin-jwt-secret="${admin_secret}" \
             --from-literal=cp-dp-grpc-jwt-secret="${grpc_secret}"
+          # The standalone mesh CA (#7298) rides the development install: it must
+          # become Ready and its gRPC Service must publish a ready endpoint.
           helm install ferrum-dev ./charts/ferrum-mesh -n ferrum-dev \
             -f ./charts/ferrum-mesh/examples/development-values.yaml \
             --set image.repository=ferrum-edge \
             --set image.tag=helm-chart-ci \
             --set image.pullPolicy=IfNotPresent \
+            --set ca.enabled=true \
             --set gatewayClass.name=ferrum-dev
           kubectl -n ferrum-dev rollout status deployment/ferrum-mesh-control-plane --timeout=180s
+          kubectl -n ferrum-dev rollout status deployment/ferrum-mesh-ca --timeout=180s
+          ca_endpoint_ports="$(kubectl -n ferrum-dev get endpointslices \
+            -l kubernetes.io/service-name=ferrum-mesh-ca \
+            -o jsonpath='{range .items[*]}{range .endpoints[?(@.conditions.ready==true)]}{"ready "}{end}{range .ports[*]}{.name}{"="}{.port}{" "}{end}{end}')"
+          echo "ferrum-mesh-ca endpoints: ${ca_endpoint_ports}"
+          if ! printf '%s\n' "$ca_endpoint_ports" | grep -Fq 'ready ' ||
+             ! printf '%s\n' "$ca_endpoint_ports" | grep -Fq 'grpc=50051'; then
+            echo "::error title=Mesh CA unreachable::the ferrum-mesh-ca Service must publish a ready grpc endpoint on 50051"
+            kubectl -n ferrum-dev get endpointslices -l kubernetes.io/service-name=ferrum-mesh-ca -o yaml
+            exit 1
+          fi
+          kubectl -n ferrum-dev logs deployment/ferrum-mesh-ca --all-containers --tail=1000 > "$RUNNER_TEMP/ferrum-helm-results/development-ca.log"
+          if grep -Fq "${admin_secret}" "$RUNNER_TEMP/ferrum-helm-results/development-ca.log" ||
+             grep -Fq "${grpc_secret}" "$RUNNER_TEMP/ferrum-helm-results/development-ca.log"; then
+            rm -f "$RUNNER_TEMP/ferrum-helm-results/development-ca.log"
+            echo "::error title=Secret leaked to logs::development mesh CA logs contained a JWT secret"
+            exit 1
+          fi
           kubectl -n ferrum-dev get pods -o wide > "$RUNNER_TEMP/ferrum-helm-results/development-pods.txt"
           kubectl -n ferrum-dev describe deployment/ferrum-mesh-control-plane > "$RUNNER_TEMP/ferrum-helm-results/development-control-plane-deployment.txt"
           kubectl -n ferrum-dev get events --sort-by=.lastTimestamp > "$RUNNER_TEMP/ferrum-helm-results/development-events.txt"

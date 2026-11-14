@@ -689,6 +689,12 @@
         "enabled": {
           "type": "boolean"
         },
+        "grpcPort": {
+          "type": "integer",
+          "description": "CP/DP gRPC port of the CA Deployment: the listen address, the grpc container port, and the ferrum-mesh-ca Service port.",
+          "minimum": 1,
+          "maximum": 65535
+        },
         "env": {
           "type": "object",
           "description": "Free-form CA env map.",

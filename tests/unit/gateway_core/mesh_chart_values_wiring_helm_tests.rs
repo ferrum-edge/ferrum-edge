@@ -210,7 +210,7 @@ fn ca_plaintext_cp_grpc_bind_fails_the_render() {
     let ca_block = &ca_block[..ca_block.find("{{- end -}}").expect("closed CA block")];
     assert!(
         ca_block.contains(
-            "{{- include \"ferrum-mesh.validateCpGrpcTransport\" (dict \"label\" \"ca.env\" \"env\" .Values.ca.env) -}}"
+            "{{- include \"ferrum-mesh.validateCpGrpcTransport\" (dict \"label\" \"ca.env\" \"env\" .Values.ca.env \"defaultListenAddr\" (printf \"0.0.0.0:%v\" .Values.ca.grpcPort)) -}}"
         ),
         "the CA component must run the CP gRPC transport guard over ca.env"
     );
@@ -224,7 +224,7 @@ fn ca_plaintext_cp_grpc_bind_fails_the_render() {
         .find("{{- end -}}\n{{- end -}}")
         .expect("closed helper")];
     for needle in [
-        "\"FERRUM_CP_GRPC_LISTEN_ADDR\" | default \"0.0.0.0:50051\"",
+        "\"FERRUM_CP_GRPC_LISTEN_ADDR\" | default (.defaultListenAddr | default \"0.0.0.0:50051\")",
         "\"FERRUM_CP_GRPC_TLS_CERT_PATH\"",
         "\"FERRUM_CP_GRPC_TLS_KEY_PATH\"",
         "\"FERRUM_CP_DP_GRPC_ALLOW_PLAINTEXT\"",
@@ -255,5 +255,71 @@ fn ca_plaintext_cp_grpc_bind_fails_the_render() {
         ca.contains("FERRUM_CP_DP_GRPC_ALLOW_PLAINTEXT: \"true\""),
         "the development example must opt the CA into plaintext CP gRPC so \
          `-f development-values.yaml --set ca.enabled=true` still renders"
+    );
+}
+
+/// The standalone mesh CA must be reachable (issue #7298): `ca.grpcPort` moves
+/// the CP gRPC listener, the named `grpc` container port, and the
+/// `ferrum-mesh-ca` Service together, the way `controlPlane.grpcPort` does.
+#[test]
+fn ca_grpc_port_renders_listener_container_port_and_service() {
+    let template = read_chart("templates/ca-deployment.yaml");
+    assert!(
+        template.contains("- name: grpc\n              containerPort: {{ .Values.ca.grpcPort }}"),
+        "the CA Deployment must declare a named grpc container port from ca.grpcPort"
+    );
+    assert!(
+        template.contains("{{- if not (hasKey $caEnv \"FERRUM_CP_GRPC_LISTEN_ADDR\") }}")
+            && template.contains("value: {{ printf \"0.0.0.0:%v\" .Values.ca.grpcPort | quote }}"),
+        "the chart must bind FERRUM_CP_GRPC_LISTEN_ADDR to ca.grpcPort unless ca.env sets it"
+    );
+    let service = &template[template
+        .find("kind: Service")
+        .expect("the CA template must render a Service")..];
+    for needle in [
+        "name: ferrum-mesh-ca",
+        "app.kubernetes.io/name: ferrum-mesh-ca",
+        "- name: grpc",
+        "port: {{ .Values.ca.grpcPort }}",
+        "targetPort: grpc",
+    ] {
+        assert!(
+            service.contains(needle),
+            "the ferrum-mesh-ca Service must expose the CA gRPC port: missing {needle}"
+        );
+    }
+    assert!(
+        !service.contains("admin-http"),
+        "admin stays off the CA gRPC Service; metrics use ferrum-mesh-ca-metrics"
+    );
+
+    // The CA ServiceAccount has no RBAC and mounts no API token, so the
+    // in-cluster defaults for the CRD controller and pod discovery would fail
+    // at startup. The chart turns them off unless ca.env sets them.
+    for name in [
+        "FERRUM_K8S_CONTROLLER_ENABLED",
+        "FERRUM_K8S_POD_DISCOVERY_ENABLED",
+    ] {
+        assert!(
+            template.contains(&format!("{{{{- if not (hasKey $caEnv \"{name}\") }}}}"))
+                && template.contains(&format!("- name: {name}\n              value: \"false\"")),
+            "the CA must default {name} to false unless ca.env sets it"
+        );
+    }
+
+    let values = read_chart("values.yaml");
+    let ca = &values[values.find("\nca:\n").expect("values.yaml has a ca block")..];
+    assert!(
+        ca.contains("grpcPort: 50051"),
+        "ca.grpcPort must default to 50051"
+    );
+    let schema = read_chart("values.schema.json");
+    let ca_schema = &schema[schema
+        .find("\"ca\": {")
+        .expect("values.schema.json describes ca")..];
+    assert!(
+        ca_schema[..ca_schema.find("\"probes\"").expect("ca schema has probes")]
+            .contains("\"grpcPort\""),
+        "values.schema.json must declare ca.grpcPort"
     );
 }

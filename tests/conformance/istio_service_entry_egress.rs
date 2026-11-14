@@ -211,7 +211,7 @@ fn se_http_egress_materializes() {
         category = CATEGORY,
         feature = "HTTP-family egress materialization",
         status = Status::Supported,
-        notes = "TLS/HTTP/HTTP2/GRPC protocols map to one host-routed HTTP-family proxy on the shared egress listener.",
+        notes = "TLS/HTTP/HTTP2/GRPC protocols map to one host-routed HTTP-family proxy on the shared egress listener; HTTP/HTTP2/GRPC are plaintext unless a DestinationRule tls.mode originates TLS (issue #7236).",
     );
     let translation = translate_k8s_objects(
         &[external_se("api", vec!["api.external.com"], 443, "TLS")],

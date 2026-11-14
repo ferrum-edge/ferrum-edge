@@ -531,6 +531,44 @@ fn test_http3_websocket_enabled_parses_false() {
 }
 
 #[test]
+fn test_mesh_sidecar_identity_narrowing_defaults_true() {
+    // Issue #7243: identity narrowing is on by default; it still only takes
+    // effect together with FERRUM_MESH_SIDECAR_ENFORCED=true.
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/path/to/config.yaml"),
+        ],
+        || {
+            remove_var("FERRUM_MESH_SIDECAR_IDENTITY_NARROWING");
+            let config = EnvConfig::from_env().unwrap();
+            assert!(
+                config.mesh_sidecar_identity_narrowing,
+                "Missing FERRUM_MESH_SIDECAR_IDENTITY_NARROWING must default to true"
+            );
+        },
+    );
+}
+
+#[test]
+fn test_mesh_sidecar_identity_narrowing_false_is_the_off_switch() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/path/to/config.yaml"),
+            ("FERRUM_MESH_SIDECAR_IDENTITY_NARROWING", "false"),
+        ],
+        || {
+            let config = EnvConfig::from_env().unwrap();
+            assert!(
+                !config.mesh_sidecar_identity_narrowing,
+                "FERRUM_MESH_SIDECAR_IDENTITY_NARROWING=false must turn narrowing off"
+            );
+        },
+    );
+}
+
+#[test]
 fn test_http3_websocket_enabled_parses_true() {
     with_env_vars(
         &[

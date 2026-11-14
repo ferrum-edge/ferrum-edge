@@ -11,7 +11,7 @@ naming, labelling, secret, and validation conventions.
 | Control plane | `controlPlane.enabled` | `false` | Requires DB + JWT secrets |
 | Injector webhook | `injector.enabled` | `false` | Requires TLS Secret **and** exactly one CA trust source (`injector.caBundle` or `injector.certManager.injectCaFrom`) |
 | East-west gateway | `eastWest.enabled` | `false` | Cross-cluster SNI passthrough |
-| Mesh CA | `ca.enabled` | `false` | Fixed one replica in template |
+| Mesh CA | `ca.enabled` | `false` | Fixed one replica; gRPC Service `ferrum-mesh-ca` on `ca.grpcPort` (see [Mesh CA](#mesh-ca)) |
 | Ambient proxy | `ambient.enabled` | `false` | Requires `nodeAgent.enabled` |
 | Node agent | `nodeAgent.enabled` | `false` | eBPF capture manager |
 
@@ -25,6 +25,32 @@ its Service port, and the listener itself: the chart renders
 `FERRUM_CP_GRPC_LISTEN_ADDR=0.0.0.0:<grpcPort>` unless `controlPlane.env` sets
 `FERRUM_CP_GRPC_LISTEN_ADDR`, in which case that value is used unchanged and must
 listen on the same port.
+
+## Mesh CA
+
+`ca.enabled=true` adds the `ferrum-mesh-ca` Deployment: one replica of the
+Ferrum binary in `FERRUM_MODE=cp`, sharing the control plane's database and
+JWT credentials. It serves the CP gRPC API (ConfigSync and MeshConfigSync) on
+`ca.grpcPort` (default `50051`) and is reachable in-cluster through the
+`ferrum-mesh-ca` Service at `ferrum-mesh-ca.<release namespace>.svc:<ca.grpcPort>`
+(port name `grpc`). The chart renders `FERRUM_CP_GRPC_LISTEN_ADDR=0.0.0.0:<ca.grpcPort>`
+unless `ca.env` sets it. Admin health and metrics stay off that Service: the
+admin listener backs the probes and, with observability enabled, the dedicated
+`ferrum-mesh-ca-metrics` Service.
+
+The CA has no Kubernetes RBAC and mounts no API token, so the chart sets
+`FERRUM_K8S_CONTROLLER_ENABLED=false` and `FERRUM_K8S_POD_DISCOVERY_ENABLED=false`
+for it unless `ca.env` sets them; the control plane owns the Kubernetes watches.
+Like the control plane, the CA refuses a plaintext non-loopback CP gRPC bind, so
+the render fails unless `ca.env` sets `FERRUM_CP_GRPC_TLS_CERT_PATH` and
+`FERRUM_CP_GRPC_TLS_KEY_PATH` (mounted), binds a loopback
+`FERRUM_CP_GRPC_LISTEN_ADDR`, or opts into `FERRUM_CP_DP_GRPC_ALLOW_PLAINTEXT="true"`
+(development only; `examples/development-values.yaml` does this).
+
+Workload identity does not come from this Deployment: mesh data planes get their
+SVIDs from `FERRUM_MESH_CA_BACKEND=spire` (SPIRE Agent), file SVIDs, or the
+process-local `internal` dev CA (see `docs/mesh.md`). Data planes that should
+reach the CA's CP gRPC API list it in `FERRUM_DP_CP_GRPC_URLS`.
 
 ## Container image tag
 

@@ -59,8 +59,7 @@ use crate::modes::mesh::config::{
     bracketed_mesh_attribute_name, normalize_mesh_condition_values,
     normalize_request_match_host_pattern, policy_scope_applies_to_workload,
     policy_scope_applies_with_waypoint, policy_target_attachment_applies_to_service,
-    resolve_target_port, validate_mesh_condition, validate_mesh_policy_request_matchers,
-    workload_selector_matches,
+    validate_mesh_condition, validate_mesh_policy_request_matchers, workload_selector_matches,
 };
 use crate::modes::mesh::hbone::{BAGGAGE_HEADER, HboneIdentity};
 use crate::modes::mesh::policy::{
@@ -916,18 +915,9 @@ fn destination_policy_scopes_for_service_port(
         if workload.addresses.is_empty() {
             continue;
         }
-        let app_port = match service_port.target_port.as_ref() {
-            Some(_) => {
-                match resolve_target_port(service_port.target_port.as_ref(), &workload.ports) {
-                    Some(port) if port != 0 => port,
-                    _ => continue,
-                }
-            }
-            None => service_port.port,
-        };
-        if app_port == 0 {
+        let Some(app_port) = service_port.backend_port_for(&workload.ports) else {
             continue;
-        }
+        };
         // Stamp the DESTINATION service identity from the Service this index is
         // keyed by — not from `Workload.service_name`, which names one
         // projection and cannot disambiguate a pod several Services select.
