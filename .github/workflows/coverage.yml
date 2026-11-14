@@ -265,11 +265,13 @@ jobs:
           INTEGRATION_PARTITION: ${{ matrix.partition }}
           # Same pooling as the functional step below. nextest runs every test
           # in its own process, and cargo-llvm-cov's default `%p` name gave each
-          # one an ~11 MB profile: 357-881 files and 3.7-9 GB written in seconds
-          # per shard, then copied again into the shard tar. The mesh-routing
-          # shard lost its hosted runner during that burst and while writing
-          # the 6.9 GB tar. Pooled, a shard writes 4 files and ~41 MB and its
-          # tar shrinks to the ~3.4 GB of instrumented binaries.
+          # one an ~11 MB profile, all copied again into the shard tar:
+          # mesh-routing wrote 357 (3.7 GB) in under 20 s and lost its hosted
+          # runner during that burst and while writing its 6.9 GB tar. Pooled,
+          # each instrumented binary's processes merge into at most four files
+          # (~41 MB for integration_tests; a shard that also runs the
+          # ferrum-cni binary gets four more), and the tar shrinks to the
+          # ~3.4 GB of instrumented binaries.
           LLVM_PROFILE_FILE_NAME: ferrum-edge-integration-%4m.profraw
           RUST_BACKTRACE: 1
 
@@ -660,8 +662,9 @@ jobs:
             # pipefail propagates corrupt ZIPs AND tar extraction failures.
             unzip -p "$archive" "$member" | { tar -xpf - && cat > /dev/null; }
             # Raw-profile names can coincide across runners: cargo-llvm-cov's
-            # default `%p-%Nm` name reuses pids, and the functional shards'
-            # pooled `%4m` name carries only the binary signature (#6378). Tag
+            # default `%p-%Nm` name reuses pids, and the pooled `%4m` names of
+            # the functional and integration shards carry no pid, only the
+            # binary signature and pool index (#6378). Tag
             # every profile this shard just extracted with its shard name before
             # the next shard can overwrite it. The report merges every
             # top-level `*.profraw`, whatever its name.
