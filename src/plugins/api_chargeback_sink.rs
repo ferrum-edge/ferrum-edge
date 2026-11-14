@@ -6277,9 +6277,12 @@ fn spool_owner_digest(fields: &[&str]) -> String {
 /// process-global switch, so no production sink can be steered away from the
 /// real filesystem calls.
 ///
-/// Non-`None` variants are constructed only by the external unit-test suite via
-/// [`SpoolManager::for_tests_with_owner_and_faults`]; the binary crate never
-/// builds them, so clippy's dead-code lint is expected there.
+/// Compiled only with the `test-support` cargo feature (issue #7122), which
+/// test targets enable through the crate's self dev-dependency: a production
+/// build carries no fault-injection entry point on the billing-spool
+/// fsync/rename path. Constructed by the external unit-test suite via
+/// [`SpoolManager::for_tests_with_owner_and_faults`].
+#[cfg(feature = "test-support")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SpoolFsFault {
     None,
@@ -6324,10 +6327,12 @@ pub enum SpoolFinalOwnership {
     Shared,
 }
 
-/// Injectable durable-write steps for the atomic spool publish sequence.
+/// Durable-write steps for the atomic spool publish sequence.
 ///
-/// Parent-directory fsync is a Unix-only step, so the two directory hooks are
-/// unread on other targets.
+/// Production always uses [`SpoolFsOps::REAL`]; only a `test-support` build can
+/// substitute a failing step (`SpoolFsOps::with_fault`). Parent-directory
+/// fsync is a Unix-only step, so the two directory hooks are unread on other
+/// targets.
 #[derive(Clone, Copy)]
 #[cfg_attr(not(unix), allow(dead_code))]
 struct SpoolFsOps {
@@ -6350,6 +6355,7 @@ impl SpoolFsOps {
         sync_dir: real_sync_spool_dir,
     };
 
+    #[cfg(feature = "test-support")]
     fn with_fault(fault: SpoolFsFault) -> Self {
         let mut ops = Self::REAL;
         match fault {
@@ -6406,6 +6412,7 @@ fn real_sync_spool_dir(dir: &File, path: &Path) -> Result<(), String> {
     })
 }
 
+#[cfg(feature = "test-support")]
 #[allow(dead_code)] // reachable only through the test-only faulted constructors
 fn fail_sync_spool_file(_file: &File, path: &Path) -> Result<(), String> {
     Err(format!(
@@ -6414,6 +6421,7 @@ fn fail_sync_spool_file(_file: &File, path: &Path) -> Result<(), String> {
     ))
 }
 
+#[cfg(feature = "test-support")]
 #[allow(dead_code)] // reachable only through the test-only faulted constructors
 fn fail_rename_spool_file(from: &Path, to: &Path) -> Result<(), String> {
     Err(format!(
@@ -6423,6 +6431,7 @@ fn fail_rename_spool_file(from: &Path, to: &Path) -> Result<(), String> {
     ))
 }
 
+#[cfg(feature = "test-support")]
 #[allow(dead_code)] // reachable only through the test-only faulted constructors
 fn fail_open_spool_dir(path: &Path) -> Result<File, String> {
     Err(format!(
@@ -6434,6 +6443,7 @@ fn fail_open_spool_dir(path: &Path) -> Result<File, String> {
 /// Atomically replace the just-published final path with a distinct file, as a
 /// peer writer racing this attempt would. The replacement is renamed into place
 /// so the entry always names a complete file with a different inode.
+#[cfg(feature = "test-support")]
 #[allow(dead_code)] // reachable only through the test-only faulted constructors
 fn republish_final_path_as_peer(final_path: &Path) {
     let mut peer_tmp = final_path.as_os_str().to_os_string();
@@ -6446,9 +6456,11 @@ fn republish_final_path_as_peer(final_path: &Path) {
 
 /// Contents written by [`republish_final_path_as_peer`]; asserted by tests that
 /// check a peer publication survived another writer's rollback.
+#[cfg(feature = "test-support")]
 #[doc(hidden)]
 pub const PEER_REPUBLISH_MARKER: &[u8] = b"{\"peer_republished\":true}\n";
 
+#[cfg(feature = "test-support")]
 #[allow(dead_code)] // reachable only through the test-only faulted constructors
 fn fail_sync_spool_dir(_dir: &File, path: &Path) -> Result<(), String> {
     Err(format!(
@@ -7621,11 +7633,11 @@ impl SpoolManager {
         node_id: &str,
         ceiling: &'static RetainedByteCeiling,
     ) -> Result<Self, String> {
-        Self::for_tests_with_owner_faults_ages_and_ceiling(
+        Self::for_tests_with_ops(
             cfg,
             &default_test_spool_owner_spec(node_id),
             1,
-            SpoolFsFault::None,
+            SpoolFsOps::REAL,
             0,
             SPOOL_CLAIM_LEASE_MIN_SECS,
             ceiling,
@@ -7638,9 +7650,20 @@ impl SpoolManager {
         spec: &SpoolOwnerSpec<'_>,
         generation: u64,
     ) -> Result<Self, String> {
-        Self::for_tests_with_owner_and_faults(cfg, spec, generation, SpoolFsFault::None)
+        // Tests treat a foreign temp as immediately reconcilable unless a live
+        // in-process writer lease protects it.
+        Self::for_tests_with_ops(
+            cfg,
+            spec,
+            generation,
+            SpoolFsOps::REAL,
+            0,
+            SPOOL_CLAIM_LEASE_MIN_SECS,
+            process_ceiling(),
+        )
     }
 
+    #[cfg(feature = "test-support")]
     #[doc(hidden)]
     pub fn for_tests_with_owner_and_faults(
         cfg: SpoolSettings,
@@ -7663,6 +7686,7 @@ impl SpoolManager {
     /// Same as [`Self::for_tests_with_owner_and_faults`] with explicit
     /// stale-temp and claim-lease horizons, so age-gated stranded-claim
     /// reporting is exercised without wall-clock sleeps.
+    #[cfg(feature = "test-support")]
     #[doc(hidden)]
     pub fn for_tests_with_owner_faults_and_ages(
         cfg: SpoolSettings,
@@ -7687,6 +7711,7 @@ impl SpoolManager {
     /// test-owned retained-byte ceiling, so write-side reservation and refusal
     /// assertions stay exact while other tests in the same binary reserve
     /// against the process-global counter.
+    #[cfg(feature = "test-support")]
     #[doc(hidden)]
     #[allow(dead_code, clippy::too_many_arguments)] // external unit tests only
     pub fn for_tests_with_owner_faults_ages_and_ceiling(
@@ -7694,6 +7719,30 @@ impl SpoolManager {
         spec: &SpoolOwnerSpec<'_>,
         generation: u64,
         fault: SpoolFsFault,
+        stale_temp_age_secs: u64,
+        claim_lease_secs: u64,
+        ceiling: &'static RetainedByteCeiling,
+    ) -> Result<Self, String> {
+        Self::for_tests_with_ops(
+            cfg,
+            spec,
+            generation,
+            SpoolFsOps::with_fault(fault),
+            stale_temp_age_secs,
+            claim_lease_secs,
+            ceiling,
+        )
+    }
+
+    /// Shared body of the test constructors: `fs_ops` is
+    /// [`SpoolFsOps::REAL`] except in a `test-support` build's faulted
+    /// constructors.
+    #[allow(clippy::too_many_arguments)]
+    fn for_tests_with_ops(
+        cfg: SpoolSettings,
+        spec: &SpoolOwnerSpec<'_>,
+        generation: u64,
+        fs_ops: SpoolFsOps,
         stale_temp_age_secs: u64,
         claim_lease_secs: u64,
         ceiling: &'static RetainedByteCeiling,
@@ -7716,10 +7765,7 @@ impl SpoolManager {
         // the real filesystem so an injected fault applies only to the durable
         // writes actually under test.
         manager.prepare_live_storage()?;
-        Ok(Self {
-            fs_ops: SpoolFsOps::with_fault(fault),
-            ..manager
-        })
+        Ok(Self { fs_ops, ..manager })
     }
 
     #[doc(hidden)]
@@ -11075,6 +11121,7 @@ pub enum SpoolReplayHookPoint {
 /// that owns it, not a bug in the code under test.
 type SpoolWriteHookForTests = Arc<dyn Fn(SpoolWriteHookPoint, &Path) + Send + Sync + 'static>;
 
+#[cfg(feature = "test-support")]
 fn spool_write_hook_slot() -> &'static Mutex<Option<SpoolWriteHookForTests>> {
     static HOOK: OnceLock<Mutex<Option<SpoolWriteHookForTests>>> = OnceLock::new();
     HOOK.get_or_init(|| Mutex::new(None))
@@ -11085,6 +11132,7 @@ fn spool_write_hook_slot() -> &'static Mutex<Option<SpoolWriteHookForTests>> {
 /// Tests must clear the hook before finishing (including panic paths), serialize
 /// against other chargeback-sink tests that publish ACTIVE_SINKS, and ignore
 /// every point whose namespace root is not their own spool.
+#[cfg(feature = "test-support")]
 #[doc(hidden)]
 pub fn set_spool_write_hook_for_tests(hook: Option<SpoolWriteHookForTests>) {
     if let Ok(mut slot) = spool_write_hook_slot().lock() {
@@ -11092,11 +11140,21 @@ pub fn set_spool_write_hook_for_tests(hook: Option<SpoolWriteHookForTests>) {
     }
 }
 
+#[cfg(feature = "test-support")]
 fn snapshot_spool_write_hook_for_tests() -> Option<SpoolWriteHookForTests> {
     spool_write_hook_slot()
         .lock()
         .ok()
         .and_then(|slot| slot.clone())
+}
+
+/// Without `test-support` no hook can be installed, so the per-operation
+/// check is a constant `None` the compiler folds away: production never takes
+/// the process-global hook mutex (issue #7122).
+#[cfg(not(feature = "test-support"))]
+#[inline(always)]
+fn snapshot_spool_write_hook_for_tests() -> Option<SpoolWriteHookForTests> {
+    None
 }
 
 /// Deterministic injection point inside the bounded spool tree walk.
@@ -11117,6 +11175,7 @@ pub enum SpoolWalkHookPoint {
 /// process-global and the test binary runs tests in parallel.
 type SpoolWalkHookForTests = Arc<dyn Fn(SpoolWalkHookPoint, &Path) + Send + Sync + 'static>;
 
+#[cfg(feature = "test-support")]
 fn spool_walk_hook_slot() -> &'static Mutex<Option<SpoolWalkHookForTests>> {
     static HOOK: OnceLock<Mutex<Option<SpoolWalkHookForTests>>> = OnceLock::new();
     HOOK.get_or_init(|| Mutex::new(None))
@@ -11126,6 +11185,7 @@ fn spool_walk_hook_slot() -> &'static Mutex<Option<SpoolWalkHookForTests>> {
 ///
 /// Tests must clear the hook before finishing (including panic paths) and
 /// ignore every invocation whose entry path is outside their own spool root.
+#[cfg(feature = "test-support")]
 #[doc(hidden)]
 pub fn set_spool_walk_hook_for_tests(hook: Option<SpoolWalkHookForTests>) {
     if let Ok(mut slot) = spool_walk_hook_slot().lock() {
@@ -11133,6 +11193,7 @@ pub fn set_spool_walk_hook_for_tests(hook: Option<SpoolWalkHookForTests>) {
     }
 }
 
+#[cfg(feature = "test-support")]
 fn snapshot_spool_walk_hook_for_tests() -> Option<SpoolWalkHookForTests> {
     spool_walk_hook_slot()
         .lock()
@@ -11140,8 +11201,18 @@ fn snapshot_spool_walk_hook_for_tests() -> Option<SpoolWalkHookForTests> {
         .and_then(|slot| slot.clone())
 }
 
+/// Without `test-support` no hook can be installed, so the per-operation
+/// check is a constant `None` the compiler folds away: production never takes
+/// the process-global hook mutex (issue #7122).
+#[cfg(not(feature = "test-support"))]
+#[inline(always)]
+fn snapshot_spool_walk_hook_for_tests() -> Option<SpoolWalkHookForTests> {
+    None
+}
+
 type SpoolReplayHookForTests = Arc<dyn Fn(SpoolReplayHookPoint, &Path) + Send + Sync + 'static>;
 
+#[cfg(feature = "test-support")]
 fn spool_replay_hook_slot() -> &'static Mutex<Option<SpoolReplayHookForTests>> {
     static HOOK: OnceLock<Mutex<Option<SpoolReplayHookForTests>>> = OnceLock::new();
     HOOK.get_or_init(|| Mutex::new(None))
@@ -11151,6 +11222,7 @@ fn spool_replay_hook_slot() -> &'static Mutex<Option<SpoolReplayHookForTests>> {
 ///
 /// Tests must clear the hook before finishing (including panic paths) and
 /// ignore every invocation whose claimed path is outside their own spool root.
+#[cfg(feature = "test-support")]
 #[doc(hidden)]
 pub fn set_spool_replay_hook_for_tests(hook: Option<SpoolReplayHookForTests>) {
     if let Ok(mut slot) = spool_replay_hook_slot().lock() {
@@ -11158,11 +11230,21 @@ pub fn set_spool_replay_hook_for_tests(hook: Option<SpoolReplayHookForTests>) {
     }
 }
 
+#[cfg(feature = "test-support")]
 fn snapshot_spool_replay_hook_for_tests() -> Option<SpoolReplayHookForTests> {
     spool_replay_hook_slot()
         .lock()
         .ok()
         .and_then(|slot| slot.clone())
+}
+
+/// Without `test-support` no hook can be installed, so the per-operation
+/// check is a constant `None` the compiler folds away: production never takes
+/// the process-global hook mutex (issue #7122).
+#[cfg(not(feature = "test-support"))]
+#[inline(always)]
+fn snapshot_spool_replay_hook_for_tests() -> Option<SpoolReplayHookForTests> {
+    None
 }
 
 /// Ensures [`SpoolWriteHookPoint::AfterWrite`] runs on every `write_events`
@@ -12927,6 +13009,8 @@ pub struct SharedSpoolBatchCloneProbe {
 /// exceptional path that reserves before cloning. `clone_ceiling` is injected
 /// into the real delivery worker, allowing external tests to exercise both
 /// admission and refusal without perturbing the process-global ceiling.
+/// Installs a spool write hook, so it exists only with `test-support`.
+#[cfg(feature = "test-support")]
 #[doc(hidden)]
 pub async fn probe_shared_spool_batch_clone_for_tests(
     spool: Arc<SpoolManager>,
@@ -13308,6 +13392,7 @@ pub fn write_private_file_atomically_for_tests(
 }
 
 /// Exercise the durable-write contract with one step forced to fail.
+#[cfg(feature = "test-support")]
 #[doc(hidden)]
 pub fn write_private_file_atomically_with_fault_for_tests(
     tmp_path: &Path,

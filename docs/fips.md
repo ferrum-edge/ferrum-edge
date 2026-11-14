@@ -686,6 +686,12 @@ each, then compiles each against the real module:
 | `fips,acme,pkcs11,ebpf` | Supported — the combined operational features, under the same resolved-graph audit and hosted compile gate |
 | `fips,cloud-secrets` | **Builds, refused at runtime** (above) |
 
+`fuzzing` and `test-support` are exempt from that inventory: neither compiles
+cryptography and neither ships. `test-support` (test-only fault injection and
+hooks, issue #7122) is enabled only through the crate's self dev-dependency, so
+`cargo test --no-default-features --features fips` gets it on the FIPS backend
+while a FIPS `cargo build --release` never does.
+
 ## Verifying a deployment
 
 An operator confirms the runtime posture through the **authenticated** detail

@@ -519,6 +519,14 @@ fips = [
 ]
 
 fuzzing = []
+# Test-only fault injection and per-operation test hooks that must never ship
+# (issue #7122): the `api_chargeback_sink` billing-spool fsync/rename/directory
+# fault dispatch and its process-global spool write/walk/replay hook slots.
+# Never enable it on a shipped build. Test targets enable it through the
+# self dev-dependency below, so `cargo test` / nextest / clippy `--all-targets`
+# get it on both crypto profiles while `cargo build --release` (release,
+# Docker and FIPS artifacts) never resolves dev-dependencies and leaves it off.
+test-support = []
 acme = ["dep:instant-acme", "dep:hyper-rustls"]
 pkcs11 = ["dep:cryptoki"]
 cloud-secrets = ["secrets-vault", "secrets-aws", "secrets-gcp", "secrets-azure"]
@@ -646,6 +654,12 @@ time = "0.3"
 paste = "1"
 # Simple HTTP server dependencies
 tokio = { version = "1", features = ["net", "io-util", "time", "rt", "test-util"] }
+# Self dev-dependency (issue #7122): every test, bench and example build gets
+# the `test-support` feature. `default-features = false` so the crypto
+# backend still comes from the command line: `--no-default-features
+# --features fips` must not pull `crypto-ring` back in, which `src/fips/mod.rs`
+# refuses at compile time.
+ferrum-edge = { path = ".", default-features = false, features = ["test-support"] }
 
 # ── Vendored upstream patches ──────────────────────────────────────────────
 # We carry a vendored copy of reqwest 0.13.4 with PR seanmonstar/reqwest#3017
