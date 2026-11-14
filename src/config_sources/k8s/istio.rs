@@ -86,6 +86,9 @@ pub(super) fn translate(
         }
         "VirtualService" => {
             let (proxies, upstreams, plugins) = virtual_service_routes(object, acc)?;
+            // Resolved before anything is upserted so an invalid `exportTo`
+            // refuses the VirtualService atomically.
+            let mesh_http_export_to = virtual_service_mesh_http_route_export_to(object)?;
             claim_virtual_service_ids(acc, object, &proxies, &upstreams)?;
             for upstream in upstreams {
                 acc.upsert_upstream(upstream);
@@ -124,6 +127,31 @@ pub(super) fn translate(
                 });
                 if !follows_refused_proxy {
                     acc.config.plugin_configs.push(plugin);
+                }
+            }
+            // Issue #7233: record which of the accepted HTTP route proxies
+            // apply to mesh data planes, and to which namespaces, so the slice
+            // builder can carry them to a NodeWaypoint.
+            if let Some(export_to) = mesh_http_export_to {
+                let proxy_ids: Vec<String> = accepted_proxy_keys
+                    .into_iter()
+                    .filter(|(namespace, id)| {
+                        *namespace == object.metadata.namespace
+                            && crate::modes::mesh::config::is_virtual_service_http_route_proxy_id(
+                                id,
+                            )
+                    })
+                    .map(|(_, id)| id)
+                    .collect();
+                if !proxy_ids.is_empty() {
+                    acc.mesh.virtual_service_http_routes.push(
+                        crate::modes::mesh::config::MeshVirtualServiceHttpRoutes {
+                            name: object.metadata.name.clone(),
+                            namespace: object.metadata.namespace.clone(),
+                            export_to,
+                            proxy_ids,
+                        },
+                    );
                 }
             }
             Ok(true)
@@ -5066,6 +5094,49 @@ fn virtual_service_l4_proxies(
     project_l4_proxy_visibility(object, acc, proxies, upstream_templates)
 }
 
+/// The mesh `exportTo` of a VirtualService: the validated, normalized
+/// `spec.exportTo`, or Istio's public `["*"]` when it is omitted (the mesh
+/// model's EMPTY list is namespace-local). Shared by the CORS policy and the
+/// HTTP route binding so both carry the same visibility.
+///
+/// `optional_string_array` (not the lossy `string_array`): a non-array
+/// `exportTo`, or a non-string entry, would otherwise be dropped and the
+/// resource would default to the PUBLIC `["*"]` — a fail-open on the one field
+/// that bounds its blast radius.
+fn virtual_service_mesh_export_to(object: &K8sObject) -> Result<Vec<String>, K8sTranslateError> {
+    let declared = optional_string_array(
+        object,
+        &object.spec,
+        "exportTo",
+        "VirtualService spec.exportTo",
+    )?;
+    let mut errors = Vec::new();
+    validate_mesh_export_to("VirtualService spec", &declared, &mut errors);
+    if let Some(first) = errors.first() {
+        return Err(invalid_resource(object, first.clone()));
+    }
+    if declared.is_empty() {
+        Ok(vec!["*".to_string()])
+    } else {
+        let mut entries = declared;
+        crate::modes::mesh::config::normalize_mesh_export_to(&mut entries);
+        Ok(entries)
+    }
+}
+
+/// The mesh export list of a VirtualService whose HTTP routes apply to mesh
+/// data planes, or `None` when `spec.gateways` names only ingress gateways
+/// (issue #7233). An omitted `gateways` defaults to `mesh`, as in Istio.
+fn virtual_service_mesh_http_route_export_to(
+    object: &K8sObject,
+) -> Result<Option<Vec<String>>, K8sTranslateError> {
+    let gateways = string_array(&object.spec, "gateways");
+    if !gateways.is_empty() && !gateways.iter().any(|gateway| gateway == "mesh") {
+        return Ok(None);
+    }
+    virtual_service_mesh_export_to(object).map(Some)
+}
+
 fn virtual_service_routes(
     object: &K8sObject,
     acc: &mut K8sAccumulator,
@@ -5147,26 +5218,7 @@ fn virtual_service_routes(
         // a non-string entry, would otherwise be silently dropped and the
         // policy would default to Istio's PUBLIC `["*"]` — a fail-open on the
         // one field that bounds the policy's blast radius.
-        let export_to = {
-            let declared = optional_string_array(
-                object,
-                &object.spec,
-                "exportTo",
-                "VirtualService spec.exportTo",
-            )?;
-            let mut errors = Vec::new();
-            validate_mesh_export_to("VirtualService spec", &declared, &mut errors);
-            if let Some(first) = errors.first() {
-                return Err(invalid_resource(object, first.clone()));
-            }
-            if declared.is_empty() {
-                vec!["*".to_string()]
-            } else {
-                let mut entries = declared;
-                crate::modes::mesh::config::normalize_mesh_export_to(&mut entries);
-                entries
-            }
-        };
+        let export_to = virtual_service_mesh_export_to(object)?;
         for host in &hosts {
             acc.mesh
                 .virtual_service_cors_policies
