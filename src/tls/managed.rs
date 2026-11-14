@@ -694,6 +694,17 @@ pub(crate) fn validate_source_reference_kind(
     ManagedSourceReference::parse(identifier, field_kind).map(|_| ())
 }
 
+/// The record id a `managed://` JWKS reference names (the identifier after the
+/// scheme, for example `jwks/<id>#jwks`), after the same grammar and kind
+/// checks every managed load applies. Reads nothing from the store.
+///
+/// Used by the JWKS consumers (`jwks_auth`, `oidc_relying_party`) to refuse a
+/// non-JWKS fragment or collection at config load and to canonicalize every
+/// accepted spelling onto one shared key store (issue #7277).
+pub fn jwks_reference_record_id(identifier: &str) -> Result<String, ManagedTlsError> {
+    ManagedSourceReference::parse(identifier, MaterialKind::Jwks).map(|reference| reference.id)
+}
+
 impl ManagedSourceReference {
     /// Parse `[<collection>/]<id>[#<part>]`.
     ///

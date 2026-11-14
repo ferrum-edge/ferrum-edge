@@ -9063,8 +9063,40 @@ pub(crate) fn collect_plugin_config_admission_errors(
                 "PluginConfig '{}': invalid config: {}",
                 plugin_config.id, err
             ));
+        } else if plugin_config.enabled {
+            // Managed JWKS references must name an existing, usable record
+            // (issue #7277), exactly like a single `POST /plugins/config`.
+            for err in crate::plugins::utils::jwks_store::plugin_managed_jwks_source_errors(
+                &plugin_config.plugin_name,
+                &plugin_config.config,
+            ) {
+                validation_errors.push(format!(
+                    "PluginConfig '{}': invalid config: {}",
+                    plugin_config.id, err
+                ));
+            }
         }
     }
+}
+
+/// Managed JWKS references (`managed://jwks/<id>#jwks`) an enabled plugin
+/// write carries must name a record that exists in this node's managed TLS
+/// store and holds a usable key set (issue #7277). The admin node is the one
+/// `/admin/tls/jwks` writes land on, so the check is authoritative here even
+/// in CP mode. Reads the store on the blocking pool.
+pub(crate) async fn managed_jwks_source_admission_errors(pc: &PluginConfig) -> Vec<String> {
+    if !pc.enabled
+        || !crate::plugins::utils::jwks_store::plugin_may_reference_managed_jwks(&pc.plugin_name)
+    {
+        return Vec::new();
+    }
+    let plugin_name = pc.plugin_name.clone();
+    let config = pc.config.clone();
+    tokio::task::spawn_blocking(move || {
+        crate::plugins::utils::jwks_store::plugin_managed_jwks_source_errors(&plugin_name, &config)
+    })
+    .await
+    .unwrap_or_else(|_| vec!["managed JWKS source check did not complete".to_string()])
 }
 
 pub(crate) fn validate_plugin_config_definition(

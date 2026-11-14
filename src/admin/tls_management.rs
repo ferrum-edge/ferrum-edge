@@ -538,7 +538,9 @@ pub(super) async fn handle_create_jwks(
             ));
         }
     };
-    Ok(respond_managed_upsert(store, record, overwrite, StatusCode::CREATED).await)
+    let response = respond_managed_upsert(store, record, overwrite, StatusCode::CREATED).await;
+    refresh_managed_jwks_consumers().await;
+    Ok(response)
 }
 
 pub(super) async fn handle_create_acme_certificate(
@@ -1213,7 +1215,9 @@ pub(super) async fn handle_update_jwks(
             ));
         }
     };
-    Ok(respond_managed_upsert(store, record, true, StatusCode::OK).await)
+    let response = respond_managed_upsert(store, record, true, StatusCode::OK).await;
+    refresh_managed_jwks_consumers().await;
+    Ok(response)
 }
 
 pub(super) async fn handle_delete_managed(
@@ -1266,6 +1270,9 @@ pub(super) async fn handle_delete_managed(
             match deleted {
                 Ok(record) => {
                     request_managed_source_reloads();
+                    if kind == ManagedTlsMaterialKind::Jwks {
+                        refresh_managed_jwks_consumers().await;
+                    }
                     Ok(super::json_response(
                         StatusCode::OK,
                         &json!({"deleted": true, "record": record.summary()}),
@@ -2065,6 +2072,15 @@ fn acme_error_response(error: AcmeError) -> Response<Full<Bytes>> {
     super::json_response(status, &json!({"error": error.to_string()}))
 }
 
+/// Re-read every managed-JWKS-backed key store on this node before the admin
+/// response is sent (issue #7277), so a create, rotation, or delete is in
+/// effect for this node's `jwks_auth` / `oidc_relying_party` consumers when the
+/// write returns. A failed write leaves the record unchanged, so re-reading is
+/// a no-op then. Other nodes sharing the store re-read on their own cadence.
+async fn refresh_managed_jwks_consumers() {
+    let _ = crate::plugins::utils::jwks_cache::refresh_managed_jwks_stores().await;
+}
+
 fn request_managed_source_reloads() {
     // Same-kind replacement keeps `managed://{collection}/{id}` references valid.
     // Admission already validated PEM/DER/JWKS before the store write; watchers
@@ -2676,17 +2692,14 @@ fn combine_cert_and_chain(cert_pem: &str, chain_pem: Option<&str>) -> String {
     combined
 }
 
+/// Admit a managed JWKS document only when a JWKS consumer could verify with
+/// it (issue #7277): the same bounds and key rules `jwks_auth` and
+/// `oidc_relying_party` apply to every key set, so an accepted record is never
+/// one its consumers would read as "no usable keys" and fail closed on.
 fn validate_jwks_json(jwks_json: &str) -> Result<(), String> {
-    let value: Value = serde_json::from_str(jwks_json)
-        .map_err(|error| format!("jwks_json must be valid JSON: {error}"))?;
-    let keys = value
-        .get("keys")
-        .and_then(Value::as_array)
-        .ok_or_else(|| "jwks_json must contain a keys array".to_string())?;
-    if keys.is_empty() {
-        return Err("jwks_json keys array must not be empty".to_string());
-    }
-    Ok(())
+    crate::plugins::utils::jwks_store::validate_jwks_document(jwks_json.as_bytes())
+        .map(|_| ())
+        .map_err(|error| format!("jwks_json is not a usable key set: {error}"))
 }
 
 /// Whether an inventory source identifier names the record `id`.
@@ -2922,8 +2935,15 @@ mod tests {
     }
 
     #[test]
-    fn jwks_validation_requires_non_empty_keys_array() {
-        assert!(validate_jwks_json(r#"{"keys":[{"kid":"one","kty":"RSA"}]}"#).is_ok());
+    fn jwks_validation_requires_a_usable_signing_key() {
+        // A key with no public components, a symmetric key, an empty set, and
+        // a document without `keys` all leave a consumer with nothing to
+        // verify against. The accepted shape is covered by the external
+        // managed-JWKS admission tests.
+        assert!(validate_jwks_json(r#"{"keys":[{"kid":"one","kty":"RSA"}]}"#).is_err());
+        assert!(
+            validate_jwks_json(r#"{"keys":[{"kid":"one","kty":"oct","k":"dGVzdA"}]}"#).is_err()
+        );
         assert!(validate_jwks_json(r#"{"keys":[]}"#).is_err());
         assert!(validate_jwks_json(r#"{"not_keys":[]}"#).is_err());
     }

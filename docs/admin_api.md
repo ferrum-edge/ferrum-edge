@@ -464,7 +464,7 @@ Service-discovery task lifecycle and bounded staleness drive the same coarse fie
 
 A terminating process reports `status: "draining"`, `ready: false`, and HTTP 503. The verdict is published the moment SIGTERM/SIGINT is observed — ahead of the accept-loop close — so an orchestrator or load balancer can withdraw the replica from its endpoint set before a new connection is refused; `FERRUM_SHUTDOWN_PREDRAIN_SECONDS` keeps every listener (proxy and admin) accepting for that window. `draining` is terminal and wins over every other status. `/live` is deliberately unaffected and keeps returning 200: a liveness probe pointed at a draining pod must not trigger a SIGKILL mid-drain. See [graceful_shutdown.md](graceful_shutdown.md).
 
-Unauthenticated callers receive only `status` and `ready` (enough for a readiness probe) with the correct status code — 503 `"starting"` until the gateway is ready, 200 otherwise. Active remote JWKS trust still drives those coarse fields without leaking detail: grace keeps `ready: true` with `status: "degraded"`; expiry flips `ready: false` with `status: "unavailable"` and HTTP 503; with no active remote JWKS the coarse shape stays neutral. The probe path is an O(1) ArcSwap load plus monotonic deadline comparison — it never walks attacker-sized cache state.
+Unauthenticated callers receive only `status` and `ready` (enough for a readiness probe) with the correct status code — 503 `"starting"` until the gateway is ready, 200 otherwise. Active remote and admin-managed (`jwks_source`) JWKS trust still drives those coarse fields without leaking detail: grace keeps `ready: true` with `status: "degraded"`; expiry flips `ready: false` with `status: "unavailable"` and HTTP 503; with no active remote JWKS the coarse shape stays neutral. The probe path is an O(1) ArcSwap load plus monotonic deadline comparison — it never walks attacker-sized cache state.
 
 The detailed diagnostics (DB type/pool stats, optional `database.failover_topology`, optional `database.mtls_dns_admission_fence` (see [mongodb.md](mongodb.md#retained-mtls-dns-admission-fences)), cached-config proxy/consumer counts, `database_polling` degradation, `config_rejected`, mesh state, sanitized listener failures, fixed-cardinality `jwks_trust` fresh/grace/expired counts with per-state max ages — never URLs, kids, tokens, claims, or key material — and the `service_discovery` block described below) require the authenticated tier described under [Authentication](#authentication); a namespace-bounded JWT gets the [tenant tier](#tenant-tier-for-namespace-bounded-tokens).
 
@@ -794,7 +794,27 @@ export FERRUM_FRONTEND_TLS_OCSP_RESPONSE_SOURCE="managed://ocsp-responses/edge-o
 export FERRUM_FRONTEND_TLS_LIVE_RELOAD_ENABLED=true
 ```
 
-No setting or plugin field reads JWKS records yet: `jwks_auth` takes only `jwks_uri`, inline `jwks`, or discovery, and no field accepts a `managed://jwks/{id}#jwks` source. A stored JWKS record is kept and listed but has no runtime effect (issue #7277).
+JWKS records are read by `jwks_auth` (`providers[].jwks_source`) and `oidc_relying_party` (`providers[0].jwks_source`, with explicit endpoints) as `managed://jwks/{id}#jwks` (issue #7277):
+
+```bash
+curl -X POST -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"id": "corp-idp", "name": "Corporate IdP keys", "jwks_json": "{\"keys\":[...]}"}' \
+  http://localhost:9000/admin/tls/jwks
+```
+
+```yaml
+plugin_name: jwks_auth
+config:
+  providers:
+    - issuer: "https://idp.corp.example"
+      jwks_source: "managed://jwks/corp-idp#jwks"
+```
+
+- **Admission.** `POST`/`PUT /admin/tls/jwks` admit `jwks_json` only when a JWKS consumer could verify with it: at most 1 MiB and 256 keys, no duplicate usable `kid`, and at least one usable signing key (same key rules as a fetched JWKS; unusable keys beside a usable one are skipped). A plugin write whose `jwks_source` names a record that does not exist, is of another kind, or holds no usable key returns `400`; so do `POST /batch` and `POST /restore` rows. Namespace-bounded operator tokens cannot introduce a `managed://` reference.
+- **Rotation.** Before a JWKS create, `PUT`, or delete returns, every key store on this node that is backed by a managed JWKS record is re-read, so a `kid` the update adds is accepted and a `kid` it removes is refused on this node when the response arrives. Other nodes sharing `FERRUM_TLS_MANAGED_STORE_PATH` (database replicas, data planes) re-read every `jwks_refresh_interval_secs` (`900` seconds for `oidc_relying_party`), and an unknown `kid` triggers an immediate re-read subject to `kid_miss_refresh_cooldown_seconds`, so a new key is usually accepted on the first token that names it; set the refresh interval to your key-removal objective.
+- **Trust.** A present record with usable keys is `fresh` (no interval-based grace). A deleted, wrong-kind, oversized, malformed, or keyless record withdraws every key and the consumer refuses tokens, exactly like an expired remote set (`expired` in `jwks_trust`, readiness `unavailable`). A store that cannot be read keeps the last-read keys in `grace` for at most `jwks_max_stale_seconds`.
+- **Control plane / data plane.** The record never travels on ConfigSync: the plugin config carries only the reference, and each node resolves it from its own `FERRUM_TLS_MANAGED_STORE_PATH`, like every other `managed://` source. Point the CP and every DP at one shared store volume (see [Managed TLS And ACME Across Multiple Replicas](frontend_tls.md#managed-tls-and-acme-across-multiple-replicas)); a DP without the record refuses the provider's tokens.
 
 `DELETE` returns `409 Conflict` when the current runtime/config inventory still references the record.
 

@@ -38,7 +38,10 @@ use super::utils::jwks_cache::{
     JwksRefreshRequirement, LateActiveRequirement, clear_late_active_requirement,
     get_or_create_jwks_store, publish_late_active_requirement,
 };
-use super::utils::jwks_store::{DEFAULT_JWKS_MAX_STALE_SECONDS, JwksKeyStore};
+use super::utils::jwks_store::{
+    DEFAULT_JWKS_MAX_STALE_SECONDS, JwksKeyStore, canonical_managed_jwks_source,
+    check_managed_jwks_source, is_managed_jwks_source,
+};
 use super::utils::jwt_verifier::{JwtVerifyParams, verify_jwt_with_jwks};
 use super::utils::log_helpers::redacted_endpoint_url_str;
 use super::utils::oauth_client_auth::{self, PrivateKeyDecodeError};
@@ -164,6 +167,7 @@ const PROVIDER_FIELDS: &[&str] = &[
     "token_endpoint",
     "userinfo_endpoint",
     "jwks_uri",
+    "jwks_source",
     "end_session_endpoint",
     "client_id",
     "client_auth",
@@ -529,6 +533,10 @@ struct NormalizedProviderContext {
     token_endpoint: Option<String>,
     userinfo_endpoint: Option<String>,
     jwks_uri: Option<String>,
+    /// Omitted when unset so every existing session context seed (and the
+    /// sessions sealed under it) is unchanged by the field's existence.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    jwks_source: Option<String>,
     end_session_endpoint: Option<String>,
     client_id: String,
     client_auth: NormalizedClientAuthContext,
@@ -1018,18 +1026,29 @@ impl OidcRelyingParty {
         let token_endpoint = optional_string(provider_obj, "token_endpoint", "provider[0]")?;
         let userinfo_endpoint = optional_string(provider_obj, "userinfo_endpoint", "provider[0]")?;
         let jwks_uri = optional_string(provider_obj, "jwks_uri", "provider[0]")?;
+        let jwks_source = parse_managed_jwks_source(provider_obj)?;
         let end_session_endpoint =
             optional_string(provider_obj, "end_session_endpoint", "provider[0]")?;
-        let explicit_complete =
-            authorization_endpoint.is_some() && token_endpoint.is_some() && jwks_uri.is_some();
+        if jwks_uri.is_some() && jwks_source.is_some() {
+            return Err(
+                "oidc_relying_party: `provider[0]` must configure at most one of `jwks_uri` or `jwks_source`"
+                    .to_string(),
+            );
+        }
+        let explicit_complete = authorization_endpoint.is_some()
+            && token_endpoint.is_some()
+            && (jwks_uri.is_some() || jwks_source.is_some());
         if discovery_url.is_none() && !explicit_complete {
             return Err(
-                "oidc_relying_party: `provider[0]` requires `discovery_url` or explicit `authorization_endpoint`, `token_endpoint`, and `jwks_uri`"
+                "oidc_relying_party: `provider[0]` requires `discovery_url` or explicit `authorization_endpoint`, `token_endpoint`, and `jwks_uri` (or `jwks_source`)"
                     .to_string(),
             );
         }
         if discovery_url.is_some()
-            && (authorization_endpoint.is_some() || token_endpoint.is_some() || jwks_uri.is_some())
+            && (authorization_endpoint.is_some()
+                || token_endpoint.is_some()
+                || jwks_uri.is_some()
+                || jwks_source.is_some())
         {
             return Err(
                 "oidc_relying_party: `provider[0]` `discovery_url` conflicts with explicit endpoints"
@@ -1061,6 +1080,9 @@ impl OidcRelyingParty {
         let jwks_uri = jwks_uri
             .map(|url| validate_url_string(&url, "provider[0].jwks_uri", UrlAudience::Gateway))
             .transpose()?;
+        // The ID-token key store is keyed by a validated http(s) `jwks_uri` or
+        // by the canonical `managed://jwks/<id>#jwks` source (issue #7277).
+        let jwks_uri = jwks_uri.or(jwks_source);
         let end_session_endpoint = end_session_endpoint
             .map(|url| {
                 validate_url_string(
@@ -3527,6 +3549,11 @@ impl super::Plugin for OidcRelyingParty {
                 &discovery.token_endpoint,
                 &discovery.jwks_uri,
             ] {
+                // A managed JWKS source is read from the local store, never
+                // dialed, so it contributes no DNS warmup host.
+                if is_managed_jwks_source(url) {
+                    continue;
+                }
                 if let Some(host) = hostname_from_url(url)
                     && !hosts.iter().any(|known| known == &host)
                 {
@@ -4104,6 +4131,7 @@ fn session_context_seed(
             token_endpoint: optional_string(provider, "token_endpoint", "provider[0]")?,
             userinfo_endpoint: optional_string(provider, "userinfo_endpoint", "provider[0]")?,
             jwks_uri: optional_string(provider, "jwks_uri", "provider[0]")?,
+            jwks_source: optional_string(provider, "jwks_source", "provider[0]")?,
             end_session_endpoint: optional_string(provider, "end_session_endpoint", "provider[0]")?,
             client_id: required_string(provider, "client_id", "provider[0]")?,
             client_auth: normalized_client_auth_context(provider),
@@ -5250,6 +5278,46 @@ fn reject(status_code: u16, body: String) -> PluginResult {
         body,
         headers: HashMap::new(),
     }
+}
+
+/// Parse `provider[0].jwks_source` (issue #7277): an admin-managed JWKS
+/// record used instead of `jwks_uri` with explicit endpoints. Static only.
+fn parse_managed_jwks_source(provider: &Map<String, Value>) -> Result<Option<String>, String> {
+    // A present `null` is "unset", like every other optional provider string.
+    let Some(value) = provider.get("jwks_source").filter(|value| !value.is_null()) else {
+        return Ok(None);
+    };
+    let Some(raw) = value.as_str() else {
+        return Err(
+            "oidc_relying_party: `provider[0].jwks_source` must be a `managed://jwks/<id>#jwks` string"
+                .to_string(),
+        );
+    };
+    canonical_managed_jwks_source(raw)
+        .map(Some)
+        .map_err(|error| format!("oidc_relying_party: `provider[0].jwks_source` {error}"))
+}
+
+/// Canonical managed JWKS source an `oidc_relying_party` config references,
+/// if any. Malformed values are skipped: construction reports them.
+pub fn managed_jwks_source(config: &Value) -> Option<String> {
+    let raw = config
+        .get("providers")?
+        .as_array()?
+        .first()?
+        .get("jwks_source")?
+        .as_str()?;
+    canonical_managed_jwks_source(raw).ok()
+}
+
+/// Presence check for the managed JWKS record an `oidc_relying_party` config
+/// names. Blocking: reads the managed TLS store.
+pub fn managed_jwks_source_errors(config: &Value) -> Vec<String> {
+    managed_jwks_source(config)
+        .and_then(|source| check_managed_jwks_source(&source).err())
+        .map(|error| format!("oidc_relying_party: `provider[0].jwks_source`: {error}"))
+        .into_iter()
+        .collect()
 }
 
 fn hostname_from_url(url: &str) -> Option<String> {

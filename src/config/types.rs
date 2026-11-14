@@ -11934,6 +11934,15 @@ impl GatewayConfig {
                     }
                 }
             }
+            // A managed JWKS record is node-local material like the files
+            // above (issue #7277): file mode refuses startup without it,
+            // database mode warns, and the runtime store fails closed.
+            for error in crate::plugins::utils::jwks_store::plugin_managed_jwks_source_errors(
+                &pc.plugin_name,
+                &pc.config,
+            ) {
+                errors.push(format!("PluginConfig {:?}: {}", pc.id, error));
+            }
             if pc.plugin_name == "mesh_route_dispatch"
                 && let Some(rules) = pc.config.get("rules").and_then(serde_json::Value::as_array)
             {

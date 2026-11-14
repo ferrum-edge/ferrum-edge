@@ -732,6 +732,50 @@ fn collect_gateway_sources(config: &GatewayConfig, sources: &mut Vec<InventorySo
 
     for plugin in &config.plugin_configs {
         collect_mesh_route_dispatch_sources(plugin, sources);
+        collect_managed_jwks_sources(plugin, sources);
+    }
+}
+
+/// Managed JWKS records referenced by enabled JWKS consumers (issue #7277),
+/// so the inventory lists them and `DELETE /admin/tls/jwks/{id}` is refused
+/// while a consumer still reads the record.
+fn collect_managed_jwks_sources(plugin: &PluginConfig, sources: &mut Vec<InventorySourceRef>) {
+    if !plugin.enabled {
+        return;
+    }
+    let references: Vec<(String, String)> = match plugin.plugin_name.as_str() {
+        "jwks_auth" => crate::plugins::jwks_auth::managed_jwks_sources(&plugin.config)
+            .into_iter()
+            .map(|(idx, source)| (format!("{}#provider[{idx}]", plugin.id), source))
+            .collect(),
+        "oidc_relying_party" => {
+            crate::plugins::oidc_relying_party::managed_jwks_source(&plugin.config)
+                .map(|source| (format!("{}#provider[0]", plugin.id), source))
+                .into_iter()
+                .collect()
+        }
+        _ => return,
+    };
+    for (resource_id, source) in references {
+        push_optional_resource(
+            sources,
+            ResourceUsageRef {
+                surface: plugin_surface(&plugin.plugin_name),
+                role: "jwks",
+                resource_type: "plugin_config",
+                resource_id: &resource_id,
+                field: "providers[].jwks_source",
+            },
+            Some(&source),
+            MaterialKind::Jwks,
+        );
+    }
+}
+
+fn plugin_surface(plugin_name: &str) -> &'static str {
+    match plugin_name {
+        "oidc_relying_party" => "oidc_relying_party",
+        _ => "jwks_auth",
     }
 }
 

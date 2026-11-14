@@ -5057,6 +5057,16 @@ impl AdminResource for PluginConfig {
             )]));
         }
 
+        let managed_jwks_errors = super::managed_jwks_source_admission_errors(resource).await;
+        if !managed_jwks_errors.is_empty() {
+            return Err(AfterValidateError::BadRequest(
+                managed_jwks_errors
+                    .into_iter()
+                    .map(|error| format!("Invalid plugin config: {error}"))
+                    .collect(),
+            ));
+        }
+
         validate_openapi_validator_precondition(db, namespace, resource).await?;
 
         let upstream_errors =
