@@ -10698,6 +10698,9 @@ pub(crate) fn apply_destination_rules_with_tenant_file_roots(
     // refused after every rule has applied, so every TLS build for those
     // destinations fails while the rest of the slice applies.
     let mut tls_file_refused_upstreams: HashSet<usize> = HashSet::new();
+    // Client TLS modes the winning rules applied, per upstream index, for the
+    // EgressGateway origination decision (issue #7236).
+    let mut applied_client_tls_modes: HashMap<usize, AppliedClientTlsModes> = HashMap::new();
 
     for dr in sorted_destination_rules.iter().copied() {
         let mut matched_any_host = false;
@@ -10807,6 +10810,9 @@ pub(crate) fn apply_destination_rules_with_tenant_file_roots(
             let upstream = &mut config.upstreams[idx];
             if let Some(ref policy) = dr.traffic_policy {
                 apply_traffic_policy_to_upstream(upstream, policy, runtime)?;
+                if let Some(ref tls) = policy.tls {
+                    applied_client_tls_modes.entry(idx).or_default().top_level = Some(tls.mode);
+                }
             }
             // Capture this DR's settled top-level passive tier before an
             // owner-gated port policy is also projected onto the upstream for
@@ -10983,6 +10989,12 @@ pub(crate) fn apply_destination_rules_with_tenant_file_roots(
                     .outlier_detection
                     .as_ref()
                     .and_then(|_| top_level_passive.clone());
+                if let Some(ref port_tls) = port_policy.tls {
+                    let modes = applied_client_tls_modes.entry(idx).or_default();
+                    for store_port in &store_ports {
+                        modes.per_port.insert(*store_port, port_tls.mode);
+                    }
+                }
                 for store_port in store_ports {
                     let override_slot = upstream.port_overrides.entry(store_port).or_default();
                     if override_slot.passive_health_check.is_none()
@@ -11296,6 +11308,8 @@ pub(crate) fn apply_destination_rules_with_tenant_file_roots(
             fail_closed_upstream_backend_tls(upstream);
         }
     }
+
+    project_egress_gateway_origination(config, runtime, mesh_slice, &applied_client_tls_modes);
 
     Ok(())
 }
@@ -13123,11 +13137,14 @@ fn build_egress_upstream_targets(
     }
 }
 
-/// Determine the backend scheme from the ServiceEntry port protocol.
+/// Determine the DEFAULT backend scheme from the ServiceEntry port protocol.
 ///
 /// HTTP-family protocols (`Http`, `Https/Tls`, `Http2`, `Grpc`, `Unknown`) map
 /// to `Http` / `Https` so the egress gateway terminates inbound mTLS and
-/// re-emits HTTP-family traffic to the external backend. TCP-based
+/// re-emits HTTP-family traffic to the external backend. The plaintext ones
+/// (`Http`, `Http2`, `Grpc`, `Unknown`) only start at `Http`: a
+/// DestinationRule `tls.mode` decides their final scheme after DestinationRule
+/// application ([`project_egress_gateway_origination`]). TCP-based
 /// stream-family protocols (`Tcp`, `Mongo`, `Redis`, `Mysql`, `Postgres`) map
 /// to `BackendScheme::Tcp` and are materialized as raw L4 stream proxies via
 /// [`build_stream_egress_for_entry`]. `Udp` has no scheme here: the
@@ -13150,15 +13167,15 @@ fn build_egress_upstream_targets(
 /// needed it would be a distinct stream-family egress mode, not a remap of this
 /// scheme. See #1727.
 ///
-/// `Http2` and `Grpc` also map to `Https`: the egress gateway always originates
-/// verified TLS to such a port, and a DestinationRule `tls.mode: DISABLE` does
-/// not undo it. That diverges from Istio, where these ports are plaintext unless
-/// a DestinationRule requests origination; `docs/mesh.md` lists it under Istio
-/// Compatibility Gaps (issue #7236).
+/// `Http2` and `Grpc` map to `Http`, as in Istio: these ports are plaintext
+/// (gRPC dials h2c) unless a DestinationRule `tls.mode` of `SIMPLE`, `MUTUAL`
+/// or `ISTIO_MUTUAL` asks the gateway to originate TLS (issue #7236).
 fn egress_backend_scheme(protocol: AppProtocol) -> Option<BackendScheme> {
     match protocol {
-        AppProtocol::Tls | AppProtocol::Http2 | AppProtocol::Grpc => Some(BackendScheme::Https),
-        AppProtocol::Http | AppProtocol::Unknown => Some(BackendScheme::Http),
+        AppProtocol::Tls => Some(BackendScheme::Https),
+        AppProtocol::Http | AppProtocol::Http2 | AppProtocol::Grpc | AppProtocol::Unknown => {
+            Some(BackendScheme::Http)
+        }
         // `Udp` never reaches here: the materializer routes it to the
         // datagram-over-mesh branch first (no listener, no upstream).
         AppProtocol::Udp => None,
@@ -13174,6 +13191,113 @@ fn egress_backend_scheme(protocol: AppProtocol) -> Option<BackendScheme> {
         | AppProtocol::Redis
         | AppProtocol::Mysql
         | AppProtocol::Postgres => Some(BackendScheme::Tcp),
+    }
+}
+
+/// True when an EgressGateway ServiceEntry port's backend scheme follows the
+/// DestinationRule (issue #7236): the plaintext HTTP-family protocols. Istio
+/// treats `HTTP`, `HTTP2` and `GRPC` ports as plaintext and originates TLS only
+/// when a DestinationRule asks for it. `TLS` stays a terminate-and-re-originate
+/// port whatever the DestinationRule says (see [`egress_backend_scheme`]).
+fn egress_scheme_follows_destination_rule(protocol: AppProtocol) -> bool {
+    matches!(
+        protocol,
+        AppProtocol::Http | AppProtocol::Http2 | AppProtocol::Grpc | AppProtocol::Unknown
+    )
+}
+
+/// The DestinationRule client TLS modes the winning rules applied to one
+/// upstream: the top-level `trafficPolicy.tls` and each `portLevelSettings`
+/// entry's `tls`, in rule application order (a later rule overwrites, as it
+/// does for every upstream-wide field). Recorded by
+/// [`apply_destination_rules_with_tenant_file_roots`] for
+/// [`project_egress_gateway_origination`].
+#[derive(Debug, Default)]
+struct AppliedClientTlsModes {
+    top_level: Option<MtlsMode>,
+    per_port: HashMap<u16, MtlsMode>,
+}
+
+impl AppliedClientTlsModes {
+    /// True when the effective mode for `service_port` (a per-port entry, else
+    /// the top-level one) asks the client to originate TLS. `DISABLE`, an
+    /// absent `tls`, and a server-side mode (ignored with a warning when the
+    /// rule applied) all leave the port plaintext.
+    fn originates_tls(&self, service_port: u16) -> bool {
+        matches!(
+            self.per_port.get(&service_port).copied().or(self.top_level),
+            Some(MtlsMode::Simple | MtlsMode::Mutual | MtlsMode::IstioMutual)
+        )
+    }
+}
+
+/// Let the DestinationRule drive the EgressGateway backend scheme of every
+/// plaintext HTTP-family `ServiceEntry` port (issue #7236, Istio semantics).
+///
+/// [`materialize_egress_gateway_proxies`] builds those proxies with
+/// `BackendScheme::Http`. Once DestinationRules have applied, a port whose
+/// effective `tls.mode` is `SIMPLE`, `MUTUAL` or `ISTIO_MUTUAL` switches to
+/// `Https`, so the gateway originates TLS with the material the rule projected
+/// onto the upstream. `DISABLE` or no `tls` keeps it plaintext: HTTP/1.1 for
+/// ordinary requests and h2c for gRPC.
+///
+/// The proxy and upstream ids are forward-derived from the slice's
+/// ServiceEntries with the same id helpers the materializer used, never parsed
+/// back from ids.
+fn project_egress_gateway_origination(
+    config: &mut GatewayConfig,
+    runtime: &MeshRuntimeConfig,
+    mesh_slice: &MeshSlice,
+    applied: &HashMap<usize, AppliedClientTlsModes>,
+) {
+    if runtime.topology != MeshTopology::EgressGateway || applied.is_empty() {
+        return;
+    }
+    let namespace = runtime.namespace.as_str();
+    let applied_by_upstream: HashMap<String, &AppliedClientTlsModes> = applied
+        .iter()
+        .filter_map(|(idx, modes)| {
+            let upstream = config.upstreams.get(*idx)?;
+            (upstream.namespace == namespace).then(|| (upstream.id.clone(), modes))
+        })
+        .collect();
+    if applied_by_upstream.is_empty() {
+        return;
+    }
+    for entry in &mesh_slice.service_entries {
+        if entry.location != ServiceEntryLocation::MeshExternal
+            || !service_entry_exported_to_namespace(entry, namespace)
+        {
+            continue;
+        }
+        for port_spec in &entry.ports {
+            if !egress_scheme_follows_destination_rule(port_spec.protocol) {
+                continue;
+            }
+            for host in &entry.hosts {
+                let upstream_id =
+                    mesh_egress_upstream_id(&entry.namespace, &entry.name, host, port_spec.port);
+                if !applied_by_upstream
+                    .get(&upstream_id)
+                    .is_some_and(|modes| modes.originates_tls(port_spec.port))
+                {
+                    continue;
+                }
+                let proxy_id =
+                    mesh_egress_proxy_id(&entry.namespace, &entry.name, host, port_spec.port);
+                if let Some(proxy) = config.proxies.iter_mut().find(|proxy| {
+                    proxy.namespace == namespace
+                        && proxy.id == proxy_id
+                        && proxy.upstream_id.as_deref() == Some(upstream_id.as_str())
+                }) {
+                    debug!(
+                        proxy = %sanitize_startup_scalar(&proxy.id),
+                        "DestinationRule tls.mode originates TLS for an EgressGateway port"
+                    );
+                    proxy.backend_scheme = Some(BackendScheme::Https);
+                }
+            }
+        }
     }
 }
 
@@ -41416,13 +41540,15 @@ mod tests {
             egress_backend_scheme(AppProtocol::Tls),
             Some(BackendScheme::Https)
         );
+        // Issue #7236: HTTP2/GRPC are plaintext by default, as in Istio; a
+        // DestinationRule `tls.mode` decides origination afterwards.
         assert_eq!(
             egress_backend_scheme(AppProtocol::Http2),
-            Some(BackendScheme::Https)
+            Some(BackendScheme::Http)
         );
         assert_eq!(
             egress_backend_scheme(AppProtocol::Grpc),
-            Some(BackendScheme::Https)
+            Some(BackendScheme::Http)
         );
         assert_eq!(
             egress_backend_scheme(AppProtocol::Http),
