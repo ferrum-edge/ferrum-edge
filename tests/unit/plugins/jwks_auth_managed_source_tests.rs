@@ -507,6 +507,84 @@ async fn jwks_auth_verifies_rotates_and_refuses_with_a_managed_record() {
     store.delete(&id).expect("cleanup");
 }
 
+// ─── Process-global state (isolated child processes) ────────────────────
+
+/// Run this test binary's `test_name` alone in a child process with `env`
+/// set, and require that it ran and passed. The process managed TLS store and
+/// the plugin HTTP client build counter are process-global, so a regression
+/// that depends on their first use or on an exact count needs its own process.
+fn run_in_child_process(test_name: &str, env: &[(&str, &std::ffi::OsStr)]) {
+    let exe = std::env::current_exe().expect("current test executable");
+    let mut command = std::process::Command::new(exe);
+    for (key, value) in env {
+        command.env(key, value);
+    }
+    let output = command
+        .args(["--exact", test_name, "--nocapture"])
+        .stdin(std::process::Stdio::null())
+        .output()
+        .expect("run child test");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "{test_name} child failed: {}",
+        String::from_utf8_lossy(&output.stderr[..output.stderr.len().min(4096)])
+    );
+    assert!(
+        stdout.contains("1 passed"),
+        "{test_name} child must run exactly that test"
+    );
+}
+
+/// A managed key store never dials, so constructing managed providers, and
+/// starting the shared managed stores, builds no plugin HTTP client: a
+/// config-load validation sweep must build a bounded number of clients, not
+/// one per managed provider (issue #4116; dsf F5 on #7373).
+#[tokio::test]
+async fn managed_providers_build_no_plugin_http_client() {
+    const CHILD_ENV: &str = "FERRUM_TEST_MANAGED_JWKS_CLIENT_BUILDS_CHILD";
+    const TEST_NAME: &str = "unit::plugins::jwks_auth_managed_source_tests::managed_providers_build_no_plugin_http_client";
+
+    if std::env::var_os(CHILD_ENV).is_none() {
+        run_in_child_process(TEST_NAME, &[(CHILD_ENV, std::ffi::OsStr::new("1"))]);
+        return;
+    }
+
+    let config = json!({
+        "providers": [
+            { "issuer": "https://idp-a.example.com", "jwks_source": "managed://jwks/builds-a#jwks" },
+            { "issuer": "https://idp-b.example.com", "jwks_source": "managed://jwks/builds-b#jwks" },
+            { "issuer": "https://idp-c.example.com", "jwks_source": "managed://jwks/builds-c#jwks" }
+        ]
+    });
+    let client = default_client();
+    let before = ferrum_edge::_test_support::plugin_http_client_builds_for_test();
+
+    for _ in 0..4 {
+        JwksAuth::new(&config, client.clone()).expect("managed providers");
+    }
+    let plugin = JwksAuth::new(&config, client.clone()).expect("managed providers");
+    plugin
+        .start_background_tasks()
+        .expect("runtime starts the shared managed stores");
+    for source in [
+        "managed://jwks/builds-a#jwks",
+        "managed://jwks/builds-b#jwks",
+        "managed://jwks/builds-c#jwks",
+    ] {
+        assert!(
+            cached_store(source).is_some_and(|store| store.is_managed()),
+            "{source} joins the shared cache"
+        );
+    }
+
+    assert_eq!(
+        ferrum_edge::_test_support::plugin_http_client_builds_for_test() - before,
+        0,
+        "managed key stores must reuse the caller's client, never build one"
+    );
+}
+
 #[test]
 fn oidc_relying_party_accepts_a_managed_jwks_source_with_explicit_endpoints() {
     let base = json!({

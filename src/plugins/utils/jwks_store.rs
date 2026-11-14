@@ -649,23 +649,33 @@ impl JwksKeyStore {
     /// `source` must be the canonical form returned by
     /// [`canonical_managed_jwks_source`]. Like [`Self::new`], this reads
     /// nothing: call [`Self::fetch_keys`] or start the background refresh.
-    pub fn new_managed(source: String) -> Self {
-        Self::managed_with_store(source, None)
+    ///
+    /// A managed store never dials: `http_client` is the caller's existing
+    /// client (a cheap clone), held only so the store shares one shape with a
+    /// remote store. Never build a client for it here: constructing one loads
+    /// the platform trust roots, and a config-load validation sweep must build
+    /// a bounded number of clients, not one per managed provider (#4116).
+    pub fn new_managed(source: String, http_client: PluginHttpClient) -> Self {
+        Self::managed_with_store(source, None, http_client)
     }
 
     /// [`Self::new_managed`] reading an explicit managed TLS store instead of
     /// the process store. Test support: lets a test own its store directory.
     #[doc(hidden)]
     pub fn new_managed_with_store(source: String, store: Arc<ManagedTlsStore>) -> Self {
-        Self::managed_with_store(source, Some(store))
+        Self::managed_with_store(source, Some(store), PluginHttpClient::default())
     }
 
-    fn managed_with_store(source: String, store: Option<Arc<ManagedTlsStore>>) -> Self {
+    fn managed_with_store(
+        source: String,
+        store: Option<Arc<ManagedTlsStore>>,
+        http_client: PluginHttpClient,
+    ) -> Self {
         let reference = source
             .strip_prefix(MANAGED_JWKS_SOURCE_PREFIX)
             .unwrap_or(&source)
             .to_string();
-        let mut created = Self::new(source, PluginHttpClient::default());
+        let mut created = Self::new(source, http_client);
         created.managed = Some(Arc::new(ManagedJwksOrigin { reference, store }));
         created
     }

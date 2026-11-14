@@ -943,7 +943,7 @@ impl JwksAuth {
             } else if let Some(ref source) = managed_jwks_source {
                 // Same pure-construction contract as a direct URI: a local,
                 // not-yet-read store; runtime startup swaps in the shared one.
-                let store = JwksKeyStore::new_managed(source.clone());
+                let store = JwksKeyStore::new_managed(source.clone(), http_client.clone());
                 store.configure_trust_policy(refresh_interval, provider_max_stale);
                 store.configure_kid_miss_cooldown(kid_miss_cooldown);
                 jwks_store_slot.store(Arc::new(Some(Arc::new(store))));
