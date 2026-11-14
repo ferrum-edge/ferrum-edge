@@ -125,8 +125,9 @@ pub struct MeshGrpcServer {
     sidecar_enforced: bool,
     /// Mirror of `EnvConfig.mesh_sidecar_enforced_dry_run`.
     sidecar_enforced_dry_run: bool,
-    /// Mirror of `EnvConfig.mesh_sidecar_identity_narrowing`. Only takes
-    /// effect when `sidecar_enforced` is also true.
+    /// Mirror of `EnvConfig.mesh_sidecar_identity_narrowing` (default `true`,
+    /// like the env var). Only takes effect when `sidecar_enforced` is also
+    /// true.
     sidecar_identity_narrowing: bool,
     /// Cluster DNS suffix used when synthesizing MeshService FQDN aliases for
     /// Sidecar egress matching.
@@ -184,7 +185,7 @@ impl MeshGrpcServerBuilder {
             require_ns_claim: false,
             sidecar_enforced: false,
             sidecar_enforced_dry_run: false,
-            sidecar_identity_narrowing: false,
+            sidecar_identity_narrowing: true,
             cluster_domain: crate::modes::mesh::dns_proxy::DEFAULT_CLUSTER_DOMAIN.to_string(),
             cluster_audience: None,
         }

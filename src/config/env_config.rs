@@ -2837,7 +2837,8 @@ pub struct EnvConfig {
     pub mesh_sidecar_enforced_dry_run: bool,
     /// When `true`, and only when `FERRUM_MESH_SIDECAR_ENFORCED=true`, the
     /// slice builder also narrows `workloads` to SPIFFE identities referenced
-    /// by admitted services. Default `false` for a one-release rollout window.
+    /// by admitted services. Default `true` (issue #7243); `false` is the
+    /// explicit off switch.
     pub mesh_sidecar_identity_narrowing: bool,
     /// CP-side: ordering domain this control plane advertises for authoritative
     /// mesh config revisions (`FERRUM_MESH_CONFIG_AUTHORITY_ID`, issue #2473).
@@ -4576,7 +4577,7 @@ impl Default for EnvConfig {
             mesh_outbound_registry_reject_status: 502,
             mesh_sidecar_enforced: false,
             mesh_sidecar_enforced_dry_run: false,
-            mesh_sidecar_identity_narrowing: false,
+            mesh_sidecar_identity_narrowing: true,
             mesh_config_authority_id: crate::modes::mesh::revision::DEFAULT_CONFIG_AUTHORITY_ID
                 .to_string(),
             mesh_config_k8s_authority_id: String::new(),
@@ -5232,7 +5233,7 @@ impl EnvConfig {
             mesh_outbound_registry_reject_status: u16 = "FERRUM_MESH_OUTBOUND_REGISTRY_REJECT_STATUS" => 502u16;
             mesh_sidecar_enforced: bool = "FERRUM_MESH_SIDECAR_ENFORCED" => false;
             mesh_sidecar_enforced_dry_run: bool = "FERRUM_MESH_SIDECAR_ENFORCED_DRY_RUN" => false;
-            mesh_sidecar_identity_narrowing: bool = "FERRUM_MESH_SIDECAR_IDENTITY_NARROWING" => false;
+            mesh_sidecar_identity_narrowing: bool = "FERRUM_MESH_SIDECAR_IDENTITY_NARROWING" => true;
             mesh_config_authority_id: String = "FERRUM_MESH_CONFIG_AUTHORITY_ID" => crate::modes::mesh::revision::DEFAULT_CONFIG_AUTHORITY_ID.to_string();
             mesh_config_k8s_authority_id: String = "FERRUM_MESH_CONFIG_K8S_AUTHORITY_ID" => String::new();
             mesh_config_revision_adopt_secs: u64 = "FERRUM_MESH_CONFIG_REVISION_ADOPT_SECS" => crate::modes::mesh::revision::DEFAULT_FOREIGN_AUTHORITY_ADOPT_SECS;

@@ -1369,6 +1369,29 @@ fn native_mtls_negative_control_contract_violations(run_sh: &str, helper: &str) 
     errors
 }
 
+/// Issue #7243: Sidecar identity narrowing is on by default, and the live
+/// Mesh E2E Sidecar suite is the gate that proves the default works on a real
+/// datapath. Its Sidecar-enforced data planes must therefore run with the
+/// DEFAULT, never with an explicit `FERRUM_MESH_SIDECAR_IDENTITY_NARROWING`
+/// override in either direction.
+#[test]
+fn live_contract_sidecar_suite_exercises_default_identity_narrowing() {
+    const RUN_SH: &str = include_str!("../k8s/mesh_e2e_sidecar/run.sh");
+    const MANIFESTS: &str = include_str!("../k8s/mesh_e2e_sidecar/manifests.yaml");
+
+    assert!(
+        MANIFESTS.contains("FERRUM_MESH_SIDECAR_ENFORCED"),
+        "the suite must keep Sidecar enforcement on, or identity narrowing never runs"
+    );
+    for (name, text) in [("manifests.yaml", MANIFESTS), ("run.sh", RUN_SH)] {
+        assert!(
+            !text.contains("FERRUM_MESH_SIDECAR_IDENTITY_NARROWING"),
+            "{name} must not override FERRUM_MESH_SIDECAR_IDENTITY_NARROWING; the live \
+             suite has to exercise the default"
+        );
+    }
+}
+
 /// Issue #3855 hosted Mesh E2E Sidecar: omit-client, foreign-client, and
 /// invalid-JWT were classified `connected-without-jwt-class` from the client
 /// `Connected to CP` line even though ferrum-cp had already rejected each

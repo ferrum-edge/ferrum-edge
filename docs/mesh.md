@@ -3243,11 +3243,11 @@ When multiple `Sidecar` resources apply at the same scope tier (two namespace-de
 
 ### Workload Identity Narrowing
 
-`FERRUM_MESH_SIDECAR_IDENTITY_NARROWING=true` adds a second, default-off narrowing pass after Sidecar egress scope has admitted services. The slice builder collects `MeshService.workloads[].spiffe_id` references from the admitted services and filters `workloads` to that reachable identity set. The flag only takes effect when `FERRUM_MESH_SIDECAR_ENFORCED=true`; with either flag disabled, workload identity lists stay namespace-wide.
+Whenever `FERRUM_MESH_SIDECAR_ENFORCED=true`, a second narrowing pass runs after Sidecar egress scope has admitted services (`FERRUM_MESH_SIDECAR_IDENTITY_NARROWING`, default `true`). The slice builder collects `MeshService.workloads[].spiffe_id` references from the admitted services and filters `workloads` to that reachable identity set. Set `FERRUM_MESH_SIDECAR_IDENTITY_NARROWING=false` to turn the pass off; with either flag off, workload identity lists stay namespace-wide. A deployment that resolves workload identities outside its Sidecar egress scope (a destination it reaches without an admitted service, or tooling that reads `slice.workloads` for identities it does not route to) loses them under the default, and should either admit those services in the Sidecar or set the flag to `false`.
 
 The local workload identity is still preserved separately on `MeshSlice::workload_spiffe_id`. It is often not listed under any admitted service's `workloads[]`, so it can be absent from the narrowed `slice.workloads` output; operators should treat `workload_spiffe_id` as the canonical local identity field.
 
-Before enabling identity narrowing, confirm admitted `MeshService.workloads[]` lists are populated in a few representative slices. Empty workload refs on admitted services cause the second pass to remove every workload identity from `slice.workloads`; this usually indicates EndpointSlice reconciliation lag in Kubernetes-derived config or a file-mode service typo.
+Before enabling Sidecar enforcement, confirm admitted `MeshService.workloads[]` lists are populated in a few representative slices. Empty workload refs on admitted services cause the second pass to remove every workload identity from `slice.workloads`; this usually indicates EndpointSlice reconciliation lag in Kubernetes-derived config or a file-mode service typo.
 
 Inbound mTLS peer validation continues to use the trust bundle carried in the slice, not the `workloads` list. HBONE `source.principal` baggage continues to be accepted or rejected by peer-cert trust-domain matching plus `FERRUM_MESH_TRUST_DOMAIN_ALIASES`, not by checking whether the source identity appears in the narrowed workload list.
 
@@ -3258,8 +3258,8 @@ Inbound mTLS peer validation continues to use the trust bundle carried in the sl
 1. Apply `Sidecar` CRDs and verify the translator parses them without errors.
 2. Set `FERRUM_MESH_SIDECAR_ENFORCED_DRY_RUN=true` and inspect `GET /mesh/egress-scope` on a data plane to confirm the expected narrowing would apply without denying traffic.
 3. Use `POST /mesh/egress-scope/test` to dry-run important destinations by host and port.
-4. Set `FERRUM_MESH_SIDECAR_ENFORCED=true` on the CP and roll. DPs receive the already-narrowed slice - no DP-side configuration is required.
-5. After egress narrowing is trusted, set `FERRUM_MESH_SIDECAR_IDENTITY_NARROWING=true` and roll the CP again to trim `slice.workloads` to reachable service identities.
+4. Set `FERRUM_MESH_SIDECAR_ENFORCED=true` on the CP and roll. DPs receive the already-narrowed slice - no DP-side configuration is required. Identity narrowing is on by default, so `slice.workloads` is trimmed to reachable service identities at the same time.
+5. If a workload needs identities outside its Sidecar egress scope, admit the services in the Sidecar, or set `FERRUM_MESH_SIDECAR_IDENTITY_NARROWING=false` on the CP to keep namespace-wide identity lists.
 
 ### Egress Scope Operations
 

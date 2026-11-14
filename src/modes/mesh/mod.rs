@@ -618,7 +618,7 @@ pub struct MeshRuntimeConfig {
     /// When `true`, and only when `sidecar_enforced` is also true, per-workload
     /// slices filter `workloads` down to identities referenced by admitted
     /// services. Sourced from `FERRUM_MESH_SIDECAR_IDENTITY_NARROWING`
-    /// (default `false`).
+    /// (default `true`; `false` turns it off).
     pub sidecar_identity_narrowing: bool,
     /// Opt-in for stream-family (TCP/UDP) egress proxy materialization.
     /// Default `false`. When enabled, the materialized per-port stream egress
@@ -23337,7 +23337,10 @@ mod tests {
                 );
                 assert_eq!(runtime.cluster_domain, dns_proxy::DEFAULT_CLUSTER_DOMAIN);
                 assert_eq!(runtime.outbound_registry_reject_status, 502);
-                assert!(!runtime.sidecar_identity_narrowing);
+                assert!(
+                    runtime.sidecar_identity_narrowing,
+                    "identity narrowing is on by default (issue #7243)"
+                );
             },
         );
     }
@@ -23352,13 +23355,16 @@ mod tests {
                     "FERRUM_CP_DP_GRPC_JWT_SECRET",
                     "secret-padding-for-32-char-min!!",
                 ),
-                ("FERRUM_MESH_SIDECAR_IDENTITY_NARROWING", "true"),
+                ("FERRUM_MESH_SIDECAR_IDENTITY_NARROWING", "false"),
             ],
             || {
                 let env = EnvConfig::from_env().expect("mesh env config");
                 let runtime =
                     MeshRuntimeConfig::from_env_config(&env).expect("mesh runtime config");
-                assert!(runtime.sidecar_identity_narrowing);
+                assert!(
+                    !runtime.sidecar_identity_narrowing,
+                    "`false` is the explicit off switch for the default-on narrowing"
+                );
                 assert!(
                     !runtime.sidecar_enforced,
                     "identity narrowing is parsed independently but only takes effect during slicing when Sidecar enforcement is also enabled"
