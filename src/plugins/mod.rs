@@ -1632,6 +1632,70 @@ pub struct WsDisconnectContext {
     pub proxy_lifecycle_generation: Option<u64>,
 }
 
+/// Metadata key the projected WebSocket session-end record carries so the
+/// record is locatable at the time the session ended, not only when it was
+/// admitted.
+pub const WS_SESSION_END_TIMESTAMP_METADATA_KEY: &str = "websocket.timestamp_disconnected";
+
+impl WsDisconnectContext {
+    /// Project a WebSocket session end into the HTTP-family access-log record
+    /// (`TransactionSummary`).
+    ///
+    /// This is the one session-end record shape every `TransactionSummary`
+    /// log sink (`stdout_logging`, `http_logging`, `tcp_logging`,
+    /// `udp_logging`, `kafka_logging`, `loki_logging`) emits from
+    /// `on_ws_disconnect` (issue #7144), so a sink choice never decides whether
+    /// in-session WebSocket failures are visible.
+    ///
+    /// The handshake `log()` already emitted the upgrade row (usually without
+    /// `error_class`). In-session faults live on this context; the projection
+    /// lets operators grep the same `error_class` key. Method, path, and status
+    /// are the values captured at upgrade admission (`GET`/`101` for HTTP/1.1,
+    /// `CONNECT`/`200` for RFC 8441/9220 Extended CONNECT) so a rewritten
+    /// backend target cannot corrupt those fields. BASE schema only — this is
+    /// not the `websocket_disconnect` capability family `ws_logging` emits.
+    ///
+    /// `timestamp_received` stays the admission time and `latency_total_ms` the
+    /// session duration. A session has no request/response phase split, so
+    /// every other latency is the [`LATENCY_UNKNOWN_MS`] "not observed"
+    /// sentinel rather than a fabricated `0.0` or the session duration
+    /// relabelled as gateway processing; the end of the session is carried in
+    /// [`WS_SESSION_END_TIMESTAMP_METADATA_KEY`].
+    pub fn session_end_summary(&self) -> TransactionSummary {
+        let mut metadata = self.metadata.clone();
+        metadata.insert(
+            WS_SESSION_END_TIMESTAMP_METADATA_KEY.to_string(),
+            self.timestamp_disconnected.clone(),
+        );
+        TransactionSummary {
+            namespace: self.namespace.clone(),
+            timestamp_received: self.timestamp_connected.clone(),
+            client_ip: self.client_ip.clone(),
+            consumer_username: self.consumer_username.clone(),
+            auth_method: self.auth_method,
+            http_method: self.http_method.clone(),
+            request_path: self.request_path.clone(),
+            proxy_id: Some(self.proxy_id.clone()),
+            proxy_name: self.proxy_name.clone(),
+            backend_target: Some(self.backend_target.clone()),
+            response_status_code: self.handshake_status_code,
+            latency_total_ms: self.duration_ms,
+            latency_gateway_processing_ms: LATENCY_UNKNOWN_MS,
+            latency_backend_ttfb_ms: LATENCY_UNKNOWN_MS,
+            latency_backend_total_ms: LATENCY_UNKNOWN_MS,
+            latency_plugin_execution_ms: LATENCY_UNKNOWN_MS,
+            latency_plugin_external_io_ms: LATENCY_UNKNOWN_MS,
+            latency_gateway_overhead_ms: LATENCY_UNKNOWN_MS,
+            bytes_sent: self.bytes_client_to_backend,
+            bytes_received: self.bytes_backend_to_client,
+            error_class: self.error_class,
+            metadata,
+            proxy_lifecycle_generation: self.proxy_lifecycle_generation,
+            ..TransactionSummary::default()
+        }
+    }
+}
+
 /// One-request/session cache for the authoritative, canonical client IP.
 ///
 /// Client-IP resolution is complete before policy hooks run. The first policy
@@ -15363,10 +15427,13 @@ pub const BUILTIN_PLUGIN_REGISTRATIONS: &[PluginRegistration] = &[
         "transaction_log_schema",
         PluginFailurePolicy::KeepLastKnownGood,
     ),
-    // The access log is an audit trail: a reload that cannot construct it keeps
-    // the previous generation instead of publishing one without it.
+    // Log sinks share one contract (issue #7144): an access log is an audit
+    // trail, so a reload that cannot construct any log sink keeps the previous
+    // generation instead of publishing one that silently stops logging. Every
+    // log sink (`stdout`, `http`, `tcp`, `udp`, `kafka`, `loki`, `statsd`,
+    // `ws`, `ws_frame`) is `KeepLastKnownGood`.
     builtin_plugin("stdout_logging", PluginFailurePolicy::KeepLastKnownGood),
-    builtin_plugin("http_logging", PluginFailurePolicy::OptionalFailOpen),
+    builtin_plugin("http_logging", PluginFailurePolicy::KeepLastKnownGood),
     builtin_plugin("tcp_logging", PluginFailurePolicy::KeepLastKnownGood),
     builtin_plugin("kafka_logging", PluginFailurePolicy::KeepLastKnownGood),
     builtin_plugin("ws_logging", PluginFailurePolicy::KeepLastKnownGood),
@@ -15451,12 +15518,12 @@ pub const BUILTIN_PLUGIN_REGISTRATIONS: &[PluginRegistration] = &[
     builtin_plugin("mcp_gateway", PluginFailurePolicy::FailClosed),
     builtin_plugin("a2a_gateway", PluginFailurePolicy::FailClosed),
     builtin_plugin("ws_message_size_limiting", PluginFailurePolicy::FailClosed),
-    builtin_plugin("ws_frame_logging", PluginFailurePolicy::OptionalFailOpen),
+    builtin_plugin("ws_frame_logging", PluginFailurePolicy::KeepLastKnownGood),
     builtin_plugin("ws_rate_limiting", PluginFailurePolicy::FailClosed),
     builtin_plugin("udp_rate_limiting", PluginFailurePolicy::FailClosed),
-    builtin_plugin("udp_logging", PluginFailurePolicy::OptionalFailOpen),
-    builtin_plugin("statsd_logging", PluginFailurePolicy::OptionalFailOpen),
-    builtin_plugin("loki_logging", PluginFailurePolicy::OptionalFailOpen),
+    builtin_plugin("udp_logging", PluginFailurePolicy::KeepLastKnownGood),
+    builtin_plugin("statsd_logging", PluginFailurePolicy::KeepLastKnownGood),
+    builtin_plugin("loki_logging", PluginFailurePolicy::KeepLastKnownGood),
     builtin_plugin("sse", PluginFailurePolicy::KeepLastKnownGood),
     builtin_plugin("request_mirror", PluginFailurePolicy::KeepLastKnownGood),
     builtin_plugin("load_testing", PluginFailurePolicy::KeepLastKnownGood),

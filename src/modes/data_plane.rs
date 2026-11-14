@@ -806,6 +806,10 @@ pub async fn run(
         env_config.admin_max_connections_per_ip,
         env_config.per_ip_ipv6_prefix,
     ));
+    // No configuration database in this mode: durable admin audit records are
+    // retained in the bounded local retention file (issue #7200). Start the
+    // worker that adopts and drains the spool into it before admin traffic.
+    crate::admin::audit::start_local_retention_delivery(env_config.admin_audit_enabled);
     let admin_state = AdminState {
         db: None, // DP has no direct DB access
         jwt_manager,
@@ -1127,6 +1131,10 @@ pub async fn run(
     health_check_handles.extend(proxy_state.health_checker.take_active_check_handles());
     background_handles.extend(health_check_handles);
     crate::modes::file::join_background_handles(background_handles, Duration::from_secs(5)).await;
+    crate::admin::audit::shutdown_local_retention_delivery(Duration::from_secs(
+        env_config.shutdown_drain_seconds.clamp(5, 60),
+    ))
+    .await;
     crate::observability_delivery::shutdown(Duration::from_millis(
         env_config.log_shutdown_drain_timeout_ms,
     ))

@@ -529,7 +529,7 @@ diagnosable.
 
 In database **and control-plane** mode, if a **full** config load is rejected by the runtime-config validation contract (a reachable backend served a semantically-invalid snapshot — e.g. a partial/direct-DB write) **or by typed SQL row decoding** (a reachable backend served an undecodable row — e.g. malformed JSON in a column) the gateway keeps serving the last known-good config **and keeps the admin API writable**: `db_available` stays true because admin writes are the in-band repair path for the offending resource. Re-enabling writes is gated on any deferred schema migration applying first, so a reachable backend whose schema is still pending keeps writes blocked while `config_rejected` stays set. The rejection also skips failover (the same invalid snapshot lives on every replica). The authenticated `/health` detail then carries `config_rejected: true` and `status: "degraded"` (the boolean detail is authenticated-only; the coarse `degraded` status is also visible unauthenticated). The flag is sticky and clears only after an accepted authoritative **full** reload (an accepted incremental poll does not clear it). While the backend is later unreachable (`admin_writes_enabled` false) the `config_rejected` detail is suppressed so it never advertises the writable repair path during an outage, even though the underlying flag remains set. A genuine connectivity failure is unaffected and still flips `admin_writes_enabled` to false. Startup still fails loudly for undecodable rows (backup bootstrap is not eligible), matching the non-transient decode policy.
 
-In **database** mode a stored `plugin_configs` row that the shared plugin **construction** gate refuses (unknown key, bad regex, out-of-range value) is **quarantined** rather than fatal **only when the plugin's failure policy is `OptionalFailOpen`** (logging, metrics and other instrumentation): the serving-mode full load drops that row, logs one `error!` naming the plugin, its config id, and the constructor error, omits it from the plugin cache, and raises `config_rejected`. The process therefore reaches its admin listener with the offending row still visible through `GET /plugins/config/{id}` and deletable through `DELETE /plugins/config/{id}`, which is the in-band repair path. `config_rejected` is *not* cleared by a later accepted reload that still had to quarantine a row. A refused `FailClosed` or `KeepLastKnownGood` row, and any unknown or retired plugin name, is **never** quarantined: the serving-mode load rejects the whole snapshot and the process refuses to start, because silently omitting an authentication, authorization or traffic-policy plugin would serve requests without the control the operator configured. Repair those rows out of band (directly in the database) before restarting. Control-plane mode **rejects** every unconstructible snapshot outright, so such a row is never broadcast to the data-plane fleet.
+In **database** mode a stored `plugin_configs` row that the shared plugin **construction** gate refuses (unknown key, bad regex, out-of-range value) is **quarantined** rather than fatal **only when the plugin's failure policy is `OptionalFailOpen`** (metrics, tracing, alerting and other instrumentation; log sinks are `KeepLastKnownGood` and are never quarantined): the serving-mode full load drops that row, logs one `error!` naming the plugin, its config id, and the constructor error, omits it from the plugin cache, and raises `config_rejected`. The process therefore reaches its admin listener with the offending row still visible through `GET /plugins/config/{id}` and deletable through `DELETE /plugins/config/{id}`, which is the in-band repair path. `config_rejected` is *not* cleared by a later accepted reload that still had to quarantine a row. A refused `FailClosed` or `KeepLastKnownGood` row, and any unknown or retired plugin name, is **never** quarantined: the serving-mode load rejects the whole snapshot and the process refuses to start, because silently omitting an authentication, authorization or traffic-policy plugin would serve requests without the control the operator configured. Repair those rows out of band (directly in the database) before restarting. Control-plane mode **rejects** every unconstructible snapshot outright, so such a row is never broadcast to the data-plane fleet.
 
 A malformed `FailClosed` / `KeepLastKnownGood` row therefore never yields a serving snapshot with that plugin omitted, on any path: a cold start without `FERRUM_DB_CONFIG_BACKUP_PATH` exits before any proxy or admin listener binds; a cold start with a usable backup serves the backup generation — security plugins included — with `config_rejected` raised and admin writes available for in-band repair; and a hot reload whose authoritative full load contains such a row never reaches `update_config`, so the complete previous runtime generation keeps serving. End-to-end coverage lives in `tests/functional/functional_plugin_quarantine_test.rs`.
 
@@ -2170,6 +2170,35 @@ audit handoff still happens before the action. A `fail_closed` audit outage
 therefore refuses the audited TLS/ACME action without applying sticky database
 failover policy to that independent store or operational reload.
 
+### Modes without a configuration database
+
+`mesh`, `file`, and `dp` have no `audit_events` table. Their audited actions
+(for example `POST /mesh/config-revision/reset` and `POST /admin/tls/rotate`)
+still prepare and finalize through the spool exactly as below, but the delivery
+target is the **bounded local audit retention file**
+`admin-audit-retention.json` in `FERRUM_ADMIN_AUDIT_FALLBACK_PATH` (issue #7200):
+
+- A delivery worker starts with the admin listener. It adopts records
+  abandoned by earlier process generations (`unknown_outcome` included),
+  replays them, and drains every finalized record from `pending/` into the
+  retention file, so the spool stays empty instead of growing until
+  `FERRUM_ADMIN_AUDIT_SPOOL_MAX_RECORDS` saturates and `fail_closed` refuses
+  audited actions.
+- Without a spool the finalized event is written to the retention file
+  directly before the response returns.
+- The file is hardened, locked, and atomically published like the backup
+  fallback file beside it, and rotates the same way: it keeps the newest
+  records within `FERRUM_ADMIN_AUDIT_LOCAL_RETENTION_MAX_RECORDS` (default
+  4096) and `FERRUM_ADMIN_AUDIT_LOCAL_RETENTION_MAX_BYTES` (default 16 MiB),
+  dropping the oldest with a content-free `audit_local_retention_rotated`
+  warning. A replayed record (same event id) is not written twice.
+- `ferrum_admin_audit_evidence_lost` latches only when the retention write
+  itself fails; a replayed record whose write fails stays durable in the spool
+  and is retried like any delivery.
+- Nothing ships the file: it is not returned by `GET /audit`. Collect it like
+  any other on-host security log, and put `FERRUM_ADMIN_AUDIT_FALLBACK_PATH` on
+  a persistent, writable volume.
+
 ### Durable evidence before the mutation
 
 1. **Prepare.** The admin write gate durably creates an *audit intent* — a
@@ -3313,7 +3342,7 @@ Returns `404 Not Found` outside mesh mode (no `mesh_runtime_state`). Returns `20
 
 ## Mesh Config Revision Reset (mesh mode)
 
-`POST /mesh/config-revision/reset` clears this DP's accepted authoritative config revision so the next mesh slice from **any** config authority is eligible again. Requires JWT authentication and the **`operator`** role (`403 Forbidden` without it). Returns `404 Not Found` outside mesh mode. This lowers a fail-closed freshness guard, so it requires explicit operator confirmation via `?confirm=true` (same pattern as destructive namespace and restore operations) and leaves a durable audit record when `FERRUM_ADMIN_AUDIT_ENABLED` is on. On success returns `200 OK`:
+`POST /mesh/config-revision/reset` clears this DP's accepted authoritative config revision so the next mesh slice from **any** config authority is eligible again. Requires JWT authentication and the **`operator`** role (`403 Forbidden` without it). Returns `404 Not Found` outside mesh mode. This lowers a fail-closed freshness guard, so it requires explicit operator confirmation via `?confirm=true` (same pattern as destructive namespace and restore operations) and leaves a durable audit record when `FERRUM_ADMIN_AUDIT_ENABLED` is on. Mesh mode has no configuration database, so that record is kept in the bounded local audit retention file (`admin-audit-retention.json` in `FERRUM_ADMIN_AUDIT_FALLBACK_PATH`; see [Modes without a configuration database](#modes-without-a-configuration-database)). On success returns `200 OK`:
 
 ```json
 {

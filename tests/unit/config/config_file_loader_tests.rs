@@ -1959,8 +1959,10 @@ plugin_configs:
     assert!(message.contains("1 plugin config error(s)"), "{message}");
 }
 
+/// Issue #7144: `ws_frame_logging` is a log sink and therefore
+/// `KeepLastKnownGood`: an invalid config fails file-mode load.
 #[test]
-fn test_ws_frame_logging_optional_fail_open_admission_in_file_mode() {
+fn test_invalid_ws_frame_logging_config_rejects_file_mode_load() {
     let yaml = r#"
 version: "1"
 proxies: []
@@ -1976,16 +1978,15 @@ plugin_configs:
 "#;
     let mut file = NamedTempFile::with_suffix(".yaml").unwrap();
     write!(file, "{}", yaml).unwrap();
-    let config = load_config_from_file(
+    let error = load_config_from_file(
         file.path().to_str().unwrap(),
         30,
         &ferrum_edge::config::BackendEgressPolicy::unrestricted(),
         "ferrum",
     )
-    .expect("ws_frame_logging OptionalFailOpen must not reject file-mode load");
-
-    assert_eq!(config.plugin_configs.len(), 1);
-    assert_eq!(config.plugin_configs[0].plugin_name, "ws_frame_logging");
+    .expect_err("an unconstructible ws_frame_logging config must reject file-mode load");
+    let message = format!("{error:#}");
+    assert!(message.contains("1 plugin config error(s)"), "{message}");
 }
 
 #[test]

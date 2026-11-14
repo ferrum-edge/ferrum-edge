@@ -4983,6 +4983,12 @@ impl EnvConfig {
                 => crate::admin::audit::AUDIT_RETAINED_MAX_RECORDS_DEFAULT;
             admin_audit_max_delivery_attempts: u32 = "FERRUM_ADMIN_AUDIT_MAX_DELIVERY_ATTEMPTS"
                 => crate::admin::audit::AUDIT_MAX_DELIVERY_ATTEMPTS_DEFAULT;
+            admin_audit_local_retention_max_records: u64
+                = "FERRUM_ADMIN_AUDIT_LOCAL_RETENTION_MAX_RECORDS"
+                => crate::admin::audit::AUDIT_LOCAL_RETENTION_MAX_RECORDS_DEFAULT;
+            admin_audit_local_retention_max_bytes: u64
+                = "FERRUM_ADMIN_AUDIT_LOCAL_RETENTION_MAX_BYTES"
+                => crate::admin::audit::AUDIT_LOCAL_RETENTION_MAX_BYTES_DEFAULT;
             admin_require_namespace_claim: bool = "FERRUM_ADMIN_REQUIRE_NAMESPACE_CLAIM" => false;
             gateway_listener_failure_fails_readiness: bool
                 = "FERRUM_GATEWAY_LISTENER_FAILURE_FAILS_READINESS" => false;
@@ -5095,6 +5101,13 @@ impl EnvConfig {
             spool_max_records: admin_audit_spool_max_records,
             retained_max_records: admin_audit_retained_max_records,
             max_delivery_attempts: admin_audit_max_delivery_attempts,
+            // Resolved from `FERRUM_ADMIN_AUDIT_FALLBACK_PATH` at first write,
+            // like the backup fallback file it sits beside.
+            local_retention_dir: None,
+            local_retention: crate::admin::audit::LocalAuditRetentionBounds {
+                max_records: admin_audit_local_retention_max_records,
+                max_bytes: admin_audit_local_retention_max_bytes,
+            },
         };
         admin_audit_pipeline.validate()?;
         if resolve_var(conf, "FERRUM_DB_POLL_INTERVAL")

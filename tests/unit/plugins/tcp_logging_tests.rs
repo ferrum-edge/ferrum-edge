@@ -7,7 +7,8 @@ use ferrum_edge::plugins::{
 use serde_json::json;
 
 use super::plugin_utils::{
-    create_test_stream_transaction_summary, create_test_transaction_summary,
+    assert_ws_session_end_record, create_test_stream_transaction_summary,
+    create_test_transaction_summary, create_test_ws_disconnect_context,
 };
 
 fn default_client() -> PluginHttpClient {
@@ -320,6 +321,50 @@ async fn test_tcp_logging_log_does_not_panic() {
 
     // Give the background flush task time to attempt delivery
     tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
+}
+
+/// Issue #7144: `tcp_logging` emits the shared WebSocket session-end record
+/// from `on_ws_disconnect` as one NDJSON line.
+#[tokio::test]
+async fn test_tcp_logging_delivers_ws_session_end_record() {
+    use tokio::io::AsyncBufReadExt;
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind collector");
+    let addr = listener.local_addr().expect("collector addr");
+    let plugin = TcpLogging::new(
+        &json!({
+            "host": "127.0.0.1",
+            "port": addr.port(),
+            "batch_size": 1,
+            "flush_interval_ms": 100,
+            "max_retries": 0
+        }),
+        default_client(),
+    )
+    .unwrap();
+    assert!(plugin.requires_ws_disconnect_hooks());
+    plugin.start_background_tasks().expect("live start");
+    plugin.commit_background_tasks();
+
+    plugin
+        .on_ws_disconnect(&create_test_ws_disconnect_context())
+        .await;
+
+    let line = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        let (socket, _) = listener.accept().await.expect("accept sink connection");
+        let mut lines = tokio::io::BufReader::new(socket).lines();
+        lines
+            .next_line()
+            .await
+            .expect("read NDJSON line")
+            .expect("one NDJSON line")
+    })
+    .await
+    .expect("tcp_logging must ship the WebSocket session-end record");
+    let record: serde_json::Value = serde_json::from_str(&line).expect("NDJSON record");
+    assert_ws_session_end_record(&record, "tcp_logging");
 }
 
 #[tokio::test]

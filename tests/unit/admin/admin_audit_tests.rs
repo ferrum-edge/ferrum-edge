@@ -272,6 +272,8 @@ fn init_mesh_reset_audit_pipeline_once(dir: &TempDir) {
             spool_max_records: 1,
             retained_max_records: 8,
             max_delivery_attempts: 3,
+            local_retention_dir: Some(dir.path().join("retention")),
+            local_retention: Default::default(),
         };
         initialize(cfg).expect("audit pipeline initializes for mesh reset tests");
     });

@@ -26,6 +26,7 @@ use tokio::time::{Duration, sleep};
 
 use super::plugin_utils::{
     create_test_stream_transaction_summary, create_test_transaction_summary,
+    create_test_ws_disconnect_context,
 };
 
 fn default_http_client() -> PluginHttpClient {
@@ -403,6 +404,49 @@ async fn kafka_successful_deliveries_release_leases_before_finalization() {
             assert_eq!(finalized.shutdown_incomplete_total, 0);
         }
     }
+}
+
+/// Issue #7144: `kafka_logging` produces the shared WebSocket session-end
+/// record from `on_ws_disconnect` through its ordinary admission path.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn kafka_logging_delivers_ws_session_end_record() {
+    let cluster = MockCluster::new(1).expect("create Kafka mock cluster");
+    let topic = "ws-session-end";
+    cluster
+        .create_topic(topic, 1, 1)
+        .expect("create mock topic");
+    let plugin = KafkaLogging::new(
+        &json!({
+            "broker_list": cluster.bootstrap_servers(),
+            "topic": topic,
+            "compression": "none",
+            "message_timeout_ms": 10_000,
+            "flush_timeout_seconds": 5,
+            "producer_config": {"linger.ms": "0"}
+        }),
+        &default_http_client(),
+    )
+    .expect("construct Kafka logger");
+    assert!(plugin.requires_ws_disconnect_hooks());
+    start_kafka_logging(&plugin);
+
+    plugin
+        .on_ws_disconnect(&create_test_ws_disconnect_context())
+        .await;
+
+    tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            let snapshot = plugin.snapshot();
+            if snapshot.admitted_total == 1 && snapshot.delivered_total == 1 {
+                break;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the WebSocket session-end record must be admitted and delivered");
+    plugin.finalize().await;
+    assert_eq!(plugin.snapshot().delivery_failed_total, 0);
 }
 
 #[tokio::test]

@@ -781,9 +781,16 @@ fn local_fallback_read_path_uses_nofollow_handle_and_byte_ceiling() {
         !read_body.contains("fs::read("),
         "fallback read must not use unbounded path-based fs::read"
     );
+    // The read is shared by the backup fallback file and the DB-less
+    // retention file (issue #7200), so it enforces the store's own byte
+    // ceiling, and the backup store passes `AUDIT_LOCAL_FALLBACK_MAX_BYTES`.
     assert!(
-        read_body.contains("AUDIT_LOCAL_FALLBACK_MAX_BYTES"),
+        read_body.contains("len > max_bytes as u64") && read_body.contains("raw.len() > max_bytes"),
         "fallback read body must enforce the byte ceiling"
+    );
+    assert!(
+        AUDIT_SOURCE.contains("max_bytes: AUDIT_LOCAL_FALLBACK_MAX_BYTES,"),
+        "the backup fallback store must read under AUDIT_LOCAL_FALLBACK_MAX_BYTES"
     );
 }
 

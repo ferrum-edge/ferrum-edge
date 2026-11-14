@@ -45,6 +45,10 @@
 //! starting at the same moment therefore never sees an unlocked instance
 //! directory it could mistake for an abandoned one. A staging tree left by a
 //! crash before the rename holds no records and is removed once it is old.
+//! Non-Unix hosts cannot rename a directory holding an open lock handle, so
+//! they create the tree in place and then lock it; there the claimer never
+//! creates the lock of a lock-less instance younger than the staging grace
+//! period, so it cannot take the lock a sibling is about to take.
 //!
 //! Every record also carries a **non-secret destination identity** (database
 //! type, namespace, and a salt-free digest of the redacted connection URL). A
@@ -777,6 +781,13 @@ impl AuditSpool {
             if !fs::symlink_metadata(&path).is_ok_and(|meta| meta.is_dir()) {
                 continue;
             }
+            if !lockless_instance_is_claimable(&path) {
+                // A sibling may still be between creating this tree and
+                // locking it (issue #7200): never take a lock it is about to
+                // take.
+                report.live_instances = report.live_instances.saturating_add(1);
+                continue;
+            }
             match acquire_owner_lock(&path.join(OWNER_LOCK_FILE)) {
                 Ok(Some(lock)) => {
                     self.claim_instance(&path, &mut report);
@@ -1182,17 +1193,50 @@ fn establish_owned_instance(
     }
 }
 
-/// Remove a staging tree left by a crash before its rename. Only trees older
-/// than [`STALE_STAGING_AGE`] are touched, so a sibling that is establishing
-/// its own tree right now is never disturbed; such a tree can hold no records.
-fn remove_stale_staging(path: &Path) {
-    let old_enough = fs::symlink_metadata(path)
+/// Whether `path` is a directory last modified at least `age` ago.
+fn directory_is_older_than(path: &Path, age: std::time::Duration) -> bool {
+    fs::symlink_metadata(path)
         .ok()
         .filter(|meta| meta.is_dir())
         .and_then(|meta| meta.modified().ok())
         .and_then(|modified| modified.elapsed().ok())
-        .is_some_and(|age| age >= STALE_STAGING_AGE);
-    if !old_enough {
+        .is_some_and(|elapsed| elapsed >= age)
+}
+
+/// Whether `claim_abandoned` may take (creating it if needed) the owner lock
+/// of an instance directory.
+///
+/// A directory whose `owner.lock` exists is decided by the lock itself. A
+/// lock-less directory is either a sibling that has created its tree but not
+/// yet taken its lock, or a leftover from a crash or a partial claim. On Unix
+/// a generation only becomes visible after its locked rename, so a lock-less
+/// instance is never a sibling mid-establishment and is claimable at once.
+/// Non-Unix hosts create the tree in place and then lock it, so there a
+/// lock-less instance is claimed only once it is older than
+/// [`STALE_STAGING_AGE`]; claiming it earlier would create the lock the
+/// sibling is about to take and remove its tree (issue #7200). Such a tree
+/// holds no records: nothing is written before `open` returns.
+fn lockless_instance_is_claimable(instance: &Path) -> bool {
+    instance_lock_is_claimable(instance, !cfg!(unix))
+}
+
+/// [`lockless_instance_is_claimable`] for a host that creates instance trees
+/// in place (`creates_in_place`, non-Unix) or by a locked rename (Unix).
+pub(crate) fn instance_lock_is_claimable(instance: &Path, creates_in_place: bool) -> bool {
+    match fs::symlink_metadata(instance.join(OWNER_LOCK_FILE)) {
+        Ok(_) => true,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            !creates_in_place || directory_is_older_than(instance, STALE_STAGING_AGE)
+        }
+        Err(_) => false,
+    }
+}
+
+/// Remove a staging tree left by a crash before its rename. Only trees older
+/// than [`STALE_STAGING_AGE`] are touched, so a sibling that is establishing
+/// its own tree right now is never disturbed; such a tree can hold no records.
+fn remove_stale_staging(path: &Path) {
+    if !directory_is_older_than(path, STALE_STAGING_AGE) {
         return;
     }
     let _ = fs::remove_file(path.join(OWNER_LOCK_FILE));

@@ -336,7 +336,7 @@ fn file_mode_validate_pipeline_rejects_malformed_sink_fields() {
 
     // Constructors / validate_plugin_config must reject every malformed case
     // synchronously (runtime-free). This pins semantic validation in `new`
-    // even when file-mode OptionalFailOpen soft-warns and omits the instance.
+    // independently of the file-mode aggregate below.
     for (name, config, needle) in malformed_sink_cases() {
         let error = validate_plugin_config(name, &config)
             .expect_err(&format!("{name}: expected constructor validation failure"));
@@ -346,11 +346,16 @@ fn file_mode_validate_pipeline_rejects_malformed_sink_fields() {
         );
     }
 
-    // KeepLastKnownGood sinks must also fail closed through the file-mode
-    // load path used by `ferrum-edge validate`. OptionalFailOpen sinks warn
-    // and omit rather than aborting the surrounding snapshot (docs/plugins.md).
+    // Every log sink is KeepLastKnownGood (issue #7144), so each must also
+    // fail closed through the file-mode load path used by `ferrum-edge
+    // validate` (docs/plugins.md "Log sink contract").
     for (name, config, needle) in malformed_sink_cases() {
         if plugin_failure_policy(name) == Some(PluginFailurePolicy::OptionalFailOpen) {
+            // Only non-log-sink cases (none today) may still soft-warn.
+            assert!(
+                !name.ends_with("_logging"),
+                "{name}: a log sink must not be OptionalFailOpen"
+            );
             continue;
         }
         let spec_path = tmp.path().join(format!("{name}-bad.json"));
