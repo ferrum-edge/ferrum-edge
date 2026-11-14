@@ -25,7 +25,7 @@ use ferrum_edge::modes::mesh::config::{
     MeshTrafficPolicyTls, MtlsMode,
 };
 use ferrum_edge::modes::mesh::{
-    MeshConfigProtocol, MeshRuntimeConfig, MeshTopology, prepare_gateway_config_for_mesh,
+    MeshConfigProtocol, MeshRuntimeConfig, MeshTopology, prepare_gateway_config_via_mesh_slice,
 };
 use ferrum_edge::proxy::{ConfigApplyOutcome, ProxyState};
 
@@ -282,7 +282,8 @@ fn prepared_with_dr_at(
         ..GatewayConfig::default()
     };
     config.normalize_fields();
-    let mut prepared = prepare_gateway_config_for_mesh(config, &runtime()).expect("mesh prepare");
+    let mut prepared =
+        prepare_gateway_config_via_mesh_slice(config, &runtime()).expect("mesh prepare");
     // Stabilize operator-authored proxy timestamps so DR-only prepares do not
     // accidentally look like Proxy resource edits.
     for proxy in &mut prepared.proxies {
@@ -337,7 +338,8 @@ fn prepared_mesh_sd_with_dr(stamp: chrono::DateTime<Utc>, idle_ms: u64) -> Gatew
         ..GatewayConfig::default()
     };
     config.normalize_fields();
-    let mut prepared = prepare_gateway_config_for_mesh(config, &runtime()).expect("mesh prepare");
+    let mut prepared =
+        prepare_gateway_config_via_mesh_slice(config, &runtime()).expect("mesh prepare");
     for proxy in &mut prepared.proxies {
         proxy.created_at = stamp;
         proxy.updated_at = stamp;
@@ -346,7 +348,7 @@ fn prepared_mesh_sd_with_dr(stamp: chrono::DateTime<Utc>, idle_ms: u64) -> Gatew
         upstream.created_at = stamp;
         upstream.updated_at = stamp;
     }
-    // `prepare_gateway_config_for_mesh` also materializes reserved
+    // `prepare_gateway_config_via_mesh_slice` also materializes reserved
     // `__mesh-*` routes/upstreams. Production publishes those through the
     // crate-private trusted mesh entrypoint, while this integration test must
     // use the public validation path. Keep only the operator-authored SD pair

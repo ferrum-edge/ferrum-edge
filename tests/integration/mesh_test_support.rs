@@ -38,7 +38,7 @@ use ferrum_edge::modes::mesh::config::{
 use ferrum_edge::modes::mesh::slice::MeshSlice;
 use ferrum_edge::modes::mesh::{
     MeshConfigProtocol, MeshRuntimeConfig, MeshTopology, MeshTrafficDirection,
-    prepare_gateway_config_for_mesh,
+    prepare_gateway_config_via_mesh_slice,
 };
 use ferrum_edge::proxy::{
     ProxyState, start_proxy_listener_with_bound_listener,
@@ -457,7 +457,7 @@ pub fn http_upstream(id: &str, host: &str, port: u16) -> Upstream {
 
 /// Build an empty `GatewayConfig` with `mesh: Some(MeshConfig{...})` and the
 /// supplied proxies/upstreams/policies attached. Callers feed the result to
-/// [`prepare_gateway_config_for_mesh`] before constructing `ProxyState`.
+/// [`prepare_gateway_config_via_mesh_slice`] before constructing `ProxyState`.
 pub fn gateway_config_with_mesh(
     proxies: Vec<Proxy>,
     upstreams: Vec<Upstream>,
@@ -504,7 +504,7 @@ pub fn mesh_config_with(
 }
 
 /// Prepare a mesh-mode `ProxyState` for `proxies` and `upstreams`, with the
-/// supplied `MeshConfig`. Runs the full `prepare_gateway_config_for_mesh`
+/// supplied `MeshConfig`. Runs the full `prepare_gateway_config_via_mesh_slice`
 /// pipeline so plugin injection, locality projection, and DR materialisation
 /// all match production. The returned tuple shares the same shape as
 /// [`ProxyState::new`] so callers can also keep the health-check task
@@ -516,7 +516,8 @@ pub fn build_mesh_proxy_state(
     mesh: MeshConfig,
 ) -> ProxyState {
     let config = gateway_config_with_mesh(proxies, upstreams, mesh);
-    let prepared = prepare_gateway_config_for_mesh(config, runtime).expect("mesh-prepared config");
+    let prepared =
+        prepare_gateway_config_via_mesh_slice(config, runtime).expect("mesh-prepared config");
     let env_config = EnvConfig {
         mode: OperatingMode::Mesh,
         log_level: "error".to_string(),

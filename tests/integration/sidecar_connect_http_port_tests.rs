@@ -26,7 +26,7 @@ use ferrum_edge::modes::mesh::config::{
     SidecarIngressConnectRelay, Workload, WorkloadPort, WorkloadRef, WorkloadSelector,
 };
 use ferrum_edge::modes::mesh::{
-    MeshTopology, MeshTrafficDirection, prepare_gateway_config_for_mesh,
+    MeshTopology, MeshTrafficDirection, prepare_gateway_config_via_mesh_slice,
 };
 use ferrum_edge::proxy::{ProxyState, start_proxy_listener_with_bound_listener_and_mesh_direction};
 
@@ -150,7 +150,7 @@ fn prepared_config(
         })),
         ..GatewayConfig::default()
     };
-    prepare_gateway_config_for_mesh(config, &runtime).expect("prepare")
+    prepare_gateway_config_via_mesh_slice(config, &runtime).expect("prepare")
 }
 
 #[test]

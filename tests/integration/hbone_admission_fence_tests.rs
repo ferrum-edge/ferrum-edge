@@ -96,7 +96,7 @@ use ferrum_edge::modes::mesh::config::{
     OutboundTrafficPolicy, PolicyAction, PolicyScope, RequestMatch, ResolvedIngressListener,
 };
 use ferrum_edge::modes::mesh::{
-    MeshRuntimeConfig, MeshTopology, MeshTrafficDirection, prepare_gateway_config_for_mesh,
+    MeshRuntimeConfig, MeshTopology, MeshTrafficDirection, prepare_gateway_config_via_mesh_slice,
 };
 use ferrum_edge::plugins::{HboneReuseContext, ProxyProtocol, RequestContext};
 use ferrum_edge::proxy::hbone_admission_fence::{
@@ -283,7 +283,7 @@ fn prepared_config_from_mesh_with_runtime(
     let mut config = gateway_config_with_mesh(proxies, Vec::new(), mesh);
     config.plugin_configs = plugin_configs;
     let mut prepared =
-        prepare_gateway_config_for_mesh(config, &runtime).expect("mesh-prepared config");
+        prepare_gateway_config_via_mesh_slice(config, &runtime).expect("mesh-prepared config");
     retag_mesh_managed_plugins(&mut prepared);
     prepared
 }
@@ -3424,7 +3424,7 @@ fn tunnel_reuse_advertisement(response: &hyper::Response<h2::RecvStream>) -> Opt
 
 /// The ordinary mesh inbound chain is reusable end to end.
 ///
-/// `prepare_gateway_config_for_mesh` injects `spiffe_identity`, `mesh_authz`,
+/// `prepare_gateway_config_via_mesh_slice` injects `spiffe_identity`, `mesh_authz`,
 /// `workload_metrics`, and the `stdout_logging` access log, so this is not a
 /// one-plugin assertion: EVERY member of the production chain must classify
 /// itself reusable for the header to appear at all. Demoting any one of them —

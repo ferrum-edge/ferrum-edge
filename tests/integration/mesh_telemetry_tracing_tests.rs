@@ -10,7 +10,7 @@ use ferrum_edge::modes::mesh::config::{
 };
 use ferrum_edge::modes::mesh::{
     MESH_WORKLOAD_METRICS_PLUGIN_ID, MeshConfigProtocol, MeshRuntimeConfig, MeshTopology,
-    MeshTrafficDirection, prepare_gateway_config_for_mesh,
+    MeshTrafficDirection, prepare_gateway_config_via_mesh_slice,
 };
 use ferrum_edge::plugins::{
     TransactionSummary, create_plugin, mesh::workload_metrics::WorkloadMetrics,
@@ -143,8 +143,8 @@ fn workload_metrics_plugin_config(tracing: MeshTracingConfig) -> Value {
         loaded_at: Utc::now(),
         ..GatewayConfig::default()
     };
-    let prepared =
-        prepare_gateway_config_for_mesh(config, &test_runtime()).expect("mesh prepare succeeds");
+    let prepared = prepare_gateway_config_via_mesh_slice(config, &test_runtime())
+        .expect("mesh prepare succeeds");
     let mut plugin_config = prepared
         .plugin_configs
         .into_iter()
@@ -167,7 +167,7 @@ fn injected_workload_metrics_admits_present_and_absent_spiffe_identity() {
             ..GatewayConfig::default()
         };
         let prepared =
-            prepare_gateway_config_for_mesh(config, &runtime).expect("mesh prepare succeeds");
+            prepare_gateway_config_via_mesh_slice(config, &runtime).expect("mesh prepare succeeds");
         let injected = prepared
             .plugin_configs
             .iter()

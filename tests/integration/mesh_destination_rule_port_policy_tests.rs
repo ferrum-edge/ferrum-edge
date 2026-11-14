@@ -16,7 +16,7 @@ use ferrum_edge::modes::mesh::config::{
     WorkloadPort, cors_plugin_config_from_mesh_policy,
 };
 use ferrum_edge::modes::mesh::{
-    MeshConfigProtocol, MeshRuntimeConfig, MeshTopology, prepare_gateway_config_for_mesh,
+    MeshConfigProtocol, MeshRuntimeConfig, MeshTopology, prepare_gateway_config_via_mesh_slice,
 };
 
 use super::mesh_test_support::{service_for, workload_for};
@@ -190,7 +190,7 @@ fn destination_rule_port_level_load_balancer_projects_to_upstream_override() {
     };
     config.normalize_fields();
 
-    let prepared = prepare_gateway_config_for_mesh(config, &runtime()).expect("mesh config");
+    let prepared = prepare_gateway_config_via_mesh_slice(config, &runtime()).expect("mesh config");
     let port_override = prepared.upstreams[0]
         .port_overrides
         .get(&8080)
@@ -255,7 +255,7 @@ fn destination_rule_max_requests_only_rule_does_not_clear_prior_locality_policy(
     translated.config.normalize_fields();
 
     let prepared =
-        prepare_gateway_config_for_mesh(translated.config, &runtime()).expect("mesh config");
+        prepare_gateway_config_via_mesh_slice(translated.config, &runtime()).expect("mesh config");
     let locality = prepared.upstreams[0]
         .locality_lb_setting
         .as_ref()
@@ -299,7 +299,7 @@ fn destination_rule_port_level_outlier_detection_projects_to_dispatch_override()
     };
     config.normalize_fields();
 
-    let prepared = prepare_gateway_config_for_mesh(config, &runtime()).expect("mesh config");
+    let prepared = prepare_gateway_config_via_mesh_slice(config, &runtime()).expect("mesh config");
     let upstream_override = prepared.upstreams[0]
         .port_overrides
         .get(&8080)
@@ -365,7 +365,7 @@ fn destination_rule_empty_outlier_detection_applies_istio_defaults_at_overlay_ti
     };
     config.normalize_fields();
 
-    let prepared = prepare_gateway_config_for_mesh(config, &runtime()).expect("mesh config");
+    let prepared = prepare_gateway_config_via_mesh_slice(config, &runtime()).expect("mesh config");
     let passive = prepared.upstreams[0]
         .health_checks
         .as_ref()
@@ -418,7 +418,7 @@ fn partial_port_outlier_overlay_inherits_explicit_top_level_fields() {
     };
     config.normalize_fields();
 
-    let prepared = prepare_gateway_config_for_mesh(config, &runtime()).expect("mesh config");
+    let prepared = prepare_gateway_config_via_mesh_slice(config, &runtime()).expect("mesh config");
     let passive = prepared.upstreams[0]
         .port_overrides
         .get(&8080)
@@ -492,7 +492,8 @@ fn partial_subset_and_port_outlier_overlays_share_field_level_precedence() {
     };
     config.normalize_fields();
 
-    let mut prepared = prepare_gateway_config_for_mesh(config, &runtime()).expect("mesh config");
+    let mut prepared =
+        prepare_gateway_config_via_mesh_slice(config, &runtime()).expect("mesh config");
     let subset_passive = prepared.upstreams[0]
         .resolved_subset_tls
         .get("v1")
@@ -583,7 +584,7 @@ fn port_level_positive_outlier_overlay_clears_top_level_disable_sentinel() {
     };
     config.normalize_fields();
 
-    let prepared = prepare_gateway_config_for_mesh(config, &runtime()).expect("mesh config");
+    let prepared = prepare_gateway_config_via_mesh_slice(config, &runtime()).expect("mesh config");
     let port_passive = prepared.upstreams[0]
         .port_overrides
         .get(&8080)
@@ -694,7 +695,7 @@ fn port_level_zero_outlier_overlay_disables_top_level_positive_threshold() {
     };
     config.normalize_fields();
 
-    let prepared = prepare_gateway_config_for_mesh(config, &runtime()).expect("mesh config");
+    let prepared = prepare_gateway_config_via_mesh_slice(config, &runtime()).expect("mesh config");
     let port_passive = prepared.upstreams[0]
         .port_overrides
         .get(&8080)
@@ -785,7 +786,7 @@ fn destination_rule_top_level_max_connections_fans_out_to_all_target_ports() {
     let mut config = config;
     config.normalize_fields();
 
-    let prepared = prepare_gateway_config_for_mesh(config, &runtime()).expect("mesh config");
+    let prepared = prepare_gateway_config_via_mesh_slice(config, &runtime()).expect("mesh config");
     let upstream_override = prepared.upstreams[0]
         .port_overrides
         .get(&8080)
@@ -837,7 +838,7 @@ fn destination_rule_tcp_idle_timeout_fans_out_and_applies_to_proxy() {
     let mut config = config;
     config.normalize_fields();
 
-    let prepared = prepare_gateway_config_for_mesh(config, &runtime()).expect("mesh config");
+    let prepared = prepare_gateway_config_via_mesh_slice(config, &runtime()).expect("mesh config");
     let upstream_override = prepared.upstreams[0]
         .port_overrides
         .get(&8080)
@@ -878,7 +879,7 @@ fn destination_rule_tcp_idle_timeout_zero_disables_and_is_not_unset() {
     let mut config = config;
     config.normalize_fields();
 
-    let prepared = prepare_gateway_config_for_mesh(config, &runtime()).expect("mesh config");
+    let prepared = prepare_gateway_config_via_mesh_slice(config, &runtime()).expect("mesh config");
     assert_eq!(
         prepared.upstreams[0]
             .port_overrides
@@ -946,7 +947,7 @@ fn destination_rule_port_level_max_connections_overrides_top_level() {
     let mut config = config;
     config.normalize_fields();
 
-    let prepared = prepare_gateway_config_for_mesh(config, &runtime()).expect("mesh config");
+    let prepared = prepare_gateway_config_via_mesh_slice(config, &runtime()).expect("mesh config");
 
     // Port 8080: per-port overrides BOTH fields. The unset
     // `interval_seconds` / `probes` on the per-port keepalive replace the
@@ -1008,7 +1009,7 @@ fn destination_rule_top_level_max_connections_skips_phantom_ports() {
     let mut config = config;
     config.normalize_fields();
 
-    let prepared = prepare_gateway_config_for_mesh(config, &runtime()).expect("mesh config");
+    let prepared = prepare_gateway_config_via_mesh_slice(config, &runtime()).expect("mesh config");
     // Only port 8080 should have an entry; no phantom ports.
     assert_eq!(prepared.upstreams[0].port_overrides.len(), 1);
     assert!(prepared.upstreams[0].port_overrides.contains_key(&8080));
@@ -1055,7 +1056,7 @@ fn destination_rule_top_level_connection_pool_http_projects_inherited_fields() {
     };
     config.normalize_fields();
 
-    let prepared = prepare_gateway_config_for_mesh(config, &runtime()).expect("mesh config");
+    let prepared = prepare_gateway_config_via_mesh_slice(config, &runtime()).expect("mesh config");
     assert!(
         !prepared.upstreams[0].port_overrides.contains_key(&8080)
             || prepared.upstreams[0]
@@ -1138,7 +1139,7 @@ fn destination_rule_top_level_connection_pool_http_on_sd_upstream_goes_to_fallba
     };
     config.normalize_fields();
 
-    let prepared = prepare_gateway_config_for_mesh(config, &runtime()).expect("mesh config");
+    let prepared = prepare_gateway_config_via_mesh_slice(config, &runtime()).expect("mesh config");
 
     // The SD upstream's top-level overlay landed on the fallback, NOT fanned
     // onto a (declared static target) port_overrides entry.
@@ -1233,7 +1234,7 @@ fn destination_rule_named_target_port_sd_keeps_per_port_and_fallback_separate() 
     };
     config.normalize_fields();
 
-    let prepared = prepare_gateway_config_for_mesh(config, &runtime()).expect("mesh config");
+    let prepared = prepare_gateway_config_via_mesh_slice(config, &runtime()).expect("mesh config");
 
     let per_port = prepared.proxies[0]
         .dispatch_port_overrides
@@ -1313,7 +1314,7 @@ fn destination_rule_port_level_connection_pool_http_overrides_top_level_fan_out(
     };
     config.normalize_fields();
 
-    let prepared = prepare_gateway_config_for_mesh(config, &runtime()).expect("mesh config");
+    let prepared = prepare_gateway_config_via_mesh_slice(config, &runtime()).expect("mesh config");
     let port_override = prepared.upstreams[0]
         .port_overrides
         .get(&8080)
@@ -1376,7 +1377,7 @@ fn destination_rule_connection_pool_http_only_per_port_no_fan_out() {
     };
     config.normalize_fields();
 
-    let prepared = prepare_gateway_config_for_mesh(config, &runtime()).expect("mesh config");
+    let prepared = prepare_gateway_config_via_mesh_slice(config, &runtime()).expect("mesh config");
     let port_override = prepared.upstreams[0]
         .port_overrides
         .get(&8080)
@@ -1438,7 +1439,7 @@ fn destination_rule_port_level_explicit_default_clears_inherited_h2_upgrade_poli
     };
     config.normalize_fields();
 
-    let prepared = prepare_gateway_config_for_mesh(config, &runtime()).expect("mesh config");
+    let prepared = prepare_gateway_config_via_mesh_slice(config, &runtime()).expect("mesh config");
     let port_override = prepared.upstreams[0]
         .port_overrides
         .get(&8080)
@@ -1533,7 +1534,7 @@ fn destination_rule_combined_subset_http_policy_precedence_no_leakage_and_remova
             ..GatewayConfig::default()
         };
         config.normalize_fields();
-        prepare_gateway_config_for_mesh(config, &runtime()).expect("mesh config")
+        prepare_gateway_config_via_mesh_slice(config, &runtime()).expect("mesh config")
     };
 
     let initial = build(
@@ -1691,7 +1692,7 @@ fn destination_rule_subset_zero_pending_fails_while_zero_retries_is_valid() {
     };
     config.normalize_fields();
 
-    let error = prepare_gateway_config_for_mesh(config, &runtime())
+    let error = prepare_gateway_config_via_mesh_slice(config, &runtime())
         .expect_err("invalid subset HTTP caps must reject the whole snapshot")
         .to_string();
     assert!(error.contains("subsets[0]"));
@@ -1712,7 +1713,7 @@ fn destination_rule_subset_zero_pending_fails_while_zero_retries_is_valid() {
 // ── VirtualService-derived CORS on materialized mesh outbound routes ────────
 //
 // Issue #1973 coverage. These live here (rather than mesh_l7_routing_tests)
-// to reuse this file's `runtime()` + `prepare_gateway_config_for_mesh`
+// to reuse this file's `runtime()` + `prepare_gateway_config_via_mesh_slice`
 // harness — the property under test is route-policy application at mesh
 // prepare time, the same layer the DR tests above exercise.
 
@@ -1762,7 +1763,7 @@ virtual_service_cors_policies:
         ..GatewayConfig::default()
     };
 
-    let prepared = prepare_gateway_config_for_mesh(config, &runtime()).expect("mesh config");
+    let prepared = prepare_gateway_config_via_mesh_slice(config, &runtime()).expect("mesh config");
 
     let proxy = prepared
         .proxies
@@ -2990,7 +2991,8 @@ virtual_service_cors_policies:
         topology: MeshTopology::Ambient,
         ..runtime()
     };
-    let prepared = prepare_gateway_config_for_mesh(config, &ambient_runtime).expect("mesh config");
+    let prepared =
+        prepare_gateway_config_via_mesh_slice(config, &ambient_runtime).expect("mesh config");
     assert!(
         prepared
             .proxies
@@ -3313,7 +3315,7 @@ fn destination_rule_http2_max_requests_does_not_program_the_h2_stream_knob() {
     };
     config.normalize_fields();
 
-    let prepared = prepare_gateway_config_for_mesh(config, &runtime()).expect("mesh config");
+    let prepared = prepare_gateway_config_via_mesh_slice(config, &runtime()).expect("mesh config");
     let inherited = prepared.proxies[0]
         .dispatch_port_override_fallback
         .as_ref()
@@ -3361,7 +3363,7 @@ fn destination_rule_max_concurrent_streams_projects_only_to_the_transport_knob()
     };
     config.normalize_fields();
 
-    let prepared = prepare_gateway_config_for_mesh(config, &runtime()).expect("mesh config");
+    let prepared = prepare_gateway_config_via_mesh_slice(config, &runtime()).expect("mesh config");
     let port_override = prepared.upstreams[0]
         .port_overrides
         .get(&8080)
@@ -3429,7 +3431,7 @@ fn destination_rule_http2_max_requests_precedence_is_port_over_subset_over_top_l
     };
     config.normalize_fields();
 
-    let prepared = prepare_gateway_config_for_mesh(config, &runtime()).expect("mesh config");
+    let prepared = prepare_gateway_config_via_mesh_slice(config, &runtime()).expect("mesh config");
     let fallback_for = |id: &str| {
         prepared
             .proxies
@@ -3553,8 +3555,8 @@ fn destination_rule_top_level_connect_timeout_reaches_raw_tcp_egress_upstream() 
         HashMap::new(),
     );
 
-    let prepared =
-        prepare_gateway_config_for_mesh(config, &sidecar_client_runtime()).expect("mesh config");
+    let prepared = prepare_gateway_config_via_mesh_slice(config, &sidecar_client_runtime())
+        .expect("mesh config");
 
     assert_eq!(
         port_connect_timeout(&prepared, DB_TCP_UPSTREAM, 5432),
@@ -3591,8 +3593,8 @@ fn destination_rule_port_level_connect_timeout_wins_over_top_level_on_raw_tcp() 
         )]),
     );
 
-    let prepared =
-        prepare_gateway_config_for_mesh(config, &sidecar_client_runtime()).expect("mesh config");
+    let prepared = prepare_gateway_config_via_mesh_slice(config, &sidecar_client_runtime())
+        .expect("mesh config");
 
     assert_eq!(
         port_connect_timeout(&prepared, DB_TCP_UPSTREAM, 5432),
@@ -3629,7 +3631,7 @@ fn destination_rule_simple_load_balancer_clears_a_stale_upstream_hash_key() {
     };
     config.normalize_fields();
 
-    let prepared = prepare_gateway_config_for_mesh(config, &runtime()).expect("mesh config");
+    let prepared = prepare_gateway_config_via_mesh_slice(config, &runtime()).expect("mesh config");
 
     assert_eq!(
         prepared.upstreams[0].algorithm,
@@ -3679,7 +3681,7 @@ fn later_simple_destination_rule_clears_an_earlier_rules_hash_key() {
     };
     config.normalize_fields();
 
-    let prepared = prepare_gateway_config_for_mesh(config, &runtime()).expect("mesh config");
+    let prepared = prepare_gateway_config_via_mesh_slice(config, &runtime()).expect("mesh config");
 
     assert_eq!(
         prepared.upstreams[0].algorithm,

@@ -1560,43 +1560,46 @@ impl MeshRuntimeConfig {
     }
 }
 
-/// Prepare a gateway snapshot for mesh-mode serving.
+/// Prepare a gateway snapshot the way a mesh data plane receives it.
 ///
-/// No serving path calls this: every mesh config source builds from a
-/// [`MeshSlice`] through `gateway_config_from_mesh_slice_with_federation`.
-/// This entry point takes a whole `GatewayConfig` and is used by tests and the
-/// `startup_rollback_test_seams` seam. The mutation is cold-path: it runs
-/// before `ProxyState` builds router/plugin caches.
-pub fn prepare_gateway_config_for_mesh(
+/// No serving path calls this; it is the test convenience for the two halves
+/// production runs on either side of the wire. The snapshot is admitted and
+/// projected into this runtime's [`MeshSlice`] exactly as a control plane
+/// does ([`MeshSlice::from_gateway_config`] with
+/// [`MeshRuntimeConfig::mesh_slice_request`]), and that slice is materialized
+/// through the data-plane path, [`prepare_gateway_config_from_mesh_slice`].
+/// Anything a slice does not carry (operator proxies, upstreams, plugin
+/// configs, consumers, gateway settings) does not reach the result, just as it
+/// never reaches a mesh data plane (issue #7233).
+pub fn prepare_gateway_config_via_mesh_slice(
     mut config: GatewayConfig,
     runtime: &MeshRuntimeConfig,
 ) -> Result<GatewayConfig, anyhow::Error> {
     config.normalize_fields();
     config.normalize_mesh_fields();
-    let mesh_slice = MeshSlice::from_gateway_config(&config, runtime.mesh_slice_request());
-    // Back-project the slice's narrowed `services` view BEFORE preparation so
-    // every consumer of the prepared config sees exactly what materialization
-    // consumes — CP parity: on the CP-driven paths `gateway_config_from_mesh_slice`
-    // builds `config.mesh` FROM the slice, so a DP never carries un-narrowed
-    // services. Without this, a Sidecar egress scope that narrows a
-    // multi-port service's ports would leave the raw declaration in
-    // `config.mesh.services`, and the router's outbound sibling grouping
-    // (declared-HTTP-port fail-closed) would demand orig-dst for a service
-    // the slice narrowed to a single port.
-    if let Some(mesh) = config.mesh.as_deref_mut() {
-        mesh.services = mesh_slice.services.clone();
+    if let Err(errors) = config.validate_resource_ids() {
+        return Err(anyhow::anyhow!(
+            "Mesh input resource ID validation failed: {}",
+            errors.join("; ")
+        ));
     }
-    prepare_normalized_gateway_config_for_mesh(config, runtime, &mesh_slice)
+    let mesh_errors = config.validate_mesh_fields();
+    if !mesh_errors.is_empty() {
+        return Err(anyhow::anyhow!(
+            "Mesh configuration validation failed: {}",
+            mesh_errors.join("; ")
+        ));
+    }
+    let mesh_slice = MeshSlice::from_gateway_config(&config, runtime.mesh_slice_request());
+    prepare_gateway_config_from_mesh_slice(&mesh_slice, runtime)
 }
 
 /// Prepare a gateway snapshot from an already-projected [`MeshSlice`].
 ///
-/// This is the CP-driven materialization path: the slice *is* the serving
-/// inventory. The whole-config [`prepare_gateway_config_for_mesh`] entry
-/// point (tests only) additionally projects `MeshConfig` through
-/// [`MeshSlice::from_gateway_config`] before this step, which is why a
-/// document that names Services in other namespaces never reaches the
-/// NodeWaypoint UDP materializer on that path.
+/// This is the materialization path every mesh config source (native, xDS,
+/// file) uses: the slice *is* the serving inventory, so a document that names
+/// Services in other namespaces never reaches the NodeWaypoint UDP
+/// materializer.
 pub fn prepare_gateway_config_from_mesh_slice(
     slice: &MeshSlice,
     runtime: &MeshRuntimeConfig,
@@ -4047,11 +4050,15 @@ fn gateway_config_from_mesh_slice_with_federation(
     });
     let materialization_slice = merged_slice.as_ref().unwrap_or(slice);
 
-    let proxies = decode_virtual_service_l4_proxies(slice)?;
-    let upstreams = decode_virtual_service_l4_upstreams(slice)?;
+    let mut proxies = decode_virtual_service_l4_proxies(slice)?;
+    let mut upstreams = decode_virtual_service_l4_upstreams(slice)?;
+    let (route_proxies, route_upstreams, plugin_configs) = decode_http_route_set(slice, runtime)?;
+    proxies.extend(route_proxies);
+    upstreams.extend(route_upstreams);
     let config = GatewayConfig {
         proxies,
         upstreams,
+        plugin_configs,
         mesh: Some(Box::new(MeshConfig {
             workloads,
             services,
@@ -4161,6 +4168,139 @@ fn decode_virtual_service_l4_upstreams(
             Ok(upstream)
         })
         .collect()
+}
+
+type DecodedHttpRouteSet = (
+    Vec<Proxy>,
+    Vec<crate::config::types::Upstream>,
+    Vec<crate::config::types::PluginConfig>,
+);
+
+/// Decode the VirtualService HTTP routes a slice carries (issue #7233).
+///
+/// The set is producer input, so it is re-checked here before anything is
+/// materialized: only a NodeWaypoint serves it; every element is an object of
+/// its resource type in the slice namespace with a translator-owned id; every
+/// plugin association resolves to a carried plugin config owned by that
+/// proxy; and every upstream id a proxy or `mesh_route_dispatch` rule names
+/// resolves to a carried upstream (and every carried upstream is named). Any
+/// violation refuses the slice, so the previous generation keeps serving.
+/// Diagnostics name the element by ordinal and never echo a supplied id.
+fn decode_http_route_set(
+    slice: &MeshSlice,
+    runtime: &MeshRuntimeConfig,
+) -> Result<DecodedHttpRouteSet, anyhow::Error> {
+    use crate::config::types::{PluginConfig, Upstream};
+    let set = &slice.http_routes;
+    if set.is_empty() {
+        return Ok((Vec::new(), Vec::new(), Vec::new()));
+    }
+    if runtime.topology != MeshTopology::NodeWaypoint {
+        return Err(anyhow::anyhow!(
+            "Mesh slice carries VirtualService HTTP routes, which only a NodeWaypoint serves"
+        ));
+    }
+    let proxies: Vec<Proxy> = set
+        .proxies
+        .iter()
+        .enumerate()
+        .map(|(index, value)| {
+            let proxy: Proxy = crate::util::json_object::from_json_object_value(value.clone())
+                .map_err(|_| anyhow::anyhow!("Mesh slice HTTP route proxy {index} is malformed"))?;
+            if proxy.namespace != slice.namespace
+                || !config::is_virtual_service_http_route_proxy_id(&proxy.id)
+                || proxy.dispatch_kind.is_stream()
+                || proxy
+                    .backend_scheme
+                    .is_some_and(|scheme| scheme.is_stream())
+            {
+                return Err(anyhow::anyhow!(
+                    "Mesh slice HTTP route proxy {index} has invalid ownership"
+                ));
+            }
+            Ok(proxy)
+        })
+        .collect::<Result<_, _>>()?;
+    let plugin_configs: Vec<PluginConfig> = set
+        .plugin_configs
+        .iter()
+        .enumerate()
+        .map(|(index, value)| {
+            let plugin: PluginConfig =
+                crate::util::json_object::from_json_object_value(value.clone()).map_err(|_| {
+                    anyhow::anyhow!("Mesh slice HTTP route plugin config {index} is malformed")
+                })?;
+            let owned = plugin.namespace == slice.namespace
+                && plugin
+                    .id
+                    .starts_with(slice::VIRTUAL_SERVICE_HTTP_ROUTE_PROXY_PLUGIN_PREFIX)
+                && plugin
+                    .proxy_id
+                    .as_deref()
+                    .is_some_and(|proxy_id| proxies.iter().any(|proxy| proxy.id == proxy_id));
+            if !owned {
+                return Err(anyhow::anyhow!(
+                    "Mesh slice HTTP route plugin config {index} has invalid ownership"
+                ));
+            }
+            Ok(plugin)
+        })
+        .collect::<Result<_, _>>()?;
+    let upstreams: Vec<Upstream> = set
+        .upstreams
+        .iter()
+        .enumerate()
+        .map(|(index, value)| {
+            let upstream: Upstream =
+                crate::util::json_object::from_json_object_value(value.clone()).map_err(|_| {
+                    anyhow::anyhow!("Mesh slice HTTP route upstream {index} is malformed")
+                })?;
+            if upstream.namespace != slice.namespace
+                || !upstream
+                    .id
+                    .starts_with(slice::VIRTUAL_SERVICE_HTTP_ROUTE_UPSTREAM_ID_PREFIX)
+                || upstream.targets.is_empty()
+            {
+                return Err(anyhow::anyhow!(
+                    "Mesh slice HTTP route upstream {index} has invalid ownership"
+                ));
+            }
+            Ok(upstream)
+        })
+        .collect::<Result<_, _>>()?;
+
+    let carried_upstreams: BTreeSet<&str> = upstreams
+        .iter()
+        .map(|upstream| upstream.id.as_str())
+        .collect();
+    let mut referenced_upstreams: BTreeSet<&str> = BTreeSet::new();
+    for (index, proxy) in proxies.iter().enumerate() {
+        for association in &proxy.plugins {
+            let resolves = plugin_configs.iter().any(|plugin| {
+                plugin.id == association.plugin_config_id
+                    && plugin.proxy_id.as_deref() == Some(proxy.id.as_str())
+            });
+            if !resolves {
+                return Err(anyhow::anyhow!(
+                    "Mesh slice HTTP route proxy {index} references a plugin config the slice \
+                     does not carry"
+                ));
+            }
+        }
+        referenced_upstreams.extend(proxy.upstream_id.as_deref());
+    }
+    for plugin in &plugin_configs {
+        if plugin.plugin_name == "mesh_route_dispatch" {
+            referenced_upstreams
+                .extend(slice::mesh_route_dispatch_rule_upstream_ids(&plugin.config));
+        }
+    }
+    if referenced_upstreams != carried_upstreams {
+        return Err(anyhow::anyhow!(
+            "Mesh slice HTTP route upstreams do not match the upstreams its routes reference"
+        ));
+    }
+    Ok((proxies, upstreams, plugin_configs))
 }
 
 /// Resolve Istio `sourceLabels` / `sourceNamespace` as Sidecar-applicability
@@ -13712,11 +13852,14 @@ fn mirror_mesh_authz_baggage_gate_fields(target: &mut serde_json::Value, gate: &
 /// target's Service identity. Shared by `mesh_authz` and RequestAuthentication
 /// destination selection so both resolve a route to the same workloads.
 ///
-/// Empty on every slice-built config: `gateway_config_from_mesh_slice_with_federation`
-/// materializes only `istio-vs-l4-upstream-*` upstreams, so no
-/// `istio-vs-upstream-` / `gwapi-route-upstream-` id reaches this filter in
-/// production. Only the whole-config `prepare_gateway_config_for_mesh` test
-/// entry point supplies such upstreams (issue #7233).
+/// On a NodeWaypoint the slice carries the VirtualService HTTP routes it
+/// serves (`MeshSlice::http_routes`, issue #7233), and
+/// `gateway_config_from_mesh_slice_with_federation` decodes their
+/// `istio-vs-upstream-*` weighted-split upstreams into the config, so this
+/// returns those upstreams. `gwapi-route-upstream-*` ids stay admitted for
+/// parity with `mesh_authz`, but Gateway API HTTPRoute routes bind Gateway
+/// listeners and never ride a mesh slice. Every other topology returns
+/// nothing, since its slice carries no HTTP route.
 fn node_waypoint_authz_route_upstreams(config: &GatewayConfig) -> Vec<serde_json::Value> {
     config
         .upstreams
@@ -13782,6 +13925,16 @@ fn inject_mesh_global_plugins(
         "per_pod_policy_scoping": runtime.topology == MeshTopology::NodeWaypoint,
         "ambient_udp_source_scoping": runtime.topology.uses_ambient_udp_source_scoping(),
     });
+    // The carried HTTP routes (issue #7233) are materialized as ordinary
+    // proxies, upstreams and plugin configs; authorization reads them through
+    // `node_waypoint_route_upstreams`. Their route plugin configs (header
+    // values included) must not be copied into this plugin's config.
+    if let Some(embedded) = mesh_authz_config
+        .get_mut("mesh_slice")
+        .and_then(serde_json::Value::as_object_mut)
+    {
+        embedded.remove("http_routes");
+    }
     if runtime.topology == MeshTopology::NodeWaypoint {
         mesh_authz_config["cluster_domains"] =
             serde_json::json!(node_waypoint_authz_cluster_domains(&runtime.cluster_domain));
@@ -21913,12 +22066,13 @@ pub mod startup_rollback_test_seams {
         ensure_crypto_provider();
         let env = probe_env_config();
         let runtime = probe_runtime_config();
-        let config = prepare_gateway_config_for_mesh(GatewayConfig::default(), &runtime).unwrap();
-        let mesh_state = MeshRuntimeState::new();
-        mesh_state.install_slice(MeshSlice {
+        let slice = MeshSlice {
             version: chrono::Utc::now().to_rfc3339(),
             ..MeshSlice::default()
-        });
+        };
+        let config = prepare_gateway_config_from_mesh_slice(&slice, &runtime).unwrap();
+        let mesh_state = MeshRuntimeState::new();
+        mesh_state.install_slice(slice);
         let (shutdown_tx, _) =
             crate::overload::ShutdownSender::channel(std::time::Duration::from_secs(30));
         let shutdown_observed = Arc::new(AtomicBool::new(false));
@@ -23894,12 +24048,13 @@ mod tests {
             request_auth_require_exp: true,
             locality_lb_strict: false,
         };
-        let config = prepare_gateway_config_for_mesh(GatewayConfig::default(), &runtime).unwrap();
-        let mesh_state = MeshRuntimeState::new();
-        mesh_state.install_slice(MeshSlice {
+        let slice = MeshSlice {
             version: chrono::Utc::now().to_rfc3339(),
             ..MeshSlice::default()
-        });
+        };
+        let config = prepare_gateway_config_from_mesh_slice(&slice, &runtime).unwrap();
+        let mesh_state = MeshRuntimeState::new();
+        mesh_state.install_slice(slice);
         let (shutdown_tx, _) =
             crate::overload::ShutdownSender::channel(std::time::Duration::from_secs(30));
         let task_shutdown = shutdown_tx.clone();
@@ -24897,7 +25052,8 @@ mod tests {
         };
         let runtime = test_mesh_runtime_config();
         assert_eq!(runtime.namespace, "default");
-        let prepared = prepare_gateway_config_for_mesh(config, &runtime).expect("mesh prepare");
+        let prepared =
+            prepare_gateway_config_via_mesh_slice(config, &runtime).expect("mesh prepare");
         let mesh = prepared.mesh.expect("mesh block survives preparation");
         assert_eq!(
             mesh.services
@@ -24912,8 +25068,8 @@ mod tests {
     #[test]
     fn mesh_runtime_resource_id_allowlist_is_exact_and_materialization_scoped() {
         let runtime = test_mesh_runtime_config();
-        let prepared =
-            prepare_gateway_config_for_mesh(GatewayConfig::default(), &runtime).expect("prepare");
+        let prepared = prepare_gateway_config_via_mesh_slice(GatewayConfig::default(), &runtime)
+            .expect("prepare");
         assert!(
             prepared
                 .plugin_configs
@@ -29409,8 +29565,8 @@ mod tests {
             ..test_mesh_runtime_config()
         };
 
-        let config =
-            prepare_gateway_config_for_mesh(config, &runtime).expect("mesh preparation succeeds");
+        let config = prepare_gateway_config_via_mesh_slice(config, &runtime)
+            .expect("mesh preparation succeeds");
 
         assert_eq!(
             config.upstreams[0].algorithm,
@@ -31472,6 +31628,7 @@ mod tests {
             labels_ambiguous: false,
             virtual_service_l4_proxies: Vec::new(),
             virtual_service_l4_upstreams: Vec::new(),
+            http_routes: slice::MeshHttpRouteSet::default(),
             version: "test".to_string(),
             revision: None,
             workloads: Vec::new(),
@@ -33806,7 +33963,7 @@ mod tests {
                 };
 
                 let prepared =
-                    prepare_gateway_config_for_mesh(config, &runtime).expect("mesh config");
+                    prepare_gateway_config_via_mesh_slice(config, &runtime).expect("mesh config");
                 let proxy = prepared
                     .proxies
                     .iter()
@@ -33879,7 +34036,7 @@ mod tests {
                 };
 
                 let prepared =
-                    prepare_gateway_config_for_mesh(config, &runtime).expect("mesh config");
+                    prepare_gateway_config_via_mesh_slice(config, &runtime).expect("mesh config");
 
                 // Verify service proxy was materialized.
                 let proxy = prepared
@@ -33987,7 +34144,7 @@ mod tests {
                 };
 
                 let prepared =
-                    prepare_gateway_config_for_mesh(config, &runtime).expect("mesh config");
+                    prepare_gateway_config_via_mesh_slice(config, &runtime).expect("mesh config");
 
                 // The explicit gateway proxy owns the SNI.
                 let explicit = prepared
@@ -34094,7 +34251,7 @@ mod tests {
                 };
 
                 let prepared =
-                    prepare_gateway_config_for_mesh(config, &runtime).expect("mesh config");
+                    prepare_gateway_config_via_mesh_slice(config, &runtime).expect("mesh config");
 
                 assert!(
                     prepared
@@ -34155,7 +34312,7 @@ mod tests {
                 };
 
                 let prepared =
-                    prepare_gateway_config_for_mesh(config, &runtime).expect("mesh config");
+                    prepare_gateway_config_via_mesh_slice(config, &runtime).expect("mesh config");
 
                 assert!(
                     !prepared
@@ -34249,7 +34406,7 @@ mod tests {
                 };
 
                 let prepared =
-                    prepare_gateway_config_for_mesh(config, &runtime).expect("mesh config");
+                    prepare_gateway_config_via_mesh_slice(config, &runtime).expect("mesh config");
 
                 // Both services should produce proxies.
                 let reviews_proxy = prepared
@@ -35376,7 +35533,7 @@ mod tests {
                 };
 
                 let prepared =
-                    prepare_gateway_config_for_mesh(config, &runtime).expect("mesh config");
+                    prepare_gateway_config_via_mesh_slice(config, &runtime).expect("mesh config");
                 let upstream = prepared
                     .upstreams
                     .iter()
@@ -35513,7 +35670,7 @@ mod tests {
                 };
 
                 let prepared =
-                    prepare_gateway_config_for_mesh(config, &runtime).expect("mesh config");
+                    prepare_gateway_config_via_mesh_slice(config, &runtime).expect("mesh config");
                 let by_id = |id: &str| {
                     prepared
                         .plugin_configs
@@ -36638,7 +36795,7 @@ mod tests {
                 };
 
                 let prepared =
-                    prepare_gateway_config_for_mesh(config, &runtime).expect("mesh config");
+                    prepare_gateway_config_via_mesh_slice(config, &runtime).expect("mesh config");
                 let mesh_authz: Vec<_> = prepared
                     .plugin_configs
                     .iter()
@@ -36750,7 +36907,8 @@ mod tests {
             ..GatewayConfig::default()
         };
 
-        let prepared = prepare_gateway_config_for_mesh(config, &runtime).expect("mesh config");
+        let prepared =
+            prepare_gateway_config_via_mesh_slice(config, &runtime).expect("mesh config");
         let jwks = prepared
             .plugin_configs
             .iter()
@@ -36831,7 +36989,8 @@ mod tests {
             ..GatewayConfig::default()
         };
 
-        let prepared = prepare_gateway_config_for_mesh(config, &runtime).expect("mesh config");
+        let prepared =
+            prepare_gateway_config_via_mesh_slice(config, &runtime).expect("mesh config");
         let refusal = prepared
             .plugin_configs
             .iter()
@@ -36867,7 +37026,7 @@ mod tests {
         );
         other.jwt_rules.clear();
         other.refused = true;
-        let unaffected = prepare_gateway_config_for_mesh(
+        let unaffected = prepare_gateway_config_via_mesh_slice(
             GatewayConfig {
                 mesh: Some(Box::new(MeshConfig {
                     request_authentications: vec![other],
@@ -37144,7 +37303,8 @@ mod tests {
             ..GatewayConfig::default()
         };
 
-        let prepared = prepare_gateway_config_for_mesh(config, &runtime).expect("mesh config");
+        let prepared =
+            prepare_gateway_config_via_mesh_slice(config, &runtime).expect("mesh config");
         let jwks = prepared
             .plugin_configs
             .iter()
@@ -37231,7 +37391,8 @@ mod tests {
             ..GatewayConfig::default()
         };
 
-        let prepared = prepare_gateway_config_for_mesh(config, &runtime).expect("mesh config");
+        let prepared =
+            prepare_gateway_config_via_mesh_slice(config, &runtime).expect("mesh config");
         assert!(
             !prepared
                 .plugin_configs
@@ -37382,7 +37543,8 @@ mod tests {
             ..GatewayConfig::default()
         };
 
-        let prepared = prepare_gateway_config_for_mesh(config, &runtime).expect("mesh config");
+        let prepared =
+            prepare_gateway_config_via_mesh_slice(config, &runtime).expect("mesh config");
         let jwks = prepared
             .plugin_configs
             .iter()
@@ -37418,7 +37580,8 @@ mod tests {
             ..GatewayConfig::default()
         };
 
-        let prepared = prepare_gateway_config_for_mesh(config, &runtime).expect("mesh config");
+        let prepared =
+            prepare_gateway_config_via_mesh_slice(config, &runtime).expect("mesh config");
         assert!(
             !prepared
                 .plugin_configs
@@ -37454,7 +37617,8 @@ mod tests {
             ..GatewayConfig::default()
         };
 
-        let prepared = prepare_gateway_config_for_mesh(config, &runtime).expect("mesh config");
+        let prepared =
+            prepare_gateway_config_via_mesh_slice(config, &runtime).expect("mesh config");
         let jwks = prepared
             .plugin_configs
             .iter()
@@ -37512,7 +37676,8 @@ mod tests {
             ..GatewayConfig::default()
         };
 
-        let prepared = prepare_gateway_config_for_mesh(config, &runtime).expect("mesh config");
+        let prepared =
+            prepare_gateway_config_via_mesh_slice(config, &runtime).expect("mesh config");
         let jwks = prepared
             .plugin_configs
             .iter()
@@ -38279,7 +38444,7 @@ mod tests {
             "test runtime should carry the secure default"
         );
         let prepared =
-            prepare_gateway_config_for_mesh(request_auth_config_for_require_exp(), &runtime)
+            prepare_gateway_config_via_mesh_slice(request_auth_config_for_require_exp(), &runtime)
                 .expect("mesh config");
         let jwks = prepared
             .plugin_configs
@@ -38301,7 +38466,7 @@ mod tests {
         let mut runtime = test_mesh_runtime_config();
         runtime.request_auth_require_exp = false;
         let prepared =
-            prepare_gateway_config_for_mesh(request_auth_config_for_require_exp(), &runtime)
+            prepare_gateway_config_via_mesh_slice(request_auth_config_for_require_exp(), &runtime)
                 .expect("mesh config");
         let jwks = prepared
             .plugin_configs
@@ -41430,7 +41595,8 @@ mod tests {
             ..GatewayConfig::default()
         };
 
-        let prepared = prepare_gateway_config_for_mesh(config, &runtime).expect("mesh config");
+        let prepared =
+            prepare_gateway_config_via_mesh_slice(config, &runtime).expect("mesh config");
 
         // Should have the egress proxy
         let egress_proxy = prepared
@@ -41490,7 +41656,8 @@ mod tests {
             ..GatewayConfig::default()
         };
 
-        let prepared = prepare_gateway_config_for_mesh(config, &runtime).expect("mesh config");
+        let prepared =
+            prepare_gateway_config_via_mesh_slice(config, &runtime).expect("mesh config");
 
         // No egress proxies should be materialized for sidecar topology
         assert!(
@@ -41723,7 +41890,8 @@ mod tests {
             ..GatewayConfig::default()
         };
 
-        let prepared = prepare_gateway_config_for_mesh(config, &runtime).expect("mesh config");
+        let prepared =
+            prepare_gateway_config_via_mesh_slice(config, &runtime).expect("mesh config");
 
         let egress_proxies: Vec<_> = prepared
             .proxies
@@ -42517,7 +42685,8 @@ mod tests {
             ..GatewayConfig::default()
         };
 
-        let prepared = prepare_gateway_config_for_mesh(config, &runtime).expect("mesh config");
+        let prepared =
+            prepare_gateway_config_via_mesh_slice(config, &runtime).expect("mesh config");
 
         assert!(
             !prepared
@@ -42530,7 +42699,7 @@ mod tests {
 
     #[test]
     fn egress_stream_in_egress_gateway_topology_passes_full_validation() {
-        // Full end-to-end materialization via `prepare_gateway_config_for_mesh`
+        // Full end-to-end materialization via `prepare_gateway_config_via_mesh_slice`
         // exercises the validation pipeline that runs after materialization.
         // A stream egress proxy with a valid listen_port must pass
         // `validate_stream_proxies()` (each stream proxy needs listen_port,
@@ -42555,7 +42724,7 @@ mod tests {
         };
 
         let prepared =
-            prepare_gateway_config_for_mesh(config, &runtime).expect("prepared mesh config");
+            prepare_gateway_config_via_mesh_slice(config, &runtime).expect("prepared mesh config");
 
         let stream_proxy = prepared
             .proxies
@@ -42656,7 +42825,7 @@ mod tests {
         };
 
         let prepared =
-            prepare_gateway_config_for_mesh(config, &runtime).expect("prepared mesh config");
+            prepare_gateway_config_via_mesh_slice(config, &runtime).expect("prepared mesh config");
 
         assert!(
             !prepared

@@ -50,7 +50,9 @@ use ferrum_edge::modes::mesh::config::{
     Workload, WorkloadRef, destination_rule_exported_to_namespace,
 };
 use ferrum_edge::modes::mesh::slice::{MeshSlice, MeshSliceRequest};
-use ferrum_edge::modes::mesh::{MeshRuntimeConfig, MeshTopology, prepare_gateway_config_for_mesh};
+use ferrum_edge::modes::mesh::{
+    MeshRuntimeConfig, MeshTopology, prepare_gateway_config_via_mesh_slice,
+};
 use serde_json::{Value, json};
 
 use super::mesh_test_support::{default_mesh_runtime, http_proxy, http_upstream};
@@ -807,7 +809,7 @@ fn materialized_connect_timeout(mesh: MeshConfig, client_namespace: &str, servic
         ..default_mesh_runtime()
     };
     let prepared =
-        prepare_gateway_config_for_mesh(config, &runtime).expect("mesh preparation succeeds");
+        prepare_gateway_config_via_mesh_slice(config, &runtime).expect("mesh preparation succeeds");
     prepared
         .proxies
         .iter()
@@ -891,7 +893,7 @@ fn a_namespace_local_rule_cannot_alter_an_external_clients_effective_policy() {
         ..default_mesh_runtime()
     };
     let prepared =
-        prepare_gateway_config_for_mesh(config, &runtime).expect("mesh preparation succeeds");
+        prepare_gateway_config_via_mesh_slice(config, &runtime).expect("mesh preparation succeeds");
 
     let proxy = prepared
         .proxies
@@ -1214,7 +1216,7 @@ fn materialized_external_connect_timeout(
         ..default_mesh_runtime()
     };
     let prepared =
-        prepare_gateway_config_for_mesh(config, &runtime).expect("mesh preparation succeeds");
+        prepare_gateway_config_via_mesh_slice(config, &runtime).expect("mesh preparation succeeds");
     let effective = prepared
         .proxies
         .iter()
@@ -1530,8 +1532,8 @@ fn a_two_label_host_never_makes_an_unrelated_namespace_the_service_tier() {
             sidecar_enforced: true,
             ..default_mesh_runtime()
         };
-        let prepared =
-            prepare_gateway_config_for_mesh(config, &runtime).expect("mesh preparation succeeds");
+        let prepared = prepare_gateway_config_via_mesh_slice(config, &runtime)
+            .expect("mesh preparation succeeds");
         assert_eq!(
             prepared
                 .proxies
@@ -1715,7 +1717,7 @@ fn an_upstream_spanning_two_services_with_distinct_winners_is_refused() {
         vec![alpha_rule, beta_rule],
     );
 
-    let error = prepare_gateway_config_for_mesh(config, &alpha_subscriber_runtime())
+    let error = prepare_gateway_config_via_mesh_slice(config, &alpha_subscriber_runtime())
         .expect_err("two destinations with different winning rules cannot share one upstream");
     let message = error.to_string();
     assert!(
@@ -1755,10 +1757,12 @@ fn an_upstream_spanning_two_services_has_no_order_dependent_cross_service_winner
         vec![beta_rule, alpha_rule],
     );
 
-    let forward = prepare_gateway_config_for_mesh(forward_config, &alpha_subscriber_runtime())
-        .expect_err("conflicting upstream-wide fields are refused");
-    let reversed = prepare_gateway_config_for_mesh(reversed_config, &alpha_subscriber_runtime())
-        .expect_err("and are refused just the same in the other input order");
+    let forward =
+        prepare_gateway_config_via_mesh_slice(forward_config, &alpha_subscriber_runtime())
+            .expect_err("conflicting upstream-wide fields are refused");
+    let reversed =
+        prepare_gateway_config_via_mesh_slice(reversed_config, &alpha_subscriber_runtime())
+            .expect_err("and are refused just the same in the other input order");
 
     assert_eq!(
         forward.to_string(),
@@ -1783,7 +1787,7 @@ fn an_upstream_with_two_ports_for_one_destination_still_applies_its_rule() {
         &[(SPAN_A_HOST, 8080), (SPAN_A_HOST, 9090)],
         vec![client_rule],
     );
-    let prepared = prepare_gateway_config_for_mesh(config, &alpha_subscriber_runtime())
+    let prepared = prepare_gateway_config_via_mesh_slice(config, &alpha_subscriber_runtime())
         .expect("one destination on two ports is representable");
 
     let proxy = prepared
@@ -1817,7 +1821,7 @@ fn an_upstream_whose_second_destination_has_no_rule_still_applies() {
         &[(SPAN_A_HOST, 8080), (SPAN_B_HOST, 8080)],
         vec![rule("alpha", "client-a", SPAN_A_HOST, 1111, &["*"])],
     );
-    let prepared = prepare_gateway_config_for_mesh(config, &alpha_subscriber_runtime())
+    let prepared = prepare_gateway_config_via_mesh_slice(config, &alpha_subscriber_runtime())
         .expect("a destination with no rule cannot disagree with one that has a rule");
 
     let proxy = prepared
@@ -1901,7 +1905,7 @@ fn prepare_egress_gateway(mesh: MeshConfig) -> GatewayConfig {
         mesh: Some(Box::new(mesh)),
         ..GatewayConfig::default()
     };
-    prepare_gateway_config_for_mesh(config, &runtime).expect("mesh preparation succeeds")
+    prepare_gateway_config_via_mesh_slice(config, &runtime).expect("mesh preparation succeeds")
 }
 
 /// The materialized egress upstream for [`EXTERNAL_HOST`], plus the effective

@@ -839,7 +839,7 @@ use ferrum_edge::modes::mesh::config::{
 use ferrum_edge::modes::mesh::{
     MESH_NODE_WAYPOINT_UDP_PROXY_ID_PREFIX, MESH_NODE_WAYPOINT_UDP_UPSTREAM_ID_PREFIX,
     MeshRuntimeConfig, MeshTopology, node_waypoint_udp_proxy_id, node_waypoint_udp_upstream_id,
-    prepare_gateway_config_for_mesh, prepare_gateway_config_from_mesh_slice,
+    prepare_gateway_config_from_mesh_slice, prepare_gateway_config_via_mesh_slice,
 };
 
 use super::mesh_test_support::{
@@ -984,10 +984,11 @@ fn prepare(
     attach_local_node_waypoint(&mut workloads);
     let mesh = mesh_config_with(workloads, services, Vec::new());
     let config = gateway_config_with_mesh(Vec::new(), Vec::new(), mesh);
-    prepare_gateway_config_for_mesh(config, runtime).expect("mesh config preparation must succeed")
+    prepare_gateway_config_via_mesh_slice(config, runtime)
+        .expect("mesh config preparation must succeed")
 }
 
-/// File-mode `prepare_gateway_config_for_mesh` filters `MeshSlice` to
+/// File-mode `prepare_gateway_config_via_mesh_slice` filters `MeshSlice` to
 /// `runtime.namespace`, so Services whose Kubernetes namespace is not the
 /// NodeWaypoint subscription namespace never reach the UDP materializer.
 /// This helper drives the CP-driven path with the caller-supplied inventory
@@ -1901,7 +1902,7 @@ fn a_udp_port_already_claimed_by_a_stream_proxy_is_refused() {
         Vec::new(),
     );
     let config = gateway_config_with_mesh(vec![existing], Vec::new(), mesh);
-    let prepared = prepare_gateway_config_for_mesh(config, &runtime)
+    let prepared = prepare_gateway_config_via_mesh_slice(config, &runtime)
         .expect("mesh config preparation must succeed");
 
     assert!(

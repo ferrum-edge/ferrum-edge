@@ -291,7 +291,7 @@ removed or fixed before they land — the suite is all-green in `main`.
    features would force operators to read the test source to learn which
    assertion proved which feature.
 3. Drive translation through the public API (`translate_k8s_objects`,
-   `prepare_gateway_config_for_mesh`, `translate_mesh_slice_to_snapshot`)
+   `prepare_gateway_config_via_mesh_slice`, `translate_mesh_slice_to_snapshot`)
    so the conformance test exercises the same code path operators hit.
 4. For matcher-style features, run the resulting plugin on a synthetic
    request and assert the visible outcome (route override, reject, etc.)

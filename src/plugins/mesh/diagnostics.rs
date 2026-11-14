@@ -220,8 +220,9 @@ impl Schema {
 
 const SLICE: &str = "node_id namespace istio_root_namespace workload_spiffe_id waypoint_name \
     waypoint_gateway_class service_waypoint_bound_services labels labels_ambiguous \
-    virtual_service_l4_proxies virtual_service_l4_upstreams version revision workloads \
-    ambient_udp_source_workloads node_waypoint_assertors node_waypoint_capture_destinations \
+    virtual_service_l4_proxies virtual_service_l4_upstreams http_routes version revision \
+    workloads ambient_udp_source_workloads node_waypoint_assertors \
+    node_waypoint_capture_destinations \
     node_waypoint_capture_peer_authentications node_waypoint_capture_mesh_policies \
     node_waypoint_capture_mesh_policies_resolved services local_inbound_services \
     local_inbound_workloads local_ingress_listeners sidecar_ingress_declared \

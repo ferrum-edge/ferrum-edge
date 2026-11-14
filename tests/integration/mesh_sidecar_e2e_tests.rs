@@ -18,7 +18,7 @@ use ferrum_edge::modes::mesh::config::{
 use ferrum_edge::modes::mesh::{
     MESH_ACCESS_LOG_PLUGIN_ID, MESH_AUTHZ_PLUGIN_ID, MESH_SPIFFE_IDENTITY_PLUGIN_ID,
     MESH_WORKLOAD_METRICS_PLUGIN_ID, MeshListenerKind, MeshTopology, MeshTrafficDirection,
-    prepare_gateway_config_for_mesh,
+    prepare_gateway_config_via_mesh_slice,
 };
 
 use super::mesh_test_support::{
@@ -108,7 +108,7 @@ fn sidecar_prepare_injects_default_mesh_plugins() {
     let service = service_for("reviews", "default", &[&workload]);
     let mesh = mesh_config_with(vec![workload], vec![service], Vec::new());
     let config = gateway_config_with_mesh(Vec::new(), Vec::new(), mesh);
-    let prepared = prepare_gateway_config_for_mesh(config, &runtime).expect("mesh-prepared");
+    let prepared = prepare_gateway_config_via_mesh_slice(config, &runtime).expect("mesh-prepared");
     let ids: std::collections::HashSet<_> = prepared
         .plugin_configs
         .iter()
@@ -153,7 +153,7 @@ fn sidecar_source_locality_projects_onto_upstreams_when_workload_matches() {
     };
     let mesh = mesh_config_with(vec![workload], Vec::new(), Vec::new());
     let config = gateway_config_with_mesh(vec![proxy], vec![upstream], mesh);
-    let prepared = prepare_gateway_config_for_mesh(config, &runtime).expect("mesh-prepared");
+    let prepared = prepare_gateway_config_via_mesh_slice(config, &runtime).expect("mesh-prepared");
     let projected = prepared
         .upstreams
         .iter()
@@ -217,7 +217,7 @@ fn sidecar_authz_plugin_config_carries_mesh_slice_with_workload_identity() {
         vec![reviews_policy.clone(), ratings_policy.clone()],
     );
     let config = gateway_config_with_mesh(Vec::new(), Vec::new(), mesh);
-    let prepared = prepare_gateway_config_for_mesh(config, &runtime).expect("mesh-prepared");
+    let prepared = prepare_gateway_config_via_mesh_slice(config, &runtime).expect("mesh-prepared");
     let authz = prepared
         .plugin_configs
         .iter()
@@ -447,7 +447,7 @@ fn registry_plugin_injected(
     let runtime = outbound_policy_runtime(mesh_wide, sidecar_enforced);
     let mesh = outbound_policy_mesh(sidecar_policy);
     let config = gateway_config_with_mesh(Vec::new(), Vec::new(), mesh);
-    let prepared = prepare_gateway_config_for_mesh(config, &runtime).expect("prepared");
+    let prepared = prepare_gateway_config_via_mesh_slice(config, &runtime).expect("prepared");
     prepared
         .plugin_configs
         .iter()
@@ -516,7 +516,7 @@ fn sidecar_armed_registry_plugin_carries_the_slice_destinations_and_capture_port
     let runtime = outbound_policy_runtime(OutboundTrafficPolicy::AllowAny, true);
     let mesh = outbound_policy_mesh(Some(OutboundTrafficPolicy::RegistryOnly));
     let config = gateway_config_with_mesh(Vec::new(), Vec::new(), mesh);
-    let prepared = prepare_gateway_config_for_mesh(config, &runtime).expect("prepared");
+    let prepared = prepare_gateway_config_via_mesh_slice(config, &runtime).expect("prepared");
     let plugin = prepared
         .plugin_configs
         .iter()
@@ -653,7 +653,8 @@ fn path_parameter_mesh() -> MeshConfig {
 fn sidecar_materialised_routes_carry_the_service_path_parameter_opt_in() {
     let opt_in = |runtime: &ferrum_edge::modes::mesh::MeshRuntimeConfig, id: &str| {
         let config = gateway_config_with_mesh(Vec::new(), Vec::new(), path_parameter_mesh());
-        let prepared = prepare_gateway_config_for_mesh(config, runtime).expect("mesh-prepared");
+        let prepared =
+            prepare_gateway_config_via_mesh_slice(config, runtime).expect("mesh-prepared");
         prepared
             .proxies
             .iter()
@@ -703,7 +704,7 @@ fn ambient_direct_pod_ip_routes_carry_the_service_path_parameter_opt_in() {
     runtime.topology = MeshTopology::Ambient;
     runtime.workload_spiffe_id = Some("spiffe://cluster.local/ns/default/sa/client".to_string());
     let config = gateway_config_with_mesh(Vec::new(), Vec::new(), mesh);
-    let prepared = prepare_gateway_config_for_mesh(config, &runtime).expect("mesh-prepared");
+    let prepared = prepare_gateway_config_via_mesh_slice(config, &runtime).expect("mesh-prepared");
 
     let opt_in = |prefix: &str| -> Vec<bool> {
         prepared
