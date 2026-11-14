@@ -737,7 +737,8 @@ render_chart_assertions() {
     --set-string controlPlane.database.sqlite.path=/tmp/ferrum.db \
     --set-string "controlPlane.credentials.adminJwtSecret.value=$ADMIN_JWT_SECRET" \
     --set-string "controlPlane.credentials.cpDpGrpcJwtSecret.value=ferrum-edge-node-waypoint-live-grpc-secret" \
-    --set-string "controlPlane.env.FERRUM_NAMESPACE=$WORKLOAD_NS")"
+    --set-string "controlPlane.env.FERRUM_NAMESPACE=$WORKLOAD_NS" \
+    --set-string controlPlane.env.FERRUM_CP_DP_GRPC_ALLOW_PLAINTEXT=true)"
   if ! grep -A1 "name: FERRUM_K8S_CONTROLLER_NAMESPACE" <<<"$rendered" | grep -q "value: \"$MESH_NS\"" ||
     ! grep -A1 "name: FERRUM_NAMESPACE" <<<"$rendered" | grep -q "value: \"$WORKLOAD_NS\""; then
     echo "Control-plane render did not keep install and managed namespaces separate" >&2
@@ -753,6 +754,7 @@ render_chart_assertions() {
     --set-string "controlPlane.credentials.adminJwtSecret.value=$ADMIN_JWT_SECRET" \
     --set-string "controlPlane.credentials.cpDpGrpcJwtSecret.value=ferrum-edge-node-waypoint-live-grpc-secret" \
     --set-string "controlPlane.env.FERRUM_K8S_TRUST_DOMAIN=$TRUST_DOMAIN" \
+    --set-string controlPlane.env.FERRUM_CP_DP_GRPC_ALLOW_PLAINTEXT=true \
     --set ambient.enabled=true \
     --set ambient.captureMode=ebpf \
     --set ambient.env.FERRUM_MESH_TOPOLOGY=node_waypoint \
