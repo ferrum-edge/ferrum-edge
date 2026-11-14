@@ -2318,7 +2318,7 @@
   {
     "name": "ferrum_jwks_consecutive_failures",
     "type": "gauge",
-    "help": "Maximum current consecutive failures among active remote stores by fixed failure class.",
+    "help": "Maximum current consecutive failures among active remote and admin-managed JWKS stores by fixed failure class.",
     "labels": [
       "class"
     ],
@@ -2330,7 +2330,7 @@
   {
     "name": "ferrum_jwks_refresh_failures_total",
     "type": "counter",
-    "help": "Remote JWKS refresh failures by fixed failure class.",
+    "help": "Remote and admin-managed JWKS refresh failures by fixed failure class.",
     "labels": [
       "class"
     ],
