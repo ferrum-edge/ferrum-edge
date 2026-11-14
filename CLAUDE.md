@@ -93,7 +93,7 @@ Run the full local suite only for shared infrastructure, cross-module refactors,
 - Avoid per-request allocations and `format!()` in hot loops. Use thread-local buffers and precomputed indexes.
 - Rebuild `RouterCache`, `PluginCache`, `ConsumerIndex`, and `LoadBalancerCache` on reload, not per request.
 - Atomic config reload uses `ArcSwap`: in-flight requests see old or new config, never partial state.
-- Hot-path `DashMap` construction must use `crate::util::sharding::pool_shard_amount(env_config.pool_shard_amount)`.
+- Hot-path `DashMap` construction must use `crate::util::sharding::pool_shard_amount(env_config.pool_shard_amount)`. Exception: per-proxy passive-health maps (`ProxyHealthState.states`, `PassiveUnhealthyTargets`) use the fixed `health_check::PER_PROXY_PASSIVE_HEALTH_SHARD_AMOUNT` (8), since one pair exists per proxy (#7207).
 - Pool keys use `|` as delimiter. Include every field that affects constructed shared-client / connection behavior; exclude request-only policy and the deliberate `max_idle_per_host` tradeoff. Reqwest keys carry an inspectable `rcfg=…` client-behavior suffix.
 - Keep protocol correctness over shortcuts, especially HTTP/2/gRPC trailers, stream accounting, flow control, and WebSocket CONNECT behavior.
 

@@ -2018,6 +2018,55 @@ fn no_caller_carries_a_local_shard_count_workaround() {
     }
 }
 
+/// Issue #7207: the per-proxy passive-health maps are the one recorded
+/// exception to the `pool_shard_amount` rule. Each proxy with a passive policy
+/// owns a pair, so they take a small fixed shard count rather than the
+/// gateway-wide hot-map sizing (or DashMap's `4 × cores` default).
+#[test]
+fn per_proxy_passive_health_maps_use_the_fixed_small_shard_count() {
+    assert_eq!(
+        ferrum_edge::health_check::PER_PROXY_PASSIVE_HEALTH_SHARD_AMOUNT,
+        8,
+        "the per-proxy passive-health shard count is the CLAUDE.md exception's value"
+    );
+    let health = source("src/health_check.rs");
+    let fixed = "DashMap::with_shard_amount(PER_PROXY_PASSIVE_HEALTH_SHARD_AMOUNT)";
+    for (owner, constructor_head, field) in [
+        (
+            "PassiveUnhealthyTargets",
+            "impl PassiveUnhealthyTargets {\n    pub fn new() -> Self {",
+            "map: ",
+        ),
+        (
+            "ProxyHealthState",
+            "impl ProxyHealthState {\n    fn new() -> Self {",
+            "states: ",
+        ),
+    ] {
+        let start = health
+            .find(constructor_head)
+            .unwrap_or_else(|| panic!("{owner}::new must exist in src/health_check.rs"));
+        let body = &health[start..];
+        let body = &body[..body.find("\n    }\n").unwrap_or(body.len())];
+        assert!(
+            body.contains(&format!("{field}{fixed}")),
+            "{owner}::new must build its per-proxy map with {fixed} (#7207), got:\n{body}"
+        );
+        assert!(
+            !body.contains("DashMap::new()"),
+            "{owner}::new must not fall back to DashMap's per-core default shard count"
+        );
+    }
+    let passive_default = health
+        .find("impl Default for PassiveUnhealthyTargets")
+        .map(|start| &health[start..])
+        .and_then(|rest| rest.find("Self::new()").map(|end| &rest[..end]));
+    assert!(
+        passive_default.is_some_and(|text| !text.contains("DashMap")),
+        "PassiveUnhealthyTargets::default must delegate to new() so it keeps the fixed shard count"
+    );
+}
+
 #[test]
 fn the_stream_throttle_shard_count_comes_from_the_shared_helper() {
     let throttle = source("src/plugins/tcp_connection_throttle.rs");
