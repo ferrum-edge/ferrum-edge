@@ -2212,10 +2212,9 @@ fn a_static_service_entry_host_rule_originates_tls_to_its_endpoints() {
 
 #[test]
 fn a_static_service_entry_without_a_rule_stays_plaintext_and_a_claimant_cannot_change_it() {
-    let (_, scheme, _) = static_egress_pair(&prepare_egress_gateway(static_egress_gateway_mesh(
-        AppProtocol::Grpc,
-        Vec::new(),
-    )));
+    let unpoliced =
+        prepare_egress_gateway(static_egress_gateway_mesh(AppProtocol::Grpc, Vec::new()));
+    let (_, scheme, _) = static_egress_pair(&unpoliced);
     assert_eq!(
         scheme,
         BackendScheme::Http,
