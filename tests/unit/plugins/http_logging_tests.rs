@@ -14,8 +14,9 @@ use tokio::io::AsyncWriteExt;
 use tokio::net::TcpListener;
 
 use super::plugin_utils::{
-    create_test_stream_transaction_summary, create_test_transaction_summary,
-    read_http11_request_body, read_http11_request_headers,
+    assert_ws_session_end_record, create_test_stream_transaction_summary,
+    create_test_transaction_summary, create_test_ws_disconnect_context, read_http11_request_body,
+    read_http11_request_headers,
 };
 
 fn default_client() -> PluginHttpClient {
@@ -617,6 +618,72 @@ async fn test_http_logging_oversized_ack_does_not_block_flush_worker() {
     plugin.log(&create_test_transaction_summary()).await;
     plugin.log(&create_test_transaction_summary()).await;
     wait_for_count(&requests, 2).await;
+}
+
+/// Issue #7144: `http_logging` emits the shared WebSocket session-end record
+/// from `on_ws_disconnect`, so in-session faults reach the collector.
+#[tokio::test(flavor = "current_thread")]
+async fn test_http_logging_delivers_ws_session_end_record() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let bodies = Arc::new(std::sync::Mutex::new(Vec::<Vec<u8>>::new()));
+    let bodies_task = Arc::clone(&bodies);
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                break;
+            };
+            let bodies = Arc::clone(&bodies_task);
+            tokio::spawn(async move {
+                loop {
+                    let Some(body) = read_http11_request_body(&mut socket).await else {
+                        break;
+                    };
+                    bodies.lock().unwrap_or_else(|e| e.into_inner()).push(body);
+                    let response =
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: keep-alive\r\n\r\nOK";
+                    if socket.write_all(response).await.is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+    });
+
+    let plugin = HttpLogging::new(
+        &json!({
+            "endpoint_url": format!("http://{addr}/logs"),
+            "batch_size": 1,
+            "flush_interval_ms": 100,
+            "max_retries": 0,
+        }),
+        default_client(),
+    )
+    .unwrap();
+    assert!(plugin.requires_ws_disconnect_hooks());
+    start_http_logging(&plugin);
+
+    plugin
+        .on_ws_disconnect(&create_test_ws_disconnect_context())
+        .await;
+
+    for _ in 0..100 {
+        if !bodies.lock().unwrap_or_else(|e| e.into_inner()).is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let captured = bodies.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    assert!(
+        !captured.is_empty(),
+        "http_logging must POST the WebSocket session-end record"
+    );
+    let payload: serde_json::Value = serde_json::from_slice(&captured[0]).unwrap();
+    let entries = payload
+        .as_array()
+        .expect("http_logging posts a JSON array batch");
+    assert_eq!(entries.len(), 1);
+    assert_ws_session_end_record(&entries[0], "http_logging");
 }
 
 #[tokio::test(flavor = "current_thread")]

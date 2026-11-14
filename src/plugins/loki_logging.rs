@@ -48,7 +48,7 @@ use super::utils::{
     drain_http_batch_response_body, parse_custom_headers, parse_http_endpoint,
     validate_batch_config,
 };
-use super::{Plugin, StreamTransactionSummary, TransactionSummary};
+use super::{Plugin, StreamTransactionSummary, TransactionSummary, WsDisconnectContext};
 
 /// Fixed sink label for shared retained-byte diagnostics and metrics.
 const LOKI_PLUGIN_NAME: &str = "loki_logging";
@@ -1230,6 +1230,17 @@ impl Plugin for LokiLogging {
                 self.build_stream_labels(summary)
             }),
         }
+    }
+
+    /// WebSocket session end, emitted as the shared session-end record every
+    /// log sink writes (`WsDisconnectContext::session_end_summary`, issue
+    /// #7144) through the same admission path as `log`.
+    fn requires_ws_disconnect_hooks(&self) -> bool {
+        true
+    }
+
+    async fn on_ws_disconnect(&self, ctx: &WsDisconnectContext) {
+        self.log(&ctx.session_end_summary()).await;
     }
 
     async fn log(&self, summary: &TransactionSummary) {

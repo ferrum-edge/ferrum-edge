@@ -428,7 +428,7 @@ async fn test_statsd_logging_accepts_unsupported_schema_keys_with_warning() {
 async fn test_statsd_logging_rejects_one_character_misspellings_of_every_key() {
     assert_eq!(
         plugin_failure_policy("statsd_logging"),
-        Some(PluginFailurePolicy::OptionalFailOpen)
+        Some(PluginFailurePolicy::KeepLastKnownGood)
     );
 
     let typos = [
@@ -553,7 +553,7 @@ fn test_statsd_logging_disabled_config_skips_construction_validation() {
 }
 
 #[tokio::test]
-async fn test_statsd_logging_optional_fail_open_on_file_mode_load_and_cache_rebuild() {
+async fn test_statsd_logging_keeps_last_known_good_on_file_mode_load_and_cache_rebuild() {
     use ferrum_edge::config::types::Proxy;
 
     let policy = ferrum_edge::config::BackendEgressPolicy::unrestricted();
@@ -586,15 +586,12 @@ async fn test_statsd_logging_optional_fail_open_on_file_mode_load_and_cache_rebu
         plugin_configs: vec![bad_plugin.clone()],
         ..GatewayConfig::default()
     };
+    // Issue #7144: every log sink is KeepLastKnownGood, so a typo fails
+    // file-mode load instead of silently dropping the sink.
     ferrum_edge::_test_support::validate_plugin_configs_fatal_for_test(&mut bad_gateway, &policy)
-        .expect("OptionalFailOpen statsd typos warn but do not abort file-mode load");
-
-    let omitted = PluginCache::new(&bad_gateway)
-        .expect("cache construction must omit the failed optional statsd plugin");
-    assert!(
-        omitted.get_plugins("ferrum", "p1").is_empty(),
-        "unknown-key statsd_logging must be omitted, not silently defaulted"
-    );
+        .expect_err("a statsd_logging typo must fail file-mode load");
+    PluginCache::new(&bad_gateway)
+        .expect_err("an unconstructible statsd_logging must reject the initial cache");
 
     let valid_gateway = GatewayConfig {
         proxies: vec![proxy],
@@ -613,10 +610,15 @@ async fn test_statsd_logging_optional_fail_open_on_file_mode_load_and_cache_rebu
 
     cache
         .rebuild(&bad_gateway)
-        .expect("OptionalFailOpen reload omits bad statsd rather than rejecting the generation");
-    assert!(
-        cache.get_plugins("ferrum", "p1").is_empty(),
-        "reload with unknown keys must drop the previously published statsd instance"
+        .expect_err("a reload with an unconstructible statsd_logging must be rejected");
+    assert_eq!(
+        cache.get_plugins("ferrum", "p1").len(),
+        1,
+        "the rejected reload keeps the previously published statsd instance"
+    );
+    assert_eq!(
+        cache.get_plugins("ferrum", "p1")[0].name(),
+        "statsd_logging"
     );
 }
 
@@ -653,7 +655,7 @@ fn test_statsd_metric_docs_inventory_and_byte_directions() {
         "backend_to_client",
         "max_retries",
         "retry_delay_ms",
-        "OptionalFailOpen",
+        "KeepLastKnownGood",
         "reserved runtime tags",
     ] {
         assert!(

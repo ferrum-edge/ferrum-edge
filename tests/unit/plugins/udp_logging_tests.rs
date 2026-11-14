@@ -18,7 +18,8 @@ use serde_json::{Value, json};
 use tokio::net::UdpSocket;
 
 use super::plugin_utils::{
-    create_test_stream_transaction_summary, create_test_transaction_summary,
+    assert_ws_session_end_record, create_test_stream_transaction_summary,
+    create_test_transaction_summary, create_test_ws_disconnect_context,
 };
 
 fn test_client() -> PluginHttpClient {
@@ -329,6 +330,41 @@ async fn test_udp_logging_stream_disconnect_does_not_panic() {
 
     plugin.on_stream_disconnect(&summary).await;
     tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
+}
+
+/// Issue #7144: `udp_logging` emits the shared WebSocket session-end record
+/// from `on_ws_disconnect`.
+#[tokio::test]
+async fn test_udp_logging_delivers_ws_session_end_record() {
+    let listener = UdpSocket::bind("127.0.0.1:0")
+        .await
+        .expect("bind collector");
+    let addr = listener.local_addr().expect("collector addr");
+    let plugin = UdpLogging::new(
+        &json!({
+            "host": "127.0.0.1",
+            "port": addr.port(),
+            "batch_size": 1,
+            "flush_interval_ms": 100,
+            "max_retries": 0
+        }),
+        test_client(),
+    )
+    .expect("construct");
+    assert!(plugin.requires_ws_disconnect_hooks());
+    plugin.start_background_tasks().expect("live start");
+    plugin.commit_background_tasks();
+
+    plugin
+        .on_ws_disconnect(&create_test_ws_disconnect_context())
+        .await;
+
+    let mut buffer = vec![0u8; 65_536];
+    let len = recv_datagram(&listener, &mut buffer, "WebSocket session end").await;
+    let records: Vec<Value> =
+        serde_json::from_slice(&buffer[..len]).expect("each datagram is a JSON array");
+    assert_eq!(records.len(), 1);
+    assert_ws_session_end_record(&records[0], "udp_logging");
 }
 
 #[tokio::test]
@@ -748,7 +784,7 @@ fn test_udp_logging_disabled_skips_construction_validation() {
 }
 
 #[tokio::test]
-async fn test_udp_logging_optional_fail_open_omits_unknown_key_instance() {
+async fn test_udp_logging_unknown_key_instance_keeps_last_known_good() {
     use ferrum_edge::config::types::Proxy;
 
     let policy = ferrum_edge::config::BackendEgressPolicy::unrestricted();
@@ -781,14 +817,12 @@ async fn test_udp_logging_optional_fail_open_omits_unknown_key_instance() {
         plugin_configs: vec![bad_plugin.clone()],
         ..GatewayConfig::default()
     };
+    // Issue #7144: every log sink is KeepLastKnownGood, so a typo fails
+    // file-mode load instead of silently dropping the sink.
     ferrum_edge::_test_support::validate_plugin_configs_fatal_for_test(&mut bad_gateway, &policy)
-        .expect("OptionalFailOpen udp typos warn but do not abort file-mode load");
-
-    let omitted = PluginCache::new(&bad_gateway).expect("cache omits failed optional plugin");
-    assert!(
-        omitted.get_plugins("ferrum", "p1").is_empty(),
-        "unknown-key udp_logging must be omitted, not silently defaulted to plaintext"
-    );
+        .expect_err("a udp_logging typo must fail file-mode load");
+    PluginCache::new(&bad_gateway)
+        .expect_err("an unconstructible udp_logging must reject the initial cache");
 
     let valid_gateway = GatewayConfig {
         proxies: vec![proxy],
@@ -803,10 +837,15 @@ async fn test_udp_logging_optional_fail_open_omits_unknown_key_instance() {
 
     cache
         .rebuild(&bad_gateway)
-        .expect("OptionalFailOpen reload omits bad udp rather than rejecting the generation");
-    assert!(
-        cache.get_plugins("ferrum", "p1").is_empty(),
-        "reload with unknown keys must drop the previously published udp instance"
+        .expect_err("a reload with an unconstructible udp_logging must be rejected");
+    assert_eq!(
+        cache
+            .get_plugins("ferrum", "p1")
+            .iter()
+            .map(|plugin| plugin.name())
+            .collect::<Vec<_>>(),
+        vec!["udp_logging"],
+        "the rejected reload keeps the previously published udp instance"
     );
 }
 
@@ -1886,7 +1925,7 @@ fn test_udp_logging_docs_dns_and_delivery_contract() {
         "split per entry",
         "co-batched siblings",
         "at-least-once",
-        "OptionalFailOpen",
+        "KeepLastKnownGood",
         "shape-only",
         "immutable for that plugin generation",
         "10-second completion budget",

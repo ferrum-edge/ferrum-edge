@@ -510,6 +510,40 @@ An HTTP call a plugin makes on behalf of the current request carries the request
 
 ## Logging Plugins
 
+### Log sink contract
+
+Every log sink — `stdout_logging`, `http_logging`, `tcp_logging`,
+`udp_logging`, `kafka_logging`, `loki_logging`, `statsd_logging`, `ws_logging`,
+and `ws_frame_logging` — follows one contract (issue #7144):
+
+- **WebSocket session end.** Each sink runs `on_ws_disconnect` and records every
+  upgraded session's end exactly once, after the handshake record its `log`
+  hook already wrote. The `TransactionSummary` sinks (`stdout_logging`,
+  `http_logging`, `tcp_logging`, `udp_logging`, `kafka_logging`,
+  `loki_logging`) all emit the same session-end record: a second HTTP-family
+  `TransactionSummary` carrying the session's `error_class`, the method, path,
+  and status captured at upgrade admission, `latency_total_ms` as the session
+  duration, every other `latency_*` field as the `-1.0` "not observed"
+  sentinel, and `metadata["websocket.timestamp_disconnected"]` (see
+  [`stdout_logging`](#stdout_logging) for the field rules). That record goes
+  through the sink's ordinary admission, byte budget, `schema` / `schema_ref`
+  projection, and loss accounting, exactly like a transaction record. Sinks with
+  their own session-end representation keep it: `statsd_logging` emits the
+  `websocket.session.*` metric families, `ws_logging` its
+  `websocket_disconnect` record, and `ws_frame_logging` its disconnect event.
+- **Failure policy.** Every log sink is `KeepLastKnownGood`: an access log is an
+  audit trail, so an invalid enabled log-sink config is refused by the Admin
+  API (`400`), fails `ferrum-edge validate`, file-mode startup, and
+  database-mode cold start, is rejected by control-plane admission, and makes a
+  reload keep the previous generation rather than publish one that silently
+  stops logging. Database mode does not quarantine a log-sink row. Fix the
+  config to unblock the reload. See
+  [Config admission and failure policy](#config-admission-and-failure-policy).
+
+`transaction_debugger`, `prometheus_metrics`, `otel_tracing`, and
+`proxy_alerts` are diagnostics, metrics, tracing, and alerting plugins rather
+than log sinks; they keep their own documented policies.
+
 ### Rejection and delivery diagnostics
 
 Selected rejection and delivery-failure diagnostics use a process-wide warning
@@ -660,7 +694,7 @@ config:
 
 ### `http_logging`
 
-**Priority:** 9100 · **Phases:** `log`, `on_stream_disconnect` · **Protocols:** HTTP, gRPC, WebSocket, TCP, UDP · **Failure policy:** `OptionalFailOpen`
+**Priority:** 9100 · **Phases:** `log`, `on_stream_disconnect`, `on_ws_disconnect` · **Protocols:** HTTP, gRPC, WebSocket, TCP, UDP · **Failure policy:** `KeepLastKnownGood`
 
 Sends transaction summaries as JSON to an external HTTP endpoint. Entries are buffered and sent in batches (as a JSON array) to reduce per-request HTTP overhead.
 
@@ -673,7 +707,7 @@ Also accepts the [common batching sink options](#common-batching-sink-options): 
 
 Hot-path admission reserves a queue slot and a provisional `max_entry_bytes` lease before serializing attacker-shaped summary fields, then shrinks that lease to the exact retained JSON size.
 
-Unknown top-level keys are rejected at construction (for example a misspelled `endpont_url` cannot silently leave logs undelivered). An invalid enabled config is handled per [`OptionalFailOpen`](#config-admission-and-failure-policy).
+Unknown top-level keys are rejected at construction (for example a misspelled `endpont_url` cannot silently leave logs undelivered). An invalid enabled config is handled per [`KeepLastKnownGood`](#config-admission-and-failure-policy): it is refused, and a reload keeps the previous generation. WebSocket session ends are sent as the shared session-end record (see [Log sink contract](#log-sink-contract)).
 
 Retries fire on transport errors and 5xx responses. A **4xx response other than 408 or 429 aborts the batch immediately** (retrying a malformed or unauthorized payload just delays the drop) — fix the endpoint URL, authorization header, or field schema rather than waiting through `max_retries × retry_delay_ms`. 408 (Request Timeout) and 429 (Too Many Requests) are transient throttling signals and are retried within the configured budget. Permanent 4xx discards increment `ferrum_plugin_log_sink_records_dropped_total{plugin="http_logging",reason="batch_discard"}` once per lost record; the counter is process-cumulative and is not reset by a plugin-cache reload.
 
@@ -735,11 +769,11 @@ config:
 
 ### `statsd_logging`
 
-**Priority:** 9075 · **Phases:** `log`, `on_stream_disconnect`, `on_ws_disconnect` · **Protocols:** HTTP, gRPC, WebSocket, TCP, UDP · **Failure policy:** `OptionalFailOpen`
+**Priority:** 9075 · **Phases:** `log`, `on_stream_disconnect`, `on_ws_disconnect` · **Protocols:** HTTP, gRPC, WebSocket, TCP, UDP · **Failure policy:** `KeepLastKnownGood`
 
 Sends transaction metrics to a StatsD-compatible server (StatsD, Datadog DogStatsD, Telegraf, etc.) over UDP. Extracts counters, timers, and gauges from each transaction summary and ships them in batched, newline-delimited StatsD line protocol.
 
-**Admission.** Top-level config keys are closed: unknown properties are rejected with the exact key name(s) in the error. Nested `global_tags` remains an intentionally open string map, but keys must match `[A-Za-z_][A-Za-z0-9_.-]*` (max 64 bytes) and must not collide with reserved or schema-renamed runtime tags. Registration policy is `OptionalFailOpen` — Admin create/update still returns HTTP 400 for invalid enabled configs, while file-mode load and plugin-cache rebuild warn and omit the plugin rather than aborting the gateway. Disabled plugin configs skip construction validation.
+**Admission.** Top-level config keys are closed: unknown properties are rejected with the exact key name(s) in the error. Nested `global_tags` remains an intentionally open string map, but keys must match `[A-Za-z_][A-Za-z0-9_.-]*` (max 64 bytes) and must not collide with reserved or schema-renamed runtime tags. Registration policy is `KeepLastKnownGood` (see [Log sink contract](#log-sink-contract)) — Admin create/update returns HTTP 400 for invalid enabled configs, file-mode load and `validate` fail, and a reload whose `statsd_logging` config cannot be constructed is refused so the previous generation keeps serving. Disabled plugin configs skip construction validation.
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
@@ -921,7 +955,7 @@ config:
 
 ### `tcp_logging`
 
-**Priority:** 9125 · **Phases:** `log`, `on_stream_disconnect` · **Protocols:** HTTP, gRPC, WebSocket, TCP, UDP · **Failure policy:** `KeepLastKnownGood`
+**Priority:** 9125 · **Phases:** `log`, `on_stream_disconnect`, `on_ws_disconnect` · **Protocols:** HTTP, gRPC, WebSocket, TCP, UDP · **Failure policy:** `KeepLastKnownGood`
 
 Sends transaction summaries as newline-delimited JSON (NDJSON) over a persistent TCP or TCP+TLS connection. Entries are buffered and flushed in batches, with automatic reconnection on failure. Ideal for shipping logs to Logstash, Fluentd, Vector, rsyslog, or any TCP-based log collector.
 
@@ -982,11 +1016,11 @@ input {
 
 ### `udp_logging`
 
-**Priority:** 9160 · **Phases:** `log`, `on_stream_disconnect` · **Protocols:** HTTP, gRPC, WebSocket, TCP, UDP · **Failure policy:** `OptionalFailOpen`
+**Priority:** 9160 · **Phases:** `log`, `on_stream_disconnect`, `on_ws_disconnect` · **Protocols:** HTTP, gRPC, WebSocket, TCP, UDP · **Failure policy:** `KeepLastKnownGood`
 
 Sends transaction summaries as JSON to an external UDP endpoint. Entries are buffered and sent in batches (as a JSON array) in a single UDP datagram. Supports both plain UDP and DTLS-encrypted transport.
 
-Unknown top-level keys are rejected at construction / Admin validation (OpenAPI `additionalProperties: false`). A typo such as `dtsl: true` fails admission instead of silently shipping plaintext. An invalid enabled config is handled per [`OptionalFailOpen`](#config-admission-and-failure-policy).
+Unknown top-level keys are rejected at construction / Admin validation (OpenAPI `additionalProperties: false`). A typo such as `dtsl: true` fails admission instead of silently shipping plaintext. An invalid enabled config is handled per [`KeepLastKnownGood`](#config-admission-and-failure-policy): it is refused, and a reload keeps the previous generation. WebSocket session ends are sent as the shared session-end record (see [Log sink contract](#log-sink-contract)).
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
@@ -1029,8 +1063,8 @@ config:
 For encrypted log shipping, enable DTLS. An ephemeral self-signed certificate is used by default when no client certificate is provided. Shared Admin / CP validation is shape-only and never opens node-local certificate, key, or CA paths. When `dtls: true`, the consuming node materializes those sources during construction and, where applicable, the mode-aware plugin file-dependency phase without network I/O. Parsed material is cached in the committed plugin generation so first flush and reconnect reuse it:
 
 - **File mode:** unusable DTLS material is fatal during config load.
-- **Database mode:** the file-dependency phase warns; construction still fails closed for that instance (`OptionalFailOpen` omits it).
-- **DP mode:** the shared file-dependency phase is skipped (node-local paths may differ); construction on the DP still materializes local sources and omits the instance on failure.
+- **Database mode:** the file-dependency phase warns; construction still fails closed, and because `udp_logging` is `KeepLastKnownGood` the load is rejected (cold start refuses to start; a reload keeps the previous generation).
+- **DP mode:** the shared file-dependency phase is skipped (node-local paths may differ); construction on the DP still materializes local sources, and a failure rejects the update so the previous generation keeps serving.
 
 Cached DTLS material is immutable for that plugin generation. Certificate/key/CA rotation, or making a previously missing source available, requires reapplying or reloading the configuration; transport and handshake failures do not repeatedly reopen source paths.
 
@@ -1047,7 +1081,7 @@ config:
 
 ### `kafka_logging`
 
-**Priority:** 9150 · **Phases:** `log`, `on_stream_disconnect` · **Protocols:** HTTP, gRPC, WebSocket, TCP, UDP · **Failure policy:** `KeepLastKnownGood`
+**Priority:** 9150 · **Phases:** `log`, `on_stream_disconnect`, `on_ws_disconnect` · **Protocols:** HTTP, gRPC, WebSocket, TCP, UDP · **Failure policy:** `KeepLastKnownGood`
 
 Produces transaction summaries as JSON messages to an Apache Kafka topic. Uses an async mpsc channel of pre-serialized records to decouple the proxy hot path from Kafka I/O, with librdkafka's `ThreadedProducer` handling batching, compression, delivery retries, and partition assignment.
 
@@ -1554,7 +1588,7 @@ request paths carry no per-instance lifecycle handle.
 
 ### `loki_logging`
 
-**Priority:** 9155 · **Phases:** `log`, `on_stream_disconnect` · **Protocols:** HTTP, gRPC, WebSocket, TCP, UDP · **Failure policy:** `OptionalFailOpen`
+**Priority:** 9155 · **Phases:** `log`, `on_stream_disconnect`, `on_ws_disconnect` · **Protocols:** HTTP, gRPC, WebSocket, TCP, UDP · **Failure policy:** `KeepLastKnownGood`
 
 Ships transaction logs to Grafana Loki via the push API (`POST /loki/api/v1/push`). Entries are batched asynchronously and grouped by label set for efficient ingestion. Supports gzip compression (enabled by default), static and dynamic labels, custom headers for multi-tenant Loki (`X-Scope-OrgID`), and authentication via `Authorization` header. Config admission is strict: unknown top-level fields and explicit `null` values are rejected. Nested `labels` and `custom_headers` remain dynamic maps.
 
@@ -7415,7 +7449,7 @@ config:
 
 ### `ws_frame_logging`
 
-**Priority:** 9050 · **Phases:** `on_ws_policy_close`, `prepare_ws_frame_delivery`, `emit_ws_frame_delivery`, `on_ws_disconnect` · **Protocols:** WebSocket · **Failure policy:** `OptionalFailOpen`
+**Priority:** 9050 · **Phases:** `on_ws_policy_close`, `prepare_ws_frame_delivery`, `emit_ws_frame_delivery`, `on_ws_disconnect` · **Protocols:** WebSocket · **Failure policy:** `KeepLastKnownGood`
 
 Logs metadata for every complete WebSocket message the shared H1/H2/H3 relay **successfully delivers** (post-plugin, post-control-frame guard), plus every gateway-published policy Close decision. Provides message-level observability without requiring packet captures. This plugin never transforms or drops frames — it is purely observational (`observes_ws_frame_decisions()`): the relay reports each final policy Close to it once through `on_ws_policy_close` (`outcome=policy_close`), after the full decision is known, so the record does not depend on this plugin's priority (an accepted `priority_override` that orders it before the rejecting plugin still records the rejection). Ordinary Text/Binary/Ping/Pong and peer Close frames are recorded only after the destination sink accepts the write (`outcome=delivered`), on the same success boundary as the per-direction `frames_*` / `bytes_*` counters. Cancelled or failed sends produce no frame event.
 
@@ -7459,7 +7493,7 @@ Privacy / retention: disconnect records carry endpoint identity and success-only
 
 **What filtering does and does not skip.** When the configured tracing level is filtered out, fingerprint computation and tracing event construction are skipped. Frame parsing, plugin selection (`requires_ws_frame_hooks()` is always true while this plugin is attached), `on_ws_frame` / `on_ws_policy_close` dispatch, delivery prepare/emit hooks, and disconnect-hook dispatch still occur. Consequently, attaching this plugin keeps the connection on the parsed WebSocket relay path and prevents the H1 raw-copy tunnel fast path even if every record is filtered.
 
-**Admission / failure policy.** `ws_frame_logging` is registered `OptionalFailOpen` (see [Config admission and failure policy](#config-admission-and-failure-policy)): the Admin API returns HTTP 400 for an invalid enabled config, and serving loads omit the instance. Invalid configs include unknown keys, out-of-range `payload_preview_bytes`, invalid `log_level`, wrong types, and explicit `null` fields.
+**Admission / failure policy.** `ws_frame_logging` is registered `KeepLastKnownGood` like every log sink (see [Log sink contract](#log-sink-contract)): the Admin API returns HTTP 400 for an invalid enabled config, file-mode load and `validate` fail, and a reload that cannot construct it keeps the previous generation. Invalid configs include unknown keys, out-of-range `payload_preview_bytes`, invalid `log_level`, wrong types, and explicit `null` fields.
 
 **Raw frame contents are never logged.** WebSocket payloads routinely carry credentials — bearer tokens, session cookies, API keys (for example a GraphQL-over-WS `connection_init` payload or a custom auth handshake). To honor the project's never-log-secrets invariant, `preview` contains only a keyed, non-reversible fingerprint of the form `hmac-sha256:<12 hex chars> len=<bytes>` (with a trailing `+` after the digest when only the first `payload_preview_bytes` of the payload were hashed). The key is generated per plugin instance and is not exposed in logs, so log access alone cannot confirm guessed payloads offline. The digest lets operators correlate identical payloads observed by that plugin instance without disclosing plaintext; the payload byte length is also always available as `size_bytes`. Close reasons are treated as application payload: only `close_code` and `close_reason_len` are logged.
 

@@ -13071,10 +13071,16 @@ components:
             for an enabled config and returns HTTP 400 before storage when that
             config is invalid, regardless of serving-mode failure policy.
             During file-mode load, pre-existing DB/CP snapshot application, or
-            cache rebuild, plugins registered OptionalFailOpen (including
-            `ws_frame_logging` and other observability sinks) instead emit a
+            cache rebuild, plugins registered OptionalFailOpen (metrics,
+            tracing, and alerting instrumentation such as `prometheus_metrics`,
+            `otel_tracing`, and `proxy_alerts`) instead emit a
             validation/construction warning and omit that plugin instance from
-            the published cache while admitting the surrounding snapshot.
+            the published cache while admitting the surrounding snapshot. Log
+            sinks (`stdout_logging`, `http_logging`, `tcp_logging`,
+            `udp_logging`, `kafka_logging`, `loki_logging`, `statsd_logging`,
+            `ws_logging`, `ws_frame_logging`) are KeepLastKnownGood: an invalid
+            enabled log sink rejects the candidate and the prior generation
+            keeps serving.
             Disabled plugin configs are stored without construction, allowing
             secret-dependent plugins such as `basic_auth` to be staged before
             their runtime secret is provisioned. Enabling performs full
@@ -14207,12 +14213,12 @@ components:
         Admission contract: only the keys below are allowed; unknown keys and
         explicit `null` field values are rejected. `payload_preview_bytes`
         values above 65536 are rejected (not clamped). The plugin is registered
-        OptionalFailOpen. Admin create/update performs strict construction and
-        returns HTTP 400 for an invalid enabled config before storing it. During
-        file-mode load, pre-existing DB/CP snapshot application, or cache
-        rebuild, invalid enabled configs produce a validation/construction
-        warning and omit this instance from the published plugin cache rather
-        than rejecting the surrounding snapshot.
+        KeepLastKnownGood, like every log sink. Admin create/update performs
+        strict construction and returns HTTP 400 for an invalid enabled config
+        before storing it. File-mode load and `ferrum-edge validate` fail, and
+        a DB/CP/DP reload whose invalid enabled config cannot be constructed is
+        rejected so the previously published plugin generation keeps
+        serving.
 
         Raw frame contents are never logged: WebSocket payloads routinely carry
         credentials (bearer tokens, cookies, API keys), so when
@@ -21641,7 +21647,7 @@ components:
     HttpLoggingConfig:
       type: object
       additionalProperties: false
-      description: "Plugin: http_logging — Sends transaction logs to an HTTP endpoint in batches. Unknown top-level keys are rejected. `schema` and `schema_ref` are mutually exclusive. Registration policy is OptionalFailOpen."
+      description: "Plugin: http_logging — Sends transaction logs to an HTTP endpoint in batches. Unknown top-level keys are rejected. `schema` and `schema_ref` are mutually exclusive. WebSocket session ends are sent as the shared session-end transaction record via on_ws_disconnect. Registration policy is KeepLastKnownGood."
       required:
         - endpoint_url
       not:
@@ -21897,9 +21903,10 @@ components:
         validation so transport typos (for example `dtsl`) cannot silently
         fall back to plaintext. DTLS-only fields require `dtls: true` (omitted
         or false rejects them) so Admin/spec admission cannot accept plaintext
-        configs that runtime would ignore. Registration policy is
-        OptionalFailOpen (invalid enabled instances are omitted from the
-        published cache).
+        configs that runtime would ignore. WebSocket session ends are sent as
+        the shared session-end transaction record via on_ws_disconnect.
+        Registration policy is KeepLastKnownGood (an invalid enabled instance
+        rejects the candidate; a reload keeps the prior generation).
       required:
         - host
         - port
@@ -22855,8 +22862,8 @@ components:
         request.grpc_status.{code} counter (0-16 or OTHER) while keeping HTTP
         status/status_class distinct. WebSocket session completion emits
         websocket.* families via on_ws_disconnect. Registration policy is
-        OptionalFailOpen (invalid enabled configs warn and omit the plugin on
-        file-mode load / cache rebuild rather than aborting the gateway). See
+        KeepLastKnownGood (an invalid enabled config fails file-mode load and
+        `ferrum-edge validate`, and a reload keeps the prior generation). See
         docs/plugins.md.
       required:
         - host

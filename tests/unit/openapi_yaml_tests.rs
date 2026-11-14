@@ -9441,7 +9441,7 @@ async fn statsd_logging_schema_matches_strict_runtime_config_contract() {
             "docs/plugins.md statsd section missing `{key}`"
         );
     }
-    assert!(statsd_docs.contains("OptionalFailOpen"));
+    assert!(statsd_docs.contains("KeepLastKnownGood"));
     assert!(statsd_docs.contains("max_retries"));
     assert!(statsd_docs.contains("retry_delay_ms"));
 
@@ -15601,7 +15601,7 @@ fn ws_frame_logging_schema_matches_runtime_admission_contract() {
         .as_str()
         .expect("WsFrameLoggingConfig description");
     for contract in [
-        "OptionalFailOpen",
+        "KeepLastKnownGood",
         "FERRUM_LOG_LEVEL=warn",
         "HTTP 400",
         "stricter than `warn`",
@@ -15695,7 +15695,7 @@ fn ws_frame_logging_schema_matches_runtime_admission_contract() {
         "HTTP 400",
         "stricter than `warn`",
         "diagnostic can repeat",
-        "OptionalFailOpen",
+        "KeepLastKnownGood",
     ] {
         assert!(
             docs_section.contains(contract),

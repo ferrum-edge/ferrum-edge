@@ -347,6 +347,70 @@ pub fn create_test_transaction_summary() -> ferrum_edge::plugins::TransactionSum
     }
 }
 
+/// A WebSocket session end with an in-session fault, for the shared log-sink
+/// session-end contract (issue #7144).
+#[allow(dead_code)]
+pub fn create_test_ws_disconnect_context() -> ferrum_edge::plugins::WsDisconnectContext {
+    ferrum_edge::plugins::WsDisconnectContext {
+        namespace: "ferrum".to_string(),
+        proxy_id: "test-ws-proxy".to_string(),
+        proxy_name: Some("Test WS Proxy".to_string()),
+        client_ip: "127.0.0.1".to_string(),
+        backend_target: "ws://127.0.0.1:9000/chat".to_string(),
+        http_method: "GET".to_string(),
+        request_path: "/chat".to_string(),
+        handshake_status_code: 101,
+        listen_port: 8080,
+        connection_id: 7,
+        duration_ms: 1500.0,
+        frames_client_to_backend: 3,
+        frames_backend_to_client: 4,
+        bytes_client_to_backend: 16,
+        bytes_backend_to_client: 32,
+        timestamp_connected: "2026-11-14T10:00:00+00:00".to_string(),
+        timestamp_disconnected: "2026-11-14T10:00:01.500+00:00".to_string(),
+        direction: Some(ferrum_edge::plugins::Direction::BackendToClient),
+        io_side: Some(ferrum_edge::proxy::tcp_proxy::StreamIoSide::Read),
+        error_class: Some(ferrum_edge::retry::ErrorClass::ConnectionReset),
+        consumer_username: Some("testuser".to_string()),
+        auth_method: None,
+        metadata: ferrum_edge::plugins::MetadataMap::default(),
+        proxy_lifecycle_generation: None,
+    }
+}
+
+/// Assert `record` is the shared WebSocket session-end record
+/// (`WsDisconnectContext::session_end_summary`) for
+/// [`create_test_ws_disconnect_context`], as every `TransactionSummary` log
+/// sink must emit it (issue #7144).
+#[allow(dead_code)]
+pub fn assert_ws_session_end_record(record: &Value, sink: &str) {
+    assert_eq!(record["http_method"], "GET", "{sink}: {record}");
+    assert_eq!(record["request_path"], "/chat", "{sink}: {record}");
+    assert_eq!(record["response_status_code"], 101, "{sink}: {record}");
+    assert_eq!(record["proxy_id"], "test-ws-proxy", "{sink}: {record}");
+    assert_eq!(
+        record["backend_target"], "ws://127.0.0.1:9000/chat",
+        "{sink}: {record}"
+    );
+    assert_eq!(
+        record["error_class"], "connection_reset",
+        "{sink}: {record}"
+    );
+    assert_eq!(record["latency_total_ms"], 1500.0, "{sink}: {record}");
+    assert_eq!(record["latency_backend_ttfb_ms"], -1.0, "{sink}: {record}");
+    assert_eq!(record["bytes_sent"], 16, "{sink}: {record}");
+    assert_eq!(record["bytes_received"], 32, "{sink}: {record}");
+    assert_eq!(
+        record["timestamp_received"], "2026-11-14T10:00:00+00:00",
+        "{sink}: {record}"
+    );
+    assert_eq!(
+        record["metadata"]["websocket.timestamp_disconnected"], "2026-11-14T10:00:01.500+00:00",
+        "{sink}: {record}"
+    );
+}
+
 /// Create a test stream transaction summary for stream-aware logging plugins
 #[allow(dead_code)]
 pub fn create_test_stream_transaction_summary() -> ferrum_edge::plugins::StreamTransactionSummary {

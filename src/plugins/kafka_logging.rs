@@ -61,7 +61,7 @@ use super::utils::sink_loss::{self, SinkLossReason};
 use super::utils::{
     BatchConfig, BatchingLogger, BatchingLoggerHandle, LoggerHooks, PluginHttpClient, RetryPolicy,
 };
-use super::{Plugin, StreamTransactionSummary, TransactionSummary};
+use super::{Plugin, StreamTransactionSummary, TransactionSummary, WsDisconnectContext};
 use crate::socket_opts::monotonic_now_ms;
 use crate::util::atomic_log_rate_limiter::AtomicLogRateLimiter;
 use crate::util::unknown_keys::reject_unknown_keys;
@@ -3421,6 +3421,17 @@ impl Plugin for KafkaLogging {
         if let Some(admission) = generation.admission.load_full() {
             admission.admit_stream(summary);
         }
+    }
+
+    /// WebSocket session end, emitted as the shared session-end record every
+    /// log sink writes (`WsDisconnectContext::session_end_summary`, issue
+    /// #7144) through the same admission path as `log`.
+    fn requires_ws_disconnect_hooks(&self) -> bool {
+        true
+    }
+
+    async fn on_ws_disconnect(&self, ctx: &WsDisconnectContext) {
+        self.log(&ctx.session_end_summary()).await;
     }
 
     async fn log(&self, summary: &TransactionSummary) {
