@@ -560,8 +560,8 @@ Sorted by family name. Optional namespace labels are listed when the emitter sup
 | `ferrum_gateway_trust_retired_transports_total` | counter | `transport`, `namespace` | `gateway_trust` | `documented_only` | `always` | Live gateway-to-mesh transports terminated by a trust withdrawal, by transport class. Counts connections, not requests or streams. |
 | `ferrum_gateway_trust_withdrawals_total` | counter | `reason`, `namespace` | `gateway_trust` | `documented_only` | `always` | Accepted gateway trust publications that removed an authority and retired the outgoing generation, by closed reason. |
 | `ferrum_grpc_config_stream_terminations_total` | counter | `surface`, `reason`, `gateway_namespace` | `grpc_config` | `documented_only` | `always` | Authenticated configuration streams ended by fixed surface and reason. |
-| `ferrum_jwks_consecutive_failures` | gauge | `class` | `jwks` | `documented_only` | `always` | Maximum current consecutive failures among active remote stores by fixed failure class. |
-| `ferrum_jwks_refresh_failures_total` | counter | `class` | `jwks` | `documented_only` | `always` | Remote JWKS refresh failures by fixed failure class. |
+| `ferrum_jwks_consecutive_failures` | gauge | `class` | `jwks` | `documented_only` | `always` | Maximum current consecutive failures among active remote and admin-managed JWKS stores by fixed failure class. |
+| `ferrum_jwks_refresh_failures_total` | counter | `class` | `jwks` | `documented_only` | `always` | Remote and admin-managed JWKS refresh failures by fixed failure class. |
 | `ferrum_jwks_trust_age_seconds` | gauge | `state` | `jwks` | `documented_only` | `always` | Maximum age of the last validated non-empty JWKS among active remote and admin-managed stores in each trust state. |
 | `ferrum_jwks_trust_stores` | gauge | `state` | `jwks` | `documented_only` | `always` | Active remote and admin-managed JWKS stores by bounded trust state. |
 | `ferrum_k8s_controller_config_publications_total` | counter | — | `k8s_controller` | `documented_only` | `conditional` | Kubernetes reconciles that committed a changed gateway configuration snapshot. |
