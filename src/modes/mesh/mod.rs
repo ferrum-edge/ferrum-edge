@@ -29565,7 +29565,10 @@ mod tests {
             ..test_mesh_runtime_config()
         };
 
-        let config = prepare_gateway_config_via_mesh_slice(config, &runtime)
+        // Component test of the materialization step: a mesh slice never
+        // carries an operator upstream, so inject it beside the slice.
+        let slice = MeshSlice::from_gateway_config(&config, runtime.mesh_slice_request());
+        let config = prepare_gateway_config_for_native_slice(config, &runtime, &slice)
             .expect("mesh preparation succeeds");
 
         assert_eq!(
@@ -36794,8 +36797,11 @@ mod tests {
                     ..GatewayConfig::default()
                 };
 
-                let prepared =
-                    prepare_gateway_config_via_mesh_slice(config, &runtime).expect("mesh config");
+                // Component test of the injection step: no mesh slice carries
+                // a global plugin, so inject the operator instance beside it.
+                let slice = MeshSlice::from_gateway_config(&config, runtime.mesh_slice_request());
+                let prepared = prepare_gateway_config_for_native_slice(config, &runtime, &slice)
+                    .expect("mesh config");
                 let mesh_authz: Vec<_> = prepared
                     .plugin_configs
                     .iter()
