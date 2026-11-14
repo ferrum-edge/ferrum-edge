@@ -1,0 +1,161 @@
+# Throwaway (bench/runner-loss-rust-1100, never merged). Runs two Coverage
+# integration shards exactly as coverage.yml does (warm ci-coverage cache,
+# swap, CARGO_BUILD_JOBS=2, line-tables-only), once with cargo-llvm-cov's
+# default per-process profiles and once with an online-merged pool
+# (LLVM_PROFILE_FILE_NAME=...-%4m.profraw, as the functional shards already
+# use). Measures disk writes, PSI, profile bytes, tar size and wall time, and
+# compares the shard's coverage report totals between the two modes.
+name: Bench coverage profraw pooling
+
+on:
+  push:
+    branches:
+      - bench/runner-loss-rust-1100
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_NET_RETRY: "10"
+  CARGO_HTTP_MULTIPLEXING: "false"
+  LLVM_COV_IGNORE_FILENAME_REGEX: "(vendor/|tests/|build\\.rs|target/|custom_plugins/|ebpf/|proto/)"
+
+jobs:
+  shard:
+    name: ${{ matrix.shard }} (${{ matrix.mode }})
+    runs-on: ubuntu-26.04
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        mode: [per-process, pooled]
+        shard: [mesh-routing, integration-remainder-1]
+        include:
+          - shard: mesh-routing
+            filters: "integration::mesh_l7_routing_tests\nintegration::mesh_l4_weighted_routing_tests\nintegration::mesh_topology_hbone_tests\nintegration::mesh_authz_e2e_tests\nintegration::mesh_authz_negative_match_tests\nintegration::mesh_service_waypoint_tests\nintegration::mesh_ew_egress_e2e_tests\nintegration::mesh_destination_rule_tls_tests\nintegration::mesh_destination_rule_locality_lb_tests\nintegration::mesh_destination_rule_port_policy_tests\nintegration::mesh_dr_service_entry_e2e_tests\nintegration::mesh_sidecar_e2e_tests"
+            filterset: ""
+            partition: ""
+          - shard: integration-remainder-1
+            filters: ""
+            filterset: "not test(/integration::(admin_api_specs_handler_tests|admin_db_api_specs_tests|admin_db_live_apply_tests|admin_audit_rbac_tests|admin_backend_capabilities_tests|admin_runtime_metrics_tests|admin_observability_auth_tests|admin_cached_config_tests|admin_cross_namespace_refs_tests|admin_mesh_config_drift_tests|admin_mesh_egress_scope_tests|admin_mesh_policy_denies_tests|admin_mesh_runtime_overlay_tests|admin_mesh_service_graph_tests|admin_node_waypoint_identities_tests|apply_incremental_outcome_tests|log_schema_integration_tests|log_schema_registry_tests|gateway_error_class_observability_tests|deferred_log_tests|mesh_l7_routing_tests|mesh_l4_weighted_routing_tests|mesh_topology_hbone_tests|mesh_authz_e2e_tests|mesh_authz_negative_match_tests|mesh_service_waypoint_tests|mesh_ew_egress_e2e_tests|mesh_destination_rule_tls_tests|mesh_destination_rule_locality_lb_tests|mesh_destination_rule_port_policy_tests|mesh_dr_service_entry_e2e_tests|mesh_sidecar_e2e_tests|k8s_controller_istio_status_cas_tests|k8s_controller_istio_status_tests|k8s_controller_status_snapshot_tests|mesh_telemetry_k8s_provider_lookup_tests|mesh_telemetry_tracing_tests|mesh_federation_poller_tests|mesh_proxy_config_tests|mesh_outbound_registry_stream_tests|mesh_runtime_overlay_consumers_tests|mesh_peer_auth_live_reload_tests|mesh_k8s_pod_discovery_tests|mesh_hbone_tests|mesh_bpf_metrics_scrape_tests|cni_tests|cp_dp_grpc_tests|cp_multi_namespace_tests|connection_pool_tests|http2_pool_tests|http3_integration_tests|h3_backend_retirement_tests|grpc_proxy_tests|scripted_backend_smoke_tests|backend_timeout_enforcement_tests|dtls_integration_tests|udp_fault_injection_tests|backend_mtls_tests|backend_tls_san_allow_list_tests|frontend_tls_live_reload_tests|tcp_frontend_tls_order_tests|tcp_fast_path_l4_plugins_tests|gateway_hbone_pool_tests|gateway_svid_identity_tests|graceful_shutdown_tests|port_aware_route_traffic_tests|db_full_load_snapshot_tests|db_incremental_poll_tests|db_offline_bootstrap_tests)/)"
+            partition: "hash:1/2"
+    env:
+      CARGO_BUILD_JOBS: "2"
+      CARGO_PROFILE_DEV_DEBUG: "line-tables-only"
+      CARGO_PROFILE_TEST_DEBUG: "line-tables-only"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Runner inventory
+        run: |
+          lscpu | grep -E 'Model name'
+          echo "ImageVersion=$ImageVersion"
+          free -m; df -m /
+
+      - name: Extend runner swap (as Coverage)
+        run: |
+          set -euo pipefail
+          sudo fallocate -l 12G /mnt/ferrum-swapfile
+          sudo chmod 600 /mnt/ferrum-swapfile
+          sudo mkswap /mnt/ferrum-swapfile
+          sudo swapon /mnt/ferrum-swapfile
+
+      - uses: ./.github/actions/setup-rust-ci
+        with:
+          shared-key: "ci-coverage"
+
+      - name: Install cargo-llvm-cov and cargo-nextest
+        uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
+        with:
+          tool: cargo-llvm-cov,cargo-nextest
+
+      - name: Install llvm tools
+        run: rustup component add llvm-tools-preview
+
+      - name: Clean stale coverage data
+        run: cargo llvm-cov clean --workspace
+
+      - name: Build the instrumented test binary (not measured)
+        run: |
+          set -euo pipefail
+          filters=()
+          while IFS= read -r filter; do [ -z "$filter" ] && continue; filters+=("$filter"); done <<< "$(printf '%b' "$INTEGRATION_FILTERS")"
+          cargo llvm-cov --no-report nextest --test integration_tests --no-tests=pass -E 'none()'
+          # nextest's --list pass runs the binary; drop those profiles so only the
+          # measured step's profiles are counted.
+          find target/llvm-cov-target -name '*.profraw' -delete
+        env:
+          INTEGRATION_FILTERS: ${{ matrix.filters }}
+
+      - name: Run integration coverage shard (measured)
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/bench"
+          if [ "$MODE" = pooled ]; then export LLVM_PROFILE_FILE_NAME=ferrum-edge-integration-%4m.profraw; fi
+          echo "LLVM_PROFILE_FILE_NAME=${LLVM_PROFILE_FILE_NAME:-<cargo-llvm-cov default>}"
+          filters=()
+          while IFS= read -r filter; do [ -z "$filter" ] && continue; filters+=("$filter"); done <<< "$(printf '%b' "$INTEGRATION_FILTERS")"
+          nextest_args=()
+          if [ -n "$INTEGRATION_FILTERSET" ]; then nextest_args+=(-E "$INTEGRATION_FILTERSET"); fi
+          if [ -n "$INTEGRATION_PARTITION" ]; then nextest_args+=(--partition "$INTEGRATION_PARTITION"); fi
+          sectors() { awk '$3=="sda"{print $10}' /proc/diskstats; }
+          w0=$(sectors); start=$(date +%s)
+          python3 .github/bench/runner_sampler.py sample "$RUNNER_TEMP/bench/samples.jsonl" run &
+          spid=$!
+          trap 'kill "$spid" 2>/dev/null || true' EXIT
+          status=0
+          cargo llvm-cov --no-report nextest --test integration_tests --no-fail-fast "${nextest_args[@]}" "${filters[@]}" || status=$?
+          kill "$spid"; wait "$spid" || true; trap - EXIT
+          echo "TEST_PHASE wall_s=$(( $(date +%s) - start )) disk_written_mb=$(( ($(sectors) - w0) * 512 / 1048576 )) nextest_exit=$status"
+          echo "PROFILES count=$(find target/llvm-cov-target -name '*.profraw' | wc -l) mb=$(find target/llvm-cov-target -name '*.profraw' -printf '%s\n' | awk '{s+=$1} END {print int(s/1048576)}')"
+          python3 .github/bench/runner_sampler.py summary "$RUNNER_TEMP/bench/samples.jsonl" run
+        env:
+          MODE: ${{ matrix.mode }}
+          INTEGRATION_FILTERS: ${{ matrix.filters }}
+          INTEGRATION_FILTERSET: ${{ matrix.filterset }}
+          INTEGRATION_PARTITION: ${{ matrix.partition }}
+          RUST_BACKTRACE: 1
+
+      - name: Package coverage data (as Coverage, measured)
+        run: |
+          set -euo pipefail
+          sectors() { awk '$3=="sda"{print $10}' /proc/diskstats; }
+          w0=$(sectors); start=$(date +%s)
+          python3 .github/bench/runner_sampler.py sample "$RUNNER_TEMP/bench/samples.jsonl" package &
+          spid=$!
+          trap 'kill "$spid" 2>/dev/null || true' EXIT
+          find target/llvm-cov-target \
+            -type d \( -name incremental -o -name .fingerprint \) -prune -o \
+            -type f ! -name '*.rlib' ! -name '*.rmeta' ! -name '*.d' ! -name '*.o' -print \
+            > coverage-files.txt
+          echo "packaging $(grep -c '' coverage-files.txt) files ($(grep -c '\.profraw$' coverage-files.txt) profraw)"
+          tar -cf "coverage-${SHARD}.tar" -T coverage-files.txt
+          sync
+          sleep 6
+          kill "$spid"; wait "$spid" || true; trap - EXIT
+          echo "PACKAGE wall_s=$(( $(date +%s) - start )) disk_written_mb=$(( ($(sectors) - w0) * 512 / 1048576 )) tar_mb=$(( $(stat -c %s "coverage-${SHARD}.tar") / 1048576 ))"
+          python3 .github/bench/runner_sampler.py summary "$RUNNER_TEMP/bench/samples.jsonl" package
+          rm -f "coverage-${SHARD}.tar"
+        env:
+          SHARD: ${{ matrix.shard }}
+
+      - name: Coverage report totals for this shard
+        run: |
+          set -euo pipefail
+          start=$(date +%s)
+          cargo llvm-cov report --json --summary-only --output-path "$RUNNER_TEMP/bench/summary.json"
+          echo "REPORT wall_s=$(( $(date +%s) - start ))"
+          python3 -c "import json,sys; t=json.load(open(sys.argv[1]))['data'][0]['totals']; print('TOTALS', json.dumps({k: {'count': v['count'], 'covered': v['covered']} for k, v in t.items() if isinstance(v, dict) and 'count' in v}, sort_keys=True))" "$RUNNER_TEMP/bench/summary.json"
+
+      - name: Upload samples
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: bench-cov-${{ matrix.shard }}-${{ matrix.mode }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/bench/
+          retention-days: 7
+          if-no-files-found: warn
