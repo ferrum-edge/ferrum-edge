@@ -385,6 +385,28 @@ fn decode_and_validate_document(
         validate_resource_counts(&config, expected)?;
     }
 
+    // File mode is fatal on invalid local config (issue #7218): the CORS-style
+    // `allowed_ws_origins: ["*"]` footgun and non-origin entries are refused at
+    // load and SIGHUP reload, exactly as Admin API writes refuse them. Database,
+    // CP and DP loads keep #5454's grandfathering (warn-only through
+    // `Proxy::warn_legacy_allowed_ws_origins`): stored rows there are not
+    // operator-edited files and must not take a running gateway down. Every
+    // namespace in the file is checked, like the field-level validators below.
+    //
+    // This runs before the validation pipeline on purpose: the pipeline's
+    // field validators emit the grandfathering warning ("stored
+    // database/control-plane config is still loaded"), which would be false
+    // for a file-mode document that is refused here.
+    let ws_origin_errors = config.allowed_ws_origins_admission_errors();
+    if !ws_origin_errors.is_empty() {
+        anyhow::bail!(
+            "Configuration validation failed: {} invalid `allowed_ws_origins` \
+             entry(ies) found: {}",
+            ws_origin_errors.len(),
+            ws_origin_errors.join("; ")
+        );
+    }
+
     ValidationPipeline::new(&mut config)
         .validate_resource_ids(ValidationAction::FatalCount(
             "Configuration validation failed: {} invalid resource ID(s) found",
@@ -430,23 +452,6 @@ fn decode_and_validate_document(
              `password_hash`; plaintext `password` is accepted only by Admin API writes \
              (consumer IDs: {})",
             plaintext_basic_auth_consumers.join(", ")
-        );
-    }
-
-    // File mode is fatal on invalid local config (issue #7218): the CORS-style
-    // `allowed_ws_origins: ["*"]` footgun and non-origin entries are refused at
-    // load and SIGHUP reload, exactly as Admin API writes refuse them. Database,
-    // CP and DP loads keep #5454's grandfathering (warn-only through
-    // `Proxy::warn_legacy_allowed_ws_origins`): stored rows there are not
-    // operator-edited files and must not take a running gateway down. Every
-    // namespace in the file is checked, like the field-level validators above.
-    let ws_origin_errors = config.allowed_ws_origins_admission_errors();
-    if !ws_origin_errors.is_empty() {
-        anyhow::bail!(
-            "Configuration validation failed: {} invalid `allowed_ws_origins` \
-             entry(ies) found: {}",
-            ws_origin_errors.len(),
-            ws_origin_errors.join("; ")
         );
     }
 

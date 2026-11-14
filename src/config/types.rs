@@ -8765,8 +8765,9 @@ impl Proxy {
 
     /// Warn once when a loaded proxy still carries the CORS-style `"*"`
     /// footgun or a non-origin `allowed_ws_origins` entry. Never fails the load
-    /// by itself; file mode refuses the document separately in
-    /// `file_loader` (issue #7218).
+    /// by itself. File mode refuses such a document in `file_loader` before
+    /// the validation pipeline runs (issue #7218), so a file-mode load never
+    /// emits this warning.
     pub fn warn_legacy_allowed_ws_origins(&self) {
         let has_legacy_entry = self.allowed_ws_origins.iter().any(|origin| {
             let trimmed = origin.trim();
@@ -11617,7 +11618,7 @@ impl GatewayConfig {
             // Grandfather existing `"*"` / non-origin rows: never fail a
             // database/CP/DP load for this (issue #5454). Admission rejects
             // the same values through `validate_fields`, and file mode
-            // refuses them in `file_loader` (issue #7218).
+            // refuses them in `file_loader` before this runs (issue #7218).
             proxy.warn_legacy_allowed_ws_origins();
             proxy.warn_unreachable_regex_path_parameters();
         }
