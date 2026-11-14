@@ -22,11 +22,13 @@ use ferrum_edge::config::{EnvConfig, OperatingMode};
 use ferrum_edge::dns::{DnsCache, DnsConfig};
 use ferrum_edge::identity::spiffe::{SpiffeId, TrustDomain};
 use ferrum_edge::modes::mesh::config::{
-    AppProtocol, InboundRelayDenial, MeshConfig, MeshService, ResolvedIngressListener, ServicePort,
-    SidecarIngressConnectRelay, Workload, WorkloadPort, WorkloadRef, WorkloadSelector,
+    AppProtocol, InboundRelayDenial, MeshConfig, MeshService, MeshSidecar, MeshSidecarEgress,
+    ResolvedIngressListener, ServicePort, SidecarIngressConnectRelay, Workload, WorkloadPort,
+    WorkloadRef, WorkloadSelector,
 };
+use ferrum_edge::modes::mesh::slice::MeshSlice;
 use ferrum_edge::modes::mesh::{
-    MeshTopology, MeshTrafficDirection, prepare_gateway_config_for_mesh,
+    MeshRuntimeConfig, MeshTopology, MeshTrafficDirection, prepare_gateway_config_for_mesh,
 };
 use ferrum_edge::proxy::{ProxyState, start_proxy_listener_with_bound_listener_and_mesh_direction};
 
@@ -458,4 +460,130 @@ fn an_ingress_stream_listener_sharing_an_http_listener_endpoint_is_refused() {
         synthesis_refusal(&format!("{POD_IP}:9080"), &mesh, false, own),
         Some("ingress_endpoint_mapping_mismatch")
     );
+}
+
+// ── Identity narrowing must not take the inbound relay's port bound ──────
+//
+// Sidecar identity narrowing (on by default) keeps only the workload records
+// the egress-admitted services reference. A Sidecar whose egress scope does
+// not admit its OWN service therefore loses its own record from the routing
+// `workloads` view. Inbound serving must not depend on egress scope: the
+// owned-address port bound the raw-TCP CONNECT relay checks has to come from
+// the preserved local-inbound view, or every inbound raw-TCP CONNECT is
+// refused `PortNotDeclared`.
+
+const OTHER_SERVICE: &str = "ratings";
+const OTHER_POD_IP: &str = "10.244.2.2";
+
+/// The local `reviews` pod plus a `ratings` service, under an enforced Sidecar
+/// whose egress scope admits only `ratings`.
+fn egress_scoped_config() -> GatewayConfig {
+    let own_spiffe = format!("spiffe://cluster.local/ns/{NAMESPACE}/sa/{SERVICE}");
+    let (own_workload, own_service) = local_service(&own_spiffe, HTTP_PORT, TCP_PORT);
+    let other_spiffe = format!("spiffe://cluster.local/ns/{NAMESPACE}/sa/{OTHER_SERVICE}");
+    let (mut other_workload, mut other_service) = local_service(&other_spiffe, HTTP_PORT, TCP_PORT);
+    other_workload.service_name = OTHER_SERVICE.to_string();
+    other_workload.service_account = Some(OTHER_SERVICE.to_string());
+    other_workload.addresses = vec![OTHER_POD_IP.to_string()];
+    other_workload
+        .selector
+        .labels
+        .insert("app".to_string(), OTHER_SERVICE.to_string());
+    other_service.name = OTHER_SERVICE.to_string();
+    GatewayConfig {
+        mesh: Some(Box::new(MeshConfig {
+            workloads: vec![own_workload, other_workload],
+            services: vec![own_service, other_service],
+            sidecars: vec![MeshSidecar {
+                name: "default".to_string(),
+                namespace: NAMESPACE.to_string(),
+                workload_selector: None,
+                egress_inherits_defaults: false,
+                egress: vec![MeshSidecarEgress {
+                    hosts: vec![format!("./{OTHER_SERVICE}")],
+                    port: None,
+                }],
+                ingress_declared: false,
+                ingress: Vec::new(),
+                outbound_traffic_policy: None,
+            }],
+            ..MeshConfig::default()
+        })),
+        ..GatewayConfig::default()
+    }
+}
+
+fn egress_scoped_runtime(identity_narrowing: bool) -> MeshRuntimeConfig {
+    let mut runtime = default_mesh_runtime();
+    runtime.namespace = NAMESPACE.to_string();
+    runtime.topology = MeshTopology::Sidecar;
+    runtime.workload_spiffe_id = Some(format!(
+        "spiffe://cluster.local/ns/{NAMESPACE}/sa/{SERVICE}"
+    ));
+    runtime.sidecar_enforced = true;
+    runtime.sidecar_identity_narrowing = identity_narrowing;
+    runtime
+}
+
+#[test]
+fn identity_narrowing_keeps_inbound_raw_tcp_relay_when_self_is_outside_egress_scope() {
+    let own_spiffe = format!("spiffe://cluster.local/ns/{NAMESPACE}/sa/{SERVICE}");
+
+    // The premise: with narrowing on, the slice's routing view no longer
+    // carries this pod's own record, while the local-inbound view does.
+    let narrowed = MeshSlice::from_gateway_config(
+        &egress_scoped_config(),
+        egress_scoped_runtime(true).mesh_slice_request(),
+    );
+    assert!(
+        !narrowed
+            .workloads
+            .iter()
+            .any(|workload| workload.spiffe_id.as_str() == own_spiffe),
+        "identity narrowing drops the local record when its own service is outside \
+         the Sidecar egress scope"
+    );
+    assert!(
+        narrowed
+            .local_inbound_workloads
+            .as_deref()
+            .is_some_and(|local| local
+                .iter()
+                .any(|workload| workload.spiffe_id.as_str() == own_spiffe)),
+        "the local-inbound view keeps it"
+    );
+
+    // Narrowing on (the default) and off must serve the same inbound relay.
+    for identity_narrowing in [true, false] {
+        let prepared = prepare_gateway_config_for_mesh(
+            egress_scoped_config(),
+            &egress_scoped_runtime(identity_narrowing),
+        )
+        .expect("prepare");
+        let mesh = prepared.mesh.expect("prepared mesh block");
+        let own = Some(pod_ip());
+        assert_eq!(
+            mesh.inbound_stream_relay_destination_decision(POD_IP, TCP_PORT, own),
+            Ok(()),
+            "narrowing={identity_narrowing}: an authenticated raw-TCP CONNECT to this \
+             pod's own declared stream port must be relayed"
+        );
+        assert_eq!(
+            synthesis_refusal(&format!("{POD_IP}:{TCP_PORT}"), &mesh, false, own),
+            None,
+            "narrowing={identity_narrowing}: the relay proxy is synthesized"
+        );
+        // The bound itself is kept: an undeclared port is still refused, and
+        // the other service's pod is never an own-address destination.
+        assert_eq!(
+            mesh.inbound_stream_relay_destination_decision(POD_IP, 9999, own),
+            Err(InboundRelayDenial::PortNotDeclared),
+            "narrowing={identity_narrowing}: the own-address port bound still applies"
+        );
+        assert_eq!(
+            mesh.inbound_stream_relay_destination_decision(OTHER_POD_IP, TCP_PORT, own),
+            Err(InboundRelayDenial::AddressNotTerminated),
+            "narrowing={identity_narrowing}: another service's pod is not this terminator's"
+        );
+    }
 }
