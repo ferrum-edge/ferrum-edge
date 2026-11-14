@@ -15343,6 +15343,15 @@ pub fn screen_mesh_route_dispatch_egress(
 ///
 /// These names are intentionally fail-closed during config load so upgrades
 /// cannot silently drop authentication/authorization protections.
+///
+/// Deliberately kept (issue #7113): this is not a legacy shim. The list is a
+/// published contract surface: the ferrum-contracts `plugin-catalog`
+/// carries it as `removed_plugins`, promising that Edge refuses a config
+/// naming one of them. It also reserves the names `oauth2_auth` and
+/// `semantic_ai_firewall`, so a custom plugin cannot register under a retired
+/// security plugin's name (see the reservation in
+/// `create_plugin_with_http_client_and_config_id`). Removing or renaming an
+/// entry needs a coordinated ferrum-contracts release.
 pub const REMOVED_PLUGIN_REGISTRATIONS: &[PluginRegistration] = &[
     builtin_plugin("oauth2_auth", PluginFailurePolicy::FailClosed),
     builtin_plugin("semantic_ai_firewall", PluginFailurePolicy::FailClosed),
