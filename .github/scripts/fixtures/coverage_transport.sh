@@ -81,9 +81,8 @@ while IFS= read -r artifact_name; do
   # pipefail propagates corrupt ZIPs AND tar extraction failures.
   unzip -p "$archive" "$member" | { tar -xpf - && cat > /dev/null; }
   # Raw-profile names can coincide across runners: cargo-llvm-cov's
-  # default `%p-%Nm` name reuses pids, and the pooled `%4m` names of
-  # the functional and integration shards carry no pid, only the
-  # binary signature and pool index (#6378). Tag
+  # default `%p-%Nm` name reuses pids, and the functional shards'
+  # pooled `%4m` name carries only the binary signature (#6378). Tag
   # every profile this shard just extracted with its shard name before
   # the next shard can overwrite it. The report merges every
   # top-level `*.profraw`, whatever its name.
