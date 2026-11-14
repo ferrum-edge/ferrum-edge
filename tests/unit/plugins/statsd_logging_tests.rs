@@ -590,8 +590,10 @@ async fn test_statsd_logging_keeps_last_known_good_on_file_mode_load_and_cache_r
     // file-mode load instead of silently dropping the sink.
     ferrum_edge::_test_support::validate_plugin_configs_fatal_for_test(&mut bad_gateway, &policy)
         .expect_err("a statsd_logging typo must fail file-mode load");
-    PluginCache::new(&bad_gateway)
-        .expect_err("an unconstructible statsd_logging must reject the initial cache");
+    assert!(
+        PluginCache::new(&bad_gateway).is_err(),
+        "an unconstructible statsd_logging must reject the initial cache"
+    );
 
     let valid_gateway = GatewayConfig {
         proxies: vec![proxy],

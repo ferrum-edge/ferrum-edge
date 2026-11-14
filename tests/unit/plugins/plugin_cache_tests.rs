@@ -3346,8 +3346,10 @@ fn test_ws_frame_logging_invalid_config_keeps_last_known_good_on_admission_and_r
             Some("p1"),
         )],
     );
-    PluginCache::new(&invalid)
-        .expect_err("an invalid ws_frame_logging must reject the initial cache");
+    assert!(
+        PluginCache::new(&invalid).is_err(),
+        "an invalid ws_frame_logging must reject the initial cache"
+    );
 
     let valid = make_config(
         vec![make_proxy("p1", "/ws", vec!["ws-log"])],

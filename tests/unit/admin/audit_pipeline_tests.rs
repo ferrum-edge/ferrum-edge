@@ -1786,9 +1786,9 @@ async fn db_less_spool_saturation_drains_into_retention_and_reopens_admission() 
 async fn db_less_record_without_spool_writes_the_retention_file_and_latches_only_on_failure() {
     let retention_dir = TempDir::new().expect("retention dir");
     let pipeline_ok = pipeline(retention_config(None, retention_dir.path()));
-    let event = event();
-    let id = event.id.clone();
-    record_without_database_with_pipeline(true, Arc::clone(&pipeline_ok), None, event)
+    let retained_event = event();
+    let id = retained_event.id.clone();
+    record_without_database_with_pipeline(true, Arc::clone(&pipeline_ok), None, retained_event)
         .await
         .expect("the retention write is the durable record");
     assert_eq!(retained_ids(retention_dir.path()), vec![id]);

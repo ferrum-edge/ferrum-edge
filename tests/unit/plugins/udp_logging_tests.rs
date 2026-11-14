@@ -821,8 +821,10 @@ async fn test_udp_logging_unknown_key_instance_keeps_last_known_good() {
     // file-mode load instead of silently dropping the sink.
     ferrum_edge::_test_support::validate_plugin_configs_fatal_for_test(&mut bad_gateway, &policy)
         .expect_err("a udp_logging typo must fail file-mode load");
-    PluginCache::new(&bad_gateway)
-        .expect_err("an unconstructible udp_logging must reject the initial cache");
+    assert!(
+        PluginCache::new(&bad_gateway).is_err(),
+        "an unconstructible udp_logging must reject the initial cache"
+    );
 
     let valid_gateway = GatewayConfig {
         proxies: vec![proxy],
