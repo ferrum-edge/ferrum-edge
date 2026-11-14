@@ -122,6 +122,19 @@ identity is not honored.
 The temporary plaintext compatibility fallback and built-in bare service-account
 assertor defaults remain only for explicit no-CA/no-identity development runs.
 
+VirtualService HTTP routes ride the NodeWaypoint slice too (issue #7233).
+`MeshSlice.http_routes` carries the route proxies, `istio-vs-upstream-*`
+weighted-split upstreams and route plugins (`mesh_route_dispatch` and its
+companions) of the mesh-bound VirtualServices in the subscription namespace
+whose `exportTo` admits it, over native `MeshSubscribe` and the xDS
+`HttpRoutesCarrier`. The data plane re-checks the set and refuses the slice
+when it is not self-contained. Destination policy (`mesh_authz`'s
+`node_waypoint_route_upstreams`) and RequestAuthentication destination scoping
+therefore resolve a VirtualService route to the workloads it reaches on a
+production NodeWaypoint, not only in tests. Sidecar, Ambient and
+ServiceWaypoint slices carry no HTTP routes. See `docs/mesh.md` ("Mesh data
+planes: NodeWaypoint route carriage").
+
 ## Destination NodeWaypoint Identity
 
 Production should use a node-bound NodeWaypoint SVID so a peer can be pinned to

@@ -887,6 +887,7 @@ This is the same mechanism as the [DestinationRule carrier](#ecds-destinationrul
 | `labels_ambiguous` (shared-SPIFFE intersection marker) | `WorkloadLabelsAmbiguousCarrier` | `ferrum-mesh-carrier/workload-labels-ambiguous` |
 | `virtual_service_l4_proxies` | `VirtualServiceL4ProxiesCarrier` | `ferrum-mesh-carrier/virtual-service-l4-proxies` |
 | `virtual_service_l4_upstreams` | `VirtualServiceL4UpstreamsCarrier` | `ferrum-mesh-carrier/virtual-service-l4-upstreams` |
+| `http_routes` (NodeWaypoint VirtualService HTTP routes) | `HttpRoutesCarrier` | `ferrum-mesh-carrier/http-routes` |
 | `mesh_policies` (authz) | `MeshPoliciesCarrier` | `ferrum-mesh-carrier/mesh-policies` |
 | `virtual_service_cors_policies` | `VirtualServiceCorsPoliciesCarrier` | `ferrum-mesh-carrier/virtual-service-cors-policies` |
 | `istio_root_namespace` (DR lookup tier 3) | `IstioRootNamespaceCarrier` | `ferrum-mesh-carrier/istio-root-namespace` |
@@ -2669,6 +2670,10 @@ destinations.
   Any other destination resolves through the index `mesh_authz` uses for
   destination policy. Both lookups are keyed by namespace and upstream id,
   because generated upstream ids are unique only within a namespace.
+  The HTTP routes include the VirtualService routes the NodeWaypoint's slice
+  carries (see [Mesh data planes: NodeWaypoint route
+  carriage](#mesh-data-planes-nodewaypoint-route-carriage)), whose
+  `istio-vs-upstream-*` upstreams resolve through that index.
   - A route whose destination set differs from the waypoint's own set gets a
     proxy-group `jwks_auth` instance (`__mesh_request_auth_dst_*`) that replaces
     the global `__mesh_request_auth` on that route. JWT validation, token
@@ -5140,6 +5145,16 @@ The node-agent variables are indexed under [Node Agent](#node-agent) in Environm
 Istio `VirtualService` resources are translated at the Kubernetes translation layer into Ferrum proxy configuration. The following per-route features are supported:
 
 **Generated route ids are claimed per VirtualService.** Route proxy ids (`istio-vs-<ns>-<name>-<route suffix>`) and weighted-split upstream ids (`istio-vs-upstream-<ns>-<name>-<index>`) join the name and suffix with `-` and fold `.` into `-`, so two VirtualServices in one namespace can derive the same id (`my.app` and `my-app`, or `a` `http[1]` match 0 and `a-1` `http[0]`). The VirtualService translated first (snapshot order: namespace, then name) owns the id; a later one deriving an owned proxy or upstream id is refused as a whole and reports `FerrumAccepted=False`/`Invalid` naming the owner, instead of having its route shadowed or replacing the owner's backends. Rename one of the two to resolve it. Ids in different namespaces never collide.
+
+### Mesh data planes: NodeWaypoint route carriage
+
+A VirtualService's `http[]` routes are emitted as ordinary gateway proxies (`istio-vs-*`), weighted-split upstreams (`istio-vs-upstream-*`) and route plugins (`mesh_route_dispatch` and the companions it needs). A mesh data plane is built from its mesh slice, not from those gateway resources, so the routes reach it only through the slice (issue #7233):
+
+- **Which VirtualServices.** The translator writes a `mesh.virtual_service_http_routes` binding (name, namespace, `exportTo`, route proxy ids) for each VirtualService that binds the mesh: `spec.gateways` omitted or naming `mesh`. A VirtualService that names only ingress gateways gets no binding and stays gateway-only. `exportTo` follows the same rules as the CORS policy below (omitted means `["*"]`).
+- **Which data planes.** Only a **NodeWaypoint** subscription receives routes today, on `MeshSlice.http_routes`. The control plane carries the routes of bindings in the subscription namespace whose `exportTo` admits it, each with the plugin configs it is associated with and the `istio-vs-upstream-*` upstreams it or its `mesh_route_dispatch` rules name. When a Sidecar egress scope applies, every destination must be admitted, as for L4 routes. A route that is not self-contained (an association or upstream that is missing, shared or not translator-owned) is dropped and the waypoint serves that host through its materialized Service route instead. Sidecar, Ambient and the other topologies receive no HTTP routes.
+- **Wire.** The set rides native `MeshSubscribe` inside the slice JSON and xDS as `HttpRoutesCarrier`; slice content equality compares it, so a route edit or withdrawal re-applies and an unchanged projection does not.
+- **Data plane.** The NodeWaypoint decodes the set into its config before materialization and refuses the slice (keeping the previous generation) when an element is malformed or not in the slice namespace, an id is not translator-owned, an association or upstream reference does not resolve, an upstream is not referenced, or the topology is not NodeWaypoint. Materialized Service routes yield to the carried routes on the same host and path. The carried upstreams feed `mesh_authz`'s `node_waypoint_route_upstreams`, so destination policy and RequestAuthentication destination scoping (#6670) resolve a VirtualService route to the workloads it reaches. The managed `mesh_authz` instance does not copy the route set into its embedded `mesh_slice`.
+- **Gateway API.** HTTPRoute routes bind Gateway or ListenerSet listeners (GAMMA Service parents are not materialized as routes), so they never ride a mesh slice.
 
 ### Route splits and URI matches
 
