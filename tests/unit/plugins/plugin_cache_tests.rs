@@ -4161,6 +4161,64 @@ fn test_request_view_stays_on_single_generation_after_rebuild() {
     );
 }
 
+/// Issue #7207: a request view holds the one shared per-(proxy, protocol)
+/// entry instead of an `Arc` clone of every phase list. Building views must
+/// leave the reference counts of the lists themselves untouched, while every
+/// accessor still hands out the cache generation's own lists.
+#[test]
+fn test_request_view_shares_one_entry_instead_of_cloning_phase_lists() {
+    let config = make_config(
+        vec![make_proxy("p1", "/api", vec!["auth", "transform"])],
+        vec![
+            make_plugin_config("auth", "key_auth", PluginScope::Proxy, Some("p1"), true),
+            make_plugin_config(
+                "transform",
+                "request_transformer",
+                PluginScope::Proxy,
+                Some("p1"),
+                true,
+            ),
+        ],
+    );
+    let cache = PluginCache::new(&config).unwrap();
+    let plugins = cache.get_plugins_for_protocol("ferrum", "p1", ProxyProtocol::Http);
+    let auth = cache.get_auth_plugins("ferrum", "p1", ProxyProtocol::Http);
+    let plugins_refs = Arc::strong_count(&plugins);
+    let auth_refs = Arc::strong_count(&auth);
+
+    let views: Vec<_> = (0..8)
+        .map(|_| cache.request_view("ferrum", "p1", ProxyProtocol::Http))
+        .collect();
+    let cloned = views[0].clone();
+
+    assert_eq!(
+        Arc::strong_count(&plugins),
+        plugins_refs,
+        "building or cloning a view must not clone the plugin list"
+    );
+    assert_eq!(
+        Arc::strong_count(&auth),
+        auth_refs,
+        "building or cloning a view must not clone the auth list"
+    );
+    for view in views.iter().chain(std::iter::once(&cloned)) {
+        assert!(Arc::ptr_eq(&view.plugins(), &plugins));
+        assert!(Arc::ptr_eq(&view.auth_plugins(), &auth));
+        assert!(
+            view.capabilities()
+                .has(PluginCapabilities::MODIFIES_REQUEST_HEADERS)
+        );
+    }
+    assert!(
+        cache
+            .get_capabilities("ferrum", "p1", ProxyProtocol::Http)
+            .has(PluginCapabilities::MODIFIES_REQUEST_HEADERS)
+    );
+    let names: Vec<&str> = plugins.iter().map(|plugin| plugin.name()).collect();
+    assert!(names.contains(&"key_auth") && names.contains(&"request_transformer"));
+    assert_eq!(auth.len(), 1);
+}
+
 #[tokio::test]
 async fn test_request_view_precomputes_response_committed_hook_capability() {
     let mut audit = make_plugin_config_with_json(
