@@ -4,7 +4,7 @@
 //!
 //! Every test that consumes this module starts a REAL in-process Ferrum
 //! gateway (`ferrum_edge::modes::file::serve`) over a config that has been
-//! through `prepare_gateway_config_via_mesh_slice`, so the DestinationRule → dispatch
+//! through `prepare_gateway_config_via_mesh_slice_with_fixtures`, so the DestinationRule → dispatch
 //! policy → admission-funnel chain is exercised end to end rather than
 //! asserted from source text. The observable contract in every case is:
 //!
@@ -28,7 +28,8 @@ use ferrum_edge::config::types::GatewayConfig;
 use ferrum_edge::config::{EnvConfig, OperatingMode};
 use ferrum_edge::modes::file::ServeOptions;
 use ferrum_edge::modes::mesh::{
-    MeshConfigProtocol, MeshRuntimeConfig, MeshTopology, prepare_gateway_config_via_mesh_slice,
+    MeshConfigProtocol, MeshRuntimeConfig, MeshTopology,
+    prepare_gateway_config_via_mesh_slice_with_fixtures,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -127,11 +128,11 @@ pub(super) async fn start_gateway(
         ..EnvConfig::default()
     };
 
-    let prepared = prepare_gateway_config_via_mesh_slice(config, &mesh_runtime_config()).map_err(
-        |e| -> Box<dyn std::error::Error + Send + Sync> {
-            format!("mesh preparation failed: {e}").into()
-        },
-    )?;
+    let prepared =
+        prepare_gateway_config_via_mesh_slice_with_fixtures(config, &mesh_runtime_config())
+            .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
+                format!("mesh preparation failed: {e}").into()
+            })?;
 
     let jwt_manager = JwtManager::new(JwtConfig {
         secret: JWT_SECRET.to_string(),
@@ -176,7 +177,7 @@ pub(super) async fn start_gateway(
 /// Used by the setup gates so a translation regression fails as a config
 /// assertion instead of as a confusing traffic assertion.
 pub(super) fn prepare_for_assertions(config: GatewayConfig) -> GatewayConfig {
-    prepare_gateway_config_via_mesh_slice(config, &mesh_runtime_config())
+    prepare_gateway_config_via_mesh_slice_with_fixtures(config, &mesh_runtime_config())
         .expect("mesh preparation for assertions")
 }
 

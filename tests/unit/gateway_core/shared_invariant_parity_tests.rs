@@ -3666,6 +3666,7 @@ fn mesh_config_updates_reject_positional_slice_roots() {
         false,
         [],
         [],
+        {},
         "v1",
     ]);
     let slice: MeshSlice = serde_json::from_value(positional.clone())

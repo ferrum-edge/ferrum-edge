@@ -35,7 +35,8 @@ use ferrum_edge::dns::{DnsCache, DnsConfig};
 use ferrum_edge::identity::spiffe::TrustDomain;
 use ferrum_edge::modes::mesh::config::OutboundTrafficPolicy;
 use ferrum_edge::modes::mesh::{
-    MeshConfigProtocol, MeshRuntimeConfig, MeshTopology, prepare_gateway_config_via_mesh_slice,
+    MeshConfigProtocol, MeshRuntimeConfig, MeshTopology,
+    prepare_gateway_config_via_mesh_slice_with_fixtures,
 };
 use ferrum_edge::proxy::ProxyState;
 
@@ -227,7 +228,7 @@ fn prepared_config_with_max_connections(cap: u32) -> GatewayConfig {
     config.proxies.push(ws_proxy("ws-u"));
     config.normalize_fields();
 
-    prepare_gateway_config_via_mesh_slice(config, &runtime()).expect("mesh apply")
+    prepare_gateway_config_via_mesh_slice_with_fixtures(config, &runtime()).expect("mesh apply")
 }
 
 /// The same upstream + WS proxy with NO DestinationRule at all — the shape a
@@ -238,7 +239,7 @@ fn prepared_config_without_destination_rule() -> GatewayConfig {
     config.proxies.push(ws_proxy("ws-u"));
     config.normalize_fields();
 
-    prepare_gateway_config_via_mesh_slice(config, &runtime()).expect("mesh apply")
+    prepare_gateway_config_via_mesh_slice_with_fixtures(config, &runtime()).expect("mesh apply")
 }
 
 #[test]

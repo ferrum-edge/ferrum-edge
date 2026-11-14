@@ -14,7 +14,9 @@ use ferrum_edge::admin::jwt_auth::{JwtConfig, JwtManager};
 use ferrum_edge::config::types::{GatewayConfig, PluginAssociation};
 use ferrum_edge::config::{EnvConfig, OperatingMode};
 use ferrum_edge::modes::file::ServeOptions;
-use ferrum_edge::modes::mesh::{MeshRuntimeConfig, prepare_gateway_config_via_mesh_slice};
+use ferrum_edge::modes::mesh::{
+    MeshRuntimeConfig, prepare_gateway_config_via_mesh_slice_with_fixtures,
+};
 use http::StatusCode;
 use serde_json::json;
 use std::sync::{
@@ -1887,11 +1889,11 @@ async fn start_h3_policy_gateway_with_env(
         ..EnvConfig::default()
     };
     configure(&mut env_config);
-    let prepared = prepare_gateway_config_via_mesh_slice(config, &mesh_runtime_config()?).map_err(
-        |e| -> Box<dyn std::error::Error + Send + Sync> {
-            format!("mesh preparation failed: {e}").into()
-        },
-    )?;
+    let prepared =
+        prepare_gateway_config_via_mesh_slice_with_fixtures(config, &mesh_runtime_config()?)
+            .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
+                format!("mesh preparation failed: {e}").into()
+            })?;
     // Subset-inheritable HTTP fields (`http1MaxPendingRequests`, and siblings)
     // land on `dispatch_port_override_fallback` so cold-path projection can keep
     // port > subset > top-level. TLS still projects onto upstream/port slots.

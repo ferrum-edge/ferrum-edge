@@ -1,6 +1,6 @@
 //! DestinationRule + ServiceEntry projection coverage.
 //!
-//! Locks in the cold-path materialisation that `prepare_gateway_config_via_mesh_slice`
+//! Locks in the cold-path materialisation that `prepare_gateway_config_via_mesh_slice_with_fixtures`
 //! performs:
 //!
 //! - DestinationRule top-level `traffic_policy` lands on `Upstream.algorithm`,
@@ -26,7 +26,7 @@ use ferrum_edge::modes::mesh::config::{
     AppProtocol, MeshDestinationRule, MeshLoadBalancer, MeshOutlierDetection, MeshSimpleLb,
     MeshTrafficPolicy, Resolution, ServiceEntry, ServiceEntryLocation, ServicePort,
 };
-use ferrum_edge::modes::mesh::prepare_gateway_config_via_mesh_slice;
+use ferrum_edge::modes::mesh::prepare_gateway_config_via_mesh_slice_with_fixtures;
 
 use super::mesh_test_support::{
     DEFAULT_NAMESPACE, default_mesh_runtime, gateway_config_with_mesh, http_proxy, http_upstream,
@@ -77,7 +77,8 @@ fn destination_rule_top_level_load_balancer_projects_to_upstream_algorithm() {
     let mut mesh = mesh_config_with(Vec::new(), Vec::new(), Vec::new());
     mesh.destination_rules.push(dr);
     let config = gateway_config_with_mesh(vec![proxy], vec![upstream], mesh);
-    let prepared = prepare_gateway_config_via_mesh_slice(config, &runtime).expect("dr prepared");
+    let prepared =
+        prepare_gateway_config_via_mesh_slice_with_fixtures(config, &runtime).expect("dr prepared");
     let upstream = prepared
         .upstreams
         .iter()
@@ -109,7 +110,8 @@ fn destination_rule_passthrough_projects_to_upstream_algorithm() {
     let mut mesh = mesh_config_with(Vec::new(), Vec::new(), Vec::new());
     mesh.destination_rules.push(dr);
     let config = gateway_config_with_mesh(vec![proxy], vec![upstream], mesh);
-    let prepared = prepare_gateway_config_via_mesh_slice(config, &runtime).expect("dr prepared");
+    let prepared =
+        prepare_gateway_config_via_mesh_slice_with_fixtures(config, &runtime).expect("dr prepared");
     let upstream = prepared
         .upstreams
         .iter()
@@ -146,7 +148,8 @@ fn destination_rule_outlier_detection_projects_to_upstream_passive_health() {
     let mut mesh = mesh_config_with(Vec::new(), Vec::new(), Vec::new());
     mesh.destination_rules.push(dr);
     let config = gateway_config_with_mesh(vec![proxy], vec![upstream], mesh);
-    let prepared = prepare_gateway_config_via_mesh_slice(config, &runtime).expect("dr prepared");
+    let prepared =
+        prepare_gateway_config_via_mesh_slice_with_fixtures(config, &runtime).expect("dr prepared");
     let upstream = prepared
         .upstreams
         .iter()
@@ -185,7 +188,8 @@ fn destination_rule_connect_timeout_projects_to_proxy_connect_timeout() {
     let mut mesh = mesh_config_with(Vec::new(), Vec::new(), Vec::new());
     mesh.destination_rules.push(dr);
     let config = gateway_config_with_mesh(vec![proxy], vec![upstream], mesh);
-    let prepared = prepare_gateway_config_via_mesh_slice(config, &runtime).expect("dr prepared");
+    let prepared =
+        prepare_gateway_config_via_mesh_slice_with_fixtures(config, &runtime).expect("dr prepared");
     let proxy = prepared
         .proxies
         .iter()
@@ -221,7 +225,8 @@ fn destination_rule_with_no_matching_upstream_is_a_no_op() {
     let mut mesh = mesh_config_with(Vec::new(), Vec::new(), Vec::new());
     mesh.destination_rules.push(dr);
     let config = gateway_config_with_mesh(vec![proxy], vec![upstream], mesh);
-    let prepared = prepare_gateway_config_via_mesh_slice(config, &runtime).expect("dr prepared");
+    let prepared =
+        prepare_gateway_config_via_mesh_slice_with_fixtures(config, &runtime).expect("dr prepared");
     let upstream = prepared
         .upstreams
         .iter()
@@ -263,7 +268,8 @@ fn destination_rule_host_match_is_case_insensitive_against_canonical_host() {
     let mut mesh = mesh_config_with(Vec::new(), Vec::new(), Vec::new());
     mesh.destination_rules.push(dr);
     let config = gateway_config_with_mesh(vec![proxy], vec![upstream], mesh);
-    let prepared = prepare_gateway_config_via_mesh_slice(config, &runtime).expect("dr prepared");
+    let prepared =
+        prepare_gateway_config_via_mesh_slice_with_fixtures(config, &runtime).expect("dr prepared");
     let upstream = prepared
         .upstreams
         .iter()
@@ -300,7 +306,8 @@ fn destination_rule_short_host_form_resolves_to_namespace_qualified_fqdn() {
     let mut mesh = mesh_config_with(Vec::new(), Vec::new(), Vec::new());
     mesh.destination_rules.push(dr);
     let config = gateway_config_with_mesh(vec![proxy], vec![upstream], mesh);
-    let prepared = prepare_gateway_config_via_mesh_slice(config, &runtime).expect("dr prepared");
+    let prepared =
+        prepare_gateway_config_via_mesh_slice_with_fixtures(config, &runtime).expect("dr prepared");
     let upstream = prepared
         .upstreams
         .iter()
@@ -353,7 +360,8 @@ fn service_entry_with_no_export_to_admits_workload_in_same_namespace() {
     let mut mesh = mesh_config_with(vec![workload], Vec::new(), Vec::new());
     mesh.service_entries.push(entry);
     let config = gateway_config_with_mesh(Vec::new(), Vec::new(), mesh);
-    let prepared = prepare_gateway_config_via_mesh_slice(config, &runtime).expect("prepared");
+    let prepared =
+        prepare_gateway_config_via_mesh_slice_with_fixtures(config, &runtime).expect("prepared");
     let mesh_block = prepared.mesh.as_ref().expect("mesh block survives");
     assert_eq!(
         mesh_block.service_entries.len(),
@@ -376,7 +384,8 @@ fn service_entry_exported_to_star_is_visible_to_other_namespaces() {
     let mut mesh = mesh_config_with(vec![workload], Vec::new(), Vec::new());
     mesh.service_entries.push(entry);
     let config = gateway_config_with_mesh(Vec::new(), Vec::new(), mesh);
-    let prepared = prepare_gateway_config_via_mesh_slice(config, &runtime).expect("prepared");
+    let prepared =
+        prepare_gateway_config_via_mesh_slice_with_fixtures(config, &runtime).expect("prepared");
     let mesh_block = prepared.mesh.as_ref().expect("mesh block survives");
     let names: Vec<_> = mesh_block.service_entries.iter().map(|e| &e.name).collect();
     assert!(
@@ -398,7 +407,8 @@ fn service_entry_with_namespace_scoped_export_only_admits_listed_namespace() {
     let mut mesh = mesh_config_with(vec![workload], Vec::new(), Vec::new());
     mesh.service_entries.push(entry);
     let config = gateway_config_with_mesh(Vec::new(), Vec::new(), mesh);
-    let prepared = prepare_gateway_config_via_mesh_slice(config, &runtime).expect("prepared");
+    let prepared =
+        prepare_gateway_config_via_mesh_slice_with_fixtures(config, &runtime).expect("prepared");
     let mesh_block = prepared.mesh.as_ref().expect("mesh block survives");
     let names: Vec<_> = mesh_block.service_entries.iter().map(|e| &e.name).collect();
     assert!(
@@ -422,7 +432,8 @@ fn service_entry_mesh_internal_location_is_round_tripped_through_slice() {
     let mut mesh = mesh_config_with(vec![workload], Vec::new(), Vec::new());
     mesh.service_entries.push(entry);
     let config = gateway_config_with_mesh(Vec::new(), Vec::new(), mesh);
-    let prepared = prepare_gateway_config_via_mesh_slice(config, &runtime).expect("prepared");
+    let prepared =
+        prepare_gateway_config_via_mesh_slice_with_fixtures(config, &runtime).expect("prepared");
     let mesh_block = prepared.mesh.as_ref().expect("mesh block survives");
     let entry = mesh_block
         .service_entries
@@ -446,7 +457,8 @@ fn mesh_service_visible_in_slice_when_workload_in_same_namespace() {
     let service = service_for("reviews", DEFAULT_NAMESPACE, &[&workload]);
     let mesh = mesh_config_with(vec![workload], vec![service], Vec::new());
     let config = gateway_config_with_mesh(Vec::new(), Vec::new(), mesh);
-    let prepared = prepare_gateway_config_via_mesh_slice(config, &runtime).expect("prepared");
+    let prepared =
+        prepare_gateway_config_via_mesh_slice_with_fixtures(config, &runtime).expect("prepared");
     let mesh_block = prepared.mesh.as_ref().expect("mesh block survives");
     assert!(
         mesh_block.services.iter().any(|s| s.name == "reviews"),
@@ -482,7 +494,8 @@ fn destination_rule_combines_multiple_fields_in_a_single_traffic_policy() {
     let mut mesh = mesh_config_with(Vec::new(), Vec::new(), Vec::new());
     mesh.destination_rules.push(dr);
     let config = gateway_config_with_mesh(vec![proxy], vec![upstream], mesh);
-    let prepared = prepare_gateway_config_via_mesh_slice(config, &runtime).expect("prepared");
+    let prepared =
+        prepare_gateway_config_via_mesh_slice_with_fixtures(config, &runtime).expect("prepared");
     let upstream = prepared
         .upstreams
         .iter()

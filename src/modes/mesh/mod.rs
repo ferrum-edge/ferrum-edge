@@ -1594,6 +1594,64 @@ pub fn prepare_gateway_config_via_mesh_slice(
     prepare_gateway_config_from_mesh_slice(&mesh_slice, runtime)
 }
 
+/// [`prepare_gateway_config_via_mesh_slice`] for component tests that need
+/// gateway resources no mesh slice carries.
+///
+/// The mesh view is exactly the production one: `config` is projected into
+/// this runtime's slice and decoded from it. The operator proxies, upstreams,
+/// plugin configs and consumers in `config` are then added as fixtures beside
+/// the slice-built resources before materialization, so a test can drive a
+/// shared materializer (DestinationRule overlay, HBONE admission, dispatch
+/// policy) over a resource it controls. Translator-owned route resources
+/// (`istio-vs-*`, `gwapi-route-*`) are never added: whether a data plane gets
+/// one is the slice's decision (issue #7233). No serving path calls this.
+#[doc(hidden)]
+pub fn prepare_gateway_config_via_mesh_slice_with_fixtures(
+    mut config: GatewayConfig,
+    runtime: &MeshRuntimeConfig,
+) -> Result<GatewayConfig, anyhow::Error> {
+    config.normalize_fields();
+    config.normalize_mesh_fields();
+    if let Err(errors) = config.validate_resource_ids() {
+        return Err(anyhow::anyhow!(
+            "Mesh input resource ID validation failed: {}",
+            errors.join("; ")
+        ));
+    }
+    let mesh_errors = config.validate_mesh_fields();
+    if !mesh_errors.is_empty() {
+        return Err(anyhow::anyhow!(
+            "Mesh configuration validation failed: {}",
+            mesh_errors.join("; ")
+        ));
+    }
+    let mesh_slice = MeshSlice::from_gateway_config(&config, runtime.mesh_slice_request());
+    let (mut prepared, merged_slice) =
+        unprepared_gateway_config_from_mesh_slice(&mesh_slice, runtime, None, None)?;
+    let route_owned = |id: &str| id.starts_with("istio-vs-") || id.starts_with("gwapi-route-");
+    prepared.proxies.extend(
+        config
+            .proxies
+            .into_iter()
+            .filter(|proxy| !route_owned(&proxy.id)),
+    );
+    prepared.upstreams.extend(
+        config
+            .upstreams
+            .into_iter()
+            .filter(|upstream| !route_owned(&upstream.id)),
+    );
+    prepared.plugin_configs.extend(
+        config
+            .plugin_configs
+            .into_iter()
+            .filter(|plugin| !route_owned(&plugin.id)),
+    );
+    prepared.consumers.extend(config.consumers);
+    let materialization_slice = merged_slice.as_ref().unwrap_or(&mesh_slice);
+    prepare_gateway_config_for_native_slice(prepared, runtime, materialization_slice)
+}
+
 /// Prepare a gateway snapshot from an already-projected [`MeshSlice`].
 ///
 /// This is the materialization path every mesh config source (native, xDS,
@@ -3987,6 +4045,21 @@ fn gateway_config_from_mesh_slice_with_federation(
     federation: Option<&federation::FederationSnapshot>,
     remote_endpoints: Option<&multicluster::RemoteEndpointSnapshot>,
 ) -> Result<GatewayConfig, anyhow::Error> {
+    let (config, merged_slice) =
+        unprepared_gateway_config_from_mesh_slice(slice, runtime, federation, remote_endpoints)?;
+    let materialization_slice = merged_slice.as_ref().unwrap_or(slice);
+    prepare_gateway_config_for_native_slice(config, runtime, materialization_slice)
+}
+
+/// The config a mesh slice decodes to, before materialization, plus the
+/// remote-merged slice materialization must read when remote endpoints were
+/// merged in (`None` means materialize from `slice` itself).
+fn unprepared_gateway_config_from_mesh_slice(
+    slice: &MeshSlice,
+    runtime: &MeshRuntimeConfig,
+    federation: Option<&federation::FederationSnapshot>,
+    remote_endpoints: Option<&multicluster::RemoteEndpointSnapshot>,
+) -> Result<(GatewayConfig, Option<MeshSlice>), anyhow::Error> {
     let loaded_at = chrono::DateTime::parse_from_rfc3339(&slice.version)
         .map(|ts| ts.with_timezone(&chrono::Utc))
         .unwrap_or_else(|_| chrono::Utc::now());
@@ -4048,7 +4121,6 @@ fn gateway_config_from_mesh_slice_with_federation(
         services: services.clone(),
         ..slice.clone()
     });
-    let materialization_slice = merged_slice.as_ref().unwrap_or(slice);
 
     let mut proxies = decode_virtual_service_l4_proxies(slice)?;
     let mut upstreams = decode_virtual_service_l4_upstreams(slice)?;
@@ -4063,6 +4135,9 @@ fn gateway_config_from_mesh_slice_with_federation(
             workloads,
             services,
             mesh_policies: slice.mesh_policies.clone(),
+            // The providers CUSTOM policies bind to. Without them mesh
+            // validation refuses every slice that carries a CUSTOM policy.
+            ext_authz_providers: slice.ext_authz_providers.clone(),
             peer_authentications: slice.peer_authentications.clone(),
             service_entries: slice.service_entries.clone(),
             request_authentications: slice.request_authentications.clone(),
@@ -4088,7 +4163,7 @@ fn gateway_config_from_mesh_slice_with_federation(
         loaded_at,
         ..GatewayConfig::default()
     };
-    prepare_gateway_config_for_native_slice(config, runtime, materialization_slice)
+    Ok((config, merged_slice))
 }
 
 fn decode_virtual_service_l4_proxies(slice: &MeshSlice) -> Result<Vec<Proxy>, anyhow::Error> {
