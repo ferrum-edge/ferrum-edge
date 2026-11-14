@@ -1771,8 +1771,14 @@ async fn validate_bundle(
                         Err(error) => Err(error.clone()),
                     }
                 };
-            if let Err(error) = validation {
-                plugin_errors.push(error);
+            match validation {
+                Err(error) => plugin_errors.push(error),
+                // A managed JWKS reference (`managed://jwks/<id>#jwks`) must
+                // name an existing, usable record in this node's managed TLS
+                // store, exactly as a direct `POST /plugins/config`,
+                // `POST /batch`, or `POST /restore` requires (issue #7277).
+                Ok(()) => plugin_errors
+                    .extend(crate::admin::managed_jwks_source_admission_errors(plugin).await),
             }
         }
 

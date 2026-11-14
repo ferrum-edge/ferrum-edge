@@ -412,3 +412,179 @@ async fn admin_managed_jwks_drives_jwks_auth_verification_rotation_and_withdrawa
         )
         .await;
 }
+
+async fn sqlite_store(dir: &tempfile::TempDir) -> ferrum_edge::config::db_loader::DatabaseStore {
+    let db_path = dir
+        .path()
+        .join(format!("managed-jwks-{}.db", uuid::Uuid::new_v4().simple()));
+    let url = format!("sqlite:{}?mode=rwc", db_path.to_string_lossy());
+    ferrum_edge::config::db_loader::DatabaseStore::connect_with_pool_config(
+        "sqlite",
+        &url,
+        ferrum_edge::config::db_loader::DbPoolConfig {
+            max_connections: 4,
+            min_connections: 0,
+            acquire_timeout_seconds: 5,
+            idle_timeout_seconds: 60,
+            max_lifetime_seconds: 300,
+            connect_timeout_seconds: 5,
+            statement_timeout_seconds: 0,
+        },
+    )
+    .await
+    .expect("connect sqlite store")
+}
+
+fn jwks_auth_plugin_body(id: &str, source: &str, enabled: bool) -> Value {
+    json!({
+        "id": id,
+        "plugin_name": "jwks_auth",
+        "scope": "global",
+        "enabled": enabled,
+        "config": { "providers": [{ "issuer": TOKEN_ISSUER, "jwks_source": source }] },
+    })
+}
+
+fn jwks_auth_spec(proxy_id: &str, plugin_id: &str, source: &str) -> Value {
+    json!({
+        "openapi": "3.1.0",
+        "info": {"title": "Managed JWKS API", "version": "1.0.0"},
+        "x-ferrum-proxy": {
+            "id": proxy_id,
+            "backend_host": "backend.internal",
+            "backend_port": 443,
+            "listen_path": format!("/{proxy_id}")
+        },
+        "x-ferrum-plugins": [{
+            "id": plugin_id,
+            "plugin_name": "jwks_auth",
+            "config": { "providers": [{ "issuer": TOKEN_ISSUER, "jwks_source": source }] }
+        }]
+    })
+}
+
+/// Every admin write path that persists an enabled `jwks_auth` /
+/// `oidc_relying_party` refuses a `jwks_source` naming a managed JWKS record
+/// this node does not hold: `POST /plugins/config`, `POST /batch`, and API
+/// spec create and replace (issue #7277; dsf F2/F3 and sol F2 on #7373). A
+/// disabled plugin is staged without the check, and every path admits the
+/// reference once the record exists.
+#[tokio::test(flavor = "multi_thread")]
+async fn admin_writes_refuse_a_managed_jwks_source_without_a_usable_record() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut state = admin_state(Arc::new(ArcSwap::from_pointee(GatewayConfig::default())));
+    state.db = Some(Arc::new(sqlite_store(&dir).await));
+    state.cached_config = None;
+    state.mode = "database".to_string();
+    let admin = AdminHarness::start(state).await;
+
+    let record_id = format!("idp-{}", uuid::Uuid::new_v4().simple());
+    let source = format!("managed://jwks/{record_id}#jwks");
+    let missing_id = format!("missing-{}", uuid::Uuid::new_v4().simple());
+    let missing = format!("managed://jwks/{missing_id}#jwks");
+
+    let refused_naming = |status: StatusCode, body: &Value, expected: StatusCode, id: &str| {
+        assert_eq!(status, expected, "{body}");
+        let rendered = body.to_string();
+        assert!(
+            rendered.contains(id) && rendered.contains("does not exist"),
+            "the refusal must name the missing record: {body}"
+        );
+    };
+
+    // Single plugin write.
+    let (status, body) = admin
+        .send(
+            reqwest::Method::POST,
+            "/plugins/config",
+            Some(jwks_auth_plugin_body("managed-single", &source, true)),
+        )
+        .await;
+    refused_naming(status, &body, StatusCode::BAD_REQUEST, &record_id);
+
+    // A disabled plugin is staged: the presence check gates enabled writes.
+    let (status, body) = admin
+        .send(
+            reqwest::Method::POST,
+            "/plugins/config",
+            Some(jwks_auth_plugin_body("managed-disabled", &missing, false)),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+
+    // Batch write.
+    let (status, body) = admin
+        .send(
+            reqwest::Method::POST,
+            "/batch",
+            Some(json!({
+                "plugin_configs": [jwks_auth_plugin_body("managed-batch", &source, true)],
+            })),
+        )
+        .await;
+    refused_naming(status, &body, StatusCode::BAD_REQUEST, &record_id);
+
+    // API spec create: the extracted plugin goes through the same check.
+    let proxy_id = format!("managed-spec-{}", uuid::Uuid::new_v4().simple());
+    let (status, body) = admin
+        .send(
+            reqwest::Method::POST,
+            "/api-specs",
+            Some(jwks_auth_spec(&proxy_id, "managed-spec-plugin", &source)),
+        )
+        .await;
+    refused_naming(status, &body, StatusCode::UNPROCESSABLE_ENTITY, &record_id);
+
+    // Create the record; every path now admits the reference.
+    let key = signing_key("admission");
+    let (status, body) = admin
+        .send(
+            reqwest::Method::POST,
+            "/admin/tls/jwks",
+            Some(json!({ "id": record_id, "name": "IdP keys", "jwks_json": jwks_json(&[&key]) })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+
+    let (status, body) = admin
+        .send(
+            reqwest::Method::POST,
+            "/plugins/config",
+            Some(jwks_auth_plugin_body("managed-single", &source, true)),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+
+    let (status, body) = admin
+        .send(
+            reqwest::Method::POST,
+            "/api-specs",
+            Some(jwks_auth_spec(&proxy_id, "managed-spec-plugin", &source)),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let spec_id = body["id"].as_str().expect("created spec id").to_string();
+
+    // API spec replace: a reference to a missing record is refused and the
+    // stored spec keeps serving the admitted one.
+    let (status, body) = admin
+        .send(
+            reqwest::Method::PUT,
+            &format!("/api-specs/{spec_id}"),
+            Some(jwks_auth_spec(&proxy_id, "managed-spec-plugin", &missing)),
+        )
+        .await;
+    refused_naming(status, &body, StatusCode::UNPROCESSABLE_ENTITY, &missing_id);
+    let (status, body) = admin
+        .send(
+            reqwest::Method::GET,
+            "/plugins/config/managed-spec-plugin",
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body["config"]["providers"][0]["jwks_source"], source,
+        "a refused replacement must not be persisted: {body}"
+    );
+}
