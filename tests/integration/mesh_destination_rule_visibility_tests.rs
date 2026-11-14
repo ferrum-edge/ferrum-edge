@@ -44,10 +44,11 @@ use ferrum_edge::config_sources::k8s::{
 use ferrum_edge::identity::SpiffeId;
 use ferrum_edge::identity::spiffe::TrustDomain;
 use ferrum_edge::modes::mesh::config::{
-    AppProtocol, MeshConfig, MeshDestinationRule, MeshLoadBalancer, MeshOutlierDetection,
-    MeshService, MeshSidecar, MeshSidecarEgress, MeshSimpleLb, MeshTrafficPolicy,
-    MeshTrafficPolicyTls, MtlsMode, Resolution, ServiceEntry, ServiceEntryLocation, ServicePort,
-    Workload, WorkloadRef, destination_rule_exported_to_namespace,
+    AppProtocol, MeshConfig, MeshDestinationRule, MeshEndpoint, MeshLoadBalancer,
+    MeshOutlierDetection, MeshService, MeshSidecar, MeshSidecarEgress, MeshSimpleLb,
+    MeshTrafficPolicy, MeshTrafficPolicyTls, MtlsMode, Resolution, ServiceEntry,
+    ServiceEntryLocation, ServicePort, Workload, WorkloadRef,
+    destination_rule_exported_to_namespace,
 };
 use ferrum_edge::modes::mesh::slice::{MeshSlice, MeshSliceRequest};
 use ferrum_edge::modes::mesh::{MeshRuntimeConfig, MeshTopology, prepare_gateway_config_for_mesh};
@@ -2119,4 +2120,119 @@ fn egress_gateway_tls_port_always_originates_tls() {
         BackendScheme::Https,
         "a TLS port is a terminate-and-re-originate port; DISABLE does not downgrade it"
     );
+}
+
+// ── EgressGateway: a STATIC ServiceEntry is still matched by its host ────
+//
+// Under `resolution: STATIC` the egress upstream's targets are the declared
+// endpoint addresses, not the ServiceEntry host. A DestinationRule names the
+// host, so the upstream must carry that host as a match candidate or the rule
+// (its TLS origination included) never reaches the endpoints and an HTTP2/GRPC
+// port silently stays plaintext.
+
+const STATIC_ENDPOINT: &str = "192.0.2.10";
+
+/// [`egress_gateway_mesh`] with the ServiceEntry switched to `resolution:
+/// STATIC` and one IP endpoint carrying the named port.
+fn static_egress_gateway_mesh(
+    protocol: AppProtocol,
+    rules: Vec<MeshDestinationRule>,
+) -> MeshConfig {
+    let mut mesh = egress_gateway_mesh(EXTERNAL_HOST_OWNER, rules);
+    let entry = &mut mesh.service_entries[0];
+    entry.resolution = Resolution::Static;
+    entry.ports[0].protocol = protocol;
+    entry.endpoints = vec![MeshEndpoint {
+        address: STATIC_ENDPOINT.to_string(),
+        ports: HashMap::from([("https".to_string(), 8443)]),
+        labels: HashMap::new(),
+        network: None,
+    }];
+    mesh
+}
+
+/// The upstream and proxy materialized for the STATIC endpoint.
+fn static_egress_pair(prepared: &GatewayConfig) -> (&Upstream, BackendScheme, u64) {
+    let upstream = prepared
+        .upstreams
+        .iter()
+        .find(|u| u.targets.iter().any(|t| t.host == STATIC_ENDPOINT))
+        .expect("the egress gateway materializes an upstream for the STATIC endpoint");
+    let proxy = prepared
+        .proxies
+        .iter()
+        .find(|p| p.upstream_id.as_deref() == Some(upstream.id.as_str()))
+        .expect("the materialized egress upstream has a referencing proxy");
+    (
+        upstream,
+        proxy
+            .backend_scheme
+            .expect("an HTTP-family egress proxy carries a backend scheme"),
+        proxy.backend_connect_timeout_ms,
+    )
+}
+
+#[test]
+fn a_static_service_entry_host_rule_originates_tls_to_its_endpoints() {
+    for protocol in [AppProtocol::Http, AppProtocol::Http2, AppProtocol::Grpc] {
+        let prepared = prepare_egress_gateway(static_egress_gateway_mesh(
+            protocol,
+            vec![external_owner_policy_rule(EXTERNAL_HOST_OWNER)],
+        ));
+        let (upstream, scheme, connect_timeout_ms) = static_egress_pair(&prepared);
+        assert!(
+            upstream
+                .targets
+                .iter()
+                .all(|target| target.host == STATIC_ENDPOINT && target.port == 8443),
+            "{protocol:?}: the premise — STATIC dials the declared endpoint, not the host"
+        );
+        assert_eq!(
+            scheme,
+            BackendScheme::Https,
+            "{protocol:?}: the owner's tls.mode SIMPLE for the ServiceEntry host must \
+             originate TLS to its STATIC endpoints"
+        );
+        assert_eq!(
+            upstream.backend_tls_sni.as_deref(),
+            Some(EXTERNAL_HOST),
+            "{protocol:?}: and the rule's TLS settings must reach the upstream"
+        );
+        assert_eq!(
+            upstream.backend_tls_san_allow_list,
+            vec![EXTERNAL_HOST.to_string()],
+            "{protocol:?}: including its SAN allow-list"
+        );
+        assert_eq!(
+            connect_timeout_ms, 2222,
+            "{protocol:?}: the rest of the rule's trafficPolicy applies too"
+        );
+    }
+}
+
+#[test]
+fn a_static_service_entry_without_a_rule_stays_plaintext_and_a_claimant_cannot_change_it() {
+    let (_, scheme, _) = static_egress_pair(&prepare_egress_gateway(static_egress_gateway_mesh(
+        AppProtocol::Grpc,
+        Vec::new(),
+    )));
+    assert_eq!(
+        scheme,
+        BackendScheme::Http,
+        "no DestinationRule: plaintext h2c"
+    );
+
+    let mut claimant = external_owner_policy_rule("evil");
+    claimant.name = "claimant".to_string();
+    let prepared = prepare_egress_gateway(static_egress_gateway_mesh(
+        AppProtocol::Grpc,
+        vec![claimant],
+    ));
+    let (upstream, scheme, _) = static_egress_pair(&prepared);
+    assert_eq!(
+        scheme,
+        BackendScheme::Http,
+        "matching the ServiceEntry host must not let a non-owner's rule reach it"
+    );
+    assert_eq!(upstream.backend_tls_sni, None);
 }

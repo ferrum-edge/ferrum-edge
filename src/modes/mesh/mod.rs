@@ -12850,7 +12850,13 @@ fn build_http_egress_for_entry(
 
         materialized_http_hosts.insert(host.clone());
 
-        upstreams.push(build_egress_upstream(&upstream_id, namespace, targets, now));
+        upstreams.push(build_egress_upstream(
+            &upstream_id,
+            host,
+            namespace,
+            targets,
+            now,
+        ));
 
         let proxy = egress_gateway_proxy(
             &proxy_id,
@@ -13009,7 +13015,13 @@ fn build_stream_egress_for_entry(
 
     materialized_stream_ports.insert(port_spec.port);
 
-    upstreams.push(build_egress_upstream(&upstream_id, namespace, targets, now));
+    upstreams.push(build_egress_upstream(
+        &upstream_id,
+        representative_host,
+        namespace,
+        targets,
+        now,
+    ));
 
     let proxy = stream_egress_gateway_proxy(
         &proxy_id,
@@ -13028,8 +13040,19 @@ fn build_stream_egress_for_entry(
 /// Shared upstream constructor used by both HTTP- and stream-family egress
 /// materialization. Keeps the proxy/upstream pair fields in sync — any new
 /// upstream field added here flows to both materialization paths.
+///
+/// The upstream is NAMED with the ServiceEntry host it serves, like the
+/// outbound mesh upstreams are named with their service FQDN, so a
+/// DestinationRule keyed on that host matches it whatever the resolution
+/// (`upstream_destination_rule_match_hosts` enumerates target host / upstream
+/// NAME / id). Under `resolution: STATIC` the targets are the declared
+/// endpoint addresses and the id is an escaped token, so without the host as
+/// the name no DestinationRule for the ServiceEntry host could ever reach the
+/// upstream: its load balancer, outlier and TLS policy (including the TLS
+/// origination [`project_egress_gateway_origination`] reads) were dropped.
 fn build_egress_upstream(
     upstream_id: &str,
+    service_entry_host: &str,
     namespace: &str,
     targets: Vec<UpstreamTarget>,
     now: chrono::DateTime<chrono::Utc>,
@@ -13037,7 +13060,7 @@ fn build_egress_upstream(
     Upstream {
         labels: Default::default(),
         id: upstream_id.to_string(),
-        name: Some(upstream_id.to_string()),
+        name: Some(service_entry_host.to_string()),
         namespace: namespace.to_string(),
         targets,
         algorithm: LoadBalancerAlgorithm::RoundRobin,
