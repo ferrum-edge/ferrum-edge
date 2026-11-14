@@ -2170,6 +2170,35 @@ audit handoff still happens before the action. A `fail_closed` audit outage
 therefore refuses the audited TLS/ACME action without applying sticky database
 failover policy to that independent store or operational reload.
 
+### Modes without a configuration database
+
+`mesh`, `file`, and `dp` have no `audit_events` table. Their audited actions
+(for example `POST /mesh/config-revision/reset` and `POST /admin/tls/rotate`)
+still prepare and finalize through the spool exactly as below, but the delivery
+target is the **bounded local audit retention file**
+`admin-audit-retention.json` in `FERRUM_ADMIN_AUDIT_FALLBACK_PATH` (issue #7200):
+
+- A delivery worker starts with the admin listener. It adopts records
+  abandoned by earlier process generations (`unknown_outcome` included),
+  replays them, and drains every finalized record from `pending/` into the
+  retention file, so the spool stays empty instead of growing until
+  `FERRUM_ADMIN_AUDIT_SPOOL_MAX_RECORDS` saturates and `fail_closed` refuses
+  audited actions.
+- Without a spool the finalized event is written to the retention file
+  directly before the response returns.
+- The file is hardened, locked, and atomically published like the backup
+  fallback file beside it, and rotates the same way: it keeps the newest
+  records within `FERRUM_ADMIN_AUDIT_LOCAL_RETENTION_MAX_RECORDS` (default
+  4096) and `FERRUM_ADMIN_AUDIT_LOCAL_RETENTION_MAX_BYTES` (default 16 MiB),
+  dropping the oldest with a content-free `audit_local_retention_rotated`
+  warning. A replayed record (same event id) is not written twice.
+- `ferrum_admin_audit_evidence_lost` latches only when the retention write
+  itself fails; a replayed record whose write fails stays durable in the spool
+  and is retried like any delivery.
+- Nothing ships the file: it is not returned by `GET /audit`. Collect it like
+  any other on-host security log, and put `FERRUM_ADMIN_AUDIT_FALLBACK_PATH` on
+  a persistent, writable volume.
+
 ### Durable evidence before the mutation
 
 1. **Prepare.** The admin write gate durably creates an *audit intent* — a
@@ -3313,7 +3342,7 @@ Returns `404 Not Found` outside mesh mode (no `mesh_runtime_state`). Returns `20
 
 ## Mesh Config Revision Reset (mesh mode)
 
-`POST /mesh/config-revision/reset` clears this DP's accepted authoritative config revision so the next mesh slice from **any** config authority is eligible again. Requires JWT authentication and the **`operator`** role (`403 Forbidden` without it). Returns `404 Not Found` outside mesh mode. This lowers a fail-closed freshness guard, so it requires explicit operator confirmation via `?confirm=true` (same pattern as destructive namespace and restore operations) and leaves a durable audit record when `FERRUM_ADMIN_AUDIT_ENABLED` is on. On success returns `200 OK`:
+`POST /mesh/config-revision/reset` clears this DP's accepted authoritative config revision so the next mesh slice from **any** config authority is eligible again. Requires JWT authentication and the **`operator`** role (`403 Forbidden` without it). Returns `404 Not Found` outside mesh mode. This lowers a fail-closed freshness guard, so it requires explicit operator confirmation via `?confirm=true` (same pattern as destructive namespace and restore operations) and leaves a durable audit record when `FERRUM_ADMIN_AUDIT_ENABLED` is on. Mesh mode has no configuration database, so that record is kept in the bounded local audit retention file (`admin-audit-retention.json` in `FERRUM_ADMIN_AUDIT_FALLBACK_PATH`; see [Modes without a configuration database](#modes-without-a-configuration-database)). On success returns `200 OK`:
 
 ```json
 {

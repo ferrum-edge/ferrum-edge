@@ -3895,6 +3895,17 @@ pub mod _test_support {
             .map_err(|error| error.to_string())
     }
 
+    /// Whether the audit spool claimer may take the owner lock of `instance`
+    /// on a host that creates instance trees in place (`creates_in_place`,
+    /// the non-Unix startup path) or by a locked rename (Unix). Exposes the
+    /// non-Unix startup claim-race rule (issue #7200) to Linux CI.
+    pub fn audit_spool_instance_lock_is_claimable_for_test(
+        instance: &std::path::Path,
+        creates_in_place: bool,
+    ) -> bool {
+        crate::admin::audit_spool::instance_lock_is_claimable(instance, creates_in_place)
+    }
+
     /// Drive the cancellation-safe pre-mutation audit prepare with two blocking
     /// barriers around the durable write. External tests abort the enclosing
     /// request scope between them, then prove the detached prepare finalizes the

@@ -17531,6 +17531,10 @@ fn start_mesh_admin_listeners(
             return Err(anyhow::anyhow!("Invalid admin JWT configuration: {}", err));
         }
     };
+    // No configuration database in this mode: durable admin audit records are
+    // retained in the bounded local retention file (issue #7200). Start the
+    // worker that adopts and drains the spool into it before admin traffic.
+    crate::admin::audit::start_local_retention_delivery(env_config.admin_audit_enabled);
     let admin_state = AdminState {
         db: None,
         jwt_manager,
@@ -21772,6 +21776,10 @@ async fn shutdown_and_join_mesh(
 
     join_mesh_background_handles(tasks.handles, MESH_STARTUP_BACKGROUND_DRAIN_TIMEOUT).await;
     if finalize_global_plugins {
+        crate::admin::audit::shutdown_local_retention_delivery(Duration::from_secs(
+            proxy_state.env_config.shutdown_drain_seconds.clamp(5, 60),
+        ))
+        .await;
         crate::observability_delivery::shutdown(Duration::from_millis(
             proxy_state.env_config.log_shutdown_drain_timeout_ms,
         ))
