@@ -87,7 +87,8 @@ jobs:
       - name: Hosted prerequisites
         run: |
           sudo apt-get update
-          sudo apt-get install -y protobuf-compiler libssl-dev clang
+          # libcurl headers: rdkafka-sys builds librdkafka with OAUTHBEARER.
+          sudo apt-get install -y protobuf-compiler libssl-dev libcurl4-openssl-dev clang
       - name: Resolve the baseline commit
         run: |
           set -euo pipefail
