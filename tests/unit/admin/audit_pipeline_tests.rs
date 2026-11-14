@@ -1960,9 +1960,9 @@ fn db_less_retention_replay_resyncs_the_directory_before_acknowledging() {
     let dir = TempDir::new().expect("retention dir");
     let bounds = LocalAuditRetentionBounds::default();
     let target = dir.path().to_path_buf();
-    let failures = Arc::new(AtomicU64::new(1));
+    let fail_next = Arc::new(AtomicBool::new(true));
     let syncs = Arc::new(AtomicU64::new(0));
-    let hook_failures = Arc::clone(&failures);
+    let hook_fail_next = Arc::clone(&fail_next);
     let hook_syncs = Arc::clone(&syncs);
     let _clear = ClearLocalAuditSyncHook;
     set_local_audit_sync_hook_for_tests(Some(Arc::new(
@@ -1971,12 +1971,7 @@ fn db_less_retention_replay_resyncs_the_directory_before_acknowledging() {
                 return Ok(());
             }
             hook_syncs.fetch_add(1, Ordering::SeqCst);
-            if hook_failures
-                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
-                    left.checked_sub(1)
-                })
-                .is_ok()
-            {
+            if hook_fail_next.swap(false, Ordering::SeqCst) {
                 return Err(std::io::Error::other("injected directory sync failure"));
             }
             Ok(())
@@ -1992,7 +1987,7 @@ fn db_less_retention_replay_resyncs_the_directory_before_acknowledging() {
         "the rename is visible although its directory sync failed"
     );
 
-    failures.store(1, Ordering::SeqCst);
+    fail_next.store(true, Ordering::SeqCst);
     append_local_retention_event(dir.path(), bounds, &event)
         .expect_err("a replay must not acknowledge while the directory sync still fails");
 
