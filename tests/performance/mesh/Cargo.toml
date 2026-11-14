@@ -73,6 +73,10 @@ harness = false
 name = "unix_backend_pool"
 harness = false
 
+[[bench]]
+name = "plugin_request_view"
+harness = false
+
 [profile.dev]
 opt-level = 0
 debug = true
