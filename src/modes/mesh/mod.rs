@@ -62,8 +62,8 @@ use crate::modes::mesh::config::{
     MeshInboundTcpRoute, MeshJwtRule, MeshLoadBalancer, MeshLocalityLbSetting,
     MeshOutlierDetection, MeshPolicy, MeshRequestAuthentication, MeshSimpleLb, MeshTelemetryConfig,
     MeshTrafficPolicy, MeshTrafficPolicyTls, MtlsMode, PolicyScope, Resolution, ServiceEntry,
-    ServiceEntryLocation, ServiceTargetPort, destination_rule_exported_to_namespace,
-    destination_rule_lookup_tier, resolve_target_port, service_entry_exported_to_namespace,
+    ServiceEntryLocation, destination_rule_exported_to_namespace, destination_rule_lookup_tier,
+    resolve_target_port, service_entry_exported_to_namespace,
 };
 use crate::modes::mesh::config_consumer::native_client::NativeMeshClientConfig;
 use crate::modes::mesh::config_consumer::stock_xds_client::StockXdsClientConfig;
@@ -5172,14 +5172,8 @@ where
         // (rollout skew / typo like `targetPort: "http"` with no matching
         // container port) doesn't silently publish a target on the wrong port.
         // Only an ABSENT targetPort falls back to the service port.
-        let target_port = match service_port.target_port.as_ref() {
-            Some(_) => {
-                match resolve_target_port(service_port.target_port.as_ref(), &workload.ports) {
-                    Some(p) if p != 0 => p,
-                    _ => continue,
-                }
-            }
-            None => service_port.port,
+        let Some(target_port) = service_port.backend_port_for(&workload.ports) else {
+            continue;
         };
 
         for address in &workload.addresses {
@@ -5965,19 +5959,9 @@ pub(crate) fn mesh_outbound_http_bywl_upstreams<'a>(
             let mut seen: std::collections::HashSet<(std::net::IpAddr, u16)> =
                 std::collections::HashSet::new();
             for workload in matched_local_service_workloads(service, workloads, multi_cluster) {
-                let app_port = match service_port.target_port.as_ref() {
-                    Some(_) => match crate::modes::mesh::config::resolve_target_port(
-                        service_port.target_port.as_ref(),
-                        &workload.ports,
-                    ) {
-                        Some(p) if p != 0 => p,
-                        _ => continue,
-                    },
-                    None => service_port.port,
-                };
-                if app_port == 0 {
+                let Some(app_port) = service_port.backend_port_for(&workload.ports) else {
                     continue;
-                }
+                };
                 for address in &workload.addresses {
                     if address.is_empty() {
                         continue;
@@ -6062,20 +6046,10 @@ pub(crate) fn mesh_outbound_tcp_bywl_upstreams<'a>(
             for workload in matched_local_service_workloads(service, workloads, multi_cluster) {
                 // Same app-port resolution as `build_outbound_mesh_targets`:
                 // a DECLARED targetPort is authoritative (resolve or SKIP);
-                // only an ABSENT one falls back to the service port.
-                let app_port = match service_port.target_port.as_ref() {
-                    Some(_) => match crate::modes::mesh::config::resolve_target_port(
-                        service_port.target_port.as_ref(),
-                        &workload.ports,
-                    ) {
-                        Some(p) if p != 0 => p,
-                        _ => continue,
-                    },
-                    None => service_port.port,
-                };
-                if app_port == 0 {
+                // only an ABSENT one means the service port.
+                let Some(app_port) = service_port.backend_port_for(&workload.ports) else {
                     continue;
-                }
+                };
                 for address in &workload.addresses {
                     if address.is_empty() {
                         continue;
@@ -6110,36 +6084,6 @@ pub(crate) fn mesh_outbound_tcp_bywl_upstreams<'a>(
         }
     }
     specs
-}
-
-fn resolve_sidecar_inbound_backend_port(
-    service_port: &crate::modes::mesh::config::ServicePort,
-    workload: &crate::modes::mesh::config::Workload,
-) -> Option<u16> {
-    match service_port.target_port.as_ref() {
-        Some(ServiceTargetPort::Number(n)) => Some(*n),
-        Some(ServiceTargetPort::Name(name)) => workload
-            .ports
-            .iter()
-            .find(|wp| wp.name.as_deref() == Some(name.as_str()))
-            .map(|wp| wp.port),
-        None if workload.ports.is_empty() => Some(service_port.port),
-        None => workload
-            .ports
-            .iter()
-            .find(|wp| wp.name.is_some() && wp.name == service_port.name)
-            .or_else(|| {
-                workload
-                    .ports
-                    .iter()
-                    .find(|wp| wp.port == service_port.port)
-            })
-            .or(match workload.ports.as_slice() {
-                [only] => Some(only),
-                _ => None,
-            })
-            .map(|wp| wp.port),
-    }
 }
 
 /// Materialize inbound routes for the sidecar's **local** workload so that
@@ -6357,33 +6301,23 @@ fn materialize_sidecar_inbound_proxies(
                 .collect();
             for service_port in &http_ports {
                 // Backend = the workload's app (container) port this service port
-                // forwards to. A declared `targetPort` is Kubernetes' AUTHORITATIVE
-                // service-port→container-port binding, so honor it exclusively — no
-                // heuristic fallback: a numeric targetPort IS the container port; a
-                // named one resolves against the workload's container-port names, and
-                // an unresolved name (typo / rollout skew) SKIPS rather than guessing
-                // a different port. Only when NO targetPort is declared do we fall
-                // back to the heuristic over the signals we have, in declining order
-                // of confidence:
-                //   1. a shared port NAME — the canonical Service↔container linkage,
-                //   2. an equal port NUMBER — `targetPort` defaulting to the port,
-                //   3. the workload's sole container port — single-port pod.
-                // A workload that declares no ports defaults to the service port
-                // (Kubernetes' `targetPort`-defaults-to-`port` rule). Otherwise the
-                // target is genuinely ambiguous: skip and warn rather than misroute.
-                let backend_port = resolve_sidecar_inbound_backend_port(service_port, workload);
-                // Reject a 0 backend (invalid targetPort/port; config validation also
-                // rejects it for non-xDS slices) defensively rather than route to :0.
-                let Some(backend_port) = backend_port.filter(|&p| p != 0) else {
+                // forwards to, by the ONE Kubernetes rule every mesh path shares
+                // (`ServicePort::backend_port_for`, issue #7236): a declared
+                // `targetPort` is authoritative (a numeric one IS the container
+                // port; a named one resolves against the workload's container-port
+                // names, and an unresolved name SKIPS rather than guessing), and an
+                // absent `targetPort` means the service port. A zero port (invalid;
+                // config validation also rejects it for non-xDS slices) skips too.
+                let Some(backend_port) = service_port.backend_port_for(&workload.ports) else {
                     warn!(
                         service = %sanitize_startup_scalar(service.name.to_string()),
                         namespace = %sanitize_startup_scalar(service.namespace.to_string()),
                         service_port = %sanitize_startup_scalar(service_port.port.to_string()),
                         target_port = %sanitize_startup_scalar(format!("{:?}", service_port.target_port)),
                         "Cannot resolve a usable local backend port for an inbound mesh route \
-                         (no resolvable Service targetPort, and no port name/number match among \
-                         multiple container ports). Set targetPort, name the ports consistently, \
-                         or define an explicit proxy. Skipping this route."
+                         (the declared Service targetPort names no container port of this \
+                         workload). Fix targetPort or define an explicit proxy. Skipping this \
+                         route."
                     );
                     continue;
                 };
@@ -6461,17 +6395,15 @@ fn materialize_sidecar_inbound_proxies(
             }
 
             for service_port in service_tcp_stream_ports(service) {
-                let backend_port = resolve_sidecar_inbound_backend_port(service_port, workload);
-                let Some(backend_port) = backend_port.filter(|&p| p != 0) else {
+                let Some(backend_port) = service_port.backend_port_for(&workload.ports) else {
                     warn!(
                         service = %sanitize_startup_scalar(service.name.to_string()),
                         namespace = %sanitize_startup_scalar(service.namespace.to_string()),
                         service_port = %sanitize_startup_scalar(service_port.port.to_string()),
                         target_port = %sanitize_startup_scalar(format!("{:?}", service_port.target_port)),
                         "Cannot resolve a usable local backend port for an inbound raw-TCP mesh \
-                         route (no resolvable Service targetPort, and no port name/number match \
-                         among multiple container ports). Set targetPort or name ports \
-                         consistently. Skipping this route."
+                         route (the declared Service targetPort names no container port of this \
+                         workload). Fix targetPort. Skipping this route."
                     );
                     continue;
                 };
@@ -8958,18 +8890,9 @@ fn build_outbound_mesh_targets(
         // than fall back to the service port — an unresolved named targetPort
         // (rollout skew / typo) must not dial the wrong port. Only an ABSENT
         // targetPort falls back to the service port.
-        let app_port = match service_port.target_port.as_ref() {
-            Some(_) => {
-                match resolve_target_port(service_port.target_port.as_ref(), &workload.ports) {
-                    Some(p) if p != 0 => p,
-                    _ => continue,
-                }
-            }
-            None => service_port.port,
-        };
-        if app_port == 0 {
+        let Some(app_port) = service_port.backend_port_for(&workload.ports) else {
             continue;
-        }
+        };
 
         let mut tags = match transport {
             MeshEgressTransport::Hbone => crate::service_discovery::mesh::mesh_hbone_target_tags(
@@ -9546,12 +9469,7 @@ fn append_cross_cluster_sidecar_l4_targets(
             );
             continue;
         }
-        let app_port = match service_port.target_port.as_ref() {
-            Some(_) => resolve_target_port(service_port.target_port.as_ref(), &workload.ports)
-                .filter(|port| *port != 0),
-            None => (service_port.port != 0).then_some(service_port.port),
-        };
-        let Some(app_port) = app_port else {
+        let Some(app_port) = service_port.backend_port_for(&workload.ports) else {
             continue;
         };
 
@@ -9835,16 +9753,7 @@ pub(crate) fn append_cross_cluster_ambient_hbone_targets_prematched(
     // resolve (skip the workload otherwise — never fall back to the service
     // port); an ABSENT one uses the service port.
     let resolve_app_port = |workload: &crate::modes::mesh::config::Workload| -> Option<u16> {
-        match service_port.target_port.as_ref() {
-            Some(_) => {
-                match resolve_target_port(service_port.target_port.as_ref(), &workload.ports) {
-                    Some(p) if p != 0 => Some(p),
-                    _ => None,
-                }
-            }
-            None if service_port.port != 0 => Some(service_port.port),
-            None => None,
-        }
+        service_port.backend_port_for(&workload.ports)
     };
 
     // Build each pod's target into a local list first, tagging it with the
@@ -10039,14 +9948,8 @@ fn east_west_workload_is_reachable(
     if workload.addresses.is_empty() {
         return false;
     }
-    match service_port.target_port.as_ref() {
-        Some(_) => matches!(
-            resolve_target_port(service_port.target_port.as_ref(), &workload.ports),
-            Some(p) if p != 0
-        ),
-        // Absent targetPort falls back to the service port — always usable.
-        None => true,
-    }
+    // Absent targetPort means the service port; a declared one must resolve.
+    service_port.backend_port_for(&workload.ports).is_some()
 }
 
 /// The SNIs a client will ACCEPT an east-west gateway for: the base service FQDN
@@ -14573,14 +14476,7 @@ fn scope_request_auth_to_node_waypoint_destinations(
                 .filter(|workload| {
                     !workload.addresses.is_empty()
                         && (!secured_transport || workload.node_waypoint.is_some())
-                        && match port.target_port.as_ref() {
-                            Some(_) => config::resolve_target_port(
-                                port.target_port.as_ref(),
-                                &workload.ports,
-                            )
-                            .is_some_and(|app_port| app_port != 0),
-                            None => port.port != 0,
-                        }
+                        && port.backend_port_for(&workload.ports).is_some()
                 })
                 .collect();
             dialable_upstream_workloads.insert(
@@ -17833,9 +17729,7 @@ fn selectable_inbound_peer_auth_ports(
                     .any(|candidate| candidate.spiffe_id == workload.spiffe_id)
         }) {
             for service_port in &service.ports {
-                if let Some(app_port) = resolve_sidecar_inbound_backend_port(service_port, workload)
-                    .filter(|port| *port != 0)
-                {
+                if let Some(app_port) = service_port.backend_port_for(&workload.ports) {
                     ports.insert(app_port);
                 }
             }
@@ -24321,12 +24215,12 @@ mod tests {
     #[test]
     fn sidecar_inbound_proxies_use_workload_port_and_own_service_only() {
         // The local workload backs service "reviews" with a TCP *container* port
-        // 9090 (the app/target port); the Service declares the port as HTTP on 80.
-        // A different service "ratings" merely shares the SPIFFE id. The inbound
-        // route must (a) key on the workload's OWN service ("reviews", not
-        // "ratings"), (b) be routable from the SERVICE port's HTTP protocol
-        // despite the workload port being TCP, and (c) target the workload's app
-        // port 9090 (not the service port 80).
+        // 9090 (the app/target port); the Service declares the port as HTTP on 80
+        // with a named `targetPort` pointing at it. A different service "ratings"
+        // merely shares the SPIFFE id. The inbound route must (a) key on the
+        // workload's OWN service ("reviews", not "ratings"), (b) be routable from
+        // the SERVICE port's HTTP protocol despite the workload port being TCP,
+        // and (c) target the workload's app port 9090 (not the service port 80).
         let spiffe = "spiffe://cluster.local/ns/default/sa/reviews";
         let runtime = MeshRuntimeConfig {
             workload_spiffe_id: Some(spiffe.to_string()),
@@ -24346,7 +24240,7 @@ mod tests {
                 port: 80,
                 protocol: AppProtocol::Http,
                 name: Some("http".to_string()),
-                target_port: None,
+                target_port: Some(ServiceTargetPort::Name("http".to_string())),
             }],
             workloads: vec![crate::modes::mesh::config::WorkloadRef {
                 spiffe_id: SpiffeId::new(spiffe).unwrap(),
@@ -27768,49 +27662,63 @@ mod tests {
     }
 
     #[test]
-    fn sidecar_inbound_proxies_skip_when_backend_port_is_ambiguous() {
-        // The service port shares neither a name nor a number with any of the
-        // workload's *multiple unnamed* container ports, and the model does not
-        // carry the Service's targetPort. The backend is genuinely ambiguous, so
-        // the route is skipped — never silently routed to an arbitrary port.
+    fn sidecar_inbound_proxies_absent_target_port_uses_service_port() {
+        // Issue #7236: an ABSENT targetPort means the service port on every
+        // path, Sidecar inbound included (the Kubernetes default). The
+        // workload's container ports are never consulted: not a shared port
+        // NAME, not the workload's sole port, not "ambiguous" among several.
         let spiffe = "spiffe://cluster.local/ns/default/sa/reviews";
         let runtime = MeshRuntimeConfig {
             workload_spiffe_id: Some(spiffe.to_string()),
             ..test_mesh_runtime_config()
         };
-        let mut local = workload("reviews", "reviews");
-        local.ports = vec![
-            WorkloadPort {
-                port: 8081,
-                protocol: AppProtocol::Tcp,
-                name: None,
-            },
-            WorkloadPort {
-                port: 8082,
-                protocol: AppProtocol::Tcp,
-                name: None,
-            },
-        ];
-        // Service port 80, unnamed: no name match, no number match (80 ∉ {8081,8082}).
-        let mut service = http_mesh_service("reviews", 80, spiffe);
-        service.ports[0].name = None;
-        let slice = MeshSlice {
-            node_id: "node-a".to_string(),
-            namespace: "default".to_string(),
-            version: "test".to_string(),
-            workloads: vec![local],
-            services: vec![service],
-            ..MeshSlice::default()
-        };
-
-        let config =
-            gateway_config_from_mesh_slice(&slice, &runtime, None, None).expect("slice → config");
-        assert!(
-            !config
+        let inbound_backend = |container_ports: Vec<WorkloadPort>| {
+            let mut local = workload("reviews", "reviews");
+            local.ports = container_ports;
+            let slice = MeshSlice {
+                node_id: "node-a".to_string(),
+                namespace: "default".to_string(),
+                version: "test".to_string(),
+                workloads: vec![local],
+                // Service port 80 named "http", no targetPort.
+                services: vec![http_mesh_service("reviews", 80, spiffe)],
+                ..MeshSlice::default()
+            };
+            let config = gateway_config_from_mesh_slice(&slice, &runtime, None, None)
+                .expect("slice → config");
+            config
                 .proxies
                 .iter()
-                .any(|p| p.id.starts_with("__mesh-inbound-")),
-            "an ambiguous backend port must not materialize a (mis)routed inbound proxy"
+                .filter(|p| p.id.starts_with("__mesh-inbound-"))
+                .map(|p| (p.id.clone(), p.backend_port))
+                .collect::<Vec<_>>()
+        };
+        let expected = vec![("__mesh-inbound-default-reviews-80".to_string(), 80)];
+        let port = |port: u16, name: Option<&str>| WorkloadPort {
+            port,
+            protocol: AppProtocol::Http,
+            name: name.map(str::to_string),
+        };
+
+        assert_eq!(
+            inbound_backend(vec![port(8080, Some("http"))]),
+            expected,
+            "a same-named container port must not replace the service port"
+        );
+        assert_eq!(
+            inbound_backend(vec![port(9090, None)]),
+            expected,
+            "the workload's sole container port must not replace the service port"
+        );
+        assert_eq!(
+            inbound_backend(vec![port(8081, None), port(8082, None)]),
+            expected,
+            "several unnamed container ports are not ambiguous: the service port wins"
+        );
+        assert_eq!(
+            inbound_backend(Vec::new()),
+            expected,
+            "a workload with no declared ports uses the service port"
         );
     }
 
