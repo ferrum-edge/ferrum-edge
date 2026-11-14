@@ -1931,9 +1931,29 @@ fn prepare_normalized_gateway_config_for_mesh(
                             .iter()
                             .map(|(key, value)| (key.clone(), value.clone()))
                             .collect();
-                        mesh_slice
-                            .workloads
+                        // `workloads` is the egress/routing view. Sidecar
+                        // identity narrowing (on by default) drops this
+                        // proxy's OWN record from it whenever its own service
+                        // is outside the Sidecar egress scope, and an empty
+                        // owned view refuses every inbound relay with
+                        // `PortNotDeclared`. Inbound serving must not depend
+                        // on egress scope, so the un-narrowed local-inbound
+                        // view the slice builder preserved is scanned too.
+                        // Its records are copies of `workloads` entries, so a
+                        // record already in `workloads` is skipped: counting
+                        // one pod twice on its address would make the
+                        // own-address projection treat it as ambiguous. The
+                        // same predicate below applies to both views, and the
+                        // local view never reaches the outbound routing view.
+                        let routing_records = mesh_slice.workloads.iter();
+                        let local_inbound_records = mesh_slice
+                            .local_inbound_workloads
+                            .as_deref()
+                            .unwrap_or_default()
                             .iter()
+                            .filter(|local| !mesh_slice.workloads.contains(local));
+                        routing_records
+                            .chain(local_inbound_records)
                             .filter(|workload| {
                                 // `mesh_slice` here is the MULTICLUSTER-MERGED
                                 // materialization slice, and
