@@ -48,10 +48,12 @@ second `FERRUM_MODE=cp` process and issued no certificates. See
 The control plane refuses a plaintext non-loopback CP gRPC bind at startup, and
 the chart fails the render in the same case: set
 `controlPlane.env.FERRUM_CP_GRPC_TLS_CERT_PATH` and
-`controlPlane.env.FERRUM_CP_GRPC_TLS_KEY_PATH` (mounted), bind a loopback
-`FERRUM_CP_GRPC_LISTEN_ADDR`, or set
-`controlPlane.env.FERRUM_CP_DP_GRPC_ALLOW_PLAINTEXT: "true"` (development only;
-`examples/development-values.yaml` does this).
+`controlPlane.env.FERRUM_CP_GRPC_TLS_KEY_PATH` (mounted, as
+`examples/production-existing-secrets-values.yaml` does), or set
+`controlPlane.env.FERRUM_CP_DP_GRPC_ALLOW_PLAINTEXT: "true"` (development and
+test only; `examples/development-values.yaml` does this). Binding the listener
+to loopback also satisfies the check, but then the control-plane Service and
+the data planes cannot reach it.
 
 ## Container image tag
 

@@ -239,6 +239,21 @@ fn control_plane_plaintext_cp_grpc_bind_fails_the_render() {
         );
     }
 
+    // The remedy text must point the control plane at TLS or the explicit
+    // dev/test opt-in, never at a loopback bind: the control-plane Service
+    // targets the pod address, so a loopback listener would serve nothing.
+    let message = &helper[helper.find("{{- fail").expect("guard fails the render")..];
+    assert!(
+        message.contains("FERRUM_CP_GRPC_TLS_CERT_PATH")
+            && message.contains("FERRUM_CP_DP_GRPC_ALLOW_PLAINTEXT")
+            && message.contains("development and test only"),
+        "the guard must name the TLS pair and the plaintext opt-in as the remedies"
+    );
+    assert!(
+        !message.contains("bind a loopback") && !message.contains("(127.0.0.1:50051)"),
+        "the guard must not suggest a loopback CP gRPC bind for the control plane"
+    );
+
     let runtime = std::fs::read_to_string(
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/config/env_config.rs"),
     )

@@ -192,7 +192,10 @@ FERRUM_CP_GRPC_LISTEN_ADDR (default `.defaultListenAddr`, the address the chart
 renders from the component's grpcPort, else 0.0.0.0:50051) with no
 FERRUM_CP_GRPC_TLS_CERT_PATH + FERRUM_CP_GRPC_TLS_KEY_PATH pair and no
 FERRUM_CP_DP_GRPC_ALLOW_PLAINTEXT=true exits at boot, so fail the render
-instead of shipping a crash-looping pod (issue #7298).
+instead of shipping a crash-looping pod (issue #7298). A loopback bind still
+passes, as it does at runtime, but the message does not suggest it: the
+control-plane Service targets the pod address, so a loopback-only listener
+would leave the Service with nothing behind it.
 Input: dict "label" <values path of the env map> "env" <env map>
 "defaultListenAddr" <optional chart-rendered listen address>.
 */}}
@@ -204,7 +207,7 @@ Input: dict "label" <values path of the env map> "env" <env map>
 {{- $tls := and (trim (toString (index $env "FERRUM_CP_GRPC_TLS_CERT_PATH" | default ""))) (trim (toString (index $env "FERRUM_CP_GRPC_TLS_KEY_PATH" | default ""))) -}}
 {{- $allowPlaintext := has (lower (trim (toString (index $env "FERRUM_CP_DP_GRPC_ALLOW_PLAINTEXT" | default "")))) (list "true" "1" "yes") -}}
 {{- if and (ne ($port | int) 0) (not $tls) (not $allowPlaintext) (not (include "ferrum-mesh.isLoopbackBind" $host)) -}}
-{{- fail (printf "%s: FERRUM_MODE=cp refuses at startup to bind PLAINTEXT CP gRPC on non-loopback %s. Set %s.FERRUM_CP_GRPC_TLS_CERT_PATH and %s.FERRUM_CP_GRPC_TLS_KEY_PATH (and mount them), bind a loopback FERRUM_CP_GRPC_LISTEN_ADDR (127.0.0.1:50051), or set %s.FERRUM_CP_DP_GRPC_ALLOW_PLAINTEXT=\"true\" to permit plaintext config sync (development only)." .label $addr .label .label .label) -}}
+{{- fail (printf "%s: FERRUM_MODE=cp refuses at startup to bind PLAINTEXT CP gRPC on non-loopback %s. Serve CP gRPC over TLS by setting %s.FERRUM_CP_GRPC_TLS_CERT_PATH and %s.FERRUM_CP_GRPC_TLS_KEY_PATH (and mounting them), or set %s.FERRUM_CP_DP_GRPC_ALLOW_PLAINTEXT=\"true\" to permit plaintext config sync (development and test only). A loopback bind is not a fix here: the control-plane Service and data planes reach the listener on the pod address." .label $addr .label .label .label) -}}
 {{- end -}}
 {{- end -}}
 
