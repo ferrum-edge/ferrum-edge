@@ -230,7 +230,8 @@ fn jwks_source_is_one_of_the_mutually_exclusive_key_sources() {
 #[test]
 fn managed_providers_follow_the_max_stale_rules_of_refreshable_sources() {
     let mut config = managed_config("managed://jwks/idp-a#jwks");
-    config["providers"][0]["jwks_max_stale_seconds"] = json!(600);
+    // At least the default 900-second refresh interval.
+    config["providers"][0]["jwks_max_stale_seconds"] = json!(1800);
     JwksAuth::new(&config, default_client())
         .expect("jwks_max_stale_seconds bounds an unreadable managed store");
 
