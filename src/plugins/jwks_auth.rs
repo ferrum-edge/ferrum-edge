@@ -44,7 +44,9 @@ pub use super::utils::jwks_store::{
     DEFAULT_JWKS_MAX_STALE_SECONDS, DEFAULT_KID_MISS_REFRESH_COOLDOWN_SECONDS,
     MAX_JWKS_MAX_STALE_SECONDS, MAX_KID_MISS_REFRESH_COOLDOWN_SECONDS,
 };
-use super::utils::jwks_store::{JwksKeyStore, redacted_jwks_uri};
+use super::utils::jwks_store::{
+    JwksKeyStore, canonical_managed_jwks_source, check_managed_jwks_source, redacted_jwks_uri,
+};
 use super::utils::jwt_verifier::{
     CompiledJwtValidation, JwtVerifyParams, peek_unverified_issuer,
     verify_jwt_with_compiled_validation,
@@ -347,6 +349,9 @@ enum JwksSource {
     Inline,
     Direct(String),
     Discovery(String),
+    /// Canonical `managed://jwks/<id>#jwks` source: an admin-managed record
+    /// read from the managed TLS store (issue #7277).
+    Managed(String),
 }
 
 const CONFIG_FIELDS: &[&str] = &[
@@ -381,6 +386,7 @@ const PROVIDER_FIELDS: &[&str] = &[
     "jwks_uri",
     "discovery_url",
     "jwks",
+    "jwks_source",
     "issuer",
     "audiences",
     "from_headers",
@@ -663,6 +669,7 @@ impl JwksAuth {
             let jwks_endpoint = parse_url_field(prov_obj, "jwks_uri", idx)?;
             let discovery_endpoint = parse_url_field(prov_obj, "discovery_url", idx)?;
             let inline_jwks = parse_inline_jwks(prov_obj, idx)?;
+            let managed_jwks_source = parse_managed_jwks_source(prov_obj, idx)?;
             let provider_max_stale_seconds =
                 optional_provider_u64(prov_obj, "jwks_max_stale_seconds", idx)?
                     .unwrap_or(default_max_stale_seconds);
@@ -677,22 +684,23 @@ impl JwksAuth {
 
             let configured_jwks_sources = usize::from(jwks_uri.is_some())
                 + usize::from(discovery_url.is_some())
-                + usize::from(inline_jwks.is_some());
+                + usize::from(inline_jwks.is_some())
+                + usize::from(managed_jwks_source.is_some());
             if configured_jwks_sources == 0 {
                 return Err(format!(
-                    "jwks_auth: `provider[{}]` requires one of `jwks_uri`, `discovery_url`, or `jwks`",
+                    "jwks_auth: `provider[{}]` requires one of `jwks_uri`, `discovery_url`, `jwks`, or `jwks_source`",
                     idx
                 ));
             }
             if configured_jwks_sources > 1 {
                 return Err(format!(
-                    "jwks_auth: `provider[{}]` must configure exactly one of `jwks_uri`, `discovery_url`, or `jwks`",
+                    "jwks_auth: `provider[{}]` must configure exactly one of `jwks_uri`, `discovery_url`, `jwks`, or `jwks_source`",
                     idx
                 ));
             }
             if inline_jwks.is_some() && prov_obj.contains_key("jwks_max_stale_seconds") {
                 return Err(format!(
-                    "jwks_auth: `provider[{idx}].jwks_max_stale_seconds` applies only to remote JWKS sources"
+                    "jwks_auth: `provider[{idx}].jwks_max_stale_seconds` applies only to remote and managed JWKS sources"
                 ));
             }
             if inline_jwks.is_none() && refresh_interval_secs > provider_max_stale_seconds {
@@ -932,6 +940,14 @@ impl JwksAuth {
                 JwksSource::Direct(uri.clone())
             } else if let Some(ref disc_url) = discovery_url {
                 JwksSource::Discovery(disc_url.clone())
+            } else if let Some(ref source) = managed_jwks_source {
+                // Same pure-construction contract as a direct URI: a local,
+                // not-yet-read store; runtime startup swaps in the shared one.
+                let store = JwksKeyStore::new_managed(source.clone());
+                store.configure_trust_policy(refresh_interval, provider_max_stale);
+                store.configure_kid_miss_cooldown(kid_miss_cooldown);
+                jwks_store_slot.store(Arc::new(Some(Arc::new(store))));
+                JwksSource::Managed(source.clone())
             } else {
                 return Err(format!(
                     "jwks_auth: provider[{idx}] has no usable JWKS source"
@@ -941,16 +957,21 @@ impl JwksAuth {
             let identity_claim = prov_consumer_identity_claim
                 .as_deref()
                 .unwrap_or(consumer_identity_claim.as_str());
-            let identity_realm_authority = external_identity_realm_authority(
-                "jwks_auth",
-                &[
-                    ("provider.issuer", issuer.as_deref()),
-                    ("provider.jwks_uri", jwks_uri.as_deref()),
-                    ("provider.discovery_url", discovery_url.as_deref()),
-                    ("provider.jwks", inline_jwks.as_deref()),
-                    ("provider.identity_claim", Some(identity_claim)),
-                ],
-            );
+            // A managed source joins the realm only when configured, so the
+            // realm of every remote/inline provider is unchanged by the field's
+            // existence (live sessions bound to a realm survive the upgrade).
+            let mut realm_fields: Vec<(&str, Option<&str>)> = vec![
+                ("provider.issuer", issuer.as_deref()),
+                ("provider.jwks_uri", jwks_uri.as_deref()),
+                ("provider.discovery_url", discovery_url.as_deref()),
+                ("provider.jwks", inline_jwks.as_deref()),
+            ];
+            if let Some(source) = managed_jwks_source.as_deref() {
+                realm_fields.push(("provider.jwks_source", Some(source)));
+            }
+            realm_fields.push(("provider.identity_claim", Some(identity_claim)));
+            let identity_realm_authority =
+                external_identity_realm_authority("jwks_auth", &realm_fields);
 
             let validation = CompiledJwtValidation::new(&JwtVerifyParams {
                 issuer: issuer.as_deref(),
@@ -2029,7 +2050,7 @@ impl super::Plugin for JwksAuth {
         for provider in &self.providers {
             match &provider.jwks_source {
                 JwksSource::Inline => {}
-                JwksSource::Direct(uri) => {
+                JwksSource::Direct(uri) | JwksSource::Managed(uri) => {
                     let store = get_or_create_jwks_store(
                         uri,
                         &self.http_client,
@@ -2219,6 +2240,7 @@ impl super::Plugin for JwksAuth {
             let guard = prov.jwks_store.load();
             if let Some(ref store) = **guard
                 && store.is_refreshable()
+                && !store.is_managed()
                 && let Some(host) = hostname_from_url(store.jwks_uri())
                 && !hosts.iter().any(|known| known == &host)
             {
@@ -2982,6 +3004,62 @@ fn dpop_provider_identity(issuer: &str) -> String {
     let mut hasher = PartitionHasher::new("ferrum-edge/jwks-auth/dpop-provider-identity/v2");
     hasher.text("provider.issuer", issuer);
     hasher.hex()
+}
+
+/// Parse `provider[i].jwks_source`, a reference to an admin-managed JWKS
+/// record, into its canonical `managed://jwks/<id>#jwks` form.
+///
+/// Static: the record is not read here, so validation stays pure and a CP that
+/// admits the config never needs the material. Presence is checked by admin
+/// plugin admission and by plugin file-dependency validation, and enforced at
+/// runtime (a missing record verifies nothing).
+fn parse_managed_jwks_source(
+    config: &Map<String, Value>,
+    provider_idx: usize,
+) -> Result<Option<String>, String> {
+    let Some(value) = config.get("jwks_source") else {
+        return Ok(None);
+    };
+    let Some(raw) = value.as_str() else {
+        return Err(format!(
+            "jwks_auth: `provider[{provider_idx}].jwks_source` must be a `managed://jwks/<id>#jwks` string"
+        ));
+    };
+    canonical_managed_jwks_source(raw)
+        .map(Some)
+        .map_err(|error| format!("jwks_auth: `provider[{provider_idx}].jwks_source` {error}"))
+}
+
+/// Canonical managed JWKS sources referenced by an enabled `jwks_auth`
+/// config, as `(provider index, canonical source)` pairs. Malformed providers
+/// are skipped: construction reports them.
+pub fn managed_jwks_sources(config: &Value) -> Vec<(usize, String)> {
+    let Some(providers) = config.get("providers").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    providers
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, provider)| {
+            let raw = provider.get("jwks_source")?.as_str()?;
+            canonical_managed_jwks_source(raw)
+                .ok()
+                .map(|source| (idx, source))
+        })
+        .collect()
+}
+
+/// Presence check for every managed JWKS record a `jwks_auth` config names.
+/// Blocking: reads the managed TLS store. One message per unusable reference.
+pub fn managed_jwks_source_errors(config: &Value) -> Vec<String> {
+    managed_jwks_sources(config)
+        .into_iter()
+        .filter_map(|(idx, source)| {
+            check_managed_jwks_source(&source)
+                .err()
+                .map(|error| format!("jwks_auth: `provider[{idx}].jwks_source`: {error}"))
+        })
+        .collect()
 }
 
 fn parse_inline_jwks(
