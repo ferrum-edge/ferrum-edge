@@ -294,3 +294,85 @@ fn standalone_mesh_ca_component_is_gone() {
         );
     }
 }
+
+/// Every shipped example must render under the control-plane CP gRPC guard
+/// (issue #7298 review, sol F1): the CI chart runtime lint renders each example
+/// with no extra flags. The production example therefore carries a complete
+/// CP gRPC TLS setup (cert, key, data-plane client CA, and the Secret mount
+/// behind those paths) instead of relying on the plaintext opt-in.
+#[test]
+fn production_example_serves_cp_grpc_over_tls() {
+    let prod = read_chart("examples/production-existing-secrets-values.yaml");
+    for needle in [
+        "FERRUM_CP_GRPC_TLS_CERT_PATH: /etc/ferrum/cp-grpc-tls/tls.crt",
+        "FERRUM_CP_GRPC_TLS_KEY_PATH: /etc/ferrum/cp-grpc-tls/tls.key",
+        "FERRUM_CP_GRPC_TLS_CLIENT_CA_PATH: /etc/ferrum/cp-grpc-tls/ca.crt",
+        "secretName: ferrum-mesh-production-cp-grpc-tls",
+        "mountPath: /etc/ferrum/cp-grpc-tls",
+    ] {
+        assert!(
+            prod.contains(needle),
+            "the production example must serve CP gRPC over TLS: missing {needle}"
+        );
+    }
+    assert!(
+        !prod.contains("FERRUM_CP_DP_GRPC_ALLOW_PLAINTEXT"),
+        "the production example must not opt into plaintext CP gRPC"
+    );
+}
+
+/// Every chart invocation in the live suites and lab scripts that enables the
+/// control plane must satisfy the CP gRPC guard, or the suite dies at its
+/// preflight render (issue #7298 review, sol F2 / dsf F1).
+#[test]
+fn scripted_control_plane_renders_satisfy_the_cp_grpc_guard() {
+    fn collect(dir: &std::path::Path, out: &mut Vec<PathBuf>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                collect(&path, out);
+            } else if path.extension().is_some_and(|ext| ext == "sh") {
+                out.push(path);
+            }
+        }
+    }
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let mut scripts = Vec::new();
+    collect(&root.join("tests/k8s"), &mut scripts);
+    collect(&root.join("scripts"), &mut scripts);
+    let escapes = [
+        "FERRUM_CP_DP_GRPC_ALLOW_PLAINTEXT=true",
+        "FERRUM_CP_GRPC_TLS_CERT_PATH",
+        "FERRUM_CP_GRPC_LISTEN_ADDR=127.0.0.1",
+        "examples/development-values.yaml",
+        "examples/production-existing-secrets-values.yaml",
+    ];
+    let mut checked = 0usize;
+    for script in &scripts {
+        let text = std::fs::read_to_string(script)
+            .unwrap_or_else(|e| panic!("failed to read {}: {e}", script.display()));
+        let logical = text.replace("\\\n", " ");
+        for line in logical.lines() {
+            let is_helm = ["helm template", "helm install", "helm upgrade"]
+                .iter()
+                .any(|cmd| line.contains(cmd));
+            if !is_helm || !line.contains("controlPlane.enabled=true") {
+                continue;
+            }
+            checked += 1;
+            assert!(
+                escapes.iter().any(|escape| line.contains(escape)),
+                "{} renders the control plane without CP gRPC TLS, a loopback bind, or the \
+                 plaintext opt-in, so the chart guard fails it",
+                script.display()
+            );
+        }
+    }
+    assert!(
+        checked >= 3,
+        "expected the NodeWaypoint live suite and the Gateway API scripts to render the control plane"
+    );
+}

@@ -3342,11 +3342,7 @@ jobs:
             -f "$RUNNER_TEMP/ferrum-helm-results/mesh-extension-maps-values.yaml"
           # Development/example values must satisfy the exhaustive schema.
           helm lint ./charts/ferrum-mesh -f ./charts/ferrum-mesh/examples/development-values.yaml
-          # The production example omits CP gRPC TLS material on purpose (operators
-          # mount their own), so the control-plane plaintext guard (#7298) needs
-          # the development opt-in to lint it.
-          helm lint ./charts/ferrum-mesh -f ./charts/ferrum-mesh/examples/production-existing-secrets-values.yaml \
-            --set-string controlPlane.env.FERRUM_CP_DP_GRPC_ALLOW_PLAINTEXT=true
+          helm lint ./charts/ferrum-mesh -f ./charts/ferrum-mesh/examples/production-existing-secrets-values.yaml
           helm template ferrum ./charts/ferrum-mesh --namespace ferrum \
             > "$RUNNER_TEMP/ferrum-helm-results/default-rendered.yaml"
           helm template ferrum ./charts/ferrum-mesh --namespace ferrum \
@@ -3756,6 +3752,33 @@ jobs:
             --set-string controlPlane.env.FERRUM_CP_DP_GRPC_ALLOW_PLAINTEXT=true \
             > "$RUNNER_TEMP/ferrum-helm-results/structured-direct-credentials-rendered.yaml"
           grep -F 'postgres://ferrum%2Fuser:p%2Fa%3Fs%23%20word@[2001:db8::1]:5432/ferrum%2Fmain%20db' "$RUNNER_TEMP/ferrum-helm-results/structured-direct-credentials-rendered.yaml"
+          # Control-plane plaintext CP gRPC guard (#7298): the chart refuses a
+          # non-loopback plaintext listener (the binary refuses it at startup),
+          # names the address it renders from controlPlane.grpcPort, and accepts a
+          # loopback bind or a TLS cert/key pair.
+          cp_guard_args=(
+            --set controlPlane.enabled=true
+            --set controlPlane.database.type=sqlite
+            --set-string controlPlane.database.sqlite.path=/tmp/ferrum.db
+            --set controlPlane.credentials.adminJwtSecret.value=ferrum-edge-helm-chart-admin-secret-32b
+            --set controlPlane.credentials.cpDpGrpcJwtSecret.value=ferrum-edge-helm-chart-grpc-secret-32bxx
+          )
+          if helm template ferrum ./charts/ferrum-mesh --namespace ferrum "${cp_guard_args[@]}" \
+            --set controlPlane.grpcPort=50061 \
+            > "$RUNNER_TEMP/ferrum-helm-results/cp-plaintext-grpc.out" \
+            2> "$RUNNER_TEMP/ferrum-helm-results/cp-plaintext-grpc.err"; then
+            echo "::error title=Plaintext CP gRPC accepted::controlPlane with a non-loopback plaintext CP gRPC bind must fail the render"
+            exit 1
+          fi
+          grep -F 'controlPlane.env: FERRUM_MODE=cp refuses at startup to bind PLAINTEXT CP gRPC on non-loopback 0.0.0.0:50061' \
+            "$RUNNER_TEMP/ferrum-helm-results/cp-plaintext-grpc.err"
+          helm template ferrum ./charts/ferrum-mesh --namespace ferrum "${cp_guard_args[@]}" \
+            --set-string controlPlane.env.FERRUM_CP_GRPC_LISTEN_ADDR=127.0.0.1:50051 \
+            > "$RUNNER_TEMP/ferrum-helm-results/cp-loopback-grpc.yaml"
+          helm template ferrum ./charts/ferrum-mesh --namespace ferrum "${cp_guard_args[@]}" \
+            --set-string controlPlane.env.FERRUM_CP_GRPC_TLS_CERT_PATH=/etc/ferrum/cp-grpc-tls/tls.crt \
+            --set-string controlPlane.env.FERRUM_CP_GRPC_TLS_KEY_PATH=/etc/ferrum/cp-grpc-tls/tls.key \
+            > "$RUNNER_TEMP/ferrum-helm-results/cp-tls-grpc.yaml"
           helm template ferrum ./charts/ferrum-mesh --namespace ferrum \
             -f ./charts/ferrum-mesh/examples/development-values.yaml \
             > "$RUNNER_TEMP/ferrum-helm-results/development-rendered.yaml"
@@ -4711,16 +4734,14 @@ jobs:
             --set-string controlPlane.admin.bindAddress=0.0.0.0 \
             --set-string 'controlPlane.admin.allowedCidrs=::ffff:127.0.0.1/128' \
             > "$RUNNER_TEMP/ferrum-helm-results/mesh-prod-mapped-cidr-host.yaml"
-          for component in controlPlane; do
-            if helm template ferrum ./charts/ferrum-mesh --namespace ferrum \
-              -f ./charts/ferrum-mesh/examples/development-values.yaml \
-              --set-string "${component}.admin.bindAddress=::ffff:127.0.0.1" \
-              > "$RUNNER_TEMP/ferrum-helm-results/mesh-prod-${component}-mapped-bind.yaml" \
-              2> "$RUNNER_TEMP/ferrum-helm-results/mesh-prod-${component}-mapped-bind.err"; then
-              echo "::error title=Mapped IPv4 loopback accepted::${component} would classify ::ffff:127.0.0.1 as non-loopback at runtime and refuse startup"
-              exit 1
-            fi
-          done
+          if helm template ferrum ./charts/ferrum-mesh --namespace ferrum \
+            -f ./charts/ferrum-mesh/examples/development-values.yaml \
+            --set-string "controlPlane.admin.bindAddress=::ffff:127.0.0.1" \
+            > "$RUNNER_TEMP/ferrum-helm-results/mesh-prod-controlPlane-mapped-bind.yaml" \
+            2> "$RUNNER_TEMP/ferrum-helm-results/mesh-prod-controlPlane-mapped-bind.err"; then
+            echo "::error title=Mapped IPv4 loopback accepted::controlPlane would classify ::ffff:127.0.0.1 as non-loopback at runtime and refuse startup"
+            exit 1
+          fi
           if helm template ferrum ./charts/ferrum-mesh --namespace ferrum \
             -f ./charts/ferrum-mesh/examples/development-values.yaml \
             --set-string controlPlane.admin.bindAddress=::ffff:127.0.0.2 \
@@ -6624,17 +6645,36 @@ jobs:
           kubectl -n ferrum-prod create secret generic ferrum-mesh-production-trust-bundle \
             --from-file=cp-dp-trust-bundle.json="${trust_bundle_dir}/cp-dp-trust-bundle.json"
           rm -rf "${trust_bundle_dir}"
-          # Kind smoke keeps the production example's secret wiring, but the
-          # example intentionally omits CP gRPC TLS. Without this escape hatch the
-          # binary refuses non-loopback plaintext at startup; readiness probes then
-          # correctly keep the Deployment non-Ready (previously a Ready-race hid
-          # the crash). Do not put ALLOW_PLAINTEXT back into the example values.
+          # The production example serves CP gRPC over TLS with data-plane client
+          # certificates (#7298): mint an ephemeral CA, a CP server certificate
+          # for the control-plane Service DNS name, and a separate DP client CA,
+          # and provide them as the Secret the example mounts. No plaintext
+          # opt-in: the example must start as written.
+          cp_tls_dir="$(mktemp -d)"
+          cp_dns="ferrum-mesh-control-plane.ferrum-prod.svc.cluster.local"
+          openssl req -x509 -newkey rsa:2048 -nodes -days 1 \
+            -subj /CN=ferrum-ci-cp-grpc-ca \
+            -keyout "${cp_tls_dir}/ca.key" -out "${cp_tls_dir}/ca.crt" >/dev/null 2>&1
+          openssl req -x509 -newkey rsa:2048 -nodes -days 1 \
+            -subj /CN=ferrum-ci-dp-client-ca \
+            -keyout "${cp_tls_dir}/dp-client-ca.key" -out "${cp_tls_dir}/dp-client-ca.crt" >/dev/null 2>&1
+          printf 'subjectAltName=DNS:%s\nextendedKeyUsage=serverAuth\n' "$cp_dns" \
+            > "${cp_tls_dir}/server.ext"
+          openssl req -newkey rsa:2048 -nodes -subj "/CN=${cp_dns}" \
+            -keyout "${cp_tls_dir}/tls.key" -out "${cp_tls_dir}/server.csr" >/dev/null 2>&1
+          openssl x509 -req -days 1 -in "${cp_tls_dir}/server.csr" \
+            -CA "${cp_tls_dir}/ca.crt" -CAkey "${cp_tls_dir}/ca.key" -CAcreateserial \
+            -extfile "${cp_tls_dir}/server.ext" -out "${cp_tls_dir}/tls.crt" >/dev/null 2>&1
+          kubectl -n ferrum-prod create secret generic ferrum-mesh-production-cp-grpc-tls \
+            --from-file=tls.crt="${cp_tls_dir}/tls.crt" \
+            --from-file=tls.key="${cp_tls_dir}/tls.key" \
+            --from-file=ca.crt="${cp_tls_dir}/dp-client-ca.crt"
+          rm -rf "${cp_tls_dir}"
           helm install ferrum-prod ./charts/ferrum-mesh -n ferrum-prod \
             -f ./charts/ferrum-mesh/examples/production-existing-secrets-values.yaml \
             --set image.repository=ferrum-edge \
             --set image.tag=helm-chart-ci \
             --set image.pullPolicy=IfNotPresent \
-            --set controlPlane.env.FERRUM_CP_DP_GRPC_ALLOW_PLAINTEXT=true \
             --set gatewayClass.name=ferrum-prod
           set +e
           kubectl -n ferrum-prod rollout status deployment/ferrum-mesh-control-plane --timeout=180s
