@@ -1052,11 +1052,11 @@ pub fn render_prometheus() -> String {
 
     let mut output = String::new();
     output.push_str(
-        "# HELP ferrum_jwks_trust_stores Active remote JWKS stores by bounded trust state.\n",
+        "# HELP ferrum_jwks_trust_stores Active remote and admin-managed JWKS stores by bounded trust state.\n",
     );
     output.push_str("# TYPE ferrum_jwks_trust_stores gauge\n");
     output.push_str(
-        "# HELP ferrum_jwks_trust_age_seconds Maximum age of the last validated non-empty JWKS among active remote stores in each trust state.\n",
+        "# HELP ferrum_jwks_trust_age_seconds Maximum age of the last validated non-empty JWKS among active remote and admin-managed stores in each trust state.\n",
     );
     output.push_str("# TYPE ferrum_jwks_trust_age_seconds gauge\n");
     for state in JwksTrustState::ALL {
