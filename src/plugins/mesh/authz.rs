@@ -764,10 +764,13 @@ struct NodeWaypointBranchCustom {
     /// were applied). The request may reach only that candidate afterwards.
     executed_for: Option<usize>,
     /// The client's own entries for candidate providers' owned header names,
-    /// removed at `mesh_authz`'s `before_proxy` so no policy plugin or
-    /// backend sees a forged copy. Restored, unchanged, when the reached
-    /// destination owes no CUSTOM check (its request is not the business of
-    /// another destination's provider); discarded otherwise.
+    /// removed at `mesh_authz`'s `before_proxy` so no policy plugin before
+    /// dispatch sees a forged copy. When the reached destination is admitted
+    /// they are restored, unchanged, except for the names that destination's
+    /// own provider owns (its staged result decides those, even when it
+    /// returned no value); a destination that owes no check gets them all
+    /// back. A refused request, and proxy core's final check (which runs after
+    /// request transformers), restore nothing.
     stripped_client_headers: Vec<(String, String)>,
 }
 
@@ -928,19 +931,45 @@ enum NodeWaypointBranchVerdict<'a> {
 /// to exactly one port.
 const NODE_WAYPOINT_ROUTE_BRANCH_PORT_UNRESOLVED_POLICY: &str = "route_branch_port_unresolved";
 
-/// `request` as seen at a destination listening on `port`: the operation port
-/// and the `destination.port` attribute name that port; every other request
-/// fact is unchanged. Borrowed (no copy) when the port already matches.
-fn mesh_authz_request_at_port(request: &MeshAuthzRequest, port: u16) -> Cow<'_, MeshAuthzRequest> {
-    if request.port == Some(port) {
+/// `request` as seen at an alternative candidate destination reached on
+/// `port`. Every destination fact is replaced as a PAIR (typed fact and its
+/// `when:` attribute), so the two can never disagree:
+///
+/// * the operation port (`to.operation.ports`) and `destination.port` both
+///   name `port`, the attribute inserted even when the arrival request had
+///   none (a portless arrival must not leave a typed port beside a missing
+///   attribute, which a positive condition would read as a miss);
+/// * the destination IP is the ARRIVAL destination (the route's own Service
+///   address), which is not this candidate's, so both the typed fact and
+///   `destination.ip` are withdrawn: the evaluator then treats
+///   `destination.ip` as unsourceable and fails closed (a DENY ignores the
+///   field and still matches; an ALLOW or AUDIT never matches on it).
+///
+/// Source, method, path, host, headers and credentials are request facts and
+/// stay unchanged. Borrowed (no copy) when nothing differs.
+fn mesh_authz_request_at_candidate(
+    request: &MeshAuthzRequest,
+    port: u16,
+) -> Cow<'_, MeshAuthzRequest> {
+    let port_attribute_matches = matches!(
+        request.attributes.get(ATTR_DESTINATION_PORT),
+        Some(MeshAuthzAttribute::Scalar(value)) if value.parse::<u16>() == Ok(port)
+    );
+    if request.port == Some(port)
+        && port_attribute_matches
+        && request.destination_ip.is_none()
+        && !request.attributes.contains_key(ATTR_DESTINATION_IP)
+    {
         return Cow::Borrowed(request);
     }
-    let mut at_port = request.clone();
-    at_port.port = Some(port);
-    if let Some(attribute) = at_port.attributes.get_mut(ATTR_DESTINATION_PORT) {
-        *attribute = port.to_string().into();
-    }
-    Cow::Owned(at_port)
+    let mut at_candidate = request.clone();
+    at_candidate.port = Some(port);
+    at_candidate
+        .attributes
+        .insert(ATTR_DESTINATION_PORT.to_string(), port.to_string().into());
+    at_candidate.destination_ip = None;
+    at_candidate.attributes.remove(ATTR_DESTINATION_IP);
+    Cow::Owned(at_candidate)
 }
 
 /// One candidate's local verdict, deny/audit outcome and pending CUSTOM
@@ -1327,6 +1356,31 @@ async fn admit_node_waypoint_route_branch_index(
                     NodeWaypointBranchRefusal::Deny(kind),
                     None,
                 ));
+            }
+            // The client's copies of names only OTHER candidates' providers
+            // own go through unchanged; the selected provider's own names are
+            // discarded (its staged result below decides them, even when it
+            // returned no value).
+            if let Some(custom) = ctx
+                .node_waypoint_route_branch_authz
+                .as_mut()
+                .and_then(|record| record.custom.as_deref_mut())
+            {
+                let selected_owned = executor
+                    .as_ref()
+                    .map(|executor| executor.upstream_allow_header_names(&delegation.provider))
+                    .unwrap_or_default();
+                for (name, value) in std::mem::take(&mut custom.stripped_client_headers) {
+                    let owned_by_selected = selected_owned.iter().any(|owned| {
+                        crate::proxy::headers::field_names_equivalent_for_backends(
+                            &name,
+                            owned.as_str(),
+                        )
+                    });
+                    if !owned_by_selected {
+                        headers.entry(name).or_insert(value);
+                    }
+                }
             }
             // Only the reached destination's own provider result is applied,
             // here, before any later request transformer runs.
@@ -3988,7 +4042,7 @@ impl MeshAuthz {
                 None,
             );
         };
-        let request_at_port = mesh_authz_request_at_port(request, policy_port);
+        let request_at_port = mesh_authz_request_at_candidate(request, policy_port);
         let request = request_at_port.as_ref();
         let evaluation = match branch.scopes.as_deref() {
             Some(scopes) => evaluate_destination_policy_scopes(

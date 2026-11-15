@@ -25,8 +25,8 @@ use ferrum_edge::config_sources::k8s::{
 };
 use ferrum_edge::identity::spiffe::{SpiffeId, TrustDomain};
 use ferrum_edge::modes::mesh::config::{
-    MeshExtAuthzProvider, MeshJwtRule, MeshPolicy, MeshRequestAuthentication, MeshRule,
-    PolicyAction, PolicyScope, RequestMatch, WorkloadSelector,
+    ConditionMatch, MeshExtAuthzProvider, MeshJwtRule, MeshPolicy, MeshRequestAuthentication,
+    MeshRule, PolicyAction, PolicyScope, RequestMatch, WorkloadSelector,
 };
 use ferrum_edge::modes::mesh::runtime::PolicyScopeCache;
 use ferrum_edge::modes::mesh::slice::MeshSlice;
@@ -881,6 +881,37 @@ fn authz_with_custom_policies(
     port: u16,
     downstream_on_allow: Vec<String>,
 ) -> MeshAuthz {
+    let mut provider = stub_provider("branch-ext-authz", port, &["authorization"]);
+    provider.headers_to_downstream_on_allow = downstream_on_allow;
+    authz_with_providers(prepared, policies, vec![provider])
+}
+
+/// A stub provider named `name` on `port` that owns `upstream_owned`.
+fn stub_provider(name: &str, port: u16, upstream_owned: &[&str]) -> MeshExtAuthzProvider {
+    MeshExtAuthzProvider {
+        name: name.to_string(),
+        service: "127.0.0.1".to_string(),
+        port,
+        tls: false,
+        path_prefix: Some("/check".to_string()),
+        timeout_ms: 500,
+        fail_open: false,
+        status_on_error: 403,
+        include_request_headers_in_check: Vec::new(),
+        include_additional_headers_in_check: Vec::new(),
+        include_request_body_in_check: None,
+        headers_to_upstream_on_allow: upstream_owned.iter().map(ToString::to_string).collect(),
+        headers_to_downstream_on_deny: vec!["www-authenticate".to_string()],
+        headers_to_downstream_on_allow: Vec::new(),
+    }
+}
+
+/// `mesh_authz` from the prepared config plus `policies` and `providers`.
+fn authz_with_providers(
+    prepared: &GatewayConfig,
+    policies: Vec<MeshPolicy>,
+    providers: Vec<MeshExtAuthzProvider>,
+) -> MeshAuthz {
     let mut config = authz_config(prepared);
     let slice = config["mesh_slice"]
         .as_object_mut()
@@ -895,28 +926,12 @@ fn authz_with_custom_policies(
                 .into_iter()
                 .map(|policy| serde_json::to_value(policy).expect("policy serializes")),
         );
-    let provider = MeshExtAuthzProvider {
-        name: "branch-ext-authz".to_string(),
-        service: "127.0.0.1".to_string(),
-        port,
-        tls: false,
-        path_prefix: Some("/check".to_string()),
-        timeout_ms: 500,
-        fail_open: false,
-        status_on_error: 403,
-        include_request_headers_in_check: Vec::new(),
-        include_additional_headers_in_check: Vec::new(),
-        include_request_body_in_check: None,
-        headers_to_upstream_on_allow: vec!["authorization".to_string()],
-        headers_to_downstream_on_deny: vec!["www-authenticate".to_string()],
-        headers_to_downstream_on_allow: downstream_on_allow,
-    };
     slice.insert(
         "ext_authz_providers".to_string(),
-        json!([serde_json::to_value(provider).expect("provider serializes")]),
+        serde_json::to_value(providers).expect("providers serialize"),
     );
     MeshAuthz::new_with_http_client(&config, Some(PluginHttpClient::default()))
-        .expect("mesh_authz builds with the provider")
+        .expect("mesh_authz builds with the providers")
 }
 
 /// Issue #7383 review (sol F1): a credential the own destination's provider
@@ -1685,4 +1700,244 @@ async fn the_route_total_preview_follows_the_dispatch_group() {
         Some(RATINGS_UPSTREAM)
     );
     assert_eq!(ctx.route_override_request_timeout_ms, Some(100));
+}
+
+/// A selector-scoped `ratings` rule with one `when:` condition on
+/// `destination.port`.
+fn ratings_rule_on_destination_port(
+    name: &str,
+    values: &[&str],
+    not_values: &[&str],
+    action: PolicyAction,
+) -> MeshPolicy {
+    let mut policy = ratings_rule_on_ports(name, &[], action);
+    policy.rules[0].to = Vec::new();
+    policy.rules[0].when = vec![ConditionMatch {
+        key: "destination.port".to_string(),
+        values: values.iter().map(ToString::to_string).collect(),
+        not_values: not_values.iter().map(ToString::to_string).collect(),
+    }];
+    policy
+}
+
+fn authz_with_policy(prepared: &GatewayConfig, policy: MeshPolicy) -> MeshAuthz {
+    let mut config = authz_config(prepared);
+    config["mesh_slice"]["mesh_policies"]
+        .as_array_mut()
+        .expect("policy list")
+        .push(serde_json::to_value(policy).expect("policy serializes"));
+    MeshAuthz::new(&config).expect("mesh_authz builds")
+}
+
+/// Issue #7383 review (round 4, sol F1): a request that arrives with no
+/// destination port (no captured original destination) still has the branch
+/// port as BOTH the typed port and the `destination.port` attribute, so a
+/// positive `destination.port` DENY on the alternative applies.
+#[tokio::test]
+async fn a_portless_arrival_still_applies_a_destination_port_deny_on_the_branch() {
+    let (prepared, route) = ratings_on_8081(vec![reviews_trusted_only()]);
+    let dispatch = route_dispatch(&prepared, &route);
+    let authz = authz_with_policy(
+        &prepared,
+        ratings_rule_on_destination_port("ratings-dport-deny", &["8081"], &[], PolicyAction::Deny),
+    );
+    let (authorized, dispatched, ctx) = serve(&authz, &dispatch, &route, TRUSTED, true).await;
+    assert!(
+        matches!(authorized, PluginResult::Continue),
+        "{authorized:?}"
+    );
+    assert_denied(
+        &dispatched.expect("dispatch ran"),
+        DENIED_BODY,
+        "the destination.port DENY on ratings applies",
+    );
+    assert!(
+        ctx.metadata
+            .get("mesh_authz.deny_policy")
+            .is_some_and(|policy| policy.contains("ratings-dport-deny")),
+        "{:?}",
+        ctx.metadata.get("mesh_authz.deny_policy")
+    );
+}
+
+/// Issue #7383 review (round 4, sol F1): from a portless arrival, a
+/// negative-only `destination.port` ALLOW on the alternative does not grant a
+/// request reaching the excluded port.
+#[tokio::test]
+async fn a_portless_arrival_does_not_let_a_negative_destination_port_allow_grant() {
+    let (prepared, route) = ratings_on_8081(vec![reviews_trusted_only()]);
+    let dispatch = route_dispatch(&prepared, &route);
+    let authz = authz_with_policy(
+        &prepared,
+        ratings_rule_on_destination_port("ratings-not-8081", &[], &["8081"], PolicyAction::Allow),
+    );
+    let (authorized, dispatched, _) = serve(&authz, &dispatch, &route, TRUSTED, true).await;
+    assert!(
+        matches!(authorized, PluginResult::Continue),
+        "{authorized:?}"
+    );
+    assert_denied(
+        &dispatched.expect("dispatch ran"),
+        DENIED_BODY,
+        "an ALLOW excluding 8081 must not admit ratings:8081",
+    );
+}
+
+/// Issue #7383 review (round 4, sol F1): from a portless arrival, a CUSTOM
+/// rule conditioned on the alternative's `destination.port` runs.
+#[tokio::test]
+async fn a_portless_arrival_runs_a_destination_port_custom_rule_on_the_branch() {
+    let (port, calls) = start_provider(PROVIDER_DENY).await;
+    let (prepared, route) = ratings_on_8081(vec![reviews_trusted_only()]);
+    let dispatch = route_dispatch(&prepared, &route);
+    let authz = authz_with_custom(
+        &prepared,
+        ratings_rule_on_destination_port(
+            "ratings-dport-ext",
+            &["8081"],
+            &[],
+            PolicyAction::Custom {
+                provider: "branch-ext-authz".to_string(),
+            },
+        ),
+        port,
+    );
+    let (authorized, dispatched, ctx) = serve(&authz, &dispatch, &route, TRUSTED, true).await;
+    assert!(
+        matches!(authorized, PluginResult::Continue),
+        "{authorized:?}"
+    );
+    match dispatched.expect("dispatch ran") {
+        PluginResult::Reject { status_code, .. } => assert_eq!(status_code, 403),
+        other => panic!("the ratings provider refuses, got {other:?}"),
+    }
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        ctx.metadata
+            .get("mesh_authz.deny_policy")
+            .map(String::as_str),
+        Some("custom:ratings-dport-ext")
+    );
+}
+
+/// Issue #7383 review (round 4, sol F1): from a request that arrived on 8080,
+/// `destination.port` on the alternative names 8081: a DENY on 8081 applies,
+/// a DENY on the arrival port does not.
+#[tokio::test]
+async fn a_destination_port_condition_on_the_branch_names_its_own_port() {
+    let (prepared, route) = ratings_on_8081(vec![reviews_trusted_only()]);
+    let dispatch = route_dispatch(&prepared, &route);
+    for (deny_port, refused) in [("8081", true), ("8080", false)] {
+        let authz = authz_with_policy(
+            &prepared,
+            ratings_rule_on_destination_port(
+                "ratings-dport-deny",
+                &[deny_port],
+                &[],
+                PolicyAction::Deny,
+            ),
+        );
+        let (authorized, dispatched, _) =
+            serve_captured_on_8080(&authz, &dispatch, &route, Some("v2")).await;
+        assert!(
+            matches!(authorized, PluginResult::Continue),
+            "{authorized:?}"
+        );
+        let dispatched = dispatched.expect("dispatch ran");
+        if refused {
+            assert_denied(&dispatched, DENIED_BODY, "destination.port 8081 applies");
+        } else {
+            assert!(
+                matches!(dispatched, PluginResult::Continue),
+                "destination.port 8080 must not apply to ratings: {dispatched:?}"
+            );
+        }
+    }
+}
+
+const PROVIDER_ALLOW_WITH_VERIFIED_USER: &str = "HTTP/1.1 200 OK\r\n\
+x-verified-user: alice\r\n\
+content-length: 0\r\n\r\n";
+
+/// Issue #7383 review (round 4, sol F2 / dsf F1): two destination-specific
+/// providers with disjoint owned headers. The reached destination's provider
+/// decides only its own names; the client's copy of a name only the OTHER
+/// destination's provider owns goes through unchanged.
+#[tokio::test]
+async fn disjoint_providers_decide_only_their_own_headers() {
+    let (reviews_port, reviews_calls) = start_provider(PROVIDER_ALLOW_WITH_TOKEN).await;
+    let (ratings_port, ratings_calls) = start_provider(PROVIDER_ALLOW_WITH_VERIFIED_USER).await;
+    let slice = node_waypoint_slice(vec![reviews_trusted_only()]);
+    let prepared = prepare(&slice);
+    let route = carried_route(&prepared);
+    let mut reviews_ext = custom_policy("reviews-ext", "reviews");
+    reviews_ext.rules[0].action = PolicyAction::Custom {
+        provider: "reviews-ext-authz".to_string(),
+    };
+    let mut ratings_ext = custom_policy("ratings-ext", "ratings");
+    ratings_ext.rules[0].action = PolicyAction::Custom {
+        provider: "ratings-ext-authz".to_string(),
+    };
+    let authz = Arc::new(authz_with_providers(
+        &prepared,
+        vec![reviews_ext, ratings_ext],
+        vec![
+            stub_provider("reviews-ext-authz", reviews_port, &["authorization"]),
+            stub_provider("ratings-ext-authz", ratings_port, &["x-verified-user"]),
+        ],
+    ));
+    let chain = authz_dispatch_chain(&authz, &prepared, &route);
+
+    let serve_forged = |v2: bool| {
+        let authz = Arc::clone(&authz);
+        let chain = chain.clone();
+        let route = route.clone();
+        async move {
+            let mut ctx = node_waypoint_request(&route, TRUSTED);
+            let mut headers = branch_headers(v2.then_some("v2"));
+            headers.insert(
+                "authorization".to_string(),
+                "Bearer client-token".to_string(),
+            );
+            headers.insert("x-verified-user".to_string(), "mallory".to_string());
+            ctx.headers = headers.clone();
+            assert!(matches!(
+                authz.authorize(&mut ctx).await,
+                PluginResult::Continue
+            ));
+            let result = run_before_proxy_hooks_for_test(&chain, &mut ctx, &mut headers).await;
+            (result, headers)
+        }
+    };
+
+    // ratings: its provider sets x-verified-user; the client's bearer token
+    // (owned only by reviews' provider) reaches ratings unchanged.
+    let (result, headers) = serve_forged(true).await;
+    assert!(matches!(result, PluginResult::Continue), "{result:?}");
+    assert_eq!(
+        headers.get("x-verified-user").map(String::as_str),
+        Some("alice")
+    );
+    assert_eq!(
+        headers.get("authorization").map(String::as_str),
+        Some("Bearer client-token")
+    );
+    assert_eq!(ratings_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(reviews_calls.load(Ordering::SeqCst), 0);
+
+    // reviews: its provider sets authorization; the client's x-verified-user
+    // (owned only by ratings' provider, which was not consulted) is the
+    // client's own value, as on a route with no other candidate.
+    let (result, headers) = serve_forged(false).await;
+    assert!(matches!(result, PluginResult::Continue), "{result:?}");
+    assert_eq!(
+        headers.get("authorization").map(String::as_str),
+        Some("Bearer provider-minted-token")
+    );
+    assert_eq!(
+        headers.get("x-verified-user").map(String::as_str),
+        Some("mallory")
+    );
+    assert_eq!(reviews_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(ratings_calls.load(Ordering::SeqCst), 1);
 }
