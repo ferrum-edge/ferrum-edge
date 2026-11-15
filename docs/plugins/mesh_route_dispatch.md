@@ -393,18 +393,20 @@ kill switch never wedges a reload.
 On a NodeWaypoint, `mesh_authz` runs before this plugin picks a rule. For a
 carried VirtualService route whose rules can select a destination other than
 the route's own, it records one verdict per candidate destination (issue
-#7383), and a matched rule is admitted only when its own destination's policy
-allowed the request. When that destination's policy delegates to an external
-authorizer (CUSTOM), this plugin runs that destination's check before it
-commits the rule, and installs the provider's `headersToUpstreamOnAllow`
-result only for that destination; a request that matches no rule is admitted
-on its current destination the same way. A refused rule answers with that
-destination's denial, and a destination the verdicts do not name is refused. Proxy core
-re-checks the destination the request finally reaches after every
-`before_proxy` hook, so the verdicts hold even when no rule matches or this
-plugin stands down. Every other route keeps the single-destination check: a
-rule that rewrites to a destination other than the one authorization stamped is
-refused with `403`. See [mesh.md → Per-destination authorization for dispatch
+#7383). Several contiguous instances may replace each other's destination, so
+no instance judges a rule on its own: the cache-installed dispatch finalizer,
+right after the last instance and before request transformers, admits the
+destination the whole group selected only when that destination's own policy
+allows the request. When that policy delegates to an external authorizer
+(CUSTOM), the finalizer runs that destination's check first and installs the
+provider's `headersToUpstreamOnAllow` result only for that destination. A
+refused destination answers with its own denial (the matched rule's response
+header list and match metadata are withdrawn), and a destination the verdicts
+do not name is refused. Proxy core re-checks the destination the request
+finally reaches after every `before_proxy` hook, so the verdicts hold even
+when this plugin stands down. Every other route keeps the single-destination
+check: a rule that rewrites to a destination other than the one authorization
+stamped is refused with `403`. See [mesh.md → Per-destination authorization for dispatch
 branches](../mesh.md#per-destination-authorization-for-dispatch-branches).
 
 ### Match observability
