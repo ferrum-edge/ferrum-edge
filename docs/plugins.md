@@ -7592,7 +7592,7 @@ Mesh mode auto-injects it as the reserved global `__mesh_authz` on every applica
 
 **Evaluation order.** `CUSTOM` delegations run first, before the DENY/ALLOW tiers. DENY rules are evaluated next and the first match wins. If any ALLOW rule is loaded and none matches, the request is denied by the implicit-deny floor (`mesh_authz.deny_policy=implicit-deny`). A configuration with no policies at all evaluates nothing and allows every request — an empty `mesh_policies: []` is a valid scaffold, not a lockdown.
 
-**Configuration.** Unknown top-level keys are rejected at construction, and a non-object, non-null `config` (a string, number, or array) is rejected too — a misspelled `mesh_policies` or a malformed root would otherwise build a policy-free instance whose implicit-deny floor never engages, allowing every request. The eleven accepted keys:
+**Configuration.** Unknown top-level keys are rejected at construction, and a non-object, non-null `config` (a string, number, or array) is rejected too — a misspelled `mesh_policies` or a malformed root would otherwise build a policy-free instance whose implicit-deny floor never engages, allowing every request. The twelve accepted keys:
 
 | Key | Type | Default | Notes |
 | --- | --- | --- | --- |

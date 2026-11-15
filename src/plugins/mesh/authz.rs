@@ -931,45 +931,20 @@ enum NodeWaypointBranchVerdict<'a> {
 /// to exactly one port.
 const NODE_WAYPOINT_ROUTE_BRANCH_PORT_UNRESOLVED_POLICY: &str = "route_branch_port_unresolved";
 
-/// `request` as seen at an alternative candidate destination reached on
-/// `port`. Every destination fact is replaced as a PAIR (typed fact and its
-/// `when:` attribute), so the two can never disagree:
-///
-/// * the operation port (`to.operation.ports`) and `destination.port` both
-///   name `port`, the attribute inserted even when the arrival request had
-///   none (a portless arrival must not leave a typed port beside a missing
-///   attribute, which a positive condition would read as a miss);
-/// * the destination IP is the ARRIVAL destination (the route's own Service
-///   address), which is not this candidate's, so both the typed fact and
-///   `destination.ip` are withdrawn: the evaluator then treats
-///   `destination.ip` as unsourceable and fails closed (a DENY ignores the
-///   field and still matches; an ALLOW or AUDIT never matches on it).
-///
-/// Source, method, path, host, headers and credentials are request facts and
-/// stay unchanged. Borrowed (no copy) when nothing differs.
-fn mesh_authz_request_at_candidate(
-    request: &MeshAuthzRequest,
-    port: u16,
-) -> Cow<'_, MeshAuthzRequest> {
-    let port_attribute_matches = matches!(
-        request.attributes.get(ATTR_DESTINATION_PORT),
-        Some(MeshAuthzAttribute::Scalar(value)) if value.parse::<u16>() == Ok(port)
-    );
-    if request.port == Some(port)
-        && port_attribute_matches
-        && request.destination_ip.is_none()
-        && !request.attributes.contains_key(ATTR_DESTINATION_IP)
-    {
-        return Cow::Borrowed(request);
-    }
-    let mut at_candidate = request.clone();
-    at_candidate.port = Some(port);
-    at_candidate
-        .attributes
-        .insert(ATTR_DESTINATION_PORT.to_string(), port.to_string().into());
-    at_candidate.destination_ip = None;
-    at_candidate.attributes.remove(ATTR_DESTINATION_IP);
-    Cow::Owned(at_candidate)
+/// The destination facts an alternative candidate replaced on the shared
+/// `MeshAuthzRequest`, restored once that candidate has been judged.
+struct CandidateDestinationFacts {
+    port: Option<u16>,
+    port_attribute: SavedConditionAttribute,
+    destination_ip: Option<std::net::IpAddr>,
+    destination_ip_attribute: Option<(String, MeshAuthzAttribute)>,
+}
+
+/// What substituting one condition attribute did, so it can be undone.
+enum SavedConditionAttribute {
+    Untouched,
+    Inserted,
+    Replaced(MeshAuthzAttribute),
 }
 
 /// One candidate's local verdict, deny/audit outcome and pending CUSTOM
@@ -3976,7 +3951,7 @@ impl MeshAuthz {
     fn route_branch_record(
         &self,
         table: &Arc<NodeWaypointRouteBranches>,
-        request: &MeshAuthzRequest,
+        request: &mut MeshAuthzRequest,
         source_scope: Option<&crate::modes::mesh::runtime::PolicyScopeCache>,
     ) -> (
         NodeWaypointRouteBranchAuthz,
@@ -4002,6 +3977,7 @@ impl MeshAuthz {
             record.evaluated |= bit;
             let (allowed, outcome, delegation) =
                 self.evaluate_route_branch(branch, request, source_scope);
+
             if allowed {
                 record.allowed |= bit;
             }
@@ -4023,7 +3999,7 @@ impl MeshAuthz {
     fn evaluate_route_branch(
         &self,
         branch: &NodeWaypointRouteBranch,
-        request: &MeshAuthzRequest,
+        request: &mut MeshAuthzRequest,
         source_scope: Option<&crate::modes::mesh::runtime::PolicyScopeCache>,
     ) -> (
         bool,
@@ -4042,26 +4018,30 @@ impl MeshAuthz {
                 None,
             );
         };
-        let request_at_port = mesh_authz_request_at_candidate(request, policy_port);
-        let request = request_at_port.as_ref();
-        let evaluation = match branch.scopes.as_deref() {
-            Some(scopes) => evaluate_destination_policy_scopes(
+        // Without a source scope the route's own destination is judged on
+        // mesh-wide policies only (the census admitted the request because no
+        // enforcing scoped policy exists); every candidate is judged the same
+        // way. An unresolved modeled destination refuses only where the own
+        // destination's would (`has_scoped_policies`).
+        if branch.scopes.is_none() && branch.requires_scope && self.has_scoped_policies {
+            return (
+                false,
+                Some(NodeWaypointBranchOutcome::Deny {
+                    policy: "destination_scope_missing".to_string(),
+                    kind: NodeWaypointBranchDenyKind::DestinationScopeMissing,
+                }),
+                None,
+            );
+        }
+        let saved = self.enter_candidate_destination(request, policy_port);
+        let evaluation = match (source_scope, branch.scopes.as_deref()) {
+            (Some(_), Some(scopes)) => evaluate_destination_policy_scopes(
                 &self.slice.mesh_policies,
                 scopes,
                 self.waypoint_attachment(),
                 request,
             ),
-            None if branch.requires_scope => {
-                return (
-                    false,
-                    Some(NodeWaypointBranchOutcome::Deny {
-                        policy: "destination_scope_missing".to_string(),
-                        kind: NodeWaypointBranchDenyKind::DestinationScopeMissing,
-                    }),
-                    None,
-                );
-            }
-            None => evaluate_mesh_authorization_full(
+            _ => evaluate_mesh_authorization_full(
                 self.slice
                     .mesh_policies
                     .iter()
@@ -4069,7 +4049,82 @@ impl MeshAuthz {
                 request,
             ),
         };
+        Self::leave_candidate_destination(request, saved);
         branch_outcome_from_evaluation(evaluation)
+    }
+
+    /// Show `request` as it is at an alternative candidate reached on `port`.
+    /// Every destination fact changes as a PAIR (typed fact and its `when:`
+    /// attribute), so the two never disagree, and nothing else is copied:
+    ///
+    /// * the operation port (`to.operation.ports`) becomes `port`, and when a
+    ///   loaded policy reads `destination.port` its attribute names `port` too
+    ///   (inserted if the request arrived without one);
+    /// * when a loaded policy reads `destination.ip`, the arrival destination
+    ///   address (the route's own Service's, not this candidate's) is withdrawn
+    ///   from both the typed fact and the attribute, so the key is unsourceable
+    ///   and fails closed (a DENY ignores it and still matches; an ALLOW or
+    ///   AUDIT never matches on it). With no such policy neither is read.
+    ///
+    /// Source, method, path, host, headers and credentials are request facts
+    /// and are untouched. Allocates only to name a port in a
+    /// `destination.port` attribute that differs from the arrival one.
+    fn enter_candidate_destination(
+        &self,
+        request: &mut MeshAuthzRequest,
+        port: u16,
+    ) -> CandidateDestinationFacts {
+        let mut saved = CandidateDestinationFacts {
+            port: request.port,
+            port_attribute: SavedConditionAttribute::Untouched,
+            destination_ip: request.destination_ip,
+            destination_ip_attribute: None,
+        };
+        if request.port != Some(port) {
+            request.port = Some(port);
+            if self.condition_keys.destination_port {
+                let value = MeshAuthzAttribute::Scalar(port.to_string());
+                saved.port_attribute = match request.attributes.get_mut(ATTR_DESTINATION_PORT) {
+                    Some(existing) => {
+                        SavedConditionAttribute::Replaced(std::mem::replace(existing, value))
+                    }
+                    None => {
+                        request
+                            .attributes
+                            .insert(ATTR_DESTINATION_PORT.to_string(), value);
+                        SavedConditionAttribute::Inserted
+                    }
+                };
+            }
+        }
+        if self.condition_keys.destination_ip {
+            request.destination_ip = None;
+            saved.destination_ip_attribute = request.attributes.remove_entry(ATTR_DESTINATION_IP);
+        }
+        saved
+    }
+
+    /// Undo [`Self::enter_candidate_destination`].
+    fn leave_candidate_destination(
+        request: &mut MeshAuthzRequest,
+        saved: CandidateDestinationFacts,
+    ) {
+        request.port = saved.port;
+        match saved.port_attribute {
+            SavedConditionAttribute::Untouched => {}
+            SavedConditionAttribute::Inserted => {
+                request.attributes.remove(ATTR_DESTINATION_PORT);
+            }
+            SavedConditionAttribute::Replaced(previous) => {
+                if let Some(existing) = request.attributes.get_mut(ATTR_DESTINATION_PORT) {
+                    *existing = previous;
+                }
+            }
+        }
+        request.destination_ip = saved.destination_ip;
+        if let Some((key, value)) = saved.destination_ip_attribute {
+            request.attributes.insert(key, value);
+        }
     }
 
     /// Record per-destination verdicts for a carried route whose dispatch
@@ -4087,7 +4142,7 @@ impl MeshAuthz {
         ctx: &mut RequestContext,
         table: &Arc<NodeWaypointRouteBranches>,
         evaluation: &MeshAuthzEvaluation,
-        request: &MeshAuthzRequest,
+        request: &mut MeshAuthzRequest,
         source_scope: Option<&crate::modes::mesh::runtime::PolicyScopeCache>,
         source_for_log: Option<&str>,
     ) -> Option<bool> {
@@ -4964,7 +5019,7 @@ impl Plugin for MeshAuthz {
         // entry point that skipped that refusal would still fail closed.
         let stripped_path =
             crate::modes::mesh::policy::mesh_authz_stripped_path(&authorization_path);
-        let request = if connect_relay {
+        let mut request = if connect_relay {
             MeshAuthzRequest {
                 source_principal,
                 port,
@@ -5020,13 +5075,17 @@ impl Plugin for MeshAuthz {
         // request with a resolved source scope and scoped policies enters it;
         // relays, re-evaluations and refused asserted identities keep the
         // single-destination decision.
+        // Any loaded policy can judge two candidates differently (scoped
+        // policies select different workloads; mesh-wide ones can still read
+        // the destination port), so candidates are evaluated whenever one is
+        // loaded. A request with no source scope is still admitted only by
+        // the census below and judged mesh-wide, like the own destination.
         let route_branches = if self.per_pod_policy_scoping
-            && self.has_scoped_policies
+            && !self.slice.mesh_policies.is_empty()
             && !relay_policy_superset_request
             && !connect_relay
             && !asserted_identity_rejected
             && !live_admission_reevaluation
-            && ctx.node_waypoint_policy_scope.is_some()
         {
             ctx.matched_proxy
                 .as_ref()
@@ -5242,7 +5301,7 @@ impl Plugin for MeshAuthz {
                     if let Some(table) = route_branches.as_ref() {
                         let (mut record, pending) = self.route_branch_record(
                             table,
-                            &request,
+                            &mut request,
                             branch_source_scope.as_deref(),
                         );
                         if record.allowed != 0 {
@@ -5308,7 +5367,7 @@ impl Plugin for MeshAuthz {
                 ctx,
                 table,
                 &evaluation,
-                &request,
+                &mut request,
                 branch_source_scope.as_deref(),
                 source_for_log.as_deref(),
             ),

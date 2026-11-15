@@ -1721,11 +1721,24 @@ fn ratings_rule_on_destination_port(
 }
 
 fn authz_with_policy(prepared: &GatewayConfig, policy: MeshPolicy) -> MeshAuthz {
+    authz_with_policies(prepared, vec![policy])
+}
+
+/// `mesh_authz` from the prepared config plus `policies` (no provider).
+fn authz_with_policies(prepared: &GatewayConfig, policies: Vec<MeshPolicy>) -> MeshAuthz {
     let mut config = authz_config(prepared);
-    config["mesh_slice"]["mesh_policies"]
+    config["mesh_slice"]
+        .as_object_mut()
+        .expect("embedded mesh slice")
+        .entry("mesh_policies")
+        .or_insert_with(|| json!([]))
         .as_array_mut()
         .expect("policy list")
-        .push(serde_json::to_value(policy).expect("policy serializes"));
+        .extend(
+            policies
+                .into_iter()
+                .map(|policy| serde_json::to_value(policy).expect("policy serializes")),
+        );
     MeshAuthz::new(&config).expect("mesh_authz builds")
 }
 
@@ -1940,4 +1953,178 @@ async fn disjoint_providers_decide_only_their_own_headers() {
     );
     assert_eq!(reviews_calls.load(Ordering::SeqCst), 1);
     assert_eq!(ratings_calls.load(Ordering::SeqCst), 1);
+}
+
+/// A rule on `app` (or mesh-wide when `app` is `None`) with one `when:`
+/// condition.
+fn rule_with_condition(
+    name: &str,
+    app: Option<&str>,
+    key: &str,
+    values: &[&str],
+    action: PolicyAction,
+) -> MeshPolicy {
+    let mut policy = ratings_rule_on_ports(name, &[], action);
+    policy.scope = app.map_or(PolicyScope::MeshWide, selector);
+    policy.rules[0].to = Vec::new();
+    policy.rules[0].when = vec![ConditionMatch {
+        key: key.to_string(),
+        values: values.iter().map(ToString::to_string).collect(),
+        not_values: Vec::new(),
+    }];
+    policy
+}
+
+/// Issue #7383 review (round 5, sol F1): with only a MESH-WIDE policy loaded
+/// (no selector-scoped one), candidates are still evaluated on their own
+/// port: a mesh-wide DENY on 8081 refuses the ratings:8081 branch of a
+/// request that arrived on 8080, and leaves the own branch alone.
+#[tokio::test]
+async fn a_mesh_wide_port_deny_applies_to_the_branch_it_names() {
+    let (prepared, route) = ratings_on_8081(Vec::new());
+    let dispatch = route_dispatch(&prepared, &route);
+    let mut deny = ratings_rule_on_ports("mesh-deny-8081", &[8081], PolicyAction::Deny);
+    deny.scope = PolicyScope::MeshWide;
+    let authz = authz_with_policy(&prepared, deny);
+
+    let (authorized, dispatched, ctx) =
+        serve_captured_on_8080(&authz, &dispatch, &route, Some("v2")).await;
+    assert!(
+        matches!(authorized, PluginResult::Continue),
+        "{authorized:?}"
+    );
+    assert_denied(
+        &dispatched.expect("dispatch ran"),
+        DENIED_BODY,
+        "the mesh-wide DENY on 8081 applies to ratings:8081",
+    );
+    assert!(
+        ctx.metadata
+            .get("mesh_authz.deny_policy")
+            .is_some_and(|policy| policy.contains("mesh-deny-8081")),
+        "{:?}",
+        ctx.metadata.get("mesh_authz.deny_policy")
+    );
+
+    let (_, dispatched, _) = serve_captured_on_8080(&authz, &dispatch, &route, None).await;
+    assert!(
+        matches!(dispatched, Some(PluginResult::Continue)),
+        "reviews:8080 is not named by the DENY: {dispatched:?}"
+    );
+}
+
+/// Issue #7383 review (round 5, sol F1): a mesh-wide CUSTOM rule limited to
+/// 8081 runs for the ratings:8081 branch with no selector-scoped policy
+/// loaded, and not for the own branch on 8080.
+#[tokio::test]
+async fn a_mesh_wide_port_custom_rule_runs_for_the_branch_it_names() {
+    let (port, calls) = start_provider(PROVIDER_DENY).await;
+    let (prepared, route) = ratings_on_8081(Vec::new());
+    let dispatch = route_dispatch(&prepared, &route);
+    let mut custom = ratings_rule_on_ports(
+        "mesh-ext-8081",
+        &[8081],
+        PolicyAction::Custom {
+            provider: "branch-ext-authz".to_string(),
+        },
+    );
+    custom.scope = PolicyScope::MeshWide;
+    let authz = authz_with_custom(&prepared, custom, port);
+
+    let (authorized, dispatched, ctx) =
+        serve_captured_on_8080(&authz, &dispatch, &route, Some("v2")).await;
+    assert!(
+        matches!(authorized, PluginResult::Continue),
+        "{authorized:?}"
+    );
+    match dispatched.expect("dispatch ran") {
+        PluginResult::Reject { status_code, .. } => assert_eq!(status_code, 403),
+        other => panic!("the provider refuses the ratings branch, got {other:?}"),
+    }
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        ctx.metadata
+            .get("mesh_authz.deny_policy")
+            .map(String::as_str),
+        Some("custom:mesh-ext-8081")
+    );
+
+    let (_, dispatched, _) = serve_captured_on_8080(&authz, &dispatch, &route, None).await;
+    assert!(matches!(dispatched, Some(PluginResult::Continue)));
+    assert_eq!(calls.load(Ordering::SeqCst), 1, "no check for reviews:8080");
+}
+
+/// Issue #7383 review (round 5, dsf F1): the arrival destination address is
+/// not an alternative's, so `destination.ip` is unsourceable there and fails
+/// closed: a DENY on another address still refuses the branch.
+#[tokio::test]
+async fn a_destination_ip_deny_on_the_branch_fails_closed() {
+    let (prepared, route) = ratings_on_8081(vec![reviews_trusted_only()]);
+    let dispatch = route_dispatch(&prepared, &route);
+    let authz = authz_with_policy(
+        &prepared,
+        rule_with_condition(
+            "ratings-dip-deny",
+            Some("ratings"),
+            "destination.ip",
+            &["10.96.0.99/32"],
+            PolicyAction::Deny,
+        ),
+    );
+    let (authorized, dispatched, _) =
+        serve_captured_on_8080(&authz, &dispatch, &route, Some("v2")).await;
+    assert!(
+        matches!(authorized, PluginResult::Continue),
+        "{authorized:?}"
+    );
+    assert_denied(
+        &dispatched.expect("dispatch ran"),
+        DENIED_BODY,
+        "an unsourceable destination.ip makes the ratings DENY match",
+    );
+}
+
+/// Issue #7383 review (round 5, dsf F1): an ALLOW on the arrival address
+/// admits the own branch (whose address it is) but never the alternative.
+#[tokio::test]
+async fn a_destination_ip_allow_on_the_arrival_address_admits_only_the_own_branch() {
+    let (prepared, route) = ratings_on_8081(Vec::new());
+    let dispatch = route_dispatch(&prepared, &route);
+    let authz = authz_with_policies(
+        &prepared,
+        vec![
+            rule_with_condition(
+                "reviews-arrival-ip",
+                Some("reviews"),
+                "destination.ip",
+                &["10.96.0.20/32"],
+                PolicyAction::Allow,
+            ),
+            rule_with_condition(
+                "ratings-arrival-ip",
+                Some("ratings"),
+                "destination.ip",
+                &["10.96.0.20/32"],
+                PolicyAction::Allow,
+            ),
+        ],
+    );
+
+    let (_, dispatched, _) = serve_captured_on_8080(&authz, &dispatch, &route, None).await;
+    assert!(
+        matches!(dispatched, Some(PluginResult::Continue)),
+        "the own branch matches on its arrival address: {dispatched:?}"
+    );
+
+    let (authorized, dispatched, _) =
+        serve_captured_on_8080(&authz, &dispatch, &route, Some("v2")).await;
+    assert!(
+        matches!(authorized, PluginResult::Continue),
+        "{authorized:?}"
+    );
+    assert_denied(
+        &dispatched.expect("dispatch ran"),
+        DENIED_BODY,
+        "the arrival address is not ratings', so its ALLOW never matches",
+    );
 }
