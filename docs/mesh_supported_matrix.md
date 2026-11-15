@@ -97,6 +97,15 @@ enrolled rows and required live assertion IDs; fixture detail is in the
   the Ambient UDP lifecycle, which shells out -- and non-eBPF builds cannot
   report Ready),
   stream-family egress.
+- **VirtualService on mesh data planes.** Every mesh data plane is built from
+  its mesh slice. Slices carry VirtualService `tcp[]`/`tls[]` routes and
+  host-level `corsPolicy` (applied by client Sidecars); `http[]` routes (with their
+  `mesh_route_dispatch` rules and weighted-split upstreams) ride only a
+  **NodeWaypoint** slice (issue #7233, Experimental with the topology), so
+  route-scoped destination `AuthorizationPolicy` and `RequestAuthentication`
+  apply per VirtualService route there. Sidecar and Ambient slices do not carry
+  `http[]` routes yet. See [mesh.md → Mesh data planes: NodeWaypoint route
+  carriage](mesh.md#mesh-data-planes-nodewaypoint-route-carriage).
 
 ## Wildcard-host egress ServiceEntries
 

@@ -3270,6 +3270,11 @@ fn filter_config_to_namespace(config: &mut GatewayConfig, namespace: &str) -> us
                 policy, namespace,
             )
         });
+        mesh.virtual_service_http_routes.retain(|routes| {
+            crate::modes::mesh::config::virtual_service_http_routes_exported_to_namespace(
+                routes, namespace,
+            )
+        });
     }
     let current_mesh_cors_count = config
         .mesh

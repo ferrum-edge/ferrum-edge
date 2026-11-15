@@ -197,22 +197,23 @@ fn ambient_container_ports_follow_the_listen_addresses() {
     );
 }
 
-/// The CA Deployment runs `FERRUM_MODE=cp` from `ca.env`, which
-/// `EnvConfig::validate_cp_dp_grpc_transport_security` refuses at boot on a
-/// non-loopback plaintext CP gRPC bind (issue #7298). The chart must fail the
-/// render instead, accepting the same three escapes the runtime accepts.
+/// The control plane refuses a non-loopback plaintext CP gRPC bind at boot
+/// (`EnvConfig::validate_cp_dp_grpc_transport_security`), so the chart fails the
+/// render instead, accepting the same three escapes the runtime accepts
+/// (issue #7298). The guard reads the listen address the chart renders from
+/// `controlPlane.grpcPort`.
 #[test]
-fn ca_plaintext_cp_grpc_bind_fails_the_render() {
+fn control_plane_plaintext_cp_grpc_bind_fails_the_render() {
     let validation = read_chart("templates/validation.yaml");
-    let ca_block = &validation[validation
-        .find("{{- if .Values.ca.enabled -}}")
-        .expect("validation.yaml must validate the CA component")..];
-    let ca_block = &ca_block[..ca_block.find("{{- end -}}").expect("closed CA block")];
+    let cp_block = &validation[validation
+        .find("{{- if .Values.controlPlane.enabled -}}")
+        .expect("validation.yaml must validate the control plane")..];
+    let cp_block = &cp_block[..cp_block.find("{{- end -}}").expect("closed CP block")];
     assert!(
-        ca_block.contains(
-            "{{- include \"ferrum-mesh.validateCpGrpcTransport\" (dict \"label\" \"ca.env\" \"env\" .Values.ca.env \"defaultListenAddr\" (printf \"0.0.0.0:%v\" .Values.ca.grpcPort)) -}}"
+        cp_block.contains(
+            "{{- include \"ferrum-mesh.validateCpGrpcTransport\" (dict \"label\" \"controlPlane.env\" \"env\" .Values.controlPlane.env \"defaultListenAddr\" (printf \"0.0.0.0:%v\" .Values.controlPlane.grpcPort)) -}}"
         ),
-        "the CA component must run the CP gRPC transport guard over ca.env"
+        "the control plane must run the CP gRPC transport guard over controlPlane.env"
     );
 
     let helpers = read_chart("templates/_helpers.tpl");
@@ -238,6 +239,21 @@ fn ca_plaintext_cp_grpc_bind_fails_the_render() {
         );
     }
 
+    // The remedy text must point the control plane at TLS or the explicit
+    // dev/test opt-in, never at a loopback bind: the control-plane Service
+    // targets the pod address, so a loopback listener would serve nothing.
+    let message = &helper[helper.find("{{- fail").expect("guard fails the render")..];
+    assert!(
+        message.contains("FERRUM_CP_GRPC_TLS_CERT_PATH")
+            && message.contains("FERRUM_CP_DP_GRPC_ALLOW_PLAINTEXT")
+            && message.contains("development and test only"),
+        "the guard must name the TLS pair and the plaintext opt-in as the remedies"
+    );
+    assert!(
+        !message.contains("bind a loopback") && !message.contains("(127.0.0.1:50051)"),
+        "the guard must not suggest a loopback CP gRPC bind for the control plane"
+    );
+
     let runtime = std::fs::read_to_string(
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/config/env_config.rs"),
     )
@@ -248,78 +264,130 @@ fn ca_plaintext_cp_grpc_bind_fails_the_render() {
     );
 
     let dev = read_chart("examples/development-values.yaml");
-    let ca = &dev[dev
-        .find("\nca:\n")
-        .expect("development example has a ca block")..];
     assert!(
-        ca.contains("FERRUM_CP_DP_GRPC_ALLOW_PLAINTEXT: \"true\""),
-        "the development example must opt the CA into plaintext CP gRPC so \
-         `-f development-values.yaml --set ca.enabled=true` still renders"
+        dev.contains("FERRUM_CP_DP_GRPC_ALLOW_PLAINTEXT: \"true\""),
+        "the development example must opt the control plane into plaintext CP gRPC \
+         so `-f development-values.yaml` still renders"
     );
 }
 
-/// The standalone mesh CA must be reachable (issue #7298): `ca.grpcPort` moves
-/// the CP gRPC listener, the named `grpc` container port, and the
-/// `ferrum-mesh-ca` Service together, the way `controlPlane.grpcPort` does.
+/// The standalone `ca` component was removed (issue #7298): it ran a second
+/// `FERRUM_MODE=cp` process and issued no certificates. No template, value,
+/// schema entry or example may bring it back half-wired.
 #[test]
-fn ca_grpc_port_renders_listener_container_port_and_service() {
-    let template = read_chart("templates/ca-deployment.yaml");
+fn standalone_mesh_ca_component_is_gone() {
+    let chart = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("charts/ferrum-mesh");
     assert!(
-        template.contains("- name: grpc\n              containerPort: {{ .Values.ca.grpcPort }}"),
-        "the CA Deployment must declare a named grpc container port from ca.grpcPort"
+        !chart.join("templates/ca-deployment.yaml").exists(),
+        "templates/ca-deployment.yaml must stay deleted"
     );
-    assert!(
-        template.contains("{{- if not (hasKey $caEnv \"FERRUM_CP_GRPC_LISTEN_ADDR\") }}")
-            && template.contains("value: {{ printf \"0.0.0.0:%v\" .Values.ca.grpcPort | quote }}"),
-        "the chart must bind FERRUM_CP_GRPC_LISTEN_ADDR to ca.grpcPort unless ca.env sets it"
-    );
-    let service = &template[template
-        .find("kind: Service")
-        .expect("the CA template must render a Service")..];
-    for needle in [
-        "name: ferrum-mesh-ca",
-        "app.kubernetes.io/name: ferrum-mesh-ca",
-        "- name: grpc",
-        "port: {{ .Values.ca.grpcPort }}",
-        "targetPort: grpc",
-    ] {
-        assert!(
-            service.contains(needle),
-            "the ferrum-mesh-ca Service must expose the CA gRPC port: missing {needle}"
-        );
-    }
-    assert!(
-        !service.contains("admin-http"),
-        "admin stays off the CA gRPC Service; metrics use ferrum-mesh-ca-metrics"
-    );
-
-    // The CA ServiceAccount has no RBAC and mounts no API token, so the
-    // in-cluster defaults for the CRD controller and pod discovery would fail
-    // at startup. The chart turns them off unless ca.env sets them.
-    for name in [
-        "FERRUM_K8S_CONTROLLER_ENABLED",
-        "FERRUM_K8S_POD_DISCOVERY_ENABLED",
-    ] {
-        assert!(
-            template.contains(&format!("{{{{- if not (hasKey $caEnv \"{name}\") }}}}"))
-                && template.contains(&format!("- name: {name}\n              value: \"false\"")),
-            "the CA must default {name} to false unless ca.env sets it"
-        );
-    }
-
     let values = read_chart("values.yaml");
-    let ca = &values[values.find("\nca:\n").expect("values.yaml has a ca block")..];
     assert!(
-        ca.contains("grpcPort: 50051"),
-        "ca.grpcPort must default to 50051"
+        !values.contains("\nca:\n"),
+        "values.yaml must not declare a top-level ca block"
     );
     let schema = read_chart("values.schema.json");
-    let ca_schema = &schema[schema
-        .find("\"ca\": {")
-        .expect("values.schema.json describes ca")..];
     assert!(
-        ca_schema[..ca_schema.find("\"probes\"").expect("ca schema has probes")]
-            .contains("\"grpcPort\""),
-        "values.schema.json must declare ca.grpcPort"
+        !schema.contains("\n    \"ca\": {"),
+        "values.schema.json must not accept a top-level ca block"
+    );
+    for rel in [
+        "templates/_helpers.tpl",
+        "templates/validation.yaml",
+        "templates/serviceaccount.yaml",
+        "templates/pdb.yaml",
+        "templates/metrics-servicemonitor.yaml",
+        "examples/development-values.yaml",
+        "examples/production-existing-secrets-values.yaml",
+    ] {
+        let text = read_chart(rel);
+        assert!(
+            !text.contains(".Values.ca.")
+                && !text.contains("ferrum-mesh-ca\"")
+                && !text.contains("\nca:\n"),
+            "{rel} must not reference the removed standalone CA"
+        );
+    }
+}
+
+/// Every shipped example must render under the control-plane CP gRPC guard
+/// (issue #7298 review, sol F1): the CI chart runtime lint renders each example
+/// with no extra flags. The production example therefore carries a complete
+/// CP gRPC TLS setup (cert, key, data-plane client CA, and the Secret mount
+/// behind those paths) instead of relying on the plaintext opt-in.
+#[test]
+fn production_example_serves_cp_grpc_over_tls() {
+    let prod = read_chart("examples/production-existing-secrets-values.yaml");
+    for needle in [
+        "FERRUM_CP_GRPC_TLS_CERT_PATH: /etc/ferrum/cp-grpc-tls/tls.crt",
+        "FERRUM_CP_GRPC_TLS_KEY_PATH: /etc/ferrum/cp-grpc-tls/tls.key",
+        "FERRUM_CP_GRPC_TLS_CLIENT_CA_PATH: /etc/ferrum/cp-grpc-tls/ca.crt",
+        "secretName: ferrum-mesh-production-cp-grpc-tls",
+        "mountPath: /etc/ferrum/cp-grpc-tls",
+    ] {
+        assert!(
+            prod.contains(needle),
+            "the production example must serve CP gRPC over TLS: missing {needle}"
+        );
+    }
+    assert!(
+        !prod.contains("FERRUM_CP_DP_GRPC_ALLOW_PLAINTEXT"),
+        "the production example must not opt into plaintext CP gRPC"
+    );
+}
+
+/// Every chart invocation in the live suites and lab scripts that enables the
+/// control plane must satisfy the CP gRPC guard, or the suite dies at its
+/// preflight render (issue #7298 review, sol F2 / dsf F1).
+#[test]
+fn scripted_control_plane_renders_satisfy_the_cp_grpc_guard() {
+    fn collect(dir: &std::path::Path, out: &mut Vec<PathBuf>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                collect(&path, out);
+            } else if path.extension().is_some_and(|ext| ext == "sh") {
+                out.push(path);
+            }
+        }
+    }
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let mut scripts = Vec::new();
+    collect(&root.join("tests/k8s"), &mut scripts);
+    collect(&root.join("scripts"), &mut scripts);
+    let escapes = [
+        "FERRUM_CP_DP_GRPC_ALLOW_PLAINTEXT=true",
+        "FERRUM_CP_GRPC_TLS_CERT_PATH",
+        "FERRUM_CP_GRPC_LISTEN_ADDR=127.0.0.1",
+        "examples/development-values.yaml",
+        "examples/production-existing-secrets-values.yaml",
+    ];
+    let mut checked = 0usize;
+    for script in &scripts {
+        let text = std::fs::read_to_string(script)
+            .unwrap_or_else(|e| panic!("failed to read {}: {e}", script.display()));
+        let logical = text.replace("\\\n", " ");
+        for line in logical.lines() {
+            let is_helm = ["helm template", "helm install", "helm upgrade"]
+                .iter()
+                .any(|cmd| line.contains(cmd));
+            if !is_helm || !line.contains("controlPlane.enabled=true") {
+                continue;
+            }
+            checked += 1;
+            assert!(
+                escapes.iter().any(|escape| line.contains(escape)),
+                "{} renders the control plane without CP gRPC TLS, a loopback bind, or the \
+                 plaintext opt-in, so the chart guard fails it",
+                script.display()
+            );
+        }
+    }
+    assert!(
+        checked >= 3,
+        "expected the NodeWaypoint live suite and the Gateway API scripts to render the control plane"
     );
 }

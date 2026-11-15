@@ -20,7 +20,8 @@ use ferrum_edge::config_sources::k8s::{
 use ferrum_edge::identity::spiffe::TrustDomain;
 use ferrum_edge::modes::file::ServeOptions;
 use ferrum_edge::modes::mesh::{
-    MeshConfigProtocol, MeshRuntimeConfig, MeshTopology, prepare_gateway_config_for_mesh,
+    MeshConfigProtocol, MeshRuntimeConfig, MeshTopology,
+    prepare_gateway_config_via_mesh_slice_with_fixtures,
 };
 use reqwest::StatusCode;
 use serde_json::json;
@@ -265,7 +266,7 @@ async fn start_gateway(
 
     let config = build_config_via_destination_rule(preferred_port, secondary_port)?;
     let runtime = mesh_runtime();
-    let prepared = prepare_gateway_config_for_mesh(config, &runtime).map_err(
+    let prepared = prepare_gateway_config_via_mesh_slice_with_fixtures(config, &runtime).map_err(
         |e| -> Box<dyn std::error::Error + Send + Sync> {
             format!("mesh preparation failed: {e}").into()
         },
@@ -417,7 +418,7 @@ fn build_config_via_destination_rule(
     .expect("base gateway config is valid");
 
     // Carry the translated DestinationRule into the gateway mesh block so
-    // prepare_gateway_config_for_mesh projects it onto the upstream.
+    // prepare_gateway_config_via_mesh_slice_with_fixtures projects it onto the upstream.
     config.mesh = translated.config.mesh;
     Ok(config)
 }

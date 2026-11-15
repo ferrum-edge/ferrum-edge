@@ -13,7 +13,9 @@ use ferrum_edge::modes::mesh::config::{
     AppProtocol, MeshConfig, MeshService, MeshSidecar, MeshSidecarIngress, ServicePort, Workload,
     WorkloadPort, WorkloadRef, WorkloadSelector,
 };
-use ferrum_edge::modes::mesh::{MeshRuntimeConfig, MeshTopology, prepare_gateway_config_for_mesh};
+use ferrum_edge::modes::mesh::{
+    MeshRuntimeConfig, MeshTopology, prepare_gateway_config_via_mesh_slice,
+};
 
 use super::mesh_test_support::{default_mesh_runtime, service_for, workload_for};
 
@@ -163,7 +165,7 @@ fn prepare_sidecar_ingress(
         })),
         ..GatewayConfig::default()
     };
-    prepare_gateway_config_for_mesh(config, &runtime).expect("prepare")
+    prepare_gateway_config_via_mesh_slice(config, &runtime).expect("prepare")
 }
 
 fn sidecar_runtime(namespace: &str, spiffe: &str) -> MeshRuntimeConfig {
@@ -457,7 +459,7 @@ fn dedicated_bind_stream_listener_sharing_an_http_endpoint_is_not_materialized()
         })),
         ..GatewayConfig::default()
     };
-    let prepared = prepare_gateway_config_for_mesh(config, &runtime).expect("prepare");
+    let prepared = prepare_gateway_config_via_mesh_slice(config, &runtime).expect("prepare");
 
     assert_eq!(
         dedicated_bind_ids(&prepared),
@@ -592,7 +594,7 @@ fn inbound_target_port_on_a_gateway_listener_is_refused() {
             })),
             ..GatewayConfig::default()
         };
-        let prepared = prepare_gateway_config_for_mesh(config, &runtime).expect("prepare");
+        let prepared = prepare_gateway_config_via_mesh_slice(config, &runtime).expect("prepare");
         prepared
             .proxies
             .iter()
@@ -646,7 +648,7 @@ fn stream_dedicated_bind_does_not_suppress_outbound_http_routes() {
         })),
         ..GatewayConfig::default()
     };
-    let prepared = prepare_gateway_config_for_mesh(config, &runtime).expect("prepare");
+    let prepared = prepare_gateway_config_via_mesh_slice(config, &runtime).expect("prepare");
 
     let bind_ids = dedicated_bind_ids(&prepared);
     assert_eq!(bind_ids, vec!["__mesh-ingress-bind:default-echo-16379"]);

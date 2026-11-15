@@ -17,7 +17,8 @@ use ferrum_edge::config_sources::k8s::{
 use ferrum_edge::identity::spiffe::TrustDomain;
 use ferrum_edge::modes::mesh::config::{MeshLocalityLbSetting, OutboundTrafficPolicy};
 use ferrum_edge::modes::mesh::{
-    MeshConfigProtocol, MeshRuntimeConfig, MeshTopology, prepare_gateway_config_for_mesh,
+    MeshConfigProtocol, MeshRuntimeConfig, MeshTopology,
+    prepare_gateway_config_via_mesh_slice_with_fixtures,
 };
 
 fn istio_object(kind: &str, name: &str, spec: serde_json::Value) -> K8sObject {
@@ -483,7 +484,8 @@ fn failover_priority_projects_updates_and_clears_through_mesh_apply() {
         "reviews.default.svc.cluster.local",
     ));
     config.normalize_fields();
-    let prepared = prepare_gateway_config_for_mesh(config, &runtime()).expect("create apply");
+    let prepared = prepare_gateway_config_via_mesh_slice_with_fixtures(config, &runtime())
+        .expect("create apply");
     let upstream = prepared
         .upstreams
         .iter()
@@ -525,7 +527,8 @@ fn failover_priority_projects_updates_and_clears_through_mesh_apply() {
         "reviews.default.svc.cluster.local",
     ));
     config.normalize_fields();
-    let prepared = prepare_gateway_config_for_mesh(config, &runtime()).expect("update apply");
+    let prepared = prepare_gateway_config_via_mesh_slice_with_fixtures(config, &runtime())
+        .expect("update apply");
     let upstream = prepared
         .upstreams
         .iter()
@@ -560,7 +563,8 @@ fn failover_priority_projects_updates_and_clears_through_mesh_apply() {
         "reviews.default.svc.cluster.local",
     ));
     config.normalize_fields();
-    let prepared = prepare_gateway_config_for_mesh(config, &runtime()).expect("clear apply");
+    let prepared = prepare_gateway_config_via_mesh_slice_with_fixtures(config, &runtime())
+        .expect("clear apply");
     let upstream = prepared
         .upstreams
         .iter()
@@ -745,7 +749,8 @@ fn locality_only_destination_rule_preserves_existing_upstream_algorithm() {
     config.upstreams.push(upstream);
     config.normalize_fields();
 
-    let prepared = prepare_gateway_config_for_mesh(config, &runtime()).expect("mesh apply");
+    let prepared = prepare_gateway_config_via_mesh_slice_with_fixtures(config, &runtime())
+        .expect("mesh apply");
     let upstream = prepared
         .upstreams
         .iter()
@@ -867,7 +872,8 @@ fn distribute_projects_through_mesh_apply_onto_upstream_locality_lb_setting() {
     ));
     config.normalize_fields();
 
-    let prepared = prepare_gateway_config_for_mesh(config, &runtime()).expect("mesh apply");
+    let prepared = prepare_gateway_config_via_mesh_slice_with_fixtures(config, &runtime())
+        .expect("mesh apply");
     let upstream = prepared
         .upstreams
         .iter()
@@ -986,7 +992,8 @@ fn port_level_locality_lb_projects_onto_upstream_port_overrides() {
     ));
     config.normalize_fields();
 
-    let prepared = prepare_gateway_config_for_mesh(config, &runtime()).expect("mesh apply");
+    let prepared = prepare_gateway_config_via_mesh_slice_with_fixtures(config, &runtime())
+        .expect("mesh apply");
     let upstream = prepared
         .upstreams
         .iter()

@@ -23,7 +23,8 @@ use ferrum_edge::modes::mesh::config::{
 };
 use ferrum_edge::modes::mesh::slice::{MeshSlice, MeshSliceRequest};
 use ferrum_edge::modes::mesh::{
-    MeshConfigProtocol, MeshRuntimeConfig, MeshTopology, prepare_gateway_config_for_mesh,
+    MeshConfigProtocol, MeshRuntimeConfig, MeshTopology,
+    prepare_gateway_config_via_mesh_slice_with_fixtures,
 };
 
 fn slice_request_for_default_ns() -> MeshSliceRequest {
@@ -232,7 +233,7 @@ fn dr_tls_simple_flows_through_to_upstream_backend_tls() {
     // The CP applies DRs onto the GatewayConfig at slice projection time; we
     // simulate that here by walking the slice's destination_rules and running
     // the same projection through the runtime's public preparation entry
-    // point. Since `prepare_gateway_config_for_mesh` requires a
+    // point. Since `prepare_gateway_config_via_mesh_slice_with_fixtures` requires a
     // `MeshRuntimeConfig`, we instead reach for the integration-safe
     // primitive: rebuild a GatewayConfig from the slice + the upstream, then
     // assert the in-slice MeshDestinationRule carries the tls we expect.
@@ -325,8 +326,8 @@ fn dr_istio_mutual_projects_workload_svid_onto_upstream() {
         ..test_runtime()
     };
 
-    let prepared =
-        prepare_gateway_config_for_mesh(config, &runtime).expect("mesh preparation succeeds");
+    let prepared = prepare_gateway_config_via_mesh_slice_with_fixtures(config, &runtime)
+        .expect("mesh preparation succeeds");
     let upstream = prepared
         .upstreams
         .iter()
@@ -384,7 +385,7 @@ fn dr_istio_mutual_without_runtime_svid_fails_mesh_preparation() {
     config.upstreams.push(upstream);
     config.proxies.push(build_proxy("reviews-p", "reviews-u"));
 
-    let err = prepare_gateway_config_for_mesh(config, &test_runtime())
+    let err = prepare_gateway_config_via_mesh_slice_with_fixtures(config, &test_runtime())
         .expect_err("ISTIO_MUTUAL without runtime SVID material must fail");
 
     assert!(
@@ -419,7 +420,7 @@ fn dr_tls_sni_and_sans_project_onto_upstream() {
     ));
     config.proxies.push(build_proxy("reviews-p", "reviews-u"));
 
-    let prepared = prepare_gateway_config_for_mesh(config, &test_runtime())
+    let prepared = prepare_gateway_config_via_mesh_slice_with_fixtures(config, &test_runtime())
         .expect("mesh preparation succeeds");
     let upstream = prepared
         .upstreams
@@ -621,7 +622,7 @@ fn dr_two_subsets_with_different_cas_fragment_backend_pool() {
     // Run the full mesh preparation: apply_destination_rules +
     // normalize_fields + resolve_upstream_tls. This is the same pipeline the
     // DP uses on each slice apply.
-    let prepared = prepare_gateway_config_for_mesh(config, &test_runtime())
+    let prepared = prepare_gateway_config_via_mesh_slice_with_fixtures(config, &test_runtime())
         .expect("mesh preparation succeeds");
 
     // ── 1. Upstream carries per-subset resolved TLS for both subsets. ──
@@ -1023,7 +1024,7 @@ fn dr_subset_istio_mutual_without_runtime_svid_fails_closed() {
     proxy.upstream_subset = Some("v1".to_string());
     config.proxies.push(proxy);
 
-    let err = prepare_gateway_config_for_mesh(config, &test_runtime())
+    let err = prepare_gateway_config_via_mesh_slice_with_fixtures(config, &test_runtime())
         .expect_err("subset ISTIO_MUTUAL without runtime SVID must reject the slice");
 
     let err_str = err.to_string();

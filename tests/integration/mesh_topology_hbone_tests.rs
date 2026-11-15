@@ -22,7 +22,7 @@ use ferrum_edge::modes::mesh::{
     MESH_ACCESS_LOG_PLUGIN_ID, MESH_AUTHZ_PLUGIN_ID, MESH_BPF_METRICS_PLUGIN_ID,
     MESH_OUTBOUND_REGISTRY_PLUGIN_ID, MESH_REQUEST_AUTH_PLUGIN_ID, MESH_SPIFFE_IDENTITY_PLUGIN_ID,
     MESH_WORKLOAD_METRICS_PLUGIN_ID, MeshListenerKind, MeshTopology, MeshTrafficDirection,
-    prepare_gateway_config_for_mesh,
+    prepare_gateway_config_via_mesh_slice,
 };
 use http::{HeaderMap, HeaderValue, Method, Version};
 
@@ -142,7 +142,8 @@ fn ambient_topology_injects_same_core_plugins_as_sidecar() {
     let workload = workload_for("reviews", "default", [("app", "reviews")], ["10.0.0.1"]);
     let mesh = mesh_config_with(vec![workload], Vec::new(), Vec::new());
     let config = gateway_config_with_mesh(Vec::new(), Vec::new(), mesh);
-    let prepared = prepare_gateway_config_for_mesh(config, &runtime).expect("ambient prepared");
+    let prepared =
+        prepare_gateway_config_via_mesh_slice(config, &runtime).expect("ambient prepared");
     let ids: std::collections::HashSet<_> = prepared
         .plugin_configs
         .iter()
@@ -180,7 +181,7 @@ fn node_waypoint_topology_injects_bpf_metrics() {
     let mesh = mesh_config_with(vec![workload], Vec::new(), Vec::new());
     let config = gateway_config_with_mesh(Vec::new(), Vec::new(), mesh);
     let prepared =
-        prepare_gateway_config_for_mesh(config, &runtime).expect("node-waypoint prepared");
+        prepare_gateway_config_via_mesh_slice(config, &runtime).expect("node-waypoint prepared");
     let ids: std::collections::HashSet<_> = prepared
         .plugin_configs
         .iter()
@@ -212,7 +213,7 @@ fn registry_only_outbound_policy_injects_outbound_registry_plugin_for_sidecar() 
     let service = service_for("reviews", "default", &[&workload]);
     let mesh = mesh_config_with(vec![workload], vec![service], Vec::new());
     let config = gateway_config_with_mesh(Vec::new(), Vec::new(), mesh);
-    let prepared = prepare_gateway_config_for_mesh(config, &runtime).expect("prepared");
+    let prepared = prepare_gateway_config_via_mesh_slice(config, &runtime).expect("prepared");
     let registry_plugin = prepared
         .plugin_configs
         .iter()
@@ -237,7 +238,7 @@ fn allow_any_outbound_policy_omits_outbound_registry_plugin() {
     runtime.outbound_traffic_policy = OutboundTrafficPolicy::AllowAny;
     let mesh = mesh_config_with(Vec::new(), Vec::new(), Vec::new());
     let config = gateway_config_with_mesh(Vec::new(), Vec::new(), mesh);
-    let prepared = prepare_gateway_config_for_mesh(config, &runtime).expect("prepared");
+    let prepared = prepare_gateway_config_via_mesh_slice(config, &runtime).expect("prepared");
     assert!(
         prepared
             .plugin_configs
@@ -261,7 +262,7 @@ fn request_authentication_plugin_only_injected_when_jwt_rules_present() {
         let workload = workload_for("reviews", "default", [("app", "reviews")], ["10.0.0.1"]);
         let mesh = mesh_config_with(vec![workload], Vec::new(), Vec::new());
         let config = gateway_config_with_mesh(Vec::new(), Vec::new(), mesh);
-        let prepared = prepare_gateway_config_for_mesh(config, &runtime).expect("prepared");
+        let prepared = prepare_gateway_config_via_mesh_slice(config, &runtime).expect("prepared");
         let plugin_ids: std::collections::HashSet<_> = prepared
             .plugin_configs
             .iter()
@@ -297,7 +298,7 @@ fn request_authentication_plugin_only_injected_when_jwt_rules_present() {
                 }],
             });
         let config = gateway_config_with_mesh(Vec::new(), Vec::new(), mesh);
-        let prepared = prepare_gateway_config_for_mesh(config, &runtime).expect("prepared");
+        let prepared = prepare_gateway_config_via_mesh_slice(config, &runtime).expect("prepared");
         let plugin_ids: std::collections::HashSet<_> = prepared
             .plugin_configs
             .iter()
@@ -640,7 +641,7 @@ fn workload_labels_round_trip_through_runtime_config() {
 
     let mesh = mesh_config_with(Vec::new(), Vec::new(), Vec::new());
     let config = gateway_config_with_mesh(Vec::new(), Vec::new(), mesh);
-    let prepared = prepare_gateway_config_for_mesh(config, &runtime).expect("prepared");
+    let prepared = prepare_gateway_config_via_mesh_slice(config, &runtime).expect("prepared");
     let authz = prepared
         .plugin_configs
         .iter()

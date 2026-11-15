@@ -28,7 +28,7 @@ use ferrum_edge::modes::mesh::config::{
 };
 use ferrum_edge::modes::mesh::slice::MeshSlice;
 use ferrum_edge::modes::mesh::{
-    MeshRuntimeConfig, MeshTopology, MeshTrafficDirection, prepare_gateway_config_for_mesh,
+    MeshRuntimeConfig, MeshTopology, MeshTrafficDirection, prepare_gateway_config_via_mesh_slice,
 };
 use ferrum_edge::proxy::{ProxyState, start_proxy_listener_with_bound_listener_and_mesh_direction};
 
@@ -152,7 +152,7 @@ fn prepared_config(
         })),
         ..GatewayConfig::default()
     };
-    prepare_gateway_config_for_mesh(config, &runtime).expect("prepare")
+    prepare_gateway_config_via_mesh_slice(config, &runtime).expect("prepare")
 }
 
 #[test]
@@ -555,7 +555,7 @@ fn identity_narrowing_keeps_inbound_raw_tcp_relay_when_self_is_outside_egress_sc
 
     // Narrowing on (the default) and off must serve the same inbound relay.
     for identity_narrowing in [true, false] {
-        let prepared = prepare_gateway_config_for_mesh(
+        let prepared = prepare_gateway_config_via_mesh_slice(
             egress_scoped_config(),
             &egress_scoped_runtime(identity_narrowing),
         )

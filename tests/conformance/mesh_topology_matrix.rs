@@ -1,7 +1,7 @@
 //! Mesh topology coverage matrix.
 //!
 //! Confirms all six mesh topologies are recognized by `MeshTopology::parse` and
-//! `prepare_gateway_config_for_mesh` produces a usable `GatewayConfig` for each.
+//! `prepare_gateway_config_via_mesh_slice` produces a usable `GatewayConfig` for each.
 //! Topologies: Sidecar, Ambient, NodeWaypoint, ServiceWaypoint, EastWestGateway,
 //! EgressGateway (per QW-1).
 
@@ -13,7 +13,7 @@ use ferrum_edge::config::types::GatewayConfig;
 use ferrum_edge::modes::mesh::config::{MeshConfig, OutboundTrafficPolicy};
 use ferrum_edge::modes::mesh::{
     MeshConfigProtocol, MeshListenerKind, MeshRuntimeConfig, MeshTopology,
-    prepare_gateway_config_for_mesh,
+    prepare_gateway_config_via_mesh_slice,
 };
 
 use crate::conformance::registry::{Maturity, Status};
@@ -92,7 +92,7 @@ fn minimal_gateway_config() -> GatewayConfig {
 
 fn assert_topology_apply_succeeds(topology: MeshTopology) {
     let runtime = runtime_for(topology);
-    let result = prepare_gateway_config_for_mesh(minimal_gateway_config(), &runtime);
+    let result = prepare_gateway_config_via_mesh_slice(minimal_gateway_config(), &runtime);
     assert!(
         result.is_ok(),
         "topology {topology:?} apply must succeed on minimal config: {:?}",

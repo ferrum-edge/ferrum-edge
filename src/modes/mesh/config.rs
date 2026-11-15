@@ -4787,6 +4787,48 @@ pub fn virtual_service_cors_policy_exported_to_namespace(
     export_visibility_admits(&policy.export_to, &policy.namespace, workload_namespace)
 }
 
+/// The mesh binding of one VirtualService's HTTP routes (issue #7233).
+///
+/// The Kubernetes translator emits a VirtualService's `http[]` routes as
+/// ordinary `GatewayConfig` proxies (`istio-vs-*`), their weighted-split
+/// upstreams (`istio-vs-upstream-*`) and route plugins (`mesh_route_dispatch`
+/// and its companions). Those resources carry no mesh visibility of their own,
+/// so this record says which of them apply to mesh data planes and to which
+/// namespaces: it is written only for a VirtualService that binds the mesh
+/// (`spec.gateways` omitted or naming `mesh`), and `export_to` is the
+/// VirtualService `exportTo` with the same semantics as
+/// [`MeshVirtualServiceCorsPolicy::export_to`]. The slice builder carries the
+/// listed routes to a NodeWaypoint subscription
+/// (`MeshSlice::http_routes`) only when the routes live in the subscription
+/// namespace and `export_to` admits it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MeshVirtualServiceHttpRoutes {
+    /// Source VirtualService name.
+    pub name: String,
+    /// Source VirtualService namespace; also the namespace of every listed
+    /// proxy.
+    pub namespace: String,
+    /// VirtualService `exportTo`. EMPTY is namespace-local; the translator
+    /// writes `["*"]` for an omitted `spec.exportTo`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub export_to: Vec<String>,
+    /// Ids of the HTTP route proxies the VirtualService materialized in
+    /// `namespace`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub proxy_ids: Vec<String>,
+}
+
+/// Returns true when a VirtualService HTTP route binding is visible to a
+/// workload namespace — the shared `export_visibility_admits` rules applied to
+/// its `export_to`.
+pub fn virtual_service_http_routes_exported_to_namespace(
+    routes: &MeshVirtualServiceHttpRoutes,
+    workload_namespace: &str,
+) -> bool {
+    export_visibility_admits(&routes.export_to, &routes.namespace, workload_namespace)
+}
+
 /// The Istio `corsPolicy` fields Ferrum projects onto the `cors` plugin.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MeshCorsPolicy {
@@ -5039,6 +5081,13 @@ pub struct MeshConfig {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     #[serde(deserialize_with = "crate::util::json_object::deserialize_object_vec")]
     pub virtual_service_cors_policies: Vec<MeshVirtualServiceCorsPolicy>,
+    /// Mesh bindings of VirtualService HTTP routes (issue #7233). Written by
+    /// the K8s translator for each VirtualService that binds the mesh; the
+    /// slice builder uses them to carry those routes to NodeWaypoint data
+    /// planes on `MeshSlice::http_routes`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(deserialize_with = "crate::util::json_object::deserialize_object_vec")]
+    pub virtual_service_http_routes: Vec<MeshVirtualServiceHttpRoutes>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     #[serde(deserialize_with = "crate::util::json_object::deserialize_object_vec")]
     pub proxy_configs: Vec<MeshProxyConfig>,
@@ -6560,6 +6609,7 @@ impl Default for MeshConfig {
             telemetry_resources: Vec::new(),
             destination_rules: Vec::new(),
             virtual_service_cors_policies: Vec::new(),
+            virtual_service_http_routes: Vec::new(),
             proxy_configs: Vec::new(),
             sidecars: Vec::new(),
             waypoint_bindings: Vec::new(),
@@ -6757,6 +6807,7 @@ impl MeshConfig {
             &mut errors,
         );
         validate_virtual_service_cors_policies(&self.virtual_service_cors_policies, &mut errors);
+        validate_virtual_service_http_routes(&self.virtual_service_http_routes, &mut errors);
         validate_mesh_ext_authz_binding(
             &self.mesh_policies,
             &self.ext_authz_providers,
@@ -6782,6 +6833,9 @@ impl MeshConfig {
             &mut self.virtual_service_cors_policies,
             self.multi_cluster.as_mut(),
         );
+        for routes in &mut self.virtual_service_http_routes {
+            normalize_mesh_export_to(&mut routes.export_to);
+        }
     }
 
     /// Every namespace that owns at least one namespaced mesh object here.
@@ -6807,6 +6861,7 @@ impl MeshConfig {
         collect_ns(&self.telemetry_resources, &mut namespaces);
         collect_ns(&self.destination_rules, &mut namespaces);
         collect_ns(&self.virtual_service_cors_policies, &mut namespaces);
+        collect_ns(&self.virtual_service_http_routes, &mut namespaces);
         collect_ns(&self.proxy_configs, &mut namespaces);
         collect_ns(&self.sidecars, &mut namespaces);
         collect_ns(&self.waypoint_bindings, &mut namespaces);
@@ -6837,6 +6892,11 @@ impl MeshConfig {
         collect_ids(
             "virtual_service_cors_policies",
             &self.virtual_service_cors_policies,
+            &mut out,
+        );
+        collect_ids(
+            "virtual_service_http_routes",
+            &self.virtual_service_http_routes,
             &mut out,
         );
         collect_ids("proxy_configs", &self.proxy_configs, &mut out);
@@ -6889,6 +6949,10 @@ impl MeshConfig {
         overlay_ns(
             &mut self.virtual_service_cors_policies,
             &overlay.virtual_service_cors_policies,
+        );
+        overlay_ns(
+            &mut self.virtual_service_http_routes,
+            &overlay.virtual_service_http_routes,
         );
         overlay_ns(&mut self.proxy_configs, &overlay.proxy_configs);
         overlay_ns(&mut self.sidecars, &overlay.sidecars);
@@ -7096,6 +7160,17 @@ impl MeshNamespacedObject for MeshVirtualServiceCorsPolicy {
     }
 }
 
+impl MeshNamespacedObject for MeshVirtualServiceHttpRoutes {
+    fn object_namespace(&self) -> &str {
+        &self.namespace
+    }
+
+    /// One VirtualService writes one binding.
+    fn object_key(&self) -> Cow<'_, str> {
+        Cow::Borrowed(&self.name)
+    }
+}
+
 impl MeshNamespacedObject for MeshProxyConfig {
     fn object_namespace(&self) -> &str {
         &self.namespace
@@ -7198,6 +7273,49 @@ fn validate_mesh_extension_configs(
 /// instead of surfacing later as a plugin-construction failure on the data
 /// plane. Every origin predicate is the SHARED `plugins::cors` admission gate —
 /// do not fork it.
+/// Prefix of every VirtualService HTTP route proxy id the K8s translator
+/// derives (`istio-vs-<ns>-<name>-<suffix>`). L4 route proxies use the
+/// distinct `istio-vs-l4_` space and never appear in an HTTP route binding.
+pub const VIRTUAL_SERVICE_HTTP_ROUTE_PROXY_ID_PREFIX: &str = "istio-vs-";
+
+/// Whether `id` names a VirtualService HTTP route proxy (not an L4 one).
+pub fn is_virtual_service_http_route_proxy_id(id: &str) -> bool {
+    id.starts_with(VIRTUAL_SERVICE_HTTP_ROUTE_PROXY_ID_PREFIX)
+        && !id.starts_with(crate::proxy::stream_match::ISTIO_VS_L4_PROXY_ID_PREFIX)
+}
+
+/// Fail-closed admission for VirtualService HTTP route bindings (issue
+/// #7233). Diagnostics name the binding by ordinal and never echo a supplied
+/// name, namespace, id or `exportTo` value.
+fn validate_virtual_service_http_routes(
+    bindings: &[MeshVirtualServiceHttpRoutes],
+    errors: &mut Vec<String>,
+) {
+    let mut seen = HashSet::new();
+    for (index, binding) in bindings.iter().enumerate() {
+        let context = format!("`virtual_service_http_routes[{index}]`");
+        if binding.name.trim().is_empty() {
+            errors.push(format!("{context}: `name` must not be empty"));
+        }
+        if binding.namespace.trim().is_empty() {
+            errors.push(format!("{context}: `namespace` must not be empty"));
+        }
+        if !seen.insert((binding.namespace.as_str(), binding.name.as_str())) {
+            errors.push(format!(
+                "{context}: duplicate binding for one VirtualService"
+            ));
+        }
+        validate_mesh_export_to(&context, &binding.export_to, errors);
+        for (id_index, id) in binding.proxy_ids.iter().enumerate() {
+            if !is_virtual_service_http_route_proxy_id(id) {
+                errors.push(format!(
+                    "{context}: `proxy_ids[{id_index}]` is not a VirtualService HTTP route proxy id"
+                ));
+            }
+        }
+    }
+}
+
 fn validate_virtual_service_cors_policies(
     policies: &[MeshVirtualServiceCorsPolicy],
     errors: &mut Vec<String>,

@@ -2,7 +2,7 @@
 
 Deploys the Ferrum Edge binary in one of the **core gateway** operating modes.
 For the service-mesh components (mesh data plane, injector webhook, ambient
-node-agent, mesh CA) use the sibling [`ferrum-mesh`](../ferrum-mesh) chart
+node-agent) use the sibling [`ferrum-mesh`](../ferrum-mesh) chart
 instead — the two charts share naming, labelling, secret, and validation
 conventions so they feel like one product.
 
