@@ -132,15 +132,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   upstreams, `mesh_route_dispatch` rules and companion plugins) on the new
   `MeshSlice.http_routes`, over native `MeshSubscribe` and the xDS
   `HttpRoutesCarrier`. Every in-mesh destination is rebound onto the
-  NodeWaypoint transport, and a route to an in-cluster Service the slice does
-  not model is refused (the host keeps its Service route). Route-scoped
-  destination `AuthorizationPolicy` (`node_waypoint_route_upstreams`) and
-  `RequestAuthentication` destination scoping therefore apply per
-  VirtualService route on a production NodeWaypoint. A merged route whose
-  `mesh_route_dispatch` rule rewrites to a destination other than the route's
-  own is refused with `403` by destination authorization. Sidecar and Ambient
-  slices still carry no `http[]` routes; Gateway API HTTPRoutes bind Gateway
-  listeners and are not carried.
+  NodeWaypoint transport (weighted-split ratios kept across one scale), so
+  route-scoped destination `AuthorizationPolicy`
+  (`node_waypoint_route_upstreams`) and `RequestAuthentication` destination
+  scoping now apply per VirtualService route on a production NodeWaypoint, and
+  a carried route answers every spelling of its Service host. A route is
+  refused (the host keeps its Service route) when a destination is an
+  in-cluster Service the waypoint does not model (any alias form, two-label
+  `<svc>.<ns>` included) or when a weighted split names a Service a
+  DestinationRule governs. Only an omitted or well-formed `spec.gateways`
+  naming `mesh` binds a VirtualService to the mesh. Sidecar and Ambient slices
+  still carry no `http[]` routes.
 - **`plugin_request_view` benchmark and the `Plugin Request View Comparison`
   workflow** (#7207). The Criterion bench (`tests/performance/mesh`) measures
   the per-request plugin-cache view cost, and the dispatchable workflow

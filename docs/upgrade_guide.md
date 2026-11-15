@@ -559,9 +559,11 @@ control plane (`invalid_slice_json`) and keeps its last-good slice until it is
 upgraded. On NodeWaypoint, mesh-bound VirtualService `http[]` routes in the
 waypoint's namespace now take effect: their in-mesh destinations dial over the
 NodeWaypoint transport, a route whose destination is an in-cluster Service the
-waypoint does not model is refused (the host keeps its Service route), and a
-merged route whose `mesh_route_dispatch` rule rewrites to a different
-destination than the route's own is refused with `403` by destination
+waypoint does not model (including a two-label `<svc>.<ns>` host) or whose
+weighted split names a DestinationRule-governed Service is refused (the host
+keeps its Service route), a malformed or empty `spec.gateways` no longer counts
+as `mesh`, and a merged route whose `mesh_route_dispatch` rule rewrites to a
+different destination than the route's own is refused with `403` by destination
 authorization. Review VirtualServices bound to the mesh before upgrading
 NodeWaypoints.
 
