@@ -2794,6 +2794,47 @@ fn test_restore_refusal_of_allowed_ws_origins_star_does_not_log_grandfathering_w
     );
 }
 
+/// Restore skips the #5454 grandfathering warning because it refuses every
+/// entry the warning would flag. Pin that the warning fires exactly when
+/// admission refuses, over each entry class, so neither side can drift.
+#[test]
+fn test_allowed_ws_origins_grandfathering_warning_matches_admission_refusal() {
+    for (origin, refused) in [
+        ("", false),
+        ("   ", false),
+        ("*", true),
+        (" * ", true),
+        ("null", true),
+        ("app.example.com", true),
+        ("https://app.example.com/path", true),
+        ("https://app.example.com/?x=1", true),
+        ("https://app.example.com/#frag", true),
+        ("https://user:pass@app.example.com", true),
+        ("ftp://app.example.com", true),
+        ("https://app.example.com", false),
+        ("https://app.example.com/", false),
+        ("http://localhost:3000", false),
+        ("ws://app.example.com:8080", false),
+        ("wss://app.example.com", false),
+    ] {
+        let mut proxy = make_proxy("origin-proxy", "/ws");
+        proxy.allowed_ws_origins = vec![origin.to_string()];
+        assert_eq!(
+            !proxy.allowed_ws_origins_admission_errors().is_empty(),
+            refused,
+            "admission verdict for {origin:?}"
+        );
+        let (logs, guard) = capture_ws_origin_logs();
+        proxy.warn_legacy_allowed_ws_origins();
+        drop(guard);
+        let warned = logs.contents().contains("still loaded");
+        assert_eq!(
+            warned, refused,
+            "the grandfathering warning must fire exactly when admission refuses {origin:?}"
+        );
+    }
+}
+
 #[derive(Clone, Default)]
 struct CapturedWsOriginLogs {
     buffer: Arc<Mutex<Vec<u8>>>,

@@ -66,6 +66,16 @@ pub const MAX_HOSTS_PER_PROXY: usize = 100;
 /// literal origins; `*` is not a wildcard.
 pub const ALLOWED_WS_ORIGINS_STAR_GUIDANCE: &str =
     "empty list = allow all origins; entries are literal origins; `*` is not a wildcard";
+
+/// Why an `allowed_ws_origins` entry is refused at admission and warned about
+/// on database/CP/DP loads (issues #5454, #7218).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LegacyAllowedWsOrigin {
+    /// CORS-style `"*"`, which is not a wildcard here.
+    Star,
+    /// Anything that is not a literal `scheme://host[:port]` origin.
+    NotLiteralOrigin,
+}
 /// Maximum number of targets per upstream.
 pub const MAX_TARGETS_PER_UPSTREAM: usize = 1000;
 /// Maximum number of tags per upstream target.
@@ -8722,23 +8732,38 @@ impl Proxy {
     pub fn allowed_ws_origins_admission_errors(&self) -> Vec<String> {
         let mut errors = Vec::new();
         for (i, origin) in self.allowed_ws_origins.iter().enumerate() {
-            if origin.trim().is_empty() {
-                continue;
-            }
-            if origin.trim() == "*" {
-                errors.push(format!(
+            match Self::legacy_allowed_ws_origin(origin) {
+                None => {}
+                Some(LegacyAllowedWsOrigin::Star) => errors.push(format!(
                     "allowed_ws_origins[{}] is '*': {}",
                     i, ALLOWED_WS_ORIGINS_STAR_GUIDANCE
-                ));
-            } else if !Self::is_literal_websocket_origin(origin) {
-                errors.push(format!(
+                )),
+                Some(LegacyAllowedWsOrigin::NotLiteralOrigin) => errors.push(format!(
                     "allowed_ws_origins[{}] must be a literal origin \
                      (scheme://host[:port]); {}",
                     i, ALLOWED_WS_ORIGINS_STAR_GUIDANCE
-                ));
+                )),
             }
         }
         errors
+    }
+
+    /// The one predicate behind both [`Self::allowed_ws_origins_admission_errors`]
+    /// (admission refuses) and [`Self::warn_legacy_allowed_ws_origins`] (loads
+    /// warn). Admin API restore skips the warning because it refuses exactly
+    /// these entries, so the two must never classify an entry differently.
+    /// Empty entries are left to the field validators.
+    fn legacy_allowed_ws_origin(origin: &str) -> Option<LegacyAllowedWsOrigin> {
+        let trimmed = origin.trim();
+        if trimmed.is_empty() {
+            None
+        } else if trimmed == "*" {
+            Some(LegacyAllowedWsOrigin::Star)
+        } else if !Self::is_literal_websocket_origin(origin) {
+            Some(LegacyAllowedWsOrigin::NotLiteralOrigin)
+        } else {
+            None
+        }
     }
 
     /// Warn when a `~regex` `listen_path` mentions `;` on a proxy without
@@ -8771,10 +8796,10 @@ impl Proxy {
     /// [`GatewayConfig::validate_all_fields_for_admission_with_ip_policy`], so
     /// neither a file-mode load nor a refused restore emits this warning.
     pub fn warn_legacy_allowed_ws_origins(&self) {
-        let has_legacy_entry = self.allowed_ws_origins.iter().any(|origin| {
-            let trimmed = origin.trim();
-            !trimmed.is_empty() && (trimmed == "*" || !Self::is_literal_websocket_origin(origin))
-        });
+        let has_legacy_entry = self
+            .allowed_ws_origins
+            .iter()
+            .any(|origin| Self::legacy_allowed_ws_origin(origin).is_some());
         if !has_legacy_entry {
             return;
         }
