@@ -1838,14 +1838,34 @@ AMBIENT_HOST_UDP_LIVE_JOB = (
     env:
       CARGO_NET_RETRY: "10"
       CARGO_HTTP_MULTIPLEXING: "false"
+      # Restore-only member of the `ci-debug` rust-cache lane, which Unit
+      # Tests produces on main. Every lane member compiles with these two
+      # values so the restored dependency artifacts stay fingerprint-
+      # compatible. They also keep the compile inside the 16 GB hosted
+      # runner: with full debuginfo and no job cap, this build was killed
+      # mid-`cargo test --lib` (exit 143) or hung past the timeout.
+      CARGO_BUILD_JOBS: "3"
+      CARGO_PROFILE_DEV_DEBUG: "line-tables-only"
 
     steps:
       - name: Checkout Ferrum Edge
         uses: actions/checkout@0000000000000000000000000000000000000000
 
+      - name: Extend runner swap for the library test harness compile
+        run: |
+          set -euo pipefail
+          # `cargo test --lib` builds the library test harness, one rustc run
+          # of the whole ferrum_edge crate that peaks above 15 GB on this
+          # 16 GB runner. The image's 3 GB swap is not enough headroom.
+          sudo fallocate -l 12G /mnt/ferrum-swapfile
+          sudo chmod 600 /mnt/ferrum-swapfile
+          sudo mkswap /mnt/ferrum-swapfile
+          sudo swapon /mnt/ferrum-swapfile
+          free -h
+
       - uses: ./.github/actions/setup-rust-ci
         with:
-          shared-key: "ci-netns-capture-live"
+          shared-key: "ci-debug"
 
       - name: Build live test binaries
         id: build_test_bin
@@ -1862,7 +1882,10 @@ AMBIENT_HOST_UDP_LIVE_JOB = (
           fi
           echo "lib_test_bin=${bins[0]}" >> "$GITHUB_OUTPUT"
 
-          cargo build --bin ferrum-edge
+          # No separate `cargo build --bin ferrum-edge`: without dev-dependencies
+          # Cargo resolves a different feature set, which recompiled the
+          # dependency graph and the library a second time, and the test
+          # build below rebuilt and overwrote target/debug/ferrum-edge anyway.
           mapfile -t functional_bins < <(
             cargo test --test functional_tests --no-run --message-format=json-render-diagnostics \
               | jq -r 'select(.reason == "compiler-artifact" and .profile.test == true and .executable != null and (.target.kind | index("test"))) | .executable'
@@ -27761,7 +27784,7 @@ pre_build = []
 
     ambient_mutation(
         "separate default-profile cache",
-        '          shared-key: "ci-netns-capture-live"\n',
+        '          shared-key: "ci-debug"\n',
         '          shared-key: "ci-ambient-host-udp-live"\n',
     )
     ambient_mutation(
