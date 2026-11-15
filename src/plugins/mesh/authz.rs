@@ -176,6 +176,8 @@ pub struct MeshAuthz {
     node_waypoint_capture_destination_scopes: NodeWaypointCaptureDestinationScopes,
     destination_namespaced_service_backend_hosts: HashSet<NamespacedDestinationBackendHostKey>,
     destination_route_upstreams_requiring_scope: NamespacedUpstreamMap<()>,
+    /// See [`DestinationPolicyScopeIndex::upstream_policy_ports`].
+    destination_upstream_policy_ports: NamespacedUpstreamMap<Option<u16>>,
     has_route_upstream_metadata: bool,
     /// Candidate destinations of each carried NodeWaypoint VirtualService
     /// route whose `mesh_route_dispatch` rules can select a destination other
@@ -649,15 +651,6 @@ impl NodeWaypointBranchKey {
             Self::Upstream(_) => false,
         }
     }
-
-    /// Whether this candidate is the backend named by a canonical
-    /// `host|port` key (`mesh_route_dispatch`'s precomputed match key).
-    fn is_backend_metadata_key(&self, key: &str) -> bool {
-        key.rsplit_once('|').is_some_and(|(host, port)| {
-            port.parse::<u16>()
-                .is_ok_and(|port| port != 0 && self.is_backend(host, port))
-        })
-    }
 }
 
 /// One candidate destination with the destination scopes its policies are
@@ -669,6 +662,12 @@ struct NodeWaypointRouteBranch {
     /// Whether an unresolved candidate reaches a modeled destination (a
     /// missing scope then refuses it, as for a route's own destination).
     requires_scope: bool,
+    /// The destination port this candidate's policies are judged against
+    /// (`to.operation.ports`, `destination.port`): the port the request has
+    /// when it reaches this candidate, not the port it arrived on. `None`
+    /// when no single port exists (a split across several Service ports, or
+    /// an upstream the index does not know): the candidate is refused.
+    policy_port: Option<u16>,
 }
 
 /// The candidate destinations of one carried route, the route's own first.
@@ -701,10 +700,6 @@ impl NodeWaypointRouteBranches {
                 .branches
                 .iter()
                 .position(|branch| branch.key.is_backend(host, port)),
-            NodeWaypointBranchDestination::BackendMetadataKey(key) => self
-                .branches
-                .iter()
-                .position(|branch| branch.key.is_backend_metadata_key(key)),
             NodeWaypointBranchDestination::Unknown => None,
         }
     }
@@ -721,8 +716,6 @@ pub(crate) enum NodeWaypointBranchDestination<'a> {
         host: &'a str,
         port: u16,
     },
-    /// A canonical `host|port` key.
-    BackendMetadataKey(&'a str),
     /// A destination shape the table cannot name (always refused).
     Unknown,
 }
@@ -770,6 +763,12 @@ struct NodeWaypointBranchCustom {
     /// The candidate whose CUSTOM check ran (and whose provider mutations
     /// were applied). The request may reach only that candidate afterwards.
     executed_for: Option<usize>,
+    /// The client's own entries for candidate providers' owned header names,
+    /// removed at `mesh_authz`'s `before_proxy` so no policy plugin or
+    /// backend sees a forged copy. Restored, unchanged, when the reached
+    /// destination owes no CUSTOM check (its request is not the business of
+    /// another destination's provider); discarded otherwise.
+    stripped_client_headers: Vec<(String, String)>,
 }
 
 impl std::fmt::Debug for NodeWaypointBranchCustom {
@@ -777,6 +776,10 @@ impl std::fmt::Debug for NodeWaypointBranchCustom {
         f.debug_struct("NodeWaypointBranchCustom")
             .field("pending", &self.pending.len())
             .field("executed_for", &self.executed_for)
+            .field(
+                "stripped_client_headers",
+                &self.stripped_client_headers.len(),
+            )
             .finish_non_exhaustive()
     }
 }
@@ -921,6 +924,25 @@ enum NodeWaypointBranchVerdict<'a> {
     Unknown,
 }
 
+/// Deny policy recorded for a candidate whose policy port cannot be resolved
+/// to exactly one port.
+const NODE_WAYPOINT_ROUTE_BRANCH_PORT_UNRESOLVED_POLICY: &str = "route_branch_port_unresolved";
+
+/// `request` as seen at a destination listening on `port`: the operation port
+/// and the `destination.port` attribute name that port; every other request
+/// fact is unchanged. Borrowed (no copy) when the port already matches.
+fn mesh_authz_request_at_port(request: &MeshAuthzRequest, port: u16) -> Cow<'_, MeshAuthzRequest> {
+    if request.port == Some(port) {
+        return Cow::Borrowed(request);
+    }
+    let mut at_port = request.clone();
+    at_port.port = Some(port);
+    if let Some(attribute) = at_port.attributes.get_mut(ATTR_DESTINATION_PORT) {
+        *attribute = port.to_string().into();
+    }
+    Cow::Owned(at_port)
+}
+
 /// One candidate's local verdict, deny/audit outcome and pending CUSTOM
 /// delegation from its policy evaluation. Two different applicable providers
 /// refuse the candidate (Istio permits one per workload).
@@ -999,22 +1021,6 @@ const NODE_WAYPOINT_ROUTE_BRANCH_UNKNOWN_POLICY: &str = "route_branch_unauthoriz
 /// it does, the verdicts replace the blanket route-override refusal.
 pub(crate) fn has_node_waypoint_route_branch_authz(ctx: &RequestContext) -> bool {
     ctx.node_waypoint_route_branch_authz.is_some()
-}
-
-/// Whether `destination` would be refused by this request's per-destination
-/// verdicts before any CUSTOM check runs. Side-effect free (early route-total
-/// planning). `false` when the request carries no verdicts.
-pub(crate) fn node_waypoint_route_branch_refuses(
-    ctx: &RequestContext,
-    destination: NodeWaypointBranchDestination<'_>,
-) -> bool {
-    let Some(record) = ctx.node_waypoint_route_branch_authz.as_ref() else {
-        return false;
-    };
-    !matches!(
-        record.verdict(record.branches.position(destination)),
-        NodeWaypointBranchVerdict::Allowed { .. }
-    )
 }
 
 /// The destination the request reaches now: its effective route override,
@@ -1248,6 +1254,18 @@ async fn admit_node_waypoint_route_branch_index(
     let record = ctx.node_waypoint_route_branch_authz.as_ref()?;
     match node_waypoint_branch_admission(record, index) {
         NodeWaypointBranchAdmission::Admit(audit) => {
+            // The reached destination owes no CUSTOM check: the client's own
+            // values of other destinations' provider-owned names go through
+            // unchanged, as they would on a route with no other candidate.
+            if let Some(custom) = ctx
+                .node_waypoint_route_branch_authz
+                .as_mut()
+                .and_then(|record| record.custom.as_deref_mut())
+            {
+                for (name, value) in std::mem::take(&mut custom.stripped_client_headers) {
+                    headers.entry(name).or_insert(value);
+                }
+            }
             admit_node_waypoint_branch_audit(ctx, audit);
             None
         }
@@ -1410,6 +1428,12 @@ pub(crate) struct DestinationPolicyScopeIndex {
     service_backend_hosts: HashSet<String>,
     namespaced_service_backend_hosts: HashSet<NamespacedDestinationBackendHostKey>,
     route_upstreams_requiring_scope: NamespacedUpstreamMap<()>,
+    /// The destination port authorization judges a request to each upstream
+    /// against (`to.operation.ports`, `destination.port`): the Service port of
+    /// a materialized Service upstream, or the one Service port every target
+    /// of a route upstream shares. `None` when a route upstream's targets
+    /// span several ports (no single policy port exists).
+    upstream_policy_ports: NamespacedUpstreamMap<Option<u16>>,
 }
 
 impl DestinationPolicyScopeIndex {
@@ -1946,6 +1970,15 @@ fn destination_policy_scope_index(
             ) {
                 namespaced_service_ports.insert(key, service_key.clone());
             }
+            index.upstream_policy_ports.insert(
+                &service.namespace,
+                crate::modes::mesh::mesh_outbound_upstream_id(
+                    &service.namespace,
+                    &service.name,
+                    service_port.port,
+                ),
+                Some(service_port.port),
+            );
             let scopes = destination_policy_scopes_for_service_port(
                 service,
                 service_port,
@@ -2017,6 +2050,7 @@ fn destination_policy_scope_index(
         let mut unscoped_target_seen = false;
         let mut external_target_seen = false;
         let mut seen_service_ports = HashSet::new();
+        let mut policy_ports: HashSet<u16> = HashSet::new();
         for target in &upstream.targets {
             let Some(service_key) = service_port_key_for_route_target(
                 target,
@@ -2024,6 +2058,7 @@ fn destination_policy_scope_index(
                 &qualified_service_ports,
                 &namespaced_service_ports,
             ) else {
+                policy_ports.insert(target.service_port.unwrap_or(target.port));
                 let host = normalize_destination_backend_host(&target.host);
                 if host.is_some_and(|host| workload_backend_hosts.contains(&host))
                     || target.service_name.is_some()
@@ -2037,6 +2072,7 @@ fn destination_policy_scope_index(
                 continue;
             };
             requires_destination_scope = true;
+            policy_ports.insert(service_key.port);
             if !route_target_uses_service_alias(
                 target,
                 &service_key,
@@ -2059,6 +2095,15 @@ fn destination_policy_scope_index(
                 }
             }
         }
+        let single_policy_port = match policy_ports.len() {
+            1 => policy_ports.iter().next().copied(),
+            _ => None,
+        };
+        index.upstream_policy_ports.insert(
+            &upstream.namespace,
+            upstream.id.clone(),
+            single_policy_port,
+        );
         if requires_destination_scope {
             index.route_upstreams_requiring_scope.insert(
                 &upstream.namespace,
@@ -3291,6 +3336,7 @@ impl MeshAuthz {
                 .namespaced_service_backend_hosts,
             destination_route_upstreams_requiring_scope: destination_policy_scope_index
                 .route_upstreams_requiring_scope,
+            destination_upstream_policy_ports: destination_policy_scope_index.upstream_policy_ports,
             node_waypoint_capture_destination_scopes,
             has_route_upstream_metadata,
             node_waypoint_route_branches: NamespacedUpstreamMap::default(),
@@ -3346,10 +3392,19 @@ impl MeshAuthz {
                     host,
                     port,
                 );
+                let policy_port = match upstream_id {
+                    Some(upstream_id) => self
+                        .destination_upstream_policy_ports
+                        .get(&config.namespace, upstream_id)
+                        .copied()
+                        .flatten(),
+                    None => Some(port),
+                };
                 branches.push(NodeWaypointRouteBranch {
                     key,
                     scopes,
                     requires_scope,
+                    policy_port,
                 });
             }
             tables.insert(
@@ -3921,6 +3976,20 @@ impl MeshAuthz {
         Option<NodeWaypointBranchOutcome>,
         Option<MeshAuthzCustomDelegation>,
     ) {
+        // Port-scoped rules (`to.operation.ports`, `when: destination.port`)
+        // are judged against the port the request has at THIS candidate.
+        let Some(policy_port) = branch.policy_port else {
+            return (
+                false,
+                Some(NodeWaypointBranchOutcome::Deny {
+                    policy: NODE_WAYPOINT_ROUTE_BRANCH_PORT_UNRESOLVED_POLICY.to_string(),
+                    kind: NodeWaypointBranchDenyKind::Policy,
+                }),
+                None,
+            );
+        };
+        let request_at_port = mesh_authz_request_at_port(request, policy_port);
+        let request = request_at_port.as_ref();
         let evaluation = match branch.scopes.as_deref() {
             Some(scopes) => evaluate_destination_policy_scopes(
                 &self.slice.mesh_policies,
@@ -4020,6 +4089,7 @@ impl MeshAuthz {
                     request_principal: request.request_principal.clone(),
                 },
                 executed_for: None,
+                stripped_client_headers: Vec::new(),
             }));
         }
         install_node_waypoint_route_branch_authz(ctx, record, source_for_log);
@@ -5580,8 +5650,8 @@ impl Plugin for MeshAuthz {
             && custom.instance_id == self.instance_id
             && custom.executed_for.is_none()
         {
-            headers.retain(|name, _| {
-                !custom.pending.iter().any(|(_, delegation)| {
+            let owned = |name: &str| {
+                custom.pending.iter().any(|(_, delegation)| {
                     executor
                         .upstream_allow_header_names(&delegation.provider)
                         .iter()
@@ -5592,7 +5662,25 @@ impl Plugin for MeshAuthz {
                             )
                         })
                 })
-            });
+            };
+            let stripped: Vec<String> = headers
+                .keys()
+                .filter(|name| owned(name.as_str()))
+                .cloned()
+                .collect();
+            if !stripped.is_empty() {
+                let entries: Vec<(String, String)> = stripped
+                    .into_iter()
+                    .filter_map(|name| headers.remove_entry(&name))
+                    .collect();
+                if let Some(custom) = ctx
+                    .node_waypoint_route_branch_authz
+                    .as_mut()
+                    .and_then(|record| record.custom.as_deref_mut())
+                {
+                    custom.stripped_client_headers.extend(entries);
+                }
+            }
         }
         if let Some(staged) = ctx.plugin_state_opt_mut().and_then(|state| {
             state

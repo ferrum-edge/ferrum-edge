@@ -5386,8 +5386,8 @@ fn node_waypoint_route_branch_verdicts_gate_every_destination_decision() {
         .matches("reject_node_waypoint_authz_destination_override(")
         .count();
     assert_eq!(
-        guard_calls, 3,
-        "the blanket guard is defined once and reached only through the two verdict-aware wrappers"
+        guard_calls, 2,
+        "the blanket guard is defined once and reached only through the verdict-aware wrapper"
     );
     let finalize = item_body(
         &production,
@@ -5413,7 +5413,10 @@ fn node_waypoint_route_branch_verdicts_gate_every_destination_decision() {
         "fn node_waypoint_rule_destination_vetoed(",
         "\n}",
     );
-    assert!(preview.contains("node_waypoint_route_branch_refuses("));
+    assert!(
+        preview.contains("reject_unauthorized_node_waypoint_rule_destination(ctx, destination)"),
+        "the preview must follow the same per-rule decision as execution"
+    );
     assert!(
         item_body(&production, "fn rule_answers_before_dispatch(", "\n}")
             .contains("node_waypoint_rule_destination_vetoed(ctx, &rule.destination)"),
@@ -5423,8 +5426,8 @@ fn node_waypoint_route_branch_verdicts_gate_every_destination_decision() {
         production
             .matches("reject_unauthorized_node_waypoint_rule_destination(")
             .count(),
-        2,
-        "matched-rule admission must use the verdict-aware check (definition + one call)"
+        3,
+        "matched-rule admission and the preview share the verdict-aware check (definition + two calls)"
     );
     assert_eq!(
         production

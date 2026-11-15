@@ -72,8 +72,8 @@ use crate::plugins::fault_injection::{
 use crate::plugins::mesh::authz::{
     NODE_WAYPOINT_AUTHORIZED_BACKEND_ALIASES_METADATA, NODE_WAYPOINT_AUTHORIZED_BACKEND_METADATA,
     NODE_WAYPOINT_AUTHORIZED_UPSTREAM_ID_METADATA, NODE_WAYPOINT_SCOPED_AUTHZ_ACTIVE_METADATA,
-    NodeWaypointBranchDestination, admit_node_waypoint_route_branch_for_effective_destination,
-    has_node_waypoint_route_branch_authz, node_waypoint_route_branch_refuses,
+    admit_node_waypoint_route_branch_for_effective_destination,
+    has_node_waypoint_route_branch_authz,
 };
 use crate::plugins::mesh::diagnostics::{self, Schema};
 use crate::plugins::utils::fault_roll::{FaultRoller, MAX_FAULT_DELAY_MS};
@@ -1651,33 +1651,6 @@ impl RouteDestination {
     }
 }
 
-/// The candidate a rule's destination names in a carried route's
-/// per-destination verdict table (issue #7383). Config validation makes
-/// `upstream_id` exclusive and `backend_host` / `backend_port` paired, so a
-/// rule names the route's own destination, one upstream, or one backend;
-/// anything else is a shape the table cannot name and is refused.
-fn node_waypoint_rule_branch_destination(
-    destination: &RouteDestination,
-) -> NodeWaypointBranchDestination<'_> {
-    if destination.is_empty() {
-        return NodeWaypointBranchDestination::Own;
-    }
-    match (
-        destination.upstream_id.as_deref(),
-        destination.node_waypoint_backend_match_key.as_deref(),
-    ) {
-        (Some(upstream_id), None)
-            if destination.backend_host.is_none()
-                && destination.backend_port.is_none()
-                && destination.backend_tls.is_none() =>
-        {
-            NodeWaypointBranchDestination::Upstream(upstream_id)
-        }
-        (None, Some(key)) => NodeWaypointBranchDestination::BackendMetadataKey(key),
-        _ => NodeWaypointBranchDestination::Unknown,
-    }
-}
-
 /// Admit or refuse a matched rule's destination under NodeWaypoint
 /// destination authorization.
 ///
@@ -1719,18 +1692,15 @@ pub(crate) async fn finalize_node_waypoint_route_branch(
 }
 
 /// Side-effect-free twin of [`reject_unauthorized_node_waypoint_rule_destination`]
-/// for early route-total planning.
+/// for early route-total planning. On a route with per-destination verdicts
+/// no rule is vetoed on its own, exactly as at execution: a later instance can
+/// still replace this rule's destination (and its timeout), so the preview
+/// keeps the rule's published total and the group's final admission decides.
 fn node_waypoint_rule_destination_vetoed(
     ctx: &RequestContext,
     destination: &RouteDestination,
 ) -> bool {
-    if has_node_waypoint_route_branch_authz(ctx) {
-        return node_waypoint_route_branch_refuses(
-            ctx,
-            node_waypoint_rule_branch_destination(destination),
-        );
-    }
-    reject_node_waypoint_authz_destination_override(ctx, destination).is_some()
+    reject_unauthorized_node_waypoint_rule_destination(ctx, destination).is_some()
 }
 
 fn reject_node_waypoint_authz_destination_override(
