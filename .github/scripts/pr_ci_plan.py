@@ -532,12 +532,30 @@ LIGHTWEIGHT_PATTERNS = [
 # security validation.
 FULL_CI_PREFIXES = ("vendor/", "charts/")
 
+# Release-note documents that `tests/unit/config/changelog_upgrade_parity_tests.rs`
+# embeds with `include_str!`: every Unreleased `BREAKING` changelog entry must
+# cite an issue the upgrade guide also cites, and the guide must not promise an
+# in-place schema migration that docs/migrations.md rules out. A pull request
+# that edits only these files must still run that unit test, so they select
+# full mode and the `run_rust` lane. `validate_doc_parity_inputs()`, run by
+# verify_required_ci.py with this revision's planner, keeps this set equal to
+# the test's `include_str!` targets.
+DOC_PARITY_TEST = "tests/unit/config/changelog_upgrade_parity_tests.rs"
+DOC_PARITY_TEST_INPUTS = frozenset(
+    {
+        "CHANGELOG.md",
+        "docs/migrations.md",
+        "docs/upgrade_guide.md",
+    }
+)
+
 # These checked-in artifacts are executable contract inputs, not lightweight
 # prose. Changes must run the Rust parity tests and static contract validator.
 FULL_CI_CONTRACT_PATHS = frozenset(
     {
         "docs/prometheus_metric_contract.json",
         "docs/prometheus_metrics.md",
+        *DOC_PARITY_TEST_INPUTS,
     }
 )
 
@@ -831,6 +849,14 @@ RUST_PATTERNS = [
             for path in sorted(PERFORMANCE_TREE_WORKSPACE_INPUTS)
         ),
         r"^schemas/clickhouse/",  # DDL embedded by Rust integration tests
+        # Release-note documents embedded by the changelog/upgrade-guide
+        # parity unit test (DOC_PARITY_TEST_INPUTS).
+        *("^" + re.escape(path) + "$" for path in sorted(DOC_PARITY_TEST_INPUTS)),
+        # The Prometheus metric contract and reference, embedded by the unit
+        # parity tests (`prometheus_metric_contract_tests`,
+        # `openapi_yaml_tests`, `tls_store_bounds_tests`).
+        r"^docs/prometheus_metric_contract\.json$",
+        r"^docs/prometheus_metrics\.md$",
         r"^ferrum\.conf$",
         r"^openapi\.yaml$",
         r"^deny\.toml$",
@@ -1374,6 +1400,113 @@ def nul_transport_self_test() -> list[str]:
     return failures
 
 
+INCLUDE_STR_REPO_PATH_RE = re.compile(r'include_str!\(\s*"((?:\.\./)+)([^"]+)"\s*\)')
+
+
+def doc_parity_embedded_inputs(text: str) -> tuple[set[str], list[str]]:
+    """Repository paths DOC_PARITY_TEST embeds with `include_str!`."""
+
+    failures: list[str] = []
+    embedded: set[str] = set()
+    parts = PurePosixPath(DOC_PARITY_TEST).parent.parts
+    for match in INCLUDE_STR_REPO_PATH_RE.finditer(text):
+        ups = match.group(1).count("../")
+        if ups > len(parts):
+            failures.append(
+                f"{DOC_PARITY_TEST}: include_str! path escapes the repository: "
+                f"{match.group(0)!r}"
+            )
+            continue
+        target = PurePosixPath(*parts[: len(parts) - ups], match.group(2))
+        embedded.add(target.as_posix())
+    if not embedded:
+        failures.append(f"{DOC_PARITY_TEST}: found no include_str! inputs")
+    return embedded, failures
+
+
+def doc_parity_drift_errors(text: str, inputs: frozenset[str]) -> list[str]:
+    """Compare the parity test's embedded paths with `inputs`, both ways."""
+
+    embedded, failures = doc_parity_embedded_inputs(text)
+    for missing in sorted(embedded - inputs):
+        failures.append(
+            f"{DOC_PARITY_TEST} embeds {missing}; add it to DOC_PARITY_TEST_INPUTS "
+            "in .github/scripts/pr_ci_plan.py so a change to it runs the test"
+        )
+    for stale in sorted(inputs - embedded):
+        failures.append(
+            f"DOC_PARITY_TEST_INPUTS lists {stale}, which {DOC_PARITY_TEST} "
+            "no longer embeds"
+        )
+    return failures
+
+
+def doc_parity_scheduling_errors(inputs: frozenset[str]) -> list[str]:
+    """Every listed doc-parity input must select full CI and `run_rust`."""
+
+    failures: list[str] = []
+    for path in sorted(inputs):
+        if is_lightweight_path(path):
+            failures.append(f"{path}: doc-parity input must select full CI")
+        if not select_job_gates("pull_request", [path])["run_rust"]:
+            failures.append(f"{path}: doc-parity input must schedule run_rust")
+    return failures
+
+
+def validate_doc_parity_inputs(repo_root: Path) -> list[str]:
+    """Fail when DOC_PARITY_TEST_INPUTS drifts from the parity test's inputs.
+
+    Each `include_str!` target of DOC_PARITY_TEST must be listed, so editing
+    it alone still schedules the test, and each listed path must still be one
+    of those targets, so the set never schedules the Rust lane for nothing.
+
+    The comparison reads the checkout's test file, so it must run with the
+    planner from the SAME revision. `self_test()` does not call it: on pull
+    requests and merge groups CI Plan runs the trusted-base planner's
+    self-test against the candidate checkout, and comparing the base set with
+    a candidate test would refuse every change to the test's inputs, atomic or
+    split. `.github/scripts/verify_required_ci.py` calls it next to the
+    proposed planner's self-test, where both sides come from the candidate.
+    """
+
+    test_path = repo_root / DOC_PARITY_TEST
+    try:
+        text = test_path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as error:
+        return [f"{DOC_PARITY_TEST}: unreadable during doc-parity input scan: {error}"]
+    return doc_parity_drift_errors(text, DOC_PARITY_TEST_INPUTS) + (
+        doc_parity_scheduling_errors(DOC_PARITY_TEST_INPUTS)
+    )
+
+
+def doc_parity_self_test() -> list[str]:
+    """Revision-independent checks: synthetic drift cases and this planner's
+    own set. Safe to run from the trusted base against any checkout."""
+
+    failures = doc_parity_scheduling_errors(DOC_PARITY_TEST_INPUTS)
+    sample = (
+        'const A: &str = include_str!("../../../CHANGELOG.md");\n'
+        'const B: &str = include_str!( "../../../docs/upgrade_guide.md" );\n'
+    )
+    pair = frozenset({"CHANGELOG.md", "docs/upgrade_guide.md"})
+    if doc_parity_drift_errors(sample, pair):
+        failures.append("doc-parity drift check rejected a matching input set")
+    missing = doc_parity_drift_errors(sample, frozenset({"CHANGELOG.md"}))
+    if len(missing) != 1 or "embeds docs/upgrade_guide.md" not in missing[0]:
+        failures.append(f"doc-parity drift check missed an unlisted input: {missing!r}")
+    stale = doc_parity_drift_errors(sample, pair | {"docs/x.md"})
+    if len(stale) != 1 or "lists docs/x.md" not in stale[0]:
+        failures.append(f"doc-parity drift check missed a stale input: {stale!r}")
+    if not doc_parity_drift_errors("fn main() {}", pair):
+        failures.append("doc-parity drift check accepted a test with no inputs")
+    escaped = doc_parity_drift_errors(
+        'include_str!("../../../../etc/passwd")', frozenset()
+    )
+    if not any("escapes the repository" in failure for failure in escaped):
+        failures.append("doc-parity drift check accepted a path above the repository")
+    return failures
+
+
 PERFORMANCE_TREE_REFERENCE_RE = re.compile(r"tests/performance/[A-Za-z0-9._/-]+")
 
 
@@ -1430,6 +1563,12 @@ def self_test() -> int:
         # Executable contract inputs and governance inputs stay full.
         ("pull_request", ["docs/prometheus_metric_contract.json"], "full"),
         ("pull_request", ["docs/prometheus_metrics.md"], "full"),
+        # Release-note documents embedded by the changelog parity unit test.
+        ("pull_request", ["CHANGELOG.md"], "full"),
+        ("pull_request", ["docs/upgrade_guide.md"], "full"),
+        ("pull_request", ["docs/migrations.md"], "full"),
+        ("pull_request", ["CHANGELOG.md", "docs/upgrade_guide.md"], "full"),
+        ("merge_group", ["CHANGELOG.md"], "full"),
         (
             "pull_request",
             ["vendor/tungstenite-0.29.0-ferrum-patched/README.md"],
@@ -1498,6 +1637,10 @@ def self_test() -> int:
     # Source changes: the same lane (performance regression is out of band).
     src_only = rust_only
     gate_cases = [
+        # Release-note documents run the changelog/upgrade-guide parity test.
+        ("pull_request", ["CHANGELOG.md"], rust_only),
+        ("pull_request", ["docs/upgrade_guide.md"], rust_only),
+        ("pull_request", ["docs/migrations.md"], rust_only),
         # Nothing Rust-related: only planning/policy run.
         (
             "pull_request",
@@ -1540,8 +1683,16 @@ def self_test() -> int:
                 "run_two_cluster_live": False,
             },
         ),
-        ("pull_request", ["docs/prometheus_metric_contract.json"], {"run_helm": True}),
-        ("pull_request", ["docs/prometheus_metrics.md"], {"run_helm": True}),
+        (
+            "pull_request",
+            ["docs/prometheus_metric_contract.json"],
+            {"run_helm": True, "run_rust": True},
+        ),
+        (
+            "pull_request",
+            ["docs/prometheus_metrics.md"],
+            {"run_helm": True, "run_rust": True},
+        ),
         (
             "pull_request",
             [".github/scripts/validate_prometheus_metric_contract.py"],
@@ -1989,6 +2140,7 @@ def self_test() -> int:
     failures.extend(action_pinning_self_test())
     failures.extend(validate_action_pinning_policy(Path.cwd()))
     failures.extend(validate_performance_tree_inputs(Path.cwd()))
+    failures.extend(doc_parity_self_test())
     failures.extend(nul_transport_self_test())
     for failure in failures:
         print(f"::error::{failure}", file=sys.stderr)
