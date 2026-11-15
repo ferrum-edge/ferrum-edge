@@ -532,12 +532,29 @@ LIGHTWEIGHT_PATTERNS = [
 # security validation.
 FULL_CI_PREFIXES = ("vendor/", "charts/")
 
+# Release-note documents that `tests/unit/config/changelog_upgrade_parity_tests.rs`
+# embeds with `include_str!`: every Unreleased `BREAKING` changelog entry must
+# cite an issue the upgrade guide also cites, and the guide must not promise an
+# in-place schema migration that docs/migrations.md rules out. A pull request
+# that edits only these files must still run that unit test, so they select
+# full mode and the `run_rust` lane. `validate_doc_parity_inputs()` keeps this
+# set equal to the test's `include_str!` targets.
+DOC_PARITY_TEST = "tests/unit/config/changelog_upgrade_parity_tests.rs"
+DOC_PARITY_TEST_INPUTS = frozenset(
+    {
+        "CHANGELOG.md",
+        "docs/migrations.md",
+        "docs/upgrade_guide.md",
+    }
+)
+
 # These checked-in artifacts are executable contract inputs, not lightweight
 # prose. Changes must run the Rust parity tests and static contract validator.
 FULL_CI_CONTRACT_PATHS = frozenset(
     {
         "docs/prometheus_metric_contract.json",
         "docs/prometheus_metrics.md",
+        *DOC_PARITY_TEST_INPUTS,
     }
 )
 
@@ -831,6 +848,9 @@ RUST_PATTERNS = [
             for path in sorted(PERFORMANCE_TREE_WORKSPACE_INPUTS)
         ),
         r"^schemas/clickhouse/",  # DDL embedded by Rust integration tests
+        # Release-note documents embedded by the changelog/upgrade-guide
+        # parity unit test (DOC_PARITY_TEST_INPUTS).
+        *("^" + re.escape(path) + "$" for path in sorted(DOC_PARITY_TEST_INPUTS)),
         r"^ferrum\.conf$",
         r"^openapi\.yaml$",
         r"^deny\.toml$",
@@ -1374,6 +1394,58 @@ def nul_transport_self_test() -> list[str]:
     return failures
 
 
+INCLUDE_STR_REPO_PATH_RE = re.compile(r'include_str!\(\s*"((?:\.\./)+)([^"]+)"\s*\)')
+
+
+def validate_doc_parity_inputs(repo_root: Path) -> list[str]:
+    """Fail when DOC_PARITY_TEST_INPUTS drifts from the parity test's inputs.
+
+    Each `include_str!` target of DOC_PARITY_TEST must be listed, so editing
+    it alone still schedules the test, and each listed path must still be one
+    of those targets, so the set never schedules the Rust lane for nothing.
+    Listed paths must also select full mode and `run_rust`.
+    """
+
+    failures: list[str] = []
+    test_path = repo_root / DOC_PARITY_TEST
+    try:
+        text = test_path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as error:
+        return [f"{DOC_PARITY_TEST}: unreadable during doc-parity input scan: {error}"]
+    test_dir = PurePosixPath(DOC_PARITY_TEST).parent
+    embedded: set[str] = set()
+    for match in INCLUDE_STR_REPO_PATH_RE.finditer(text):
+        ups = match.group(1).count("../")
+        parts = test_dir.parts
+        if ups > len(parts):
+            failures.append(
+                f"{DOC_PARITY_TEST}: include_str! path escapes the repository: "
+                f"{match.group(0)!r}"
+            )
+            continue
+        base = PurePosixPath(*parts[: len(parts) - ups]) if ups < len(parts) else None
+        target = match.group(2)
+        embedded.add(str(base / target) if base else target)
+    if not embedded:
+        failures.append(f"{DOC_PARITY_TEST}: found no include_str! inputs")
+    for missing in sorted(embedded - DOC_PARITY_TEST_INPUTS):
+        failures.append(
+            f"{DOC_PARITY_TEST} embeds {missing}; add it to DOC_PARITY_TEST_INPUTS "
+            "in .github/scripts/pr_ci_plan.py so a change to it runs the test"
+        )
+    for stale in sorted(DOC_PARITY_TEST_INPUTS - embedded):
+        failures.append(
+            f"DOC_PARITY_TEST_INPUTS lists {stale}, which {DOC_PARITY_TEST} "
+            "no longer embeds"
+        )
+    for path in sorted(DOC_PARITY_TEST_INPUTS):
+        if is_lightweight_path(path):
+            failures.append(f"{path}: doc-parity input must select full CI")
+        if not select_job_gates("pull_request", [path])["run_rust"]:
+            failures.append(f"{path}: doc-parity input must schedule run_rust")
+    return failures
+
+
 PERFORMANCE_TREE_REFERENCE_RE = re.compile(r"tests/performance/[A-Za-z0-9._/-]+")
 
 
@@ -1430,6 +1502,12 @@ def self_test() -> int:
         # Executable contract inputs and governance inputs stay full.
         ("pull_request", ["docs/prometheus_metric_contract.json"], "full"),
         ("pull_request", ["docs/prometheus_metrics.md"], "full"),
+        # Release-note documents embedded by the changelog parity unit test.
+        ("pull_request", ["CHANGELOG.md"], "full"),
+        ("pull_request", ["docs/upgrade_guide.md"], "full"),
+        ("pull_request", ["docs/migrations.md"], "full"),
+        ("pull_request", ["CHANGELOG.md", "docs/upgrade_guide.md"], "full"),
+        ("merge_group", ["CHANGELOG.md"], "full"),
         (
             "pull_request",
             ["vendor/tungstenite-0.29.0-ferrum-patched/README.md"],
@@ -1498,6 +1576,10 @@ def self_test() -> int:
     # Source changes: the same lane (performance regression is out of band).
     src_only = rust_only
     gate_cases = [
+        # Release-note documents run the changelog/upgrade-guide parity test.
+        ("pull_request", ["CHANGELOG.md"], rust_only),
+        ("pull_request", ["docs/upgrade_guide.md"], rust_only),
+        ("pull_request", ["docs/migrations.md"], rust_only),
         # Nothing Rust-related: only planning/policy run.
         (
             "pull_request",
@@ -1989,6 +2071,7 @@ def self_test() -> int:
     failures.extend(action_pinning_self_test())
     failures.extend(validate_action_pinning_policy(Path.cwd()))
     failures.extend(validate_performance_tree_inputs(Path.cwd()))
+    failures.extend(validate_doc_parity_inputs(Path.cwd()))
     failures.extend(nul_transport_self_test())
     for failure in failures:
         print(f"::error::{failure}", file=sys.stderr)

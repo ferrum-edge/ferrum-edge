@@ -755,6 +755,10 @@ whose entire diff is limited to ordinary documentation, `.agents/**`,
 preserve a fast `Tests` aggregate without starting the Rust/build matrix.
 Exceptions that always select full mode: anything under `vendor/` or
 `charts/`, `docs/prometheus_metrics.md` / `docs/prometheus_metric_contract.json`,
+the release-note documents the changelog/upgrade-guide parity unit test embeds
+(`CHANGELOG.md`, `docs/upgrade_guide.md`, `docs/migrations.md`; they also set
+`run_rust`, so a release-notes-only PR runs
+`tests/unit/config/changelog_upgrade_parity_tests.rs`),
 and the dependency-governance docs (`docs/dependency-policy.md`,
 `docs/vendored-patch-lifecycle.json`, `docs/upstream-*`); see `pr_ci_plan.py`
 `is_lightweight_path`.
@@ -770,7 +774,7 @@ aggregate accepts a skipped job only when its gate was `false`:
 
 | Gate | Schedules | Pull-request trigger surface |
 |---|---|---|
-| `run_rust` | Unit Tests, Lint, Integration, Functional, Redis regression | `src/`, `tests/` (except `tests/k8s/` and the standalone benchmark workspaces under `tests/performance/`, other than the `PERFORMANCE_TREE_WORKSPACE_INPUTS` fixtures root-crate tests embed), `custom_plugins/`, `ebpf/`, `proto/`, `vendor/`, Cargo/toolchain/`build.rs`/`build/`, `.config/nextest.toml`, `ferrum.conf`, `openapi.yaml`, `deny.toml`, `clippy.toml`, `ci.yml`, the Rust setup actions |
+| `run_rust` | Unit Tests, Lint, Integration, Functional, Redis regression | `src/`, `tests/` (except `tests/k8s/` and the standalone benchmark workspaces under `tests/performance/`, other than the `PERFORMANCE_TREE_WORKSPACE_INPUTS` fixtures root-crate tests embed), `custom_plugins/`, `ebpf/`, `proto/`, `vendor/`, Cargo/toolchain/`build.rs`/`build/`, `.config/nextest.toml`, `ferrum.conf`, `openapi.yaml`, `deny.toml`, `clippy.toml`, `ci.yml`, the Rust setup actions, and the release-note documents `CHANGELOG.md` / `docs/upgrade_guide.md` / `docs/migrations.md` (`DOC_PARITY_TEST_INPUTS`, kept equal to the parity test's `include_str!` inputs by the planner self-test) |
 | `run_artifacts` | Build Test Artifacts | `run_rust` or `run_helm` |
 | `run_acme` | ACME Feature Tests (`--features acme`, own job) | `src/tls/`, `tests/acme_dns01/`, `tests/unit/tls/`, build graph |
 | `run_conformance` | Mesh Conformance Tests | `tests/conformance/`, mesh/xDS/k8s translation modules, build graph |
