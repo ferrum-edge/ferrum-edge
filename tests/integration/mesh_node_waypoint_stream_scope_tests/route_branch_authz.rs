@@ -354,8 +354,14 @@ fn a_route_without_another_candidate_is_not_threaded() {
     )
     .expect("VirtualService translates");
     let mut config = translated.config;
+    // The inventory and policy of the branching fixture, under this
+    // VirtualService's own mesh binding.
     let base = translated_config(vec![reviews_trusted_only()]);
-    config.mesh = base.mesh;
+    let base_mesh = *base.mesh.expect("fixture mesh block");
+    let mesh = config.mesh.get_or_insert_with(Box::default);
+    mesh.services = base_mesh.services;
+    mesh.workloads = base_mesh.workloads;
+    mesh.mesh_policies = base_mesh.mesh_policies;
     config.normalize_fields();
     config.normalize_mesh_fields();
     let slice =
