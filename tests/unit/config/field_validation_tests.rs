@@ -2734,6 +2734,62 @@ fn test_file_mode_refusal_of_allowed_ws_origins_star_does_not_log_grandfathering
     );
 }
 
+/// Admin API restore refuses `*` / non-origin `allowed_ws_origins`, so its
+/// field validation must not log the #5454 grandfathering warning, which
+/// says the config "is still loaded". The refusal and its aggregation are
+/// unchanged: the admission errors are still reported, after the pipeline.
+#[test]
+fn test_restore_refusal_of_allowed_ws_origins_star_does_not_log_grandfathering_warning() {
+    let mut proxy = make_proxy("ws-proxy", "/ws");
+    proxy.allowed_ws_origins = vec!["*".into(), "https://app.example.com/path".into()];
+    let mut candidate = GatewayConfig {
+        proxies: vec![proxy],
+        ..Default::default()
+    };
+    let expected = candidate.allowed_ws_origins_admission_errors();
+    assert_eq!(expected.len(), 2, "both entries are admission errors");
+    let policy = ferrum_edge::config::BackendEgressPolicy::unrestricted();
+
+    let (logs, guard) = capture_ws_origin_logs();
+    let errors = ferrum_edge::_test_support::restore_candidate_validation_errors_for_test(
+        &mut candidate,
+        30,
+        &policy,
+    );
+    drop(guard);
+    assert_eq!(
+        errors, expected,
+        "restore must refuse the candidate with exactly the admission errors"
+    );
+    assert!(
+        errors[0].contains("allowed_ws_origins[0] is '*'")
+            && errors[0].contains(ALLOWED_WS_ORIGINS_STAR_GUIDANCE),
+        "{errors:?}"
+    );
+    assert!(
+        errors[1].contains("allowed_ws_origins[1] must be a literal origin"),
+        "{errors:?}"
+    );
+    let output = logs.contents();
+    assert!(
+        !output.contains("`allowed_ws_origins` contains `*`") && !output.contains("still loaded"),
+        "a refused restore must not log the grandfathering warning: {output}"
+    );
+
+    // Positive control: the same capture sees the warning when the same
+    // candidate goes through database/CP/DP load validation, so the absence
+    // above is real and those loads keep #5454's grandfathering.
+    let (logs, _guard) = capture_ws_origin_logs();
+    candidate
+        .validate_all_fields(30)
+        .expect("database/CP/DP load validation keeps a legacy star");
+    let output = logs.contents();
+    assert!(
+        output.contains("`allowed_ws_origins` contains `*`") && output.contains("still loaded"),
+        "positive control: the warning must be captured on the load path: {output}"
+    );
+}
+
 #[derive(Clone, Default)]
 struct CapturedWsOriginLogs {
     buffer: Arc<Mutex<Vec<u8>>>,

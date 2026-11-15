@@ -11032,49 +11032,102 @@ async fn validate_restore_candidate_on_blocking_pool(
     cert_expiry_days: u64,
     backend_allow_ips: crate::config::BackendEgressPolicy,
 ) -> Result<(GatewayConfig, Vec<String>), anyhow::Error> {
-    let (candidate, result) = tokio::task::spawn_blocking(move || {
-        // Identity first: restore stamps namespaces from the already-validated
-        // X-Ferrum-Namespace header, but payload resource IDs are hostile
-        // boundary input. Reject malformed IDs before any other domain check so
-        // a wiped-and-rewritten namespace cannot persist `|`-bearing identities
-        // that would later collide after `namespace|id` encoding (issue #3094).
-        let result = ValidationPipeline::new(&mut candidate)
-            .validate_resource_ids(ValidationAction::Collect)
-            .validate_all_fields_with_ip_policy(
-                cert_expiry_days,
-                &backend_allow_ips,
-                ValidationAction::Collect,
-            )
-            .validate_unique_resource_ids(ValidationAction::Collect)
-            .validate_unique_consumer_identities(ValidationAction::Collect)
-            .validate_unique_consumer_credentials(ValidationAction::Collect)
-            // Name uniqueness is enforced by `POST /batch`, file mode, and a
-            // real unique index on `(namespace, name)` in every backend. It
-            // must be refused here too, before the destructive clear, or a
-            // duplicate-name payload wipes the namespace and only then fails
-            // during persistence (issue #4265).
-            .validate_unique_upstream_names(ValidationAction::Collect)
-            .validate_unique_proxy_names(ValidationAction::Collect)
-            .validate_hosts(ValidationAction::Collect)
-            .validate_regex_listen_paths(ValidationAction::Collect)
-            .validate_listen_path_encodings(ValidationAction::Collect)
-            .validate_unique_listen_paths(ValidationAction::Collect)
-            .validate_stream_proxies(ValidationAction::Collect)
-            .validate_plugin_configs(&backend_allow_ips, ValidationAction::Collect)
-            .validate_upstream_references(ValidationAction::Collect)
-            .validate_mesh_route_dispatch_references(ValidationAction::Collect)
-            .validate_plugin_references(ValidationAction::Collect)
-            .run();
-        (candidate, result)
+    tokio::task::spawn_blocking(move || {
+        let errors = restore_candidate_validation_errors(
+            &mut candidate,
+            cert_expiry_days,
+            &backend_allow_ips,
+        );
+        (candidate, errors)
     })
     .await
-    .map_err(|error| anyhow::anyhow!("restore validation task failed: {error}"))?;
+    .map_err(|error| anyhow::anyhow!("restore validation task failed: {error}"))
+}
 
-    let errors = match result {
+/// Every database-independent admission error for a restore candidate, in the
+/// order the restore response reports them: the validation pipeline, then
+/// operator-provided upstream fields, then `allowed_ws_origins` admission.
+///
+/// Runs on the blocking pool through
+/// [`validate_restore_candidate_on_blocking_pool`]; tests reach it
+/// synchronously through `_test_support`.
+fn restore_candidate_validation_errors(
+    candidate: &mut GatewayConfig,
+    cert_expiry_days: u64,
+    backend_allow_ips: &crate::config::BackendEgressPolicy,
+) -> Vec<String> {
+    // Identity first: restore stamps namespaces from the already-validated
+    // X-Ferrum-Namespace header, but payload resource IDs are hostile
+    // boundary input. Reject malformed IDs before any other domain check so
+    // a wiped-and-rewritten namespace cannot persist `|`-bearing identities
+    // that would later collide after `namespace|id` encoding (issue #3094).
+    //
+    // Field validation uses the admission variant: restore refuses `"*"` /
+    // non-origin `allowed_ws_origins` below, so the #5454 grandfathering
+    // warning ("stored database/control-plane config is still loaded") would
+    // be false here. File mode avoids it the same way (issue #7218).
+    let result = ValidationPipeline::new(candidate)
+        .validate_resource_ids(ValidationAction::Collect)
+        .validate_all_fields_for_admission_with_ip_policy(
+            cert_expiry_days,
+            backend_allow_ips,
+            ValidationAction::Collect,
+        )
+        .validate_unique_resource_ids(ValidationAction::Collect)
+        .validate_unique_consumer_identities(ValidationAction::Collect)
+        .validate_unique_consumer_credentials(ValidationAction::Collect)
+        // Name uniqueness is enforced by `POST /batch`, file mode, and a
+        // real unique index on `(namespace, name)` in every backend. It
+        // must be refused here too, before the destructive clear, or a
+        // duplicate-name payload wipes the namespace and only then fails
+        // during persistence (issue #4265).
+        .validate_unique_upstream_names(ValidationAction::Collect)
+        .validate_unique_proxy_names(ValidationAction::Collect)
+        .validate_hosts(ValidationAction::Collect)
+        .validate_regex_listen_paths(ValidationAction::Collect)
+        .validate_listen_path_encodings(ValidationAction::Collect)
+        .validate_unique_listen_paths(ValidationAction::Collect)
+        .validate_stream_proxies(ValidationAction::Collect)
+        .validate_plugin_configs(backend_allow_ips, ValidationAction::Collect)
+        .validate_upstream_references(ValidationAction::Collect)
+        .validate_mesh_route_dispatch_references(ValidationAction::Collect)
+        .validate_plugin_references(ValidationAction::Collect)
+        .run();
+
+    let mut errors = match result {
         Ok(errors) => errors,
         Err(error) => vec![error.to_string()],
     };
-    Ok((candidate, errors))
+    // Restore is an operator-provided admin write, so reject mesh-PROJECTED
+    // upstream fields the same way direct POST/PUT does. This check is
+    // intentionally NOT part of the shared `validate_all_fields` step (that
+    // step also runs on the mesh slice-apply path, where mesh-projected
+    // upstreams legitimately carry these fields); operator paths invoke it
+    // explicitly.
+    for upstream in &candidate.upstreams {
+        if let Err(errs) = upstream.validate_operator_provided_fields() {
+            for e in errs {
+                errors.push(format!("Upstream '{}': {}", upstream.id, e));
+            }
+        }
+    }
+    // Restore is an operator write, so reject CORS-style `"*"` / non-origin
+    // `allowed_ws_origins` the same way `POST /proxies` does. Load snapshots
+    // warn instead of failing (issue #5454).
+    errors.extend(candidate.allowed_ws_origins_admission_errors());
+    errors
+}
+
+/// Restore candidate admission errors computed on the calling thread, so a
+/// test can capture the logs validation emits.
+///
+/// Reached through `_test_support`.
+pub(crate) fn restore_candidate_validation_errors_for_test(
+    candidate: &mut GatewayConfig,
+    cert_expiry_days: u64,
+    backend_allow_ips: &crate::config::BackendEgressPolicy,
+) -> Vec<String> {
+    restore_candidate_validation_errors(candidate, cert_expiry_days, backend_allow_ips)
 }
 
 /// Restore the gateway configuration from a backup payload.
@@ -11291,23 +11344,6 @@ async fn handle_restore(
             ));
         }
     };
-    // Restore is an operator-provided admin write, so reject mesh-PROJECTED
-    // upstream fields the same way direct POST/PUT does. This check is
-    // intentionally NOT part of the shared `validate_all_fields` step (that
-    // step also runs on the mesh slice-apply path, where mesh-projected
-    // upstreams legitimately carry these fields); operator paths invoke it
-    // explicitly.
-    for upstream in &candidate.upstreams {
-        if let Err(errs) = upstream.validate_operator_provided_fields() {
-            for e in errs {
-                validation_errors.push(format!("Upstream '{}': {}", upstream.id, e));
-            }
-        }
-    }
-    // Restore is an operator write, so reject CORS-style `"*"` / non-origin
-    // `allowed_ws_origins` the same way `POST /proxies` does. Load snapshots
-    // warn instead of failing (issue #5454).
-    validation_errors.extend(candidate.allowed_ws_origins_admission_errors());
     if candidate
         .plugin_configs
         .iter()

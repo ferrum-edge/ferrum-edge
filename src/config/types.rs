@@ -8766,8 +8766,10 @@ impl Proxy {
     /// Warn once when a loaded proxy still carries the CORS-style `"*"`
     /// footgun or a non-origin `allowed_ws_origins` entry. Never fails the load
     /// by itself. File mode refuses such a document in `file_loader` before
-    /// the validation pipeline runs (issue #7218), so a file-mode load never
-    /// emits this warning.
+    /// the validation pipeline runs (issue #7218), and Admin API restore
+    /// validates through
+    /// [`GatewayConfig::validate_all_fields_for_admission_with_ip_policy`], so
+    /// neither a file-mode load nor a refused restore emits this warning.
     pub fn warn_legacy_allowed_ws_origins(&self) {
         let has_legacy_entry = self.allowed_ws_origins.iter().any(|origin| {
             let trimmed = origin.trim();
@@ -11550,10 +11552,45 @@ impl GatewayConfig {
     }
 
     /// Validate all fields with backend IP policy enforcement.
+    ///
+    /// Database, CP and DP loads use this. A proxy whose `allowed_ws_origins`
+    /// still carries `*` or a non-origin entry keeps loading with the #5454
+    /// grandfathering warning from [`Proxy::warn_legacy_allowed_ws_origins`].
     pub fn validate_all_fields_with_ip_policy(
         &self,
         cert_expiry_warning_days: u64,
         backend_allow_ips: &crate::config::BackendEgressPolicy,
+    ) -> Result<(), Vec<String>> {
+        self.validate_all_fields_with_ip_policy_inner(
+            cert_expiry_warning_days,
+            backend_allow_ips,
+            true,
+        )
+    }
+
+    /// The same field checks as [`Self::validate_all_fields_with_ip_policy`],
+    /// for operator admission paths that refuse `*` / non-origin
+    /// `allowed_ws_origins` through [`Self::allowed_ws_origins_admission_errors`]
+    /// (Admin API restore). It returns the same errors but does not emit the
+    /// #5454 grandfathering warning: that warning says the config "is still
+    /// loaded", which is false for a candidate admission refuses.
+    pub fn validate_all_fields_for_admission_with_ip_policy(
+        &self,
+        cert_expiry_warning_days: u64,
+        backend_allow_ips: &crate::config::BackendEgressPolicy,
+    ) -> Result<(), Vec<String>> {
+        self.validate_all_fields_with_ip_policy_inner(
+            cert_expiry_warning_days,
+            backend_allow_ips,
+            false,
+        )
+    }
+
+    fn validate_all_fields_with_ip_policy_inner(
+        &self,
+        cert_expiry_warning_days: u64,
+        backend_allow_ips: &crate::config::BackendEgressPolicy,
+        warn_legacy_allowed_ws_origins: bool,
     ) -> Result<(), Vec<String>> {
         let mut errors = Vec::new();
 
@@ -11617,9 +11654,13 @@ impl GatewayConfig {
             }
             // Grandfather existing `"*"` / non-origin rows: never fail a
             // database/CP/DP load for this (issue #5454). Admission rejects
-            // the same values through `validate_fields`, and file mode
-            // refuses them in `file_loader` before this runs (issue #7218).
-            proxy.warn_legacy_allowed_ws_origins();
+            // the same values through `validate_fields`, file mode refuses
+            // them in `file_loader` before this runs (issue #7218), and
+            // restore validates through the admission variant, which skips
+            // the warning because it refuses the same values.
+            if warn_legacy_allowed_ws_origins {
+                proxy.warn_legacy_allowed_ws_origins();
+            }
             proxy.warn_unreachable_regex_path_parameters();
         }
         for consumer in &self.consumers {

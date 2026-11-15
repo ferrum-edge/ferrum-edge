@@ -486,6 +486,22 @@ pub mod _test_support {
         crate::admin::restore_envelope_admission_for_test(body)
     }
 
+    /// Database-independent `POST /restore` admission errors for `candidate`,
+    /// in the order the restore response reports them. Runs on the calling
+    /// thread (production runs it on the blocking pool) so a test can capture
+    /// the logs validation emits.
+    pub fn restore_candidate_validation_errors_for_test(
+        candidate: &mut crate::config::types::GatewayConfig,
+        cert_expiry_days: u64,
+        backend_allow_ips: &crate::config::BackendEgressPolicy,
+    ) -> Vec<String> {
+        crate::admin::restore_candidate_validation_errors_for_test(
+            candidate,
+            cert_expiry_days,
+            backend_allow_ips,
+        )
+    }
+
     /// Serde-accepted member names of the `POST /restore` envelope
     /// (issue #5542).
     ///

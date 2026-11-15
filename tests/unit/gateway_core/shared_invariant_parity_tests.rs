@@ -5437,3 +5437,82 @@ fn node_waypoint_route_branch_verdicts_gate_every_destination_decision() {
         "no single dispatch instance may admit an intermediate destination"
     );
 }
+
+// ---- `allowed_ws_origins` grandfathering warning vs admission refusal ----
+
+/// Every production caller of whole-config field validation, split by whether
+/// it may emit the #5454 `allowed_ws_origins` grandfathering warning
+/// ("stored database/control-plane config is still loaded").
+///
+/// Load paths (database, CP, DP, the pre-swap guard) keep the warning. A path
+/// that refuses `*` / non-origin entries must not emit it: file mode refuses
+/// before its pipeline runs (issue #7218), and Admin API restore validates
+/// through the admission variant. A new caller fails here until it is placed
+/// in one column, so a refusing path cannot silently pick up a false warning.
+#[test]
+fn allowed_ws_origins_grandfathering_warning_never_precedes_an_admission_refusal() {
+    const WARNING_CALL: &str = ".validate_all_fields_with_ip_policy(";
+    const ADMISSION_CALL: &str = ".validate_all_fields_for_admission_with_ip_policy(";
+    // (file, warning-variant call sites, admission-variant call sites)
+    let expected: BTreeMap<&str, (usize, usize)> = BTreeMap::from([
+        // Restore: refuses through `allowed_ws_origins_admission_errors`.
+        ("src/admin/mod.rs", (0, 1)),
+        // `validate_all_fields` delegating to the warning variant.
+        ("src/config/types.rs", (1, 0)),
+        // The pipeline step dispatching to either variant.
+        ("src/config/validation_pipeline.rs", (1, 1)),
+        // File mode: reached only after the admission refusal (pinned below).
+        ("src/config/file_loader.rs", (1, 0)),
+        // Database, CP and DP loads and the pre-swap guard keep #5454.
+        ("src/config/db_loader.rs", (1, 0)),
+        ("src/config/mongo_store.rs", (1, 0)),
+        ("src/modes/control_plane.rs", (1, 0)),
+        ("src/grpc/dp_client.rs", (1, 0)),
+        ("src/proxy/mod.rs", (1, 0)),
+    ]);
+    let actual: BTreeMap<String, (usize, usize)> = production_sources()
+        .into_iter()
+        .filter_map(|(path, text)| {
+            let counts = (
+                text.matches(WARNING_CALL).count(),
+                text.matches(ADMISSION_CALL).count(),
+            );
+            (counts != (0, 0)).then_some((path, counts))
+        })
+        .collect();
+    let expected: BTreeMap<String, (usize, usize)> = expected
+        .into_iter()
+        .map(|(path, counts)| (path.to_string(), counts))
+        .collect();
+    assert_eq!(
+        actual, expected,
+        "classify every whole-config field-validation caller: a path that refuses \
+         `allowed_ws_origins` `*` must use the admission variant or refuse first"
+    );
+
+    let restore = source("src/admin/mod.rs");
+    let restore = item_body(&restore, "fn restore_candidate_validation_errors(", "\n}");
+    let admission = restore
+        .find(ADMISSION_CALL)
+        .expect("restore validates through the admission variant");
+    let refusal = restore
+        .find("candidate.allowed_ws_origins_admission_errors()")
+        .expect("restore refuses `*` / non-origin entries");
+    assert!(
+        admission < refusal,
+        "restore keeps its error order: pipeline first, admission refusal last"
+    );
+
+    let file_loader = source("src/config/file_loader.rs");
+    let core = item_body(&file_loader, "fn decode_and_validate_document(", "\n}");
+    let refusal = core
+        .find("config.allowed_ws_origins_admission_errors()")
+        .expect("file mode refuses `*` / non-origin entries");
+    let pipeline = core
+        .find(WARNING_CALL)
+        .expect("file mode runs the field validators");
+    assert!(
+        refusal < pipeline,
+        "file mode must refuse before the warning-emitting field validators run"
+    );
+}
