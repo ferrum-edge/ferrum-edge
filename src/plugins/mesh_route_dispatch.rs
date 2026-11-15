@@ -72,6 +72,8 @@ use crate::plugins::fault_injection::{
 use crate::plugins::mesh::authz::{
     NODE_WAYPOINT_AUTHORIZED_BACKEND_ALIASES_METADATA, NODE_WAYPOINT_AUTHORIZED_BACKEND_METADATA,
     NODE_WAYPOINT_AUTHORIZED_UPSTREAM_ID_METADATA, NODE_WAYPOINT_SCOPED_AUTHZ_ACTIVE_METADATA,
+    NodeWaypointBranchDestination, enforce_node_waypoint_route_branch,
+    has_node_waypoint_route_branch_authz, node_waypoint_route_branch_refuses,
 };
 use crate::plugins::mesh::diagnostics::{self, Schema};
 use crate::plugins::utils::fault_roll::{FaultRoller, MAX_FAULT_DELAY_MS};
@@ -1649,6 +1651,69 @@ impl RouteDestination {
     }
 }
 
+/// The candidate a rule's destination names in a carried route's
+/// per-destination verdict table (issue #7383). Config validation makes
+/// `upstream_id` exclusive and `backend_host` / `backend_port` paired, so a
+/// rule names the route's own destination, one upstream, or one backend;
+/// anything else is a shape the table cannot name and is refused.
+fn node_waypoint_rule_branch_destination(
+    destination: &RouteDestination,
+) -> NodeWaypointBranchDestination<'_> {
+    if destination.is_empty() {
+        return NodeWaypointBranchDestination::Own;
+    }
+    match (
+        destination.upstream_id.as_deref(),
+        destination.node_waypoint_backend_match_key.as_deref(),
+    ) {
+        (Some(upstream_id), None)
+            if destination.backend_host.is_none()
+                && destination.backend_port.is_none()
+                && destination.backend_tls.is_none() =>
+        {
+            NodeWaypointBranchDestination::Upstream(upstream_id)
+        }
+        (None, Some(key)) => NodeWaypointBranchDestination::BackendMetadataKey(key),
+        _ => NodeWaypointBranchDestination::Unknown,
+    }
+}
+
+/// Admit or refuse a matched rule's destination under NodeWaypoint
+/// destination authorization.
+///
+/// A carried VirtualService route whose rules can select another destination
+/// carries per-destination verdicts (issue #7383): the rule is admitted only
+/// when its own destination's policy allowed the request, and is refused with
+/// that policy's denial otherwise. Every other route keeps the blanket guard
+/// below, which binds dispatch to the one destination authorization stamped.
+fn reject_unauthorized_node_waypoint_rule_destination(
+    ctx: &mut RequestContext,
+    destination: &RouteDestination,
+) -> Option<PluginResult> {
+    if has_node_waypoint_route_branch_authz(ctx) {
+        return enforce_node_waypoint_route_branch(
+            ctx,
+            node_waypoint_rule_branch_destination(destination),
+        );
+    }
+    reject_node_waypoint_authz_destination_override(ctx, destination)
+}
+
+/// Side-effect-free twin of [`reject_unauthorized_node_waypoint_rule_destination`]
+/// for early route-total planning.
+fn node_waypoint_rule_destination_vetoed(
+    ctx: &RequestContext,
+    destination: &RouteDestination,
+) -> bool {
+    if has_node_waypoint_route_branch_authz(ctx) {
+        return node_waypoint_route_branch_refuses(
+            ctx,
+            node_waypoint_rule_branch_destination(destination),
+        );
+    }
+    reject_node_waypoint_authz_destination_override(ctx, destination).is_some()
+}
+
 fn reject_node_waypoint_authz_destination_override(
     ctx: &RequestContext,
     destination: &RouteDestination,
@@ -2064,8 +2129,8 @@ fn rule_answers_before_dispatch(
         .is_some_and(|abort| abort.percentage >= 100.0);
     let fault_preempted =
         facts.route_faults_may_be_preempted || ctx.metadata.contains_key("fault_injected");
-    let veto = reject_node_waypoint_authz_destination_override(ctx, &rule.destination);
-    rule.redirect.is_some() || (always_aborts && !fault_preempted) || veto.is_some()
+    let veto = node_waypoint_rule_destination_vetoed(ctx, &rule.destination);
+    rule.redirect.is_some() || (always_aborts && !fault_preempted) || veto
 }
 
 /// Validate the optional `match.source_namespace` predicate. The Istio CRD
@@ -2640,7 +2705,7 @@ impl Plugin for MeshRouteDispatch {
                     return result;
                 }
                 if let Some(result) =
-                    reject_node_waypoint_authz_destination_override(ctx, &rule.destination)
+                    reject_unauthorized_node_waypoint_rule_destination(ctx, &rule.destination)
                 {
                     // A security denial is not a response this rule
                     // generates: tenant route policy must never decorate

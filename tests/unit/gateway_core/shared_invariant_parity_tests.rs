@@ -3838,6 +3838,12 @@ fn plugin_struct_lists_behind_raw_json_values_retain_element_admission() {
         ),
         (
             "src/plugins/mesh/authz.rs",
+            "fn parse_node_waypoint_route_branches(",
+            "\n}",
+            "json_object::from_json_object_vec_value",
+        ),
+        (
+            "src/plugins/mesh/authz.rs",
             "pub fn new_with_http_client(",
             "\n    }",
             "Vec<crate::util::json_object::JsonObject<MeshPolicy>>",
@@ -5346,5 +5352,63 @@ fn final_request_body_hook_context_hand_back_has_one_implementation() {
     assert!(
         adopters >= 6,
         "expected the five proxy dispatch sites and the `_test_support` seam, found {adopters}"
+    );
+}
+
+/// NodeWaypoint per-destination authorization (issue #7383): every place that
+/// decides which destination a carried VirtualService route reaches must
+/// consult the request's per-destination verdicts before the blanket
+/// single-destination guard. The siblings are route dispatch's matched-rule
+/// admission, its early route-total preview, and proxy core's final check in
+/// the one `before_proxy` runner every transport (H1/H2, native gRPC,
+/// WebSocket, H3, deferred passes) converges on. A new call site of the
+/// blanket guard, or a runner without the final check, fails here.
+#[test]
+fn node_waypoint_route_branch_verdicts_gate_every_destination_decision() {
+    let proxy = admission_source_without_line_comments(&source("src/proxy/mod.rs"));
+    let runner = item_body(
+        &proxy,
+        "pub(crate) async fn run_before_proxy_hooks_for_backend_path_policy(",
+        "\n}",
+    );
+    assert!(
+        runner.contains("enforce_node_waypoint_route_branch_for_effective_destination("),
+        "the shared before_proxy runner must admit the reached destination on its own verdict"
+    );
+
+    let dispatch = source("src/plugins/mesh_route_dispatch.rs");
+    let production = dispatch
+        .split("\n#[cfg(test)]\nmod tests {")
+        .next()
+        .expect("dispatch source");
+    let production = admission_source_without_line_comments(production);
+    let guard_calls = production
+        .matches("reject_node_waypoint_authz_destination_override(")
+        .count();
+    assert_eq!(
+        guard_calls, 3,
+        "the blanket guard is defined once and reached only through the two verdict-aware wrappers"
+    );
+    let admission = item_body(
+        &production,
+        "fn reject_unauthorized_node_waypoint_rule_destination(",
+        "\n}",
+    );
+    assert!(admission.contains("enforce_node_waypoint_route_branch("));
+    let preview = item_body(
+        &production,
+        "fn node_waypoint_rule_destination_vetoed(",
+        "\n}",
+    );
+    assert!(preview.contains("node_waypoint_route_branch_refuses("));
+    assert!(
+        item_body(&production, "fn rule_answers_before_dispatch(", "\n}")
+            .contains("node_waypoint_rule_destination_vetoed(ctx, &rule.destination)"),
+        "early route-total planning must use the verdict-aware preview"
+    );
+    assert!(
+        production
+            .contains("reject_unauthorized_node_waypoint_rule_destination(ctx, &rule.destination)"),
+        "matched-rule admission must use the verdict-aware check"
     );
 }
