@@ -394,9 +394,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     policy plugins that run before dispatch and gives them back unchanged except
     for the names the selected destination's own provider owns; no provider is
     called for a branch the request does not take. On these routes the CUSTOM
-    check therefore runs after `rate_limiting`, `waf`, the body validators and
-    the `ai_*` plugins, so a request its provider denies may already have
-    consumed rate-limit quota.
+    check therefore runs after the `before_proxy` plugins between `mesh_authz`
+    (2075) and dispatch (2995): `rate_limiting`, `waf`, the body validators and
+    the `ai_*` plugins in that band. A request its provider denies may already
+    have consumed rate-limit quota; `ai_prompt_compressor`, `ai_federation` and
+    `ai_rate_limiter` (4055 and above) still run after the check.
   - Routes without another candidate, inbound HBONE relays and operator
     `mesh_authz` overrides keep the single-destination decision; Sidecar and
     Ambient are unchanged.
