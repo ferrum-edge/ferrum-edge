@@ -852,6 +852,11 @@ RUST_PATTERNS = [
         # Release-note documents embedded by the changelog/upgrade-guide
         # parity unit test (DOC_PARITY_TEST_INPUTS).
         *("^" + re.escape(path) + "$" for path in sorted(DOC_PARITY_TEST_INPUTS)),
+        # The Prometheus metric contract and reference, embedded by the unit
+        # parity tests (`prometheus_metric_contract_tests`,
+        # `openapi_yaml_tests`, `tls_store_bounds_tests`).
+        r"^docs/prometheus_metric_contract\.json$",
+        r"^docs/prometheus_metrics\.md$",
         r"^ferrum\.conf$",
         r"^openapi\.yaml$",
         r"^deny\.toml$",
@@ -1678,8 +1683,16 @@ def self_test() -> int:
                 "run_two_cluster_live": False,
             },
         ),
-        ("pull_request", ["docs/prometheus_metric_contract.json"], {"run_helm": True}),
-        ("pull_request", ["docs/prometheus_metrics.md"], {"run_helm": True}),
+        (
+            "pull_request",
+            ["docs/prometheus_metric_contract.json"],
+            {"run_helm": True, "run_rust": True},
+        ),
+        (
+            "pull_request",
+            ["docs/prometheus_metrics.md"],
+            {"run_helm": True, "run_rust": True},
+        ),
         (
             "pull_request",
             [".github/scripts/validate_prometheus_metric_contract.py"],
