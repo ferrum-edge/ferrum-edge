@@ -131,7 +131,11 @@ whose `exportTo` admits it, over native `MeshSubscribe` and the xDS
 when it is not self-contained. Destination policy (`mesh_authz`'s
 `node_waypoint_route_upstreams`) and RequestAuthentication destination scoping
 therefore resolve a VirtualService route to the workloads it reaches on a
-production NodeWaypoint, not only in tests. Sidecar, Ambient and
+production NodeWaypoint, not only in tests. When a merged route's
+`mesh_route_dispatch` rules can select a destination other than the route's
+own, `mesh_authz` evaluates every candidate destination before dispatch and the
+destination a request finally reaches is admitted only on its own verdict
+(issue #7383); an unknown destination is refused. Sidecar, Ambient and
 ServiceWaypoint slices carry no HTTP routes. See `docs/mesh.md` ("Mesh data
 planes: NodeWaypoint route carriage").
 
