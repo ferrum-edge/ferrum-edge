@@ -77,11 +77,7 @@ fn virtual_service(name: &str, spec: serde_json::Value) -> K8sObject {
 /// On `/api`, `x-version: v2` goes to `ratings` and everything else to
 /// `reviews`. The guarded route shares the fallback route's path, so the
 /// translator merges it into the fallback route's proxy as a dispatch rule.
-fn branch_spec() -> serde_json::Value {
-    branch_spec_with_ratings_port(8080)
-}
-
-/// [`branch_spec`] with the `ratings` branch on `ratings_port`.
+/// `ratings` is reached on `ratings_port`.
 fn branch_spec_with_ratings_port(ratings_port: u16) -> serde_json::Value {
     json!({
         "hosts": ["reviews.default.svc.cluster.local"],
