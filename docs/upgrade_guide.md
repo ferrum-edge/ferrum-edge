@@ -100,12 +100,13 @@ an install or upgrade that still sets them fails at `helm template`.
 These inputs used to render cleanly and then fail on the cluster. They now
 fail `helm template` / `helm upgrade` with the fix in the message.
 
-- `ferrum-mesh` with `ca.enabled=true`: the CA Deployment runs
-  `FERRUM_MODE=cp` from `ca.env`, which refuses a non-loopback plaintext CP
-  gRPC bind at startup (#7298). **Operator action:** set
-  `ca.env.FERRUM_CP_GRPC_TLS_CERT_PATH` and `ca.env.FERRUM_CP_GRPC_TLS_KEY_PATH`
-  (and mount them), bind a loopback `ca.env.FERRUM_CP_GRPC_LISTEN_ADDR`, or set
-  `ca.env.FERRUM_CP_DP_GRPC_ALLOW_PLAINTEXT: "true"` for development.
+- `ferrum-mesh` with `controlPlane.enabled=true` and a non-loopback plaintext
+  CP gRPC listener: the control plane refuses that bind at startup (#7298).
+  **Operator action:** set `controlPlane.env.FERRUM_CP_GRPC_TLS_CERT_PATH` and
+  `controlPlane.env.FERRUM_CP_GRPC_TLS_KEY_PATH` (and mount them, as
+  `examples/production-existing-secrets-values.yaml` now does), or set
+  `controlPlane.env.FERRUM_CP_DP_GRPC_ALLOW_PLAINTEXT: "true"` for development
+  and test.
 - `ferrum-gateway` with a null `terminationGracePeriodSeconds`: that rendered an
   empty field, leaving the pod on Kubernetes' 30s default (#7299). **Operator
   action:** set an integer at least the minimum the error names.
@@ -120,6 +121,29 @@ fail `helm template` / `helm upgrade` with the fix in the message.
 `ferrum-gateway` no longer fails the SleepAction check under `helm template`'s
 default Kubernetes version (1.20.0), which is not a real cluster; an explicit
 `--kube-version` below 1.29 still fails, as in `ferrum-mesh`.
+
+### `ferrum-mesh` chart: the standalone mesh CA is removed (#7298)
+
+The `ca` component (`ca.enabled=true`) ran a second `FERRUM_MODE=cp` Deployment
+that issued no certificates. It is removed: the `ferrum-mesh-ca` Deployment,
+Service, ServiceAccount, PodDisruptionBudget and `ferrum-mesh-ca-metrics`
+Service are deleted on upgrade, and the values schema refuses every `ca.*` key.
+Mesh workload identity comes from SPIRE (`FERRUM_MESH_CA_BACKEND=spire`), file
+SVIDs (`FERRUM_GATEWAY_SVID_*`), or the dev-only in-process `internal` CA; none
+of them used the removed Deployment.
+
+**Operator action:** delete `ca.*` from your values files before
+`helm upgrade`. A release installed with `ca.*` values keeps them in its stored
+values, so `helm upgrade` without new values (which reuses them) fails schema
+validation; upgrade with `--reset-values` or `--reset-then-reuse-values` after
+removing `ca`.
+
+The plaintext CP gRPC render check that covered `ca.env` now covers
+`controlPlane.env` (see the `ferrum-mesh` bullet in the previous section). The
+production example `examples/production-existing-secrets-values.yaml` now
+serves CP gRPC over TLS with data-plane client certificates from the Secret
+`ferrum-mesh-production-cp-grpc-tls` (`tls.crt`, `tls.key`, `ca.crt`); create
+it before installing that example.
 
 ### `correlation_id` metadata is no longer a request-ID fallback (#7303)
 
@@ -365,8 +389,170 @@ upgrading:
 - a labelled `selector`: `scope: {kind: workload_selector, selector: {labels: ..., namespace: <policy namespace>}}`.
 
 Policies translated from Istio `PeerAuthentication` objects need no change. The
-ConfigSync protocol revision is 4, so a CP and DP from different builds refuse
-each other at `Subscribe` and never exchange the earlier form.
+ConfigSync protocol revision is 5 (revision 4 introduced this shape), so a CP
+and DP from different builds refuse each other at `Subscribe` and never
+exchange the earlier form.
+
+### Every log sink is `KeepLastKnownGood` (#7144)
+
+`http_logging`, `udp_logging`, `statsd_logging`, `loki_logging` and
+`ws_frame_logging` were `OptionalFailOpen`: an invalid enabled config was
+logged and the instance silently dropped from the published plugin cache. They
+are now `KeepLastKnownGood`, like `stdout_logging`, `tcp_logging`,
+`kafka_logging` and `ws_logging`, so a typo can no longer turn off an access log
+unnoticed:
+
+- `ferrum-edge validate` and file-mode startup fail on an invalid log-sink
+  config.
+- Database-mode cold start refuses to start (or serves
+  `FERRUM_DB_CONFIG_BACKUP_PATH` with `config_rejected` raised). Such a row is
+  no longer quarantined.
+- Control-plane admission rejects the snapshot, so it is never broadcast.
+- A file, database or DP reload that carries one is rejected, and the previous
+  generation keeps serving until the config is fixed.
+- `udp_logging` with `dtls: true` whose certificate, key or CA cannot be loaded
+  on a database-mode or DP node now rejects the load instead of omitting the
+  instance.
+
+**Operator action:** before upgrading, run `ferrum-edge validate` (file mode)
+or list the plugin configs of these five sinks (`GET /plugins/config`). Fix or
+disable every invalid enabled instance. Check that `udp_logging` DTLS files
+exist on every node that loads them.
+
+`http_logging`, `tcp_logging`, `udp_logging`, `kafka_logging` and
+`loki_logging` also now emit one extra record per WebSocket session: the
+session-end record `stdout_logging` already wrote. Collectors that count
+records per request should expect it. It is identified by
+`metadata["websocket.timestamp_disconnected"]`.
+
+### DB-less admin audit records move to a local retention file (#7200)
+
+In `mesh`, `file` and `dp` modes with `FERRUM_ADMIN_AUDIT_ENABLED=true`,
+audited admin actions are now retained in `admin-audit-retention.json` under
+`FERRUM_ADMIN_AUDIT_FALLBACK_PATH` (default `./ferrum-admin-audit`, relative to
+the working directory). With a spool configured, records drain out of
+`pending/` into that file instead of accumulating until the spool ceiling is
+reached.
+
+**Operator action:** in these modes, set `FERRUM_ADMIN_AUDIT_FALLBACK_PATH` to
+a persistent, writable directory (for example on the same volume as
+`FERRUM_ADMIN_AUDIT_SPOOL_DIR`) and collect the file like any other on-host
+security log; it is not served by `GET /audit`. Size it with
+`FERRUM_ADMIN_AUDIT_LOCAL_RETENTION_MAX_RECORDS` and
+`FERRUM_ADMIN_AUDIT_LOCAL_RETENTION_MAX_BYTES`. If the directory is not
+writable, records stay in the spool and, after
+`FERRUM_ADMIN_AUDIT_MAX_DELIVERY_ATTEMPTS`, move to `<spool>/failed/` with
+degraded health. Lowering either bound is safe at any time: the next append
+rotates the existing file down to the new bounds.
+
+### `allowed_ws_origins: ["*"]` and non-origin entries fail file-mode loads (#7218)
+
+In file mode, a proxy whose `allowed_ws_origins` contains `*` or any entry that
+is not a literal origin (`scheme://host[:port]`, with scheme `http`, `https`,
+`ws` or `wss`) now fails startup and SIGHUP reload. Previously it loaded with a
+warning. Every namespace in the file is checked. `*` was never a wildcard: the
+empty list is the only allow-all, so replace `["*"]` with `[]` (allow every
+origin) or with the literal origins you mean, and drop paths, queries and
+`null`. `ferrum-edge validate` reports the same error. Database, CP and DP
+deployments are unchanged: stored rows with these values still load with one
+warning per proxy, and Admin API writes still refuse them.
+
+### `/admin/tls/jwks` refuses key sets no consumer can verify with (#7277)
+
+Managed JWKS records now have consumers: `jwks_auth` and `oidc_relying_party`
+read them through `providers[].jwks_source: managed://jwks/<id>#jwks`. To
+guarantee that a stored record can verify tokens, `POST /admin/tls/jwks` and
+`PUT /admin/tls/jwks/{id}` apply the same rules a fetched JWKS gets. They
+return `400 Bad Request` with `jwks_json is not a usable key set: ...` when the
+document:
+
+- is not a JSON object with a `keys` array, or exceeds 1 MiB or 256 keys;
+- contains a duplicate usable `kid`;
+- contains no usable signing key. Usable means a non-empty `kid`, `use` absent
+  or `sig`, `key_ops` absent or including `verify`, and a supported RSA
+  (2048-bit or larger), P-256/P-384 EC, or Ed25519 key whose `alg` (if present)
+  names a signature algorithm. Ed25519 is refused while FIPS mode is enforced.
+
+Before this release any document with a non-empty `keys` array was accepted,
+symmetric (`kty: oct`) keys included.
+
+**Operator action:**
+- Re-upload any automation fixture that stored a symmetric or otherwise
+  unusable JWKS through these endpoints, with a real public signing key.
+- Records already in the store are not rewritten. A record that holds no usable
+  key makes every consumer that references it refuse tokens.
+- In CP/DP deployments, point the CP and every data plane at one shared
+  `FERRUM_TLS_MANAGED_STORE_PATH` volume before referencing a managed JWKS
+  record. A data plane whose store lacks the record refuses that provider's
+  tokens.
+
+### EgressGateway `HTTP2`/`GRPC` ports follow the DestinationRule (#7236)
+
+The EgressGateway used to originate verified TLS to every external
+`ServiceEntry` port declared `HTTP2` or `GRPC`, and a DestinationRule
+`tls.mode: DISABLE` could not turn it off. It now follows Istio: `HTTP`,
+`HTTP2`, `GRPC` and undeclared-protocol ports are plaintext (gRPC over h2c)
+unless the effective DestinationRule `tls.mode` for the host is `SIMPLE`,
+`MUTUAL` or `ISTIO_MUTUAL`. The effective mode is the `portLevelSettings` entry
+for the ServiceEntry port, else the top-level `trafficPolicy.tls`. `TLS` ports
+are unchanged and always re-originate TLS. `ISTIO_MUTUAL` on an egress host
+presents the file-based gateway SVID; without `FERRUM_GATEWAY_SVID_*` paths the
+slice is refused, so use `MUTUAL` or `SIMPLE` for external hosts.
+
+**Operator action:** for every external `GRPC`/`HTTP2` host the gateway must
+reach over TLS, add a DestinationRule in the ServiceEntry's namespace (or the
+gateway's, or the root namespace):
+
+```yaml
+apiVersion: networking.istio.io/v1
+kind: DestinationRule
+metadata:
+  name: api-example-com
+spec:
+  host: api.example.com
+  trafficPolicy:
+    tls:
+      mode: SIMPLE
+```
+
+An `HTTP` port that already carries such a rule now originates TLS as well.
+The rule also applies to a `resolution: STATIC` ServiceEntry, whose upstream is
+now named with the ServiceEntry host.
+
+### An absent `targetPort` means the service port everywhere (#7236)
+
+Sidecar inbound routes for a native or file `MeshService` port without
+`target_port` used to pick a container port by shared port name, then equal
+port number, then the workload's only port. They now use the service port, like
+the outbound, east-west and NodeWaypoint paths. Kubernetes-sourced services are
+unaffected because the API server always sets `targetPort`. **Operator action:**
+add `target_port` to native/file service ports whose container listens on a
+different port.
+
+### Sidecar identity narrowing is on by default (#7243)
+
+`FERRUM_MESH_SIDECAR_IDENTITY_NARROWING` now defaults to `true`. With
+`FERRUM_MESH_SIDECAR_ENFORCED=true`, `slice.workloads` holds only the SPIFFE
+identities referenced by the services the applicable Sidecar admits.
+**Operator action:** if a workload relies on identities outside its Sidecar
+egress scope, admit those services in the Sidecar, or set
+`FERRUM_MESH_SIDECAR_IDENTITY_NARROWING=false` on the control plane (and on
+file-source data planes) to keep namespace-wide identity lists.
+
+### NodeWaypoint VirtualService HTTP routes and ConfigSync revision 5 (#7233)
+
+`MeshConfig` gained `virtual_service_http_routes` and `MeshSlice` gained
+`http_routes`, so the ConfigSync protocol revision is now 5: upgrade CPs and
+DPs together. A mesh data plane from an older build refuses slices from a newer
+control plane (`invalid_slice_json`) and keeps its last-good slice until it is
+upgraded. On NodeWaypoint, mesh-bound VirtualService `http[]` routes in the
+waypoint's namespace now take effect: their in-mesh destinations dial over the
+NodeWaypoint transport, a route whose destination is an in-cluster Service the
+waypoint does not model is refused (the host keeps its Service route), and a
+merged route whose `mesh_route_dispatch` rule rewrites to a different
+destination than the route's own is refused with `403` by destination
+authorization. Review VirtualServices bound to the mesh before upgrading
+NodeWaypoints.
 
 Per-release sections below are written when a release is cut. Changes already
 on `main` but not yet released, including breaking ones, are listed under
