@@ -134,9 +134,20 @@ of them used the removed Deployment.
 
 **Operator action:** delete `ca.*` from your values files before
 `helm upgrade`. A release installed with `ca.*` values keeps them in its stored
-values, so `helm upgrade` without new values (which reuses them) fails schema
-validation; upgrade with `--reset-values` or `--reset-then-reuse-values` after
-removing `ca`.
+values. `--reuse-values`, `--reset-then-reuse-values` and a plain
+`helm upgrade` that passes no values all bring those stored values back, so the
+`ca` block returns and the upgrade fails schema validation. Upgrade such a release
+with:
+
+```sh
+helm upgrade <release> <chart> --reset-values -f <complete-values.yaml>
+```
+
+`--reset-values` starts from the chart defaults and discards every stored
+override, so `<complete-values.yaml>` must carry all of the release's custom
+settings (database, secrets, TLS, `env`, replicas and so on), without `ca`.
+Running `helm get values <release>` first shows what the release carries
+today.
 
 The plaintext CP gRPC render check that covered `ca.env` now covers
 `controlPlane.env` (see the `ferrum-mesh` bullet in the previous section). The

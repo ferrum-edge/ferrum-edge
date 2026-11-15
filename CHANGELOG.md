@@ -347,10 +347,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `FERRUM_CP_DP_GRPC_ALLOW_PLAINTEXT: "true"` (it already failed at startup).
   `examples/production-existing-secrets-values.yaml` now serves CP gRPC over
   TLS from a `ferrum-mesh-production-cp-grpc-tls` Secret (cert, key and
-  data-plane client CA). **Operator action:** delete `ca.*` from values files
-  (and upgrade with `--reset-values` if the stored release values still carry
-  them); create the CP gRPC TLS Secret before installing the production
-  example.
+  data-plane client CA). **Operator action:** delete `ca.*` from values files.
+  If the stored release values still carry them, upgrade with
+  `helm upgrade <release> <chart> --reset-values -f <complete values file>`:
+  `--reuse-values` and `--reset-then-reuse-values` bring the stored `ca` block
+  back, and `--reset-values` restores chart defaults, so the file must carry
+  every custom setting. Create the CP gRPC TLS Secret before installing the
+  production example.
 - **BREAKING (library API) — `modes::mesh::prepare_gateway_config_for_mesh` is
   removed** (issue #7233). No serving path called the whole-`GatewayConfig` entry
   point; every mesh config source builds from a `MeshSlice`. Tests use
