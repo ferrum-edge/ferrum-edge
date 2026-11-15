@@ -352,7 +352,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   them); create the CP gRPC TLS Secret before installing the production
   example.
 - **BREAKING (library API) — `modes::mesh::prepare_gateway_config_for_mesh` is
-  removed** (#7233). No serving path called the whole-`GatewayConfig` entry
+  removed** (issue #7233). No serving path called the whole-`GatewayConfig` entry
   point; every mesh config source builds from a `MeshSlice`. Tests use
   `prepare_gateway_config_via_mesh_slice` (control-plane projection plus
   `prepare_gateway_config_from_mesh_slice`), which is built only with the
@@ -677,7 +677,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   install sccache; its local store was never persisted and measured 0–4 %
   hits. The FIPS producer handoff carries `target/` only, and dispatch-only
   benchmark caches are restore-only (`save-if: "false"`) (#7285).
-- **BREAKING — every log sink is `KeepLastKnownGood`** (#7144).
+- **BREAKING — every log sink is `KeepLastKnownGood`** (issue #7144).
   `http_logging`, `udp_logging`, `statsd_logging`, `loki_logging` and
   `ws_frame_logging` join `stdout_logging`, `tcp_logging`, `kafka_logging` and
   `ws_logging`: an access log is an audit trail, so an invalid enabled
@@ -717,7 +717,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Without a spool the event is written to the file directly.
   `ferrum_admin_audit_evidence_lost` now latches only when that write fails.
 - **BREAKING (file mode) — `allowed_ws_origins` entries of `*` or non-origins
-  are a load error** (#7218). File-mode startup and SIGHUP reload refuse a
+  are a load error** (issue #7218). File-mode startup and SIGHUP reload refuse a
   document whose proxy `allowed_ws_origins` contains `*` or an entry that is
   not a literal `scheme://host[:port]` origin (path, query, `null`, …), in
   every namespace of the file, as Admin API writes already did. Database, CP
@@ -766,7 +766,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Before this release, any non-empty `keys` array was stored.
   - Records already in the store are not touched, but one that holds no usable
     key now fails closed once a consumer references it.
-- **BREAKING — ConfigSync protocol revision 5** (#7233). `MeshConfig` gained
+- **BREAKING — ConfigSync protocol revision 5** (issue #7233). `MeshConfig` gained
   `virtual_service_http_routes` and `MeshSlice` gained `http_routes`, so the
   ConfigSync build identity moves to `configsync.r5`; a CP and DP from
   different builds refuse each other at `Subscribe`.
