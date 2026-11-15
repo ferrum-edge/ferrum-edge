@@ -1104,9 +1104,10 @@ Live labs that compile the same default-feature `cargo build --profile pr-build
 Lanes whose cache-affecting inputs differ keep private keys: CNI additionally
 links `ferrum-cni` (`ci-cni-lifecycle-live`), NodeWaypoint rebuilds with
 `--features cloud-secrets,ebpf` plus a nightly bpfel toolchain
-(`ci-node-waypoint-ebpf-live`). Ambient Host UDP instead shares the default
-debug-profile lib/functional dependencies with Netns and Two-Cluster through
-`ci-netns-capture-live`. Kind, kubectl, and Helm downloads used by those labs
+(`ci-node-waypoint-ebpf-live`). Ambient Host UDP instead restores the
+debug-profile lib/functional dependencies from the `ci-debug` lane that Unit
+Tests produces on main, like Netns and Two-Cluster (see "Ambient host-UDP
+live build" below). Kind, kubectl, and Helm downloads used by those labs
 are restored inside
 `.github/actions/setup-kubernetes-tools` under an exact key of pinned
 versions/checksums, install subset, and runner OS/arch; checksums are verified
@@ -4016,24 +4017,45 @@ trusted-main writer in this workflow. All package and billing settings stay as-i
 
 ### Shared default-profile live dependency cache (#4643)
 
-This heading is historical: the three live jobs no longer form one shared
-`ci-netns-capture-live` archive or producer set, and no completed producer
-supplies a common archive for the others. The current map is:
+This heading is historical: no job produces or restores a
+`ci-netns-capture-live` archive any more. The current map is:
 
-- **Netns Source Capture** and **Two-Cluster Mesh Live** (in `ci.yml`) call
+- **Netns Source Capture** and **Two-Cluster Mesh Live** (in `ci.yml`) and the
+  **Ambient host-UDP live-kernel** job (`ambient-host-udp-live.yml`) call
   `setup-rust-ci` with shared key `ci-debug` and the default `save: "false"`,
-  and compile with `CARGO_PROFILE_DEV_DEBUG=line-tables-only`. They restore
-  through `Swatinem/rust-cache` under that label and never save.
-- **Ambient host-UDP live-kernel** (`ambient-host-udp-live.yml`) supplies only
-  `shared-key: ci-netns-capture-live`. It keeps the `setup-rust-ci` default
-  `save: "false"`, sets no `CARGO_PROFILE_DEV_DEBUG` override, and builds with
-  plain Cargo, so it restores through rust-cache under that legacy label and
-  never saves.
+  and compile with `CARGO_BUILD_JOBS=3` and
+  `CARGO_PROFILE_DEV_DEBUG=line-tables-only`. They restore through
+  `Swatinem/rust-cache` the archive Unit Tests (`core` shard) saves on main,
+  and never save.
 
-Matching `ubuntu-26.04` runner labels and Cargo download variables do not
-establish a shared archive. Cargo still checks source fingerprints and each job
-independently executes its own required tests. Do not force the callers back
-onto one cache just to match the historical description below.
+Matching `ubuntu-26.04` runner labels and Cargo download variables do not by
+themselves establish a shared archive: the rust-cache key also hashes every
+`CARGO*`/`RUST*` variable, so a lane member must export exactly the lane's
+values. Cargo still checks source fingerprints and each job independently
+executes its own required tests.
+
+#### Ambient host-UDP live build
+
+Until November 2026 the Ambient job restored `ci-netns-capture-live`, a key
+nothing had saved since the #4643 rollout (`No cache found.` on every run), so
+it compiled cold every time with the dev profile's full debuginfo and no
+`CARGO_BUILD_JOBS` cap. The privileged live step itself takes about ten
+seconds; the build was the whole job. Over 2026-11-08..15 the build step took
+19.6-33.6 minutes (median 29.0) on 72 successful attempts against the
+45-minute timeout. Nine attempts died in that step instead: six hit the
+timeout with no job log uploaded, and three ended with exit 143 and "The
+runner has received a shutdown signal", each 10-12 minutes into compiling the
+`ferrum_edge` library test harness (the step the Netns job documents as
+peaking above 15 GB on the 16 GB runner). The job also ran a separate
+`cargo build --bin ferrum-edge` that resolved the feature set without
+dev-dependencies, recompiled the dependency graph and library (about 7.5
+minutes), and was then overwritten by the `functional_tests` build.
+
+The job now matches the Netns Source Capture shape: it joins the `ci-debug`
+lane with that lane's environment, adds 12 GB of swap before the compile, and
+drops the redundant binary build. Superseded *pending* main pushes are still
+cancelled by the workflow's concurrency group before any job starts; those
+runs create no `Ambient Host UDP Live` check, so they never turn a commit red.
 
 Historical September sharing (pre-rollout): the September 7 logs showed an
 additional key split: Ambient's environment hash was `c3076958`, while
@@ -4051,7 +4073,8 @@ The completed Ambient/Netns archives at that time were 2,637,841,434 /
 duplicate producer; those figures are historical measurements, not a current
 cache-hit, retention, quota, or compile-time claim. Ambient's separate GHCR
 image cache is unaffected. The frozen Ambient contract and regression
-mutations require the matching namespace and explicit network settings.
+mutations now require the `ci-debug` namespace and its explicit network,
+job-count and debuginfo settings.
 Unit, lint, feature-specific and archive-builder profiles keep separate
 keys. Reassess this map if any job changes its build profile, features,
 toolchain, environment or target layout.
