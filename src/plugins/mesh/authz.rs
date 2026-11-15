@@ -752,7 +752,8 @@ enum NodeWaypointBranchOutcome {
 /// reached candidate is asked about.
 ///
 /// A candidate's CUSTOM check runs only once route dispatch has selected that
-/// candidate (`admit_node_waypoint_route_branch`), so no provider is asked
+/// candidate (`admit_node_waypoint_route_branch_for_effective_destination`,
+/// run by the dispatch finalizer), so no provider is asked
 /// about a branch the request does not take, and a provider's
 /// `headersToUpstreamOnAllow` / `headersToDownstreamOnAllow` result is applied
 /// only to the request that reaches the destination whose policy required the
@@ -822,17 +823,6 @@ impl NodeWaypointRouteBranchAuthz {
             .iter()
             .find(|(candidate, _)| *candidate == index)
             .map(|(_, outcome)| outcome);
-        if self.allowed & bit == 0 {
-            return match outcome {
-                Some(NodeWaypointBranchOutcome::Deny { policy, kind }) => {
-                    NodeWaypointBranchVerdict::Denied {
-                        policy: policy.as_str(),
-                        kind: *kind,
-                    }
-                }
-                _ => NodeWaypointBranchVerdict::Unknown,
-            };
-        }
         // A CUSTOM check that already ran for one candidate applied that
         // provider's mutations to this request: no other candidate may be
         // reached afterwards (it would inherit them).
@@ -851,6 +841,18 @@ impl NodeWaypointRouteBranchAuthz {
                     .find(|(candidate, _)| *candidate == index)
                     .map(|(_, delegation)| delegation)
             });
+        if self.allowed & bit == 0 {
+            return match outcome {
+                Some(NodeWaypointBranchOutcome::Deny { policy, kind }) => {
+                    NodeWaypointBranchVerdict::Denied {
+                        policy: policy.as_str(),
+                        kind: *kind,
+                        pending,
+                    }
+                }
+                _ => NodeWaypointBranchVerdict::Unknown,
+            };
+        }
         let audit = match outcome {
             Some(NodeWaypointBranchOutcome::Audit(policy)) => Some(policy.as_str()),
             _ => None,
@@ -907,9 +909,12 @@ enum NodeWaypointBranchVerdict<'a> {
         audit: Option<&'a str>,
         pending: Option<&'a MeshAuthzCustomDelegation>,
     },
+    /// The DENY/ALLOW tiers refused the destination; `pending` is the CUSTOM
+    /// check that still decides first when the destination is reached.
     Denied {
         policy: &'a str,
         kind: NodeWaypointBranchDenyKind,
+        pending: Option<&'a MeshAuthzCustomDelegation>,
     },
     /// A CUSTOM check already ran for a different candidate.
     Rebound,
@@ -944,15 +949,18 @@ fn branch_outcome_from_evaluation(
             Some(NodeWaypointBranchOutcome::Audit(policy)),
             pending,
         ),
+        // Istio evaluates CUSTOM before DENY/ALLOW: a locally refused
+        // candidate keeps its delegation, so when it is reached its provider
+        // still decides first (a provider refusal keeps the provider's own
+        // response) and the stored local denial applies only if the provider
+        // allows.
         MeshAuthzDecision::Deny { policy } => (
             false,
             Some(NodeWaypointBranchOutcome::Deny {
                 policy,
                 kind: NodeWaypointBranchDenyKind::Policy,
             }),
-            // A candidate its DENY/ALLOW tiers refuse is refused whatever its
-            // provider says, so its check never needs to run.
-            None,
+            pending,
         ),
     }
 }
@@ -1040,6 +1048,9 @@ enum NodeWaypointBranchAdmission {
         index: usize,
         audit: Option<String>,
         delegation: MeshAuthzCustomDelegation,
+        /// The destination's local denial, applied only if the provider
+        /// allows (CUSTOM is evaluated before DENY/ALLOW).
+        local_denial: Option<(String, NodeWaypointBranchDenyKind)>,
     },
     Refuse {
         policy: String,
@@ -1071,13 +1082,34 @@ fn node_waypoint_branch_admission(
                 index,
                 audit: audit.map(str::to_string),
                 delegation: delegation.clone(),
+                local_denial: None,
             },
             None => NodeWaypointBranchAdmission::Refuse {
                 policy: NODE_WAYPOINT_ROUTE_BRANCH_UNKNOWN_POLICY.to_string(),
                 kind: NodeWaypointBranchRefusal::Deny(NodeWaypointBranchDenyKind::Policy),
             },
         },
-        NodeWaypointBranchVerdict::Denied { policy, kind } => NodeWaypointBranchAdmission::Refuse {
+        NodeWaypointBranchVerdict::Denied {
+            policy,
+            kind,
+            pending: Some(delegation),
+        } => match index {
+            Some(index) => NodeWaypointBranchAdmission::RunCustom {
+                index,
+                audit: None,
+                delegation: delegation.clone(),
+                local_denial: Some((policy.to_string(), kind)),
+            },
+            None => NodeWaypointBranchAdmission::Refuse {
+                policy: policy.to_string(),
+                kind: NodeWaypointBranchRefusal::Deny(kind),
+            },
+        },
+        NodeWaypointBranchVerdict::Denied {
+            policy,
+            kind,
+            pending: None,
+        } => NodeWaypointBranchAdmission::Refuse {
             policy: policy.to_string(),
             kind: NodeWaypointBranchRefusal::Deny(kind),
         },
@@ -1176,34 +1208,26 @@ fn admit_node_waypoint_branch_audit(ctx: &mut RequestContext, audit: Option<Stri
     }
 }
 
-/// Admit or refuse the destination route dispatch is about to select, under
-/// this request's per-destination verdicts, running that destination's own
-/// CUSTOM check when it owes one.
+/// Admit or refuse the destination the request reaches now (its effective
+/// route override, or the route's own destination) under this request's
+/// per-destination verdicts, running that destination's own CUSTOM check when
+/// it owes one. The dispatch finalizer calls this once, after every
+/// `mesh_route_dispatch` instance has run (so no intermediate destination a
+/// later instance replaces is judged) and before any request transformer.
 ///
-/// `None` admits it: stamps `mesh_authz.audit_policy` when that destination's
-/// policy audited the request and installs the destination's own provider's
+/// The selected destination's provider decides first (CUSTOM before
+/// DENY/ALLOW): a provider refusal is returned with the provider's own status
+/// and allowlisted headers, and a destination its DENY/ALLOW tiers refuse is
+/// refused only after its provider allowed. `None` admits it: stamps
+/// `mesh_authz.audit_policy` when that destination's policy audited the
+/// request and installs the destination's own provider's
 /// `headersToUpstreamOnAllow` result on `headers` (its
 /// `headersToDownstreamOnAllow` result is staged for the response). `Some` is
-/// the refusal that destination's own policy produces: `403` with the same
-/// body (or the provider's own denial), deny metadata, policy-deny row and
-/// counters. A destination the table does not name, one without a verdict, or
-/// one other than the destination whose CUSTOM check already ran, is refused.
-/// Returns `None` when the request carries no verdicts.
-pub(crate) async fn admit_node_waypoint_route_branch(
-    ctx: &mut RequestContext,
-    headers: &mut HashMap<String, String>,
-    destination: NodeWaypointBranchDestination<'_>,
-) -> Option<PluginResult> {
-    let index = ctx
-        .node_waypoint_route_branch_authz
-        .as_ref()?
-        .branches
-        .position(destination);
-    admit_node_waypoint_route_branch_index(ctx, headers, index).await
-}
-
-/// [`admit_node_waypoint_route_branch`] for the destination the request
-/// reaches now (its effective route override, or the route's own).
+/// the refusal that destination's own policy produces: the same body, deny
+/// metadata, policy-deny row and counters. A destination the table does not
+/// name, one without a verdict, or one other than the destination whose
+/// CUSTOM check already ran, is refused. Returns `None` when the request
+/// carries no verdicts.
 pub(crate) async fn admit_node_waypoint_route_branch_for_effective_destination(
     ctx: &mut RequestContext,
     headers: &mut HashMap<String, String>,
@@ -1234,6 +1258,7 @@ async fn admit_node_waypoint_route_branch_index(
             index,
             audit,
             delegation,
+            local_denial,
         } => {
             // Owned copies only on this CUSTOM path, which calls out anyway.
             // A pending delegation always comes with its inputs; refuse
@@ -1269,6 +1294,20 @@ async fn admit_node_waypoint_route_branch_index(
                     format!("custom:{}", delegation.policy),
                     NodeWaypointBranchRefusal::Deny(NodeWaypointBranchDenyKind::Policy),
                     Some(reject),
+                ));
+            }
+            if let Some((policy, kind)) = local_denial {
+                // The provider allowed, but the destination's DENY/ALLOW
+                // tiers refuse: none of the provider's mutations apply.
+                if let Some(state) = ctx.plugin_state_opt_mut() {
+                    state.mesh_ext_authz_upstream_headers.remove(&instance_id);
+                    state.mesh_ext_authz_downstream_headers.remove(&instance_id);
+                }
+                return Some(refuse_node_waypoint_route_branch(
+                    ctx,
+                    policy,
+                    NodeWaypointBranchRefusal::Deny(kind),
+                    None,
                 ));
             }
             // Only the reached destination's own provider result is applied,
@@ -5526,6 +5565,34 @@ impl Plugin for MeshAuthz {
     ) -> PluginResult {
         if self.ext_authz_upstream_allow_headers.is_empty() {
             return PluginResult::Continue;
+        }
+        // A carried route with per-destination verdicts (issue #7383) runs
+        // its CUSTOM check only once route dispatch has selected the
+        // destination. Strip the client's copies of every pending candidate
+        // provider's owned names here, in every spelling, so a forged value
+        // reaches neither a header-keyed policy plugin nor any backend; the
+        // reached destination's provider installs its own values later.
+        if let Some(executor) = self.ext_authz.as_ref()
+            && let Some(custom) = ctx
+                .node_waypoint_route_branch_authz
+                .as_ref()
+                .and_then(|record| record.custom.as_deref())
+            && custom.instance_id == self.instance_id
+            && custom.executed_for.is_none()
+        {
+            headers.retain(|name, _| {
+                !custom.pending.iter().any(|(_, delegation)| {
+                    executor
+                        .upstream_allow_header_names(&delegation.provider)
+                        .iter()
+                        .any(|owned| {
+                            crate::proxy::headers::field_names_equivalent_for_backends(
+                                name,
+                                owned.as_str(),
+                            )
+                        })
+                })
+            });
         }
         if let Some(staged) = ctx.plugin_state_opt_mut().and_then(|state| {
             state

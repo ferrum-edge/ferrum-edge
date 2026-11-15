@@ -5389,12 +5389,25 @@ fn node_waypoint_route_branch_verdicts_gate_every_destination_decision() {
         guard_calls, 3,
         "the blanket guard is defined once and reached only through the two verdict-aware wrappers"
     );
-    let admission = item_body(
+    let finalize = item_body(
         &production,
-        "fn reject_unauthorized_node_waypoint_rule_destination(",
+        "pub(crate) async fn finalize_node_waypoint_route_branch(",
         "\n}",
     );
-    assert!(admission.contains("admit_node_waypoint_route_branch("));
+    assert!(
+        finalize.contains("admit_node_waypoint_route_branch_for_effective_destination(ctx"),
+        "the group-level admission must judge the destination every instance selected"
+    );
+    let cache = admission_source_without_line_comments(&source("src/plugin_cache.rs"));
+    let finalizer = item_body(
+        &cache,
+        "impl Plugin for MeshRouteDispatchFinalizer {",
+        "\n}",
+    );
+    assert!(
+        finalizer.contains("finalize_node_waypoint_route_branch(ctx, headers)"),
+        "the dispatch finalizer must admit the selected destination after the last instance"
+    );
     let preview = item_body(
         &production,
         "fn node_waypoint_rule_destination_vetoed(",
@@ -5413,8 +5426,11 @@ fn node_waypoint_route_branch_verdicts_gate_every_destination_decision() {
         2,
         "matched-rule admission must use the verdict-aware check (definition + one call)"
     );
-    assert!(
-        production.contains("admit_node_waypoint_route_branch_for_effective_destination(ctx"),
-        "an unmatched request must be admitted on its effective destination's verdict"
+    assert_eq!(
+        production
+            .matches("admit_node_waypoint_route_branch_for_effective_destination(")
+            .count(),
+        1,
+        "no single dispatch instance may admit an intermediate destination"
     );
 }
