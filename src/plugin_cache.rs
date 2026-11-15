@@ -6349,7 +6349,7 @@ pub(crate) fn node_waypoint_destination_authz_ready_from_counts(
 /// connection path only ever reads a `bool`.
 fn compute_node_waypoint_destination_authz_ready(
     config: &GatewayConfig,
-    global: &HashMap<ProxyProtocol, ProtocolEntry>,
+    global: &HashMap<ProxyProtocol, SharedProtocolEntry>,
 ) -> bool {
     let (managed, enabled_global) = mesh_authz_global_config_state(config);
     let built = match global.get(&ProxyProtocol::Tcp) {
@@ -6381,7 +6381,12 @@ pub(crate) fn node_waypoint_destination_authz_ready_over_globals_for_test(
 // ---------------------------------------------------------------------------
 
 /// Per-proxy, per-protocol entry: the filtered plugin list and its derived phase data.
-#[derive(Clone)]
+///
+/// Built once per cache generation and only ever shared behind an `Arc`
+/// ([`SharedProtocolEntry`]): a [`PluginCacheRequestView`] holds that one
+/// `Arc`, so building a view costs one reference-count increment however many
+/// phase lists the entry carries (issue #7207). Deliberately not `Clone`, so
+/// nothing deep-copies an entry by accident.
 struct ProtocolEntry {
     plugins: PluginList,
     phase: PluginPhaseData,
@@ -6390,18 +6395,59 @@ struct ProtocolEntry {
     udp_datagram_policy_digest: Option<UdpDatagramPolicyDigest>,
 }
 
+/// The shared handle every protocol map stores and every request view holds.
+type SharedProtocolEntry = Arc<ProtocolEntry>;
+
+impl ProtocolEntry {
+    /// The entry a request view reads when no protocol entry resolves: every
+    /// list empty, no capability bit, no body ceiling, and no provable
+    /// response-presentation digest (`None`, never the digest of an empty
+    /// chain, so replay consumers fail closed). Built once per process and
+    /// shared, so even this fallback allocates nothing per request.
+    fn empty_shared() -> SharedProtocolEntry {
+        static EMPTY: std::sync::LazyLock<SharedProtocolEntry> = std::sync::LazyLock::new(|| {
+            Arc::new(ProtocolEntry {
+                plugins: Arc::new(Vec::new()),
+                phase: PluginPhaseData {
+                    enforced_request_body_limit: None,
+                    enforced_response_body_limit: None,
+                    grpc_deadline_plugins: Arc::new(Vec::new()),
+                    auth_plugins: Arc::new(Vec::new()),
+                    authorize_plugins: Arc::new(Vec::new()),
+                    backend_admission_plugins: Arc::new(Vec::new()),
+                    backend_path_plugins: Arc::new(Vec::new()),
+                    request_headers_to_redact: Arc::new(Vec::new()),
+                    request_trailer_strip_headers: Arc::new(Vec::new()),
+                    owned_request_assertion_headers: Arc::new(Vec::new()),
+                    initial_response_header_policy_plugins: Arc::new(Vec::new()),
+                    initial_response_header_policy_names: Arc::new(Vec::new()),
+                    response_trailer_policy_names: Arc::new(Vec::new()),
+                    response_trailer_policy_prefixes: Arc::new(Vec::new()),
+                    conditional_unbounded_trailer_policy_plugins: Arc::new(Vec::new()),
+                    response_committed_plugins: Arc::new(Vec::new()),
+                    early_route_total_plan: Arc::default(),
+                    capabilities: PluginCapabilities::default(),
+                    response_presentation_policy_digest: None,
+                },
+                udp_datagram_policy_digest: None,
+            })
+        });
+        Arc::clone(&EMPTY)
+    }
+}
+
 /// All per-proxy protocol data, swapped atomically as one unit.
 #[derive(Clone)]
 struct ProtocolSnapshot {
     /// proxy_id → (protocol → ProtocolEntry)
-    proxy: HashMap<String, HashMap<ProxyProtocol, ProtocolEntry>>,
+    proxy: HashMap<String, HashMap<ProxyProtocol, SharedProtocolEntry>>,
     /// Global fallback: protocol → ProtocolEntry
-    global: HashMap<ProxyProtocol, ProtocolEntry>,
+    global: HashMap<ProxyProtocol, SharedProtocolEntry>,
     /// HTTP plugin view plus the two native-gRPC policies that are compatible
     /// with recognized H3 gRPC-Web requests.
-    grpc_web_proxy: HashMap<String, ProtocolEntry>,
+    grpc_web_proxy: HashMap<String, SharedProtocolEntry>,
     /// Global fallback for the composed H3 gRPC-Web view.
-    grpc_web_global: ProtocolEntry,
+    grpc_web_global: SharedProtocolEntry,
     /// Generation-level readiness bit for NodeWaypoint transparent-capture
     /// destination authorization: the mesh-managed `__mesh_authz` reserved
     /// global row is enabled AND its runtime policy is provably present in
@@ -6543,7 +6589,7 @@ fn build_protocol_entry(
     plugins: &[Arc<dyn Plugin>],
     globals: &[Arc<dyn Plugin>],
     proto: ProxyProtocol,
-) -> ProtocolEntry {
+) -> SharedProtocolEntry {
     let filtered = filter_for_protocol(plugins, proto);
     let mut phase = build_phase_data(&filtered);
     if view_omits_route_admission_policy(plugins, globals, proto) {
@@ -6551,11 +6597,11 @@ fn build_protocol_entry(
     }
     let udp_datagram_policy_digest =
         (proto == ProxyProtocol::Udp).then(|| udp_datagram_policy_digest(&filtered));
-    ProtocolEntry {
+    Arc::new(ProtocolEntry {
         plugins: filtered,
         phase,
         udp_datagram_policy_digest,
-    }
+    })
 }
 
 const H3_GRPC_WEB_NATIVE_POLICY_PLUGINS: [&str; 2] = ["grpc_method_router", "grpc_deadline"];
@@ -6570,7 +6616,7 @@ fn is_grpc_web_native_policy(plugin: &Arc<dyn Plugin>) -> bool {
         .any(|name| is_builtin_named(plugin, name))
 }
 
-fn build_grpc_web_protocol_entry(plugins: &[Arc<dyn Plugin>]) -> ProtocolEntry {
+fn build_grpc_web_protocol_entry(plugins: &[Arc<dyn Plugin>]) -> SharedProtocolEntry {
     // The merged proxy list is already in configured priority/config order.
     // Filtering it once preserves that order, retains every ordinary HTTP
     // guardrail, and includes each compatible native-gRPC policy instance at
@@ -6590,11 +6636,11 @@ fn build_grpc_web_protocol_entry(plugins: &[Arc<dyn Plugin>]) -> ProtocolEntry {
     if grpc_web_view_omits_grpc_admission_policy(plugins) {
         phase.capabilities.0 |= PluginCapabilities::OMITS_ROUTE_ADMISSION_POLICY;
     }
-    ProtocolEntry {
+    Arc::new(ProtocolEntry {
         plugins: composed,
         phase,
         udp_datagram_policy_digest: None,
-    }
+    })
 }
 
 /// Whether the composed gRPC-Web view of `plugins` drops an admission-gating
@@ -7240,7 +7286,11 @@ impl PluginCacheInner {
     /// [`Self::grpc_web_request_view`], or a namespace-taking accessor such as
     /// [`Self::initial_response_header_policy_plugins`] instead of passing
     /// `proxy.id` here.
-    fn protocol_entry(&self, proxy_key: &str, protocol: ProxyProtocol) -> Option<&ProtocolEntry> {
+    fn protocol_entry(
+        &self,
+        proxy_key: &str,
+        protocol: ProxyProtocol,
+    ) -> Option<&SharedProtocolEntry> {
         self.protocol_snapshot
             .proxy
             .get(proxy_key)
@@ -7416,91 +7466,32 @@ impl PluginCacheInner {
             write_namespaced_runtime_key(&mut key, namespace, proxy_id);
             let proxy_key = key.as_str();
             // One protocol lookup per request instead of one per field: every
-            // per-field getter resolves this same entry (issue #5588).
-            match self.protocol_entry(proxy_key, protocol) {
-                Some(entry) => self.request_view_from_entry(proxy_key, entry),
-                None => self.empty_request_view(proxy_key),
-            }
+            // accessor reads this same entry (issue #5588).
+            let entry = self
+                .protocol_entry(proxy_key, protocol)
+                .map_or_else(ProtocolEntry::empty_shared, Arc::clone);
+            self.request_view_from_entry(proxy_key, entry)
         })
     }
 
     /// The request view for a resolved [`ProtocolEntry`], shared by
     /// [`Self::request_view`] and [`Self::grpc_web_request_view`].
+    ///
+    /// The view holds the entry itself, so the per-request cost is one `Arc`
+    /// increment (and one decrement when the view drops) plus the four
+    /// per-proxy flag lookups — not one increment per phase list (issue
+    /// #7207).
     fn request_view_from_entry(
         &self,
         proxy_key: &str,
-        entry: &ProtocolEntry,
+        entry: SharedProtocolEntry,
     ) -> PluginCacheRequestView {
-        let capabilities = entry.phase.capabilities;
-        let backend_path_plugins = capabilities
-            .has(PluginCapabilities::HAS_BACKEND_PATH_PLUGINS)
-            .then(|| Arc::clone(&entry.phase.backend_path_plugins));
         PluginCacheRequestView {
-            plugins: Arc::clone(&entry.plugins),
-            grpc_deadline_plugins: Arc::clone(&entry.phase.grpc_deadline_plugins),
-            auth_plugins: Arc::clone(&entry.phase.auth_plugins),
-            authorize_plugins: Arc::clone(&entry.phase.authorize_plugins),
-            backend_admission_plugins: Arc::clone(&entry.phase.backend_admission_plugins),
-            backend_path_plugins,
-            request_headers_to_redact: Arc::clone(&entry.phase.request_headers_to_redact),
-            request_trailer_strip_headers: Arc::clone(&entry.phase.request_trailer_strip_headers),
-            owned_request_assertion_headers: Arc::clone(
-                &entry.phase.owned_request_assertion_headers,
-            ),
-            initial_response_header_policy_plugins: Arc::clone(
-                &entry.phase.initial_response_header_policy_plugins,
-            ),
-            initial_response_header_policy_names: Arc::clone(
-                &entry.phase.initial_response_header_policy_names,
-            ),
-            response_trailer_policy_names: Arc::clone(&entry.phase.response_trailer_policy_names),
-            response_trailer_policy_prefixes: Arc::clone(
-                &entry.phase.response_trailer_policy_prefixes,
-            ),
-            conditional_unbounded_trailer_policy_plugins: Arc::clone(
-                &entry.phase.conditional_unbounded_trailer_policy_plugins,
-            ),
-            response_committed_plugins: Arc::clone(&entry.phase.response_committed_plugins),
-            response_presentation_policy_digest: entry.phase.response_presentation_policy_digest,
-            early_route_total_plan: Arc::clone(&entry.phase.early_route_total_plan),
-            capabilities,
+            entry,
             requires_response_body_buffering: self.requires_response_body_buffering(proxy_key),
             requires_request_body_buffering: self.requires_request_body_buffering(proxy_key),
             requires_ws_frame_hooks: self.requires_ws_frame_hooks(proxy_key),
             uses_openai_auth_error_envelope: self.uses_openai_auth_error_envelope(proxy_key),
-            enforced_request_body_limit: entry.phase.enforced_request_body_limit,
-            enforced_response_body_limit: entry.phase.enforced_response_body_limit,
-        }
-    }
-
-    /// The request view when no protocol entry resolves: every per-field
-    /// getter's `None` default.
-    fn empty_request_view(&self, proxy_key: &str) -> PluginCacheRequestView {
-        PluginCacheRequestView {
-            plugins: Arc::new(Vec::new()),
-            grpc_deadline_plugins: Arc::new(Vec::new()),
-            auth_plugins: Arc::new(Vec::new()),
-            authorize_plugins: Arc::new(Vec::new()),
-            backend_admission_plugins: Arc::new(Vec::new()),
-            backend_path_plugins: None,
-            request_headers_to_redact: Arc::new(Vec::new()),
-            request_trailer_strip_headers: Arc::new(Vec::new()),
-            owned_request_assertion_headers: Arc::new(Vec::new()),
-            initial_response_header_policy_plugins: Arc::new(Vec::new()),
-            initial_response_header_policy_names: Arc::new(Vec::new()),
-            response_trailer_policy_names: Arc::new(Vec::new()),
-            response_trailer_policy_prefixes: Arc::new(Vec::new()),
-            conditional_unbounded_trailer_policy_plugins: Arc::new(Vec::new()),
-            response_committed_plugins: Arc::new(Vec::new()),
-            response_presentation_policy_digest: None,
-            early_route_total_plan: Arc::default(),
-            capabilities: PluginCapabilities::default(),
-            requires_response_body_buffering: self.requires_response_body_buffering(proxy_key),
-            requires_request_body_buffering: self.requires_request_body_buffering(proxy_key),
-            requires_ws_frame_hooks: self.requires_ws_frame_hooks(proxy_key),
-            uses_openai_auth_error_envelope: self.uses_openai_auth_error_envelope(proxy_key),
-            enforced_request_body_limit: None,
-            enforced_response_body_limit: None,
         }
     }
 
@@ -7518,7 +7509,7 @@ impl PluginCacheInner {
                 .grpc_web_proxy
                 .get(proxy_key)
                 .unwrap_or(&self.protocol_snapshot.grpc_web_global);
-            self.request_view_from_entry(proxy_key, entry)
+            self.request_view_from_entry(proxy_key, Arc::clone(entry))
         })
     }
 }
@@ -7526,34 +7517,19 @@ impl PluginCacheInner {
 /// Request-scoped plugin cache values for one proxy/protocol pair.
 ///
 /// Built from one cache generation near the start of request handling. It
-/// stores only the values that request paths need, so the full plugin-cache
-/// snapshot does not stay pinned across plugin/backend awaits.
+/// holds that generation's resolved [`ProtocolEntry`] for the pair — one
+/// shared, immutable snapshot of the filtered plugin list and its phase data —
+/// plus four per-proxy flags. Building or cloning a view is therefore one
+/// `Arc` increment, never a per-phase-list fan-out of reference-count writes
+/// on shared cache lines (issue #7207). Only that one entry stays pinned
+/// across plugin/backend awaits, not the full plugin-cache snapshot.
 #[derive(Clone)]
 pub struct PluginCacheRequestView {
-    plugins: Arc<Vec<Arc<dyn Plugin>>>,
-    grpc_deadline_plugins: Arc<Vec<Arc<dyn Plugin>>>,
-    auth_plugins: Arc<Vec<Arc<dyn Plugin>>>,
-    authorize_plugins: Arc<Vec<Arc<dyn Plugin>>>,
-    backend_admission_plugins: Arc<Vec<Arc<dyn Plugin>>>,
-    backend_path_plugins: Option<Arc<Vec<Arc<dyn Plugin>>>>,
-    request_headers_to_redact: Arc<Vec<String>>,
-    request_trailer_strip_headers: Arc<Vec<String>>,
-    owned_request_assertion_headers: Arc<Vec<String>>,
-    initial_response_header_policy_plugins: Arc<Vec<Arc<dyn Plugin>>>,
-    initial_response_header_policy_names: Arc<Vec<String>>,
-    response_trailer_policy_names: Arc<Vec<String>>,
-    response_trailer_policy_prefixes: Arc<Vec<String>>,
-    conditional_unbounded_trailer_policy_plugins: Arc<Vec<Arc<dyn Plugin>>>,
-    response_committed_plugins: Arc<Vec<Arc<dyn Plugin>>>,
-    response_presentation_policy_digest: Option<[u8; 32]>,
-    early_route_total_plan: Arc<EarlyRouteTotalPlan>,
-    capabilities: PluginCapabilities,
+    entry: SharedProtocolEntry,
     requires_response_body_buffering: bool,
     requires_request_body_buffering: bool,
     requires_ws_frame_hooks: bool,
     uses_openai_auth_error_envelope: bool,
-    enforced_request_body_limit: Option<u64>,
-    enforced_response_body_limit: Option<u64>,
 }
 
 impl PluginCacheRequestView {
@@ -7568,7 +7544,11 @@ impl PluginCacheRequestView {
         ctx: &RequestContext,
         identity_ready: bool,
     ) -> Option<tokio::time::Instant> {
-        let timeout_ms = self.early_route_total_plan.select_ms(ctx, identity_ready)?;
+        let timeout_ms = self
+            .entry
+            .phase
+            .early_route_total_plan
+            .select_ms(ctx, identity_ready)?;
         ctx.grpc_deadline_received_at
             .checked_add(std::time::Duration::from_millis(timeout_ms))
     }
@@ -7580,13 +7560,13 @@ impl PluginCacheRequestView {
     /// `crate::proxy::effective_request_body_limit` before forwarding or
     /// retaining any bytes (`GHSA-xrfj-852f-645j`).
     pub fn enforced_request_body_limit(&self) -> Option<u64> {
-        self.enforced_request_body_limit
+        self.entry.phase.enforced_request_body_limit
     }
 
     /// Strictest active client-facing response-body ceiling for this
     /// proxy/protocol pair, or `None` when no matched plugin enforces one.
     pub fn enforced_response_body_limit(&self) -> Option<u64> {
-        self.enforced_response_body_limit
+        self.entry.phase.enforced_response_body_limit
     }
 
     /// Publish this view's precomputed route body policy on the request
@@ -7596,102 +7576,108 @@ impl PluginCacheRequestView {
     /// Every handler (H1/H2 and native H3) stamps through this one call, so
     /// the fields cannot drift apart. Three copies, no lookup, no allocation.
     pub fn stamp_route_body_policy(&self, ctx: &mut RequestContext) {
-        ctx.route_request_body_limit_bytes = self.enforced_request_body_limit;
-        ctx.route_response_body_limit_bytes = self.enforced_response_body_limit;
+        ctx.route_request_body_limit_bytes = self.entry.phase.enforced_request_body_limit;
+        ctx.route_response_body_limit_bytes = self.entry.phase.enforced_response_body_limit;
         ctx.route_may_rewrite_response_stream = Some(self.requires_response_stream_hooks());
     }
 
     /// Get pre-resolved protocol-filtered plugins from this request view.
     pub fn plugins(&self) -> Arc<Vec<Arc<dyn Plugin>>> {
-        Arc::clone(&self.plugins)
+        Arc::clone(&self.entry.plugins)
     }
 
     /// Get the pre-filtered synchronous gRPC deadline-policy chain.
     pub fn grpc_deadline_plugins(&self) -> &[Arc<dyn Plugin>] {
-        self.grpc_deadline_plugins.as_slice()
+        self.entry.phase.grpc_deadline_plugins.as_slice()
     }
 
     /// Get pre-computed auth plugins from this request view.
     pub fn auth_plugins(&self) -> Arc<Vec<Arc<dyn Plugin>>> {
-        Arc::clone(&self.auth_plugins)
+        Arc::clone(&self.entry.phase.auth_plugins)
     }
 
     /// Get pre-computed authorization plugins from this request view.
     pub fn authorize_plugins(&self) -> Arc<Vec<Arc<dyn Plugin>>> {
-        Arc::clone(&self.authorize_plugins)
+        Arc::clone(&self.entry.phase.authorize_plugins)
     }
 
     /// Get pre-computed backend admission plugins from this request view.
     pub fn backend_admission_plugins(&self) -> Arc<Vec<Arc<dyn Plugin>>> {
-        Arc::clone(&self.backend_admission_plugins)
+        Arc::clone(&self.entry.phase.backend_admission_plugins)
     }
 
-    /// Get plugins that inspect the finalized backend path.
+    /// Get plugins that inspect the finalized backend path. Empty unless the
+    /// entry's [`PluginCapabilities::HAS_BACKEND_PATH_PLUGINS`] bit is set.
     pub fn backend_path_plugins(&self) -> &[Arc<dyn Plugin>] {
-        self.backend_path_plugins
-            .as_deref()
-            .map(Vec::as_slice)
-            .unwrap_or(&[])
+        let phase = &self.entry.phase;
+        if phase
+            .capabilities
+            .has(PluginCapabilities::HAS_BACKEND_PATH_PLUGINS)
+        {
+            phase.backend_path_plugins.as_slice()
+        } else {
+            &[]
+        }
     }
 
     /// Get credential-bearing request headers precomputed for safe downstream views.
     pub fn request_headers_to_redact(&self) -> Arc<Vec<String>> {
-        Arc::clone(&self.request_headers_to_redact)
+        Arc::clone(&self.entry.phase.request_headers_to_redact)
     }
 
     /// Get the names every late request-trailer boundary strips on this route:
     /// the credential locations plus every owned gateway-assertion header.
     pub fn request_trailer_strip_headers(&self) -> Arc<Vec<String>> {
-        Arc::clone(&self.request_trailer_strip_headers)
+        Arc::clone(&self.entry.phase.request_trailer_strip_headers)
     }
 
     /// Whether a plugin on this route owns any gateway-assertion request header
     /// (`claim_headers` destinations, OPA decision headers,
     /// `x-ferrum-peer-spiffe-id`).
     pub fn owns_request_assertion_headers(&self) -> bool {
-        !self.owned_request_assertion_headers.is_empty()
+        !self.entry.phase.owned_request_assertion_headers.is_empty()
     }
 
     /// Every gateway-assertion request header a plugin on this route owns.
     pub fn owned_request_assertion_headers(&self) -> Arc<Vec<String>> {
-        Arc::clone(&self.owned_request_assertion_headers)
+        Arc::clone(&self.entry.phase.owned_request_assertion_headers)
     }
 
     /// Get the pre-filtered deterministic initial-response header policy chain.
     pub fn initial_response_header_policy_plugins(&self) -> Arc<Vec<Arc<dyn Plugin>>> {
-        Arc::clone(&self.initial_response_header_policy_plugins)
+        Arc::clone(&self.entry.phase.initial_response_header_policy_plugins)
     }
 
     /// Get canonical field names touched by initial-response policy.
     pub fn initial_response_header_policy_names(&self) -> Arc<Vec<String>> {
-        Arc::clone(&self.initial_response_header_policy_names)
+        Arc::clone(&self.entry.phase.initial_response_header_policy_names)
     }
 
     /// Canonical field names whose response-header policy also binds the
     /// trailer section. Empty for chains that only observe, authenticate, or
     /// authorize, so those chains forward backend trailers untouched.
     pub fn response_trailer_policy_names(&self) -> &[String] {
-        self.response_trailer_policy_names.as_slice()
+        self.entry.phase.response_trailer_policy_names.as_slice()
     }
 
     /// Shared handle to the same list, for relays whose trailer boundary is
     /// enforced by a response BODY that outlives the request handler (the
     /// streaming HTTP/2 arm). One `Arc` bump, no per-request allocation.
     pub fn response_trailer_policy_names_shared(&self) -> Arc<Vec<String>> {
-        Arc::clone(&self.response_trailer_policy_names)
+        Arc::clone(&self.entry.phase.response_trailer_policy_names)
     }
 
     /// Case-insensitive ASCII prefixes whose response-header policy also binds
     /// the trailer section. Empty unless a plugin declared
     /// `ResponseTrailerPolicy::NamesAndPrefixes`.
     pub fn response_trailer_policy_prefixes(&self) -> &[String] {
-        self.response_trailer_policy_prefixes.as_slice()
+        self.entry.phase.response_trailer_policy_prefixes.as_slice()
     }
 
     /// Shared handle to the same prefix list, for the streaming HTTP/2 body
     /// governor. One `Arc` bump, no per-request allocation.
     pub fn response_trailer_policy_prefixes_shared(&self) -> Arc<Vec<String>> {
-        Arc::clone(&self.response_trailer_policy_prefixes)
+        Arc::clone(&self.entry.phase.response_trailer_policy_prefixes)
     }
 
     /// Whether the fail-closed "drop the whole backend trailer section" arm is
@@ -7712,20 +7698,22 @@ impl PluginCacheRequestView {
     /// exemptions may key on the authenticated consumer, which only exists after
     /// the authentication phase.
     pub fn unbounded_response_trailer_policy_applies(&self, ctx: &RequestContext) -> bool {
-        if self
+        let phase = &self.entry.phase;
+        if phase
             .capabilities
             .has(PluginCapabilities::UNBOUNDED_RESPONSE_TRAILER_POLICY)
         {
             return true;
         }
-        self.conditional_unbounded_trailer_policy_plugins
+        phase
+            .conditional_unbounded_trailer_policy_plugins
             .iter()
             .any(|plugin| plugin.request_applies_unbounded_response_trailer_policy(ctx))
     }
 
     /// Get the pre-filtered committed-response observer chain.
     pub fn response_committed_plugins(&self) -> &[Arc<dyn Plugin>] {
-        self.response_committed_plugins.as_slice()
+        self.entry.phase.response_committed_plugins.as_slice()
     }
 
     /// Effective static response-presentation policy digest for this request,
@@ -7734,12 +7722,12 @@ impl PluginCacheRequestView {
     /// is driven by live runtime state. Either way the policy is unknown, not
     /// empty, and replay consumers must fail closed.
     pub fn response_presentation_policy_digest(&self) -> Option<[u8; 32]> {
-        self.response_presentation_policy_digest
+        self.entry.phase.response_presentation_policy_digest
     }
 
     /// Get pre-computed capability bitset from this request view.
     pub fn capabilities(&self) -> PluginCapabilities {
-        self.capabilities
+        self.entry.phase.capabilities
     }
 
     /// Check response-body buffering requirement from this request view.
@@ -7767,7 +7755,9 @@ impl PluginCacheRequestView {
     /// inspection or terminal hooks. Precomputed at cache-build time so the
     /// common response path does not scan plugins per request.
     pub fn requires_response_stream_hooks(&self) -> bool {
-        self.capabilities
+        self.entry
+            .phase
+            .capabilities
             .has(PluginCapabilities::HAS_RESPONSE_STREAM_HOOKS)
     }
 }

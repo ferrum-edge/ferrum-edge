@@ -2670,6 +2670,70 @@ fn test_proxy_allowed_ws_origins_load_warns_once_per_proxy() {
     );
 }
 
+/// Issue #7218 review follow-up: file mode refuses a `*` / non-origin
+/// `allowed_ws_origins` document, so it must not first log the database/CP/DP
+/// grandfathering warning ("stored database/control-plane config is still
+/// loaded"), which would be false for a refused file.
+#[test]
+fn test_file_mode_refusal_of_allowed_ws_origins_star_does_not_log_grandfathering_warning() {
+    use std::io::Write;
+
+    let document = serde_json::json!({
+        "version": "1",
+        "proxies": [{
+            "id": "ws-proxy",
+            "listen_path": "/ws",
+            "backend_scheme": "http",
+            "backend_host": "localhost",
+            "backend_port": 3000,
+            "allowed_ws_origins": ["*", "https://app.example.com/path"]
+        }],
+        "consumers": [],
+        "plugin_configs": []
+    });
+    let mut file = tempfile::NamedTempFile::with_suffix(".json").unwrap();
+    write!(file, "{}", serde_json::to_string(&document).unwrap()).unwrap();
+    let path = file.path().to_str().unwrap();
+    let policy = ferrum_edge::config::BackendEgressPolicy::unrestricted();
+
+    let (logs, guard) = capture_ws_origin_logs();
+    let load = ferrum_edge::config::file_loader::load_config_from_file(path, 30, &policy, "ferrum");
+    let reload =
+        ferrum_edge::config::file_loader::reload_config_from_file(path, 30, &policy, "ferrum");
+    drop(guard);
+    for (operation, result) in [("load", load), ("reload", reload)] {
+        let error = format!("{:#}", result.expect_err(operation));
+        assert!(
+            error.contains("invalid `allowed_ws_origins` entry(ies)"),
+            "{operation}: {error}"
+        );
+    }
+    let output = logs.contents();
+    assert!(
+        !output.contains("`allowed_ws_origins` contains `*`") && !output.contains("still loaded"),
+        "a refused file-mode document must not log the grandfathering warning: {output}"
+    );
+
+    // Positive control: the same capture does see the warning on the
+    // database/CP/DP load-validation path, so the absence above is real.
+    let mut proxy = make_proxy("star-proxy", "/api");
+    proxy.allowed_ws_origins = vec!["*".into()];
+    let config = GatewayConfig {
+        proxies: vec![proxy],
+        ..Default::default()
+    };
+    let (logs, _guard) = capture_ws_origin_logs();
+    config
+        .validate_all_fields(30)
+        .expect("database/CP/DP load validation keeps a legacy star");
+    assert!(
+        logs.contents()
+            .contains("`allowed_ws_origins` contains `*`"),
+        "positive control: the warning must be captured on the load path: {}",
+        logs.contents()
+    );
+}
+
 #[derive(Clone, Default)]
 struct CapturedWsOriginLogs {
     buffer: Arc<Mutex<Vec<u8>>>,

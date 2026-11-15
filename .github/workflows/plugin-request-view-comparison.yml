@@ -1,0 +1,140 @@
+name: Plugin Request View Comparison
+
+# Hosted evidence for issue #7207: the per-request cost of resolving a
+# `PluginCacheRequestView` (`PluginCache::request_view` + drop) on 1 and 8
+# threads, for a five-plugin route and a global-only route. The `compare` job
+# builds the candidate's `plugin_request_view` Criterion harness against the
+# candidate and against a baseline commit, then interleaves the two binaries on
+# one runner (`.github/scripts/run_plugin_request_view_comparison.sh`).
+#
+# Pull requests that edit this lane measure against their base commit; manual
+# dispatch measures against a chosen ancestor (default: the merge base with
+# main). Informational: no budget, not a required check, not in any merge gate.
+on:
+  workflow_dispatch:
+    inputs:
+      baseline:
+        description: "Optional full commit SHA (an ancestor of this ref) to compare with; default is the merge base with main"
+        required: false
+        default: ""
+        type: string
+      rounds:
+        description: "Interleaved rounds per revision"
+        required: false
+        default: "3"
+        type: choice
+        options: ["1", "2", "3", "4", "5"]
+  pull_request:
+    paths:
+      - .github/workflows/plugin-request-view-comparison.yml
+      - .github/scripts/run_plugin_request_view_comparison.sh
+      - .github/scripts/summarize_plugin_request_view_comparison.py
+      - tests/performance/mesh/benches/plugin_request_view.rs
+
+permissions:
+  contents: read
+
+# `.cargo/config.toml` points cargo at mold, and a runner- or user-level
+# rustc-wrapper may select sccache; this lane installs neither, so clear both,
+# exactly like alloc-per-request.yml.
+env:
+  RUSTC_WRAPPER: ""
+  CARGO_BUILD_RUSTC_WRAPPER: ""
+  RUSTFLAGS: ""
+  CARGO_TERM_COLOR: always
+  CARGO_NET_RETRY: "10"
+  CARGO_HTTP_MULTIPLEXING: "false"
+
+# A newer push to the same pull request cancels the superseded run. Every
+# dispatch gets a unique group so it always runs to completion.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || format('run-{0}', github.run_id) }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  contracts:
+    name: Request-view comparison contracts
+    runs-on: ubuntu-26.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Runner syntax and summarizer self-test
+        run: |
+          set -euo pipefail
+          bash -n .github/scripts/run_plugin_request_view_comparison.sh
+          python3 .github/scripts/summarize_plugin_request_view_comparison.py self-test
+      - name: Runner refuses a candidate other than the expected head
+        run: |
+          set -euo pipefail
+          log="$RUNNER_TEMP/expected-candidate.log"
+          if REQUEST_VIEW_BASE_SHA="$(git rev-parse HEAD)" \
+             REQUEST_VIEW_EXPECTED_CANDIDATE=1111111111111111111111111111111111111111 \
+             bash .github/scripts/run_plugin_request_view_comparison.sh > "$log" 2>&1; then
+            echo '::error::the runner measured a HEAD that is not the expected candidate'
+            exit 1
+          fi
+          grep -q 'is not the expected candidate' "$log"
+          test ! -e tests/performance/ci_results/plugin-request-view
+
+  compare:
+    name: Paired request-view comparison
+    needs: contracts
+    runs-on: ubuntu-26.04
+    # Two uncached optimized builds of the root crate plus the rounds.
+    timeout-minutes: 180
+    env:
+      # Pull requests: measure the PR HEAD (never the synthetic merge commit,
+      # which would also carry every main-side change merged since the PR
+      # forked) against the commit the head forked from.
+      REQUEST_VIEW_PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+      REQUEST_VIEW_EXPECTED_CANDIDATE: ${{ github.event.pull_request.head.sha }}
+      REQUEST_VIEW_EVENT_SHA: ${{ github.sha }}
+      REQUEST_VIEW_BASE_SHA: ${{ inputs.baseline }}
+      REQUEST_VIEW_ROUNDS: ${{ inputs.rounds || '3' }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          # The baseline commit must be present for its worktree.
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          toolchain: stable
+      - name: Hosted prerequisites
+        run: |
+          sudo apt-get update
+          # libcurl headers: rdkafka-sys builds librdkafka with OAUTHBEARER.
+          sudo apt-get install -y protobuf-compiler libssl-dev libcurl4-openssl-dev clang
+      - name: Resolve the baseline commit
+        run: |
+          set -euo pipefail
+          if [ "$GITHUB_EVENT_NAME" = pull_request ]; then
+            # The fork point of the PR head, so the pair differs by exactly
+            # the PR's own commits.
+            REQUEST_VIEW_BASE_SHA="$(git merge-base "$REQUEST_VIEW_PR_BASE_SHA" HEAD)"
+          elif [ -z "$REQUEST_VIEW_BASE_SHA" ]; then
+            REQUEST_VIEW_BASE_SHA="$(git merge-base origin/main HEAD)"
+          fi
+          echo "REQUEST_VIEW_BASE_SHA=$REQUEST_VIEW_BASE_SHA" >> "$GITHUB_ENV"
+          echo "Candidate: $(git rev-parse HEAD)"
+          echo "Baseline: $REQUEST_VIEW_BASE_SHA"
+      - name: Measure both revisions on this runner
+        run: bash .github/scripts/run_plugin_request_view_comparison.sh
+      - name: Publish the comparison summary
+        if: always()
+        run: |
+          summary=tests/performance/ci_results/plugin-request-view/summary.md
+          if [ -f "$summary" ]; then
+            cat "$summary" >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - name: Upload measurements
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: plugin-request-view-comparison-${{ github.sha }}-${{ github.run_attempt }}
+          path: tests/performance/ci_results/plugin-request-view/
+          if-no-files-found: warn
+          retention-days: 30

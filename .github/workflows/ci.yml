@@ -4609,7 +4609,7 @@ jobs:
             --set-string 'controlPlane.admin.allowedCidrs=0.0.0.0/0' \
             > "$RUNNER_TEMP/ferrum-helm-results/mesh-prod-catchall-cidr.yaml" \
             2> "$RUNNER_TEMP/ferrum-helm-results/mesh-prod-catchall-cidr.err"; then
-            echo "::error title=Catch-all admin allowlist accepted::a full-family allowlist is not plaintext protection for cp/ca"
+            echo "::error title=Catch-all admin allowlist accepted::a full-family allowlist is not plaintext protection for cp"
             exit 1
           fi
           if helm template ferrum ./charts/ferrum-mesh --namespace ferrum \

@@ -627,7 +627,7 @@ pub fn get_or_create_jwks_store(
         // A canonical `managed://jwks/<id>#jwks` key names an admin-managed
         // record (issue #7277); every other key is a validated http(s) URL.
         let store = if is_managed_jwks_source(jwks_uri) {
-            JwksKeyStore::new_managed(jwks_uri.to_string())
+            JwksKeyStore::new_managed(jwks_uri.to_string(), http_client.clone())
         } else {
             JwksKeyStore::new(jwks_uri.to_string(), http_client.clone())
         };
@@ -1075,11 +1075,11 @@ pub fn render_prometheus() -> String {
     }
 
     output.push_str(
-        "# HELP ferrum_jwks_refresh_failures_total Remote JWKS refresh failures by fixed failure class.\n",
+        "# HELP ferrum_jwks_refresh_failures_total Remote and admin-managed JWKS refresh failures by fixed failure class.\n",
     );
     output.push_str("# TYPE ferrum_jwks_refresh_failures_total counter\n");
     output.push_str(
-        "# HELP ferrum_jwks_consecutive_failures Maximum current consecutive failures among active remote stores by fixed failure class.\n",
+        "# HELP ferrum_jwks_consecutive_failures Maximum current consecutive failures among active remote and admin-managed JWKS stores by fixed failure class.\n",
     );
     output.push_str("# TYPE ferrum_jwks_consecutive_failures gauge\n");
     let failure_counts = JwksKeyStore::refresh_failure_counts();
