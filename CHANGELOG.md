@@ -85,6 +85,66 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - CI: the chart runtime-socket lint now renders every chart, including
   `charts/ferrum-gateway`, so a template-built socket path in the gateway
   chart is rejected (GHSA-4xcp-8c2m-g84j).
+- **The h3 declared-frame-length OOM (h3 patch 005) is recorded as reported
+  upstream** (GHSA-7m2p-q358-g4h3). It was reported privately to hyperium
+  (security advisory report, 2026-11-14). The vendored-patch lifecycle gains
+  an `upstream.filing: reported_privately` state with a closed `private_report
+  {channel, reported_on}` record, which never holds the embargoed report
+  identifier, and the checker requires the patch README and the
+  dependency-policy inventory row to carry the same record. Ferrum builds were
+  already protected by the vendored patch.
+
+### Added
+- **`jwks_auth` and `oidc_relying_party` read admin-managed JWKS records**
+  (issue #7277). `providers[].jwks_source: "managed://jwks/<id>#jwks"` names a
+  JWKS document stored through `/admin/tls/jwks`. In `jwks_auth` it is a
+  fourth key source, mutually exclusive with `jwks_uri`, `discovery_url` and
+  `jwks`; in `oidc_relying_party` it replaces `jwks_uri` when the endpoints
+  are explicit.
+  - **Trust.** While the record is present and holds a usable signing key, its
+    keys are trusted. If the record is deleted, has the wrong kind or holds no
+    usable key, every key is withdrawn and tokens are refused, as with an
+    expired remote set, and readiness fails the same way. If the store cannot
+    be read, the last-read keys are kept for at most `jwks_max_stale_seconds`.
+    The `ferrum_jwks_*` trust and refresh-failure metrics now count managed
+    stores too.
+  - **Rotation.** A create, `PUT` or delete on `/admin/tls/jwks` re-reads the
+    record on that node before the response returns. Other nodes sharing
+    `FERRUM_TLS_MANAGED_STORE_PATH` re-read it every refresh interval
+    (`jwks_refresh_interval_secs`; 900 seconds for `oidc_relying_party`) and
+    when a token names an unknown `kid`. That token is refused; later tokens
+    verify once the re-read completes.
+  - **Admission and references.** A plugin write (`POST /plugins/config`,
+    `POST /batch`, `POST /restore`) that references a missing, wrong-kind or
+    keyless record returns `400`, and `POST`/`PUT /api-specs` refuses such an
+    enabled `x-ferrum-plugins` entry with `422`. File mode refuses to start
+    and database mode logs a warning. Namespace-bounded operator tokens cannot
+    introduce a `managed://` reference. `DELETE /admin/tls/jwks/{id}` returns
+    `409` while a consumer references the record, and the TLS inventory lists
+    each reference.
+  - **CP/DP.** ConfigSync carries only the reference, so the CP and every data
+    plane must share the managed store volume.
+- **NodeWaypoint serves VirtualService HTTP routes from its mesh slice**
+  (#7233). The Kubernetes translator records mesh-bound VirtualService HTTP
+  routes (`spec.gateways` omitted or naming `mesh`) with their `exportTo` in
+  `mesh.virtual_service_http_routes`, and a NodeWaypoint subscription's slice
+  carries the routes of its namespace (route proxies, weighted-split
+  upstreams, `mesh_route_dispatch` rules and companion plugins) on the new
+  `MeshSlice.http_routes`, over native `MeshSubscribe` and the xDS
+  `HttpRoutesCarrier`. Every in-mesh destination is rebound onto the
+  NodeWaypoint transport, and a route to an in-cluster Service the slice does
+  not model is refused (the host keeps its Service route). Route-scoped
+  destination `AuthorizationPolicy` (`node_waypoint_route_upstreams`) and
+  `RequestAuthentication` destination scoping therefore apply per
+  VirtualService route on a production NodeWaypoint. A merged route whose
+  `mesh_route_dispatch` rule rewrites to a destination other than the route's
+  own is refused with `403` by destination authorization. Sidecar and Ambient
+  slices still carry no `http[]` routes; Gateway API HTTPRoutes bind Gateway
+  listeners and are not carried.
+- **`plugin_request_view` benchmark and the `Plugin Request View Comparison`
+  workflow** (#7207). The Criterion bench (`tests/performance/mesh`) measures
+  the per-request plugin-cache view cost, and the dispatchable workflow
+  compares a commit against a baseline on one runner.
 
 ### Removed
 - **Plugin readers for metadata and record shapes no built-in writes**
@@ -273,6 +333,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `kong_native`/`envoy_native` metadata (#7306).
 - The unused `tracing-appender` dependency, with its `symlink` dependency,
   from `Cargo.toml` and the root, fuzz and mesh-benchmark lockfiles (#7295).
+- **BREAKING — `ferrum-mesh` chart: the standalone mesh CA component is
+  removed** (issue #7298). `ca.enabled` started a second `FERRUM_MODE=cp`
+  Deployment that issued no certificates: Ferrum has no remote CA protocol,
+  and mesh workload identity comes from SPIRE
+  (`FERRUM_MESH_CA_BACKEND=spire`), file SVIDs, or the dev-only in-process
+  `internal` CA. The `ferrum-mesh-ca` Deployment, Service, ServiceAccount,
+  PodDisruptionBudget and metrics Service are gone, and the values schema
+  refuses every `ca.*` key. The chart's plaintext CP gRPC render guard now
+  applies to `controlPlane.env`, so a control plane with a non-loopback
+  plaintext CP gRPC bind fails `helm template` unless `controlPlane.env` sets
+  `FERRUM_CP_GRPC_TLS_CERT_PATH` + `FERRUM_CP_GRPC_TLS_KEY_PATH` or
+  `FERRUM_CP_DP_GRPC_ALLOW_PLAINTEXT: "true"` (it already failed at startup).
+  `examples/production-existing-secrets-values.yaml` now serves CP gRPC over
+  TLS from a `ferrum-mesh-production-cp-grpc-tls` Secret (cert, key and
+  data-plane client CA). **Operator action:** delete `ca.*` from values files
+  (and upgrade with `--reset-values` if the stored release values still carry
+  them); create the CP gRPC TLS Secret before installing the production
+  example.
+- **BREAKING (library API) — `modes::mesh::prepare_gateway_config_for_mesh` is
+  removed** (#7233). No serving path called the whole-`GatewayConfig` entry
+  point; every mesh config source builds from a `MeshSlice`. Tests use
+  `prepare_gateway_config_via_mesh_slice` (control-plane projection plus
+  `prepare_gateway_config_from_mesh_slice`), which is built only with the
+  `test-support` feature.
 
 ### Changed
 - **ferrum-mesh chart: values now reach the workload they name, once**
@@ -593,6 +677,99 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   install sccache; its local store was never persisted and measured 0–4 %
   hits. The FIPS producer handoff carries `target/` only, and dispatch-only
   benchmark caches are restore-only (`save-if: "false"`) (#7285).
+- **BREAKING — every log sink is `KeepLastKnownGood`** (#7144).
+  `http_logging`, `udp_logging`, `statsd_logging`, `loki_logging` and
+  `ws_frame_logging` join `stdout_logging`, `tcp_logging`, `kafka_logging` and
+  `ws_logging`: an access log is an audit trail, so an invalid enabled
+  log-sink config is no longer omitted with a warning. The Admin API still
+  answers `400`. `ferrum-edge validate`, file-mode startup and database-mode
+  cold start now fail, control-plane admission rejects the snapshot, database
+  mode no longer quarantines the row, and a reload or DP update that carries
+  it is rejected while the previous generation keeps serving. This includes
+  `udp_logging` DTLS material that cannot be loaded on the node. See
+  `docs/plugins.md` → "Log sink contract".
+- **Every log sink records WebSocket session ends** (#7144). `http_logging`,
+  `tcp_logging`, `udp_logging`, `kafka_logging` and `loki_logging` now run
+  `on_ws_disconnect` and emit the same session-end record `stdout_logging`
+  writes: a second HTTP-family transaction record per upgraded session,
+  carrying the session's `error_class`, the handshake method, path and status,
+  `latency_total_ms` as the session duration, `-1.0` for the other latencies,
+  and `metadata["websocket.timestamp_disconnected"]`. It goes through each
+  sink's normal schema projection, byte budget and loss accounting.
+  `statsd_logging`, `ws_logging` and `ws_frame_logging` keep their existing
+  session-end output.
+- **Modes without a configuration database keep admin audit records in a
+  bounded local file** (#7200). In `mesh`, `file` and `dp`, the durable record
+  of an audited admin action (for example `POST /mesh/config-revision/reset`
+  or `POST /admin/tls/rotate`) is now `admin-audit-retention.json` in
+  `FERRUM_ADMIN_AUDIT_FALLBACK_PATH`. The file is hardened, locked and
+  atomically published like the backup fallback file beside it. It keeps the
+  newest records by event timestamp, whatever order they are delivered in,
+  within the new `FERRUM_ADMIN_AUDIT_LOCAL_RETENTION_MAX_RECORDS` (default
+  4096) and `FERRUM_ADMIN_AUDIT_LOCAL_RETENTION_MAX_BYTES` (default 16 MiB),
+  and rotates the oldest out with an `audit_local_retention_rotated` warning.
+  Lowering either bound takes effect on the next append, which rotates the
+  existing file down. With a spool, a delivery worker started at boot adopts
+  abandoned records and drains `pending/` into the file, so the spool no
+  longer fills until `FERRUM_ADMIN_AUDIT_SPOOL_MAX_RECORDS` saturates and
+  `fail_closed` refuses audited actions. A replayed record is not written
+  twice, and its directory is synced again before the spool copy is released.
+  Without a spool the event is written to the file directly.
+  `ferrum_admin_audit_evidence_lost` now latches only when that write fails.
+- **BREAKING (file mode) — `allowed_ws_origins` entries of `*` or non-origins
+  are a load error** (#7218). File-mode startup and SIGHUP reload refuse a
+  document whose proxy `allowed_ws_origins` contains `*` or an entry that is
+  not a literal `scheme://host[:port]` origin (path, query, `null`, …), in
+  every namespace of the file, as Admin API writes already did. Database, CP
+  and DP loads keep the warn-only grandfathering from #5454. `ferrum-edge
+  validate` reports the refusal through the shared loader.
+- **Billing-spool fault injection and spool test hooks no longer ship**
+  (#7122). The `api_chargeback_sink` spool fsync/rename/directory fault
+  dispatch and its process-global write/walk/replay hook slots are compiled
+  only with the new never-shipped `test-support` cargo feature, which test
+  builds enable through a self dev-dependency. Production spool writes, walks
+  and replays no longer take a hook mutex per operation.
+- **BREAKING — EgressGateway `HTTP2`/`GRPC` ServiceEntry ports are plaintext
+  unless a DestinationRule asks for TLS** (issue #7236). The EgressGateway
+  used to originate verified TLS to every external `HTTP2`/`GRPC` port and
+  ignored a DestinationRule `tls.mode: DISABLE`, so a plaintext h2c/gRPC
+  backend was unreachable. It now follows Istio: an `HTTP`, `HTTP2`, `GRPC` or
+  undeclared-protocol port is plaintext (gRPC over h2c) unless the effective
+  DestinationRule `tls.mode` for the host (the `portLevelSettings` entry for
+  the port, else the top-level `tls`) is `SIMPLE`, `MUTUAL` or `ISTIO_MUTUAL`;
+  `DISABLE` or no `tls` keeps it plaintext. `ISTIO_MUTUAL` there needs the
+  file-based gateway SVID, otherwise the slice is refused. `TLS` ports still
+  always re-originate TLS. **Operator action:** add a DestinationRule with
+  `trafficPolicy.tls.mode: SIMPLE` for external `GRPC`/`HTTP2` hosts that need
+  TLS. An `HTTP` port that already has such a rule now originates TLS.
+- **BREAKING — an absent `targetPort` means the service port on every mesh
+  path** (issue #7236). Sidecar inbound used to guess a container port from a
+  shared port name, an equal port number or the workload's sole port when a
+  native/file `MeshService` port had no `target_port`, while every outbound
+  path used the service port. Sidecar inbound now uses the service port too.
+  Kubernetes is unaffected (the API server always sets `targetPort`).
+  **Operator action:** declare `target_port` on native/file service ports
+  whose container listens on another port.
+- **BREAKING — `FERRUM_MESH_SIDECAR_IDENTITY_NARROWING` is on by default**
+  (issue #7243). With `FERRUM_MESH_SIDECAR_ENFORCED=true`, each slice now
+  carries only the workload identities its admitted services reference.
+  **Operator action:** a deployment that resolves workload identities outside
+  its Sidecar egress scope must admit those services in the Sidecar or set
+  `FERRUM_MESH_SIDECAR_IDENTITY_NARROWING=false`.
+- **BREAKING — `POST`/`PUT /admin/tls/jwks` admit only a key set a JWKS
+  consumer can verify with** (issue #7277). `jwks_json` must hold at least one
+  usable signing key, and documents over 1 MiB or 256 keys, or with a
+  duplicate usable `kid`, are refused with `400`.
+  - A usable signing key has a non-empty `kid`, a `use` of `sig` or none, and
+    `key_ops` that is absent or includes `verify`. It must also be a supported
+    RS*/PS*/ES256/ES384/EdDSA key of approved strength.
+  - Before this release, any non-empty `keys` array was stored.
+  - Records already in the store are not touched, but one that holds no usable
+    key now fails closed once a consumer references it.
+- **BREAKING — ConfigSync protocol revision 5** (#7233). `MeshConfig` gained
+  `virtual_service_http_routes` and `MeshSlice` gained `http_routes`, so the
+  ConfigSync build identity moves to `configsync.r5`; a CP and DP from
+  different builds refuse each other at `Subscribe`.
 
 ### Fixed
 - **The hosted protocol benchmark flags the samples a host disturbance
@@ -1918,11 +2095,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   previously a 500 "failed to parse ACME certificate store" (#7229)
 - `ferrum.conf` `FERRUM_FILE_CONFIG_PATH` and the CLI share a single file-mode
   inference implementation (#7221)
-- ferrum-mesh: `ca.enabled=true` now fails `helm template` when `ca.env` would
-  bind plaintext CP gRPC on a non-loopback address with no TLS cert/key paths
-  and no `FERRUM_CP_DP_GRPC_ALLOW_PLAINTEXT`. The CA pod previously rendered
-  and then exited at startup. The development example sets the opt-in
-  (issue #7298).
 - ferrum-gateway chart: loopback binds are parsed instead of prefix-matched, so
   an expanded IPv6 loopback such as `0:0:0:0:0:0:0:1` is refused for
   `admin.service`, `metrics.serviceMonitor` and `cp.service` like `::1`
@@ -2185,6 +2357,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Repository: `CODEOWNERS` now covers every `docs/upstream-*-patches/`
   directory. The issue and PR templates link `SECURITY.md` and
   `CONTRIBUTING.md` correctly and list every operating mode (#7309).
+- **The admin audit spool startup claim race is closed on non-Unix hosts**
+  (#7200). Windows creates a new generation's instance tree in place and then
+  locks it, so a sibling starting at the same moment could take that lock
+  first and remove the tree. The claimer no longer creates the lock of a
+  lock-less instance younger than the 10-minute staging grace period. Unix
+  already built and locked the tree under a staging name before renaming it
+  into place.
+- A failed first open of the managed TLS store at
+  `FERRUM_TLS_MANAGED_STORE_PATH` (a torn or unreadable `managed-tls.json`, or
+  an unwritable directory) is now retried on next use instead of being cached
+  for the life of the process. `managed://` TLS sources, managed JWKS
+  consumers and `/admin/tls/*` recover once the store is repaired, without a
+  restart (#7378).
+- An EgressGateway `DestinationRule` now applies to a `resolution: STATIC`
+  `ServiceEntry`. The synthesized upstream is named with the ServiceEntry
+  host, so the rule's load balancer, outlier and TLS policy reach the declared
+  endpoints, and `tls.mode` `SIMPLE`/`MUTUAL` originates TLS on its `HTTP`,
+  `HTTP2` and `GRPC` ports instead of leaving them plaintext (#7236).
+- With Sidecar identity narrowing on, a Sidecar whose egress scope does not
+  admit its own service again accepts authenticated inbound raw-TCP CONNECTs.
+  The inbound relay's own-address port bound now reads the un-narrowed
+  local-inbound workload view, which removes the `PortNotDeclared` refusal
+  (#7243).
+- Mesh data planes accept slices that carry a CUSTOM `AuthorizationPolicy`. A
+  config built from a mesh slice dropped the slice's `ext_authz_providers`, so
+  mesh validation refused every slice with a CUSTOM policy and the data plane
+  kept its previous generation (#7233).
 
 ### Performance
 - **The TLS record layer now uses AWS-LC's AES-GCM on the CPUs where it is
@@ -2500,6 +2699,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   deep-clones every HTTP proxy (#7168).
 - **Two fewer relaxed atomic updates per relayed DTLS datagram and per UDP
   listener batch** (#7186), from removing the unread counters.
+- **Plugin cache request views hold one shared per-route snapshot** (#7207). A
+  view was about sixteen reference-counted lists; it is now one `Arc` plus
+  four flags, so building or cloning it is one refcount increment. Resolving a
+  route's plugin chain takes half the time single-threaded and scales across
+  cores instead of contending on shared reference counts: 6.8x the throughput
+  at 8 threads in the new `plugin_request_view` benchmark.
+- **Per-proxy passive-health maps use a fixed 8-shard `DashMap`** (#7207).
+  `ProxyHealthState.states` and `PassiveUnhealthyTargets` exist once per proxy
+  with a passive policy. They no longer allocate DashMap's `4 × cores`
+  cache-padded shards (about 16 KiB per proxy on 16 cores), so the 1 s passive
+  recovery sweep and the `/metrics` walk visit fewer empty shards.
 
 ## [0.9.20] - 2026-11-02
 
