@@ -14,7 +14,10 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use ferrum_edge::_test_support::run_before_proxy_hooks_for_test;
+use ferrum_edge::_test_support::{
+    install_plugin_finalizers_for_test, run_after_proxy_hooks_for_test,
+    run_before_proxy_hooks_for_test,
+};
 use ferrum_edge::config::types::{GatewayConfig, PluginScope, Proxy};
 use ferrum_edge::config_sources::k8s::{
     K8sMetadata, K8sObject, K8sTranslationOptions, translate_k8s_objects,
@@ -241,8 +244,20 @@ fn authz_config(prepared: &GatewayConfig) -> serde_json::Value {
         .clone()
 }
 
-/// The production `mesh_route_dispatch` instance of `route`.
-fn route_dispatch(prepared: &GatewayConfig, route: &Proxy) -> Arc<dyn Plugin> {
+/// The production `mesh_route_dispatch` instance of `route`, as the plugin
+/// cache assembles it: followed by the cache-installed dispatch finalizer,
+/// which admits the destination the dispatch group selected.
+fn route_dispatch(prepared: &GatewayConfig, route: &Proxy) -> Vec<Arc<dyn Plugin>> {
+    dispatch_chain(vec![route_dispatch_instance(prepared, route)])
+}
+
+/// `plugins` with the cache-internal finalizers installed.
+fn dispatch_chain(mut plugins: Vec<Arc<dyn Plugin>>) -> Vec<Arc<dyn Plugin>> {
+    install_plugin_finalizers_for_test(&mut plugins).expect("dispatch chain assembles");
+    plugins
+}
+
+fn route_dispatch_instance(prepared: &GatewayConfig, route: &Proxy) -> Arc<dyn Plugin> {
     let config = prepared
         .plugin_configs
         .iter()
@@ -277,13 +292,13 @@ fn node_waypoint_request(route: &Proxy, source: &str) -> RequestContext {
     ctx
 }
 
-fn branch_headers(v2: bool) -> HashMap<String, String> {
+fn branch_headers(version: Option<&str>) -> HashMap<String, String> {
     let mut headers = HashMap::from([(
         "host".to_string(),
         "reviews.default.svc.cluster.local".to_string(),
     )]);
-    if v2 {
-        headers.insert("x-version".to_string(), "v2".to_string());
+    if let Some(version) = version {
+        headers.insert("x-version".to_string(), version.to_string());
     }
     headers
 }
@@ -297,7 +312,9 @@ async fn serve(
     source: &str,
     v2: bool,
 ) -> (PluginResult, Option<PluginResult>, RequestContext) {
-    let (authorized, dispatched, ctx, _) = serve_capture(authz, plugins, route, source, v2).await;
+    let version = v2.then_some("v2");
+    let (authorized, dispatched, ctx, _) =
+        serve_version(authz, plugins, route, source, version).await;
     (authorized, dispatched, ctx)
 }
 
@@ -314,8 +331,25 @@ async fn serve_capture(
     RequestContext,
     HashMap<String, String>,
 ) {
+    serve_version(authz, plugins, route, source, v2.then_some("v2")).await
+}
+
+/// One request carrying `x-version: <version>` (when set), returning the
+/// backend-bound request headers too.
+async fn serve_version(
+    authz: &MeshAuthz,
+    plugins: &[Arc<dyn Plugin>],
+    route: &Proxy,
+    source: &str,
+    version: Option<&str>,
+) -> (
+    PluginResult,
+    Option<PluginResult>,
+    RequestContext,
+    HashMap<String, String>,
+) {
     let mut ctx = node_waypoint_request(route, source);
-    let mut headers = branch_headers(v2);
+    let mut headers = branch_headers(version);
     headers.insert(
         "authorization".to_string(),
         "Bearer client-token".to_string(),
@@ -431,7 +465,7 @@ async fn an_allowed_alternative_branch_passes() {
     let authz = MeshAuthz::new(&authz_config(&prepared)).expect("mesh_authz builds");
     let dispatch = route_dispatch(&prepared, &route);
 
-    let (authorized, dispatched, ctx) = serve(&authz, &[dispatch], &route, UNTRUSTED, true).await;
+    let (authorized, dispatched, ctx) = serve(&authz, &dispatch, &route, UNTRUSTED, true).await;
     assert!(
         matches!(authorized, PluginResult::Continue),
         "ratings admits the request, so authorization defers to dispatch: {authorized:?}"
@@ -458,14 +492,13 @@ async fn a_denied_alternative_branch_is_refused_even_when_the_static_destination
     let authz = MeshAuthz::new(&authz_config(&prepared)).expect("mesh_authz builds");
     let dispatch = route_dispatch(&prepared, &route);
 
-    let (authorized, dispatched, ctx) = serve(&authz, &[dispatch], &route, TRUSTED, true).await;
+    let (authorized, dispatched, ctx) = serve(&authz, &dispatch, &route, TRUSTED, true).await;
     assert!(
         matches!(authorized, PluginResult::Continue),
         "reviews admits TRUSTED: {authorized:?}"
     );
     let dispatched = dispatched.expect("dispatch ran");
     assert_denied(&dispatched, DENIED_BODY, "the ratings branch is refused");
-    assert_eq!(ctx.route_override_upstream_id, None);
     assert!(
         !ctx.metadata.contains_key(RULE_INDEX_METADATA_KEY),
         "the refused rule served nothing"
@@ -491,8 +524,7 @@ async fn the_static_branch_still_uses_its_own_policy() {
 
     // UNTRUSTED: ratings would admit it, so authorization defers, but the
     // request reaches reviews, whose policy refuses it.
-    let (authorized, dispatched, ctx) =
-        serve(&authz, &[Arc::clone(&dispatch)], &route, UNTRUSTED, false).await;
+    let (authorized, dispatched, ctx) = serve(&authz, &dispatch, &route, UNTRUSTED, false).await;
     assert!(matches!(authorized, PluginResult::Continue));
     assert_denied(
         &dispatched.expect("dispatch ran"),
@@ -504,7 +536,7 @@ async fn the_static_branch_still_uses_its_own_policy() {
     assert_eq!(ctx.metadata.get("mesh_authz.deny_policy"), Some(&expected));
 
     // TRUSTED reaches reviews and is admitted.
-    let (_, dispatched, ctx) = serve(&authz, &[dispatch], &route, TRUSTED, false).await;
+    let (_, dispatched, ctx) = serve(&authz, &dispatch, &route, TRUSTED, false).await;
     assert!(matches!(dispatched, Some(PluginResult::Continue)));
     assert!(
         ctx.route_override_upstream_id.is_none()
@@ -548,7 +580,7 @@ async fn a_destination_without_a_verdict_is_refused() {
     let authz = MeshAuthz::new(&config).expect("mesh_authz builds");
     let dispatch = route_dispatch(&prepared, &route);
 
-    let (authorized, dispatched, ctx) = serve(&authz, &[dispatch], &route, TRUSTED, true).await;
+    let (authorized, dispatched, ctx) = serve(&authz, &dispatch, &route, TRUSTED, true).await;
     assert!(matches!(authorized, PluginResult::Continue));
     assert_denied(
         &dispatched.expect("dispatch ran"),
@@ -574,7 +606,7 @@ async fn without_verdicts_the_blanket_override_refusal_stays() {
     let authz = single_destination_authz(&prepared);
     let dispatch = route_dispatch(&prepared, &route);
 
-    let (authorized, dispatched, _) = serve(&authz, &[dispatch], &route, TRUSTED, true).await;
+    let (authorized, dispatched, _) = serve(&authz, &dispatch, &route, TRUSTED, true).await;
     assert!(matches!(authorized, PluginResult::Continue));
     match dispatched.expect("dispatch ran") {
         PluginResult::Reject {
@@ -703,8 +735,7 @@ async fn an_unresolvable_own_destination_defers_to_an_allowed_alternative() {
     let authz = MeshAuthz::new(&config).expect("mesh_authz builds");
     let dispatch = route_dispatch(&prepared, &route);
 
-    let (authorized, dispatched, ctx) =
-        serve(&authz, &[Arc::clone(&dispatch)], &route, TRUSTED, true).await;
+    let (authorized, dispatched, ctx) = serve(&authz, &dispatch, &route, TRUSTED, true).await;
     assert!(
         matches!(authorized, PluginResult::Continue),
         "ratings is allowed, so authorization defers: {authorized:?}"
@@ -715,7 +746,7 @@ async fn an_unresolvable_own_destination_defers_to_an_allowed_alternative() {
         Some(RATINGS_UPSTREAM)
     );
 
-    let (authorized, dispatched, ctx) = serve(&authz, &[dispatch], &route, TRUSTED, false).await;
+    let (authorized, dispatched, ctx) = serve(&authz, &dispatch, &route, TRUSTED, false).await;
     assert!(matches!(authorized, PluginResult::Continue));
     assert_denied(
         &dispatched.expect("dispatch ran"),
@@ -741,7 +772,7 @@ async fn when_every_candidate_refuses_the_own_refusal_stands_at_authorization() 
     let authz = MeshAuthz::new(&authz_config(&prepared)).expect("mesh_authz builds");
     let dispatch = route_dispatch(&prepared, &route);
 
-    let (authorized, dispatched, ctx) = serve(&authz, &[dispatch], &route, UNTRUSTED, true).await;
+    let (authorized, dispatched, ctx) = serve(&authz, &dispatch, &route, UNTRUSTED, true).await;
     assert_denied(
         &authorized,
         DENIED_BODY,
@@ -809,6 +840,17 @@ fn custom_policy(name: &str, app: &str) -> MeshPolicy {
 /// `mesh_authz` from the prepared config plus a CUSTOM policy selecting one
 /// destination, bound to a stub provider that owns `authorization` upstream.
 fn authz_with_custom(prepared: &GatewayConfig, policy: MeshPolicy, port: u16) -> MeshAuthz {
+    authz_with_custom_policies(prepared, vec![policy], port, Vec::new())
+}
+
+/// [`authz_with_custom`] with several added policies and the provider's
+/// `headersToDownstreamOnAllow` list.
+fn authz_with_custom_policies(
+    prepared: &GatewayConfig,
+    policies: Vec<MeshPolicy>,
+    port: u16,
+    downstream_on_allow: Vec<String>,
+) -> MeshAuthz {
     let mut config = authz_config(prepared);
     let slice = config["mesh_slice"]
         .as_object_mut()
@@ -818,7 +860,11 @@ fn authz_with_custom(prepared: &GatewayConfig, policy: MeshPolicy, port: u16) ->
         .or_insert_with(|| json!([]))
         .as_array_mut()
         .expect("policy list")
-        .push(serde_json::to_value(policy).expect("policy serializes"));
+        .extend(
+            policies
+                .into_iter()
+                .map(|policy| serde_json::to_value(policy).expect("policy serializes")),
+        );
     let provider = MeshExtAuthzProvider {
         name: "branch-ext-authz".to_string(),
         service: "127.0.0.1".to_string(),
@@ -833,7 +879,7 @@ fn authz_with_custom(prepared: &GatewayConfig, policy: MeshPolicy, port: u16) ->
         include_request_body_in_check: None,
         headers_to_upstream_on_allow: vec!["authorization".to_string()],
         headers_to_downstream_on_deny: vec!["www-authenticate".to_string()],
-        headers_to_downstream_on_allow: Vec::new(),
+        headers_to_downstream_on_allow: downstream_on_allow,
     };
     slice.insert(
         "ext_authz_providers".to_string(),
@@ -856,7 +902,7 @@ async fn a_provider_credential_does_not_follow_the_request_to_another_branch() {
     let dispatch = route_dispatch(&prepared, &route);
 
     let (authorized, dispatched, ctx, headers) =
-        serve_capture(&authz, &[Arc::clone(&dispatch)], &route, TRUSTED, true).await;
+        serve_capture(&authz, &dispatch, &route, TRUSTED, true).await;
     assert!(matches!(authorized, PluginResult::Continue));
     assert!(
         matches!(dispatched, Some(PluginResult::Continue)),
@@ -880,7 +926,7 @@ async fn a_provider_credential_does_not_follow_the_request_to_another_branch() {
     // The request that does reach reviews runs reviews' check and carries
     // its provider's credential.
     let (_, dispatched, _, headers) =
-        serve_capture(&authz, &[dispatch], &route, TRUSTED, false).await;
+        serve_capture(&authz, &dispatch, &route, TRUSTED, false).await;
     assert!(matches!(dispatched, Some(PluginResult::Continue)));
     assert_eq!(calls.load(Ordering::SeqCst), 1);
     assert_eq!(
@@ -901,7 +947,7 @@ async fn an_alternative_branch_runs_its_own_custom_check() {
     let dispatch = route_dispatch(&prepared, &route);
 
     let (authorized, dispatched, ctx, headers) =
-        serve_capture(&authz, &[Arc::clone(&dispatch)], &route, TRUSTED, true).await;
+        serve_capture(&authz, &dispatch, &route, TRUSTED, true).await;
     assert!(matches!(authorized, PluginResult::Continue));
     assert!(
         matches!(dispatched, Some(PluginResult::Continue)),
@@ -919,7 +965,7 @@ async fn an_alternative_branch_runs_its_own_custom_check() {
 
     // The own branch has no CUSTOM policy: no check, no provider header.
     let (_, dispatched, _, headers) =
-        serve_capture(&authz, &[dispatch], &route, TRUSTED, false).await;
+        serve_capture(&authz, &dispatch, &route, TRUSTED, false).await;
     assert!(matches!(dispatched, Some(PluginResult::Continue)));
     assert_eq!(calls.load(Ordering::SeqCst), 1);
     assert_eq!(
@@ -940,13 +986,12 @@ async fn an_own_destination_custom_refusal_applies_only_to_its_own_branch() {
     let authz = authz_with_custom(&prepared, custom_policy("reviews-ext", "reviews"), port);
     let dispatch = route_dispatch(&prepared, &route);
 
-    let (authorized, dispatched, _) =
-        serve(&authz, &[Arc::clone(&dispatch)], &route, TRUSTED, true).await;
+    let (authorized, dispatched, _) = serve(&authz, &dispatch, &route, TRUSTED, true).await;
     assert!(matches!(authorized, PluginResult::Continue));
     assert!(matches!(dispatched, Some(PluginResult::Continue)));
     assert_eq!(calls.load(Ordering::SeqCst), 0);
 
-    let (_, dispatched, ctx) = serve(&authz, &[dispatch], &route, TRUSTED, false).await;
+    let (_, dispatched, ctx) = serve(&authz, &dispatch, &route, TRUSTED, false).await;
     match dispatched.expect("dispatch ran") {
         PluginResult::Reject {
             status_code,
@@ -995,4 +1040,351 @@ async fn a_destination_owing_a_custom_check_without_dispatch_is_refused() {
             .map(String::as_str),
         Some("custom:reviews-ext")
     );
+}
+
+const PROVIDER_DENY_401: &str = "HTTP/1.1 401 Unauthorized\r\n\
+www-authenticate: Bearer realm=\"mesh\"\r\n\
+content-length: 0\r\n\r\n";
+
+const PROVIDER_ALLOW_WITH_COOKIE: &str = "HTTP/1.1 200 OK\r\n\
+authorization: Bearer provider-minted-token\r\n\
+set-cookie: session=refreshed; Path=/\r\n\
+content-length: 0\r\n\r\n";
+
+/// Two contiguous dispatch instances on the carried route, both soft
+/// fallbacks (`reject_unmatched: false`): the first routes `x-version: v1`
+/// to the route's own destination (reviews), the second `x-version: v2` to
+/// ratings. The cache installs one finalizer after the second.
+fn two_dispatch_chain() -> Vec<Arc<dyn Plugin>> {
+    let instance = |version: &str, upstream: &str| {
+        create_plugin(
+            "mesh_route_dispatch",
+            &json!({
+                "rules": [{
+                    "match": {"headers": {"x-version": version}},
+                    "destination": {"upstream_id": upstream}
+                }]
+            }),
+        )
+        .expect("dispatch config constructs")
+        .expect("built-in plugin")
+    };
+    dispatch_chain(vec![
+        instance("v1", REVIEWS_UPSTREAM),
+        instance("v2", RATINGS_UPSTREAM),
+    ])
+}
+
+/// Issue #7383 review (round 2, sol F1): with several dispatch instances, an
+/// earlier instance that does not match must not judge the destination the
+/// request has at that point. Only the destination the whole group selects
+/// is admitted, so a request the own destination would refuse reaches the
+/// alternative a later instance selects.
+#[tokio::test]
+async fn two_dispatch_instances_judge_only_the_final_destination() {
+    let slice = node_waypoint_slice(vec![reviews_trusted_only()]);
+    let prepared = prepare(&slice);
+    let route = carried_route(&prepared);
+    let authz = MeshAuthz::new(&authz_config(&prepared)).expect("mesh_authz builds");
+    let chain = two_dispatch_chain();
+
+    let (authorized, dispatched, ctx, _) =
+        serve_version(&authz, &chain, &route, UNTRUSTED, Some("v2")).await;
+    assert!(matches!(authorized, PluginResult::Continue));
+    assert!(
+        matches!(dispatched, Some(PluginResult::Continue)),
+        "the first instance's miss must not refuse for reviews: {dispatched:?}"
+    );
+    assert_eq!(
+        ctx.route_override_upstream_id.as_deref(),
+        Some(RATINGS_UPSTREAM)
+    );
+
+    // A request the first instance routes to reviews is still judged by
+    // reviews' own policy.
+    let (_, dispatched, _, _) = serve_version(&authz, &chain, &route, UNTRUSTED, Some("v1")).await;
+    assert_denied(
+        &dispatched.expect("dispatch ran"),
+        DENIED_BODY,
+        "reviews refuses UNTRUSTED",
+    );
+}
+
+/// Issue #7383 review (round 2, sol F1): with several dispatch instances, the
+/// own destination's CUSTOM check runs only for a request the group finally
+/// sends there; an allow binds nothing for a request a later instance sends
+/// elsewhere.
+#[tokio::test]
+async fn two_dispatch_instances_run_custom_only_for_the_final_destination_allow() {
+    let (port, calls) = start_provider(PROVIDER_ALLOW_WITH_TOKEN).await;
+    let slice = node_waypoint_slice(vec![reviews_trusted_only()]);
+    let prepared = prepare(&slice);
+    let route = carried_route(&prepared);
+    let authz = authz_with_custom(&prepared, custom_policy("reviews-ext", "reviews"), port);
+    let chain = two_dispatch_chain();
+
+    let (_, dispatched, ctx, headers) =
+        serve_version(&authz, &chain, &route, TRUSTED, Some("v2")).await;
+    assert!(
+        matches!(dispatched, Some(PluginResult::Continue)),
+        "ratings is reached and admitted: {dispatched:?}"
+    );
+    assert_eq!(
+        ctx.route_override_upstream_id.as_deref(),
+        Some(RATINGS_UPSTREAM)
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        headers.get("authorization").map(String::as_str),
+        Some("Bearer client-token")
+    );
+
+    let (_, dispatched, _, headers) =
+        serve_version(&authz, &chain, &route, TRUSTED, Some("v1")).await;
+    assert!(matches!(dispatched, Some(PluginResult::Continue)));
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        headers.get("authorization").map(String::as_str),
+        Some("Bearer provider-minted-token")
+    );
+}
+
+/// Issue #7383 review (round 2, sol F1): an own-destination CUSTOM refusal
+/// never refuses a request a later dispatch instance sends elsewhere.
+#[tokio::test]
+async fn two_dispatch_instances_run_custom_only_for_the_final_destination_deny() {
+    let (port, calls) = start_provider(PROVIDER_DENY).await;
+    let slice = node_waypoint_slice(vec![reviews_trusted_only()]);
+    let prepared = prepare(&slice);
+    let route = carried_route(&prepared);
+    let authz = authz_with_custom(&prepared, custom_policy("reviews-ext", "reviews"), port);
+    let chain = two_dispatch_chain();
+
+    let (_, dispatched, _, _) = serve_version(&authz, &chain, &route, TRUSTED, Some("v2")).await;
+    assert!(matches!(dispatched, Some(PluginResult::Continue)));
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+
+    let (_, dispatched, ctx, _) = serve_version(&authz, &chain, &route, TRUSTED, Some("v1")).await;
+    match dispatched.expect("dispatch ran") {
+        PluginResult::Reject { status_code, .. } => assert_eq!(status_code, 403),
+        other => panic!("the reviews provider refuses its own branch, got {other:?}"),
+    }
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        ctx.metadata
+            .get("mesh_authz.deny_policy")
+            .map(String::as_str),
+        Some("custom:reviews-ext")
+    );
+}
+
+/// Issue #7383 review (round 2, sol F2): a reached branch whose destination
+/// has both a CUSTOM policy and a refusing local policy runs its provider
+/// first, as a direct request to that destination does. A provider refusal
+/// keeps the provider's own status and allowlisted header.
+#[tokio::test]
+async fn a_reached_branch_runs_custom_before_its_local_denial_provider_refuses() {
+    let (port, calls) = start_provider(PROVIDER_DENY_401).await;
+    let slice = node_waypoint_slice(vec![reviews_trusted_only(), ratings_untrusted_only()]);
+    let prepared = prepare(&slice);
+    let route = carried_route(&prepared);
+    let authz = authz_with_custom(&prepared, custom_policy("ratings-ext", "ratings"), port);
+    let dispatch = route_dispatch(&prepared, &route);
+
+    let (authorized, dispatched, ctx) = serve(&authz, &dispatch, &route, TRUSTED, true).await;
+    assert!(matches!(authorized, PluginResult::Continue));
+    match dispatched.expect("dispatch ran") {
+        PluginResult::Reject {
+            status_code,
+            headers,
+            ..
+        } => {
+            assert_eq!(status_code, 401, "the provider's own status is kept");
+            assert!(
+                headers.contains_key("www-authenticate"),
+                "the provider's allowlisted challenge is kept: {headers:?}"
+            );
+        }
+        other => panic!("the ratings provider refuses, got {other:?}"),
+    }
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "the provider decides first"
+    );
+    assert_eq!(
+        ctx.metadata
+            .get("mesh_authz.deny_policy")
+            .map(String::as_str),
+        Some("custom:ratings-ext")
+    );
+    assert!(ctx.metadata.contains_key("mesh_authz.ext_authz_outcome"));
+}
+
+/// Issue #7383 review (round 2, sol F2): when the provider allows, the
+/// branch's stored local denial still applies, and none of the provider's
+/// mutations reach the request.
+#[tokio::test]
+async fn a_reached_branch_runs_custom_before_its_local_denial_provider_allows() {
+    let (port, calls) = start_provider(PROVIDER_ALLOW_WITH_TOKEN).await;
+    let slice = node_waypoint_slice(vec![reviews_trusted_only(), ratings_untrusted_only()]);
+    let prepared = prepare(&slice);
+    let route = carried_route(&prepared);
+    let authz = authz_with_custom(&prepared, custom_policy("ratings-ext", "ratings"), port);
+    let dispatch = route_dispatch(&prepared, &route);
+
+    let (_, dispatched, ctx, headers) =
+        serve_capture(&authz, &dispatch, &route, TRUSTED, true).await;
+    assert_denied(
+        &dispatched.expect("dispatch ran"),
+        DENIED_BODY,
+        "ratings' local policy refuses TRUSTED after the provider allowed",
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    // A request straight to ratings is decided the same way: its provider
+    // allows, then its local policy refuses.
+    let expected =
+        own_route_deny_policy(&authz, &service_route(&prepared, RATINGS_UPSTREAM), TRUSTED).await;
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    assert_eq!(ctx.metadata.get("mesh_authz.deny_policy"), Some(&expected));
+    assert_eq!(
+        headers.get("authorization").map(String::as_str),
+        Some("Bearer client-token"),
+        "a refused branch gets none of the provider's headers"
+    );
+}
+
+/// Issue #7383 review (round 2, dsf F1): on a route with per-destination
+/// verdicts, `mesh_authz`'s own `before_proxy` strips the client's copies of
+/// every candidate provider's owned names before any later policy plugin
+/// sees them, and installs nothing.
+#[tokio::test]
+async fn client_copies_of_provider_owned_headers_are_stripped_at_mesh_authz() {
+    let (port, calls) = start_provider(PROVIDER_ALLOW_WITH_TOKEN).await;
+    let slice = node_waypoint_slice(vec![reviews_trusted_only()]);
+    let prepared = prepare(&slice);
+    let route = carried_route(&prepared);
+    let authz: Arc<dyn Plugin> = Arc::new(authz_with_custom(
+        &prepared,
+        custom_policy("reviews-ext", "reviews"),
+        port,
+    ));
+
+    let mut ctx = node_waypoint_request(&route, TRUSTED);
+    let mut headers = branch_headers(Some("v2"));
+    headers.insert(
+        "authorization".to_string(),
+        "Bearer client-token".to_string(),
+    );
+    headers.insert("Authorization".to_string(), "Bearer forged".to_string());
+    ctx.headers = headers.clone();
+    assert!(matches!(
+        authz.authorize(&mut ctx).await,
+        PluginResult::Continue
+    ));
+    let result =
+        run_before_proxy_hooks_for_test(&[Arc::clone(&authz)], &mut ctx, &mut headers).await;
+    assert!(matches!(result, PluginResult::Continue));
+    assert!(
+        !headers
+            .keys()
+            .any(|name| name.eq_ignore_ascii_case("authorization")),
+        "every spelling of the provider-owned name is stripped at 2075: {headers:?}"
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 0, "no check runs at 2075");
+}
+
+/// Issue #7383 review (round 2, dsf F3): the reached destination's provider
+/// `headersToDownstreamOnAllow` result lands on that request's response only.
+#[tokio::test]
+async fn downstream_provider_headers_land_only_for_the_reached_branch() {
+    let (port, calls) = start_provider(PROVIDER_ALLOW_WITH_COOKIE).await;
+    let slice = node_waypoint_slice(vec![reviews_trusted_only()]);
+    let prepared = prepare(&slice);
+    let route = carried_route(&prepared);
+    let authz = Arc::new(authz_with_custom_policies(
+        &prepared,
+        vec![custom_policy("reviews-ext", "reviews")],
+        port,
+        vec!["set-cookie".to_string()],
+    ));
+    let chain = dispatch_chain(vec![
+        Arc::clone(&authz) as Arc<dyn Plugin>,
+        route_dispatch_instance(&prepared, &route),
+    ]);
+
+    for (v2, expect_cookie) in [(false, true), (true, false)] {
+        let (authorized, dispatched, mut ctx, _) =
+            serve_capture(&authz, &chain, &route, TRUSTED, v2).await;
+        assert!(matches!(authorized, PluginResult::Continue));
+        assert!(
+            matches!(dispatched, Some(PluginResult::Continue)),
+            "v2={v2}: {dispatched:?}"
+        );
+        let mut response_headers = HashMap::new();
+        run_after_proxy_hooks_for_test(&chain, &mut ctx, 200, &mut response_headers).await;
+        assert_eq!(
+            response_headers.contains_key("set-cookie"),
+            expect_cookie,
+            "v2={v2}: {response_headers:?}"
+        );
+    }
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "only the reviews branch is checked"
+    );
+}
+
+/// Issue #7383 review (round 2, dsf F3): a second `mesh_authz` instance folds
+/// its verdicts in conjunctively; tables that cannot be aligned refuse every
+/// destination.
+#[tokio::test]
+async fn a_second_mesh_authz_instance_merges_conjunctively() {
+    let slice = node_waypoint_slice(vec![reviews_trusted_only()]);
+    let prepared = prepare(&slice);
+    let route = carried_route(&prepared);
+    let config = authz_config(&prepared);
+    let first = MeshAuthz::new(&config).expect("mesh_authz builds");
+    let aligned = MeshAuthz::new(&config).expect("mesh_authz builds");
+    let mut misaligned_config = config.clone();
+    misaligned_config["node_waypoint_route_branches"][0]["destinations"]
+        .as_array_mut()
+        .expect("destinations")
+        .push(json!({"backend_host": "api.example.com", "backend_port": 443}));
+    let misaligned = MeshAuthz::new(&misaligned_config).expect("mesh_authz builds");
+    let dispatch = route_dispatch(&prepared, &route);
+
+    for (second, admitted) in [(&aligned, true), (&misaligned, false)] {
+        let mut ctx = node_waypoint_request(&route, TRUSTED);
+        let mut headers = branch_headers(Some("v2"));
+        ctx.headers = headers.clone();
+        assert!(matches!(
+            first.authorize(&mut ctx).await,
+            PluginResult::Continue
+        ));
+        assert!(matches!(
+            second.authorize(&mut ctx).await,
+            PluginResult::Continue
+        ));
+        let result = run_before_proxy_hooks_for_test(&dispatch, &mut ctx, &mut headers).await;
+        if admitted {
+            assert!(
+                matches!(result, PluginResult::Continue),
+                "aligned verdicts keep ratings allowed: {result:?}"
+            );
+        } else {
+            assert_denied(
+                &result,
+                DENIED_BODY,
+                "misaligned tables refuse every destination",
+            );
+            assert_eq!(
+                ctx.metadata
+                    .get("mesh_authz.deny_policy")
+                    .map(String::as_str),
+                Some("route_branch_unauthorized")
+            );
+        }
+    }
 }
