@@ -18,6 +18,9 @@ enum ValidationStep<'a> {
     AllFieldsWithIpPolicy {
         cert_expiry_warning_days: u64,
         backend_allow_ips: &'a BackendEgressPolicy,
+        /// `false` for operator admission (restore): same errors, without the
+        /// #5454 `allowed_ws_origins` grandfathering warning.
+        warn_legacy_allowed_ws_origins: bool,
         action: ValidationAction<'a>,
     },
     UniqueResourceIds {
@@ -457,6 +460,27 @@ impl<'a> ValidationPipeline<'a> {
         self.steps.push(ValidationStep::AllFieldsWithIpPolicy {
             cert_expiry_warning_days,
             backend_allow_ips,
+            warn_legacy_allowed_ws_origins: true,
+            action,
+        });
+        self
+    }
+
+    /// [`Self::validate_all_fields_with_ip_policy`] for operator admission
+    /// paths (Admin API restore) that refuse `*` / non-origin
+    /// `allowed_ws_origins` themselves. Collects the same errors but skips the
+    /// #5454 grandfathering warning, which would claim a refused candidate is
+    /// "still loaded".
+    pub(crate) fn validate_all_fields_for_admission_with_ip_policy(
+        mut self,
+        cert_expiry_warning_days: u64,
+        backend_allow_ips: &'a BackendEgressPolicy,
+        action: ValidationAction<'a>,
+    ) -> Self {
+        self.steps.push(ValidationStep::AllFieldsWithIpPolicy {
+            cert_expiry_warning_days,
+            backend_allow_ips,
+            warn_legacy_allowed_ws_origins: false,
             action,
         });
         self
@@ -588,12 +612,21 @@ impl<'a> ValidationPipeline<'a> {
                 ValidationStep::AllFieldsWithIpPolicy {
                     cert_expiry_warning_days,
                     backend_allow_ips,
+                    warn_legacy_allowed_ws_origins,
                     action,
                 } => {
-                    if let Err(errors) = config.validate_all_fields_with_ip_policy(
-                        cert_expiry_warning_days,
-                        backend_allow_ips,
-                    ) {
+                    let result = if warn_legacy_allowed_ws_origins {
+                        config.validate_all_fields_with_ip_policy(
+                            cert_expiry_warning_days,
+                            backend_allow_ips,
+                        )
+                    } else {
+                        config.validate_all_fields_for_admission_with_ip_policy(
+                            cert_expiry_warning_days,
+                            backend_allow_ips,
+                        )
+                    };
+                    if let Err(errors) = result {
                         handle_validation_errors(action, errors, &mut collected_errors)?;
                     }
                 }

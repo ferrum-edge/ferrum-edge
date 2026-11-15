@@ -2734,6 +2734,107 @@ fn test_file_mode_refusal_of_allowed_ws_origins_star_does_not_log_grandfathering
     );
 }
 
+/// Admin API restore refuses `*` / non-origin `allowed_ws_origins`, so its
+/// field validation must not log the #5454 grandfathering warning, which
+/// says the config "is still loaded". The refusal and its aggregation are
+/// unchanged: the admission errors are still reported, after the pipeline.
+#[test]
+fn test_restore_refusal_of_allowed_ws_origins_star_does_not_log_grandfathering_warning() {
+    // Restore validation reads process env (the plugin-config step builds the
+    // compression admission policy from it): isolate and serialize it for the
+    // whole test so a sibling's env mutation cannot add an unrelated error.
+    let _env = crate::unit::env_lock::EnvGuard::new(&[]);
+    let mut proxy = make_proxy("ws-proxy", "/ws");
+    proxy.allowed_ws_origins = vec!["*".into(), "https://app.example.com/path".into()];
+    let mut candidate = GatewayConfig {
+        proxies: vec![proxy],
+        ..Default::default()
+    };
+    let expected = candidate.allowed_ws_origins_admission_errors();
+    assert_eq!(expected.len(), 2, "both entries are admission errors");
+    let policy = ferrum_edge::config::BackendEgressPolicy::unrestricted();
+
+    let (logs, guard) = capture_ws_origin_logs();
+    let errors = ferrum_edge::_test_support::restore_candidate_validation_errors_for_test(
+        &mut candidate,
+        30,
+        &policy,
+    );
+    drop(guard);
+    assert_eq!(
+        errors, expected,
+        "restore must refuse the candidate with exactly the admission errors"
+    );
+    assert!(
+        errors[0].contains("allowed_ws_origins[0] is '*'")
+            && errors[0].contains(ALLOWED_WS_ORIGINS_STAR_GUIDANCE),
+        "{errors:?}"
+    );
+    assert!(
+        errors[1].contains("allowed_ws_origins[1] must be a literal origin"),
+        "{errors:?}"
+    );
+    let output = logs.contents();
+    assert!(
+        !output.contains("`allowed_ws_origins` contains `*`") && !output.contains("still loaded"),
+        "a refused restore must not log the grandfathering warning: {output}"
+    );
+
+    // Positive control: the same capture sees the warning when the same
+    // candidate goes through database/CP/DP load validation, so the absence
+    // above is real and those loads keep #5454's grandfathering.
+    let (logs, _guard) = capture_ws_origin_logs();
+    candidate
+        .validate_all_fields(30)
+        .expect("database/CP/DP load validation keeps a legacy star");
+    let output = logs.contents();
+    assert!(
+        output.contains("`allowed_ws_origins` contains `*`") && output.contains("still loaded"),
+        "positive control: the warning must be captured on the load path: {output}"
+    );
+}
+
+/// Restore skips the #5454 grandfathering warning because it refuses every
+/// entry the warning would flag. Pin that the warning fires exactly when
+/// admission refuses, over each entry class, so neither side can drift.
+#[test]
+fn test_allowed_ws_origins_grandfathering_warning_matches_admission_refusal() {
+    for (origin, refused) in [
+        ("", false),
+        ("   ", false),
+        ("*", true),
+        (" * ", true),
+        ("null", true),
+        ("app.example.com", true),
+        ("https://app.example.com/path", true),
+        ("https://app.example.com/?x=1", true),
+        ("https://app.example.com/#frag", true),
+        ("https://user:pass@app.example.com", true),
+        ("ftp://app.example.com", true),
+        ("https://app.example.com", false),
+        ("https://app.example.com/", false),
+        ("http://localhost:3000", false),
+        ("ws://app.example.com:8080", false),
+        ("wss://app.example.com", false),
+    ] {
+        let mut proxy = make_proxy("origin-proxy", "/ws");
+        proxy.allowed_ws_origins = vec![origin.to_string()];
+        assert_eq!(
+            !proxy.allowed_ws_origins_admission_errors().is_empty(),
+            refused,
+            "admission verdict for {origin:?}"
+        );
+        let (logs, guard) = capture_ws_origin_logs();
+        proxy.warn_legacy_allowed_ws_origins();
+        drop(guard);
+        let warned = logs.contents().contains("still loaded");
+        assert_eq!(
+            warned, refused,
+            "the grandfathering warning must fire exactly when admission refuses {origin:?}"
+        );
+    }
+}
+
 #[derive(Clone, Default)]
 struct CapturedWsOriginLogs {
     buffer: Arc<Mutex<Vec<u8>>>,
