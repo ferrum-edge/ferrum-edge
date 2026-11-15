@@ -146,6 +146,14 @@ host, as Istio does (issue #7236). The effective `tls.mode` is a
 | `GRPC` | Plaintext h2c | TLS origination |
 | `TLS` | TLS origination (verified); `DISABLE` does not downgrade it | TLS origination |
 
+`ISTIO_MUTUAL` presents the file-based gateway SVID
+(`FERRUM_GATEWAY_SVID_CERT_PATH` / `FERRUM_GATEWAY_SVID_KEY_PATH`) as the
+client certificate. Without those files — a CA-backed SVID only
+(`FERRUM_MESH_CA_BACKEND`), or no SVID at all — an `ISTIO_MUTUAL` rule on an
+external `ServiceEntry` upstream fails slice apply closed, because generic
+backend TLS cannot present a dynamic SVID. Use `MUTUAL` with an explicit
+`clientCertificate` / `privateKey`, or `SIMPLE`, for those ports.
+
 ## Support boundaries, deferrals, and non-goals (the long tail)
 
 These items are off the GA path. Each is a **non-goal**, **deferred** (a field

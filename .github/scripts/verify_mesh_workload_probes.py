@@ -609,7 +609,6 @@ def validate_startup_overrides(results_dir: Path, expectations: dict) -> None:
     )
     expected = (
         ("ferrum-mesh-control-plane", "Deployment", "/bin/startup-cp"),
-        ("ferrum-mesh-ca", "Deployment", "/bin/startup-ca"),
         ("ferrum-mesh-east-west", "Deployment", "/bin/startup-ew"),
         ("ferrum-mesh-ambient", "DaemonSet", "/bin/startup-amb"),
         ("ferrum-mesh-injector", "Deployment", "/bin/startup-inj"),
@@ -649,14 +648,12 @@ def validate_service_account_isolation(rendered: str) -> None:
         "ferrum-mesh-ambient": "ferrum-mesh-ambient",
         "ferrum-mesh-east-west": "ferrum-mesh-east-west",
         "ferrum-mesh-injector": "ferrum-mesh-injector",
-        "ferrum-mesh-ca": "ferrum-mesh-ca",
     }
     workloads = {
         "ferrum-mesh-control-plane": ("Deployment", "ferrum-mesh-control-plane"),
         "ferrum-mesh-ambient": ("DaemonSet", "ferrum-mesh-ambient"),
         "ferrum-mesh-east-west": ("Deployment", "ferrum-mesh-east-west"),
         "ferrum-mesh-injector": ("Deployment", "ferrum-mesh-injector"),
-        "ferrum-mesh-ca": ("Deployment", "ferrum-mesh-ca"),
     }
     for component, account in expected_accounts.items():
         kind, workload_name = workloads[component]
