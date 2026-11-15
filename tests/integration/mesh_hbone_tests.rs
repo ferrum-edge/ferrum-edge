@@ -2179,8 +2179,9 @@ fn materialize_source_side_external_udp(
         }
     });
 
-    let prepared = ferrum_edge::modes::mesh::prepare_gateway_config_for_mesh(config, &runtime)
-        .expect("source mesh apply");
+    let prepared =
+        ferrum_edge::modes::mesh::prepare_gateway_config_via_mesh_slice(config, &runtime)
+            .expect("source mesh apply");
     let mesh = prepared.mesh.as_deref().expect("prepared mesh block");
     let route = mesh.external_udp_egress_routes.first()?;
     let target = prepared

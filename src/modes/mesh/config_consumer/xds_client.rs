@@ -1857,6 +1857,9 @@ fn reverse_translate(
             && !recovered_labels_are_authoritative(recovered.labels_ambiguous, &config.labels),
         virtual_service_l4_proxies: recovered.virtual_service_l4_proxies,
         virtual_service_l4_upstreams: recovered.virtual_service_l4_upstreams,
+        // Issue #7233: the NodeWaypoint's VirtualService HTTP routes ride their
+        // own carrier; the DP re-checks the set when it decodes the slice.
+        http_routes: recovered.http_routes,
         // Required xDS types are coherent before a slice is built, so this is
         // the shared observability version for the installed mesh slice.
         version: composite_required_version(accumulator),
@@ -2119,6 +2122,7 @@ struct RecoveredSliceCarriers {
     labels_ambiguous: bool,
     virtual_service_l4_proxies: Vec<serde_json::Value>,
     virtual_service_l4_upstreams: Vec<serde_json::Value>,
+    http_routes: crate::modes::mesh::slice::MeshHttpRouteSet,
     /// Authoritative config revision (issue #2473) recovered from the
     /// `ConfigRevision` carrier. `None` when the CP's config authority is
     /// unordered (or predates the carrier) — the DP freshness gate then treats
@@ -2618,6 +2622,7 @@ fn apply_recovered_carrier(
         MeshSliceCarrier::VirtualServiceL4Upstreams(value) => {
             recovered.virtual_service_l4_upstreams = value
         }
+        MeshSliceCarrier::HttpRoutes(value) => recovered.http_routes = value,
         MeshSliceCarrier::MeshPolicies(value) => recovered.mesh_policies = value,
         MeshSliceCarrier::ExtAuthzProviders(value) => recovered.ext_authz_providers = value,
         MeshSliceCarrier::VirtualServiceCorsPolicies(value) => {

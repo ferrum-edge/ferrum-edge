@@ -49,7 +49,7 @@ use crate::modes::mesh::config::{
     TrustBundleSet, Workload,
 };
 use crate::modes::mesh::revision::MeshConfigRevision;
-use crate::modes::mesh::slice::{MeshEgressScopeSnapshot, MeshSlice};
+use crate::modes::mesh::slice::{MeshEgressScopeSnapshot, MeshHttpRouteSet, MeshSlice};
 
 /// Common inner `type_url` prefix for every Ferrum mesh-slice carrier.
 pub const FERRUM_CARRIER_TYPE_URL_PREFIX: &str = "type.googleapis.com/ferrum.config.extension.v3.";
@@ -155,6 +155,12 @@ pub const FERRUM_ECDS_VS_L4_PROXIES_TYPE_URL: &str =
 /// beside the L4 proxies.
 pub const FERRUM_ECDS_VS_L4_UPSTREAMS_TYPE_URL: &str =
     "type.googleapis.com/ferrum.config.extension.v3.VirtualServiceL4UpstreamsCarrier";
+/// Inner `type_url` for the VirtualService HTTP routes a NodeWaypoint serves
+/// (issue #7233): route proxies, their weighted-split upstreams and their
+/// route plugin configs (`MeshSlice::http_routes`). The DP re-checks the set
+/// when it decodes the slice, before anything is materialized.
+pub const FERRUM_ECDS_HTTP_ROUTES_TYPE_URL: &str =
+    "type.googleapis.com/ferrum.config.extension.v3.HttpRoutesCarrier";
 /// Inner `type_url` for the authorization-policy carrier (`MeshPolicy` list).
 pub const FERRUM_ECDS_MESH_POLICIES_TYPE_URL: &str =
     "type.googleapis.com/ferrum.config.extension.v3.MeshPoliciesCarrier";
@@ -290,6 +296,9 @@ pub enum MeshSliceCarrier {
     LabelsAmbiguous(bool),
     VirtualServiceL4Proxies(Vec<serde_json::Value>),
     VirtualServiceL4Upstreams(Vec<serde_json::Value>),
+    /// VirtualService HTTP routes for a NodeWaypoint (issue #7233); see
+    /// [`FERRUM_ECDS_HTTP_ROUTES_TYPE_URL`]. Emitted only when non-empty.
+    HttpRoutes(MeshHttpRouteSet),
     MeshPolicies(Vec<MeshPolicy>),
     ExtAuthzProviders(Vec<crate::modes::mesh::config::MeshExtAuthzProvider>),
     VirtualServiceCorsPolicies(Vec<MeshVirtualServiceCorsPolicy>),
@@ -365,6 +374,7 @@ impl MeshSliceCarrier {
             MeshSliceCarrier::LabelsAmbiguous(_) => FERRUM_ECDS_LABELS_AMBIGUOUS_TYPE_URL,
             MeshSliceCarrier::VirtualServiceL4Proxies(_) => FERRUM_ECDS_VS_L4_PROXIES_TYPE_URL,
             MeshSliceCarrier::VirtualServiceL4Upstreams(_) => FERRUM_ECDS_VS_L4_UPSTREAMS_TYPE_URL,
+            MeshSliceCarrier::HttpRoutes(_) => FERRUM_ECDS_HTTP_ROUTES_TYPE_URL,
             MeshSliceCarrier::MeshPolicies(_) => FERRUM_ECDS_MESH_POLICIES_TYPE_URL,
             MeshSliceCarrier::ExtAuthzProviders(_) => FERRUM_ECDS_EXT_AUTHZ_PROVIDERS_TYPE_URL,
             MeshSliceCarrier::VirtualServiceCorsPolicies(_) => {
@@ -418,6 +428,7 @@ impl MeshSliceCarrier {
             MeshSliceCarrier::LabelsAmbiguous(_) => "workload-labels-ambiguous",
             MeshSliceCarrier::VirtualServiceL4Proxies(_) => "virtual-service-l4-proxies",
             MeshSliceCarrier::VirtualServiceL4Upstreams(_) => "virtual-service-l4-upstreams",
+            MeshSliceCarrier::HttpRoutes(_) => "http-routes",
             MeshSliceCarrier::MeshPolicies(_) => "mesh-policies",
             MeshSliceCarrier::ExtAuthzProviders(_) => "ext-authz-providers",
             MeshSliceCarrier::VirtualServiceCorsPolicies(_) => "virtual-service-cors-policies",
@@ -458,6 +469,7 @@ impl MeshSliceCarrier {
             MeshSliceCarrier::LabelsAmbiguous(value) => encode(value),
             MeshSliceCarrier::VirtualServiceL4Proxies(value) => encode(value),
             MeshSliceCarrier::VirtualServiceL4Upstreams(value) => encode(value),
+            MeshSliceCarrier::HttpRoutes(value) => encode(value),
             MeshSliceCarrier::MeshPolicies(value) => encode(value),
             MeshSliceCarrier::ExtAuthzProviders(value) => encode(value),
             MeshSliceCarrier::VirtualServiceCorsPolicies(value) => encode(value),
@@ -545,6 +557,7 @@ impl MeshSliceCarrier {
             FERRUM_ECDS_VS_L4_UPSTREAMS_TYPE_URL => {
                 MeshSliceCarrier::VirtualServiceL4Upstreams(decode_json(value)?)
             }
+            FERRUM_ECDS_HTTP_ROUTES_TYPE_URL => MeshSliceCarrier::HttpRoutes(decode_json(value)?),
             FERRUM_ECDS_MESH_POLICIES_TYPE_URL => {
                 MeshSliceCarrier::MeshPolicies(decode_json(value)?)
             }
@@ -671,6 +684,7 @@ pub fn carrier_resource_name_for_type_url(type_url: &str) -> Option<&'static str
         FERRUM_ECDS_VS_L4_UPSTREAMS_TYPE_URL => {
             Some("ferrum-mesh-carrier/virtual-service-l4-upstreams")
         }
+        FERRUM_ECDS_HTTP_ROUTES_TYPE_URL => Some("ferrum-mesh-carrier/http-routes"),
         FERRUM_ECDS_MESH_POLICIES_TYPE_URL => Some("ferrum-mesh-carrier/mesh-policies"),
         FERRUM_ECDS_EXT_AUTHZ_PROVIDERS_TYPE_URL => Some("ferrum-mesh-carrier/ext-authz-providers"),
         FERRUM_ECDS_VS_CORS_POLICIES_TYPE_URL => {
@@ -905,6 +919,9 @@ pub fn build_slice_carriers(slice: &MeshSlice) -> Vec<MeshSliceCarrier> {
         carriers.push(MeshSliceCarrier::VirtualServiceL4Upstreams(
             slice.virtual_service_l4_upstreams.clone(),
         ));
+    }
+    if !slice.http_routes.is_empty() {
+        carriers.push(MeshSliceCarrier::HttpRoutes(slice.http_routes.clone()));
     }
     if !slice.mesh_policies.is_empty() {
         carriers.push(MeshSliceCarrier::MeshPolicies(slice.mesh_policies.clone()));
@@ -1152,6 +1169,11 @@ mod tests {
             MeshSliceCarrier::VirtualServiceL4Upstreams(vec![serde_json::json!({
                 "id": "istio-vs-l4-upstream-default-db-tcp-0"
             })]),
+            MeshSliceCarrier::HttpRoutes(MeshHttpRouteSet {
+                proxies: vec![serde_json::json!({"id": "istio-vs-default-api-0"})],
+                upstreams: vec![serde_json::json!({"id": "istio-vs-upstream-default-api-0"})],
+                plugin_configs: vec![serde_json::json!({"id": "istio-vs-mrd-default-api-0"})],
+            }),
             MeshSliceCarrier::MeshPolicies(Vec::new()),
             MeshSliceCarrier::ExtAuthzProviders(Vec::new()),
             MeshSliceCarrier::VirtualServiceCorsPolicies(Vec::new()),
@@ -1268,6 +1290,7 @@ mod tests {
             MeshSliceCarrier::LabelsAmbiguous(true),
             MeshSliceCarrier::VirtualServiceL4Proxies(Vec::new()),
             MeshSliceCarrier::VirtualServiceL4Upstreams(Vec::new()),
+            MeshSliceCarrier::HttpRoutes(MeshHttpRouteSet::default()),
             MeshSliceCarrier::MeshPolicies(Vec::new()),
             MeshSliceCarrier::ExtAuthzProviders(Vec::new()),
             MeshSliceCarrier::VirtualServiceCorsPolicies(Vec::new()),

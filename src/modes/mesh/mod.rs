@@ -1560,43 +1560,107 @@ impl MeshRuntimeConfig {
     }
 }
 
-/// Prepare a gateway snapshot for mesh-mode serving.
+/// Prepare a gateway snapshot the way a mesh data plane receives it.
 ///
-/// No serving path calls this: every mesh config source builds from a
-/// [`MeshSlice`] through `gateway_config_from_mesh_slice_with_federation`.
-/// This entry point takes a whole `GatewayConfig` and is used by tests and the
-/// `startup_rollback_test_seams` seam. The mutation is cold-path: it runs
-/// before `ProxyState` builds router/plugin caches.
-pub fn prepare_gateway_config_for_mesh(
+/// Test-only (`test-support`); no serving path calls this. It is the test
+/// convenience for the two halves
+/// production runs on either side of the wire. The snapshot is admitted and
+/// projected into this runtime's [`MeshSlice`] exactly as a control plane
+/// does ([`MeshSlice::from_gateway_config`] with
+/// [`MeshRuntimeConfig::mesh_slice_request`]), and that slice is materialized
+/// through the data-plane path, [`prepare_gateway_config_from_mesh_slice`].
+/// Anything a slice does not carry (operator proxies, upstreams, plugin
+/// configs, consumers, gateway settings) does not reach the result, just as it
+/// never reaches a mesh data plane (issue #7233).
+#[cfg(any(test, feature = "test-support"))]
+pub fn prepare_gateway_config_via_mesh_slice(
     mut config: GatewayConfig,
     runtime: &MeshRuntimeConfig,
 ) -> Result<GatewayConfig, anyhow::Error> {
     config.normalize_fields();
     config.normalize_mesh_fields();
-    let mesh_slice = MeshSlice::from_gateway_config(&config, runtime.mesh_slice_request());
-    // Back-project the slice's narrowed `services` view BEFORE preparation so
-    // every consumer of the prepared config sees exactly what materialization
-    // consumes — CP parity: on the CP-driven paths `gateway_config_from_mesh_slice`
-    // builds `config.mesh` FROM the slice, so a DP never carries un-narrowed
-    // services. Without this, a Sidecar egress scope that narrows a
-    // multi-port service's ports would leave the raw declaration in
-    // `config.mesh.services`, and the router's outbound sibling grouping
-    // (declared-HTTP-port fail-closed) would demand orig-dst for a service
-    // the slice narrowed to a single port.
-    if let Some(mesh) = config.mesh.as_deref_mut() {
-        mesh.services = mesh_slice.services.clone();
+    if let Err(errors) = config.validate_resource_ids() {
+        return Err(anyhow::anyhow!(
+            "Mesh input resource ID validation failed: {}",
+            errors.join("; ")
+        ));
     }
-    prepare_normalized_gateway_config_for_mesh(config, runtime, &mesh_slice)
+    let mesh_errors = config.validate_mesh_fields();
+    if !mesh_errors.is_empty() {
+        return Err(anyhow::anyhow!(
+            "Mesh configuration validation failed: {}",
+            mesh_errors.join("; ")
+        ));
+    }
+    let mesh_slice = MeshSlice::from_gateway_config(&config, runtime.mesh_slice_request());
+    prepare_gateway_config_from_mesh_slice(&mesh_slice, runtime)
+}
+
+/// [`prepare_gateway_config_via_mesh_slice`] for component tests that need
+/// gateway resources no mesh slice carries.
+///
+/// The mesh view is exactly the production one: `config` is projected into
+/// this runtime's slice and decoded from it. The operator proxies, upstreams,
+/// plugin configs and consumers in `config` are then added as fixtures beside
+/// the slice-built resources before materialization, so a test can drive a
+/// shared materializer (DestinationRule overlay, HBONE admission, dispatch
+/// policy) over a resource it controls. Translator-owned route resources
+/// (`istio-vs-*`, `gwapi-route-*`) are never added: whether a data plane gets
+/// one is the slice's decision (issue #7233). No serving path calls this.
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub fn prepare_gateway_config_via_mesh_slice_with_fixtures(
+    mut config: GatewayConfig,
+    runtime: &MeshRuntimeConfig,
+) -> Result<GatewayConfig, anyhow::Error> {
+    config.normalize_fields();
+    config.normalize_mesh_fields();
+    if let Err(errors) = config.validate_resource_ids() {
+        return Err(anyhow::anyhow!(
+            "Mesh input resource ID validation failed: {}",
+            errors.join("; ")
+        ));
+    }
+    let mesh_errors = config.validate_mesh_fields();
+    if !mesh_errors.is_empty() {
+        return Err(anyhow::anyhow!(
+            "Mesh configuration validation failed: {}",
+            mesh_errors.join("; ")
+        ));
+    }
+    let mesh_slice = MeshSlice::from_gateway_config(&config, runtime.mesh_slice_request());
+    let (mut prepared, merged_slice) =
+        unprepared_gateway_config_from_mesh_slice(&mesh_slice, runtime, None, None)?;
+    let route_owned = |id: &str| id.starts_with("istio-vs-") || id.starts_with("gwapi-route-");
+    prepared.proxies.extend(
+        config
+            .proxies
+            .into_iter()
+            .filter(|proxy| !route_owned(&proxy.id)),
+    );
+    prepared.upstreams.extend(
+        config
+            .upstreams
+            .into_iter()
+            .filter(|upstream| !route_owned(&upstream.id)),
+    );
+    prepared.plugin_configs.extend(
+        config
+            .plugin_configs
+            .into_iter()
+            .filter(|plugin| !route_owned(&plugin.id)),
+    );
+    prepared.consumers.extend(config.consumers);
+    let materialization_slice = merged_slice.as_ref().unwrap_or(&mesh_slice);
+    prepare_gateway_config_for_native_slice(prepared, runtime, materialization_slice)
 }
 
 /// Prepare a gateway snapshot from an already-projected [`MeshSlice`].
 ///
-/// This is the CP-driven materialization path: the slice *is* the serving
-/// inventory. The whole-config [`prepare_gateway_config_for_mesh`] entry
-/// point (tests only) additionally projects `MeshConfig` through
-/// [`MeshSlice::from_gateway_config`] before this step, which is why a
-/// document that names Services in other namespaces never reaches the
-/// NodeWaypoint UDP materializer on that path.
+/// This is the materialization path every mesh config source (native, xDS,
+/// file) uses: the slice *is* the serving inventory, so a document that names
+/// Services in other namespaces never reaches the NodeWaypoint UDP
+/// materializer.
 pub fn prepare_gateway_config_from_mesh_slice(
     slice: &MeshSlice,
     runtime: &MeshRuntimeConfig,
@@ -1659,6 +1723,7 @@ fn prepare_normalized_gateway_config_for_mesh(
     // under the service-port key or dial-port key their dispatch path uses.
     // Topology-aware: Ambient emits HBONE routes; Sidecar emits SVID-mTLS routes.
     materialize_mesh_outbound_proxies(&mut config, runtime, mesh_slice);
+    bind_carried_http_routes_to_node_waypoint_transport(&mut config, runtime, mesh_slice);
     let refused_destination_routes =
         scope_request_auth_to_node_waypoint_destinations(&mut config, runtime, mesh_slice);
     scope_request_auth_refusal_to_inbound_routes(&mut config, runtime, &refused_destination_routes);
@@ -4004,6 +4069,21 @@ fn gateway_config_from_mesh_slice_with_federation(
     federation: Option<&federation::FederationSnapshot>,
     remote_endpoints: Option<&multicluster::RemoteEndpointSnapshot>,
 ) -> Result<GatewayConfig, anyhow::Error> {
+    let (config, merged_slice) =
+        unprepared_gateway_config_from_mesh_slice(slice, runtime, federation, remote_endpoints)?;
+    let materialization_slice = merged_slice.as_ref().unwrap_or(slice);
+    prepare_gateway_config_for_native_slice(config, runtime, materialization_slice)
+}
+
+/// The config a mesh slice decodes to, before materialization, plus the
+/// remote-merged slice materialization must read when remote endpoints were
+/// merged in (`None` means materialize from `slice` itself).
+fn unprepared_gateway_config_from_mesh_slice(
+    slice: &MeshSlice,
+    runtime: &MeshRuntimeConfig,
+    federation: Option<&federation::FederationSnapshot>,
+    remote_endpoints: Option<&multicluster::RemoteEndpointSnapshot>,
+) -> Result<(GatewayConfig, Option<MeshSlice>), anyhow::Error> {
     let loaded_at = chrono::DateTime::parse_from_rfc3339(&slice.version)
         .map(|ts| ts.with_timezone(&chrono::Utc))
         .unwrap_or_else(|_| chrono::Utc::now());
@@ -4065,17 +4145,23 @@ fn gateway_config_from_mesh_slice_with_federation(
         services: services.clone(),
         ..slice.clone()
     });
-    let materialization_slice = merged_slice.as_ref().unwrap_or(slice);
 
-    let proxies = decode_virtual_service_l4_proxies(slice)?;
-    let upstreams = decode_virtual_service_l4_upstreams(slice)?;
+    let mut proxies = decode_virtual_service_l4_proxies(slice)?;
+    let mut upstreams = decode_virtual_service_l4_upstreams(slice)?;
+    let (route_proxies, route_upstreams, plugin_configs) = decode_http_route_set(slice, runtime)?;
+    proxies.extend(route_proxies);
+    upstreams.extend(route_upstreams);
     let config = GatewayConfig {
         proxies,
         upstreams,
+        plugin_configs,
         mesh: Some(Box::new(MeshConfig {
             workloads,
             services,
             mesh_policies: slice.mesh_policies.clone(),
+            // The providers CUSTOM policies bind to. Without them mesh
+            // validation refuses every slice that carries a CUSTOM policy.
+            ext_authz_providers: slice.ext_authz_providers.clone(),
             peer_authentications: slice.peer_authentications.clone(),
             service_entries: slice.service_entries.clone(),
             request_authentications: slice.request_authentications.clone(),
@@ -4101,7 +4187,7 @@ fn gateway_config_from_mesh_slice_with_federation(
         loaded_at,
         ..GatewayConfig::default()
     };
-    prepare_gateway_config_for_native_slice(config, runtime, materialization_slice)
+    Ok((config, merged_slice))
 }
 
 fn decode_virtual_service_l4_proxies(slice: &MeshSlice) -> Result<Vec<Proxy>, anyhow::Error> {
@@ -4181,6 +4267,650 @@ fn decode_virtual_service_l4_upstreams(
             Ok(upstream)
         })
         .collect()
+}
+
+type DecodedHttpRouteSet = (
+    Vec<Proxy>,
+    Vec<crate::config::types::Upstream>,
+    Vec<crate::config::types::PluginConfig>,
+);
+
+/// Decode the VirtualService HTTP routes a slice carries (issue #7233).
+///
+/// The set is producer input, so it is re-checked here before anything is
+/// materialized: only a NodeWaypoint serves it; every element is an object of
+/// its resource type in the slice namespace with a translator-owned id; every
+/// plugin association resolves to a carried plugin config owned by that
+/// proxy; and every upstream id a proxy or `mesh_route_dispatch` rule names
+/// resolves to a carried upstream (and every carried upstream is named). Any
+/// violation refuses the slice, so the previous generation keeps serving.
+/// Diagnostics name the element by ordinal and never echo a supplied id.
+fn decode_http_route_set(
+    slice: &MeshSlice,
+    runtime: &MeshRuntimeConfig,
+) -> Result<DecodedHttpRouteSet, anyhow::Error> {
+    use crate::config::types::{PluginConfig, Upstream};
+    let set = &slice.http_routes;
+    if set.is_empty() {
+        return Ok((Vec::new(), Vec::new(), Vec::new()));
+    }
+    if runtime.topology != MeshTopology::NodeWaypoint {
+        return Err(anyhow::anyhow!(
+            "Mesh slice carries VirtualService HTTP routes, which only a NodeWaypoint serves"
+        ));
+    }
+    let proxies: Vec<Proxy> = set
+        .proxies
+        .iter()
+        .enumerate()
+        .map(|(index, value)| {
+            let proxy: Proxy = crate::util::json_object::from_json_object_value(value.clone())
+                .map_err(|_| anyhow::anyhow!("Mesh slice HTTP route proxy {index} is malformed"))?;
+            if proxy.namespace != slice.namespace
+                || !config::is_virtual_service_http_route_proxy_id(&proxy.id)
+                || proxy.dispatch_kind.is_stream()
+                || proxy
+                    .backend_scheme
+                    .is_some_and(|scheme| scheme.is_stream())
+            {
+                return Err(anyhow::anyhow!(
+                    "Mesh slice HTTP route proxy {index} has invalid ownership"
+                ));
+            }
+            Ok(proxy)
+        })
+        .collect::<Result<_, _>>()?;
+    let plugin_configs: Vec<PluginConfig> = set
+        .plugin_configs
+        .iter()
+        .enumerate()
+        .map(|(index, value)| {
+            let plugin: PluginConfig =
+                crate::util::json_object::from_json_object_value(value.clone()).map_err(|_| {
+                    anyhow::anyhow!("Mesh slice HTTP route plugin config {index} is malformed")
+                })?;
+            let owned = plugin.namespace == slice.namespace
+                && plugin
+                    .id
+                    .starts_with(slice::VIRTUAL_SERVICE_HTTP_ROUTE_PROXY_PLUGIN_PREFIX)
+                && plugin
+                    .proxy_id
+                    .as_deref()
+                    .is_some_and(|proxy_id| proxies.iter().any(|proxy| proxy.id == proxy_id));
+            if !owned {
+                return Err(anyhow::anyhow!(
+                    "Mesh slice HTTP route plugin config {index} has invalid ownership"
+                ));
+            }
+            Ok(plugin)
+        })
+        .collect::<Result<_, _>>()?;
+    let upstreams: Vec<Upstream> = set
+        .upstreams
+        .iter()
+        .enumerate()
+        .map(|(index, value)| {
+            let upstream: Upstream =
+                crate::util::json_object::from_json_object_value(value.clone()).map_err(|_| {
+                    anyhow::anyhow!("Mesh slice HTTP route upstream {index} is malformed")
+                })?;
+            if upstream.namespace != slice.namespace
+                || !upstream
+                    .id
+                    .starts_with(slice::VIRTUAL_SERVICE_HTTP_ROUTE_UPSTREAM_ID_PREFIX)
+                || upstream.targets.is_empty()
+            {
+                return Err(anyhow::anyhow!(
+                    "Mesh slice HTTP route upstream {index} has invalid ownership"
+                ));
+            }
+            Ok(upstream)
+        })
+        .collect::<Result<_, _>>()?;
+
+    let carried_upstreams: BTreeSet<&str> = upstreams
+        .iter()
+        .map(|upstream| upstream.id.as_str())
+        .collect();
+    let mut referenced_upstreams: BTreeSet<&str> = BTreeSet::new();
+    for (index, proxy) in proxies.iter().enumerate() {
+        for association in &proxy.plugins {
+            let resolves = plugin_configs.iter().any(|plugin| {
+                plugin.id == association.plugin_config_id
+                    && plugin.proxy_id.as_deref() == Some(proxy.id.as_str())
+            });
+            if !resolves {
+                return Err(anyhow::anyhow!(
+                    "Mesh slice HTTP route proxy {index} references a plugin config the slice \
+                     does not carry"
+                ));
+            }
+        }
+        referenced_upstreams.extend(proxy.upstream_id.as_deref());
+    }
+    for plugin in &plugin_configs {
+        if plugin.plugin_name == "mesh_route_dispatch" {
+            referenced_upstreams
+                .extend(slice::mesh_route_dispatch_rule_upstream_ids(&plugin.config));
+        }
+    }
+    if referenced_upstreams != carried_upstreams {
+        return Err(anyhow::anyhow!(
+            "Mesh slice HTTP route upstreams do not match the upstreams its routes reference"
+        ));
+    }
+    Ok((proxies, upstreams, plugin_configs))
+}
+
+/// Where a carried VirtualService destination host lives, from the NodeWaypoint's
+/// own slice view.
+enum CarriedRouteHost {
+    /// A Service in the slice: `(namespace, name)`.
+    Service(String, String),
+    /// A cluster Service host (`*.svc[.<cluster domain>]`, or a short name) the
+    /// slice does not model.
+    UnmodeledService,
+    /// Anything else: an external host.
+    External,
+}
+
+/// Index of the Service host names a NodeWaypoint slice models.
+struct CarriedRouteHostIndex {
+    qualified: HashMap<String, (String, String)>,
+    short: HashSet<(String, String)>,
+    svc_suffix: String,
+}
+
+impl CarriedRouteHostIndex {
+    fn new(mesh_slice: &MeshSlice, cluster_domain: &str) -> Self {
+        let cluster_domain = cluster_domain.trim_matches('.').to_ascii_lowercase();
+        let mut qualified = HashMap::new();
+        let mut short = HashSet::new();
+        for service in &mesh_slice.services {
+            short.insert((service.namespace.clone(), service.name.to_ascii_lowercase()));
+            for host in
+                mesh_service_host_variants(&service.name, &service.namespace, &cluster_domain)
+                    .into_iter()
+                    .skip(1)
+            {
+                qualified.insert(
+                    host.to_ascii_lowercase(),
+                    (service.namespace.clone(), service.name.clone()),
+                );
+            }
+        }
+        Self {
+            qualified,
+            short,
+            svc_suffix: format!(".svc.{cluster_domain}"),
+        }
+    }
+
+    /// Classify `host` as written on a route in `namespace`.
+    fn classify(&self, namespace: &str, host: &str) -> CarriedRouteHost {
+        let host = host.trim().trim_end_matches('.').to_ascii_lowercase();
+        if !host.contains('.') {
+            return if self.short.contains(&(namespace.to_string(), host.clone())) {
+                CarriedRouteHost::Service(namespace.to_string(), host)
+            } else {
+                CarriedRouteHost::UnmodeledService
+            };
+        }
+        if let Some((namespace, name)) = self.qualified.get(&host) {
+            return CarriedRouteHost::Service(namespace.clone(), name.clone());
+        }
+        // Every Service alias form the translator recognises
+        // (`service_host_components`: `<svc>.<ns>`, `<svc>.<ns>.svc`,
+        // `<svc>.<ns>.svc.<domain>`) is a Service, so an absent one is refused
+        // rather than dialed as an external host. Cluster DNS search domains
+        // resolve a two-label name in-cluster too.
+        if host.matches('.').count() == 1
+            || host.ends_with(".svc")
+            || host.ends_with(&self.svc_suffix)
+        {
+            CarriedRouteHost::UnmodeledService
+        } else {
+            CarriedRouteHost::External
+        }
+    }
+}
+
+/// Whether a visible DestinationRule names this Service's host. A weighted
+/// split dials the Service's workloads through its own upstream, which a
+/// Service-host DestinationRule does not match, so such a split is refused
+/// instead of silently running without the rule (fail-closed; over-matching
+/// only refuses more).
+fn service_has_destination_rule(
+    mesh_slice: &MeshSlice,
+    namespace: &str,
+    name: &str,
+    cluster_domain: &str,
+) -> bool {
+    let fqdn = format!(
+        "{name}.{namespace}.svc.{}",
+        cluster_domain.trim_matches('.')
+    )
+    .to_ascii_lowercase();
+    mesh_slice.destination_rules.iter().any(|rule| {
+        let host = rule.host.trim().trim_end_matches('.').to_ascii_lowercase();
+        host == "*"
+            || host
+                .strip_prefix('*')
+                .is_some_and(|suffix| fqdn.ends_with(suffix))
+            || destination_rule_host_matches(&host, &rule.namespace, &fqdn)
+    })
+}
+
+/// Rebind the VirtualService HTTP routes a NodeWaypoint slice carries onto the
+/// NodeWaypoint mesh transport (issue #7233).
+///
+/// The translator's routes dial Service DNS names over plain HTTP. Served as
+/// they are, a carried route would replace the materialized Service route's
+/// pinned, node-to-node HBONE targets with a plaintext dial. So every in-mesh
+/// destination is rebound onto the Service port's materialized upstream
+/// (`materialize_mesh_outbound_proxies` keeps those upstreams even when a
+/// carried route shadows the Service's own route):
+///
+/// * a direct backend (the route's own, or a `mesh_route_dispatch` rule's)
+///   becomes that upstream's id;
+/// * a weighted-split upstream's Service targets become the Service's
+///   workload targets, each leg's weight divided across its workloads, with
+///   the Service attribution kept on every target. DestinationRule policy
+///   therefore applies per Service route, never across a split.
+///
+/// A route with a destination that is an in-cluster Service the slice does not
+/// model, or a modeled Service port with no materialized upstream, is dropped
+/// with its plugins, fail-closed; its host then gets the materialized Service
+/// route. External hosts are left as they are.
+fn bind_carried_http_routes_to_node_waypoint_transport(
+    config: &mut GatewayConfig,
+    runtime: &MeshRuntimeConfig,
+    mesh_slice: &MeshSlice,
+) {
+    use crate::config::types::{
+        UPSTREAM_TARGET_SERVICE_NAME_TAG, UPSTREAM_TARGET_SERVICE_NAMESPACE_TAG,
+        UPSTREAM_TARGET_SERVICE_PORT_TAG,
+    };
+    if runtime.topology != MeshTopology::NodeWaypoint || mesh_slice.http_routes.is_empty() {
+        return;
+    }
+    let hosts = CarriedRouteHostIndex::new(mesh_slice, &runtime.cluster_domain);
+    // The materialized upstream for a modeled Service port, if any.
+    let service_upstream = |config: &GatewayConfig, namespace: &str, name: &str, port: u16| {
+        let id = mesh_outbound_upstream_id(namespace, name, port);
+        config
+            .upstreams
+            .iter()
+            .any(|upstream| upstream.namespace == namespace && upstream.id == id)
+            .then_some(id)
+    };
+
+    // 1. Weighted splits. Each leg is resolved to its dial targets first, then
+    // ONE scale is applied to every leg (external legs included) so the
+    // configured ratios survive, and each leg's share is divided across its
+    // targets.
+    let split_ids: Vec<(String, String)> = config
+        .upstreams
+        .iter()
+        .filter(|upstream| {
+            upstream
+                .id
+                .starts_with(slice::VIRTUAL_SERVICE_HTTP_ROUTE_UPSTREAM_ID_PREFIX)
+        })
+        .map(|upstream| (upstream.namespace.clone(), upstream.id.clone()))
+        .collect();
+    let mut failed_splits: HashSet<(String, String)> = HashSet::new();
+    let mut policy_refused_splits = 0usize;
+    for (namespace, id) in split_ids {
+        let Some(split) = config
+            .upstreams
+            .iter()
+            .find(|upstream| upstream.namespace == namespace && upstream.id == id)
+        else {
+            continue;
+        };
+        // (leg weight, dial targets for that leg)
+        let mut legs: Vec<(u32, Vec<crate::config::types::UpstreamTarget>)> = Vec::new();
+        let mut rebound = true;
+        let mut governed_by_destination_rule = false;
+        for target in &split.targets {
+            match hosts.classify(&namespace, &target.host) {
+                CarriedRouteHost::External => legs.push((target.weight, vec![target.clone()])),
+                CarriedRouteHost::UnmodeledService => rebound = false,
+                CarriedRouteHost::Service(service_namespace, service_name) => {
+                    if service_has_destination_rule(
+                        mesh_slice,
+                        &service_namespace,
+                        &service_name,
+                        &runtime.cluster_domain,
+                    ) {
+                        governed_by_destination_rule = true;
+                    }
+                    let Some(service_upstream_id) =
+                        service_upstream(config, &service_namespace, &service_name, target.port)
+                    else {
+                        rebound = false;
+                        continue;
+                    };
+                    let Some(service_upstream) = config.upstreams.iter().find(|upstream| {
+                        upstream.namespace == service_namespace.as_str()
+                            && upstream.id == service_upstream_id
+                    }) else {
+                        rebound = false;
+                        continue;
+                    };
+                    let leg_targets = service_upstream
+                        .targets
+                        .iter()
+                        .map(|workload_target| {
+                            let mut rebound_target = workload_target.clone();
+                            rebound_target.service_port_policy_key = Some(target.port);
+                            rebound_target.tags.insert(
+                                UPSTREAM_TARGET_SERVICE_NAMESPACE_TAG.to_string(),
+                                service_namespace.clone(),
+                            );
+                            rebound_target.tags.insert(
+                                UPSTREAM_TARGET_SERVICE_NAME_TAG.to_string(),
+                                service_name.clone(),
+                            );
+                            rebound_target.tags.insert(
+                                UPSTREAM_TARGET_SERVICE_PORT_TAG.to_string(),
+                                target.port.to_string(),
+                            );
+                            rebound_target
+                        })
+                        .collect::<Vec<_>>();
+                    if leg_targets.is_empty() {
+                        rebound = false;
+                        continue;
+                    }
+                    legs.push((target.weight, leg_targets));
+                }
+            }
+        }
+        if governed_by_destination_rule {
+            policy_refused_splits += 1;
+        }
+        if !rebound || governed_by_destination_rule || legs.is_empty() {
+            failed_splits.insert((namespace, id));
+            continue;
+        }
+        let targets = split_targets_with_common_scale(legs);
+        let weighted = targets
+            .first()
+            .is_some_and(|first| targets.iter().any(|target| target.weight != first.weight));
+        if let Some(split) = config
+            .upstreams
+            .iter_mut()
+            .find(|upstream| upstream.namespace == namespace && upstream.id == id)
+        {
+            split.targets = targets;
+            if weighted {
+                split.algorithm = LoadBalancerAlgorithm::WeightedRoundRobin;
+            }
+        }
+    }
+
+    // 2. Route proxies and their dispatch rules.
+    let mut dropped: HashSet<(String, String)> = HashSet::new();
+    let mut upstream_updates: Vec<(usize, String)> = Vec::new();
+    let mut rule_updates: Vec<(usize, usize, String)> = Vec::new();
+    for index in 0..config.proxies.len() {
+        let proxy = &config.proxies[index];
+        if !config::is_virtual_service_http_route_proxy_id(&proxy.id) {
+            continue;
+        }
+        let namespace = proxy.namespace.clone();
+        let proxy_id = proxy.id.clone();
+        let backend_host = proxy.backend_host.clone();
+        let backend_port = proxy.backend_port;
+        let mut keep = true;
+        let mut proxy_upstream: Option<String> = None;
+        match proxy.upstream_id.as_deref() {
+            Some(upstream_id) => {
+                if failed_splits.contains(&(namespace.clone(), upstream_id.to_string())) {
+                    keep = false;
+                }
+            }
+            None if !backend_host.is_empty() && backend_port != 0 => {
+                match hosts.classify(&namespace, &backend_host) {
+                    CarriedRouteHost::External => {}
+                    CarriedRouteHost::UnmodeledService => keep = false,
+                    CarriedRouteHost::Service(service_namespace, service_name) => {
+                        match service_upstream(
+                            config,
+                            &service_namespace,
+                            &service_name,
+                            backend_port,
+                        ) {
+                            Some(id) => proxy_upstream = Some(id),
+                            None => keep = false,
+                        }
+                    }
+                }
+            }
+            None => {}
+        }
+        let dispatch_ids: Vec<String> = proxy
+            .plugins
+            .iter()
+            .map(|association| association.plugin_config_id.clone())
+            .collect();
+        let mut rule_rewrites: Vec<(usize, usize, String)> = Vec::new();
+        for plugin_index in 0..config.plugin_configs.len() {
+            let plugin = &config.plugin_configs[plugin_index];
+            if plugin.plugin_name != "mesh_route_dispatch"
+                || plugin.namespace != namespace
+                || !dispatch_ids.contains(&plugin.id)
+            {
+                continue;
+            }
+            for (rule_index, rule) in plugin
+                .config
+                .get("rules")
+                .and_then(serde_json::Value::as_array)
+                .into_iter()
+                .flatten()
+                .enumerate()
+            {
+                let Some(destination) = rule.get("destination") else {
+                    continue;
+                };
+                if let Some(upstream_id) = destination
+                    .get("upstream_id")
+                    .and_then(serde_json::Value::as_str)
+                {
+                    if failed_splits.contains(&(namespace.clone(), upstream_id.to_string())) {
+                        keep = false;
+                    }
+                    continue;
+                }
+                let host = destination
+                    .get("backend_host")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or(backend_host.as_str());
+                let port = destination
+                    .get("backend_port")
+                    .and_then(serde_json::Value::as_u64)
+                    .and_then(|port| u16::try_from(port).ok())
+                    .unwrap_or(backend_port);
+                if host.is_empty() || port == 0 {
+                    continue;
+                }
+                match hosts.classify(&namespace, host) {
+                    CarriedRouteHost::External => {}
+                    CarriedRouteHost::UnmodeledService => keep = false,
+                    CarriedRouteHost::Service(service_namespace, service_name) => {
+                        match service_upstream(config, &service_namespace, &service_name, port) {
+                            Some(id) => rule_rewrites.push((plugin_index, rule_index, id)),
+                            None => keep = false,
+                        }
+                    }
+                }
+            }
+        }
+        if !keep {
+            dropped.insert((namespace, proxy_id));
+            continue;
+        }
+        if let Some(upstream_id) = proxy_upstream {
+            upstream_updates.push((index, upstream_id));
+        }
+        rule_updates.extend(rule_rewrites);
+    }
+    for (index, upstream_id) in upstream_updates {
+        if let Some(proxy) = config.proxies.get_mut(index) {
+            proxy.upstream_id = Some(upstream_id);
+        }
+    }
+    for (plugin_index, rule_index, upstream_id) in rule_updates {
+        let Some(destination) = config
+            .plugin_configs
+            .get_mut(plugin_index)
+            .and_then(|plugin| plugin.config.get_mut("rules"))
+            .and_then(serde_json::Value::as_array_mut)
+            .and_then(|rules| rules.get_mut(rule_index))
+            .and_then(|rule| rule.get_mut("destination"))
+            .and_then(serde_json::Value::as_object_mut)
+        else {
+            continue;
+        };
+        destination.remove("backend_host");
+        destination.remove("backend_port");
+        destination.remove("backend_tls");
+        destination.insert(
+            "upstream_id".to_string(),
+            serde_json::Value::String(upstream_id),
+        );
+    }
+    if !dropped.is_empty() {
+        warn!(
+            routes = dropped.len(),
+            destination_rule_splits = policy_refused_splits,
+            "NodeWaypoint VirtualService routes refused: a destination is an in-cluster Service \
+             this waypoint cannot reach over its mesh transport, or a weighted split names a \
+             Service governed by a DestinationRule; their hosts use the materialized Service \
+             routes"
+        );
+        config
+            .proxies
+            .retain(|proxy| !dropped.contains(&(proxy.namespace.clone(), proxy.id.clone())));
+        config.plugin_configs.retain(|plugin| {
+            plugin.proxy_id.as_deref().is_none_or(|proxy_id| {
+                !dropped.contains(&(plugin.namespace.clone(), proxy_id.to_string()))
+            })
+        });
+    }
+    // Prune carried split upstreams no surviving route or dispatch rule names
+    // (failed splits included): a leftover still names Service DNS hosts and
+    // would reach DestinationRule application.
+    let mut referenced_splits: HashSet<(String, String)> = config
+        .proxies
+        .iter()
+        .filter_map(|proxy| {
+            proxy
+                .upstream_id
+                .as_ref()
+                .map(|id| (proxy.namespace.clone(), id.clone()))
+        })
+        .collect();
+    for plugin in &config.plugin_configs {
+        if plugin.plugin_name == "mesh_route_dispatch" {
+            for id in slice::mesh_route_dispatch_rule_upstream_ids(&plugin.config) {
+                referenced_splits.insert((plugin.namespace.clone(), id.to_string()));
+            }
+        }
+    }
+    config.upstreams.retain(|upstream| {
+        !upstream
+            .id
+            .starts_with(slice::VIRTUAL_SERVICE_HTTP_ROUTE_UPSTREAM_ID_PREFIX)
+            || referenced_splits.contains(&(upstream.namespace.clone(), upstream.id.clone()))
+    });
+    // A carried route declaring a modeled Service's host (`reviews`, or its
+    // FQDN) stands for that Service under every name a client can use, like
+    // the Service route it shadows, so it answers all of the Service's host
+    // spellings. A spelling another carried route already declares on the
+    // same path stays with that route.
+    expand_carried_route_service_hosts(config, &hosts, &runtime.cluster_domain);
+    if !dropped.is_empty() {
+        // Re-run materialization so the hosts the dropped routes shadowed
+        // get their Service routes back.
+        materialize_mesh_outbound_proxies(config, runtime, mesh_slice);
+    }
+}
+
+/// Spread every leg's share over its targets with one common scale, so the
+/// effective ratio between legs is the configured one: a target's weight is
+/// `leg_weight / leg_targets`, scaled so the largest target weight is
+/// `MAX_TARGET_WEIGHT`. Every target keeps a weight of at least 1.
+fn split_targets_with_common_scale(
+    legs: Vec<(u32, Vec<crate::config::types::UpstreamTarget>)>,
+) -> Vec<crate::config::types::UpstreamTarget> {
+    let per_target = |weight: u32, targets: usize| f64::from(weight) / targets.max(1) as f64;
+    let largest = legs
+        .iter()
+        .map(|(weight, targets)| per_target(*weight, targets.len()))
+        .fold(0.0_f64, f64::max);
+    let scale = if largest > 0.0 {
+        f64::from(crate::config::types::MAX_TARGET_WEIGHT) / largest
+    } else {
+        1.0
+    };
+    let mut out = Vec::new();
+    for (weight, targets) in legs {
+        let scaled = (per_target(weight, targets.len()) * scale).round();
+        let target_weight = if scaled.is_finite() {
+            (scaled as u32).clamp(1, crate::config::types::MAX_TARGET_WEIGHT)
+        } else {
+            1
+        };
+        for mut target in targets {
+            target.weight = target_weight;
+            out.push(target);
+        }
+    }
+    out
+}
+
+/// Give each carried route that declares a modeled Service's host all of that
+/// Service's host spellings (see `bind_carried_http_routes_to_node_waypoint_transport`).
+fn expand_carried_route_service_hosts(
+    config: &mut GatewayConfig,
+    hosts: &CarriedRouteHostIndex,
+    cluster_domain: &str,
+) {
+    let mut claimed: HashSet<(String, Option<String>)> = HashSet::new();
+    for proxy in &config.proxies {
+        if config::is_virtual_service_http_route_proxy_id(&proxy.id) {
+            for host in &proxy.hosts {
+                claimed.insert((host.to_ascii_lowercase(), proxy.listen_path.clone()));
+            }
+        }
+    }
+    for proxy in &mut config.proxies {
+        if !config::is_virtual_service_http_route_proxy_id(&proxy.id) {
+            continue;
+        }
+        let mut added = Vec::new();
+        for host in &proxy.hosts {
+            if let CarriedRouteHost::Service(namespace, name) =
+                hosts.classify(&proxy.namespace, host)
+            {
+                for variant in mesh_service_host_variants(&name, &namespace, cluster_domain) {
+                    // A bare name means a Service in the route's own namespace.
+                    if !variant.contains('.') && namespace != proxy.namespace {
+                        continue;
+                    }
+                    let key = (variant.to_ascii_lowercase(), proxy.listen_path.clone());
+                    if claimed.insert(key) {
+                        added.push(variant);
+                    }
+                }
+            }
+        }
+        proxy.hosts.extend(added);
+    }
 }
 
 /// Resolve Istio `sourceLabels` / `sourceNamespace` as Sidecar-applicability
@@ -7803,7 +8533,12 @@ fn materialize_mesh_outbound_proxies(
             // this service's own per-port siblings, grouped by the router) and
             // are skipped only for re-materialization idempotency. Stream proxies
             // route by `listen_port` and are skipped.
-            if config.proxies.iter().any(|p| {
+            //
+            // A NodeWaypoint still materializes the shadowed Service's UPSTREAM
+            // (not its route): the VirtualService routes its slice carries are
+            // rebound onto these secured per-workload targets
+            // (`bind_carried_http_routes_to_node_waypoint_transport`, #7233).
+            let shadowed = config.proxies.iter().any(|p| {
                 if (p.namespace == proxy.namespace && p.id == proxy.id)
                     || p.dispatch_kind.is_stream()
                     || is_mesh_outbound_route_id(&p.id)
@@ -7816,12 +8551,15 @@ fn materialize_mesh_outbound_proxies(
                         .as_deref()
                         .is_some_and(|lp| lp.starts_with('~'));
                 shadows_or_collides && crate::config::types::hosts_overlap(&p.hosts, &proxy.hosts)
-            }) {
+            });
+            if shadowed {
                 debug!(
                     proxy_id = %sanitize_startup_scalar(proxy.id.to_string()),
                     "Skipping outbound route materialization; an existing operator proxy already routes this host/path"
                 );
-                continue;
+                if transport != MeshEgressTransport::NodeWaypointCapturedService {
+                    continue;
+                }
             }
             // Name the upstream with the service FQDN (not the internal id) so a
             // DestinationRule keyed on the service host matches it
@@ -7852,6 +8590,9 @@ fn materialize_mesh_outbound_proxies(
                 *existing = upstream;
             } else {
                 config.upstreams.push(upstream);
+            }
+            if shadowed {
+                continue;
             }
             if let Some(existing) = config
                 .proxies
@@ -13782,11 +14523,14 @@ fn mirror_mesh_authz_baggage_gate_fields(target: &mut serde_json::Value, gate: &
 /// target's Service identity. Shared by `mesh_authz` and RequestAuthentication
 /// destination selection so both resolve a route to the same workloads.
 ///
-/// Empty on every slice-built config: `gateway_config_from_mesh_slice_with_federation`
-/// materializes only `istio-vs-l4-upstream-*` upstreams, so no
-/// `istio-vs-upstream-` / `gwapi-route-upstream-` id reaches this filter in
-/// production. Only the whole-config `prepare_gateway_config_for_mesh` test
-/// entry point supplies such upstreams (issue #7233).
+/// On a NodeWaypoint the slice carries the VirtualService HTTP routes it
+/// serves (`MeshSlice::http_routes`, issue #7233), and
+/// `gateway_config_from_mesh_slice_with_federation` decodes their
+/// `istio-vs-upstream-*` weighted-split upstreams into the config, so this
+/// returns those upstreams. `gwapi-route-upstream-*` ids stay admitted for
+/// parity with `mesh_authz`, but Gateway API HTTPRoute routes bind Gateway
+/// listeners and never ride a mesh slice. Every other topology returns
+/// nothing, since its slice carries no HTTP route.
 fn node_waypoint_authz_route_upstreams(config: &GatewayConfig) -> Vec<serde_json::Value> {
     config
         .upstreams
@@ -13852,6 +14596,16 @@ fn inject_mesh_global_plugins(
         "per_pod_policy_scoping": runtime.topology == MeshTopology::NodeWaypoint,
         "ambient_udp_source_scoping": runtime.topology.uses_ambient_udp_source_scoping(),
     });
+    // The carried HTTP routes (issue #7233) are materialized as ordinary
+    // proxies, upstreams and plugin configs; authorization reads them through
+    // `node_waypoint_route_upstreams`. Their route plugin configs (header
+    // values included) must not be copied into this plugin's config.
+    if let Some(embedded) = mesh_authz_config
+        .get_mut("mesh_slice")
+        .and_then(serde_json::Value::as_object_mut)
+    {
+        embedded.remove("http_routes");
+    }
     if runtime.topology == MeshTopology::NodeWaypoint {
         mesh_authz_config["cluster_domains"] =
             serde_json::json!(node_waypoint_authz_cluster_domains(&runtime.cluster_domain));
@@ -21982,12 +22736,13 @@ pub mod startup_rollback_test_seams {
         ensure_crypto_provider();
         let env = probe_env_config();
         let runtime = probe_runtime_config();
-        let config = prepare_gateway_config_for_mesh(GatewayConfig::default(), &runtime).unwrap();
-        let mesh_state = MeshRuntimeState::new();
-        mesh_state.install_slice(MeshSlice {
+        let slice = MeshSlice {
             version: chrono::Utc::now().to_rfc3339(),
             ..MeshSlice::default()
-        });
+        };
+        let config = prepare_gateway_config_from_mesh_slice(&slice, &runtime).unwrap();
+        let mesh_state = MeshRuntimeState::new();
+        mesh_state.install_slice(slice);
         let (shutdown_tx, _) =
             crate::overload::ShutdownSender::channel(std::time::Duration::from_secs(30));
         let shutdown_observed = Arc::new(AtomicBool::new(false));
@@ -23969,12 +24724,13 @@ mod tests {
             request_auth_require_exp: true,
             locality_lb_strict: false,
         };
-        let config = prepare_gateway_config_for_mesh(GatewayConfig::default(), &runtime).unwrap();
-        let mesh_state = MeshRuntimeState::new();
-        mesh_state.install_slice(MeshSlice {
+        let slice = MeshSlice {
             version: chrono::Utc::now().to_rfc3339(),
             ..MeshSlice::default()
-        });
+        };
+        let config = prepare_gateway_config_from_mesh_slice(&slice, &runtime).unwrap();
+        let mesh_state = MeshRuntimeState::new();
+        mesh_state.install_slice(slice);
         let (shutdown_tx, _) =
             crate::overload::ShutdownSender::channel(std::time::Duration::from_secs(30));
         let task_shutdown = shutdown_tx.clone();
@@ -24972,7 +25728,8 @@ mod tests {
         };
         let runtime = test_mesh_runtime_config();
         assert_eq!(runtime.namespace, "default");
-        let prepared = prepare_gateway_config_for_mesh(config, &runtime).expect("mesh prepare");
+        let prepared =
+            prepare_gateway_config_via_mesh_slice(config, &runtime).expect("mesh prepare");
         let mesh = prepared.mesh.expect("mesh block survives preparation");
         assert_eq!(
             mesh.services
@@ -24987,8 +25744,8 @@ mod tests {
     #[test]
     fn mesh_runtime_resource_id_allowlist_is_exact_and_materialization_scoped() {
         let runtime = test_mesh_runtime_config();
-        let prepared =
-            prepare_gateway_config_for_mesh(GatewayConfig::default(), &runtime).expect("prepare");
+        let prepared = prepare_gateway_config_via_mesh_slice(GatewayConfig::default(), &runtime)
+            .expect("prepare");
         assert!(
             prepared
                 .plugin_configs
@@ -29498,8 +30255,11 @@ mod tests {
             ..test_mesh_runtime_config()
         };
 
-        let config =
-            prepare_gateway_config_for_mesh(config, &runtime).expect("mesh preparation succeeds");
+        // Component test of the materialization step: a mesh slice never
+        // carries an operator upstream, so inject it beside the slice.
+        let slice = MeshSlice::from_gateway_config(&config, runtime.mesh_slice_request());
+        let config = prepare_gateway_config_for_native_slice(config, &runtime, &slice)
+            .expect("mesh preparation succeeds");
 
         assert_eq!(
             config.upstreams[0].algorithm,
@@ -31561,6 +32321,7 @@ mod tests {
             labels_ambiguous: false,
             virtual_service_l4_proxies: Vec::new(),
             virtual_service_l4_upstreams: Vec::new(),
+            http_routes: slice::MeshHttpRouteSet::default(),
             version: "test".to_string(),
             revision: None,
             workloads: Vec::new(),
@@ -33895,7 +34656,7 @@ mod tests {
                 };
 
                 let prepared =
-                    prepare_gateway_config_for_mesh(config, &runtime).expect("mesh config");
+                    prepare_gateway_config_via_mesh_slice(config, &runtime).expect("mesh config");
                 let proxy = prepared
                     .proxies
                     .iter()
@@ -33968,7 +34729,7 @@ mod tests {
                 };
 
                 let prepared =
-                    prepare_gateway_config_for_mesh(config, &runtime).expect("mesh config");
+                    prepare_gateway_config_via_mesh_slice(config, &runtime).expect("mesh config");
 
                 // Verify service proxy was materialized.
                 let proxy = prepared
@@ -34076,7 +34837,7 @@ mod tests {
                 };
 
                 let prepared =
-                    prepare_gateway_config_for_mesh(config, &runtime).expect("mesh config");
+                    prepare_gateway_config_via_mesh_slice(config, &runtime).expect("mesh config");
 
                 // The explicit gateway proxy owns the SNI.
                 let explicit = prepared
@@ -34183,7 +34944,7 @@ mod tests {
                 };
 
                 let prepared =
-                    prepare_gateway_config_for_mesh(config, &runtime).expect("mesh config");
+                    prepare_gateway_config_via_mesh_slice(config, &runtime).expect("mesh config");
 
                 assert!(
                     prepared
@@ -34244,7 +35005,7 @@ mod tests {
                 };
 
                 let prepared =
-                    prepare_gateway_config_for_mesh(config, &runtime).expect("mesh config");
+                    prepare_gateway_config_via_mesh_slice(config, &runtime).expect("mesh config");
 
                 assert!(
                     !prepared
@@ -34338,7 +35099,7 @@ mod tests {
                 };
 
                 let prepared =
-                    prepare_gateway_config_for_mesh(config, &runtime).expect("mesh config");
+                    prepare_gateway_config_via_mesh_slice(config, &runtime).expect("mesh config");
 
                 // Both services should produce proxies.
                 let reviews_proxy = prepared
@@ -35465,7 +36226,7 @@ mod tests {
                 };
 
                 let prepared =
-                    prepare_gateway_config_for_mesh(config, &runtime).expect("mesh config");
+                    prepare_gateway_config_via_mesh_slice(config, &runtime).expect("mesh config");
                 let upstream = prepared
                     .upstreams
                     .iter()
@@ -35602,7 +36363,7 @@ mod tests {
                 };
 
                 let prepared =
-                    prepare_gateway_config_for_mesh(config, &runtime).expect("mesh config");
+                    prepare_gateway_config_via_mesh_slice(config, &runtime).expect("mesh config");
                 let by_id = |id: &str| {
                     prepared
                         .plugin_configs
@@ -36726,8 +37487,11 @@ mod tests {
                     ..GatewayConfig::default()
                 };
 
-                let prepared =
-                    prepare_gateway_config_for_mesh(config, &runtime).expect("mesh config");
+                // Component test of the injection step: no mesh slice carries
+                // a global plugin, so inject the operator instance beside it.
+                let slice = MeshSlice::from_gateway_config(&config, runtime.mesh_slice_request());
+                let prepared = prepare_gateway_config_for_native_slice(config, &runtime, &slice)
+                    .expect("mesh config");
                 let mesh_authz: Vec<_> = prepared
                     .plugin_configs
                     .iter()
@@ -36839,7 +37603,8 @@ mod tests {
             ..GatewayConfig::default()
         };
 
-        let prepared = prepare_gateway_config_for_mesh(config, &runtime).expect("mesh config");
+        let prepared =
+            prepare_gateway_config_via_mesh_slice(config, &runtime).expect("mesh config");
         let jwks = prepared
             .plugin_configs
             .iter()
@@ -36920,7 +37685,8 @@ mod tests {
             ..GatewayConfig::default()
         };
 
-        let prepared = prepare_gateway_config_for_mesh(config, &runtime).expect("mesh config");
+        let prepared =
+            prepare_gateway_config_via_mesh_slice(config, &runtime).expect("mesh config");
         let refusal = prepared
             .plugin_configs
             .iter()
@@ -36956,7 +37722,7 @@ mod tests {
         );
         other.jwt_rules.clear();
         other.refused = true;
-        let unaffected = prepare_gateway_config_for_mesh(
+        let unaffected = prepare_gateway_config_via_mesh_slice(
             GatewayConfig {
                 mesh: Some(Box::new(MeshConfig {
                     request_authentications: vec![other],
@@ -37233,7 +37999,8 @@ mod tests {
             ..GatewayConfig::default()
         };
 
-        let prepared = prepare_gateway_config_for_mesh(config, &runtime).expect("mesh config");
+        let prepared =
+            prepare_gateway_config_via_mesh_slice(config, &runtime).expect("mesh config");
         let jwks = prepared
             .plugin_configs
             .iter()
@@ -37320,7 +38087,8 @@ mod tests {
             ..GatewayConfig::default()
         };
 
-        let prepared = prepare_gateway_config_for_mesh(config, &runtime).expect("mesh config");
+        let prepared =
+            prepare_gateway_config_via_mesh_slice(config, &runtime).expect("mesh config");
         assert!(
             !prepared
                 .plugin_configs
@@ -37471,7 +38239,8 @@ mod tests {
             ..GatewayConfig::default()
         };
 
-        let prepared = prepare_gateway_config_for_mesh(config, &runtime).expect("mesh config");
+        let prepared =
+            prepare_gateway_config_via_mesh_slice(config, &runtime).expect("mesh config");
         let jwks = prepared
             .plugin_configs
             .iter()
@@ -37507,7 +38276,8 @@ mod tests {
             ..GatewayConfig::default()
         };
 
-        let prepared = prepare_gateway_config_for_mesh(config, &runtime).expect("mesh config");
+        let prepared =
+            prepare_gateway_config_via_mesh_slice(config, &runtime).expect("mesh config");
         assert!(
             !prepared
                 .plugin_configs
@@ -37543,7 +38313,8 @@ mod tests {
             ..GatewayConfig::default()
         };
 
-        let prepared = prepare_gateway_config_for_mesh(config, &runtime).expect("mesh config");
+        let prepared =
+            prepare_gateway_config_via_mesh_slice(config, &runtime).expect("mesh config");
         let jwks = prepared
             .plugin_configs
             .iter()
@@ -37601,7 +38372,8 @@ mod tests {
             ..GatewayConfig::default()
         };
 
-        let prepared = prepare_gateway_config_for_mesh(config, &runtime).expect("mesh config");
+        let prepared =
+            prepare_gateway_config_via_mesh_slice(config, &runtime).expect("mesh config");
         let jwks = prepared
             .plugin_configs
             .iter()
@@ -38368,7 +39140,7 @@ mod tests {
             "test runtime should carry the secure default"
         );
         let prepared =
-            prepare_gateway_config_for_mesh(request_auth_config_for_require_exp(), &runtime)
+            prepare_gateway_config_via_mesh_slice(request_auth_config_for_require_exp(), &runtime)
                 .expect("mesh config");
         let jwks = prepared
             .plugin_configs
@@ -38390,7 +39162,7 @@ mod tests {
         let mut runtime = test_mesh_runtime_config();
         runtime.request_auth_require_exp = false;
         let prepared =
-            prepare_gateway_config_for_mesh(request_auth_config_for_require_exp(), &runtime)
+            prepare_gateway_config_via_mesh_slice(request_auth_config_for_require_exp(), &runtime)
                 .expect("mesh config");
         let jwks = prepared
             .plugin_configs
@@ -41519,7 +42291,8 @@ mod tests {
             ..GatewayConfig::default()
         };
 
-        let prepared = prepare_gateway_config_for_mesh(config, &runtime).expect("mesh config");
+        let prepared =
+            prepare_gateway_config_via_mesh_slice(config, &runtime).expect("mesh config");
 
         // Should have the egress proxy
         let egress_proxy = prepared
@@ -41579,7 +42352,8 @@ mod tests {
             ..GatewayConfig::default()
         };
 
-        let prepared = prepare_gateway_config_for_mesh(config, &runtime).expect("mesh config");
+        let prepared =
+            prepare_gateway_config_via_mesh_slice(config, &runtime).expect("mesh config");
 
         // No egress proxies should be materialized for sidecar topology
         assert!(
@@ -41814,7 +42588,8 @@ mod tests {
             ..GatewayConfig::default()
         };
 
-        let prepared = prepare_gateway_config_for_mesh(config, &runtime).expect("mesh config");
+        let prepared =
+            prepare_gateway_config_via_mesh_slice(config, &runtime).expect("mesh config");
 
         let egress_proxies: Vec<_> = prepared
             .proxies
@@ -42608,7 +43383,8 @@ mod tests {
             ..GatewayConfig::default()
         };
 
-        let prepared = prepare_gateway_config_for_mesh(config, &runtime).expect("mesh config");
+        let prepared =
+            prepare_gateway_config_via_mesh_slice(config, &runtime).expect("mesh config");
 
         assert!(
             !prepared
@@ -42621,7 +43397,7 @@ mod tests {
 
     #[test]
     fn egress_stream_in_egress_gateway_topology_passes_full_validation() {
-        // Full end-to-end materialization via `prepare_gateway_config_for_mesh`
+        // Full end-to-end materialization via `prepare_gateway_config_via_mesh_slice`
         // exercises the validation pipeline that runs after materialization.
         // A stream egress proxy with a valid listen_port must pass
         // `validate_stream_proxies()` (each stream proxy needs listen_port,
@@ -42646,7 +43422,7 @@ mod tests {
         };
 
         let prepared =
-            prepare_gateway_config_for_mesh(config, &runtime).expect("prepared mesh config");
+            prepare_gateway_config_via_mesh_slice(config, &runtime).expect("prepared mesh config");
 
         let stream_proxy = prepared
             .proxies
@@ -42747,7 +43523,7 @@ mod tests {
         };
 
         let prepared =
-            prepare_gateway_config_for_mesh(config, &runtime).expect("prepared mesh config");
+            prepare_gateway_config_via_mesh_slice(config, &runtime).expect("prepared mesh config");
 
         assert!(
             !prepared

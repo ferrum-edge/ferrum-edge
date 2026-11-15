@@ -3,7 +3,7 @@
 //! These exercise the end-to-end slice → injected `workload_metrics` plugin
 //! flow: a `MeshProxyConfig` with `tracing_sampling=N` must surface as
 //! `sampling_percentage: N` in the injected `__mesh_workload_metrics` plugin
-//! config when `prepare_gateway_config_for_mesh` runs.
+//! config when `prepare_gateway_config_via_mesh_slice` runs.
 
 use chrono::Utc;
 use std::collections::HashMap;
@@ -17,7 +17,7 @@ use ferrum_edge::modes::mesh::config::{
 };
 use ferrum_edge::modes::mesh::{
     MESH_WORKLOAD_METRICS_PLUGIN_ID, MeshConfigProtocol, MeshRuntimeConfig, MeshTopology,
-    prepare_gateway_config_for_mesh,
+    prepare_gateway_config_via_mesh_slice,
 };
 
 fn test_addr(s: &str) -> SocketAddr {
@@ -113,7 +113,7 @@ fn proxy_config_tracing_sampling_flows_into_workload_metrics_plugin() {
     let runtime = test_runtime();
 
     let prepared =
-        prepare_gateway_config_for_mesh(config, &runtime).expect("mesh preparation succeeds");
+        prepare_gateway_config_via_mesh_slice(config, &runtime).expect("mesh preparation succeeds");
 
     let metrics_plugin = prepared
         .plugin_configs
@@ -159,7 +159,7 @@ fn proxy_config_does_not_set_sampling_when_unset() {
     let runtime = test_runtime();
 
     let prepared =
-        prepare_gateway_config_for_mesh(config, &runtime).expect("mesh preparation succeeds");
+        prepare_gateway_config_via_mesh_slice(config, &runtime).expect("mesh preparation succeeds");
 
     let metrics_plugin = prepared
         .plugin_configs
@@ -224,7 +224,7 @@ fn telemetry_tracing_sampling_overrides_proxy_config_tracing_sampling() {
     let runtime = test_runtime();
 
     let prepared =
-        prepare_gateway_config_for_mesh(config, &runtime).expect("mesh preparation succeeds");
+        prepare_gateway_config_via_mesh_slice(config, &runtime).expect("mesh preparation succeeds");
 
     let metrics_plugin = prepared
         .plugin_configs
@@ -294,7 +294,7 @@ fn proxy_config_tracing_sampling_survives_telemetry_without_sampling_field() {
     let runtime = test_runtime();
 
     let prepared =
-        prepare_gateway_config_for_mesh(config, &runtime).expect("mesh preparation succeeds");
+        prepare_gateway_config_via_mesh_slice(config, &runtime).expect("mesh preparation succeeds");
 
     let metrics_plugin = prepared
         .plugin_configs
@@ -344,7 +344,7 @@ fn proxy_config_zero_sampling_is_applied_not_skipped() {
     let runtime = test_runtime();
 
     let prepared =
-        prepare_gateway_config_for_mesh(config, &runtime).expect("mesh preparation succeeds");
+        prepare_gateway_config_via_mesh_slice(config, &runtime).expect("mesh preparation succeeds");
 
     let metrics_plugin = prepared
         .plugin_configs
@@ -395,7 +395,7 @@ fn proxy_config_non_matching_selector_does_not_apply() {
     let runtime = test_runtime();
 
     let prepared =
-        prepare_gateway_config_for_mesh(config, &runtime).expect("mesh preparation succeeds");
+        prepare_gateway_config_via_mesh_slice(config, &runtime).expect("mesh preparation succeeds");
 
     let metrics_plugin = prepared
         .plugin_configs
@@ -435,7 +435,7 @@ fn mesh_wide_proxy_config_applies_to_workload_in_other_namespace() {
     let runtime = test_runtime();
 
     let prepared =
-        prepare_gateway_config_for_mesh(config, &runtime).expect("mesh preparation succeeds");
+        prepare_gateway_config_via_mesh_slice(config, &runtime).expect("mesh preparation succeeds");
 
     let metrics_plugin = prepared
         .plugin_configs

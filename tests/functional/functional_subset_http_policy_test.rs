@@ -20,7 +20,8 @@ use ferrum_edge::config::types::{GatewayConfig, H2UpgradePolicy};
 use ferrum_edge::config::{EnvConfig, OperatingMode};
 use ferrum_edge::modes::file::ServeOptions;
 use ferrum_edge::modes::mesh::{
-    MeshConfigProtocol, MeshRuntimeConfig, MeshTopology, prepare_gateway_config_for_mesh,
+    MeshConfigProtocol, MeshRuntimeConfig, MeshTopology,
+    prepare_gateway_config_via_mesh_slice_with_fixtures,
 };
 use ferrum_edge::proxy::build_backend_url_with_target;
 use http::StatusCode;
@@ -433,11 +434,11 @@ async fn start_subset_gateway(
         namespace: NS.to_string(),
         ..EnvConfig::default()
     };
-    let prepared = prepare_gateway_config_for_mesh(config, &mesh_runtime_config()).map_err(
-        |e| -> Box<dyn std::error::Error + Send + Sync> {
-            format!("mesh preparation failed: {e}").into()
-        },
-    )?;
+    let prepared =
+        prepare_gateway_config_via_mesh_slice_with_fixtures(config, &mesh_runtime_config())
+            .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
+                format!("mesh preparation failed: {e}").into()
+            })?;
     assert_subset_preparation(&prepared, expected);
 
     let jwt_manager = JwtManager::new(JwtConfig {
