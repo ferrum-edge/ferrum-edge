@@ -21,7 +21,8 @@ use ferrum_edge::config_sources::k8s::{
 };
 use ferrum_edge::identity::spiffe::{SpiffeId, TrustDomain};
 use ferrum_edge::modes::mesh::config::{
-    MeshJwtRule, MeshPolicy, MeshRequestAuthentication, PolicyScope, WorkloadSelector,
+    MeshExtAuthzProvider, MeshJwtRule, MeshPolicy, MeshRequestAuthentication, MeshRule,
+    PolicyAction, PolicyScope, WorkloadSelector,
 };
 use ferrum_edge::modes::mesh::runtime::PolicyScopeCache;
 use ferrum_edge::modes::mesh::slice::MeshSlice;
@@ -32,8 +33,13 @@ use ferrum_edge::modes::mesh::{
 };
 use ferrum_edge::plugins::mesh::authz::MeshAuthz;
 use ferrum_edge::plugins::mesh_route_dispatch::RULE_INDEX_METADATA_KEY;
-use ferrum_edge::plugins::{Plugin, PluginResult, RequestContext, create_plugin};
+use ferrum_edge::plugins::{Plugin, PluginHttpClient, PluginResult, RequestContext, create_plugin};
 use serde_json::json;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpListener;
+
+use crate::scaffolding::port_registry::TestSocket;
 
 use super::super::mesh_test_support::{
     DEFAULT_NAMESPACE, policy_allow_principal, runtime_for_topology, service_for, workload_for,
@@ -64,14 +70,18 @@ fn virtual_service(name: &str, spec: serde_json::Value) -> K8sObject {
     }
 }
 
-/// `x-version: v2` goes to `ratings`; everything else to `reviews`. The
-/// translator merges the guarded route into the fallback route's proxy.
+/// On `/api`, `x-version: v2` goes to `ratings` and everything else to
+/// `reviews`. The guarded route shares the fallback route's path, so the
+/// translator merges it into the fallback route's proxy as a dispatch rule.
 fn branch_spec() -> serde_json::Value {
     json!({
         "hosts": ["reviews.default.svc.cluster.local"],
         "http": [
             {
-                "match": [{"headers": {"x-version": {"exact": "v2"}}}],
+                "match": [{
+                    "uri": {"prefix": "/api"},
+                    "headers": {"x-version": {"exact": "v2"}}
+                }],
                 "route": [{
                     "destination": {
                         "host": "ratings.default.svc.cluster.local",
@@ -80,6 +90,7 @@ fn branch_spec() -> serde_json::Value {
                 }]
             },
             {
+                "match": [{"uri": {"prefix": "/api"}}],
                 "route": [{
                     "destination": {
                         "host": "reviews.default.svc.cluster.local",
@@ -106,6 +117,16 @@ fn reviews_trusted_only() -> MeshPolicy {
         "reviews-trusted-only",
         DEFAULT_NAMESPACE,
         selector("reviews"),
+        TRUSTED,
+    )
+}
+
+/// Destination policy admitting only `TRUSTED` to `app=ratings`.
+fn ratings_trusted_only() -> MeshPolicy {
+    policy_allow_principal(
+        "ratings-trusted-only",
+        DEFAULT_NAMESPACE,
+        selector("ratings"),
         TRUSTED,
     )
 }
@@ -240,7 +261,11 @@ fn route_dispatch(prepared: &GatewayConfig, route: &Proxy) -> Arc<dyn Plugin> {
 }
 
 fn node_waypoint_request(route: &Proxy, source: &str) -> RequestContext {
-    let mut ctx = RequestContext::new("127.0.0.1".to_string(), "GET".to_string(), "/".to_string());
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "GET".to_string(),
+        "/api".to_string(),
+    );
     let identity = SpiffeId::new(source).expect("spiffe");
     ctx.peer_spiffe_id = Some(identity.clone());
     ctx.node_waypoint_policy_scope = Some(Arc::new(PolicyScopeCache::new(
@@ -272,15 +297,36 @@ async fn serve(
     source: &str,
     v2: bool,
 ) -> (PluginResult, Option<PluginResult>, RequestContext) {
+    let (authorized, dispatched, ctx, _) = serve_capture(authz, plugins, route, source, v2).await;
+    (authorized, dispatched, ctx)
+}
+
+/// [`serve`], also returning the backend-bound request headers.
+async fn serve_capture(
+    authz: &MeshAuthz,
+    plugins: &[Arc<dyn Plugin>],
+    route: &Proxy,
+    source: &str,
+    v2: bool,
+) -> (
+    PluginResult,
+    Option<PluginResult>,
+    RequestContext,
+    HashMap<String, String>,
+) {
     let mut ctx = node_waypoint_request(route, source);
     let mut headers = branch_headers(v2);
+    headers.insert(
+        "authorization".to_string(),
+        "Bearer client-token".to_string(),
+    );
     ctx.headers = headers.clone();
     let authorized = authz.authorize(&mut ctx).await;
     if !matches!(authorized, PluginResult::Continue) {
-        return (authorized, None, ctx);
+        return (authorized, None, ctx, headers);
     }
     let dispatched = run_before_proxy_hooks_for_test(plugins, &mut ctx, &mut headers).await;
-    (authorized, Some(dispatched), ctx)
+    (authorized, Some(dispatched), ctx, headers)
 }
 
 fn assert_denied(result: &PluginResult, body: &str, what: &str) {
@@ -633,4 +679,320 @@ fn request_authentication_holds_for_every_branch() {
         .expect("trigger serializes")
         .to_string();
     assert!(trigger.contains(&route.id), "{trigger}");
+}
+
+/// Issue #7383 review (dsf F2): when the route's own destination cannot be
+/// resolved but another candidate is allowed, the request continues, the
+/// alternative is admitted, and the own branch is refused as
+/// `destination_scope_missing`.
+#[tokio::test]
+async fn an_unresolvable_own_destination_defers_to_an_allowed_alternative() {
+    let slice = node_waypoint_slice(vec![reviews_trusted_only()]);
+    let prepared = prepare(&slice);
+    let route = carried_route(&prepared);
+    let mut config = authz_config(&prepared);
+    // The destination index no longer resolves `reviews`, while its upstream
+    // still names a modeled mesh destination.
+    for field in ["services", "workloads"] {
+        if let Some(entries) = config["mesh_slice"][field].as_array_mut() {
+            entries.retain(|entry| {
+                entry["name"] != json!("reviews") && entry["service_name"] != json!("reviews")
+            });
+        }
+    }
+    let authz = MeshAuthz::new(&config).expect("mesh_authz builds");
+    let dispatch = route_dispatch(&prepared, &route);
+
+    let (authorized, dispatched, ctx) =
+        serve(&authz, &[Arc::clone(&dispatch)], &route, TRUSTED, true).await;
+    assert!(
+        matches!(authorized, PluginResult::Continue),
+        "ratings is allowed, so authorization defers: {authorized:?}"
+    );
+    assert!(matches!(dispatched, Some(PluginResult::Continue)));
+    assert_eq!(
+        ctx.route_override_upstream_id.as_deref(),
+        Some(RATINGS_UPSTREAM)
+    );
+
+    let (authorized, dispatched, ctx) = serve(&authz, &[dispatch], &route, TRUSTED, false).await;
+    assert!(matches!(authorized, PluginResult::Continue));
+    assert_denied(
+        &dispatched.expect("dispatch ran"),
+        r#"{"error":"Mesh authorization denied: missing destination policy scope"}"#,
+        "the own branch has no resolvable destination scope",
+    );
+    assert_eq!(
+        ctx.metadata
+            .get("mesh_authz.deny_policy")
+            .map(String::as_str),
+        Some("destination_scope_missing")
+    );
+}
+
+/// Issue #7383 review (dsf F2): when every candidate refuses the request, the
+/// route's own destination refuses it at authorization, with its own deny
+/// policy, exactly as a route without other candidates would.
+#[tokio::test]
+async fn when_every_candidate_refuses_the_own_refusal_stands_at_authorization() {
+    let slice = node_waypoint_slice(vec![reviews_trusted_only(), ratings_trusted_only()]);
+    let prepared = prepare(&slice);
+    let route = carried_route(&prepared);
+    let authz = MeshAuthz::new(&authz_config(&prepared)).expect("mesh_authz builds");
+    let dispatch = route_dispatch(&prepared, &route);
+
+    let (authorized, dispatched, ctx) = serve(&authz, &[dispatch], &route, UNTRUSTED, true).await;
+    assert_denied(
+        &authorized,
+        DENIED_BODY,
+        "no candidate admits UNTRUSTED, so authorization refuses",
+    );
+    assert!(dispatched.is_none(), "dispatch never runs");
+    let expected =
+        own_route_deny_policy(&single_destination_authz(&prepared), &route, UNTRUSTED).await;
+    assert_eq!(ctx.metadata.get("mesh_authz.deny_policy"), Some(&expected));
+}
+
+const PROVIDER_ALLOW_WITH_TOKEN: &str = "HTTP/1.1 200 OK\r\n\
+authorization: Bearer provider-minted-token\r\n\
+content-length: 0\r\n\r\n";
+
+const PROVIDER_DENY: &str = "HTTP/1.1 403 Forbidden\r\n\
+www-authenticate: Bearer realm=\"mesh\"\r\n\
+content-length: 0\r\n\r\n";
+
+/// A local stub authorizer answering every check with `response`, counting
+/// the checks it receives.
+async fn start_provider(response: &'static str) -> (u16, Arc<AtomicUsize>) {
+    let listener = TcpListener::bind_test("127.0.0.1:0")
+        .await
+        .expect("stub authorizer binds");
+    let port = listener.local_addr().expect("stub local addr").port();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let task_calls = Arc::clone(&calls);
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
+            task_calls.fetch_add(1, Ordering::SeqCst);
+            tokio::spawn(async move {
+                let mut buffer = vec![0u8; 8192];
+                let _ = stream.read(&mut buffer).await;
+                let _ = stream.write_all(response.as_bytes()).await;
+            });
+        }
+    });
+    (port, calls)
+}
+
+fn custom_policy(name: &str, app: &str) -> MeshPolicy {
+    MeshPolicy {
+        name: name.to_string(),
+        namespace: DEFAULT_NAMESPACE.to_string(),
+        scope: selector(app),
+        rules: vec![MeshRule {
+            from: Vec::new(),
+            to: Vec::new(),
+            when: Vec::new(),
+            request_principals: Vec::new(),
+            not_request_principals: Vec::new(),
+            source_negation: Default::default(),
+            never_matches: false,
+            action: PolicyAction::Custom {
+                provider: "branch-ext-authz".to_string(),
+            },
+        }],
+    }
+}
+
+/// `mesh_authz` from the prepared config plus a CUSTOM policy selecting one
+/// destination, bound to a stub provider that owns `authorization` upstream.
+fn authz_with_custom(prepared: &GatewayConfig, policy: MeshPolicy, port: u16) -> MeshAuthz {
+    let mut config = authz_config(prepared);
+    let slice = config["mesh_slice"]
+        .as_object_mut()
+        .expect("embedded mesh slice");
+    slice
+        .entry("mesh_policies")
+        .or_insert_with(|| json!([]))
+        .as_array_mut()
+        .expect("policy list")
+        .push(serde_json::to_value(policy).expect("policy serializes"));
+    let provider = MeshExtAuthzProvider {
+        name: "branch-ext-authz".to_string(),
+        service: "127.0.0.1".to_string(),
+        port,
+        tls: false,
+        path_prefix: Some("/check".to_string()),
+        timeout_ms: 500,
+        fail_open: false,
+        status_on_error: 403,
+        include_request_headers_in_check: Vec::new(),
+        include_additional_headers_in_check: Vec::new(),
+        include_request_body_in_check: None,
+        headers_to_upstream_on_allow: vec!["authorization".to_string()],
+        headers_to_downstream_on_deny: vec!["www-authenticate".to_string()],
+        headers_to_downstream_on_allow: Vec::new(),
+    };
+    slice.insert(
+        "ext_authz_providers".to_string(),
+        json!([serde_json::to_value(provider).expect("provider serializes")]),
+    );
+    MeshAuthz::new_with_http_client(&config, Some(PluginHttpClient::default()))
+        .expect("mesh_authz builds with the provider")
+}
+
+/// Issue #7383 review (sol F1): a credential the own destination's provider
+/// mints is never forwarded to an alternative branch without a CUSTOM policy
+/// of its own, and the provider is not even asked about such a request.
+#[tokio::test]
+async fn a_provider_credential_does_not_follow_the_request_to_another_branch() {
+    let (port, calls) = start_provider(PROVIDER_ALLOW_WITH_TOKEN).await;
+    let slice = node_waypoint_slice(vec![reviews_trusted_only()]);
+    let prepared = prepare(&slice);
+    let route = carried_route(&prepared);
+    let authz = authz_with_custom(&prepared, custom_policy("reviews-ext", "reviews"), port);
+    let dispatch = route_dispatch(&prepared, &route);
+
+    let (authorized, dispatched, ctx, headers) =
+        serve_capture(&authz, &[Arc::clone(&dispatch)], &route, TRUSTED, true).await;
+    assert!(matches!(authorized, PluginResult::Continue));
+    assert!(
+        matches!(dispatched, Some(PluginResult::Continue)),
+        "ratings has no CUSTOM policy and admits the request: {dispatched:?}"
+    );
+    assert_eq!(
+        ctx.route_override_upstream_id.as_deref(),
+        Some(RATINGS_UPSTREAM)
+    );
+    assert_eq!(
+        headers.get("authorization").map(String::as_str),
+        Some("Bearer client-token"),
+        "the reviews provider's credential must not reach ratings"
+    );
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        0,
+        "no check runs for a destination the request does not reach"
+    );
+
+    // The request that does reach reviews runs reviews' check and carries
+    // its provider's credential.
+    let (_, dispatched, _, headers) =
+        serve_capture(&authz, &[dispatch], &route, TRUSTED, false).await;
+    assert!(matches!(dispatched, Some(PluginResult::Continue)));
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        headers.get("authorization").map(String::as_str),
+        Some("Bearer provider-minted-token")
+    );
+}
+
+/// Issue #7383 review (sol F2): an alternative destination's own CUSTOM
+/// check runs when dispatch selects it, and its allow admits the request.
+#[tokio::test]
+async fn an_alternative_branch_runs_its_own_custom_check() {
+    let (port, calls) = start_provider(PROVIDER_ALLOW_WITH_TOKEN).await;
+    let slice = node_waypoint_slice(vec![reviews_trusted_only()]);
+    let prepared = prepare(&slice);
+    let route = carried_route(&prepared);
+    let authz = authz_with_custom(&prepared, custom_policy("ratings-ext", "ratings"), port);
+    let dispatch = route_dispatch(&prepared, &route);
+
+    let (authorized, dispatched, ctx, headers) =
+        serve_capture(&authz, &[Arc::clone(&dispatch)], &route, TRUSTED, true).await;
+    assert!(matches!(authorized, PluginResult::Continue));
+    assert!(
+        matches!(dispatched, Some(PluginResult::Continue)),
+        "the ratings provider allows: {dispatched:?}"
+    );
+    assert_eq!(
+        ctx.route_override_upstream_id.as_deref(),
+        Some(RATINGS_UPSTREAM)
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        headers.get("authorization").map(String::as_str),
+        Some("Bearer provider-minted-token")
+    );
+
+    // The own branch has no CUSTOM policy: no check, no provider header.
+    let (_, dispatched, _, headers) =
+        serve_capture(&authz, &[dispatch], &route, TRUSTED, false).await;
+    assert!(matches!(dispatched, Some(PluginResult::Continue)));
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        headers.get("authorization").map(String::as_str),
+        Some("Bearer client-token")
+    );
+}
+
+/// Issue #7383 review (sol F2): the own destination's CUSTOM refusal applies
+/// only to requests that reach it; a request routed to an alternative without
+/// a CUSTOM policy passes, and the provider is not consulted for it.
+#[tokio::test]
+async fn an_own_destination_custom_refusal_applies_only_to_its_own_branch() {
+    let (port, calls) = start_provider(PROVIDER_DENY).await;
+    let slice = node_waypoint_slice(vec![reviews_trusted_only()]);
+    let prepared = prepare(&slice);
+    let route = carried_route(&prepared);
+    let authz = authz_with_custom(&prepared, custom_policy("reviews-ext", "reviews"), port);
+    let dispatch = route_dispatch(&prepared, &route);
+
+    let (authorized, dispatched, _) =
+        serve(&authz, &[Arc::clone(&dispatch)], &route, TRUSTED, true).await;
+    assert!(matches!(authorized, PluginResult::Continue));
+    assert!(matches!(dispatched, Some(PluginResult::Continue)));
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+
+    let (_, dispatched, ctx) = serve(&authz, &[dispatch], &route, TRUSTED, false).await;
+    match dispatched.expect("dispatch ran") {
+        PluginResult::Reject {
+            status_code,
+            headers,
+            ..
+        } => {
+            assert_eq!(status_code, 403);
+            assert!(
+                headers.contains_key("www-authenticate"),
+                "the provider's own denial is kept: {headers:?}"
+            );
+        }
+        other => panic!("the reviews provider refuses its own branch, got {other:?}"),
+    }
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        ctx.metadata
+            .get("mesh_authz.deny_policy")
+            .map(String::as_str),
+        Some("custom:reviews-ext")
+    );
+}
+
+/// A destination that still owes its CUSTOM check when the `before_proxy`
+/// pass ends (route dispatch did not run) is refused, never admitted
+/// unchecked, and no provider is called after the request transformers.
+#[tokio::test]
+async fn a_destination_owing_a_custom_check_without_dispatch_is_refused() {
+    let (port, calls) = start_provider(PROVIDER_ALLOW_WITH_TOKEN).await;
+    let slice = node_waypoint_slice(vec![reviews_trusted_only()]);
+    let prepared = prepare(&slice);
+    let route = carried_route(&prepared);
+    let authz = authz_with_custom(&prepared, custom_policy("reviews-ext", "reviews"), port);
+
+    let (authorized, dispatched, ctx) = serve(&authz, &[], &route, TRUSTED, false).await;
+    assert!(matches!(authorized, PluginResult::Continue));
+    assert_denied(
+        &dispatched.expect("before_proxy ran"),
+        DENIED_BODY,
+        "the reviews check never ran",
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        ctx.metadata
+            .get("mesh_authz.deny_policy")
+            .map(String::as_str),
+        Some("custom:reviews-ext")
+    );
 }

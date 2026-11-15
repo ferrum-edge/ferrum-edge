@@ -9559,7 +9559,7 @@ fn mesh_authz_rejects_a_misspelled_trusted_hbone_assertors_key() {
 fn mesh_authz_accepts_every_allowlisted_key() {
     use ferrum_edge::plugins::mesh::authz::MESH_AUTHZ_CONFIG_KEYS;
 
-    // A config exercising all 11 allowlisted keys at once: an over-narrow
+    // A config exercising all 12 allowlisted keys at once: an over-narrow
     // allowlist fails here rather than failing mesh slice apply in production.
     let config = json!({
         "mesh_slice": MeshSlice::default(),
@@ -9573,6 +9573,7 @@ fn mesh_authz_accepts_every_allowlisted_key() {
         "cluster_domain": "cluster.local",
         "cluster_domains": ["cluster.local"],
         "node_waypoint_route_upstreams": [],
+        "node_waypoint_route_branches": [],
     });
     let configured: std::collections::BTreeSet<&str> = config
         .as_object()
