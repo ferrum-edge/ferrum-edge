@@ -7232,6 +7232,15 @@ async fn optional_builtin_plugin_fields_match_runtime_and_openapi() {
                         "service_name": "reviews",
                         "service_port": 80
                     }]
+                }],
+                "node_waypoint_route_branches": [{
+                    "namespace": "ferrum",
+                    "proxy_id": "istio-vs-ferrum-reviews-0",
+                    "destinations": [
+                        {"upstream_id": "__mesh-out-upstream-ferrum-reviews-8080"},
+                        {"upstream_id": "__mesh-out-upstream-ferrum-ratings-8080"},
+                        {"backend_host": "api.example.com", "backend_port": 443}
+                    ]
                 }]
             }),
         ),
@@ -20186,6 +20195,13 @@ fn mesh_authz_component_matches_runtime_admission() {
         json!({"node_waypoint_route_upstreams": [
             {"id": "u", "namespace": "default", "targets": [{"host": "h", "port": 8080}]}
         ]}),
+        json!({"node_waypoint_route_branches": [{
+            "namespace": "default", "proxy_id": "route",
+            "destinations": [
+                {"upstream_id": "own"},
+                {"backend_host": "api.example.com", "backend_port": 443}
+            ]
+        }]}),
         // `targetRefs` attachments mirror `PolicyTargetAttachment`.
         target_refs(json!([
             {"kind": "service", "namespace": "default", "name": "reviews"},
@@ -20229,6 +20245,30 @@ fn mesh_authz_component_matches_runtime_admission() {
         // uint16 has a numeric ceiling, not just a format hint.
         json!({"node_waypoint_route_upstreams": [
             {"id": "u", "namespace": "default", "targets": [{"host": "h", "port": 65536}]}
+        ]}),
+        // A route's candidate list names its own destination first, and each
+        // candidate is exactly one upstream or one direct backend.
+        json!({"node_waypoint_route_branches": [
+            {"namespace": "default", "proxy_id": "route", "destinations": []}
+        ]}),
+        json!({"node_waypoint_route_branches": [{
+            "namespace": "default", "proxy_id": "route",
+            "destinations": [{"upstream_id": "own", "backend_host": "h", "backend_port": 80}]
+        }]}),
+        json!({"node_waypoint_route_branches": [{
+            "namespace": "default", "proxy_id": "route",
+            "destinations": [{"backend_host": "h"}]
+        }]}),
+        json!({"node_waypoint_route_branches": [{
+            "namespace": "default", "proxy_id": "route",
+            "destinations": [{"backend_host": "h", "backend_port": 0}]
+        }]}),
+        json!({"node_waypoint_route_branches": [{
+            "namespace": "default", "proxy_id": "route",
+            "destinations": [{"upstream_id": "own", "weight": 1}]
+        }]}),
+        json!({"node_waypoint_route_branches": [
+            {"namespace": "default", "destinations": [{"upstream_id": "own"}]}
         ]}),
         // Every attachment names its target; namespaced kinds carry their
         // namespace, and the cluster-scoped GatewayClass carries none.
@@ -20385,6 +20425,7 @@ fn mesh_authz_public_guide_documents_its_configuration_contract() {
         "cluster_domain",
         "cluster_domains",
         "node_waypoint_route_upstreams",
+        "node_waypoint_route_branches",
     ] {
         assert!(
             section.contains(&format!("`{key}`")),

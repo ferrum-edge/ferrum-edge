@@ -12003,3 +12003,76 @@ async fn mesh_authz_case_variant_readings_match_egress_for_lists_cookies_and_sin
         }
     }
 }
+
+/// `node_waypoint_route_branches` (issue #7383) is closed and refused when
+/// malformed: a candidate list that drops or garbles a destination would
+/// leave a branch without a verdict, so the generation is rejected and the
+/// previous one keeps serving.
+#[test]
+fn mesh_authz_route_branches_admit_only_well_formed_candidate_lists() {
+    let with_branches = |branches: serde_json::Value| {
+        json!({
+            "per_pod_policy_scoping": true,
+            "mesh_policies": [],
+            "node_waypoint_route_branches": branches,
+        })
+    };
+    let own = json!({"upstream_id": "__mesh-out-upstream-default-reviews-8080"});
+    MeshAuthz::new(&with_branches(json!([{
+        "namespace": "default",
+        "proxy_id": "istio-vs-default-reviews-0",
+        "destinations": [
+            own.clone(),
+            {"upstream_id": "__mesh-out-upstream-default-ratings-8080"},
+            {"backend_host": "API.example.com.", "backend_port": 443}
+        ]
+    }])))
+    .expect("a well-formed candidate list is admitted");
+
+    let too_many: Vec<serde_json::Value> = (0..65)
+        .map(|index| json!({"upstream_id": format!("upstream-{index}")}))
+        .collect();
+    for (case, destinations) in [
+        ("empty", json!([])),
+        (
+            "both forms",
+            json!([{"upstream_id": "u", "backend_host": "h", "backend_port": 80}]),
+        ),
+        (
+            "host without port",
+            json!([own.clone(), {"backend_host": "h"}]),
+        ),
+        (
+            "zero port",
+            json!([own.clone(), {"backend_host": "h", "backend_port": 0}]),
+        ),
+        ("blank upstream", json!([{"upstream_id": "  "}])),
+        ("unknown member", json!([{"upstream_id": "u", "weight": 1}])),
+        ("over the bound", serde_json::Value::Array(too_many)),
+    ] {
+        let config = with_branches(json!([{
+            "namespace": "default",
+            "proxy_id": "route",
+            "destinations": destinations
+        }]));
+        assert!(MeshAuthz::new(&config).is_err(), "{case} must be refused");
+    }
+    assert!(
+        MeshAuthz::new(&with_branches(json!([{
+            "namespace": "default",
+            "destinations": [own.clone()]
+        }])))
+        .is_err(),
+        "a candidate list must name its route"
+    );
+    assert!(
+        MeshAuthz::new(&with_branches(json!([{
+            "namespace": "default",
+            "proxy_id": "route",
+            "destinations": [own],
+            "extra": true
+        }])))
+        .is_err(),
+        "entries are closed"
+    );
+}

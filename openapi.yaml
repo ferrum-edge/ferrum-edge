@@ -27501,6 +27501,56 @@ components:
                       format: uint16
                       minimum: 0
                       maximum: 65535
+        node_waypoint_route_branches:
+          type: array
+          readOnly: true
+          description: >-
+            Mesh-generated candidate destinations of each NodeWaypoint
+            VirtualService route whose `mesh_route_dispatch` rules can select
+            a destination other than the route's own: the route's own
+            destination first, then each rule destination. Each candidate's
+            destination policy is evaluated before dispatch, and the
+            destination a request finally reaches is admitted only on its own
+            verdict. Every entry and destination is closed; a destination
+            names exactly one of `upstream_id` or `backend_host` +
+            `backend_port`.
+          items:
+            type: object
+            required: [namespace, proxy_id, destinations]
+            additionalProperties: false
+            properties:
+              namespace:
+                type: string
+              proxy_id:
+                type: string
+              destinations:
+                type: array
+                minItems: 1
+                maxItems: 64
+                items:
+                  type: object
+                  additionalProperties: false
+                  oneOf:
+                    - required: [upstream_id]
+                      not:
+                        anyOf:
+                          - required: [backend_host]
+                          - required: [backend_port]
+                    - required: [backend_host, backend_port]
+                      not:
+                        required: [upstream_id]
+                  properties:
+                    upstream_id:
+                      type: string
+                      minLength: 1
+                    backend_host:
+                      type: string
+                      minLength: 1
+                    backend_port:
+                      type: integer
+                      format: uint16
+                      minimum: 1
+                      maximum: 65535
         trusted_hbone_assertors:
           $ref: '#/components/schemas/MeshTrustedHboneAssertors'
           default: ["ztunnel", "waypoint"]

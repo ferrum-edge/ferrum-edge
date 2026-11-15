@@ -177,6 +177,11 @@ pub struct MeshAuthz {
     destination_namespaced_service_backend_hosts: HashSet<NamespacedDestinationBackendHostKey>,
     destination_route_upstreams_requiring_scope: NamespacedUpstreamMap<()>,
     has_route_upstream_metadata: bool,
+    /// Candidate destinations of each carried NodeWaypoint VirtualService
+    /// route whose `mesh_route_dispatch` rules can select a destination other
+    /// than the route's own (`node_waypoint_route_branches`, issue #7383),
+    /// keyed by the route proxy's `(namespace, id)`. Empty off NodeWaypoint.
+    node_waypoint_route_branches: NamespacedUpstreamMap<Arc<NodeWaypointRouteBranches>>,
     /// Distinct lowercase request-header names referenced by any loaded
     /// `to.headers` predicate, precomputed at construction. The request path
     /// resolves ONLY these names (via [`http_request_header_value`]) instead of
@@ -557,6 +562,454 @@ enum NodeWaypointCaptureScopeLookup<'a> {
 struct DestinationScopeMatch<'a> {
     authorized_destination: NodeWaypointAuthorizedDestination,
     scopes: &'a [crate::modes::mesh::runtime::PolicyScopeCache],
+}
+
+/// Most candidate destinations one carried route may declare (its own plus
+/// every `mesh_route_dispatch` rule destination). Verdicts are one bit per
+/// candidate in a `u64`, so recording them never allocates. Mesh slice
+/// preparation does not thread a route with more candidates; such a route
+/// keeps the blanket override refusal.
+pub(crate) const MAX_NODE_WAYPOINT_ROUTE_BRANCHES: usize = 64;
+
+/// One `node_waypoint_route_branches` entry: a carried VirtualService route
+/// and its candidate destinations, the route's own first. Closed like
+/// `node_waypoint_route_upstreams`: a misspelled member would silently drop a
+/// candidate, and an unknown candidate is refused at dispatch.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NodeWaypointRouteBranchConfig {
+    namespace: String,
+    proxy_id: String,
+    #[serde(deserialize_with = "crate::util::json_object::deserialize_object_vec")]
+    destinations: Vec<NodeWaypointRouteBranchDestinationConfig>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NodeWaypointRouteBranchDestinationConfig {
+    #[serde(default)]
+    upstream_id: Option<String>,
+    #[serde(default)]
+    backend_host: Option<String>,
+    #[serde(default)]
+    backend_port: Option<u16>,
+}
+
+/// A candidate destination of a carried route, in the form route dispatch
+/// selects it: an upstream id, or a direct backend (normalized host + port).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum NodeWaypointBranchKey {
+    Upstream(String),
+    Backend { host: String, port: u16 },
+}
+
+impl NodeWaypointBranchKey {
+    fn from_config(
+        destination: &NodeWaypointRouteBranchDestinationConfig,
+    ) -> Result<Self, &'static str> {
+        match (
+            destination.upstream_id.as_deref(),
+            destination.backend_host.as_deref(),
+            destination.backend_port,
+        ) {
+            (Some(upstream_id), None, None) if !upstream_id.trim().is_empty() => {
+                Ok(Self::Upstream(upstream_id.to_string()))
+            }
+            (None, Some(host), Some(port)) => DestinationBackendKey::new(host, port)
+                .map(|key| Self::Backend {
+                    host: key.host,
+                    port: key.port,
+                })
+                .ok_or("a direct backend needs a non-empty host and a non-zero port"),
+            _ => Err(
+                "each destination names exactly one of `upstream_id` or `backend_host` + `backend_port`",
+            ),
+        }
+    }
+
+    /// Whether this candidate is the upstream `upstream_id`.
+    fn is_upstream(&self, upstream_id: &str) -> bool {
+        matches!(self, Self::Upstream(id) if id == upstream_id)
+    }
+
+    /// Whether this candidate is the direct backend `host:port`, compared the
+    /// way `DestinationBackendKey` normalizes it, without allocating.
+    fn is_backend(&self, host: &str, port: u16) -> bool {
+        match self {
+            Self::Backend {
+                host: candidate,
+                port: candidate_port,
+            } => {
+                *candidate_port == port
+                    && host
+                        .trim()
+                        .trim_end_matches('.')
+                        .eq_ignore_ascii_case(candidate)
+            }
+            Self::Upstream(_) => false,
+        }
+    }
+
+    /// Whether this candidate is the backend named by a canonical
+    /// `host|port` key (`mesh_route_dispatch`'s precomputed match key).
+    fn is_backend_metadata_key(&self, key: &str) -> bool {
+        key.rsplit_once('|').is_some_and(|(host, port)| {
+            port.parse::<u16>()
+                .is_ok_and(|port| port != 0 && self.is_backend(host, port))
+        })
+    }
+}
+
+/// One candidate destination with the destination scopes its policies are
+/// evaluated against, resolved once per plugin generation.
+struct NodeWaypointRouteBranch {
+    key: NodeWaypointBranchKey,
+    /// `None` when the destination index does not resolve the candidate.
+    scopes: Option<Vec<crate::modes::mesh::runtime::PolicyScopeCache>>,
+    /// Whether an unresolved candidate reaches a modeled destination (a
+    /// missing scope then refuses it, as for a route's own destination).
+    requires_scope: bool,
+}
+
+/// The candidate destinations of one carried route, the route's own first.
+/// Shared (`Arc`) between the plugin generation and every request whose
+/// verdicts it indexes.
+pub(crate) struct NodeWaypointRouteBranches {
+    branches: Vec<NodeWaypointRouteBranch>,
+    /// This waypoint's identity, for the policy-deny drilldown row a refused
+    /// branch records when route dispatch selects it.
+    deny_destination: Option<String>,
+}
+
+impl std::fmt::Debug for NodeWaypointRouteBranches {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NodeWaypointRouteBranches")
+            .field("branches", &self.branches.len())
+            .finish_non_exhaustive()
+    }
+}
+
+impl NodeWaypointRouteBranches {
+    fn position(&self, destination: NodeWaypointBranchDestination<'_>) -> Option<usize> {
+        match destination {
+            NodeWaypointBranchDestination::Own => Some(0),
+            NodeWaypointBranchDestination::Upstream(upstream_id) => self
+                .branches
+                .iter()
+                .position(|branch| branch.key.is_upstream(upstream_id)),
+            NodeWaypointBranchDestination::Backend { host, port } => self
+                .branches
+                .iter()
+                .position(|branch| branch.key.is_backend(host, port)),
+            NodeWaypointBranchDestination::BackendMetadataKey(key) => self
+                .branches
+                .iter()
+                .position(|branch| branch.key.is_backend_metadata_key(key)),
+            NodeWaypointBranchDestination::Unknown => None,
+        }
+    }
+}
+
+/// The destination route dispatch (or the request's effective route
+/// override) selects, in the forms the verdict table can match.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum NodeWaypointBranchDestination<'a> {
+    /// The route's own destination (no override).
+    Own,
+    Upstream(&'a str),
+    Backend {
+        host: &'a str,
+        port: u16,
+    },
+    /// A canonical `host|port` key.
+    BackendMetadataKey(&'a str),
+    /// A destination shape the table cannot name (always refused).
+    Unknown,
+}
+
+/// Why a branch was refused, which fixes its response body and counter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NodeWaypointBranchDenyKind {
+    Policy,
+    DestinationScopeMissing,
+}
+
+#[derive(Debug, Clone)]
+enum NodeWaypointBranchOutcome {
+    Audit(String),
+    Deny {
+        policy: String,
+        kind: NodeWaypointBranchDenyKind,
+    },
+}
+
+/// Per-destination authorization verdicts for one request on a carried
+/// NodeWaypoint VirtualService route whose `mesh_route_dispatch` rules can
+/// select a destination other than the route's own (issue #7383).
+///
+/// `mesh_authz` evaluates every candidate destination's policy before route
+/// dispatch picks a rule and records the verdicts here; the destination the
+/// request finally reaches is admitted only when its own verdict allowed it
+/// (`enforce_node_waypoint_route_branch`). A destination the table does not
+/// name, or one with no recorded verdict, is refused. Recording allocates
+/// nothing unless a candidate audits or is denied.
+#[derive(Debug, Clone)]
+pub(crate) struct NodeWaypointRouteBranchAuthz {
+    branches: Arc<NodeWaypointRouteBranches>,
+    /// Bit `i` set: candidate `i` was evaluated.
+    evaluated: u64,
+    /// Bit `i` set: candidate `i` was allowed.
+    allowed: u64,
+    /// Audit and deny outcomes, keyed by candidate index.
+    outcomes: Vec<(usize, NodeWaypointBranchOutcome)>,
+    /// The authz principal the deny drilldown records.
+    source_for_log: Option<String>,
+}
+
+impl NodeWaypointRouteBranchAuthz {
+    fn verdict(&self, index: Option<usize>) -> NodeWaypointBranchVerdict<'_> {
+        let Some(index) = index.filter(|index| *index < MAX_NODE_WAYPOINT_ROUTE_BRANCHES) else {
+            return NodeWaypointBranchVerdict::Unknown;
+        };
+        let bit = 1u64 << index;
+        if self.evaluated & bit == 0 {
+            return NodeWaypointBranchVerdict::Unknown;
+        }
+        let outcome = self
+            .outcomes
+            .iter()
+            .find(|(candidate, _)| *candidate == index)
+            .map(|(_, outcome)| outcome);
+        if self.allowed & bit == 0 {
+            return match outcome {
+                Some(NodeWaypointBranchOutcome::Deny { policy, kind }) => {
+                    NodeWaypointBranchVerdict::Denied {
+                        policy: policy.as_str(),
+                        kind: *kind,
+                    }
+                }
+                _ => NodeWaypointBranchVerdict::Unknown,
+            };
+        }
+        match outcome {
+            Some(NodeWaypointBranchOutcome::Audit(policy)) => {
+                NodeWaypointBranchVerdict::Allowed(Some(policy.as_str()))
+            }
+            _ => NodeWaypointBranchVerdict::Allowed(None),
+        }
+    }
+
+    /// Fold another `mesh_authz` instance's verdicts into these: a candidate
+    /// stays allowed only when both allowed it. Tables of different shape
+    /// cannot be aligned, so every candidate is refused (fail closed).
+    fn merge(&mut self, other: Self) {
+        let aligned = Arc::ptr_eq(&self.branches, &other.branches)
+            || (self.branches.branches.len() == other.branches.branches.len()
+                && self
+                    .branches
+                    .branches
+                    .iter()
+                    .zip(other.branches.branches.iter())
+                    .all(|(left, right)| left.key == right.key));
+        if !aligned {
+            self.allowed = 0;
+            return;
+        }
+        self.evaluated &= other.evaluated;
+        let newly_denied = self.allowed & !other.allowed;
+        self.allowed &= other.allowed;
+        for (index, outcome) in other.outcomes {
+            let denial = matches!(outcome, NodeWaypointBranchOutcome::Deny { .. });
+            if denial && newly_denied & (1u64 << index) != 0 {
+                self.outcomes.retain(|(candidate, _)| *candidate != index);
+                self.outcomes.insert(0, (index, outcome));
+            } else if !self
+                .outcomes
+                .iter()
+                .any(|(candidate, _)| *candidate == index)
+            {
+                self.outcomes.push((index, outcome));
+            }
+        }
+        if self.source_for_log.is_none() {
+            self.source_for_log = other.source_for_log;
+        }
+    }
+}
+
+enum NodeWaypointBranchVerdict<'a> {
+    Allowed(Option<&'a str>),
+    Denied {
+        policy: &'a str,
+        kind: NodeWaypointBranchDenyKind,
+    },
+    Unknown,
+}
+
+/// Record this instance's per-destination verdicts on the request. A second
+/// `mesh_authz` instance on the same request folds its verdicts in
+/// conjunctively instead of replacing the first instance's.
+fn install_node_waypoint_route_branch_authz(
+    ctx: &mut RequestContext,
+    mut record: NodeWaypointRouteBranchAuthz,
+    source_for_log: Option<&str>,
+) {
+    // Only a refusal reads the principal, so only a record that can refuse
+    // pays for the copy.
+    if record
+        .outcomes
+        .iter()
+        .any(|(_, outcome)| matches!(outcome, NodeWaypointBranchOutcome::Deny { .. }))
+    {
+        record.source_for_log = source_for_log.map(str::to_string);
+    }
+    match ctx.node_waypoint_route_branch_authz.as_mut() {
+        Some(existing) => existing.merge(record),
+        None => ctx.node_waypoint_route_branch_authz = Some(record),
+    }
+}
+
+/// Deny policy recorded when a request reaches a destination its route's
+/// verdict table does not name.
+const NODE_WAYPOINT_ROUTE_BRANCH_UNKNOWN_POLICY: &str = "route_branch_unauthorized";
+
+/// Whether this request carries per-destination verdicts (a carried
+/// NodeWaypoint route whose dispatch rules can change its destination). When
+/// it does, the verdicts replace the blanket route-override refusal.
+pub(crate) fn has_node_waypoint_route_branch_authz(ctx: &RequestContext) -> bool {
+    ctx.node_waypoint_route_branch_authz.is_some()
+}
+
+/// Whether `destination` would be refused by this request's per-destination
+/// verdicts. Side-effect free (early route-total planning). `false` when the
+/// request carries no verdicts.
+pub(crate) fn node_waypoint_route_branch_refuses(
+    ctx: &RequestContext,
+    destination: NodeWaypointBranchDestination<'_>,
+) -> bool {
+    let Some(record) = ctx.node_waypoint_route_branch_authz.as_ref() else {
+        return false;
+    };
+    !matches!(
+        record.verdict(record.branches.position(destination)),
+        NodeWaypointBranchVerdict::Allowed(_)
+    )
+}
+
+/// Admit or refuse the destination a request is about to reach under this
+/// request's per-destination verdicts.
+///
+/// `None` admits it (stamping `mesh_authz.audit_policy` when that
+/// destination's policy audited the request); `Some` is the refusal the
+/// destination's own policy produces: `403` with the same body, deny metadata,
+/// policy-deny drilldown row and NodeWaypoint rejection counter `mesh_authz`
+/// records for a refused route. A destination the table does not name, or one
+/// without a recorded verdict, is refused. Returns `None` when the request
+/// carries no verdicts.
+pub(crate) fn enforce_node_waypoint_route_branch(
+    ctx: &mut RequestContext,
+    destination: NodeWaypointBranchDestination<'_>,
+) -> Option<PluginResult> {
+    let index = ctx
+        .node_waypoint_route_branch_authz
+        .as_ref()?
+        .branches
+        .position(destination);
+    enforce_node_waypoint_route_branch_at(ctx, index)
+}
+
+fn enforce_node_waypoint_route_branch_at(
+    ctx: &mut RequestContext,
+    index: Option<usize>,
+) -> Option<PluginResult> {
+    let record = ctx.node_waypoint_route_branch_authz.as_ref()?;
+    let (policy, kind) = match record.verdict(index) {
+        NodeWaypointBranchVerdict::Allowed(audit) => {
+            if let Some(policy) = audit {
+                let policy = policy.to_string();
+                ctx.metadata
+                    .insert("mesh_authz.audit_policy".to_string(), policy);
+            }
+            return None;
+        }
+        NodeWaypointBranchVerdict::Denied { policy, kind } => (policy.to_string(), kind),
+        NodeWaypointBranchVerdict::Unknown => (
+            NODE_WAYPOINT_ROUTE_BRANCH_UNKNOWN_POLICY.to_string(),
+            NodeWaypointBranchDenyKind::Policy,
+        ),
+    };
+    let source = record.source_for_log.clone();
+    let deny_destination = record.branches.deny_destination.clone();
+    if kind == NodeWaypointBranchDenyKind::DestinationScopeMissing {
+        ctx.metadata.insert(
+            "mesh_authz.destination_scope_missing".to_string(),
+            "true".to_string(),
+        );
+    }
+    ctx.metadata
+        .insert("mesh_authz.deny_policy".to_string(), policy.clone());
+    policy_deny_log::record_global(PolicyDenyEvent {
+        rule: policy.clone(),
+        source,
+        destination: deny_destination,
+        reason: policy,
+        at: Utc::now(),
+        reevaluation: ctx
+            .metadata
+            .contains_key(MESH_AUTHZ_REEVALUATION_METADATA_KEY),
+    });
+    // Verdicts are recorded only for ordinary requests (never a live-tunnel
+    // re-evaluation or a refused asserted identity), so a refusal always
+    // counts like the destination policy's own refusal would.
+    crate::modes::mesh::node_waypoint_observability::record_destination_policy_rejection(
+        match kind {
+            NodeWaypointBranchDenyKind::Policy => crate::modes::mesh::node_waypoint_observability::NodeWaypointDestinationPolicyRejectReason::AuthzDeny,
+            NodeWaypointBranchDenyKind::DestinationScopeMissing => crate::modes::mesh::node_waypoint_observability::NodeWaypointDestinationPolicyRejectReason::DestinationScopeMissing,
+        },
+    );
+    Some(PluginResult::Reject {
+        status_code: 403,
+        body: match kind {
+            NodeWaypointBranchDenyKind::Policy => r#"{"error":"Mesh authorization denied"}"#,
+            NodeWaypointBranchDenyKind::DestinationScopeMissing => {
+                r#"{"error":"Mesh authorization denied: missing destination policy scope"}"#
+            }
+        }
+        .into(),
+        headers: HashMap::new(),
+    })
+}
+
+/// Admit or refuse the destination a request finally reaches after the whole
+/// `before_proxy` pass, from its effective route override (or the route's own
+/// destination when none is set). Proxy core runs this once every
+/// `before_proxy` hook has run, so the verdicts hold whether or not route
+/// dispatch ran, matched, or stood down. `None` when the request carries no
+/// verdicts.
+pub(crate) fn enforce_node_waypoint_route_branch_for_effective_destination(
+    ctx: &mut RequestContext,
+) -> Option<PluginResult> {
+    let record = ctx.node_waypoint_route_branch_authz.as_ref()?;
+    let (own_host, own_port) = ctx.matched_proxy.as_deref().map_or(("", 0), |proxy| {
+        (proxy.backend_host.as_str(), proxy.backend_port)
+    });
+    let destination = match (
+        ctx.route_override_upstream_id.as_deref(),
+        ctx.route_override_backend_host.as_deref(),
+        ctx.route_override_backend_port,
+    ) {
+        (None, None, None) => NodeWaypointBranchDestination::Own,
+        (Some(upstream_id), None, None) => NodeWaypointBranchDestination::Upstream(upstream_id),
+        (None, host, port) => NodeWaypointBranchDestination::Backend {
+            host: host.unwrap_or(own_host),
+            port: port.unwrap_or(own_port),
+        },
+        _ => NodeWaypointBranchDestination::Unknown,
+    };
+    // Resolved to an index first so the borrows of the request end before
+    // the enforcement writes its metadata; nothing is copied.
+    let index = record.branches.position(destination);
+    enforce_node_waypoint_route_branch_at(ctx, index)
 }
 
 /// Generated upstream ids are unique only within a namespace:
@@ -957,6 +1410,40 @@ fn parse_node_waypoint_route_upstreams(
         .map_err(|error| format!("mesh_authz: invalid `node_waypoint_route_upstreams`: {error}")),
         None => Ok((false, Vec::new())),
     }
+}
+
+fn parse_node_waypoint_route_branches(
+    config: &Value,
+) -> Result<Vec<NodeWaypointRouteBranchConfig>, String> {
+    let Some(value) = config.get("node_waypoint_route_branches") else {
+        return Ok(Vec::new());
+    };
+    let entries = crate::util::json_object::from_json_object_vec_value::<
+        NodeWaypointRouteBranchConfig,
+    >(value.clone())
+    .map_err(|error| format!("mesh_authz: invalid `node_waypoint_route_branches`: {error}"))?;
+    for (index, entry) in entries.iter().enumerate() {
+        if entry.destinations.is_empty() {
+            return Err(format!(
+                "mesh_authz: `node_waypoint_route_branches[{index}].destinations` must name the \
+                 route's own destination first"
+            ));
+        }
+        if entry.destinations.len() > MAX_NODE_WAYPOINT_ROUTE_BRANCHES {
+            return Err(format!(
+                "mesh_authz: `node_waypoint_route_branches[{index}].destinations` exceeds \
+                 {MAX_NODE_WAYPOINT_ROUTE_BRANCHES} candidate destinations"
+            ));
+        }
+        for (destination_index, destination) in entry.destinations.iter().enumerate() {
+            NodeWaypointBranchKey::from_config(destination).map_err(|reason| {
+                format!(
+                    "mesh_authz: `node_waypoint_route_branches[{index}].destinations[{destination_index}]`: {reason}"
+                )
+            })?;
+        }
+    }
+    Ok(entries)
 }
 
 fn service_port_key_for_backend(
@@ -1967,6 +2454,7 @@ pub const MESH_AUTHZ_CONFIG_KEYS: &[&str] = &[
     "cluster_domain",
     "cluster_domains",
     "node_waypoint_route_upstreams",
+    "node_waypoint_route_branches",
 ];
 
 fn ambient_udp_source_scope_index(
@@ -2421,8 +2909,11 @@ impl MeshAuthz {
             .is_some_and(|executor| executor.mutates_downstream_on_allow());
         let ext_authz_declared_modified_headers =
             backend_folded_header_spellings(&ext_authz_upstream_allow_headers);
+        // Parsed (and refused when malformed) on every topology; only a
+        // NodeWaypoint resolves it into per-route candidate tables.
+        let route_branch_configs = parse_node_waypoint_route_branches(config)?;
 
-        Ok(Self {
+        let mut authz = Self {
             slice,
             ext_authz,
             body_inspecting_custom_rules,
@@ -2454,6 +2945,7 @@ impl MeshAuthz {
                 .route_upstreams_requiring_scope,
             node_waypoint_capture_destination_scopes,
             has_route_upstream_metadata,
+            node_waypoint_route_branches: NamespacedUpstreamMap::default(),
             header_rule_names,
             relay_policy_superset_header_rule_names,
             trust_domain_aliases,
@@ -2467,7 +2959,61 @@ impl MeshAuthz {
             waypoint_name,
             waypoint_gateway_class,
             udp_principal_pod_mismatch_warn_last_ms: std::sync::atomic::AtomicU64::new(0),
-        })
+        };
+        if per_pod_policy_scoping {
+            authz.node_waypoint_route_branches = authz.route_branch_tables(route_branch_configs);
+        }
+        Ok(authz)
+    }
+
+    /// Resolve every carried route's candidate destinations against the
+    /// destination index once per generation (issue #7383), so a request
+    /// evaluates each candidate's policies without a lookup or allocation.
+    fn route_branch_tables(
+        &self,
+        configs: Vec<NodeWaypointRouteBranchConfig>,
+    ) -> NamespacedUpstreamMap<Arc<NodeWaypointRouteBranches>> {
+        let mut tables = NamespacedUpstreamMap::default();
+        for config in configs {
+            let mut branches: Vec<NodeWaypointRouteBranch> =
+                Vec::with_capacity(config.destinations.len());
+            for destination in &config.destinations {
+                // Validated by `parse_node_waypoint_route_branches`.
+                let Ok(key) = NodeWaypointBranchKey::from_config(destination) else {
+                    continue;
+                };
+                if branches.iter().any(|branch| branch.key == key) {
+                    continue;
+                }
+                let (upstream_id, host, port) = match &key {
+                    NodeWaypointBranchKey::Upstream(id) => (Some(id.as_str()), "", 0),
+                    NodeWaypointBranchKey::Backend { host, port } => (None, host.as_str(), *port),
+                };
+                let scopes = self
+                    .destination_scope_match_for_target(&config.namespace, upstream_id, host, port)
+                    .map(|scope_match| scope_match.scopes.to_vec());
+                let requires_scope = self.target_requires_destination_scope(
+                    &config.namespace,
+                    upstream_id,
+                    host,
+                    port,
+                );
+                branches.push(NodeWaypointRouteBranch {
+                    key,
+                    scopes,
+                    requires_scope,
+                });
+            }
+            tables.insert(
+                &config.namespace,
+                config.proxy_id,
+                Arc::new(NodeWaypointRouteBranches {
+                    branches,
+                    deny_destination: self.slice.workload_spiffe_id.clone(),
+                }),
+            );
+        }
+        tables
     }
 
     /// This proxy's authoritative waypoint identity for `targetRefs` matching.
@@ -2778,10 +3324,30 @@ impl MeshAuthz {
         &self,
         proxy: &Proxy,
     ) -> Option<DestinationScopeMatch<'_>> {
-        if let Some(upstream_id) = proxy.upstream_id.as_deref() {
+        self.destination_scope_match_for_target(
+            &proxy.namespace,
+            proxy.upstream_id.as_deref(),
+            &proxy.backend_host,
+            proxy.backend_port,
+        )
+    }
+
+    /// Destination scopes for one route target (a proxy's own destination or
+    /// a `mesh_route_dispatch` rule's), resolved exactly as for a matched
+    /// proxy: an `upstream_id` is decided by the upstream index alone, a
+    /// direct backend by its qualified alias first, then by its name in
+    /// `namespace`.
+    fn destination_scope_match_for_target(
+        &self,
+        namespace: &str,
+        upstream_id: Option<&str>,
+        backend_host: &str,
+        backend_port: u16,
+    ) -> Option<DestinationScopeMatch<'_>> {
+        if let Some(upstream_id) = upstream_id {
             if let Some(scopes) = self
                 .destination_policy_scopes_by_upstream
-                .get(&proxy.namespace, upstream_id)
+                .get(namespace, upstream_id)
             {
                 return Some(DestinationScopeMatch {
                     authorized_destination: NodeWaypointAuthorizedDestination::Upstream(
@@ -2792,20 +3358,18 @@ impl MeshAuthz {
             }
             return None;
         }
-        let backend_key = DestinationBackendKey::new(&proxy.backend_host, proxy.backend_port)?;
+        let backend_key = DestinationBackendKey::new(backend_host, backend_port)?;
         if let Some(scopes) = self.destination_policy_scopes_by_backend.get(&backend_key) {
             let mut aliases = self
                 .destination_backend_aliases_by_backend
                 .get(&backend_key)
                 .cloned()
                 .unwrap_or_else(|| vec![backend_key.clone()]);
-            if let Some(namespaced_backend_key) = NamespacedDestinationBackendKey::new(
-                &proxy.namespace,
-                &backend_key.host,
-                backend_key.port,
-            ) && let Some(short_alias) = self
-                .destination_same_namespace_backend_alias_by_backend
-                .get(&namespaced_backend_key)
+            if let Some(namespaced_backend_key) =
+                NamespacedDestinationBackendKey::new(namespace, &backend_key.host, backend_key.port)
+                && let Some(short_alias) = self
+                    .destination_same_namespace_backend_alias_by_backend
+                    .get(&namespaced_backend_key)
                 && !aliases.contains(short_alias)
             {
                 aliases.push(short_alias.clone());
@@ -2818,11 +3382,8 @@ impl MeshAuthz {
                 scopes,
             });
         }
-        let namespaced_backend_key = NamespacedDestinationBackendKey::new(
-            &proxy.namespace,
-            &proxy.backend_host,
-            proxy.backend_port,
-        )?;
+        let namespaced_backend_key =
+            NamespacedDestinationBackendKey::new(namespace, backend_host, backend_port)?;
         self.destination_policy_scopes_by_namespaced_backend
             .get(&namespaced_backend_key)
             .map(|scopes| DestinationScopeMatch {
@@ -2933,8 +3494,155 @@ impl MeshAuthz {
         })
     }
 
+    /// The candidate table of a carried route whose own destination is the
+    /// matched proxy's. A table naming a different own destination is never
+    /// used: the route keeps the single-destination decision.
+    fn route_branch_table_for_proxy(
+        &self,
+        proxy: &Proxy,
+    ) -> Option<Arc<NodeWaypointRouteBranches>> {
+        let table = self
+            .node_waypoint_route_branches
+            .get(&proxy.namespace, &proxy.id)?;
+        let own = &table.branches.first()?.key;
+        let matches_proxy = match proxy.upstream_id.as_deref() {
+            Some(upstream_id) => own.is_upstream(upstream_id),
+            None => own.is_backend(&proxy.backend_host, proxy.backend_port),
+        };
+        matches_proxy.then(|| Arc::clone(table))
+    }
+
+    /// Evaluate every candidate destination other than the route's own
+    /// (candidate 0, judged by the ordinary path) against its own
+    /// destination policy.
+    fn route_branch_record(
+        &self,
+        table: &Arc<NodeWaypointRouteBranches>,
+        request: &MeshAuthzRequest,
+        source_scope: Option<&crate::modes::mesh::runtime::PolicyScopeCache>,
+        executed_custom_provider: Option<&str>,
+    ) -> NodeWaypointRouteBranchAuthz {
+        let mut record = NodeWaypointRouteBranchAuthz {
+            branches: Arc::clone(table),
+            evaluated: 0,
+            allowed: 0,
+            outcomes: Vec::new(),
+            source_for_log: None,
+        };
+        for (index, branch) in table
+            .branches
+            .iter()
+            .enumerate()
+            .take(MAX_NODE_WAYPOINT_ROUTE_BRANCHES)
+            .skip(1)
+        {
+            let bit = 1u64 << index;
+            record.evaluated |= bit;
+            let (allowed, outcome) =
+                self.evaluate_route_branch(branch, request, source_scope, executed_custom_provider);
+            if allowed {
+                record.allowed |= bit;
+            }
+            if let Some(outcome) = outcome {
+                record.outcomes.push((index, outcome));
+            }
+        }
+        record
+    }
+
+    /// One candidate's verdict, decided exactly as the route's own
+    /// destination is decided on the per-pod path. A CUSTOM delegation is
+    /// satisfied only by the check this request already ran (the own
+    /// destination's, same provider, allowed): a candidate needing a check
+    /// that did not run is refused rather than consulting a provider for a
+    /// branch the request may never take.
+    fn evaluate_route_branch(
+        &self,
+        branch: &NodeWaypointRouteBranch,
+        request: &MeshAuthzRequest,
+        source_scope: Option<&crate::modes::mesh::runtime::PolicyScopeCache>,
+        executed_custom_provider: Option<&str>,
+    ) -> (bool, Option<NodeWaypointBranchOutcome>) {
+        let evaluation = match branch.scopes.as_deref() {
+            Some(scopes) => evaluate_destination_policy_scopes(
+                &self.slice.mesh_policies,
+                scopes,
+                self.waypoint_attachment(),
+                request,
+            ),
+            None if branch.requires_scope => {
+                return (
+                    false,
+                    Some(NodeWaypointBranchOutcome::Deny {
+                        policy: "destination_scope_missing".to_string(),
+                        kind: NodeWaypointBranchDenyKind::DestinationScopeMissing,
+                    }),
+                );
+            }
+            None => evaluate_mesh_authorization_full(
+                self.slice
+                    .mesh_policies
+                    .iter()
+                    .filter(|policy| Self::policy_applies_to_pod(policy, source_scope)),
+                request,
+            ),
+        };
+        if evaluation.custom_provider_conflict {
+            return (
+                false,
+                Some(NodeWaypointBranchOutcome::Deny {
+                    policy: crate::modes::mesh::policy::MESH_AUTHZ_CUSTOM_PROVIDER_CONFLICT
+                        .to_string(),
+                    kind: NodeWaypointBranchDenyKind::Policy,
+                }),
+            );
+        }
+        if let Some(delegation) = evaluation.custom
+            && executed_custom_provider != Some(delegation.provider.as_str())
+        {
+            return (
+                false,
+                Some(NodeWaypointBranchOutcome::Deny {
+                    policy: format!("custom:{}", delegation.policy),
+                    kind: NodeWaypointBranchDenyKind::Policy,
+                }),
+            );
+        }
+        match evaluation.decision {
+            MeshAuthzDecision::Allow => (true, None),
+            MeshAuthzDecision::Audit { policy } => {
+                (true, Some(NodeWaypointBranchOutcome::Audit(policy)))
+            }
+            MeshAuthzDecision::Deny { policy } => (
+                false,
+                Some(NodeWaypointBranchOutcome::Deny {
+                    policy,
+                    kind: NodeWaypointBranchDenyKind::Policy,
+                }),
+            ),
+        }
+    }
+
     fn proxy_requires_destination_scope(&self, proxy: &Proxy) -> bool {
-        if let Some(upstream_id) = proxy.upstream_id.as_deref() {
+        self.target_requires_destination_scope(
+            &proxy.namespace,
+            proxy.upstream_id.as_deref(),
+            &proxy.backend_host,
+            proxy.backend_port,
+        )
+    }
+
+    /// Whether a route target reaches a modeled destination, so a missing
+    /// destination scope means "unresolved" (refuse) rather than "not a mesh
+    /// workload".
+    fn target_requires_destination_scope(
+        &self,
+        namespace: &str,
+        upstream_id: Option<&str>,
+        backend_host: &str,
+        backend_port: u16,
+    ) -> bool {
+        if let Some(upstream_id) = upstream_id {
             if upstream_id.starts_with("__mesh-out-upstream-") {
                 return true;
             }
@@ -2942,22 +3650,20 @@ impl MeshAuthz {
                 return !self.has_route_upstream_metadata
                     || self
                         .destination_route_upstreams_requiring_scope
-                        .get(&proxy.namespace, upstream_id)
+                        .get(namespace, upstream_id)
                         .is_some();
             }
             return false;
         }
-        if DestinationBackendKey::new(&proxy.backend_host, proxy.backend_port)
+        if DestinationBackendKey::new(backend_host, backend_port)
             .is_some_and(|key| self.destination_service_backend_hosts.contains(&key.host))
         {
             return true;
         }
-        NamespacedDestinationBackendHostKey::new(&proxy.namespace, &proxy.backend_host).is_some_and(
-            |key| {
-                self.destination_namespaced_service_backend_hosts
-                    .contains(&key)
-            },
-        )
+        NamespacedDestinationBackendHostKey::new(namespace, backend_host).is_some_and(|key| {
+            self.destination_namespaced_service_backend_hosts
+                .contains(&key)
+        })
     }
 
     fn decision_to_result<MS: std::hash::BuildHasher>(
@@ -3887,6 +4593,31 @@ impl Plugin for MeshAuthz {
         // Missing-scope census for THIS request; the per-pod branch below
         // widens it for the synthesized inbound relay.
         let mut scoped_policy_census = self.has_scoped_policies;
+        // Per-destination verdicts for a carried VirtualService route whose
+        // `mesh_route_dispatch` rules can select a destination other than the
+        // route's own (issue #7383). Only an ordinary per-pod-scoped HTTP
+        // request with a resolved source scope and scoped policies enters it;
+        // relays, re-evaluations and refused asserted identities keep the
+        // single-destination decision.
+        let route_branches = if self.per_pod_policy_scoping
+            && self.has_scoped_policies
+            && !relay_policy_superset_request
+            && !connect_relay
+            && !asserted_identity_rejected
+            && !live_admission_reevaluation
+            && ctx.node_waypoint_policy_scope.is_some()
+        {
+            ctx.matched_proxy
+                .as_ref()
+                .and_then(|proxy| self.route_branch_table_for_proxy(proxy))
+        } else {
+            None
+        };
+        let branch_source_scope = route_branches
+            .as_ref()
+            .and_then(|_| ctx.node_waypoint_policy_scope.clone());
+        let mut executed_custom_provider: Option<String> = None;
+        let mut branch_own_deferred = false;
         let evaluation = if relay_policy_superset_request {
             // Destination-aware inbound relay. ServiceWaypoint byte-stream and
             // UDP CONNECTs both resolve the exact destination workload scope;
@@ -4084,6 +4815,34 @@ impl Plugin for MeshAuthz {
                         .as_ref()
                         .is_some_and(|proxy| self.proxy_requires_destination_scope(proxy))
                 {
+                    // The route's own destination cannot be resolved, but
+                    // route dispatch may still select another candidate:
+                    // record the own destination as refused and let each
+                    // candidate's verdict decide (issue #7383).
+                    if let Some(table) = route_branches.as_ref() {
+                        let mut record = self.route_branch_record(
+                            table,
+                            &request,
+                            branch_source_scope.as_deref(),
+                            None,
+                        );
+                        if record.allowed != 0 {
+                            record.evaluated |= 1;
+                            record.outcomes.push((
+                                0,
+                                NodeWaypointBranchOutcome::Deny {
+                                    policy: "destination_scope_missing".to_string(),
+                                    kind: NodeWaypointBranchDenyKind::DestinationScopeMissing,
+                                },
+                            ));
+                            install_node_waypoint_route_branch_authz(
+                                ctx,
+                                record,
+                                source_for_log.as_deref(),
+                            );
+                            return PluginResult::Continue;
+                        }
+                    }
                     ctx.metadata.insert(
                         "mesh_authz.destination_scope_missing".to_string(),
                         "true".to_string(),
@@ -4217,7 +4976,12 @@ impl Plugin for MeshAuthz {
                     )
                     .await
                 {
-                    None => evaluation.decision,
+                    None => {
+                        if route_branches.is_some() {
+                            executed_custom_provider = Some(delegation.provider.clone());
+                        }
+                        evaluation.decision
+                    }
                     Some(reject) => {
                         ctx.metadata.insert(
                             "mesh_authz.deny_policy".to_string(),
@@ -4245,7 +5009,54 @@ impl Plugin for MeshAuthz {
             ctx.metadata
                 .insert("mesh_authz.scope_missing".to_string(), "true".to_string());
         }
-        let result = self.decision_to_result(decision, &mut ctx.metadata);
+        let result = match route_branches.as_ref() {
+            Some(table) => {
+                // The route's own verdict is candidate 0; every other
+                // candidate is judged by its own destination policy. The
+                // request continues while ANY candidate is allowed, and the
+                // destination it finally reaches is admitted only on its own
+                // verdict (`enforce_node_waypoint_route_branch`). When every
+                // candidate refuses, the own destination's refusal stands now.
+                let mut record = self.route_branch_record(
+                    table,
+                    &request,
+                    branch_source_scope.as_deref(),
+                    executed_custom_provider.as_deref(),
+                );
+                let own_allowed = !matches!(decision, MeshAuthzDecision::Deny { .. });
+                if own_allowed || record.allowed != 0 {
+                    record.evaluated |= 1;
+                    match decision {
+                        MeshAuthzDecision::Allow => record.allowed |= 1,
+                        MeshAuthzDecision::Audit { policy } => {
+                            record.allowed |= 1;
+                            record
+                                .outcomes
+                                .push((0, NodeWaypointBranchOutcome::Audit(policy)));
+                        }
+                        MeshAuthzDecision::Deny { policy } => {
+                            branch_own_deferred = true;
+                            record.outcomes.push((
+                                0,
+                                NodeWaypointBranchOutcome::Deny {
+                                    policy,
+                                    kind: NodeWaypointBranchDenyKind::Policy,
+                                },
+                            ));
+                        }
+                    }
+                    install_node_waypoint_route_branch_authz(
+                        ctx,
+                        record,
+                        source_for_log.as_deref(),
+                    );
+                    PluginResult::Continue
+                } else {
+                    self.decision_to_result(decision, &mut ctx.metadata)
+                }
+            }
+            None => self.decision_to_result(decision, &mut ctx.metadata),
+        };
         // NodeWaypoint stamps destinations when scoped policy filtering is
         // active. ServiceWaypoint byte-stream and UDP relays must stamp as well:
         // their exact backend supplied the destination scopes above even though
@@ -4254,6 +5065,7 @@ impl Plugin for MeshAuthz {
         // authorized.
         if (scoped_policy_census || self.service_waypoint_destination_scope_required)
             && matches!(result, PluginResult::Continue)
+            && !branch_own_deferred
             && let Some(destination) = authorized_destination
         {
             match destination {
