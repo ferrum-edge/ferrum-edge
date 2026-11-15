@@ -4459,12 +4459,46 @@ impl CarriedRouteHostIndex {
         if let Some((namespace, name)) = self.qualified.get(&host) {
             return CarriedRouteHost::Service(namespace.clone(), name.clone());
         }
-        if host.ends_with(".svc") || host.ends_with(&self.svc_suffix) {
+        // Every Service alias form the translator recognises
+        // (`service_host_components`: `<svc>.<ns>`, `<svc>.<ns>.svc`,
+        // `<svc>.<ns>.svc.<domain>`) is a Service, so an absent one is refused
+        // rather than dialed as an external host. Cluster DNS search domains
+        // resolve a two-label name in-cluster too.
+        if host.matches('.').count() == 1
+            || host.ends_with(".svc")
+            || host.ends_with(&self.svc_suffix)
+        {
             CarriedRouteHost::UnmodeledService
         } else {
             CarriedRouteHost::External
         }
     }
+}
+
+/// Whether a visible DestinationRule names this Service's host. A weighted
+/// split dials the Service's workloads through its own upstream, which a
+/// Service-host DestinationRule does not match, so such a split is refused
+/// instead of silently running without the rule (fail-closed; over-matching
+/// only refuses more).
+fn service_has_destination_rule(
+    mesh_slice: &MeshSlice,
+    namespace: &str,
+    name: &str,
+    cluster_domain: &str,
+) -> bool {
+    let fqdn = format!(
+        "{name}.{namespace}.svc.{}",
+        cluster_domain.trim_matches('.')
+    )
+    .to_ascii_lowercase();
+    mesh_slice.destination_rules.iter().any(|rule| {
+        let host = rule.host.trim().trim_end_matches('.').to_ascii_lowercase();
+        host == "*"
+            || host
+                .strip_prefix('*')
+                .is_some_and(|suffix| fqdn.ends_with(suffix))
+            || destination_rule_host_matches(&host, &rule.namespace, &fqdn)
+    })
 }
 
 /// Rebind the VirtualService HTTP routes a NodeWaypoint slice carries onto the
@@ -4511,7 +4545,10 @@ fn bind_carried_http_routes_to_node_waypoint_transport(
             .then_some(id)
     };
 
-    // 1. Weighted splits.
+    // 1. Weighted splits. Each leg is resolved to its dial targets first, then
+    // ONE scale is applied to every leg (external legs included) so the
+    // configured ratios survive, and each leg's share is divided across its
+    // targets.
     let split_ids: Vec<(String, String)> = config
         .upstreams
         .iter()
@@ -4523,6 +4560,7 @@ fn bind_carried_http_routes_to_node_waypoint_transport(
         .map(|upstream| (upstream.namespace.clone(), upstream.id.clone()))
         .collect();
     let mut failed_splits: HashSet<(String, String)> = HashSet::new();
+    let mut policy_refused_splits = 0usize;
     for (namespace, id) in split_ids {
         let Some(split) = config
             .upstreams
@@ -4531,13 +4569,23 @@ fn bind_carried_http_routes_to_node_waypoint_transport(
         else {
             continue;
         };
-        let mut targets = Vec::new();
+        // (leg weight, dial targets for that leg)
+        let mut legs: Vec<(u32, Vec<crate::config::types::UpstreamTarget>)> = Vec::new();
         let mut rebound = true;
+        let mut governed_by_destination_rule = false;
         for target in &split.targets {
             match hosts.classify(&namespace, &target.host) {
-                CarriedRouteHost::External => targets.push(target.clone()),
+                CarriedRouteHost::External => legs.push((target.weight, vec![target.clone()])),
                 CarriedRouteHost::UnmodeledService => rebound = false,
                 CarriedRouteHost::Service(service_namespace, service_name) => {
+                    if service_has_destination_rule(
+                        mesh_slice,
+                        &service_namespace,
+                        &service_name,
+                        &runtime.cluster_domain,
+                    ) {
+                        governed_by_destination_rule = true;
+                    }
                     let Some(service_upstream_id) =
                         service_upstream(config, &service_namespace, &service_name, target.port)
                     else {
@@ -4551,35 +4599,43 @@ fn bind_carried_http_routes_to_node_waypoint_transport(
                         rebound = false;
                         continue;
                     };
-                    let workloads =
-                        u32::try_from(service_upstream.targets.len().max(1)).unwrap_or(u32::MAX);
-                    let weight = (target.weight.saturating_mul(1000) / workloads)
-                        .clamp(1, crate::config::types::MAX_TARGET_WEIGHT);
-                    for workload_target in &service_upstream.targets {
-                        let mut rebound_target = workload_target.clone();
-                        rebound_target.weight = weight;
-                        rebound_target.service_port_policy_key = Some(target.port);
-                        rebound_target.tags.insert(
-                            UPSTREAM_TARGET_SERVICE_NAMESPACE_TAG.to_string(),
-                            service_namespace.clone(),
-                        );
-                        rebound_target.tags.insert(
-                            UPSTREAM_TARGET_SERVICE_NAME_TAG.to_string(),
-                            service_name.clone(),
-                        );
-                        rebound_target.tags.insert(
-                            UPSTREAM_TARGET_SERVICE_PORT_TAG.to_string(),
-                            target.port.to_string(),
-                        );
-                        targets.push(rebound_target);
+                    let leg_targets = service_upstream
+                        .targets
+                        .iter()
+                        .map(|workload_target| {
+                            let mut rebound_target = workload_target.clone();
+                            rebound_target.service_port_policy_key = Some(target.port);
+                            rebound_target.tags.insert(
+                                UPSTREAM_TARGET_SERVICE_NAMESPACE_TAG.to_string(),
+                                service_namespace.clone(),
+                            );
+                            rebound_target.tags.insert(
+                                UPSTREAM_TARGET_SERVICE_NAME_TAG.to_string(),
+                                service_name.clone(),
+                            );
+                            rebound_target.tags.insert(
+                                UPSTREAM_TARGET_SERVICE_PORT_TAG.to_string(),
+                                target.port.to_string(),
+                            );
+                            rebound_target
+                        })
+                        .collect::<Vec<_>>();
+                    if leg_targets.is_empty() {
+                        rebound = false;
+                        continue;
                     }
+                    legs.push((target.weight, leg_targets));
                 }
             }
         }
-        if !rebound || targets.is_empty() {
+        if governed_by_destination_rule {
+            policy_refused_splits += 1;
+        }
+        if !rebound || governed_by_destination_rule || legs.is_empty() {
             failed_splits.insert((namespace, id));
             continue;
         }
+        let targets = split_targets_with_common_scale(legs);
         let weighted = targets
             .first()
             .is_some_and(|first| targets.iter().any(|target| target.weight != first.weight));
@@ -4727,26 +4783,134 @@ fn bind_carried_http_routes_to_node_waypoint_transport(
             serde_json::Value::String(upstream_id),
         );
     }
-    if dropped.is_empty() {
-        return;
+    if !dropped.is_empty() {
+        warn!(
+            routes = dropped.len(),
+            destination_rule_splits = policy_refused_splits,
+            "NodeWaypoint VirtualService routes refused: a destination is an in-cluster Service \
+             this waypoint cannot reach over its mesh transport, or a weighted split names a \
+             Service governed by a DestinationRule; their hosts use the materialized Service \
+             routes"
+        );
+        config
+            .proxies
+            .retain(|proxy| !dropped.contains(&(proxy.namespace.clone(), proxy.id.clone())));
+        config.plugin_configs.retain(|plugin| {
+            plugin.proxy_id.as_deref().is_none_or(|proxy_id| {
+                !dropped.contains(&(plugin.namespace.clone(), proxy_id.to_string()))
+            })
+        });
     }
-    warn!(
-        routes = dropped.len(),
-        "NodeWaypoint VirtualService routes refused: a destination is an in-cluster Service \
-         this waypoint cannot reach over its mesh transport; their hosts use the materialized \
-         Service routes"
-    );
-    config
+    // Prune carried split upstreams no surviving route or dispatch rule names
+    // (failed splits included): a leftover still names Service DNS hosts and
+    // would reach DestinationRule application.
+    let mut referenced_splits: HashSet<(String, String)> = config
         .proxies
-        .retain(|proxy| !dropped.contains(&(proxy.namespace.clone(), proxy.id.clone())));
-    config.plugin_configs.retain(|plugin| {
-        plugin.proxy_id.as_deref().is_none_or(|proxy_id| {
-            !dropped.contains(&(plugin.namespace.clone(), proxy_id.to_string()))
+        .iter()
+        .filter_map(|proxy| {
+            proxy
+                .upstream_id
+                .as_ref()
+                .map(|id| (proxy.namespace.clone(), id.clone()))
         })
+        .collect();
+    for plugin in &config.plugin_configs {
+        if plugin.plugin_name == "mesh_route_dispatch" {
+            for id in slice::mesh_route_dispatch_rule_upstream_ids(&plugin.config) {
+                referenced_splits.insert((plugin.namespace.clone(), id.to_string()));
+            }
+        }
+    }
+    config.upstreams.retain(|upstream| {
+        !upstream
+            .id
+            .starts_with(slice::VIRTUAL_SERVICE_HTTP_ROUTE_UPSTREAM_ID_PREFIX)
+            || referenced_splits.contains(&(upstream.namespace.clone(), upstream.id.clone()))
     });
-    // Re-run materialization so the hosts the dropped routes shadowed get
-    // their Service routes back.
-    materialize_mesh_outbound_proxies(config, runtime, mesh_slice);
+    // A carried route declaring a modeled Service's host (`reviews`, or its
+    // FQDN) stands for that Service under every name a client can use, like
+    // the Service route it shadows, so it answers all of the Service's host
+    // spellings. A spelling another carried route already declares on the
+    // same path stays with that route.
+    expand_carried_route_service_hosts(config, &hosts, &runtime.cluster_domain);
+    if !dropped.is_empty() {
+        // Re-run materialization so the hosts the dropped routes shadowed
+        // get their Service routes back.
+        materialize_mesh_outbound_proxies(config, runtime, mesh_slice);
+    }
+}
+
+/// Spread every leg's share over its targets with one common scale, so the
+/// effective ratio between legs is the configured one: a target's weight is
+/// `leg_weight / leg_targets`, scaled so the largest target weight is
+/// `MAX_TARGET_WEIGHT`. Every target keeps a weight of at least 1.
+fn split_targets_with_common_scale(
+    legs: Vec<(u32, Vec<crate::config::types::UpstreamTarget>)>,
+) -> Vec<crate::config::types::UpstreamTarget> {
+    let per_target = |weight: u32, targets: usize| f64::from(weight) / targets.max(1) as f64;
+    let largest = legs
+        .iter()
+        .map(|(weight, targets)| per_target(*weight, targets.len()))
+        .fold(0.0_f64, f64::max);
+    let scale = if largest > 0.0 {
+        f64::from(crate::config::types::MAX_TARGET_WEIGHT) / largest
+    } else {
+        1.0
+    };
+    let mut out = Vec::new();
+    for (weight, targets) in legs {
+        let scaled = (per_target(weight, targets.len()) * scale).round();
+        let target_weight = if scaled.is_finite() {
+            (scaled as u32).clamp(1, crate::config::types::MAX_TARGET_WEIGHT)
+        } else {
+            1
+        };
+        for mut target in targets {
+            target.weight = target_weight;
+            out.push(target);
+        }
+    }
+    out
+}
+
+/// Give each carried route that declares a modeled Service's host all of that
+/// Service's host spellings (see `bind_carried_http_routes_to_node_waypoint_transport`).
+fn expand_carried_route_service_hosts(
+    config: &mut GatewayConfig,
+    hosts: &CarriedRouteHostIndex,
+    cluster_domain: &str,
+) {
+    let mut claimed: HashSet<(String, Option<String>)> = HashSet::new();
+    for proxy in &config.proxies {
+        if config::is_virtual_service_http_route_proxy_id(&proxy.id) {
+            for host in &proxy.hosts {
+                claimed.insert((host.to_ascii_lowercase(), proxy.listen_path.clone()));
+            }
+        }
+    }
+    for proxy in &mut config.proxies {
+        if !config::is_virtual_service_http_route_proxy_id(&proxy.id) {
+            continue;
+        }
+        let mut added = Vec::new();
+        for host in &proxy.hosts {
+            if let CarriedRouteHost::Service(namespace, name) =
+                hosts.classify(&proxy.namespace, host)
+            {
+                for variant in mesh_service_host_variants(&name, &namespace, cluster_domain) {
+                    // A bare name means a Service in the route's own namespace.
+                    if !variant.contains('.') && namespace != proxy.namespace {
+                        continue;
+                    }
+                    let key = (variant.to_ascii_lowercase(), proxy.listen_path.clone());
+                    if claimed.insert(key) {
+                        added.push(variant);
+                    }
+                }
+            }
+        }
+        proxy.hosts.extend(added);
+    }
 }
 
 /// Resolve Istio `sourceLabels` / `sourceNamespace` as Sidecar-applicability

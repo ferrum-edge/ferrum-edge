@@ -5125,13 +5125,20 @@ fn virtual_service_mesh_export_to(object: &K8sObject) -> Result<Vec<String>, K8s
 }
 
 /// The mesh export list of a VirtualService whose HTTP routes apply to mesh
-/// data planes, or `None` when `spec.gateways` names only ingress gateways
-/// (issue #7233). An omitted `gateways` defaults to `mesh`, as in Istio.
+/// data planes, or `None` when `spec.gateways` does not bind the mesh (issue
+/// #7233). Only an OMITTED `gateways` defaults to `mesh`, as in Istio; the
+/// value is read with the strict L4 parser, so a non-array, an empty array, or
+/// a non-string entry never collapses to that default and binds nothing (the
+/// gateway routes still translate).
 fn virtual_service_mesh_http_route_export_to(
     object: &K8sObject,
 ) -> Result<Option<Vec<String>>, K8sTranslateError> {
-    let gateways = string_array(&object.spec, "gateways");
-    if !gateways.is_empty() && !gateways.iter().any(|gateway| gateway == "mesh") {
+    let binds_mesh = parse_l4_virtual_service_gateways(object).is_ok_and(|gateways| {
+        gateways
+            .iter()
+            .any(|gateway| gateway == crate::proxy::stream_match::MESH_GATEWAY_TOKEN)
+    });
+    if !binds_mesh {
         return Ok(None);
     }
     virtual_service_mesh_export_to(object).map(Some)

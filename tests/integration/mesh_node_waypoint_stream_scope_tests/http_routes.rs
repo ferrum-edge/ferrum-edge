@@ -15,7 +15,7 @@ use ferrum_edge::config_sources::k8s::{
     K8sMetadata, K8sObject, K8sTranslationOptions, translate_k8s_objects,
 };
 use ferrum_edge::identity::spiffe::{SpiffeId, TrustDomain};
-use ferrum_edge::modes::mesh::config::{MeshConfig, PolicyScope, WorkloadSelector};
+use ferrum_edge::modes::mesh::config::{MeshConfig, PolicyScope, WorkloadRef, WorkloadSelector};
 use ferrum_edge::modes::mesh::runtime::PolicyScopeCache;
 use ferrum_edge::modes::mesh::slice::{MeshSlice, MeshSliceRequest};
 use ferrum_edge::modes::mesh::{
@@ -634,10 +634,12 @@ fn a_route_to_an_unmodeled_cluster_service_is_refused() {
     );
 }
 
-/// Review finding dsf F2: a split across two Services with different
-/// DestinationRules is served, not refused as an unrepresentable upstream.
+/// Review findings dsf F2 (round 1) and sol F2 (round 2): a split across
+/// Services that DestinationRules govern would dial their workloads without
+/// the rules, so the split route is refused; the slice still materializes and
+/// both Services keep their own routes (which do carry the rules).
 #[test]
-fn a_split_across_services_with_their_own_destination_rules_is_served() {
+fn a_split_across_destination_rule_governed_services_is_refused_not_the_slice() {
     let config = translated_config(&[
         virtual_service("split", split_spec(json!({}))),
         destination_rule("reviews-dr", "reviews.default.svc.cluster.local", "RANDOM"),
@@ -652,11 +654,226 @@ fn a_split_across_services_with_their_own_destination_rules_is_served() {
     assert_eq!(slice.destination_rules.len(), 2);
     let split_id = carried_ids(&slice.http_routes.upstreams).remove(0);
     let prepared = prepare_gateway_config_from_mesh_slice(&slice, &runtime)
-        .expect("a split over two DestinationRule-governed Services materializes");
+        .expect("the slice materializes without the refused split");
+    assert!(carried_route_proxies(&prepared).is_empty());
     assert!(
-        prepared
+        !prepared
+            .upstreams
+            .iter()
+            .any(|upstream| upstream.id == split_id),
+        "the refused split's upstream is pruned"
+    );
+    for service in ["reviews", "ratings"] {
+        assert!(
+            prepared.proxies.iter().any(|proxy| proxy
+                .upstream_id
+                .as_deref()
+                .is_some_and(|id| id.starts_with("__mesh-out") && id.contains(service))),
+            "{service} keeps its Service route"
+        );
+    }
+}
+
+fn add_reviews_replica(config: &mut GatewayConfig, address: &'static str) {
+    let replica = workload_for(
+        "reviews-replica",
+        DEFAULT_NAMESPACE,
+        [("app", "reviews")],
+        [address],
+    );
+    let mesh = config.mesh.as_mut().expect("mesh block");
+    let reviews = mesh
+        .services
+        .iter_mut()
+        .find(|service| service.name == "reviews")
+        .expect("reviews service");
+    reviews.workloads.push(WorkloadRef {
+        spiffe_id: replica.spiffe_id.clone(),
+    });
+    mesh.workloads.push(replica);
+}
+
+fn split_target_weights(prepared: &GatewayConfig, split_id: &str) -> HashMap<String, u32> {
+    prepared
+        .upstreams
+        .iter()
+        .find(|upstream| upstream.id == split_id)
+        .expect("split served")
+        .targets
+        .iter()
+        .map(|target| (target.host.clone(), target.weight))
+        .collect()
+}
+
+/// Review findings sol F3 / dsf F2 (round 2): unequal leg weights keep their
+/// ratio across one common scale, and a leg's share is divided across its
+/// workloads.
+#[test]
+fn split_weights_keep_the_configured_ratio_across_legs_and_workloads() {
+    let mut spec = split_spec(json!({}));
+    spec["http"][0]["route"][0]["weight"] = json!(90);
+    spec["http"][0]["route"][1]["weight"] = json!(10);
+    let mut config = translated_config(&[virtual_service("split", spec)]);
+    add_reviews_replica(&mut config, "10.0.0.21");
+    let runtime = node_waypoint_runtime();
+    let slice = node_waypoint_slice(&config, &runtime);
+    let split_id = carried_ids(&slice.http_routes.upstreams).remove(0);
+    let prepared =
+        prepare_gateway_config_from_mesh_slice(&slice, &runtime).expect("slice materializes");
+    let weights = split_target_weights(&prepared, &split_id);
+    let reviews = f64::from(weights["10.0.0.11"]) + f64::from(weights["10.0.0.21"]);
+    let ratings = f64::from(weights["10.0.0.12"]);
+    assert_eq!(
+        weights["10.0.0.11"], weights["10.0.0.21"],
+        "a leg's share is split evenly across its workloads"
+    );
+    let ratio = reviews / ratings;
+    assert!(
+        (ratio - 9.0).abs() < 0.01,
+        "90/10 must stay 9:1 across the legs, got {ratio}"
+    );
+}
+
+/// Review findings sol F3 / dsf F2 (round 2): an external leg is scaled with
+/// the in-mesh legs, so a 50/50 split stays 50/50.
+#[test]
+fn a_mixed_internal_and_external_split_keeps_its_ratio() {
+    let mut spec = split_spec(json!({}));
+    spec["http"][0]["route"][1]["destination"] = json!({
+        "host": "api.example.com",
+        "port": {"number": 443}
+    });
+    let config = translated_config(&[virtual_service("split", spec)]);
+    let runtime = node_waypoint_runtime();
+    let slice = node_waypoint_slice(&config, &runtime);
+    let split_id = carried_ids(&slice.http_routes.upstreams).remove(0);
+    let prepared =
+        prepare_gateway_config_from_mesh_slice(&slice, &runtime).expect("slice materializes");
+    let weights = split_target_weights(&prepared, &split_id);
+    assert_eq!(weights.len(), 2, "one workload and one external target");
+    assert_eq!(
+        weights["10.0.0.11"], weights["api.example.com"],
+        "50/50 between a Service and an external host stays 50/50"
+    );
+}
+
+/// Review findings sol F4 / dsf F3 (round 2): a split with an unreachable leg
+/// is refused and its upstream pruned, so the Services' distinct
+/// DestinationRules cannot refuse the whole slice through the leftover.
+#[test]
+fn an_unreachable_split_leg_refuses_the_route_and_prunes_the_split() {
+    let mut config = translated_config(&[
+        virtual_service("split", split_spec(json!({}))),
+        destination_rule("reviews-dr", "reviews.default.svc.cluster.local", "RANDOM"),
+        destination_rule(
+            "ratings-dr",
+            "ratings.default.svc.cluster.local",
+            "ROUND_ROBIN",
+        ),
+    ]);
+    let mesh = config.mesh.as_mut().expect("mesh block");
+    for workload in &mut mesh.workloads {
+        if workload.service_name == "ratings" {
+            workload.addresses.clear();
+        }
+    }
+    let runtime = node_waypoint_runtime();
+    let slice = node_waypoint_slice(&config, &runtime);
+    let split_id = carried_ids(&slice.http_routes.upstreams).remove(0);
+    let prepared = prepare_gateway_config_from_mesh_slice(&slice, &runtime)
+        .expect("the slice materializes without the refused split");
+    assert!(carried_route_proxies(&prepared).is_empty());
+    assert!(
+        !prepared
             .upstreams
             .iter()
             .any(|upstream| upstream.id == split_id)
     );
+}
+
+/// Review finding sol F1 (round 2): a two-label `<svc>.<ns>` alias of a Service
+/// the slice does not model is refused, never dialed as an external host.
+#[test]
+fn a_two_label_alias_of_an_unmodeled_service_is_refused() {
+    for host in ["missing.default", "ratings.other"] {
+        let config = translated_config(&[virtual_service(
+            "alias",
+            json!({
+                "hosts": ["reviews.default.svc.cluster.local"],
+                "http": [{
+                    "route": [{
+                        "destination": {"host": host, "port": {"number": 8080}}
+                    }]
+                }]
+            }),
+        )]);
+        let runtime = node_waypoint_runtime();
+        let slice = node_waypoint_slice(&config, &runtime);
+        assert!(!slice.http_routes.proxies.is_empty(), "{host}");
+        let prepared =
+            prepare_gateway_config_from_mesh_slice(&slice, &runtime).expect("slice materializes");
+        assert!(carried_route_proxies(&prepared).is_empty(), "{host}");
+    }
+}
+
+fn direct_route(hosts: serde_json::Value) -> serde_json::Value {
+    json!({
+        "hosts": hosts,
+        "http": [{
+            "route": [{
+                "destination": {
+                    "host": "reviews.default.svc.cluster.local",
+                    "port": {"number": 8080}
+                }
+            }]
+        }]
+    })
+}
+
+/// Review finding dsf F1 (round 2): a carried route declaring a Service by
+/// short name or by FQDN answers every spelling of that Service's host, like
+/// the Service route it shadows.
+#[test]
+fn a_carried_route_answers_every_spelling_of_its_service_host() {
+    for declared in ["reviews", "reviews.default.svc.cluster.local"] {
+        let config =
+            translated_config(&[virtual_service("direct", direct_route(json!([declared])))]);
+        let runtime = node_waypoint_runtime();
+        let slice = node_waypoint_slice(&config, &runtime);
+        let prepared =
+            prepare_gateway_config_from_mesh_slice(&slice, &runtime).expect("slice materializes");
+        let routes = carried_route_proxies(&prepared);
+        assert!(!routes.is_empty(), "{declared}");
+        for route in routes {
+            for spelling in [
+                "reviews",
+                "reviews.default",
+                "reviews.default.svc",
+                "reviews.default.svc.cluster.local",
+            ] {
+                assert!(
+                    route.hosts.iter().any(|host| host == spelling),
+                    "declared {declared:?}: missing {spelling:?} in {:?}",
+                    route.hosts
+                );
+            }
+        }
+    }
+}
+
+/// Review finding dsf F4 (round 2): a malformed or empty `spec.gateways` never
+/// falls back to the `mesh` default.
+#[test]
+fn a_malformed_gateways_field_does_not_bind_the_mesh() {
+    for gateways in [json!([]), json!("istio-system/public"), json!([7])] {
+        let config = translated_config(&[virtual_service(
+            "split",
+            split_spec(json!({"gateways": gateways.clone()})),
+        )]);
+        let mesh = config.mesh.as_ref().expect("mesh block");
+        assert!(
+            mesh.virtual_service_http_routes.is_empty(),
+            "gateways {gateways} must not bind the mesh"
+        );
+    }
 }
