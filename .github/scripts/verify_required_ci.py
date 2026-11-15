@@ -39,6 +39,7 @@ from pr_ci_plan import (
     JOB_GATE_NAMES,
     UNCLASSIFIABLE_REASON,
     self_test as planner_self_test,
+    validate_doc_parity_inputs,
 )
 from validate_live_assertions import (
     run_self_test as live_assertion_validator_self_test,
@@ -2438,6 +2439,11 @@ def main() -> int:
     # influence which jobs the trusted scheduler selected.
     if planner_self_test() != 0:
         planner_errors.append("proposed PR CI planner self-test failed")
+    # The doc-parity drift check reads the checkout's parity test, so it runs
+    # here with the proposed planner (same revision as the test), never from
+    # the trusted-base self-test, which would compare the base input set with
+    # a candidate test and refuse every change to the test's inputs.
+    planner_errors.extend(validate_doc_parity_inputs(Path.cwd()))
     if ci_gate_replay_self_test() != 0:
         planner_errors.append("CI gate replay self-test failed")
     try:
