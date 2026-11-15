@@ -1,7 +1,7 @@
 # ferrum-mesh Helm chart
 
 Deploys Ferrum Edge service-mesh components: control plane, sidecar injector,
-east-west gateway, mesh CA, ambient/node-agent DaemonSets, and optional
+east-west gateway, ambient/node-agent DaemonSets, and optional
 observability assets. Core gateway modes (`database`, `file`, `cp`, `dp`) belong
 in the sibling [`ferrum-gateway`](../ferrum-gateway) chart — the two charts share
 naming, labelling, secret, and validation conventions.
@@ -11,7 +11,6 @@ naming, labelling, secret, and validation conventions.
 | Control plane | `controlPlane.enabled` | `false` | Requires DB + JWT secrets |
 | Injector webhook | `injector.enabled` | `false` | Requires TLS Secret **and** exactly one CA trust source (`injector.caBundle` or `injector.certManager.injectCaFrom`) |
 | East-west gateway | `eastWest.enabled` | `false` | Cross-cluster SNI passthrough |
-| Mesh CA | `ca.enabled` | `false` | Fixed one replica; gRPC Service `ferrum-mesh-ca` on `ca.grpcPort` (see [Mesh CA](#mesh-ca)) |
 | Ambient proxy | `ambient.enabled` | `false` | Requires `nodeAgent.enabled` |
 | Node agent | `nodeAgent.enabled` | `false` | eBPF capture manager |
 
@@ -26,31 +25,35 @@ its Service port, and the listener itself: the chart renders
 `FERRUM_CP_GRPC_LISTEN_ADDR`, in which case that value is used unchanged and must
 listen on the same port.
 
-## Mesh CA
+## Workload identity
 
-`ca.enabled=true` adds the `ferrum-mesh-ca` Deployment: one replica of the
-Ferrum binary in `FERRUM_MODE=cp`, sharing the control plane's database and
-JWT credentials. It serves the CP gRPC API (ConfigSync and MeshConfigSync) on
-`ca.grpcPort` (default `50051`) and is reachable in-cluster through the
-`ferrum-mesh-ca` Service at `ferrum-mesh-ca.<release namespace>.svc:<ca.grpcPort>`
-(port name `grpc`). The chart renders `FERRUM_CP_GRPC_LISTEN_ADDR=0.0.0.0:<ca.grpcPort>`
-unless `ca.env` sets it. Admin health and metrics stay off that Service: the
-admin listener backs the probes and, with observability enabled, the dedicated
-`ferrum-mesh-ca-metrics` Service.
+The chart deploys no certificate authority. Mesh data planes (sidecars, the
+ambient NodeWaypoint, the east-west gateway) get their SPIFFE identity from one
+of the supported sources, set through the component's `env`:
 
-The CA has no Kubernetes RBAC and mounts no API token, so the chart sets
-`FERRUM_K8S_CONTROLLER_ENABLED=false` and `FERRUM_K8S_POD_DISCOVERY_ENABLED=false`
-for it unless `ca.env` sets them; the control plane owns the Kubernetes watches.
-Like the control plane, the CA refuses a plaintext non-loopback CP gRPC bind, so
-the render fails unless `ca.env` sets `FERRUM_CP_GRPC_TLS_CERT_PATH` and
-`FERRUM_CP_GRPC_TLS_KEY_PATH` (mounted), binds a loopback
-`FERRUM_CP_GRPC_LISTEN_ADDR`, or opts into `FERRUM_CP_DP_GRPC_ALLOW_PLAINTEXT="true"`
-(development only; `examples/development-values.yaml` does this).
+- `FERRUM_MESH_CA_BACKEND=spire`: fetch the SVID from a SPIRE Agent over the
+  Workload API (`FERRUM_MESH_SPIRE_AGENT_SOCKET`). This is the production path;
+  see `docs/spire_deployment.md`.
+- File SVIDs: `FERRUM_GATEWAY_SVID_CERT_PATH`, `FERRUM_GATEWAY_SVID_KEY_PATH` and
+  `FERRUM_GATEWAY_SVID_TRUST_BUNDLE_PATH` from mounted Secrets.
+- `FERRUM_MESH_CA_BACKEND=internal`: Ferrum's in-process CA. It is dev-only
+  (`FERRUM_MESH_CA_BOOTSTRAP_DEV=true`, refused under
+  `FERRUM_MESH_PRODUCTION_MODE=true`) and process-local, so two processes using
+  it cannot mTLS each other.
 
-Workload identity does not come from this Deployment: mesh data planes get their
-SVIDs from `FERRUM_MESH_CA_BACKEND=spire` (SPIRE Agent), file SVIDs, or the
-process-local `internal` dev CA (see `docs/mesh.md`). Data planes that should
-reach the CA's CP gRPC API list it in `FERRUM_DP_CP_GRPC_URLS`.
+The earlier standalone `ca` component (`ca.enabled`) was removed: it ran a
+second `FERRUM_MODE=cp` process and issued no certificates. See
+`docs/upgrade_guide.md`.
+
+The control plane refuses a plaintext non-loopback CP gRPC bind at startup, and
+the chart fails the render in the same case: set
+`controlPlane.env.FERRUM_CP_GRPC_TLS_CERT_PATH` and
+`controlPlane.env.FERRUM_CP_GRPC_TLS_KEY_PATH` (mounted, as
+`examples/production-existing-secrets-values.yaml` does), or set
+`controlPlane.env.FERRUM_CP_DP_GRPC_ALLOW_PLAINTEXT: "true"` (development and
+test only; `examples/development-values.yaml` does this). Binding the listener
+to loopback also satisfies the check, but then the control-plane Service and
+the data planes cannot reach it.
 
 ## Container image tag
 
@@ -81,7 +84,7 @@ helm install ferrum ./charts/ferrum-mesh --namespace ferrum \
   --set 'image.pullSecrets[0]=regcred'
 ```
 
-The names are attached to **every** mesh pod spec — control plane, CA,
+The names are attached to **every** mesh pod spec — control plane,
 east-west gateway, injector, ambient DaemonSet, node agent, and both CNI
 uninstall-hook pods — including workloads that use the `nodeAgent.image` tag
 override. The uninstall-hook pods matter: they run the Ferrum image, so without
@@ -183,7 +186,7 @@ When `injector.enabled=true`, the rendered `MutatingWebhookConfiguration`:
 
 1. **Always** appends `kubernetes.io/metadata.name NotIn [<release namespace>]`
    to `namespaceSelector`, even when `injector.namespaceSelector` is overridden.
-   Pods in the release namespace (injector, control plane, mesh CA, east-west
+   Pods in the release namespace (injector, control plane, east-west
    gateway) are therefore never gated on the webhook.
 2. Sets `objectSelector` to `app.kubernetes.io/name NotIn [ferrum-mesh-injector]`
    so injector pods are excluded by label regardless of namespace.
@@ -232,14 +235,13 @@ spreads pods across `kubernetes.io/hostname` (`ScheduleAnyway`). Set
 **Explicit non-HA defaults** (PDB skipped — `minAvailable: 1` would block drains):
 
 - `controlPlane.replicas: 1` — single-node lab installs (`examples/development-values.yaml`). Raise to `>= 2` before production control planes.
-- `ca` — hard-coded to one replica in the template.
 
 Set any data-path workload to `replicas: 1` only as a deliberate lab choice; the
 PDB is omitted automatically.
 
 ## Graceful shutdown
 
-Serving workloads (`controlPlane`, `ca`, `eastWest`, `ambient`) ship the same
+Serving workloads (`controlPlane`, `eastWest`, `ambient`) ship the same
 additive drain contract as `ferrum-gateway` (`docs/graceful_shutdown.md`):
 
 - `FERRUM_SHUTDOWN_DRAIN_SECONDS` / `FERRUM_SHUTDOWN_PREDRAIN_SECONDS`
@@ -249,7 +251,7 @@ additive drain contract as `ferrum-gateway` (`docs/graceful_shutdown.md`):
 Render fails when the grace period is under budget. On Kubernetes &lt;1.29 set
 `shutdownPreStopSeconds: 0` and raise `shutdownPreDrainSeconds` to at least
 readiness `failureThreshold × periodSeconds`. That remediation is real for every
-serving workload here, `controlPlane` and `ca` included: `cp` mode honors
+serving workload here, `controlPlane` included: `cp` mode honors
 `FERRUM_SHUTDOWN_PREDRAIN_SECONDS` (its admin and CP-gRPC accept loops close on
 the same broadcast the window delays, while `/health` already reports
 `ready: false`). One-shot hooks/jobs (CNI uninstall) do not receive this
@@ -309,7 +311,7 @@ instead of CrashLooping the pod:
   are rejected — `EnvConfig::validate()` exits on them.
 - `allowedCidrs` is parsed entry-for-entry like `CidrSet::parse_strict`: bare
   IPv4/IPv6 addresses or CIDRs, no brackets, prefixes in family range.
-- For `controlPlane` and `ca` (which run `cp` mode and hard-fail on a
+- For `controlPlane` (which runs `cp` mode and hard-fails on a
   non-loopback plaintext admin listener), a **full-family** allowlist —
   `0.0.0.0/0`, `::/0`, an IPv4-mapped `/96`, or a union that covers a whole
   family — does not count as protection. Use a narrower allowlist, keep the
@@ -327,7 +329,7 @@ parses `FERRUM_METRICS_ALLOWED_CIDRS` with the same strict parser.
 
 ## Pod security and resources
 
-`controlPlane`, `ca`, and `eastWest` default to restricted-compatible
+`controlPlane` and `eastWest` default to restricted-compatible
 PodSecurity (non-root 65532, drop ALL, no privilege escalation, read-only root,
 RuntimeDefault seccomp, `/tmp` emptyDir) with non-empty CPU/memory requests and
 limits. Their `podSecurityContext` / `securityContext` are free-form and
@@ -385,7 +387,7 @@ and the chart **fails render** when:
   so the scrape verifies the admin certificate;
 - `tlsConfig.insecureSkipVerify: true` is combined with a bearer credential.
 
-Admin HTTPS is available on `controlPlane`, `ca`, `eastWest`, `ambient`, and
+Admin HTTPS is available on `controlPlane`, `eastWest`, `ambient`, and
 `nodeAgent` through the same shape: `admin.httpsPort` (default `0`, so existing
 HTTP-only installs are unchanged) plus `admin.tls`
 (`enabled`, `secretName`, `mountPath`, `certKey`, `keyKey`, optional

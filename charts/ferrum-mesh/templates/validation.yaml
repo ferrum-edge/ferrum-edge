@@ -7,12 +7,7 @@
 {{- if .Values.controlPlane.enabled -}}
 {{- include "ferrum-mesh.validateResources" (dict "component" "controlPlane" "resources" .Values.controlPlane.resources) -}}
 {{- include "ferrum-mesh.validatePlaintextAdmin" (dict "component" "controlPlane" "resolved" (include "ferrum-mesh.resolveComponentAdmin" (dict "component" "controlPlane" "env" (.Values.controlPlane.env | default dict) "admin" (.Values.controlPlane.admin | default dict)) | fromYaml) "hardFail" true "probes" .Values.controlPlane.probes) -}}
-{{- end -}}
-{{- if .Values.ca.enabled -}}
-{{- include "ferrum-mesh.validateResources" (dict "component" "ca" "resources" .Values.ca.resources) -}}
-{{- include "ferrum-mesh.validatePlaintextAdmin" (dict "component" "ca" "resolved" (include "ferrum-mesh.resolveComponentAdmin" (dict "component" "ca" "env" (.Values.ca.env | default dict) "admin" (.Values.ca.admin | default dict)) | fromYaml) "hardFail" true "probes" .Values.ca.probes) -}}
-{{- include "ferrum-mesh.failReservedEnv" (dict "label" "ca.env" "env" .Values.ca.env "names" (list "FERRUM_SHUTDOWN_DRAIN_SECONDS" "FERRUM_SHUTDOWN_PREDRAIN_SECONDS" "FERRUM_METRICS_BEARER_TOKEN" "FERRUM_METRICS_ALLOWED_CIDRS")) -}}
-{{- include "ferrum-mesh.validateCpGrpcTransport" (dict "label" "ca.env" "env" .Values.ca.env "defaultListenAddr" (printf "0.0.0.0:%v" .Values.ca.grpcPort)) -}}
+{{- include "ferrum-mesh.validateCpGrpcTransport" (dict "label" "controlPlane.env" "env" .Values.controlPlane.env "defaultListenAddr" (printf "0.0.0.0:%v" .Values.controlPlane.grpcPort)) -}}
 {{- end -}}
 {{- if .Values.eastWest.enabled -}}
 {{- include "ferrum-mesh.validateResources" (dict "component" "eastWest" "resources" .Values.eastWest.resources) -}}

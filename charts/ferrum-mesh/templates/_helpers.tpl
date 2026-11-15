@@ -116,8 +116,7 @@ Context: root.
 {{- end -}}
 
 {{- define "ferrum-mesh.validateControlPlaneInputs" -}}
-{{- $needsCpConfig := or .Values.controlPlane.enabled .Values.ca.enabled -}}
-{{- if $needsCpConfig -}}
+{{- if .Values.controlPlane.enabled -}}
 {{- $cp := .Values.controlPlane | default dict -}}
 {{- $env := $cp.env | default dict -}}
 {{- range $reserved := list "FERRUM_DB_TYPE" "FERRUM_DB_URL" "FERRUM_ADMIN_JWT_SECRET" "FERRUM_CP_DP_GRPC_JWT_SECRET" "FERRUM_SHUTDOWN_DRAIN_SECONDS" "FERRUM_SHUTDOWN_PREDRAIN_SECONDS" "FERRUM_METRICS_BEARER_TOKEN" "FERRUM_METRICS_ALLOWED_CIDRS" -}}
@@ -127,7 +126,7 @@ Context: root.
 {{- end -}}
 {{- $db := $cp.database | default dict -}}
 {{- if not $db.type -}}
-{{- fail "controlPlane.database.type is required when controlPlane.enabled or ca.enabled is true" -}}
+{{- fail "controlPlane.database.type is required when controlPlane.enabled is true" -}}
 {{- end -}}
 {{- if not (has $db.type (list "sqlite" "postgres" "mysql" "mongodb")) -}}
 {{- fail "controlPlane.database.type must be one of: sqlite, postgres, mysql, mongodb" -}}
@@ -193,7 +192,10 @@ FERRUM_CP_GRPC_LISTEN_ADDR (default `.defaultListenAddr`, the address the chart
 renders from the component's grpcPort, else 0.0.0.0:50051) with no
 FERRUM_CP_GRPC_TLS_CERT_PATH + FERRUM_CP_GRPC_TLS_KEY_PATH pair and no
 FERRUM_CP_DP_GRPC_ALLOW_PLAINTEXT=true exits at boot, so fail the render
-instead of shipping a crash-looping pod (issue #7298).
+instead of shipping a crash-looping pod (issue #7298). A loopback bind still
+passes, as it does at runtime, but the message does not suggest it: the
+control-plane Service targets the pod address, so a loopback-only listener
+would leave the Service with nothing behind it.
 Input: dict "label" <values path of the env map> "env" <env map>
 "defaultListenAddr" <optional chart-rendered listen address>.
 */}}
@@ -205,7 +207,7 @@ Input: dict "label" <values path of the env map> "env" <env map>
 {{- $tls := and (trim (toString (index $env "FERRUM_CP_GRPC_TLS_CERT_PATH" | default ""))) (trim (toString (index $env "FERRUM_CP_GRPC_TLS_KEY_PATH" | default ""))) -}}
 {{- $allowPlaintext := has (lower (trim (toString (index $env "FERRUM_CP_DP_GRPC_ALLOW_PLAINTEXT" | default "")))) (list "true" "1" "yes") -}}
 {{- if and (ne ($port | int) 0) (not $tls) (not $allowPlaintext) (not (include "ferrum-mesh.isLoopbackBind" $host)) -}}
-{{- fail (printf "%s: FERRUM_MODE=cp refuses at startup to bind PLAINTEXT CP gRPC on non-loopback %s. Set %s.FERRUM_CP_GRPC_TLS_CERT_PATH and %s.FERRUM_CP_GRPC_TLS_KEY_PATH (and mount them), bind a loopback FERRUM_CP_GRPC_LISTEN_ADDR (127.0.0.1:50051), or set %s.FERRUM_CP_DP_GRPC_ALLOW_PLAINTEXT=\"true\" to permit plaintext config sync (development only)." .label $addr .label .label .label) -}}
+{{- fail (printf "%s: FERRUM_MODE=cp refuses at startup to bind PLAINTEXT CP gRPC on non-loopback %s. Serve CP gRPC over TLS by setting %s.FERRUM_CP_GRPC_TLS_CERT_PATH and %s.FERRUM_CP_GRPC_TLS_KEY_PATH (and mounting them), or set %s.FERRUM_CP_DP_GRPC_ALLOW_PLAINTEXT=\"true\" to permit plaintext config sync (development and test only). A loopback bind is not a fix here: the control-plane Service and data planes reach the listener on the pod address." .label $addr .label .label .label) -}}
 {{- end -}}
 {{- end -}}
 
@@ -1034,9 +1036,6 @@ older clusters with injector.enabled=false.
 {{- if .Values.controlPlane.enabled -}}
 {{- include "ferrum-mesh.validateShutdown" (dict "root" . "component" "controlPlane" "values" .Values.controlPlane) -}}
 {{- end -}}
-{{- if .Values.ca.enabled -}}
-{{- include "ferrum-mesh.validateShutdown" (dict "root" . "component" "ca" "values" .Values.ca) -}}
-{{- end -}}
 {{- if .Values.eastWest.enabled -}}
 {{- include "ferrum-mesh.validateShutdown" (dict "root" . "component" "eastWest" "values" .Values.eastWest) -}}
 {{- end -}}
@@ -1234,7 +1233,6 @@ falls back to liveHandler exactly as renderProbes does).
 {{- fail "observability ServiceMonitor/PodMonitor without metrics.allowedCidrs requires observability.metrics.bearerToken.existingSecret.name so the monitor can attach Bearer authorization (inline bearerToken.value wires the pod env only — create the Secret out-of-band)" -}}
 {{- end -}}
 {{- $cpAdmin := include "ferrum-mesh.resolveComponentAdmin" (dict "component" "controlPlane" "env" (.Values.controlPlane.env | default dict) "admin" (.Values.controlPlane.admin | default dict)) | fromYaml -}}
-{{- $caAdmin := include "ferrum-mesh.resolveComponentAdmin" (dict "component" "ca" "env" (.Values.ca.env | default dict) "admin" (.Values.ca.admin | default dict)) | fromYaml -}}
 {{- $ewAdmin := include "ferrum-mesh.resolveComponentAdmin" (dict "component" "eastWest" "env" (.Values.eastWest.env | default dict) "admin" (.Values.eastWest.admin | default dict)) | fromYaml -}}
 {{- $ambAdmin := include "ferrum-mesh.resolveComponentAdmin" (dict "component" "ambient" "env" (.Values.ambient.env | default dict) "admin" (.Values.ambient.admin | default dict)) | fromYaml -}}
 {{- if and $smOn .Values.controlPlane.enabled -}}
@@ -1243,14 +1241,6 @@ falls back to liveHandler exactly as renderProbes does).
 {{- end -}}
 {{- if and (eq (toString $cpAdmin.port) "0") (not (include "ferrum-mesh.adminHttpsActive" (dict "resolved" $cpAdmin))) -}}
 {{- fail "observability.metrics.serviceMonitor.enabled=true with controlPlane.enabled=true requires a non-zero controlPlane.admin.httpPort, or a non-zero controlPlane.admin.httpsPort with controlPlane.admin.tls configured, so Prometheus can scrape /metrics" -}}
-{{- end -}}
-{{- end -}}
-{{- if and $smOn .Values.ca.enabled -}}
-{{- if include "ferrum-mesh.isLoopbackBind" $caAdmin.bind -}}
-{{- fail "observability.metrics.serviceMonitor.enabled=true with ca.enabled=true requires a non-loopback ca.admin.bindAddress (e.g. 0.0.0.0 or ::); loopback-bound admin is not reachable through a Service" -}}
-{{- end -}}
-{{- if and (eq (toString $caAdmin.port) "0") (not (include "ferrum-mesh.adminHttpsActive" (dict "resolved" $caAdmin))) -}}
-{{- fail "observability.metrics.serviceMonitor.enabled=true with ca.enabled=true requires a non-zero ca.admin.httpPort, or a non-zero ca.admin.httpsPort with ca.admin.tls configured, so Prometheus can scrape /metrics" -}}
 {{- end -}}
 {{- end -}}
 {{- if and $smOn .Values.eastWest.enabled -}}

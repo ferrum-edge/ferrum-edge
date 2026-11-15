@@ -85,7 +85,7 @@ controlPlane:
     # not affect trusted NodeWaypoint discovery.
   database:
     # One of: sqlite, postgres, mysql, mongodb. Required when controlPlane.enabled
-    # or ca.enabled is true.
+    # is true.
     type: ""
     # Direct URL value. Suitable for local/dev only; prefer urlFrom or
     # existingSecret for shared environments.
@@ -629,89 +629,6 @@ eastWest:
       memory: 64Mi
     limits:
       cpu: "2"
-      memory: 256Mi
-  priorityClassName: ""
-
-ca:
-  # Disabled by default. This Deployment runs the Ferrum binary in CP mode, so
-  # it shares the controlPlane database/JWT contract when enabled. Replicas are
-  # fixed at 1 in the template — an explicit non-HA choice; scale via separate
-  # releases or out-of-band if you need CA redundancy.
-  enabled: false
-  # CP/DP gRPC port of the CA Deployment: the chart renders
-  # FERRUM_CP_GRPC_LISTEN_ADDR=0.0.0.0:<grpcPort> (unless ca.env sets
-  # FERRUM_CP_GRPC_LISTEN_ADDR) and uses the same port for the `grpc` container
-  # port and the ferrum-mesh-ca Service, so the CA is reachable in-cluster at
-  # ferrum-mesh-ca.<release namespace>.svc:<grpcPort>.
-  grpcPort: 50051
-  env:
-    FERRUM_MESH_PRODUCTION_MODE: "true"
-  # Same admin health semantics as controlPlane (CP mode).
-  probes:
-    startup:
-      enabled: true
-      failureThreshold: 36
-      periodSeconds: 5
-      override: {}
-    liveness:
-      enabled: true
-      initialDelaySeconds: 10
-      periodSeconds: 15
-      override: {}
-    readiness:
-      enabled: true
-      initialDelaySeconds: 5
-      periodSeconds: 10
-      failureThreshold: 3
-      override: {}
-  admin:
-    bindAddress: "127.0.0.1"
-    httpPort: 9000
-    allowInsecureHttp: false
-    allowedCidrs: ""
-    # Admin HTTPS port. Default 0 keeps existing HTTP-only installs unchanged
-    # (the binary default is 9443, so the chart must pin 0 until TLS is opted
-    # in). Set a nonzero port together with admin.tls below for HTTPS-only
-    # (httpPort=0) or dual-listener operation. A metrics bearer scrape is only
-    # ever attached to this HTTPS listener, never to httpPort.
-    httpsPort: 0
-    # Optional admin TLS Secret mount. Uses the shared FERRUM_ADMIN_TLS_*
-    # contract, the same shape nodeAgent.admin.tls uses. When enabled with a
-    # secretName the chart mounts cert/key (and optional client CA / CRL)
-    # read-only and sets the matching PATH env vars. Incomplete or invalid
-    # combinations fail at helm render; do not store PEM material in values.
-    tls:
-      enabled: false
-      secretName: ""
-      mountPath: /etc/ferrum/tls/admin
-      certKey: tls.crt
-      keyKey: tls.key
-      clientCaKey: ""
-      crlKey: ""
-  shutdownDrainSeconds: 30
-  shutdownPreStopSeconds: 30
-  shutdownPreDrainSeconds: 0
-  terminationGracePeriodSeconds: 110
-  podSecurityContext:
-    runAsNonRoot: true
-    runAsUser: 65532
-    runAsGroup: 65532
-    fsGroup: 65532
-    fsGroupChangePolicy: OnRootMismatch
-    seccompProfile:
-      type: RuntimeDefault
-  securityContext:
-    allowPrivilegeEscalation: false
-    readOnlyRootFilesystem: true
-    capabilities:
-      drop:
-        - ALL
-  resources:
-    requests:
-      cpu: 100m
-      memory: 64Mi
-    limits:
-      cpu: "1"
       memory: 256Mi
   priorityClassName: ""
 
