@@ -14,9 +14,10 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use async_trait::async_trait;
 use ferrum_edge::_test_support::{
-    install_plugin_finalizers_for_test, run_after_proxy_hooks_for_test,
-    run_before_proxy_hooks_for_test,
+    early_route_total_ms_for_test, install_plugin_finalizers_for_test,
+    run_after_proxy_hooks_for_test, run_before_proxy_hooks_for_test,
 };
 use ferrum_edge::config::types::{GatewayConfig, PluginScope, Proxy};
 use ferrum_edge::config_sources::k8s::{
@@ -25,7 +26,7 @@ use ferrum_edge::config_sources::k8s::{
 use ferrum_edge::identity::spiffe::{SpiffeId, TrustDomain};
 use ferrum_edge::modes::mesh::config::{
     MeshExtAuthzProvider, MeshJwtRule, MeshPolicy, MeshRequestAuthentication, MeshRule,
-    PolicyAction, PolicyScope, WorkloadSelector,
+    PolicyAction, PolicyScope, RequestMatch, WorkloadSelector,
 };
 use ferrum_edge::modes::mesh::runtime::PolicyScopeCache;
 use ferrum_edge::modes::mesh::slice::MeshSlice;
@@ -77,6 +78,11 @@ fn virtual_service(name: &str, spec: serde_json::Value) -> K8sObject {
 /// `reviews`. The guarded route shares the fallback route's path, so the
 /// translator merges it into the fallback route's proxy as a dispatch rule.
 fn branch_spec() -> serde_json::Value {
+    branch_spec_with_ratings_port(8080)
+}
+
+/// [`branch_spec`] with the `ratings` branch on `ratings_port`.
+fn branch_spec_with_ratings_port(ratings_port: u16) -> serde_json::Value {
     json!({
         "hosts": ["reviews.default.svc.cluster.local"],
         "http": [
@@ -88,7 +94,7 @@ fn branch_spec() -> serde_json::Value {
                 "route": [{
                     "destination": {
                         "host": "ratings.default.svc.cluster.local",
-                        "port": {"number": 8080}
+                        "port": {"number": ratings_port}
                     }
                 }]
             },
@@ -147,8 +153,20 @@ fn ratings_untrusted_only() -> MeshPolicy {
 /// Translate the branching VirtualService and add the mesh inventory it
 /// reaches. Both workloads also carry `tier=backend`.
 fn translated_config(policies: Vec<MeshPolicy>) -> GatewayConfig {
+    translated_config_with_ratings_port(policies, 8080)
+}
+
+/// [`translated_config`] with the `ratings` Service, its workload and the
+/// VirtualService branch on `ratings_port`.
+fn translated_config_with_ratings_port(
+    policies: Vec<MeshPolicy>,
+    ratings_port: u16,
+) -> GatewayConfig {
     let translated = translate_k8s_objects(
-        &[virtual_service("branches", branch_spec())],
+        &[virtual_service(
+            "branches",
+            branch_spec_with_ratings_port(ratings_port),
+        )],
         K8sTranslationOptions::new(
             DEFAULT_NAMESPACE.to_string(),
             TrustDomain::new("cluster.local").expect("trust domain"),
@@ -162,16 +180,19 @@ fn translated_config(policies: Vec<MeshPolicy>) -> GatewayConfig {
         [("app", "reviews"), ("tier", "backend")],
         ["10.0.0.11"],
     );
-    let ratings = workload_for(
+    let mut ratings = workload_for(
         "ratings",
         DEFAULT_NAMESPACE,
         [("app", "ratings"), ("tier", "backend")],
         ["10.0.0.12"],
     );
+    ratings.ports[0].port = ratings_port;
+    let mut ratings_service = service_for("ratings", DEFAULT_NAMESPACE, &[&ratings]);
+    ratings_service.ports[0].port = ratings_port;
     let mesh = config.mesh.get_or_insert_with(Box::default);
     mesh.services = vec![
         service_for("reviews", DEFAULT_NAMESPACE, &[&reviews]),
-        service_for("ratings", DEFAULT_NAMESPACE, &[&ratings]),
+        ratings_service,
     ];
     mesh.workloads = vec![reviews, ratings];
     mesh.mesh_policies = policies;
@@ -249,6 +270,19 @@ fn authz_config(prepared: &GatewayConfig) -> serde_json::Value {
 /// which admits the destination the dispatch group selected.
 fn route_dispatch(prepared: &GatewayConfig, route: &Proxy) -> Vec<Arc<dyn Plugin>> {
     dispatch_chain(vec![route_dispatch_instance(prepared, route)])
+}
+
+/// The production chain of a carried route with `authz` in it: `mesh_authz`'s
+/// own `before_proxy` hook, the route's dispatch instance, and the finalizer.
+fn authz_dispatch_chain(
+    authz: &Arc<MeshAuthz>,
+    prepared: &GatewayConfig,
+    route: &Proxy,
+) -> Vec<Arc<dyn Plugin>> {
+    dispatch_chain(vec![
+        Arc::clone(authz) as Arc<dyn Plugin>,
+        route_dispatch_instance(prepared, route),
+    ])
 }
 
 /// `plugins` with the cache-internal finalizers installed.
@@ -898,8 +932,13 @@ async fn a_provider_credential_does_not_follow_the_request_to_another_branch() {
     let slice = node_waypoint_slice(vec![reviews_trusted_only()]);
     let prepared = prepare(&slice);
     let route = carried_route(&prepared);
-    let authz = authz_with_custom(&prepared, custom_policy("reviews-ext", "reviews"), port);
-    let dispatch = route_dispatch(&prepared, &route);
+    let authz = Arc::new(authz_with_custom(
+        &prepared,
+        custom_policy("reviews-ext", "reviews"),
+        port,
+    ));
+    // The production chain: `mesh_authz`'s own hook, dispatch, finalizer.
+    let dispatch = authz_dispatch_chain(&authz, &prepared, &route);
 
     let (authorized, dispatched, ctx, headers) =
         serve_capture(&authz, &dispatch, &route, TRUSTED, true).await;
@@ -943,8 +982,13 @@ async fn an_alternative_branch_runs_its_own_custom_check() {
     let slice = node_waypoint_slice(vec![reviews_trusted_only()]);
     let prepared = prepare(&slice);
     let route = carried_route(&prepared);
-    let authz = authz_with_custom(&prepared, custom_policy("ratings-ext", "ratings"), port);
-    let dispatch = route_dispatch(&prepared, &route);
+    let authz = Arc::new(authz_with_custom(
+        &prepared,
+        custom_policy("ratings-ext", "ratings"),
+        port,
+    ));
+    // The production chain: `mesh_authz`'s own hook, dispatch, finalizer.
+    let dispatch = authz_dispatch_chain(&authz, &prepared, &route);
 
     let (authorized, dispatched, ctx, headers) =
         serve_capture(&authz, &dispatch, &route, TRUSTED, true).await;
@@ -1254,12 +1298,45 @@ async fn a_reached_branch_runs_custom_before_its_local_denial_provider_allows() 
     );
 }
 
-/// Issue #7383 review (round 2, dsf F1): on a route with per-destination
-/// verdicts, `mesh_authz`'s own `before_proxy` strips the client's copies of
-/// every candidate provider's owned names before any later policy plugin
-/// sees them, and installs nothing.
+/// Records whether a provider-owned name is visible to a policy plugin
+/// running between `mesh_authz` and route dispatch.
+struct OwnedHeaderProbe {
+    saw_authorization: Arc<std::sync::Mutex<Option<bool>>>,
+}
+
+#[async_trait]
+impl Plugin for OwnedHeaderProbe {
+    fn name(&self) -> &str {
+        "test_owned_header_probe"
+    }
+
+    fn priority(&self) -> u16 {
+        2900
+    }
+
+    async fn before_proxy(
+        &self,
+        _ctx: &mut RequestContext,
+        headers: &mut HashMap<String, String>,
+    ) -> PluginResult {
+        let seen = headers
+            .keys()
+            .any(|name| name.eq_ignore_ascii_case("authorization"));
+        if let Ok(mut slot) = self.saw_authorization.lock() {
+            *slot = Some(seen);
+        }
+        PluginResult::Continue
+    }
+}
+
+/// Issue #7383 review (round 2 dsf F1, round 3 dsf F1): on a route with
+/// per-destination verdicts, `mesh_authz`'s own `before_proxy` removes the
+/// client's copies of every candidate provider's owned names, so no policy
+/// plugin before dispatch sees them, and installs nothing. When the selected
+/// destination owes no CUSTOM check, the client's own values are given back
+/// unchanged.
 #[tokio::test]
-async fn client_copies_of_provider_owned_headers_are_stripped_at_mesh_authz() {
+async fn client_copies_of_provider_owned_headers_are_hidden_then_restored() {
     let (port, calls) = start_provider(PROVIDER_ALLOW_WITH_TOKEN).await;
     let slice = node_waypoint_slice(vec![reviews_trusted_only()]);
     let prepared = prepare(&slice);
@@ -1269,6 +1346,10 @@ async fn client_copies_of_provider_owned_headers_are_stripped_at_mesh_authz() {
         custom_policy("reviews-ext", "reviews"),
         port,
     ));
+    let saw_authorization = Arc::new(std::sync::Mutex::new(None));
+    let probe: Arc<dyn Plugin> = Arc::new(OwnedHeaderProbe {
+        saw_authorization: Arc::clone(&saw_authorization),
+    });
 
     let mut ctx = node_waypoint_request(&route, TRUSTED);
     let mut headers = branch_headers(Some("v2"));
@@ -1276,17 +1357,15 @@ async fn client_copies_of_provider_owned_headers_are_stripped_at_mesh_authz() {
         "authorization".to_string(),
         "Bearer client-token".to_string(),
     );
-    headers.insert("Authorization".to_string(), "Bearer forged".to_string());
+    headers.insert("X_Authorization".to_string(), "unrelated".to_string());
     ctx.headers = headers.clone();
     assert!(matches!(
         authz.authorize(&mut ctx).await,
         PluginResult::Continue
     ));
-    // The request goes to ratings, which has no CUSTOM policy: the
-    // finalizer installs nothing and strips nothing, so a missing client
-    // copy proves `mesh_authz`'s own hook removed it.
     let chain = dispatch_chain(vec![
         Arc::clone(&authz),
+        probe,
         route_dispatch_instance(&prepared, &route),
     ]);
     let result = run_before_proxy_hooks_for_test(&chain, &mut ctx, &mut headers).await;
@@ -1295,11 +1374,20 @@ async fn client_copies_of_provider_owned_headers_are_stripped_at_mesh_authz() {
         ctx.route_override_upstream_id.as_deref(),
         Some(RATINGS_UPSTREAM)
     );
-    assert!(
-        !headers
-            .keys()
-            .any(|name| name.eq_ignore_ascii_case("authorization")),
-        "every spelling of the provider-owned name is stripped at mesh_authz: {headers:?}"
+    assert_eq!(
+        *saw_authorization.lock().expect("probe slot"),
+        Some(false),
+        "a policy plugin between mesh_authz and dispatch never sees the client's copy"
+    );
+    assert_eq!(
+        headers.get("authorization").map(String::as_str),
+        Some("Bearer client-token"),
+        "ratings owes no CUSTOM check, so the client's own value is restored: {headers:?}"
+    );
+    assert_eq!(
+        headers.get("X_Authorization").map(String::as_str),
+        Some("unrelated"),
+        "an unrelated header is untouched"
     );
     assert_eq!(calls.load(Ordering::SeqCst), 0, "no check runs for ratings");
 }
@@ -1397,4 +1485,208 @@ async fn a_second_mesh_authz_instance_merges_conjunctively() {
             );
         }
     }
+}
+
+const RATINGS_8081_UPSTREAM: &str = "__mesh-out-upstream-default-ratings-8081";
+
+/// A selector-scoped `ratings` rule limited to `ports`.
+fn ratings_rule_on_ports(name: &str, ports: &[u16], action: PolicyAction) -> MeshPolicy {
+    MeshPolicy {
+        name: name.to_string(),
+        namespace: DEFAULT_NAMESPACE.to_string(),
+        scope: selector("ratings"),
+        rules: vec![MeshRule {
+            from: Vec::new(),
+            to: vec![RequestMatch {
+                ports: ports.to_vec(),
+                ..RequestMatch::default()
+            }],
+            when: Vec::new(),
+            request_principals: Vec::new(),
+            not_request_principals: Vec::new(),
+            source_negation: Default::default(),
+            never_matches: false,
+            action,
+        }],
+    }
+}
+
+/// The ratings-on-8081 fixture: `reviews` on 8080 is the route's own
+/// destination, `x-version: v2` goes to `ratings` on 8081.
+fn ratings_on_8081(policies: Vec<MeshPolicy>) -> (GatewayConfig, Proxy) {
+    let config = translated_config_with_ratings_port(policies, 8081);
+    let slice =
+        MeshSlice::from_gateway_config(&config, node_waypoint_runtime().mesh_slice_request());
+    let prepared = prepare(&slice);
+    let route = carried_route(&prepared);
+    (prepared, route)
+}
+
+/// A captured NodeWaypoint request that arrived on port 8080 (reviews' port).
+async fn serve_captured_on_8080(
+    authz: &MeshAuthz,
+    plugins: &[Arc<dyn Plugin>],
+    route: &Proxy,
+    version: Option<&str>,
+) -> (PluginResult, Option<PluginResult>, RequestContext) {
+    let mut ctx = node_waypoint_request(route, TRUSTED);
+    ctx.mesh_direction = Some(ferrum_edge::modes::mesh::MeshTrafficDirection::Outbound);
+    ctx.orig_dst = Some("10.96.0.20:8080".parse().expect("orig dst"));
+    let mut headers = branch_headers(version);
+    ctx.headers = headers.clone();
+    let authorized = authz.authorize(&mut ctx).await;
+    if !matches!(authorized, PluginResult::Continue) {
+        return (authorized, None, ctx);
+    }
+    let dispatched = run_before_proxy_hooks_for_test(plugins, &mut ctx, &mut headers).await;
+    (authorized, Some(dispatched), ctx)
+}
+
+/// Issue #7383 review (round 3, sol F1): an alternative destination on a
+/// different port is judged on ITS port. A DENY scoped to ratings' port
+/// refuses the ratings branch although the request arrived on reviews' port,
+/// and a DENY scoped to the arrival port does not leak onto ratings.
+#[tokio::test]
+async fn an_alternative_on_another_port_is_judged_on_its_own_port() {
+    let (prepared, route) = ratings_on_8081(vec![reviews_trusted_only()]);
+    let branches = authz_config(&prepared)["node_waypoint_route_branches"].clone();
+    assert_eq!(
+        branches[0]["destinations"][1],
+        json!({"upstream_id": RATINGS_8081_UPSTREAM}),
+        "the branch is threaded on ratings' own Service port"
+    );
+    let dispatch = route_dispatch(&prepared, &route);
+
+    for (deny_port, refused) in [(8081u16, true), (8080u16, false)] {
+        let mut config = authz_config(&prepared);
+        config["mesh_slice"]["mesh_policies"]
+            .as_array_mut()
+            .expect("policy list")
+            .push(
+                serde_json::to_value(ratings_rule_on_ports(
+                    "ratings-port-deny",
+                    &[deny_port],
+                    PolicyAction::Deny,
+                ))
+                .expect("policy serializes"),
+            );
+        let authz = MeshAuthz::new(&config).expect("mesh_authz builds");
+        let (authorized, dispatched, ctx) =
+            serve_captured_on_8080(&authz, &dispatch, &route, Some("v2")).await;
+        assert!(
+            matches!(authorized, PluginResult::Continue),
+            "deny on {deny_port}: {authorized:?}"
+        );
+        let dispatched = dispatched.expect("dispatch ran");
+        if refused {
+            assert_denied(&dispatched, DENIED_BODY, "a DENY on ratings' port applies");
+            assert!(
+                ctx.metadata
+                    .get("mesh_authz.deny_policy")
+                    .is_some_and(|policy| policy.contains("ratings-port-deny")),
+                "{:?}",
+                ctx.metadata.get("mesh_authz.deny_policy")
+            );
+        } else {
+            assert!(
+                matches!(dispatched, PluginResult::Continue),
+                "a DENY on the arrival port must not apply to ratings: {dispatched:?}"
+            );
+            assert_eq!(
+                ctx.route_override_upstream_id.as_deref(),
+                Some(RATINGS_8081_UPSTREAM)
+            );
+        }
+    }
+}
+
+/// Issue #7383 review (round 3, sol F1): a CUSTOM rule limited to the
+/// alternative's own port is found for that branch and its provider decides.
+#[tokio::test]
+async fn an_alternative_port_scoped_custom_rule_runs_on_its_own_port() {
+    let (port, calls) = start_provider(PROVIDER_DENY).await;
+    let (prepared, route) = ratings_on_8081(vec![reviews_trusted_only()]);
+    let authz = authz_with_custom(
+        &prepared,
+        ratings_rule_on_ports(
+            "ratings-port-ext",
+            &[8081],
+            PolicyAction::Custom {
+                provider: "branch-ext-authz".to_string(),
+            },
+        ),
+        port,
+    );
+    let dispatch = route_dispatch(&prepared, &route);
+
+    let (authorized, dispatched, ctx) =
+        serve_captured_on_8080(&authz, &dispatch, &route, Some("v2")).await;
+    assert!(matches!(authorized, PluginResult::Continue));
+    match dispatched.expect("dispatch ran") {
+        PluginResult::Reject { status_code, .. } => assert_eq!(status_code, 403),
+        other => panic!("the ratings provider refuses, got {other:?}"),
+    }
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "the port-scoped CUSTOM rule matched ratings' port"
+    );
+    assert_eq!(
+        ctx.metadata
+            .get("mesh_authz.deny_policy")
+            .map(String::as_str),
+        Some("custom:ratings-port-ext")
+    );
+}
+
+/// Issue #7383 review (round 3, sol F2): the early route-total preview follows
+/// the dispatch group like execution does. An intermediate rule whose
+/// destination the request may not reach is replaced by a later instance's
+/// allowed, timed destination, so the preview arms that destination's total.
+#[tokio::test]
+async fn the_route_total_preview_follows_the_dispatch_group() {
+    let slice = node_waypoint_slice(vec![reviews_trusted_only()]);
+    let prepared = prepare(&slice);
+    let route = carried_route(&prepared);
+    let authz = MeshAuthz::new(&authz_config(&prepared)).expect("mesh_authz builds");
+    let instance = |upstream: &str, timeout_ms: u64| {
+        create_plugin(
+            "mesh_route_dispatch",
+            &json!({
+                "rules": [{
+                    "match": {"headers": {"x-version": "v2"}},
+                    "destination": {"upstream_id": upstream},
+                    "request_timeout_ms": timeout_ms
+                }]
+            }),
+        )
+        .expect("dispatch config constructs")
+        .expect("built-in plugin")
+    };
+    // Both instances match; the first selects reviews (which refuses
+    // UNTRUSTED), the second replaces it with ratings and a 100 ms total.
+    let chain = dispatch_chain(vec![
+        instance(REVIEWS_UPSTREAM, 5000),
+        instance(RATINGS_UPSTREAM, 100),
+    ]);
+
+    let mut ctx = node_waypoint_request(&route, UNTRUSTED);
+    let mut headers = branch_headers(Some("v2"));
+    ctx.headers = headers.clone();
+    assert!(matches!(
+        authz.authorize(&mut ctx).await,
+        PluginResult::Continue
+    ));
+    assert_eq!(
+        early_route_total_ms_for_test(&chain, &ctx, true),
+        Some(100),
+        "the preview arms the final destination's total"
+    );
+    let result = run_before_proxy_hooks_for_test(&chain, &mut ctx, &mut headers).await;
+    assert!(matches!(result, PluginResult::Continue), "{result:?}");
+    assert_eq!(
+        ctx.route_override_upstream_id.as_deref(),
+        Some(RATINGS_UPSTREAM)
+    );
+    assert_eq!(ctx.route_override_request_timeout_ms, Some(100));
 }
