@@ -364,6 +364,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `test-support` feature.
 
 ### Changed
+- **NodeWaypoint authorizes each `mesh_route_dispatch` branch of a VirtualService
+  route against its own destination** (#7383). When the translator merges a
+  header-matched route into a fallback route, the carried route's dispatch rules
+  can send a request to a destination other than the route's own. `mesh_authz`
+  used to evaluate only the route's own destination before dispatch, and a rule
+  that rewrote to another destination was refused with `403`.
+  - Slice preparation threads every carried route's candidate destinations to
+    the managed `mesh_authz` instance (injection-only
+    `node_waypoint_route_branches`). Whenever any AuthorizationPolicy is loaded
+    (mesh-wide ones included), `mesh_authz` evaluates each candidate's own
+    destination policy on that candidate's own destination port
+    (`to.operation.ports` and `destination.port`; `destination.ip` is
+    unsourceable for an alternative and fails closed) and records one verdict
+    per candidate on the request.
+  - The dispatch finalizer admits the destination the whole
+    `mesh_route_dispatch` group selects only when that destination was allowed,
+    and proxy core admits the destination a request finally reaches only on its
+    own verdict on every transport. A refused branch answers exactly as its
+    destination's policy would (`403`, `mesh_authz.deny_policy`, policy-deny
+    drilldown row, NodeWaypoint rejection counter); a destination without a
+    verdict is refused (`route_branch_unauthorized`), and so is a candidate
+    split across several Service ports (`route_branch_port_unresolved`).
+  - A branch whose policy delegates to an external authorizer has its own
+    CUSTOM check run when it is selected (before its DENY/ALLOW tiers, as
+    everywhere else), and only that provider's `headersToUpstreamOnAllow` /
+    `headersToDownstreamOnAllow` result is applied to that request. `mesh_authz`
+    hides client copies of every candidate provider's owned headers from the
+    policy plugins that run before dispatch and gives them back unchanged except
+    for the names the selected destination's own provider owns; no provider is
+    called for a branch the request does not take. On these routes the CUSTOM
+    check therefore runs after `rate_limiting`, `waf`, the body validators and
+    the `ai_*` plugins, so a request its provider denies may already have
+    consumed rate-limit quota.
+  - Routes without another candidate, inbound HBONE relays and operator
+    `mesh_authz` overrides keep the single-destination decision; Sidecar and
+    Ambient are unchanged.
 - **ferrum-mesh chart: values now reach the workload they name, once**
   (#7297, #7299).
   - `controlPlane.grpcPort` now renders

@@ -5071,8 +5071,8 @@ impl Plugin for MeshAuthz {
         let mut scoped_policy_census = self.has_scoped_policies;
         // Per-destination verdicts for a carried VirtualService route whose
         // `mesh_route_dispatch` rules can select a destination other than the
-        // route's own (issue #7383). Only an ordinary per-pod-scoped HTTP
-        // request with a resolved source scope and scoped policies enters it;
+        // route's own (issue #7383). Every ordinary per-pod-scoped HTTP
+        // request on such a route enters it whenever any policy is loaded;
         // relays, re-evaluations and refused asserted identities keep the
         // single-destination decision.
         // Any loaded policy can judge two candidates differently (scoped

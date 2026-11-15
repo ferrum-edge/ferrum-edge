@@ -562,9 +562,13 @@ NodeWaypoint transport, a route whose destination is an in-cluster Service the
 waypoint does not model (including a two-label `<svc>.<ns>` host) or whose
 weighted split names a DestinationRule-governed Service is refused (the host
 keeps its Service route), a malformed or empty `spec.gateways` no longer counts
-as `mesh`, and a merged route whose `mesh_route_dispatch` rule rewrites to a
-different destination than the route's own is refused with `403` by destination
-authorization. Review VirtualServices bound to the mesh before upgrading
+as `mesh`, and when a merged route's `mesh_route_dispatch` rules can select a
+destination other than the route's own, each destination's `AuthorizationPolicy`
+(CUSTOM delegations included) decides the requests that reach it (#7383): a
+branch its destination's policy admits is served, one it refuses answers with
+that policy's refusal, and a destination the route's candidate table does not
+name is refused. See
+[Per-destination authorization for dispatch branches](mesh.md#per-destination-authorization-for-dispatch-branches). Review VirtualServices bound to the mesh before upgrading
 NodeWaypoints.
 
 Per-release sections below are written when a release is cut. Changes already
