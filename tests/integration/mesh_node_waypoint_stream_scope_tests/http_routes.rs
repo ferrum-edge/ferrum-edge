@@ -85,6 +85,17 @@ fn split_spec(extra: serde_json::Value) -> serde_json::Value {
     spec
 }
 
+/// [`split_spec`] guarded by a header match, which the translator captures as
+/// `mesh_route_dispatch` rules on the route (an unguarded route has none).
+fn guarded_split_spec() -> serde_json::Value {
+    let mut spec = split_spec(json!({}));
+    spec["http"][0]["match"] = json!([{
+        "uri": {"prefix": "/api"},
+        "headers": {"x-version": {"exact": "v2"}}
+    }]);
+    spec
+}
+
 /// Translate `objects`, then add the mesh inventory the routes reach and a
 /// destination policy that admits only `TRUSTED` to `app=reviews`.
 fn translated_config(objects: &[K8sObject]) -> GatewayConfig {
@@ -188,7 +199,7 @@ fn translator_does_not_bind_an_ingress_only_virtual_service() {
 
 #[test]
 fn node_waypoint_slice_carries_bound_routes_their_plugins_and_upstreams() {
-    let config = translated_config(&[virtual_service("split", split_spec(json!({})))]);
+    let config = translated_config(&[virtual_service("split", guarded_split_spec())]);
     let slice = node_waypoint_slice(&config, &node_waypoint_runtime());
     let routes = &slice.http_routes;
     assert!(!routes.proxies.is_empty(), "NodeWaypoint gets the routes");
@@ -254,7 +265,7 @@ fn http_routes_honour_virtual_service_export_to() {
 
 #[test]
 fn a_route_with_a_missing_plugin_config_is_not_carried() {
-    let mut config = translated_config(&[virtual_service("split", split_spec(json!({})))]);
+    let mut config = translated_config(&[virtual_service("split", guarded_split_spec())]);
     config
         .plugin_configs
         .retain(|plugin| plugin.plugin_name != "mesh_route_dispatch");
@@ -328,7 +339,7 @@ fn http_routes_round_trip_over_native_json_and_the_xds_carrier() {
 
 #[test]
 fn data_plane_materializes_carried_routes_and_exposes_route_upstreams_to_authz() {
-    let config = translated_config(&[virtual_service("split", split_spec(json!({})))]);
+    let config = translated_config(&[virtual_service("split", guarded_split_spec())]);
     let runtime = node_waypoint_runtime();
     let slice = node_waypoint_slice(&config, &runtime);
     let prepared =
