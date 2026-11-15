@@ -2118,3 +2118,7 @@ mod node_waypoint_cross_namespace_source_resolution {
 
 /// VirtualService HTTP routes carried on a NodeWaypoint mesh slice (issue #7233).
 mod http_routes;
+
+/// Per-destination authorization for `mesh_route_dispatch` branches of a
+/// carried VirtualService route (issue #7383).
+mod route_branch_authz;
