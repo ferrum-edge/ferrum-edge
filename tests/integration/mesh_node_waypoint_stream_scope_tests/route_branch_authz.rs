@@ -1282,16 +1282,26 @@ async fn client_copies_of_provider_owned_headers_are_stripped_at_mesh_authz() {
         authz.authorize(&mut ctx).await,
         PluginResult::Continue
     ));
-    let result =
-        run_before_proxy_hooks_for_test(&[Arc::clone(&authz)], &mut ctx, &mut headers).await;
-    assert!(matches!(result, PluginResult::Continue));
+    // The request goes to ratings, which has no CUSTOM policy: the
+    // finalizer installs nothing and strips nothing, so a missing client
+    // copy proves `mesh_authz`'s own hook removed it.
+    let chain = dispatch_chain(vec![
+        Arc::clone(&authz),
+        route_dispatch_instance(&prepared, &route),
+    ]);
+    let result = run_before_proxy_hooks_for_test(&chain, &mut ctx, &mut headers).await;
+    assert!(matches!(result, PluginResult::Continue), "{result:?}");
+    assert_eq!(
+        ctx.route_override_upstream_id.as_deref(),
+        Some(RATINGS_UPSTREAM)
+    );
     assert!(
         !headers
             .keys()
             .any(|name| name.eq_ignore_ascii_case("authorization")),
-        "every spelling of the provider-owned name is stripped at 2075: {headers:?}"
+        "every spelling of the provider-owned name is stripped at mesh_authz: {headers:?}"
     );
-    assert_eq!(calls.load(Ordering::SeqCst), 0, "no check runs at 2075");
+    assert_eq!(calls.load(Ordering::SeqCst), 0, "no check runs for ratings");
 }
 
 /// Issue #7383 review (round 2, dsf F3): the reached destination's provider
