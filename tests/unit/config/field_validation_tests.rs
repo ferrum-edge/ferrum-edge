@@ -2740,6 +2740,10 @@ fn test_file_mode_refusal_of_allowed_ws_origins_star_does_not_log_grandfathering
 /// unchanged: the admission errors are still reported, after the pipeline.
 #[test]
 fn test_restore_refusal_of_allowed_ws_origins_star_does_not_log_grandfathering_warning() {
+    // Restore validation reads process env (the plugin-config step builds the
+    // compression admission policy from it): isolate and serialize it for the
+    // whole test so a sibling's env mutation cannot add an unrelated error.
+    let _env = crate::unit::env_lock::EnvGuard::new(&[]);
     let mut proxy = make_proxy("ws-proxy", "/ws");
     proxy.allowed_ws_origins = vec!["*".into(), "https://app.example.com/path".into()];
     let mut candidate = GatewayConfig {
