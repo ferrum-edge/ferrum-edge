@@ -10,9 +10,6 @@
 {{- if .Values.controlPlane.enabled -}}
 {{- $workloads = append $workloads (dict "name" "ferrum-mesh-control-plane" "component" "controlPlane" "env" (.Values.controlPlane.env | default dict) "admin" (.Values.controlPlane.admin | default dict)) -}}
 {{- end -}}
-{{- if .Values.ca.enabled -}}
-{{- $workloads = append $workloads (dict "name" "ferrum-mesh-ca" "component" "ca" "env" (.Values.ca.env | default dict) "admin" (.Values.ca.admin | default dict)) -}}
-{{- end -}}
 {{- if .Values.eastWest.enabled -}}
 {{- $workloads = append $workloads (dict "name" "ferrum-mesh-east-west" "component" "eastWest" "env" (.Values.eastWest.env | default dict) "admin" (.Values.eastWest.admin | default dict)) -}}
 {{- end -}}

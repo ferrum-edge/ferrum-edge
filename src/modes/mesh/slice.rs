@@ -319,6 +319,21 @@ pub struct MeshSlice {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     #[serde(deserialize_with = "crate::util::json_object::deserialize_object_vec")]
     pub virtual_service_l4_upstreams: Vec<serde_json::Value>,
+    /// VirtualService HTTP routes this data plane serves (issue #7233): the
+    /// route proxies, the weighted-split upstreams they and their
+    /// `mesh_route_dispatch` rules reference, and their route plugins.
+    /// Populated only for a NodeWaypoint subscription, from the routes bound
+    /// to the mesh in the subscription namespace whose `exportTo` admits it
+    /// (`MeshConfig::virtual_service_http_routes`).
+    ///
+    /// Without this a NodeWaypoint built from a slice had no HTTP route
+    /// upstream, so the `mesh_authz` destination index
+    /// (`node_waypoint_route_upstreams`) and RequestAuthentication destination
+    /// scoping could not reach a VirtualService route. Compared by
+    /// [`MeshSlice::content_eq`] so a route edit or withdrawal re-applies.
+    #[serde(default, skip_serializing_if = "MeshHttpRouteSet::is_empty")]
+    #[serde(deserialize_with = "crate::util::json_object::deserialize_object")]
+    pub http_routes: MeshHttpRouteSet,
     pub version: String,
     /// Authoritative, CP-replica-shared config revision this slice was built
     /// from (issue #2473).
@@ -621,6 +636,34 @@ pub struct MeshSlice {
     #[serde(default, skip_serializing_if = "MeshRuntimeOverlay::is_empty")]
     #[serde(deserialize_with = "crate::util::json_object::deserialize_object")]
     pub runtime_overlay: MeshRuntimeOverlay,
+}
+
+/// HTTP route resources carried on a [`MeshSlice`] (issue #7233).
+///
+/// Each element is the full serialized resource, decoded at apply time
+/// through the ordinary `Proxy` / `Upstream` / `PluginConfig` admission path,
+/// like [`MeshSlice::virtual_service_l4_proxies`]. The set is closed: every
+/// proxy's plugin associations resolve to `plugin_configs` owned by that
+/// proxy, and every upstream id a proxy or a `mesh_route_dispatch` rule names
+/// resolves to `upstreams`. The data plane refuses a slice that breaks this.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MeshHttpRouteSet {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(deserialize_with = "crate::util::json_object::deserialize_object_vec")]
+    pub proxies: Vec<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(deserialize_with = "crate::util::json_object::deserialize_object_vec")]
+    pub upstreams: Vec<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(deserialize_with = "crate::util::json_object::deserialize_object_vec")]
+    pub plugin_configs: Vec<serde_json::Value>,
+}
+
+impl MeshHttpRouteSet {
+    pub fn is_empty(&self) -> bool {
+        self.proxies.is_empty() && self.upstreams.is_empty() && self.plugin_configs.is_empty()
+    }
 }
 
 /// One opaque typed extension config, transported through xDS ECDS.
@@ -974,6 +1017,11 @@ impl MeshSlice {
             && self.labels_ambiguous == other.labels_ambiguous
             && self.virtual_service_l4_proxies == other.virtual_service_l4_proxies
             && self.virtual_service_l4_upstreams == other.virtual_service_l4_upstreams
+            // A VirtualService HTTP route edit or withdrawal (issue #7233) can
+            // leave every other field unchanged; it must re-apply so the
+            // NodeWaypoint stops serving the stale route and its destination
+            // policy scope.
+            && self.http_routes == other.http_routes
             && self.workloads == other.workloads
             && self.ambient_udp_source_workloads == other.ambient_udp_source_workloads
             && self.node_waypoint_assertors == other.node_waypoint_assertors
@@ -1788,6 +1836,38 @@ impl MeshSlice {
                 .into_iter()
                 .filter(|upstream| admitted_upstream_ids.contains(upstream.id.as_str())),
         );
+        // VirtualService HTTP routes (issue #7233), NodeWaypoint first: the
+        // routes bound to the mesh in this subscription's namespace whose
+        // `exportTo` admits it, with every destination admitted by an
+        // applicable Sidecar egress scope exactly like the L4 routes above.
+        let http_routes = if request.node_waypoint_capture_scoping {
+            node_waypoint_http_route_set(
+                config,
+                mesh,
+                &namespace,
+                &service_waypoint_namespaces,
+                &|proxy_namespace: &str, host: &str, port: u16| {
+                    let Some(sidecar) = applicable_sidecar else {
+                        return true;
+                    };
+                    let host_scope = policy_host_scope(
+                        host,
+                        proxy_namespace,
+                        &cluster_domain,
+                        &mesh_service_identities,
+                        &service_entry_hosts,
+                    );
+                    let host_refs: Vec<&str> = host_scope
+                        .host_candidates
+                        .iter()
+                        .map(String::as_str)
+                        .collect();
+                    sidecar.includes_service(&host_scope.scope_namespace, &host_refs, Some(&[port]))
+                },
+            )
+        } else {
+            MeshHttpRouteSet::default()
+        };
 
         let services: Vec<MeshService> = mesh
             .services
@@ -2256,6 +2336,7 @@ impl MeshSlice {
             labels_ambiguous,
             virtual_service_l4_proxies,
             virtual_service_l4_upstreams,
+            http_routes,
             version,
             revision,
             workloads,
@@ -3312,6 +3393,223 @@ fn serialize_virtual_service_l4_upstreams<'a>(
         })
         .collect()
 }
+
+/// Upstream id prefix of a VirtualService HTTP weighted-split upstream.
+pub(crate) const VIRTUAL_SERVICE_HTTP_ROUTE_UPSTREAM_ID_PREFIX: &str = "istio-vs-upstream-";
+
+/// The upstream ids a `mesh_route_dispatch` plugin config's rules can rewrite
+/// a request to.
+pub(crate) fn mesh_route_dispatch_rule_upstream_ids(config: &serde_json::Value) -> Vec<&str> {
+    config
+        .get("rules")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|rule| {
+            rule.get("destination")
+                .and_then(|destination| destination.get("upstream_id"))
+                .and_then(serde_json::Value::as_str)
+        })
+        .collect()
+}
+
+/// Project the VirtualService HTTP routes a NodeWaypoint serves (issue #7233).
+///
+/// A route rides the slice only when a [`MeshConfig::virtual_service_http_routes`]
+/// binding lists it, the binding lives in a namespace this subscription sees
+/// (the same visibility as `services`), and its `exportTo` admits the
+/// subscription namespace. Each route carries exactly the plugin configs it is
+/// associated with (all owned by that proxy) and the weighted-split upstreams
+/// it and its `mesh_route_dispatch` rules name. A route that is not
+/// self-contained — an association or upstream that is missing, shared, or
+/// not translator-owned — or one with a destination the applicable Sidecar
+/// egress scope does not admit is dropped, fail-closed: the waypoint then
+/// serves that host through its materialized Service route instead.
+fn node_waypoint_http_route_set(
+    config: &GatewayConfig,
+    mesh: &MeshConfig,
+    namespace: &str,
+    service_waypoint_namespaces: &Option<BTreeSet<String>>,
+    destination_admitted: &dyn Fn(&str, &str, u16) -> bool,
+) -> MeshHttpRouteSet {
+    use crate::config::types::{PluginConfig, Upstream};
+    use crate::modes::mesh::config::{
+        is_virtual_service_http_route_proxy_id, virtual_service_http_routes_exported_to_namespace,
+    };
+
+    let mut bound: HashSet<(&str, &str)> = HashSet::new();
+    for binding in &mesh.virtual_service_http_routes {
+        if !resource_namespace_visible(service_waypoint_namespaces, &binding.namespace, namespace)
+            || !virtual_service_http_routes_exported_to_namespace(binding, namespace)
+        {
+            continue;
+        }
+        for id in &binding.proxy_ids {
+            bound.insert((binding.namespace.as_str(), id.as_str()));
+        }
+    }
+    if bound.is_empty() {
+        return MeshHttpRouteSet::default();
+    }
+    let upstreams: HashMap<(&str, &str), &Upstream> = config
+        .upstreams
+        .iter()
+        .filter(|upstream| {
+            upstream
+                .id
+                .starts_with(VIRTUAL_SERVICE_HTTP_ROUTE_UPSTREAM_ID_PREFIX)
+        })
+        .map(|upstream| {
+            (
+                (upstream.namespace.as_str(), upstream.id.as_str()),
+                upstream,
+            )
+        })
+        .collect();
+    let plugins: HashMap<(&str, &str), &PluginConfig> = config
+        .plugin_configs
+        .iter()
+        .map(|plugin| ((plugin.namespace.as_str(), plugin.id.as_str()), plugin))
+        .collect();
+
+    let mut set = MeshHttpRouteSet::default();
+    let mut carried_upstreams: HashSet<(&str, &str)> = HashSet::new();
+    let mut carried_plugins: HashSet<(&str, &str)> = HashSet::new();
+    for proxy in &config.proxies {
+        if !bound.contains(&(proxy.namespace.as_str(), proxy.id.as_str()))
+            || !is_virtual_service_http_route_proxy_id(&proxy.id)
+            || proxy.dispatch_kind.is_stream()
+            || proxy
+                .backend_scheme
+                .is_some_and(|scheme| scheme.is_stream())
+        {
+            continue;
+        }
+        let proxy_namespace = proxy.namespace.as_str();
+        let mut route_plugins: Vec<&PluginConfig> = Vec::with_capacity(proxy.plugins.len());
+        let mut self_contained = true;
+        for association in &proxy.plugins {
+            match plugins.get(&(proxy_namespace, association.plugin_config_id.as_str())) {
+                Some(&plugin)
+                    if plugin.proxy_id.as_deref() == Some(proxy.id.as_str())
+                        && plugin
+                            .id
+                            .starts_with(VIRTUAL_SERVICE_HTTP_ROUTE_PROXY_PLUGIN_PREFIX) =>
+                {
+                    route_plugins.push(plugin);
+                }
+                _ => self_contained = false,
+            }
+        }
+        let mut upstream_ids: BTreeSet<&str> = BTreeSet::new();
+        upstream_ids.extend(proxy.upstream_id.as_deref());
+        let mut destinations: Vec<(&str, u16)> = Vec::new();
+        if !proxy.backend_host.is_empty() && proxy.backend_port != 0 {
+            destinations.push((proxy.backend_host.as_str(), proxy.backend_port));
+        }
+        for &plugin in &route_plugins {
+            if plugin.plugin_name != "mesh_route_dispatch" {
+                continue;
+            }
+            upstream_ids.extend(mesh_route_dispatch_rule_upstream_ids(&plugin.config));
+            for rule in plugin
+                .config
+                .get("rules")
+                .and_then(serde_json::Value::as_array)
+                .into_iter()
+                .flatten()
+            {
+                let Some(destination) = rule.get("destination") else {
+                    continue;
+                };
+                let host = destination
+                    .get("backend_host")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or(proxy.backend_host.as_str());
+                let port = destination
+                    .get("backend_port")
+                    .and_then(serde_json::Value::as_u64)
+                    .and_then(|port| u16::try_from(port).ok())
+                    .unwrap_or(proxy.backend_port);
+                if destination.get("upstream_id").is_none() && !host.is_empty() && port != 0 {
+                    destinations.push((host, port));
+                }
+            }
+        }
+        let mut route_upstreams: Vec<&Upstream> = Vec::with_capacity(upstream_ids.len());
+        for upstream_id in &upstream_ids {
+            match upstreams.get(&(proxy_namespace, *upstream_id)) {
+                Some(&upstream) => route_upstreams.push(upstream),
+                None => self_contained = false,
+            }
+        }
+        for &upstream in &route_upstreams {
+            for target in &upstream.targets {
+                destinations.push((target.host.as_str(), target.port));
+            }
+        }
+        if !self_contained {
+            debug!(
+                proxy_id = %sanitize_startup_cause(format!("{:?}", proxy.id.to_string()), &[]),
+                "VirtualService HTTP route is not self-contained; not carrying it to the \
+                 NodeWaypoint slice"
+            );
+            continue;
+        }
+        if !destinations
+            .iter()
+            .all(|(host, port)| destination_admitted(proxy_namespace, host, *port))
+        {
+            continue;
+        }
+        let Ok(proxy_value) = serde_json::to_value(proxy) else {
+            continue;
+        };
+        let mut plugin_values = Vec::with_capacity(route_plugins.len());
+        let mut upstream_values = Vec::with_capacity(route_upstreams.len());
+        let mut serialized = true;
+        for &plugin in &route_plugins {
+            if carried_plugins.contains(&(plugin.namespace.as_str(), plugin.id.as_str())) {
+                continue;
+            }
+            match serde_json::to_value(plugin) {
+                Ok(value) => plugin_values.push((plugin, value)),
+                Err(_) => serialized = false,
+            }
+        }
+        for &upstream in &route_upstreams {
+            if carried_upstreams.contains(&(upstream.namespace.as_str(), upstream.id.as_str())) {
+                continue;
+            }
+            match serde_json::to_value(upstream) {
+                Ok(value) => upstream_values.push((upstream, value)),
+                Err(_) => serialized = false,
+            }
+        }
+        if !serialized {
+            warn!(
+                proxy_id = %sanitize_startup_cause(format!("{:?}", proxy.id.to_string()), &[]),
+                "Failed to serialize a VirtualService HTTP route into the mesh slice; \
+                 dropping the route fail-closed"
+            );
+            continue;
+        }
+        set.proxies.push(proxy_value);
+        for (plugin, value) in plugin_values {
+            carried_plugins.insert((plugin.namespace.as_str(), plugin.id.as_str()));
+            set.plugin_configs.push(value);
+        }
+        for (upstream, value) in upstream_values {
+            carried_upstreams.insert((upstream.namespace.as_str(), upstream.id.as_str()));
+            set.upstreams.push(value);
+        }
+    }
+    set
+}
+
+/// Id prefix shared by every route plugin the K8s translator attaches to a
+/// VirtualService HTTP route (`istio-vs-mrd-`, `istio-vs-cors-`, …).
+pub(crate) const VIRTUAL_SERVICE_HTTP_ROUTE_PROXY_PLUGIN_PREFIX: &str = "istio-vs-";
 
 fn service_host_aliases(name: &str, namespace: &str, cluster_domain: &str) -> Vec<String> {
     let name = name.trim().trim_end_matches('.').to_ascii_lowercase();
@@ -5591,6 +5889,7 @@ mod tests {
             virtual_service_cors_policies: Vec::new(),
             virtual_service_l4_proxies: Vec::new(),
             virtual_service_l4_upstreams: Vec::new(),
+            http_routes: MeshHttpRouteSet::default(),
             proxy_configs: Vec::new(),
             request_authentications: vec![make_request_auth("ra1", "ns", PolicyScope::MeshWide)],
             telemetry_resources: vec![make_telemetry("t1", "ns", PolicyScope::MeshWide)],

@@ -8661,9 +8661,9 @@ fn test_stream_lifetime_is_published_only_from_the_accepted_startup_config() {
 /// Issue #4266: the pre-drain window must be honored by `mode=cp`.
 ///
 /// The `ferrum-mesh` chart renders `FERRUM_SHUTDOWN_PREDRAIN_SECONDS` for its
-/// `controlPlane` and `ca` workloads and, on Kubernetes older than 1.29, tells
-/// operators to replace the `SleepAction` `preStop` with it. Both workloads run
-/// the binary in `cp` mode, so a mode gate that forces the window to zero there
+/// `controlPlane` workload and, on Kubernetes older than 1.29, tells operators
+/// to replace the `SleepAction` `preStop` with it. That workload runs the
+/// binary in `cp` mode, so a mode gate that forces the window to zero there
 /// would silently budget grace-period seconds the runtime never spends and let
 /// the CP close its accept loops before endpoint withdrawal completes.
 #[test]

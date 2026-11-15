@@ -4,7 +4,7 @@
 //!   - `ServiceEntry` translation through `translate_k8s_objects`
 //!     (`location: MESH_EXTERNAL` vs `MESH_INTERNAL`, multi-port, multi-host).
 //!   - Egress gateway materialization of HTTP-family + stream-family
-//!     ServiceEntries (T5-A, PR #907) via `prepare_gateway_config_for_mesh`.
+//!     ServiceEntries (T5-A, PR #907) via `prepare_gateway_config_via_mesh_slice`.
 //!   - `outboundTrafficPolicy: REGISTRY_ONLY` injects the
 //!     `mesh_outbound_registry` plugin on topologies with an outbound capture
 //!     listener (T5-B, PR #893).
@@ -24,7 +24,7 @@ use ferrum_edge::modes::mesh::config::{
 };
 use ferrum_edge::modes::mesh::{
     MESH_OUTBOUND_REGISTRY_PLUGIN_ID, MeshConfigProtocol, MeshEgressGatewayEndpoint,
-    MeshRuntimeConfig, MeshTopology, prepare_gateway_config_for_mesh,
+    MeshRuntimeConfig, MeshTopology, prepare_gateway_config_via_mesh_slice,
 };
 use serde_json::{Value, json};
 
@@ -188,8 +188,8 @@ fn se_mesh_internal_skipped_by_egress() {
     )
     .expect("translation succeeds");
 
-    let prepared =
-        prepare_gateway_config_for_mesh(translation.config, &egress_runtime()).expect("mesh apply");
+    let prepared = prepare_gateway_config_via_mesh_slice(translation.config, &egress_runtime())
+        .expect("mesh apply");
 
     // No egress proxy for the internal entry. (The host `api.internal` would
     // encode into an egress id as `api_dot_internal` under the injective id
@@ -218,8 +218,8 @@ fn se_http_egress_materializes() {
         options(),
     )
     .expect("translation succeeds");
-    let prepared =
-        prepare_gateway_config_for_mesh(translation.config, &egress_runtime()).expect("mesh apply");
+    let prepared = prepare_gateway_config_via_mesh_slice(translation.config, &egress_runtime())
+        .expect("mesh apply");
 
     let egress = prepared
         .proxies
@@ -257,8 +257,8 @@ fn se_tcp_egress_materializes_as_stream_proxy() {
         options(),
     )
     .expect("translation succeeds");
-    let prepared =
-        prepare_gateway_config_for_mesh(translation.config, &egress_runtime()).expect("mesh apply");
+    let prepared = prepare_gateway_config_via_mesh_slice(translation.config, &egress_runtime())
+        .expect("mesh apply");
 
     let stream = prepared
         .proxies
@@ -288,8 +288,8 @@ fn se_database_protocols_egress_materialize_as_stream_proxies() {
         options(),
     )
     .expect("translation succeeds");
-    let prepared =
-        prepare_gateway_config_for_mesh(translation.config, &egress_runtime()).expect("mesh apply");
+    let prepared = prepare_gateway_config_via_mesh_slice(translation.config, &egress_runtime())
+        .expect("mesh apply");
 
     assert!(
         prepared
@@ -338,7 +338,8 @@ fn outbound_traffic_policy_registry_only_injects_plugin() {
     };
 
     let runtime = sidecar_runtime_with_policy(OutboundTrafficPolicy::RegistryOnly);
-    let prepared = prepare_gateway_config_for_mesh(config, &runtime).expect("mesh apply succeeds");
+    let prepared =
+        prepare_gateway_config_via_mesh_slice(config, &runtime).expect("mesh apply succeeds");
 
     assert!(
         prepared
@@ -364,7 +365,8 @@ fn outbound_traffic_policy_allow_any_omits_plugin() {
         ..GatewayConfig::default()
     };
     let runtime = sidecar_runtime_with_policy(OutboundTrafficPolicy::AllowAny);
-    let prepared = prepare_gateway_config_for_mesh(config, &runtime).expect("mesh apply succeeds");
+    let prepared =
+        prepare_gateway_config_via_mesh_slice(config, &runtime).expect("mesh apply succeeds");
 
     assert!(
         prepared
@@ -440,7 +442,7 @@ fn sidecar_outbound_traffic_policy_overrides_the_mesh_wide_policy() {
         runtime.namespace = "default".to_string();
         runtime.sidecar_enforced = true;
         let prepared =
-            prepare_gateway_config_for_mesh(config, &runtime).expect("mesh apply succeeds");
+            prepare_gateway_config_via_mesh_slice(config, &runtime).expect("mesh apply succeeds");
         let injected = prepared
             .plugin_configs
             .iter()
@@ -535,8 +537,8 @@ fn se_udp_egress_materializes_relay_destination_not_listener() {
         options(),
     )
     .expect("translation succeeds");
-    let prepared =
-        prepare_gateway_config_for_mesh(translation.config, &egress_runtime()).expect("mesh apply");
+    let prepared = prepare_gateway_config_via_mesh_slice(translation.config, &egress_runtime())
+        .expect("mesh apply");
 
     assert!(
         !prepared.proxies.iter().any(|p| p.listen_port == Some(53)),
@@ -579,8 +581,8 @@ fn se_udp_egress_destinations_are_withdrawn_on_reload() {
         options(),
     )
     .expect("translation succeeds");
-    let prepared =
-        prepare_gateway_config_for_mesh(initial.config, &egress_runtime()).expect("mesh apply");
+    let prepared = prepare_gateway_config_via_mesh_slice(initial.config, &egress_runtime())
+        .expect("mesh apply");
     assert_eq!(
         prepared
             .mesh
@@ -598,8 +600,8 @@ fn se_udp_egress_destinations_are_withdrawn_on_reload() {
         options(),
     )
     .expect("translation succeeds");
-    let prepared =
-        prepare_gateway_config_for_mesh(updated.config, &egress_runtime()).expect("mesh apply");
+    let prepared = prepare_gateway_config_via_mesh_slice(updated.config, &egress_runtime())
+        .expect("mesh apply");
     assert_eq!(
         prepared
             .mesh
@@ -623,8 +625,8 @@ fn se_udp_egress_destinations_are_withdrawn_on_reload() {
         options(),
     )
     .expect("translation succeeds");
-    let prepared =
-        prepare_gateway_config_for_mesh(deleted.config, &egress_runtime()).expect("mesh apply");
+    let prepared = prepare_gateway_config_via_mesh_slice(deleted.config, &egress_runtime())
+        .expect("mesh apply");
     assert!(
         prepared
             .mesh
@@ -651,7 +653,7 @@ fn se_udp_egress_destinations_are_empty_off_egress_gateway() {
         options(),
     )
     .expect("translation succeeds");
-    let prepared = prepare_gateway_config_for_mesh(
+    let prepared = prepare_gateway_config_via_mesh_slice(
         translation.config,
         &sidecar_runtime_with_policy(OutboundTrafficPolicy::AllowAny),
     )
@@ -685,7 +687,7 @@ fn se_udp_egress_destinations_require_stream_egress_opt_in() {
     let mut runtime = egress_runtime();
     runtime.egress_stream_enabled = false;
     let prepared =
-        prepare_gateway_config_for_mesh(translation.config, &runtime).expect("mesh apply");
+        prepare_gateway_config_via_mesh_slice(translation.config, &runtime).expect("mesh apply");
 
     assert!(
         prepared
@@ -757,8 +759,8 @@ fn se_udp_egress_static_authority_dials_declared_endpoints() {
         options(),
     )
     .expect("translation succeeds");
-    let prepared =
-        prepare_gateway_config_for_mesh(translation.config, &egress_runtime()).expect("mesh apply");
+    let prepared = prepare_gateway_config_via_mesh_slice(translation.config, &egress_runtime())
+        .expect("mesh apply");
     let mesh = prepared.mesh.as_deref().expect("prepared mesh block");
 
     let host_admission = mesh
@@ -812,8 +814,8 @@ fn se_udp_egress_static_without_usable_endpoints_admits_nothing() {
         options(),
     )
     .expect("translation succeeds");
-    let prepared =
-        prepare_gateway_config_for_mesh(translation.config, &egress_runtime()).expect("mesh apply");
+    let prepared = prepare_gateway_config_via_mesh_slice(translation.config, &egress_runtime())
+        .expect("mesh apply");
 
     assert!(
         prepared
@@ -846,9 +848,11 @@ fn se_udp_source_side_routes_captured_datagrams_through_the_egress_gateway() {
         options(),
     )
     .expect("translation succeeds");
-    let prepared =
-        prepare_gateway_config_for_mesh(translation.config, &sidecar_source_runtime_with_gateway())
-            .expect("mesh apply");
+    let prepared = prepare_gateway_config_via_mesh_slice(
+        translation.config,
+        &sidecar_source_runtime_with_gateway(),
+    )
+    .expect("mesh apply");
     let mesh = prepared.mesh.as_deref().expect("prepared mesh block");
 
     let route = mesh
@@ -929,9 +933,11 @@ fn se_udp_source_side_routes_respect_total_cap() {
         })
         .collect();
     let translation = translate_k8s_objects(&objects, options()).expect("translation succeeds");
-    let prepared =
-        prepare_gateway_config_for_mesh(translation.config, &sidecar_source_runtime_with_gateway())
-            .expect("mesh apply");
+    let prepared = prepare_gateway_config_via_mesh_slice(
+        translation.config,
+        &sidecar_source_runtime_with_gateway(),
+    )
+    .expect("mesh apply");
     let routes = &prepared
         .mesh
         .as_deref()
@@ -976,7 +982,7 @@ fn se_udp_source_side_without_configured_gateway_materializes_nothing() {
         options(),
     )
     .expect("translation succeeds");
-    let prepared = prepare_gateway_config_for_mesh(
+    let prepared = prepare_gateway_config_via_mesh_slice(
         translation.config,
         &sidecar_runtime_with_policy(OutboundTrafficPolicy::AllowAny),
     )
@@ -1024,8 +1030,8 @@ fn se_udp_source_side_routes_require_stream_egress_opt_in() {
     let mut runtime = sidecar_source_runtime_with_gateway();
 
     // Flag on: STATIC source routes materialize.
-    let prepared =
-        prepare_gateway_config_for_mesh(translation.config.clone(), &runtime).expect("mesh apply");
+    let prepared = prepare_gateway_config_via_mesh_slice(translation.config.clone(), &runtime)
+        .expect("mesh apply");
     assert_eq!(
         prepared
             .mesh
@@ -1040,7 +1046,7 @@ fn se_udp_source_side_routes_require_stream_egress_opt_in() {
     // Flag off on a subsequent apply must withdraw the prior route set.
     runtime.egress_stream_enabled = false;
     let prepared =
-        prepare_gateway_config_for_mesh(translation.config, &runtime).expect("mesh apply");
+        prepare_gateway_config_via_mesh_slice(translation.config, &runtime).expect("mesh apply");
     assert!(
         prepared
             .mesh
@@ -1075,9 +1081,11 @@ fn se_udp_source_side_refuses_non_static_resolution() {
         options(),
     )
     .expect("translation succeeds");
-    let prepared =
-        prepare_gateway_config_for_mesh(translation.config, &sidecar_source_runtime_with_gateway())
-            .expect("mesh apply");
+    let prepared = prepare_gateway_config_via_mesh_slice(
+        translation.config,
+        &sidecar_source_runtime_with_gateway(),
+    )
+    .expect("mesh apply");
 
     assert!(
         prepared
@@ -1111,7 +1119,8 @@ fn se_udp_source_side_routes_are_withdrawn_on_reload() {
         options(),
     )
     .expect("translation succeeds");
-    let prepared = prepare_gateway_config_for_mesh(initial.config, &runtime).expect("mesh apply");
+    let prepared =
+        prepare_gateway_config_via_mesh_slice(initial.config, &runtime).expect("mesh apply");
     assert_eq!(
         prepared
             .mesh
@@ -1133,7 +1142,8 @@ fn se_udp_source_side_routes_are_withdrawn_on_reload() {
         options(),
     )
     .expect("translation succeeds");
-    let prepared = prepare_gateway_config_for_mesh(updated.config, &runtime).expect("mesh apply");
+    let prepared =
+        prepare_gateway_config_via_mesh_slice(updated.config, &runtime).expect("mesh apply");
     assert_eq!(
         prepared
             .mesh
@@ -1157,7 +1167,8 @@ fn se_udp_source_side_routes_are_withdrawn_on_reload() {
         options(),
     )
     .expect("translation succeeds");
-    let prepared = prepare_gateway_config_for_mesh(deleted.config, &runtime).expect("mesh apply");
+    let prepared =
+        prepare_gateway_config_via_mesh_slice(deleted.config, &runtime).expect("mesh apply");
     assert!(
         prepared
             .mesh
@@ -1199,7 +1210,7 @@ fn se_udp_source_side_routes_are_empty_on_non_producer_topologies() {
             .expect("gateway spiffe id"),
     });
     let prepared =
-        prepare_gateway_config_for_mesh(translation.config, &runtime).expect("mesh apply");
+        prepare_gateway_config_via_mesh_slice(translation.config, &runtime).expect("mesh apply");
 
     assert!(
         prepared
@@ -1215,7 +1226,7 @@ fn se_udp_source_side_routes_are_empty_on_non_producer_topologies() {
 /// route whose CONNECT the gateway is guaranteed to refuse.
 ///
 /// A host-less `ServiceEntry` is structurally invalid and is rejected at the
-/// public `prepare_gateway_config_for_mesh` boundary (`hosts must not be empty`)
+/// public `prepare_gateway_config_via_mesh_slice` boundary (`hosts must not be empty`)
 /// before either materializer runs. The source-side materializer also refuses
 /// empty `hosts[]` as defense in depth for slice carriers that bypass the
 /// operator-input validator (xDS / native-slice paths).
@@ -1257,7 +1268,7 @@ fn se_udp_hostless_service_entry_admits_nothing_on_either_half() {
     };
 
     let assert_rejected_at_mesh_boundary = |runtime: &MeshRuntimeConfig, half: &str| {
-        let err = prepare_gateway_config_for_mesh(hostless(), runtime).expect_err(&format!(
+        let err = prepare_gateway_config_via_mesh_slice(hostless(), runtime).expect_err(&format!(
             "{half} half must reject a host-less ServiceEntry at the mesh boundary"
         ));
         let err = err.to_string();
@@ -1351,8 +1362,8 @@ fn se_http_egress_materializes_dns_wildcard_host() {
         options(),
     )
     .expect("translation succeeds");
-    let prepared =
-        prepare_gateway_config_for_mesh(translation.config, &egress_runtime()).expect("mesh apply");
+    let prepared = prepare_gateway_config_via_mesh_slice(translation.config, &egress_runtime())
+        .expect("mesh apply");
 
     let proxy = prepared
         .proxies
@@ -1385,8 +1396,8 @@ fn se_http_egress_static_without_endpoints_fails_closed() {
         options(),
     )
     .expect("translation succeeds");
-    let prepared =
-        prepare_gateway_config_for_mesh(translation.config, &egress_runtime()).expect("mesh apply");
+    let prepared = prepare_gateway_config_via_mesh_slice(translation.config, &egress_runtime())
+        .expect("mesh apply");
 
     assert!(
         prepared
@@ -1430,8 +1441,8 @@ fn se_stream_egress_refuses_wildcard_host_without_claiming_the_port() {
         options(),
     )
     .expect("translation succeeds");
-    let prepared =
-        prepare_gateway_config_for_mesh(translation.config, &egress_runtime()).expect("mesh apply");
+    let prepared = prepare_gateway_config_via_mesh_slice(translation.config, &egress_runtime())
+        .expect("mesh apply");
 
     assert!(
         !prepared
@@ -1484,8 +1495,8 @@ fn se_static_wildcard_host_with_endpoints_still_materializes() {
         options(),
     )
     .expect("translation succeeds");
-    let prepared =
-        prepare_gateway_config_for_mesh(translation.config, &egress_runtime()).expect("mesh apply");
+    let prepared = prepare_gateway_config_via_mesh_slice(translation.config, &egress_runtime())
+        .expect("mesh apply");
 
     let egress = prepared
         .proxies
@@ -1542,7 +1553,7 @@ fn se_udp_egress_refuses_every_wildcard_host_including_static() {
             options(),
         )
         .expect("translation succeeds");
-        let prepared = prepare_gateway_config_for_mesh(translation.config, &egress_runtime())
+        let prepared = prepare_gateway_config_via_mesh_slice(translation.config, &egress_runtime())
             .expect("mesh apply");
         let mesh = prepared.mesh.as_deref().expect("prepared mesh block");
         assert!(

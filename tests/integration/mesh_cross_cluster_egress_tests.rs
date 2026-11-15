@@ -12,14 +12,14 @@
 //! target — fail closed, never dial an unresolved address.
 //!
 //! These are deterministic projection tests: they run the full
-//! `prepare_gateway_config_for_mesh` pipeline and inspect the materialized
+//! `prepare_gateway_config_via_mesh_slice` pipeline and inspect the materialized
 //! `Upstream.targets`, with no live network.
 
 use ferrum_edge::modes::mesh::config::{
     AppProtocol, EastWestGateway, MeshConfig, MeshService, MultiClusterConfig, ServicePort,
     ServiceTargetPort, Workload, WorkloadPort, WorkloadRef, WorkloadSelector,
 };
-use ferrum_edge::modes::mesh::{MeshTopology, prepare_gateway_config_for_mesh};
+use ferrum_edge::modes::mesh::{MeshTopology, prepare_gateway_config_via_mesh_slice};
 use ferrum_edge::proxy::mesh_mtls_pool::{
     MESH_CROSS_CLUSTER_TAG, MESH_EASTWEST_SNI_TAG, MESH_MTLS_AUTHORITY_HOST_TAG,
     MESH_MTLS_DIAL_HOST_TAG, MESH_MTLS_PORT_TAG, MESH_MTLS_TARGET_TAG,
@@ -150,7 +150,7 @@ fn materialize_targets(
     mesh.multi_cluster = Some(multi_cluster_with_gateway(gateway_network));
 
     let config = gateway_config_with_mesh(Vec::new(), Vec::new(), mesh);
-    let prepared = prepare_gateway_config_for_mesh(config, &runtime).expect("mesh-prepared");
+    let prepared = prepare_gateway_config_via_mesh_slice(config, &runtime).expect("mesh-prepared");
     prepared
         .upstreams
         .into_iter()
@@ -329,7 +329,7 @@ fn materialize_all_upstream_targets(
     runtime: &ferrum_edge::modes::mesh::MeshRuntimeConfig,
 ) -> std::collections::HashMap<String, Vec<ferrum_edge::config::types::UpstreamTarget>> {
     let config = gateway_config_with_mesh(Vec::new(), Vec::new(), mesh);
-    let prepared = prepare_gateway_config_for_mesh(config, runtime).expect("mesh-prepared");
+    let prepared = prepare_gateway_config_via_mesh_slice(config, runtime).expect("mesh-prepared");
     prepared
         .upstreams
         .into_iter()
@@ -820,7 +820,7 @@ fn cross_cluster_port_set_skew_still_reaches_the_dialed_port() {
     let mut east_west_runtime = runtime_for_topology(MeshTopology::EastWestGateway);
     east_west_runtime.namespace = "default".to_string();
     east_west_runtime.east_west_listen_port = GATEWAY_PORT;
-    let destination = prepare_gateway_config_for_mesh(
+    let destination = prepare_gateway_config_via_mesh_slice(
         gateway_config_with_mesh(
             Vec::new(),
             Vec::new(),
