@@ -1724,6 +1724,9 @@ fn prepare_normalized_gateway_config_for_mesh(
     // Topology-aware: Ambient emits HBONE routes; Sidecar emits SVID-mTLS routes.
     materialize_mesh_outbound_proxies(&mut config, runtime, mesh_slice);
     bind_carried_http_routes_to_node_waypoint_transport(&mut config, runtime, mesh_slice);
+    // After rebinding, so each candidate names the destination route dispatch
+    // actually selects (the Service port's upstream, not its DNS name).
+    thread_node_waypoint_route_branches_to_authz(&mut config, runtime);
     let refused_destination_routes =
         scope_request_auth_to_node_waypoint_destinations(&mut config, runtime, mesh_slice);
     scope_request_auth_refusal_to_inbound_routes(&mut config, runtime, &refused_destination_routes);
@@ -4837,6 +4840,160 @@ fn bind_carried_http_routes_to_node_waypoint_transport(
         // Re-run materialization so the hosts the dropped routes shadowed
         // get their Service routes back.
         materialize_mesh_outbound_proxies(config, runtime, mesh_slice);
+    }
+}
+
+/// Give the managed `mesh_authz` instance every carried VirtualService route's
+/// candidate destinations (`node_waypoint_route_branches`, issue #7383).
+///
+/// A route the translator merged carries `mesh_route_dispatch` rules that can
+/// send a request to a destination other than the route's own. Authorization
+/// runs before dispatch picks a rule, so `mesh_authz` evaluates every
+/// candidate's own destination policy and the destination the request finally
+/// reaches is admitted only on its own verdict. Each entry lists the route's
+/// own destination first, then each distinct rule destination (an upstream id,
+/// or a direct backend for an external host); a rule with no destination keeps
+/// the route's own. Only routes with at least one other candidate are listed:
+/// every other route keeps the single-destination decision and its blanket
+/// override refusal. A route with more than
+/// [`crate::plugins::mesh::authz::MAX_NODE_WAYPOINT_ROUTE_BRANCHES`] candidates
+/// is left out too, so its other branches stay refused (fail closed).
+///
+/// Without the managed instance (an operator global `mesh_authz` replaced
+/// it) nothing is threaded and the blanket refusal stays.
+fn thread_node_waypoint_route_branches_to_authz(
+    config: &mut GatewayConfig,
+    runtime: &MeshRuntimeConfig,
+) {
+    if runtime.topology != MeshTopology::NodeWaypoint {
+        return;
+    }
+    let route_dispatch_rules: HashMap<(&str, &str), &serde_json::Value> = config
+        .plugin_configs
+        .iter()
+        .filter(|plugin| plugin.enabled && plugin.plugin_name == "mesh_route_dispatch")
+        .map(|plugin| {
+            (
+                (plugin.namespace.as_str(), plugin.id.as_str()),
+                &plugin.config,
+            )
+        })
+        .collect();
+    // A global dispatch instance runs on every route without an association.
+    let global_route_dispatch: Vec<&serde_json::Value> = config
+        .plugin_configs
+        .iter()
+        .filter(|plugin| {
+            plugin.enabled
+                && plugin.plugin_name == "mesh_route_dispatch"
+                && plugin.scope == PluginScope::Global
+        })
+        .map(|plugin| &plugin.config)
+        .collect();
+    let mut entries: Vec<serde_json::Value> = Vec::new();
+    let mut oversized_routes = 0usize;
+    for proxy in &config.proxies {
+        if !config::is_virtual_service_http_route_proxy_id(&proxy.id) {
+            continue;
+        }
+        let own = match proxy.upstream_id.as_deref() {
+            Some(upstream_id) => serde_json::json!({ "upstream_id": upstream_id }),
+            None if !proxy.backend_host.trim().is_empty() && proxy.backend_port != 0 => {
+                serde_json::json!({
+                    "backend_host": proxy.backend_host,
+                    "backend_port": proxy.backend_port,
+                })
+            }
+            None => continue,
+        };
+        let mut destinations = vec![own];
+        let dispatch_configs = proxy
+            .plugins
+            .iter()
+            .filter_map(|association| {
+                route_dispatch_rules
+                    .get(&(
+                        proxy.namespace.as_str(),
+                        association.plugin_config_id.as_str(),
+                    ))
+                    .copied()
+            })
+            .chain(global_route_dispatch.iter().copied());
+        for dispatch in dispatch_configs {
+            for destination in dispatch
+                .get("rules")
+                .and_then(serde_json::Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(|rule| rule.get("destination"))
+            {
+                let upstream_id = destination
+                    .get("upstream_id")
+                    .and_then(serde_json::Value::as_str);
+                let backend_host = destination
+                    .get("backend_host")
+                    .and_then(serde_json::Value::as_str);
+                let backend_port = destination
+                    .get("backend_port")
+                    .and_then(serde_json::Value::as_u64)
+                    .and_then(|port| u16::try_from(port).ok());
+                // `mesh_route_dispatch` refuses any other shape at
+                // construction; an empty destination keeps the route's own.
+                let candidate = match (upstream_id, backend_host, backend_port) {
+                    (Some(upstream_id), None, None) => {
+                        serde_json::json!({ "upstream_id": upstream_id })
+                    }
+                    (None, Some(host), Some(port)) => serde_json::json!({
+                        "backend_host": host,
+                        "backend_port": port,
+                    }),
+                    _ => continue,
+                };
+                if !destinations.contains(&candidate) {
+                    destinations.push(candidate);
+                }
+            }
+        }
+        if destinations.len() < 2 {
+            continue;
+        }
+        if destinations.len() > crate::plugins::mesh::authz::MAX_NODE_WAYPOINT_ROUTE_BRANCHES {
+            oversized_routes += 1;
+            continue;
+        }
+        entries.push(serde_json::json!({
+            "namespace": proxy.namespace,
+            "proxy_id": proxy.id,
+            "destinations": destinations,
+        }));
+    }
+    if oversized_routes > 0 {
+        warn!(
+            routes = oversized_routes,
+            limit = crate::plugins::mesh::authz::MAX_NODE_WAYPOINT_ROUTE_BRANCHES,
+            "NodeWaypoint VirtualService routes name more mesh_route_dispatch destinations than \
+             per-destination authorization tracks; a rule on those routes that selects a \
+             destination other than the route's own is refused (fail closed)"
+        );
+    }
+    let Some(authz) = config.plugin_configs.iter_mut().find(|plugin| {
+        plugin.scope == PluginScope::Global
+            && plugin.plugin_name == "mesh_authz"
+            && plugin.namespace == runtime.namespace
+            && plugin.id == MESH_AUTHZ_PLUGIN_ID
+    }) else {
+        return;
+    };
+    let Some(authz_config) = authz.config.as_object_mut() else {
+        return;
+    };
+    if entries.is_empty() {
+        authz_config.remove("node_waypoint_route_branches");
+    } else {
+        authz_config.insert(
+            "node_waypoint_route_branches".to_string(),
+            serde_json::Value::Array(entries),
+        );
     }
 }
 

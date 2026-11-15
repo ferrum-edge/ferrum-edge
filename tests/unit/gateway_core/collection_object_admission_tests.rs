@@ -576,13 +576,19 @@ fn mesh_authz_raw_lists_require_object_elements_before_construction() {
     let valid = json!({
         "per_pod_policy_scoping": true,
         "mesh_policies": [policy()],
-        "node_waypoint_route_upstreams": [upstream]
+        "node_waypoint_route_upstreams": [upstream],
+        "node_waypoint_route_branches": [{
+            "namespace": "ferrum", "proxy_id": "route",
+            "destinations": [{"upstream_id": "route"}, {"upstream_id": "other"}]
+        }]
     });
     assert!(MeshAuthz::new(&valid).is_ok());
     for pointer in [
         "/mesh_policies/0",
         "/node_waypoint_route_upstreams/0",
         "/node_waypoint_route_upstreams/0/targets/0",
+        "/node_waypoint_route_branches/0",
+        "/node_waypoint_route_branches/0/destinations/0",
     ] {
         for rejected in [json!([]), json!(["positional"]), json!(7)] {
             let mut body = valid.clone();

@@ -467,7 +467,12 @@ impl Plugin for MeshRouteDispatchFinalizer {
         crate::plugins::ResponseBodyProduction::Never
     }
 
-    /// Cache-internal sentinel: rewrites no request input (issue #6008).
+    /// Cache-internal sentinel: rewrites no request input of its own (issue
+    /// #6008). On a NodeWaypoint route with per-destination verdicts it
+    /// installs the selected destination's CUSTOM provider result (issue
+    /// #7383), whose header names the owning `mesh_authz` instance declares;
+    /// it runs after every dispatch instance and before request transformers,
+    /// deduplication and caching.
     fn declares_request_input_mutations(&self) -> bool {
         true
     }
@@ -475,15 +480,25 @@ impl Plugin for MeshRouteDispatchFinalizer {
     async fn before_proxy(
         &self,
         ctx: &mut RequestContext,
-        _headers: &mut std::collections::HashMap<String, String>,
+        headers: &mut std::collections::HashMap<String, String>,
     ) -> PluginResult {
-        if !std::mem::take(&mut ctx.mesh_route_dispatch_reject_unmatched)
-            || ctx.mesh_route_dispatch_matched
-            || ctx.has_route_overrides()
+        if std::mem::take(&mut ctx.mesh_route_dispatch_reject_unmatched)
+            && !ctx.mesh_route_dispatch_matched
+            && !ctx.has_route_overrides()
         {
-            return PluginResult::Continue;
+            return crate::plugins::mesh_route_dispatch::reject_unmatched_result();
         }
-        crate::plugins::mesh_route_dispatch::reject_unmatched_result()
+        // NodeWaypoint per-destination authorization (issue #7383): every
+        // instance has run, so the effective destination is final. Admit it
+        // on its own verdict and run its own CUSTOM check here, before any
+        // request transformer.
+        if let Some(refusal) =
+            crate::plugins::mesh_route_dispatch::finalize_node_waypoint_route_branch(ctx, headers)
+                .await
+        {
+            return refusal;
+        }
+        PluginResult::Continue
     }
 }
 

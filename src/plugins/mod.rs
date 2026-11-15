@@ -3741,6 +3741,16 @@ pub struct RequestContext {
     /// the shared listener carries no single proxy identity that fits
     /// the slice-level filter that other topologies use.
     pub node_waypoint_policy_scope: Option<Arc<crate::modes::mesh::runtime::PolicyScopeCache>>,
+    /// Per-destination authorization verdicts `mesh_authz` records for a
+    /// carried NodeWaypoint VirtualService route whose `mesh_route_dispatch`
+    /// rules can select a destination other than the route's own (issue
+    /// #7383). Private and typed, never metadata: route dispatch and proxy
+    /// core admit the destination the request finally reaches only on its own
+    /// verdict
+    /// (`plugins::mesh::authz::admit_node_waypoint_route_branch_for_effective_destination`).
+    /// `None` on every other route and topology.
+    pub(crate) node_waypoint_route_branch_authz:
+        Option<crate::plugins::mesh::authz::NodeWaypointRouteBranchAuthz>,
     /// Mesh traffic direction stamped by the listener that accepted this
     /// request. `Some(Inbound)` for mesh inbound mTLS / HBONE termination
     /// listeners; `Some(Outbound)` for the outbound capture listener;
@@ -4942,6 +4952,7 @@ impl RequestContext {
             ai_stream_router_claim: None,
             node_waypoint_pod_uid: None,
             node_waypoint_policy_scope: None,
+            node_waypoint_route_branch_authz: None,
             mesh_direction: None,
             orig_dst: None,
             destination_ip: None,
@@ -6750,6 +6761,7 @@ impl RequestContext {
             ai_stream_router_claim: self.ai_stream_router_claim.clone(),
             node_waypoint_pod_uid: self.node_waypoint_pod_uid,
             node_waypoint_policy_scope: self.node_waypoint_policy_scope.clone(),
+            node_waypoint_route_branch_authz: self.node_waypoint_route_branch_authz.clone(),
             mesh_direction: self.mesh_direction,
             orig_dst: self.orig_dst,
             destination_ip: self.destination_ip,

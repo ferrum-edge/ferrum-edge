@@ -71,7 +71,7 @@ type column says so. Unknown keys are rejected at every level.
 | `backend_host` | String \| null | omitted | Direct-backend host. A **bare host**: a DNS name, an IPv4 literal, or an IPv6 literal in either `::1` or `[::1]` form. The port belongs in `backend_port`; an embedded authority port, scheme, path, query, fragment, or userinfo is rejected at load rather than failing DNS resolution with a 502 on every matching request. Trimmed and ASCII-lowercased at load; max 255 characters |
 | `backend_port` | 1–65535 \| null | omitted | Direct-backend port. Must be set together with `backend_host` |
 | `backend_tls` | Object \| null | omitted | Route-local backend TLS (below). **Direct backends only** — an `upstream_id` destination inherits TLS from the referenced `Upstream` (including mesh `DestinationRule` projection), so per-canary TLS for an upstream override is modeled as a separate upstream resource |
-| `requires_node_waypoint_authz` | bool | `false` | Trusted mesh-translator marker. Under scoped NodeWaypoint authorization, a matching destination carrying it fails closed without an authorized destination stamp. Not for hand-authored config |
+| `requires_node_waypoint_authz` | bool | `false` | Trusted mesh-translator marker. Under scoped NodeWaypoint authorization, a matching destination carrying it fails closed without an authorized destination stamp (routes without per-destination verdicts; see *NodeWaypoint destination authorization*). Not for hand-authored config |
 
 **`rules[].fault`** — at least one of `delay` / `abort` is required.
 
@@ -387,6 +387,27 @@ one yourself (see the third example below). The check counts a configured
 transformer whatever its RTDS gate: an instance an RTDS overlay disables is not
 eligible at runtime and leaves the route list unused, exactly as before, so the
 kill switch never wedges a reload.
+
+### NodeWaypoint destination authorization
+
+On a NodeWaypoint, `mesh_authz` runs before this plugin picks a rule. For a
+carried VirtualService route whose rules can select a destination other than
+the route's own, it records one verdict per candidate destination (issue
+#7383). Several contiguous instances may replace each other's destination, so
+no instance judges a rule on its own: the cache-installed dispatch finalizer,
+right after the last instance and before request transformers, admits the
+destination the whole group selected only when that destination's own policy
+allows the request. When that policy delegates to an external authorizer
+(CUSTOM), the finalizer runs that destination's check first and installs the
+provider's `headersToUpstreamOnAllow` result only for that destination. A
+refused destination answers with its own denial (the matched rule's response
+header list and match metadata are withdrawn), and a destination the verdicts
+do not name is refused. Proxy core re-checks the destination the request
+finally reaches after every `before_proxy` hook, so the verdicts hold even
+when this plugin stands down. Every other route keeps the single-destination
+check: a rule that rewrites to a destination other than the one authorization
+stamped is refused with `403`. See [mesh.md → Per-destination authorization for dispatch
+branches](../mesh.md#per-destination-authorization-for-dispatch-branches).
 
 ### Match observability
 

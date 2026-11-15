@@ -206,6 +206,14 @@ pub(super) fn contract(name: &str) -> Option<PluginConfigContract> {
                         "service_name": "reviews",
                         "service_port": 80
                     }]
+                }],
+                "node_waypoint_route_branches": [{
+                    "namespace": "default",
+                    "proxy_id": "istio-vs-default-reviews-0",
+                    "destinations": [
+                        {"upstream_id": "istio-vs-upstream-reviews"},
+                        {"backend_host": "api.example.com", "backend_port": 443}
+                    ]
                 }]
             }),
         ])

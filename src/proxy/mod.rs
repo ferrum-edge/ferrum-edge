@@ -34277,6 +34277,22 @@ pub(crate) async fn run_before_proxy_hooks_for_backend_path_policy(
             }
         }
     }
+    // NodeWaypoint per-destination authorization (issue #7383): on a carried
+    // VirtualService route whose dispatch rules can select another
+    // destination, `mesh_authz` recorded one verdict per candidate. Whatever
+    // decided the destination in this pass (a matched dispatch rule, no rule,
+    // a dispatch instance that stood down, or another override writer), the
+    // destination the request reaches now is admitted only on its own
+    // verdict; one the table does not name is refused. Every transport and
+    // deferred pass converges here, so no path skips it. One `Option` read
+    // for every other request.
+    if let Some(refusal) =
+        crate::plugins::mesh::authz::enforce_node_waypoint_route_branch_for_effective_destination(
+            ctx,
+        )
+    {
+        return refusal;
+    }
     // A hook in this pass may have relabelled the request as gRPC-Web after
     // the intake refusal above (a `request_transformer` `content-type` rule, a
     // correlation or routing header writer): refuse it before any body leaves.

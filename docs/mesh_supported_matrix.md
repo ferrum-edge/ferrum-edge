@@ -103,7 +103,9 @@ enrolled rows and required live assertion IDs; fixture detail is in the
   `mesh_route_dispatch` rules and weighted-split upstreams) ride only a
   **NodeWaypoint** slice (issue #7233, Experimental with the topology), so
   route-scoped destination `AuthorizationPolicy` and `RequestAuthentication`
-  apply per VirtualService route there. Sidecar and Ambient slices do not carry
+  apply per VirtualService route there. A merged route's `mesh_route_dispatch`
+  branches are each authorized against their own destination's policy (issue
+  #7383). Sidecar and Ambient slices do not carry
   `http[]` routes yet. See [mesh.md → Mesh data planes: NodeWaypoint route
   carriage](mesh.md#mesh-data-planes-nodewaypoint-route-carriage).
 

@@ -7592,7 +7592,7 @@ Mesh mode auto-injects it as the reserved global `__mesh_authz` on every applica
 
 **Evaluation order.** `CUSTOM` delegations run first, before the DENY/ALLOW tiers. DENY rules are evaluated next and the first match wins. If any ALLOW rule is loaded and none matches, the request is denied by the implicit-deny floor (`mesh_authz.deny_policy=implicit-deny`). A configuration with no policies at all evaluates nothing and allows every request — an empty `mesh_policies: []` is a valid scaffold, not a lockdown.
 
-**Configuration.** Unknown top-level keys are rejected at construction, and a non-object, non-null `config` (a string, number, or array) is rejected too — a misspelled `mesh_policies` or a malformed root would otherwise build a policy-free instance whose implicit-deny floor never engages, allowing every request. The eleven accepted keys:
+**Configuration.** Unknown top-level keys are rejected at construction, and a non-object, non-null `config` (a string, number, or array) is rejected too — a misspelled `mesh_policies` or a malformed root would otherwise build a policy-free instance whose implicit-deny floor never engages, allowing every request. The twelve accepted keys:
 
 | Key | Type | Default | Notes |
 | --- | --- | --- | --- |
@@ -7607,8 +7607,9 @@ Mesh mode auto-injects it as the reserved global `__mesh_authz` on every applica
 | `cluster_domain` | String | `cluster.local` | **Injection-only.** Primary Kubernetes cluster domain, used for node-waypoint service-host matching. |
 | `cluster_domains` | Array of strings | `[]` | **Injection-only.** Deduplicated cluster-domain aliases for the same host matching. |
 | `node_waypoint_route_upstreams` | Array of objects | `[]` | **Injection-only.** Mesh-generated route upstream metadata used to precompute destination policy scopes for node-waypoint dispatch: the `istio-vs-upstream-*` weighted-split upstreams of the VirtualService HTTP routes the NodeWaypoint's slice carries (`MeshSlice.http_routes`, native and xDS). Empty on every other topology, and when no mesh-bound VirtualService HTTP route in the NodeWaypoint's namespace uses a weighted split. Gateway API HTTPRoute routes bind Gateway listeners and never ride a mesh slice. |
+| `node_waypoint_route_branches` | Array of objects | `[]` | **Injection-only.** Candidate destinations of each NodeWaypoint VirtualService route whose `mesh_route_dispatch` rules can select a destination other than the route's own (issue #7383): `namespace`, `proxy_id`, and `destinations` (the route's own first, then each rule destination; each names exactly one of `upstream_id` or `backend_host` + `backend_port`; at most 64). The plugin evaluates every candidate's destination policy before dispatch, and the destination a request finally reaches is admitted only on its own verdict. Closed at every level. Absent on every other topology and route. |
 
-The five injection-only keys are populated by mesh mode and are documented here only so an operator reading a live `/plugins` response can identify them; do not hand-author them.
+The six injection-only keys are populated by mesh mode and are documented here only so an operator reading a live `/plugins` response can identify them; do not hand-author them.
 
 **Direct policy example.** A namespace-scoped policy that denies `/admin` and every path under `/admin/` outright and otherwise allows only one service account. Both patterns are needed: `/admin/*` is a prefix match on `/admin/`, so it does not match the bare `/admin` path.
 

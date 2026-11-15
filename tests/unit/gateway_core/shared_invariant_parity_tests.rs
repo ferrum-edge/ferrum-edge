@@ -3838,6 +3838,12 @@ fn plugin_struct_lists_behind_raw_json_values_retain_element_admission() {
         ),
         (
             "src/plugins/mesh/authz.rs",
+            "fn parse_node_waypoint_route_branches(",
+            "\n}",
+            "json_object::from_json_object_vec_value",
+        ),
+        (
+            "src/plugins/mesh/authz.rs",
             "pub fn new_with_http_client(",
             "\n    }",
             "Vec<crate::util::json_object::JsonObject<MeshPolicy>>",
@@ -5346,5 +5352,88 @@ fn final_request_body_hook_context_hand_back_has_one_implementation() {
     assert!(
         adopters >= 6,
         "expected the five proxy dispatch sites and the `_test_support` seam, found {adopters}"
+    );
+}
+
+/// NodeWaypoint per-destination authorization (issue #7383): every place that
+/// decides which destination a carried VirtualService route reaches must
+/// consult the request's per-destination verdicts before the blanket
+/// single-destination guard. The siblings are route dispatch's matched-rule
+/// admission, its early route-total preview, and proxy core's final check in
+/// the one `before_proxy` runner every transport (H1/H2, native gRPC,
+/// WebSocket, H3, deferred passes) converges on. A new call site of the
+/// blanket guard, or a runner without the final check, fails here.
+#[test]
+fn node_waypoint_route_branch_verdicts_gate_every_destination_decision() {
+    let proxy = admission_source_without_line_comments(&source("src/proxy/mod.rs"));
+    let runner = item_body(
+        &proxy,
+        "pub(crate) async fn run_before_proxy_hooks_for_backend_path_policy(",
+        "\n}",
+    );
+    assert!(
+        runner.contains("enforce_node_waypoint_route_branch_for_effective_destination("),
+        "the shared before_proxy runner must admit the reached destination on its own verdict"
+    );
+
+    let dispatch = source("src/plugins/mesh_route_dispatch.rs");
+    let production = dispatch
+        .split("\n#[cfg(test)]\nmod tests {")
+        .next()
+        .expect("dispatch source");
+    let production = admission_source_without_line_comments(production);
+    let guard_calls = production
+        .matches("reject_node_waypoint_authz_destination_override(")
+        .count();
+    assert_eq!(
+        guard_calls, 2,
+        "the blanket guard is defined once and reached only through the verdict-aware wrapper"
+    );
+    let finalize = item_body(
+        &production,
+        "pub(crate) async fn finalize_node_waypoint_route_branch(",
+        "\n}",
+    );
+    assert!(
+        finalize.contains("admit_node_waypoint_route_branch_for_effective_destination(ctx"),
+        "the group-level admission must judge the destination every instance selected"
+    );
+    let cache = admission_source_without_line_comments(&source("src/plugin_cache.rs"));
+    let finalizer = item_body(
+        &cache,
+        "impl Plugin for MeshRouteDispatchFinalizer {",
+        "\n}",
+    );
+    assert!(
+        finalizer.contains("finalize_node_waypoint_route_branch(ctx, headers)"),
+        "the dispatch finalizer must admit the selected destination after the last instance"
+    );
+    let preview = item_body(
+        &production,
+        "fn node_waypoint_rule_destination_vetoed(",
+        "\n}",
+    );
+    assert!(
+        preview.contains("reject_unauthorized_node_waypoint_rule_destination(ctx, destination)"),
+        "the preview must follow the same per-rule decision as execution"
+    );
+    assert!(
+        item_body(&production, "fn rule_answers_before_dispatch(", "\n}")
+            .contains("node_waypoint_rule_destination_vetoed(ctx, &rule.destination)"),
+        "early route-total planning must use the verdict-aware preview"
+    );
+    assert_eq!(
+        production
+            .matches("reject_unauthorized_node_waypoint_rule_destination(")
+            .count(),
+        3,
+        "matched-rule admission and the preview share the verdict-aware check (definition + two calls)"
+    );
+    assert_eq!(
+        production
+            .matches("admit_node_waypoint_route_branch_for_effective_destination(")
+            .count(),
+        1,
+        "no single dispatch instance may admit an intermediate destination"
     );
 }
