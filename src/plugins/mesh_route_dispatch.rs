@@ -72,7 +72,8 @@ use crate::plugins::fault_injection::{
 use crate::plugins::mesh::authz::{
     NODE_WAYPOINT_AUTHORIZED_BACKEND_ALIASES_METADATA, NODE_WAYPOINT_AUTHORIZED_BACKEND_METADATA,
     NODE_WAYPOINT_AUTHORIZED_UPSTREAM_ID_METADATA, NODE_WAYPOINT_SCOPED_AUTHZ_ACTIVE_METADATA,
-    NodeWaypointBranchDestination, enforce_node_waypoint_route_branch,
+    NodeWaypointBranchDestination, admit_node_waypoint_route_branch,
+    admit_node_waypoint_route_branch_for_effective_destination,
     has_node_waypoint_route_branch_authz, node_waypoint_route_branch_refuses,
 };
 use crate::plugins::mesh::diagnostics::{self, Schema};
@@ -1683,18 +1684,23 @@ fn node_waypoint_rule_branch_destination(
 ///
 /// A carried VirtualService route whose rules can select another destination
 /// carries per-destination verdicts (issue #7383): the rule is admitted only
-/// when its own destination's policy allowed the request, and is refused with
-/// that policy's denial otherwise. Every other route keeps the blanket guard
-/// below, which binds dispatch to the one destination authorization stamped.
-fn reject_unauthorized_node_waypoint_rule_destination(
+/// when its own destination's policy allowed the request (running that
+/// destination's own CUSTOM check, whose provider headers land on `headers`
+/// here), and is refused with that policy's denial otherwise. Every other
+/// route keeps the blanket guard below, which binds dispatch to the one
+/// destination authorization stamped.
+async fn reject_unauthorized_node_waypoint_rule_destination(
     ctx: &mut RequestContext,
+    headers: &mut HashMap<String, String>,
     destination: &RouteDestination,
 ) -> Option<PluginResult> {
     if has_node_waypoint_route_branch_authz(ctx) {
-        return enforce_node_waypoint_route_branch(
+        return admit_node_waypoint_route_branch(
             ctx,
+            headers,
             node_waypoint_rule_branch_destination(destination),
-        );
+        )
+        .await;
     }
     reject_node_waypoint_authz_destination_override(ctx, destination)
 }
@@ -2704,8 +2710,12 @@ impl Plugin for MeshRouteDispatch {
                 {
                     return result;
                 }
-                if let Some(result) =
-                    reject_unauthorized_node_waypoint_rule_destination(ctx, &rule.destination)
+                if let Some(result) = reject_unauthorized_node_waypoint_rule_destination(
+                    ctx,
+                    headers,
+                    &rule.destination,
+                )
+                .await
                 {
                     // A security denial is not a response this rule
                     // generates: tenant route policy must never decorate
@@ -2837,6 +2847,15 @@ impl Plugin for MeshRouteDispatch {
                 return PluginResult::Continue;
             }
             return reject_unmatched_result();
+        }
+        // No rule matched: the request keeps the destination it already had
+        // (the route's own, or an earlier instance's override). Admit it on
+        // its own verdict here, so a CUSTOM check it owes runs at this
+        // instance's priority like a matched rule's would (issue #7383).
+        if let Some(result) =
+            admit_node_waypoint_route_branch_for_effective_destination(ctx, headers).await
+        {
+            return result;
         }
         PluginResult::Continue
     }

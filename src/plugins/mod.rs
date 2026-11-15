@@ -3746,7 +3746,7 @@ pub struct RequestContext {
     /// rules can select a destination other than the route's own (issue
     /// #7383). Private and typed, never metadata: route dispatch and proxy
     /// core admit the destination the request finally reaches only on its own
-    /// verdict (`plugins::mesh::authz::enforce_node_waypoint_route_branch`).
+    /// verdict (`plugins::mesh::authz::admit_node_waypoint_route_branch`).
     /// `None` on every other route and topology.
     pub(crate) node_waypoint_route_branch_authz:
         Option<crate::plugins::mesh::authz::NodeWaypointRouteBranchAuthz>,

@@ -394,8 +394,12 @@ On a NodeWaypoint, `mesh_authz` runs before this plugin picks a rule. For a
 carried VirtualService route whose rules can select a destination other than
 the route's own, it records one verdict per candidate destination (issue
 #7383), and a matched rule is admitted only when its own destination's policy
-allowed the request. A refused rule answers with that destination's `403`
-denial, and a destination the verdicts do not name is refused. Proxy core
+allowed the request. When that destination's policy delegates to an external
+authorizer (CUSTOM), this plugin runs that destination's check before it
+commits the rule, and installs the provider's `headersToUpstreamOnAllow`
+result only for that destination; a request that matches no rule is admitted
+on its current destination the same way. A refused rule answers with that
+destination's denial, and a destination the verdicts do not name is refused. Proxy core
 re-checks the destination the request finally reaches after every
 `before_proxy` hook, so the verdicts hold even when no rule matches or this
 plugin stands down. Every other route keeps the single-destination check: a

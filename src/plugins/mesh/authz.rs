@@ -727,11 +727,16 @@ pub(crate) enum NodeWaypointBranchDestination<'a> {
     Unknown,
 }
 
-/// Why a branch was refused, which fixes its response body and counter.
+/// Why a branch was refused, which fixes its response body, metadata and
+/// counters.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum NodeWaypointBranchDenyKind {
+    /// The destination's DENY/ALLOW tiers refused the request.
     Policy,
+    /// The destination reaches a modeled workload whose scope is unresolved.
     DestinationScopeMissing,
+    /// Two different CUSTOM providers apply to the destination.
+    CustomProviderConflict,
 }
 
 #[derive(Debug, Clone)]
@@ -743,27 +748,64 @@ enum NodeWaypointBranchOutcome {
     },
 }
 
+/// The CUSTOM delegations candidates still owe, and what a check for the
+/// reached candidate is asked about.
+///
+/// A candidate's CUSTOM check runs only once route dispatch has selected that
+/// candidate (`admit_node_waypoint_route_branch`), so no provider is asked
+/// about a branch the request does not take, and a provider's
+/// `headersToUpstreamOnAllow` / `headersToDownstreamOnAllow` result is applied
+/// only to the request that reaches the destination whose policy required the
+/// check. Debug output omits the inputs: they carry request header values.
+#[derive(Clone)]
+struct NodeWaypointBranchCustom {
+    /// `(candidate index, delegation)`, at most one per candidate.
+    pending: Vec<(usize, MeshAuthzCustomDelegation)>,
+    executor: Option<Arc<MeshExtAuthzExecutor>>,
+    /// The owning `mesh_authz` instance, which keys the staged downstream
+    /// mutations its `after_proxy` hook applies.
+    instance_id: u64,
+    inputs: MeshCustomCheckInputs,
+    /// The candidate whose CUSTOM check ran (and whose provider mutations
+    /// were applied). The request may reach only that candidate afterwards.
+    executed_for: Option<usize>,
+}
+
+impl std::fmt::Debug for NodeWaypointBranchCustom {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NodeWaypointBranchCustom")
+            .field("pending", &self.pending.len())
+            .field("executed_for", &self.executed_for)
+            .finish_non_exhaustive()
+    }
+}
+
 /// Per-destination authorization verdicts for one request on a carried
 /// NodeWaypoint VirtualService route whose `mesh_route_dispatch` rules can
 /// select a destination other than the route's own (issue #7383).
 ///
-/// `mesh_authz` evaluates every candidate destination's policy before route
-/// dispatch picks a rule and records the verdicts here; the destination the
+/// `mesh_authz` evaluates every candidate destination's DENY/ALLOW tiers
+/// before route dispatch picks a rule and records the verdicts here, together
+/// with each candidate's pending CUSTOM delegation. The destination the
 /// request finally reaches is admitted only when its own verdict allowed it
-/// (`enforce_node_waypoint_route_branch`). A destination the table does not
-/// name, or one with no recorded verdict, is refused. Recording allocates
-/// nothing unless a candidate audits or is denied.
+/// and its own CUSTOM check (if any) ran for it and allowed it. A destination
+/// the table does not name, or one with no recorded verdict, is refused.
+/// Recording allocates nothing unless a candidate audits, is denied, or owes
+/// a CUSTOM check.
 #[derive(Debug, Clone)]
 pub(crate) struct NodeWaypointRouteBranchAuthz {
     branches: Arc<NodeWaypointRouteBranches>,
     /// Bit `i` set: candidate `i` was evaluated.
     evaluated: u64,
-    /// Bit `i` set: candidate `i` was allowed.
+    /// Bit `i` set: candidate `i`'s DENY/ALLOW tiers allowed the request (a
+    /// pending CUSTOM check is still required).
     allowed: u64,
     /// Audit and deny outcomes, keyed by candidate index.
     outcomes: Vec<(usize, NodeWaypointBranchOutcome)>,
     /// The authz principal the deny drilldown records.
     source_for_log: Option<String>,
+    /// Pending CUSTOM delegations; `None` when no candidate owes one.
+    custom: Option<Box<NodeWaypointBranchCustom>>,
 }
 
 impl NodeWaypointRouteBranchAuthz {
@@ -791,26 +833,47 @@ impl NodeWaypointRouteBranchAuthz {
                 _ => NodeWaypointBranchVerdict::Unknown,
             };
         }
-        match outcome {
-            Some(NodeWaypointBranchOutcome::Audit(policy)) => {
-                NodeWaypointBranchVerdict::Allowed(Some(policy.as_str()))
-            }
-            _ => NodeWaypointBranchVerdict::Allowed(None),
+        // A CUSTOM check that already ran for one candidate applied that
+        // provider's mutations to this request: no other candidate may be
+        // reached afterwards (it would inherit them).
+        let custom = self.custom.as_deref();
+        if let Some(executed) = custom.and_then(|custom| custom.executed_for)
+            && executed != index
+        {
+            return NodeWaypointBranchVerdict::Rebound;
         }
+        let pending = custom
+            .filter(|custom| custom.executed_for != Some(index))
+            .and_then(|custom| {
+                custom
+                    .pending
+                    .iter()
+                    .find(|(candidate, _)| *candidate == index)
+                    .map(|(_, delegation)| delegation)
+            });
+        let audit = match outcome {
+            Some(NodeWaypointBranchOutcome::Audit(policy)) => Some(policy.as_str()),
+            _ => None,
+        };
+        NodeWaypointBranchVerdict::Allowed { audit, pending }
     }
 
     /// Fold another `mesh_authz` instance's verdicts into these: a candidate
-    /// stays allowed only when both allowed it. Tables of different shape
-    /// cannot be aligned, so every candidate is refused (fail closed).
+    /// stays allowed only when both allowed it. Tables of different shape, or
+    /// records that owe CUSTOM checks (two executors cannot share one
+    /// admission), cannot be aligned, so every candidate is refused (fail
+    /// closed).
     fn merge(&mut self, other: Self) {
-        let aligned = Arc::ptr_eq(&self.branches, &other.branches)
-            || (self.branches.branches.len() == other.branches.branches.len()
-                && self
-                    .branches
-                    .branches
-                    .iter()
-                    .zip(other.branches.branches.iter())
-                    .all(|(left, right)| left.key == right.key));
+        let aligned = self.custom.is_none()
+            && other.custom.is_none()
+            && (Arc::ptr_eq(&self.branches, &other.branches)
+                || (self.branches.branches.len() == other.branches.branches.len()
+                    && self
+                        .branches
+                        .branches
+                        .iter()
+                        .zip(other.branches.branches.iter())
+                        .all(|(left, right)| left.key == right.key)));
         if !aligned {
             self.allowed = 0;
             return;
@@ -838,12 +901,60 @@ impl NodeWaypointRouteBranchAuthz {
 }
 
 enum NodeWaypointBranchVerdict<'a> {
-    Allowed(Option<&'a str>),
+    /// The DENY/ALLOW tiers allowed the destination; `pending` is the CUSTOM
+    /// check it still owes (not yet run for it).
+    Allowed {
+        audit: Option<&'a str>,
+        pending: Option<&'a MeshAuthzCustomDelegation>,
+    },
     Denied {
         policy: &'a str,
         kind: NodeWaypointBranchDenyKind,
     },
+    /// A CUSTOM check already ran for a different candidate.
+    Rebound,
     Unknown,
+}
+
+/// One candidate's local verdict, deny/audit outcome and pending CUSTOM
+/// delegation from its policy evaluation. Two different applicable providers
+/// refuse the candidate (Istio permits one per workload).
+fn branch_outcome_from_evaluation(
+    evaluation: MeshAuthzEvaluation,
+) -> (
+    bool,
+    Option<NodeWaypointBranchOutcome>,
+    Option<MeshAuthzCustomDelegation>,
+) {
+    if evaluation.custom_provider_conflict {
+        return (
+            false,
+            Some(NodeWaypointBranchOutcome::Deny {
+                policy: crate::modes::mesh::policy::MESH_AUTHZ_CUSTOM_PROVIDER_CONFLICT.to_string(),
+                kind: NodeWaypointBranchDenyKind::CustomProviderConflict,
+            }),
+            None,
+        );
+    }
+    let pending = evaluation.custom;
+    match evaluation.decision {
+        MeshAuthzDecision::Allow => (true, None, pending),
+        MeshAuthzDecision::Audit { policy } => (
+            true,
+            Some(NodeWaypointBranchOutcome::Audit(policy)),
+            pending,
+        ),
+        MeshAuthzDecision::Deny { policy } => (
+            false,
+            Some(NodeWaypointBranchOutcome::Deny {
+                policy,
+                kind: NodeWaypointBranchDenyKind::Policy,
+            }),
+            // A candidate its DENY/ALLOW tiers refuse is refused whatever its
+            // provider says, so its check never needs to run.
+            None,
+        ),
+    }
 }
 
 /// Record this instance's per-destination verdicts on the request. A second
@@ -856,10 +967,11 @@ fn install_node_waypoint_route_branch_authz(
 ) {
     // Only a refusal reads the principal, so only a record that can refuse
     // pays for the copy.
-    if record
-        .outcomes
-        .iter()
-        .any(|(_, outcome)| matches!(outcome, NodeWaypointBranchOutcome::Deny { .. }))
+    if record.custom.is_some()
+        || record
+            .outcomes
+            .iter()
+            .any(|(_, outcome)| matches!(outcome, NodeWaypointBranchOutcome::Deny { .. }))
     {
         record.source_for_log = source_for_log.map(str::to_string);
     }
@@ -870,7 +982,8 @@ fn install_node_waypoint_route_branch_authz(
 }
 
 /// Deny policy recorded when a request reaches a destination its route's
-/// verdict table does not name.
+/// verdict table does not name, or a different destination than the one
+/// whose CUSTOM check already ran.
 const NODE_WAYPOINT_ROUTE_BRANCH_UNKNOWN_POLICY: &str = "route_branch_unauthorized";
 
 /// Whether this request carries per-destination verdicts (a carried
@@ -881,8 +994,8 @@ pub(crate) fn has_node_waypoint_route_branch_authz(ctx: &RequestContext) -> bool
 }
 
 /// Whether `destination` would be refused by this request's per-destination
-/// verdicts. Side-effect free (early route-total planning). `false` when the
-/// request carries no verdicts.
+/// verdicts before any CUSTOM check runs. Side-effect free (early route-total
+/// planning). `false` when the request carries no verdicts.
 pub(crate) fn node_waypoint_route_branch_refuses(
     ctx: &RequestContext,
     destination: NodeWaypointBranchDestination<'_>,
@@ -892,59 +1005,135 @@ pub(crate) fn node_waypoint_route_branch_refuses(
     };
     !matches!(
         record.verdict(record.branches.position(destination)),
-        NodeWaypointBranchVerdict::Allowed(_)
+        NodeWaypointBranchVerdict::Allowed { .. }
     )
 }
 
-/// Admit or refuse the destination a request is about to reach under this
-/// request's per-destination verdicts.
-///
-/// `None` admits it (stamping `mesh_authz.audit_policy` when that
-/// destination's policy audited the request); `Some` is the refusal the
-/// destination's own policy produces: `403` with the same body, deny metadata,
-/// policy-deny drilldown row and NodeWaypoint rejection counter `mesh_authz`
-/// records for a refused route. A destination the table does not name, or one
-/// without a recorded verdict, is refused. Returns `None` when the request
-/// carries no verdicts.
-pub(crate) fn enforce_node_waypoint_route_branch(
-    ctx: &mut RequestContext,
-    destination: NodeWaypointBranchDestination<'_>,
-) -> Option<PluginResult> {
-    let index = ctx
-        .node_waypoint_route_branch_authz
-        .as_ref()?
-        .branches
-        .position(destination);
-    enforce_node_waypoint_route_branch_at(ctx, index)
+/// The destination the request reaches now: its effective route override,
+/// or the route's own destination when none is set.
+fn node_waypoint_effective_branch_destination(
+    ctx: &RequestContext,
+) -> NodeWaypointBranchDestination<'_> {
+    let (own_host, own_port) = ctx.matched_proxy.as_deref().map_or(("", 0), |proxy| {
+        (proxy.backend_host.as_str(), proxy.backend_port)
+    });
+    match (
+        ctx.route_override_upstream_id.as_deref(),
+        ctx.route_override_backend_host.as_deref(),
+        ctx.route_override_backend_port,
+    ) {
+        (None, None, None) => NodeWaypointBranchDestination::Own,
+        (Some(upstream_id), None, None) => NodeWaypointBranchDestination::Upstream(upstream_id),
+        (None, host, port) => NodeWaypointBranchDestination::Backend {
+            host: host.unwrap_or(own_host),
+            port: port.unwrap_or(own_port),
+        },
+        _ => NodeWaypointBranchDestination::Unknown,
+    }
 }
 
-fn enforce_node_waypoint_route_branch_at(
-    ctx: &mut RequestContext,
+/// What admitting one candidate requires, resolved with only shared borrows
+/// of the request so the caller can then act on it.
+enum NodeWaypointBranchAdmission {
+    Admit(Option<String>),
+    RunCustom {
+        index: usize,
+        audit: Option<String>,
+        delegation: MeshAuthzCustomDelegation,
+    },
+    Refuse {
+        policy: String,
+        kind: NodeWaypointBranchRefusal,
+    },
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum NodeWaypointBranchRefusal {
+    Deny(NodeWaypointBranchDenyKind),
+    /// The candidate owes a CUSTOM check this enforcement point cannot run.
+    CustomUnexecuted,
+}
+
+fn node_waypoint_branch_admission(
+    record: &NodeWaypointRouteBranchAuthz,
     index: Option<usize>,
-) -> Option<PluginResult> {
-    let record = ctx.node_waypoint_route_branch_authz.as_ref()?;
-    let (policy, kind) = match record.verdict(index) {
-        NodeWaypointBranchVerdict::Allowed(audit) => {
-            if let Some(policy) = audit {
-                let policy = policy.to_string();
-                ctx.metadata
-                    .insert("mesh_authz.audit_policy".to_string(), policy);
+) -> NodeWaypointBranchAdmission {
+    match record.verdict(index) {
+        NodeWaypointBranchVerdict::Allowed {
+            audit,
+            pending: None,
+        } => NodeWaypointBranchAdmission::Admit(audit.map(str::to_string)),
+        NodeWaypointBranchVerdict::Allowed {
+            audit,
+            pending: Some(delegation),
+        } => match index {
+            Some(index) => NodeWaypointBranchAdmission::RunCustom {
+                index,
+                audit: audit.map(str::to_string),
+                delegation: delegation.clone(),
+            },
+            None => NodeWaypointBranchAdmission::Refuse {
+                policy: NODE_WAYPOINT_ROUTE_BRANCH_UNKNOWN_POLICY.to_string(),
+                kind: NodeWaypointBranchRefusal::Deny(NodeWaypointBranchDenyKind::Policy),
+            },
+        },
+        NodeWaypointBranchVerdict::Denied { policy, kind } => NodeWaypointBranchAdmission::Refuse {
+            policy: policy.to_string(),
+            kind: NodeWaypointBranchRefusal::Deny(kind),
+        },
+        NodeWaypointBranchVerdict::Rebound | NodeWaypointBranchVerdict::Unknown => {
+            NodeWaypointBranchAdmission::Refuse {
+                policy: NODE_WAYPOINT_ROUTE_BRANCH_UNKNOWN_POLICY.to_string(),
+                kind: NodeWaypointBranchRefusal::Deny(NodeWaypointBranchDenyKind::Policy),
             }
-            return None;
         }
-        NodeWaypointBranchVerdict::Denied { policy, kind } => (policy.to_string(), kind),
-        NodeWaypointBranchVerdict::Unknown => (
-            NODE_WAYPOINT_ROUTE_BRANCH_UNKNOWN_POLICY.to_string(),
-            NodeWaypointBranchDenyKind::Policy,
-        ),
-    };
-    let source = record.source_for_log.clone();
-    let deny_destination = record.branches.deny_destination.clone();
-    if kind == NodeWaypointBranchDenyKind::DestinationScopeMissing {
-        ctx.metadata.insert(
-            "mesh_authz.destination_scope_missing".to_string(),
-            "true".to_string(),
-        );
+    }
+}
+
+/// Record a branch refusal exactly as the destination's own policy refusal
+/// is recorded (deny metadata, policy-deny row, NodeWaypoint rejection
+/// counter, and the CUSTOM counters for a CUSTOM refusal), and build its
+/// response unless `response` already carries the provider's own.
+fn refuse_node_waypoint_route_branch(
+    ctx: &mut RequestContext,
+    policy: String,
+    kind: NodeWaypointBranchRefusal,
+    response: Option<PluginResult>,
+) -> PluginResult {
+    let (source, deny_destination) = ctx
+        .node_waypoint_route_branch_authz
+        .as_ref()
+        .map(|record| {
+            (
+                record.source_for_log.clone(),
+                record.branches.deny_destination.clone(),
+            )
+        })
+        .unwrap_or_default();
+    match kind {
+        NodeWaypointBranchRefusal::Deny(NodeWaypointBranchDenyKind::DestinationScopeMissing) => {
+            ctx.metadata.insert(
+                "mesh_authz.destination_scope_missing".to_string(),
+                "true".to_string(),
+            );
+        }
+        NodeWaypointBranchRefusal::Deny(NodeWaypointBranchDenyKind::CustomProviderConflict) => {
+            let reason = crate::plugins::mesh::ext_authz::MeshExtAuthzReason::ProviderConflict;
+            crate::plugins::mesh::ext_authz::record(reason, false);
+            ctx.metadata.insert(
+                "mesh_authz.ext_authz_outcome".to_string(),
+                reason.as_str().to_string(),
+            );
+        }
+        NodeWaypointBranchRefusal::CustomUnexecuted => {
+            let reason = crate::plugins::mesh::ext_authz::MeshExtAuthzReason::Unexecutable;
+            crate::plugins::mesh::ext_authz::record(reason, false);
+            ctx.metadata.insert(
+                "mesh_authz.ext_authz_outcome".to_string(),
+                reason.as_str().to_string(),
+            );
+        }
+        NodeWaypointBranchRefusal::Deny(NodeWaypointBranchDenyKind::Policy) => {}
     }
     ctx.metadata
         .insert("mesh_authz.deny_policy".to_string(), policy.clone());
@@ -963,53 +1152,173 @@ fn enforce_node_waypoint_route_branch_at(
     // counts like the destination policy's own refusal would.
     crate::modes::mesh::node_waypoint_observability::record_destination_policy_rejection(
         match kind {
-            NodeWaypointBranchDenyKind::Policy => crate::modes::mesh::node_waypoint_observability::NodeWaypointDestinationPolicyRejectReason::AuthzDeny,
-            NodeWaypointBranchDenyKind::DestinationScopeMissing => crate::modes::mesh::node_waypoint_observability::NodeWaypointDestinationPolicyRejectReason::DestinationScopeMissing,
+            NodeWaypointBranchRefusal::Deny(NodeWaypointBranchDenyKind::DestinationScopeMissing) => crate::modes::mesh::node_waypoint_observability::NodeWaypointDestinationPolicyRejectReason::DestinationScopeMissing,
+            _ => crate::modes::mesh::node_waypoint_observability::NodeWaypointDestinationPolicyRejectReason::AuthzDeny,
         },
     );
-    Some(PluginResult::Reject {
+    response.unwrap_or_else(|| PluginResult::Reject {
         status_code: 403,
         body: match kind {
-            NodeWaypointBranchDenyKind::Policy => r#"{"error":"Mesh authorization denied"}"#,
-            NodeWaypointBranchDenyKind::DestinationScopeMissing => {
-                r#"{"error":"Mesh authorization denied: missing destination policy scope"}"#
-            }
+            NodeWaypointBranchRefusal::Deny(
+                NodeWaypointBranchDenyKind::DestinationScopeMissing,
+            ) => r#"{"error":"Mesh authorization denied: missing destination policy scope"}"#,
+            _ => r#"{"error":"Mesh authorization denied"}"#,
         }
         .into(),
         headers: HashMap::new(),
     })
 }
 
+fn admit_node_waypoint_branch_audit(ctx: &mut RequestContext, audit: Option<String>) {
+    if let Some(policy) = audit {
+        ctx.metadata
+            .insert("mesh_authz.audit_policy".to_string(), policy);
+    }
+}
+
+/// Admit or refuse the destination route dispatch is about to select, under
+/// this request's per-destination verdicts, running that destination's own
+/// CUSTOM check when it owes one.
+///
+/// `None` admits it: stamps `mesh_authz.audit_policy` when that destination's
+/// policy audited the request and installs the destination's own provider's
+/// `headersToUpstreamOnAllow` result on `headers` (its
+/// `headersToDownstreamOnAllow` result is staged for the response). `Some` is
+/// the refusal that destination's own policy produces: `403` with the same
+/// body (or the provider's own denial), deny metadata, policy-deny row and
+/// counters. A destination the table does not name, one without a verdict, or
+/// one other than the destination whose CUSTOM check already ran, is refused.
+/// Returns `None` when the request carries no verdicts.
+pub(crate) async fn admit_node_waypoint_route_branch(
+    ctx: &mut RequestContext,
+    headers: &mut HashMap<String, String>,
+    destination: NodeWaypointBranchDestination<'_>,
+) -> Option<PluginResult> {
+    let index = ctx
+        .node_waypoint_route_branch_authz
+        .as_ref()?
+        .branches
+        .position(destination);
+    admit_node_waypoint_route_branch_index(ctx, headers, index).await
+}
+
+/// [`admit_node_waypoint_route_branch`] for the destination the request
+/// reaches now (its effective route override, or the route's own).
+pub(crate) async fn admit_node_waypoint_route_branch_for_effective_destination(
+    ctx: &mut RequestContext,
+    headers: &mut HashMap<String, String>,
+) -> Option<PluginResult> {
+    let index = ctx
+        .node_waypoint_route_branch_authz
+        .as_ref()?
+        .branches
+        .position(node_waypoint_effective_branch_destination(ctx));
+    admit_node_waypoint_route_branch_index(ctx, headers, index).await
+}
+
+async fn admit_node_waypoint_route_branch_index(
+    ctx: &mut RequestContext,
+    headers: &mut HashMap<String, String>,
+    index: Option<usize>,
+) -> Option<PluginResult> {
+    let record = ctx.node_waypoint_route_branch_authz.as_ref()?;
+    match node_waypoint_branch_admission(record, index) {
+        NodeWaypointBranchAdmission::Admit(audit) => {
+            admit_node_waypoint_branch_audit(ctx, audit);
+            None
+        }
+        NodeWaypointBranchAdmission::Refuse { policy, kind } => {
+            Some(refuse_node_waypoint_route_branch(ctx, policy, kind, None))
+        }
+        NodeWaypointBranchAdmission::RunCustom {
+            index,
+            audit,
+            delegation,
+        } => {
+            // Owned copies only on this CUSTOM path, which calls out anyway.
+            // A pending delegation always comes with its inputs; refuse
+            // rather than admit if that ever does not hold.
+            let Some(custom) = record.custom.as_deref() else {
+                return Some(refuse_node_waypoint_route_branch(
+                    ctx,
+                    format!("custom:{}", delegation.policy),
+                    NodeWaypointBranchRefusal::CustomUnexecuted,
+                    None,
+                ));
+            };
+            let (executor, instance_id, inputs) = (
+                custom.executor.clone(),
+                custom.instance_id,
+                custom.inputs.clone(),
+            );
+            // Bind the check to this candidate BEFORE it runs: whatever its
+            // outcome, no other candidate may be reached afterwards.
+            if let Some(custom) = ctx
+                .node_waypoint_route_branch_authz
+                .as_mut()
+                .and_then(|record| record.custom.as_deref_mut())
+            {
+                custom.executed_for = Some(index);
+            }
+            if let Some(reject) =
+                run_mesh_custom_check(ctx, executor.as_ref(), instance_id, &delegation, &inputs)
+                    .await
+            {
+                return Some(refuse_node_waypoint_route_branch(
+                    ctx,
+                    format!("custom:{}", delegation.policy),
+                    NodeWaypointBranchRefusal::Deny(NodeWaypointBranchDenyKind::Policy),
+                    Some(reject),
+                ));
+            }
+            // Only the reached destination's own provider result is applied,
+            // here, before any later request transformer runs.
+            if let Some(staged) = ctx
+                .plugin_state_opt_mut()
+                .and_then(|state| state.mesh_ext_authz_upstream_headers.remove(&instance_id))
+            {
+                apply_staged_ext_authz_upstream_headers(ctx, headers, staged);
+            }
+            admit_node_waypoint_branch_audit(ctx, audit);
+            None
+        }
+    }
+}
+
 /// Admit or refuse the destination a request finally reaches after the whole
 /// `before_proxy` pass, from its effective route override (or the route's own
 /// destination when none is set). Proxy core runs this once every
 /// `before_proxy` hook has run, so the verdicts hold whether or not route
-/// dispatch ran, matched, or stood down. `None` when the request carries no
-/// verdicts.
+/// dispatch ran, matched, or stood down. It runs no CUSTOM check (a provider
+/// mutation applied after every request transformer would bypass them): a
+/// destination that still owes its check here is refused. `None` when the
+/// request carries no verdicts.
 pub(crate) fn enforce_node_waypoint_route_branch_for_effective_destination(
     ctx: &mut RequestContext,
 ) -> Option<PluginResult> {
     let record = ctx.node_waypoint_route_branch_authz.as_ref()?;
-    let (own_host, own_port) = ctx.matched_proxy.as_deref().map_or(("", 0), |proxy| {
-        (proxy.backend_host.as_str(), proxy.backend_port)
-    });
-    let destination = match (
-        ctx.route_override_upstream_id.as_deref(),
-        ctx.route_override_backend_host.as_deref(),
-        ctx.route_override_backend_port,
-    ) {
-        (None, None, None) => NodeWaypointBranchDestination::Own,
-        (Some(upstream_id), None, None) => NodeWaypointBranchDestination::Upstream(upstream_id),
-        (None, host, port) => NodeWaypointBranchDestination::Backend {
-            host: host.unwrap_or(own_host),
-            port: port.unwrap_or(own_port),
-        },
-        _ => NodeWaypointBranchDestination::Unknown,
-    };
-    // Resolved to an index first so the borrows of the request end before
-    // the enforcement writes its metadata; nothing is copied.
-    let index = record.branches.position(destination);
-    enforce_node_waypoint_route_branch_at(ctx, index)
+    let index = record
+        .branches
+        .position(node_waypoint_effective_branch_destination(ctx));
+    // Resolved with shared borrows first, so nothing is copied unless the
+    // destination is refused or audited.
+    match node_waypoint_branch_admission(record, index) {
+        NodeWaypointBranchAdmission::Admit(audit) => {
+            admit_node_waypoint_branch_audit(ctx, audit);
+            None
+        }
+        NodeWaypointBranchAdmission::RunCustom { delegation, .. } => {
+            Some(refuse_node_waypoint_route_branch(
+                ctx,
+                format!("custom:{}", delegation.policy),
+                NodeWaypointBranchRefusal::CustomUnexecuted,
+                None,
+            ))
+        }
+        NodeWaypointBranchAdmission::Refuse { policy, kind } => {
+            Some(refuse_node_waypoint_route_branch(ctx, policy, kind, None))
+        }
+    }
 }
 
 /// Generated upstream ids are unique only within a namespace:
@@ -3514,21 +3823,26 @@ impl MeshAuthz {
 
     /// Evaluate every candidate destination other than the route's own
     /// (candidate 0, judged by the ordinary path) against its own
-    /// destination policy.
+    /// destination policy. Returns the verdicts and each candidate's pending
+    /// CUSTOM delegation.
     fn route_branch_record(
         &self,
         table: &Arc<NodeWaypointRouteBranches>,
         request: &MeshAuthzRequest,
         source_scope: Option<&crate::modes::mesh::runtime::PolicyScopeCache>,
-        executed_custom_provider: Option<&str>,
-    ) -> NodeWaypointRouteBranchAuthz {
+    ) -> (
+        NodeWaypointRouteBranchAuthz,
+        Vec<(usize, MeshAuthzCustomDelegation)>,
+    ) {
         let mut record = NodeWaypointRouteBranchAuthz {
             branches: Arc::clone(table),
             evaluated: 0,
             allowed: 0,
             outcomes: Vec::new(),
             source_for_log: None,
+            custom: None,
         };
+        let mut pending = Vec::new();
         for (index, branch) in table
             .branches
             .iter()
@@ -3538,31 +3852,36 @@ impl MeshAuthz {
         {
             let bit = 1u64 << index;
             record.evaluated |= bit;
-            let (allowed, outcome) =
-                self.evaluate_route_branch(branch, request, source_scope, executed_custom_provider);
+            let (allowed, outcome, delegation) =
+                self.evaluate_route_branch(branch, request, source_scope);
             if allowed {
                 record.allowed |= bit;
             }
             if let Some(outcome) = outcome {
                 record.outcomes.push((index, outcome));
             }
+            if let Some(delegation) = delegation {
+                pending.push((index, delegation));
+            }
         }
-        record
+        (record, pending)
     }
 
     /// One candidate's verdict, decided exactly as the route's own
-    /// destination is decided on the per-pod path. A CUSTOM delegation is
-    /// satisfied only by the check this request already ran (the own
-    /// destination's, same provider, allowed): a candidate needing a check
-    /// that did not run is refused rather than consulting a provider for a
-    /// branch the request may never take.
+    /// destination is decided on the per-pod path: its DENY/ALLOW tiers now,
+    /// and its CUSTOM delegation (returned, not run) once route dispatch
+    /// selects it, so no provider is consulted for a branch the request does
+    /// not take.
     fn evaluate_route_branch(
         &self,
         branch: &NodeWaypointRouteBranch,
         request: &MeshAuthzRequest,
         source_scope: Option<&crate::modes::mesh::runtime::PolicyScopeCache>,
-        executed_custom_provider: Option<&str>,
-    ) -> (bool, Option<NodeWaypointBranchOutcome>) {
+    ) -> (
+        bool,
+        Option<NodeWaypointBranchOutcome>,
+        Option<MeshAuthzCustomDelegation>,
+    ) {
         let evaluation = match branch.scopes.as_deref() {
             Some(scopes) => evaluate_destination_policy_scopes(
                 &self.slice.mesh_policies,
@@ -3577,6 +3896,7 @@ impl MeshAuthz {
                         policy: "destination_scope_missing".to_string(),
                         kind: NodeWaypointBranchDenyKind::DestinationScopeMissing,
                     }),
+                    None,
                 );
             }
             None => evaluate_mesh_authorization_full(
@@ -3587,40 +3907,83 @@ impl MeshAuthz {
                 request,
             ),
         };
-        if evaluation.custom_provider_conflict {
-            return (
-                false,
-                Some(NodeWaypointBranchOutcome::Deny {
-                    policy: crate::modes::mesh::policy::MESH_AUTHZ_CUSTOM_PROVIDER_CONFLICT
-                        .to_string(),
-                    kind: NodeWaypointBranchDenyKind::Policy,
-                }),
+        branch_outcome_from_evaluation(evaluation)
+    }
+
+    /// Record per-destination verdicts for a carried route whose dispatch
+    /// rules can reach another destination (issue #7383), with the route's
+    /// own destination as candidate 0 judged from `evaluation`.
+    ///
+    /// Returns `Some(own_stampable)` when the verdicts were recorded and the
+    /// request continues to route dispatch (`own_stampable`: the own
+    /// destination was allowed outright, with no CUSTOM check outstanding),
+    /// and `None` when every candidate's DENY/ALLOW tiers refuse the request:
+    /// the caller then decides the route's own destination exactly as before,
+    /// so its refusal keeps its own shape.
+    fn defer_route_branches(
+        &self,
+        ctx: &mut RequestContext,
+        table: &Arc<NodeWaypointRouteBranches>,
+        evaluation: &MeshAuthzEvaluation,
+        request: &MeshAuthzRequest,
+        source_scope: Option<&crate::modes::mesh::runtime::PolicyScopeCache>,
+        source_for_log: Option<&str>,
+    ) -> Option<bool> {
+        let (mut record, mut pending) = self.route_branch_record(table, request, source_scope);
+        let (own_allowed, own_outcome, own_pending) =
+            branch_outcome_from_evaluation(evaluation.clone());
+        if !own_allowed && record.allowed == 0 {
+            return None;
+        }
+        record.evaluated |= 1;
+        if own_allowed {
+            record.allowed |= 1;
+        }
+        let own_stampable = own_allowed && own_pending.is_none();
+        if let Some(outcome) = own_outcome {
+            record.outcomes.push((0, outcome));
+        }
+        if let Some(delegation) = own_pending {
+            pending.insert(0, (0, delegation));
+        }
+        self.install_route_branch_record(ctx, record, pending, request, source_for_log);
+        Some(own_stampable)
+    }
+
+    /// Record per-destination verdicts on a request whose route can reach
+    /// another candidate (issue #7383), with the pending CUSTOM delegations
+    /// and the check inputs (fixed now, when the local rules were judged).
+    fn install_route_branch_record(
+        &self,
+        ctx: &mut RequestContext,
+        mut record: NodeWaypointRouteBranchAuthz,
+        pending: Vec<(usize, MeshAuthzCustomDelegation)>,
+        request: &MeshAuthzRequest,
+        source_for_log: Option<&str>,
+    ) {
+        if !pending.is_empty() {
+            let check_headers = mesh_custom_check_headers(
+                ctx,
+                self.ext_authz.as_ref(),
+                pending
+                    .iter()
+                    .map(|(_, delegation)| delegation.provider.as_str()),
             );
+            record.custom = Some(Box::new(NodeWaypointBranchCustom {
+                pending,
+                executor: self.ext_authz.clone(),
+                instance_id: self.instance_id,
+                inputs: MeshCustomCheckInputs {
+                    path: request.path.clone().unwrap_or_default(),
+                    check_headers,
+                    authority: request.host.clone(),
+                    source_principal: request.source_principal.clone(),
+                    request_principal: request.request_principal.clone(),
+                },
+                executed_for: None,
+            }));
         }
-        if let Some(delegation) = evaluation.custom
-            && executed_custom_provider != Some(delegation.provider.as_str())
-        {
-            return (
-                false,
-                Some(NodeWaypointBranchOutcome::Deny {
-                    policy: format!("custom:{}", delegation.policy),
-                    kind: NodeWaypointBranchDenyKind::Policy,
-                }),
-            );
-        }
-        match evaluation.decision {
-            MeshAuthzDecision::Allow => (true, None),
-            MeshAuthzDecision::Audit { policy } => {
-                (true, Some(NodeWaypointBranchOutcome::Audit(policy)))
-            }
-            MeshAuthzDecision::Deny { policy } => (
-                false,
-                Some(NodeWaypointBranchOutcome::Deny {
-                    policy,
-                    kind: NodeWaypointBranchDenyKind::Policy,
-                }),
-            ),
-        }
+        install_node_waypoint_route_branch_authz(ctx, record, source_for_log);
     }
 
     fn proxy_requires_destination_scope(&self, proxy: &Proxy) -> bool {
@@ -3707,146 +4070,41 @@ impl MeshAuthz {
         source_principal: Option<&SpiffeId>,
         request_principal: Option<&str>,
     ) -> Option<PluginResult> {
-        let Some(executor) = self.ext_authz.as_ref() else {
-            // An executor-unavailable denial is a MATCHED delegation that was
-            // refused, so it participates in the same fixed-cardinality
-            // counters as every other outcome — exactly once, and never
-            // labelled by provider, policy, or request input. Leaving it
-            // uncounted would make a whole generation's worth of denials
-            // invisible on `/metrics`.
-            crate::plugins::mesh::ext_authz::record(
-                crate::plugins::mesh::ext_authz::MeshExtAuthzReason::ProviderUnbound,
-                false,
-            );
-            ctx.metadata.insert(
-                "mesh_authz.ext_authz_outcome".to_string(),
-                crate::plugins::mesh::ext_authz::MeshExtAuthzReason::ProviderUnbound
-                    .as_str()
-                    .to_string(),
-            );
-            return Some(PluginResult::Reject {
-                status_code: 403,
-                body: r#"{"error":"Mesh authorization denied"}"#.into(),
-                headers: HashMap::new(),
-            });
-        };
-
-        // Materialize ONLY the header values the provider asked for. The full
-        // client header map is never forwarded, so a credential header reaches
-        // the provider only because the operator named it in
-        // `includeRequestHeadersInCheck`.
-        let mut check_headers = HashMap::new();
-        for name in executor.required_header_names(&delegation.provider) {
-            if let Some(value) = http_header_attribute(ctx, name.as_str()) {
-                check_headers.insert(name.as_str().to_string(), value);
-            }
-        }
         // Same canonical-path contract the policy matcher was held to above:
         // the provider is handed exactly the string `paths:` / `notPaths:`
         // were evaluated against, never the raw target. `authorize` gates on
         // this before it can select a CUSTOM delegation, so the error arm is
         // unreachable in production — it exists so the provider can never be
         // asked to judge a target the matcher itself refused to judge.
-        let path = mesh_authz_authorization_path(&ctx.path).map(Cow::into_owned);
-        let path = match path {
-            Ok(path) => path,
-            Err(rejection) => {
-                return Some(non_canonical_authorization_path_reject(ctx, rejection));
-            }
-        };
-        let body = ctx.request_body_bytes.clone();
-        // The ext-auth protocol carries the ORIGINAL request authority. This is
-        // the same validated `Host` / `:authority` the policy matcher used, and
-        // it becomes a header on the check request only — the dial destination
-        // stays the provider's configured service/port, so it cannot route the
-        // provider connection.
-        let outcome = executor
-            .check(
-                &delegation.provider,
-                MeshExtAuthzCheckRequest {
-                    method: &ctx.method,
-                    path: &path,
-                    headers: &check_headers,
-                    authority: authority.as_deref(),
-                    // The identity the local rules were judged on: the
-                    // authenticated peer, or the trusted assertor's verified
-                    // baggage identity. Never a client-supplied header.
-                    source_principal,
-                    request_principal,
-                    body: body.as_deref(),
-                    body_proven_empty: ctx.replay_request_body_empty_proven(),
-                    proxy_hops: crate::proxy::hop_limit::plugin_call_proxy_hops(ctx),
-                },
-                &ctx.plugin_http_call_ns,
-            )
-            .await;
-
-        match outcome {
-            MeshExtAuthzOutcome::Allow {
-                reason,
-                upstream_headers,
-                downstream_headers,
-            } => {
-                ctx.metadata.insert(
-                    "mesh_authz.ext_authz_outcome".to_string(),
-                    reason.as_str().to_string(),
-                );
-                // `headersToUpstreamOnAllow` names are PROVIDER-OWNED on an
-                // allowed check: every one of them is staged, with the
-                // provider's value or `None`, so `before_proxy` strips the
-                // client's copy even when the provider returned nothing (or
-                // the allow came from `failOpen`, where no provider vouched
-                // for anything). Staged in typed request state, never in
-                // `metadata`, so an exchanged token cannot reach a log line.
-                let owned = executor.upstream_allow_header_names(&delegation.provider);
-                if !owned.is_empty() || !downstream_headers.is_empty() {
-                    let staged_upstream: crate::plugins::mesh::ext_authz::StagedUpstreamHeaders =
-                        owned
-                            .iter()
-                            .map(|name| {
-                                let name = name.as_str();
-                                let value = upstream_headers
-                                    .iter()
-                                    .find(|(returned, _)| returned == name)
-                                    .map(|(_, value)| value.clone());
-                                (name.to_string(), value)
-                            })
-                            .collect();
-                    // Keyed by THIS instance: another effective `mesh_authz`
-                    // on the same request stages (and consumes) its own entry.
-                    let state = ctx.plugin_state_mut();
-                    if !staged_upstream.is_empty() {
-                        state
-                            .mesh_ext_authz_upstream_headers
-                            .insert(self.instance_id, staged_upstream);
-                    }
-                    if !downstream_headers.is_empty() {
-                        state
-                            .mesh_ext_authz_downstream_headers
-                            .insert(self.instance_id, downstream_headers);
-                    }
+        let path = if self.ext_authz.is_some() {
+            match mesh_authz_authorization_path(&ctx.path).map(Cow::into_owned) {
+                Ok(path) => path,
+                Err(rejection) => {
+                    return Some(non_canonical_authorization_path_reject(ctx, rejection));
                 }
-                None
             }
-            MeshExtAuthzOutcome::Deny {
-                status,
-                headers,
-                reason,
-            } => {
-                ctx.metadata.insert(
-                    "mesh_authz.ext_authz_outcome".to_string(),
-                    reason.as_str().to_string(),
-                );
-                Some(PluginResult::Reject {
-                    status_code: status,
-                    // The provider's own response body is deliberately NOT
-                    // echoed: it is unvalidated third-party content that would
-                    // otherwise be rendered into a gateway-authored response.
-                    body: r#"{"error":"Mesh authorization denied"}"#.into(),
-                    headers: headers.into_iter().collect(),
-                })
-            }
-        }
+        } else {
+            String::new()
+        };
+        let inputs = MeshCustomCheckInputs {
+            path,
+            check_headers: mesh_custom_check_headers(
+                ctx,
+                self.ext_authz.as_ref(),
+                std::iter::once(delegation.provider.as_str()),
+            ),
+            authority,
+            source_principal: source_principal.cloned(),
+            request_principal: request_principal.map(str::to_string),
+        };
+        run_mesh_custom_check(
+            ctx,
+            self.ext_authz.as_ref(),
+            self.instance_id,
+            delegation,
+            &inputs,
+        )
+        .await
     }
 
     /// Push a deny record into the process-singleton policy-deny recorder
@@ -4616,7 +4874,6 @@ impl Plugin for MeshAuthz {
         let branch_source_scope = route_branches
             .as_ref()
             .and_then(|_| ctx.node_waypoint_policy_scope.clone());
-        let mut executed_custom_provider: Option<String> = None;
         let mut branch_own_deferred = false;
         let evaluation = if relay_policy_superset_request {
             // Destination-aware inbound relay. ServiceWaypoint byte-stream and
@@ -4820,11 +5077,10 @@ impl Plugin for MeshAuthz {
                     // record the own destination as refused and let each
                     // candidate's verdict decide (issue #7383).
                     if let Some(table) = route_branches.as_ref() {
-                        let mut record = self.route_branch_record(
+                        let (mut record, pending) = self.route_branch_record(
                             table,
                             &request,
                             branch_source_scope.as_deref(),
-                            None,
                         );
                         if record.allowed != 0 {
                             record.evaluated |= 1;
@@ -4835,9 +5091,11 @@ impl Plugin for MeshAuthz {
                                     kind: NodeWaypointBranchDenyKind::DestinationScopeMissing,
                                 },
                             ));
-                            install_node_waypoint_route_branch_authz(
+                            self.install_route_branch_record(
                                 ctx,
                                 record,
+                                pending,
+                                &request,
                                 source_for_log.as_deref(),
                             );
                             return PluginResult::Continue;
@@ -4876,70 +5134,56 @@ impl Plugin for MeshAuthz {
         } else {
             evaluate_mesh_authorization_full(self.slice.mesh_policies.iter(), &request)
         };
-        // Istio evaluates CUSTOM BEFORE DENY and ALLOW, so a matched delegation
-        // runs here — ahead of anything `evaluation.decision` would have
-        // granted. An ALLOW verdict from the provider does NOT end the
-        // evaluation: the DENY/ALLOW tiers still apply below, so a DENY policy
-        // can still refuse a request the provider was willing to admit.
-        //
-        // Two DIFFERENT applicable providers is a refusal, not a precedence
-        // question: Istio permits at most one extension provider per workload,
-        // so picking one by iteration order would let policy ordering choose
-        // which operator's authorizer enforces. The refusal carries a stable,
-        // bounded reason and is counted once.
-        if evaluation.custom_provider_conflict {
-            // Not on a live-tunnel re-evaluation: the mesh ext_authz counters
-            // describe checks a REQUEST provoked, and a sweep provokes none.
-            if !live_admission_reevaluation {
-                crate::plugins::mesh::ext_authz::record(
-                    crate::plugins::mesh::ext_authz::MeshExtAuthzReason::ProviderConflict,
-                    false,
-                );
-            }
-            ctx.metadata.insert(
-                "mesh_authz.ext_authz_outcome".to_string(),
-                crate::plugins::mesh::ext_authz::MeshExtAuthzReason::ProviderConflict
-                    .as_str()
-                    .to_string(),
-            );
-            ctx.metadata.insert(
-                "mesh_authz.deny_policy".to_string(),
-                crate::modes::mesh::policy::MESH_AUTHZ_CUSTOM_PROVIDER_CONFLICT.to_string(),
-            );
-            self.record_policy_deny(&ctx.metadata, source_for_log.as_deref());
-            if self.per_pod_policy_scoping
-                && !asserted_identity_rejected
-                && !live_admission_reevaluation
-            {
-                crate::modes::mesh::node_waypoint_observability::record_destination_policy_rejection(
-                    crate::modes::mesh::node_waypoint_observability::NodeWaypointDestinationPolicyRejectReason::AuthzDeny,
-                );
-            }
-            return PluginResult::Reject {
-                status_code: 403,
-                body: r#"{"error":"Mesh authorization denied"}"#.into(),
-                headers: HashMap::new(),
-            };
-        }
-        let decision = match evaluation.custom {
-            None => evaluation.decision,
-            // A relayed tunnel carries no request a provider could judge:
-            // asking it about the CONNECT would authorize the tunnel, not the
-            // requests written into it. Refuse, as the stream path does for a
-            // matched delegation. This makes no external call, so a live-tunnel
-            // re-evaluation applies it too.
-            Some(delegation) if connect_relay => {
-                let reason = crate::plugins::mesh::ext_authz::MeshExtAuthzReason::Unexecutable;
+        // A carried route whose dispatch rules can reach another destination
+        // (issue #7383): every candidate's own policy decides the requests
+        // that reach it, CUSTOM delegations included, so nothing here refuses
+        // for the route's own destination while another candidate's
+        // DENY/ALLOW tiers allow the request. Each candidate's CUSTOM check
+        // runs only once route dispatch selects it.
+        let branch_deferral = match route_branches.as_ref() {
+            Some(table) => self.defer_route_branches(
+                ctx,
+                table,
+                &evaluation,
+                &request,
+                branch_source_scope.as_deref(),
+                source_for_log.as_deref(),
+            ),
+            None => None,
+        };
+        let result = if let Some(own_stampable) = branch_deferral {
+            branch_own_deferred = !own_stampable;
+            PluginResult::Continue
+        } else {
+            // Istio evaluates CUSTOM BEFORE DENY and ALLOW, so a matched delegation
+            // runs here — ahead of anything `evaluation.decision` would have
+            // granted. An ALLOW verdict from the provider does NOT end the
+            // evaluation: the DENY/ALLOW tiers still apply below, so a DENY policy
+            // can still refuse a request the provider was willing to admit.
+            //
+            // Two DIFFERENT applicable providers is a refusal, not a precedence
+            // question: Istio permits at most one extension provider per workload,
+            // so picking one by iteration order would let policy ordering choose
+            // which operator's authorizer enforces. The refusal carries a stable,
+            // bounded reason and is counted once.
+            if evaluation.custom_provider_conflict {
+                // Not on a live-tunnel re-evaluation: the mesh ext_authz counters
+                // describe checks a REQUEST provoked, and a sweep provokes none.
                 if !live_admission_reevaluation {
-                    crate::plugins::mesh::ext_authz::record(reason, false);
+                    crate::plugins::mesh::ext_authz::record(
+                        crate::plugins::mesh::ext_authz::MeshExtAuthzReason::ProviderConflict,
+                        false,
+                    );
                 }
                 ctx.metadata.insert(
                     "mesh_authz.ext_authz_outcome".to_string(),
-                    reason.as_str().to_string(),
+                    crate::plugins::mesh::ext_authz::MeshExtAuthzReason::ProviderConflict
+                        .as_str()
+                        .to_string(),
                 );
                 ctx.metadata.insert(
                     "mesh_authz.deny_policy".to_string(),
-                    format!("custom:{}", delegation.policy),
+                    crate::modes::mesh::policy::MESH_AUTHZ_CUSTOM_PROVIDER_CONFLICT.to_string(),
                 );
                 self.record_policy_deny(&ctx.metadata, source_for_log.as_deref());
                 if self.per_pod_policy_scoping
@@ -4956,50 +5200,82 @@ impl Plugin for MeshAuthz {
                     headers: HashMap::new(),
                 };
             }
-            // Live-tunnel re-evaluation keeps the provider's admission-time
-            // verdict (see `MESH_AUTHZ_REEVALUATION_METADATA_KEY`).
-            Some(_)
-                if ctx
-                    .metadata
-                    .contains_key(MESH_AUTHZ_REEVALUATION_METADATA_KEY) =>
-            {
-                evaluation.decision
-            }
-            Some(delegation) => {
-                match self
-                    .run_custom_delegation(
-                        ctx,
-                        &delegation,
-                        request.host.clone(),
-                        request.source_principal.as_ref(),
-                        request.request_principal.as_deref(),
-                    )
-                    .await
-                {
-                    None => {
-                        if route_branches.is_some() {
-                            executed_custom_provider = Some(delegation.provider.clone());
-                        }
-                        evaluation.decision
+            let decision = match evaluation.custom {
+                None => evaluation.decision,
+                // A relayed tunnel carries no request a provider could judge:
+                // asking it about the CONNECT would authorize the tunnel, not the
+                // requests written into it. Refuse, as the stream path does for a
+                // matched delegation. This makes no external call, so a live-tunnel
+                // re-evaluation applies it too.
+                Some(delegation) if connect_relay => {
+                    let reason = crate::plugins::mesh::ext_authz::MeshExtAuthzReason::Unexecutable;
+                    if !live_admission_reevaluation {
+                        crate::plugins::mesh::ext_authz::record(reason, false);
                     }
-                    Some(reject) => {
-                        ctx.metadata.insert(
-                            "mesh_authz.deny_policy".to_string(),
-                            format!("custom:{}", delegation.policy),
+                    ctx.metadata.insert(
+                        "mesh_authz.ext_authz_outcome".to_string(),
+                        reason.as_str().to_string(),
+                    );
+                    ctx.metadata.insert(
+                        "mesh_authz.deny_policy".to_string(),
+                        format!("custom:{}", delegation.policy),
+                    );
+                    self.record_policy_deny(&ctx.metadata, source_for_log.as_deref());
+                    if self.per_pod_policy_scoping
+                        && !asserted_identity_rejected
+                        && !live_admission_reevaluation
+                    {
+                        crate::modes::mesh::node_waypoint_observability::record_destination_policy_rejection(
+                            crate::modes::mesh::node_waypoint_observability::NodeWaypointDestinationPolicyRejectReason::AuthzDeny,
                         );
-                        self.record_policy_deny(&ctx.metadata, source_for_log.as_deref());
-                        if self.per_pod_policy_scoping
-                            && !asserted_identity_rejected
-                            && !live_admission_reevaluation
-                        {
-                            crate::modes::mesh::node_waypoint_observability::record_destination_policy_rejection(
-                                crate::modes::mesh::node_waypoint_observability::NodeWaypointDestinationPolicyRejectReason::AuthzDeny,
+                    }
+                    return PluginResult::Reject {
+                        status_code: 403,
+                        body: r#"{"error":"Mesh authorization denied"}"#.into(),
+                        headers: HashMap::new(),
+                    };
+                }
+                // Live-tunnel re-evaluation keeps the provider's admission-time
+                // verdict (see `MESH_AUTHZ_REEVALUATION_METADATA_KEY`).
+                Some(_)
+                    if ctx
+                        .metadata
+                        .contains_key(MESH_AUTHZ_REEVALUATION_METADATA_KEY) =>
+                {
+                    evaluation.decision
+                }
+                Some(delegation) => {
+                    match self
+                        .run_custom_delegation(
+                            ctx,
+                            &delegation,
+                            request.host.clone(),
+                            request.source_principal.as_ref(),
+                            request.request_principal.as_deref(),
+                        )
+                        .await
+                    {
+                        None => evaluation.decision,
+                        Some(reject) => {
+                            ctx.metadata.insert(
+                                "mesh_authz.deny_policy".to_string(),
+                                format!("custom:{}", delegation.policy),
                             );
+                            self.record_policy_deny(&ctx.metadata, source_for_log.as_deref());
+                            if self.per_pod_policy_scoping
+                                && !asserted_identity_rejected
+                                && !live_admission_reevaluation
+                            {
+                                crate::modes::mesh::node_waypoint_observability::record_destination_policy_rejection(
+                                    crate::modes::mesh::node_waypoint_observability::NodeWaypointDestinationPolicyRejectReason::AuthzDeny,
+                                );
+                            }
+                            return reject;
                         }
-                        return reject;
                     }
                 }
-            }
+            };
+            self.decision_to_result(decision, &mut ctx.metadata)
         };
         // Remaining scope-missing cases reach here only when no scoped policies
         // are configured (the mesh is fully evaluable mesh-wide), so surface the
@@ -5009,54 +5285,6 @@ impl Plugin for MeshAuthz {
             ctx.metadata
                 .insert("mesh_authz.scope_missing".to_string(), "true".to_string());
         }
-        let result = match route_branches.as_ref() {
-            Some(table) => {
-                // The route's own verdict is candidate 0; every other
-                // candidate is judged by its own destination policy. The
-                // request continues while ANY candidate is allowed, and the
-                // destination it finally reaches is admitted only on its own
-                // verdict (`enforce_node_waypoint_route_branch`). When every
-                // candidate refuses, the own destination's refusal stands now.
-                let mut record = self.route_branch_record(
-                    table,
-                    &request,
-                    branch_source_scope.as_deref(),
-                    executed_custom_provider.as_deref(),
-                );
-                let own_allowed = !matches!(decision, MeshAuthzDecision::Deny { .. });
-                if own_allowed || record.allowed != 0 {
-                    record.evaluated |= 1;
-                    match decision {
-                        MeshAuthzDecision::Allow => record.allowed |= 1,
-                        MeshAuthzDecision::Audit { policy } => {
-                            record.allowed |= 1;
-                            record
-                                .outcomes
-                                .push((0, NodeWaypointBranchOutcome::Audit(policy)));
-                        }
-                        MeshAuthzDecision::Deny { policy } => {
-                            branch_own_deferred = true;
-                            record.outcomes.push((
-                                0,
-                                NodeWaypointBranchOutcome::Deny {
-                                    policy,
-                                    kind: NodeWaypointBranchDenyKind::Policy,
-                                },
-                            ));
-                        }
-                    }
-                    install_node_waypoint_route_branch_authz(
-                        ctx,
-                        record,
-                        source_for_log.as_deref(),
-                    );
-                    PluginResult::Continue
-                } else {
-                    self.decision_to_result(decision, &mut ctx.metadata)
-                }
-            }
-            None => self.decision_to_result(decision, &mut ctx.metadata),
-        };
         // NodeWaypoint stamps destinations when scoped policy filtering is
         // active. ServiceWaypoint byte-stream and UDP relays must stamp as well:
         // their exact backend supplied the destination scopes above even though
@@ -5299,45 +5527,12 @@ impl Plugin for MeshAuthz {
         if self.ext_authz_upstream_allow_headers.is_empty() {
             return PluginResult::Continue;
         }
-        let Some(staged) = ctx.plugin_state_opt_mut().and_then(|state| {
+        if let Some(staged) = ctx.plugin_state_opt_mut().and_then(|state| {
             state
                 .mesh_ext_authz_upstream_headers
                 .remove(&self.instance_id)
-        }) else {
-            return PluginResult::Continue;
-        };
-        if staged.is_empty() {
-            return PluginResult::Continue;
-        }
-        headers.retain(|name, _| {
-            !staged.iter().any(|(owned, _)| {
-                crate::proxy::headers::field_names_equivalent_for_backends(name, owned)
-            })
-        });
-        for (name, value) in staged {
-            // Not an owner (Istio ext_authz semantics: only a CUSTOM-checked
-            // request carries provider-owned names), but when another plugin
-            // on the route owns this name as a gateway assertion, the
-            // provider's verified decision IS its current authorized state:
-            // record the install (or the removal) so the final
-            // gateway-assertion pass keeps exactly this value.
-            let route_owned = ctx
-                .route_owned_request_assertion_headers()
-                .is_some_and(|owned| {
-                    owned.iter().any(|owned| {
-                        crate::proxy::headers::field_names_equivalent_for_backends(owned, &name)
-                    })
-                });
-            match value {
-                Some(value) => {
-                    if route_owned {
-                        ctx.record_installed_request_assertion(&name, &value);
-                    }
-                    headers.insert(name, value);
-                }
-                None if route_owned => ctx.record_cleared_request_assertion(&name),
-                None => {}
-            }
+        }) {
+            apply_staged_ext_authz_upstream_headers(ctx, headers, staged);
         }
         PluginResult::Continue
     }
@@ -5962,6 +6157,220 @@ fn backend_folded_header_spellings(names: &[String]) -> Option<Vec<String>> {
     spellings.sort();
     spellings.dedup();
     Some(spellings)
+}
+
+/// The request facts a CUSTOM check is asked about, fixed when the local
+/// rules were evaluated: the canonical authorization path, ONLY the header
+/// values the provider asked for (`includeRequestHeadersInCheck`), the
+/// validated authority, and the authenticated source and request principals.
+/// The full client header map is never forwarded.
+#[derive(Clone)]
+struct MeshCustomCheckInputs {
+    path: String,
+    check_headers: HashMap<String, String>,
+    authority: Option<String>,
+    source_principal: Option<SpiffeId>,
+    request_principal: Option<String>,
+}
+
+/// Materialize the header values the given providers asked for.
+fn mesh_custom_check_headers<'p>(
+    ctx: &RequestContext,
+    executor: Option<&Arc<MeshExtAuthzExecutor>>,
+    providers: impl IntoIterator<Item = &'p str>,
+) -> HashMap<String, String> {
+    let mut check_headers = HashMap::new();
+    let Some(executor) = executor else {
+        return check_headers;
+    };
+    for provider in providers {
+        for name in executor.required_header_names(provider) {
+            if check_headers.contains_key(name.as_str()) {
+                continue;
+            }
+            if let Some(value) = http_header_attribute(ctx, name.as_str()) {
+                check_headers.insert(name.as_str().to_string(), value);
+            }
+        }
+    }
+    check_headers
+}
+
+/// Execute one matched Istio `action: CUSTOM` delegation.
+///
+/// Returns `None` when the provider allowed the request (its
+/// `headersToUpstreamOnAllow` / `headersToDownstreamOnAllow` result staged in
+/// typed request state under `instance_id`), and `Some(reject)` when the
+/// request is refused. Every failure path is a refusal unless the provider
+/// itself opted into `failOpen`; no executor refuses too, so a CUSTOM policy
+/// can never be skipped. Nothing here logs a header value, a body byte, or the
+/// resolved provider URL: the executor owns redaction.
+async fn run_mesh_custom_check(
+    ctx: &mut RequestContext,
+    executor: Option<&Arc<MeshExtAuthzExecutor>>,
+    instance_id: u64,
+    delegation: &MeshAuthzCustomDelegation,
+    inputs: &MeshCustomCheckInputs,
+) -> Option<PluginResult> {
+    let Some(executor) = executor else {
+        // An executor-unavailable denial is a MATCHED delegation that was
+        // refused, so it participates in the same fixed-cardinality counters
+        // as every other outcome — exactly once, and never labelled by
+        // provider, policy, or request input.
+        crate::plugins::mesh::ext_authz::record(
+            crate::plugins::mesh::ext_authz::MeshExtAuthzReason::ProviderUnbound,
+            false,
+        );
+        ctx.metadata.insert(
+            "mesh_authz.ext_authz_outcome".to_string(),
+            crate::plugins::mesh::ext_authz::MeshExtAuthzReason::ProviderUnbound
+                .as_str()
+                .to_string(),
+        );
+        return Some(PluginResult::Reject {
+            status_code: 403,
+            body: r#"{"error":"Mesh authorization denied"}"#.into(),
+            headers: HashMap::new(),
+        });
+    };
+    let body = ctx.request_body_bytes.clone();
+    // The ext-auth protocol carries the ORIGINAL request authority (the same
+    // validated `Host` / `:authority` the policy matcher used). It becomes a
+    // header on the check request only — the dial destination stays the
+    // provider's configured service/port, so it cannot route the provider
+    // connection.
+    let outcome = executor
+        .check(
+            &delegation.provider,
+            MeshExtAuthzCheckRequest {
+                method: &ctx.method,
+                path: &inputs.path,
+                headers: &inputs.check_headers,
+                authority: inputs.authority.as_deref(),
+                // The identity the local rules were judged on: the
+                // authenticated peer, or the trusted assertor's verified
+                // baggage identity. Never a client-supplied header.
+                source_principal: inputs.source_principal.as_ref(),
+                request_principal: inputs.request_principal.as_deref(),
+                body: body.as_deref(),
+                body_proven_empty: ctx.replay_request_body_empty_proven(),
+                proxy_hops: crate::proxy::hop_limit::plugin_call_proxy_hops(ctx),
+            },
+            &ctx.plugin_http_call_ns,
+        )
+        .await;
+
+    match outcome {
+        MeshExtAuthzOutcome::Allow {
+            reason,
+            upstream_headers,
+            downstream_headers,
+        } => {
+            ctx.metadata.insert(
+                "mesh_authz.ext_authz_outcome".to_string(),
+                reason.as_str().to_string(),
+            );
+            // `headersToUpstreamOnAllow` names are PROVIDER-OWNED on an
+            // allowed check: every one of them is staged, with the provider's
+            // value or `None`, so the client's copy is stripped even when the
+            // provider returned nothing (or the allow came from `failOpen`).
+            // Staged in typed request state, never in `metadata`, so an
+            // exchanged token cannot reach a log line.
+            let owned = executor.upstream_allow_header_names(&delegation.provider);
+            if !owned.is_empty() || !downstream_headers.is_empty() {
+                let staged_upstream: crate::plugins::mesh::ext_authz::StagedUpstreamHeaders = owned
+                    .iter()
+                    .map(|name| {
+                        let name = name.as_str();
+                        let value = upstream_headers
+                            .iter()
+                            .find(|(returned, _)| returned == name)
+                            .map(|(_, value)| value.clone());
+                        (name.to_string(), value)
+                    })
+                    .collect();
+                // Keyed by the owning instance: another effective `mesh_authz`
+                // on the same request stages (and consumes) its own entry.
+                let state = ctx.plugin_state_mut();
+                if !staged_upstream.is_empty() {
+                    state
+                        .mesh_ext_authz_upstream_headers
+                        .insert(instance_id, staged_upstream);
+                }
+                if !downstream_headers.is_empty() {
+                    state
+                        .mesh_ext_authz_downstream_headers
+                        .insert(instance_id, downstream_headers);
+                }
+            }
+            None
+        }
+        MeshExtAuthzOutcome::Deny {
+            status,
+            headers,
+            reason,
+        } => {
+            ctx.metadata.insert(
+                "mesh_authz.ext_authz_outcome".to_string(),
+                reason.as_str().to_string(),
+            );
+            Some(PluginResult::Reject {
+                status_code: status,
+                // The provider's own response body is deliberately NOT echoed:
+                // it is unvalidated third-party content that would otherwise
+                // be rendered into a gateway-authored response.
+                body: r#"{"error":"Mesh authorization denied"}"#.into(),
+                headers: headers.into_iter().collect(),
+            })
+        }
+    }
+}
+
+/// Install an allowed CUSTOM check's staged `headersToUpstreamOnAllow` result
+/// on the backend request headers.
+///
+/// Every provider-owned name is removed first — case-insensitively and with
+/// `_` folded to `-`, the way CGI-style backends read it — so a client-forged
+/// `x-auth-request-user` (or `X_Auth_Request_User`) can never reach the
+/// backend beside, or instead of, the provider's value.
+fn apply_staged_ext_authz_upstream_headers(
+    ctx: &mut RequestContext,
+    headers: &mut HashMap<String, String>,
+    staged: crate::plugins::mesh::ext_authz::StagedUpstreamHeaders,
+) {
+    if staged.is_empty() {
+        return;
+    }
+    headers.retain(|name, _| {
+        !staged.iter().any(|(owned, _)| {
+            crate::proxy::headers::field_names_equivalent_for_backends(name, owned)
+        })
+    });
+    for (name, value) in staged {
+        // Not an owner (Istio ext_authz semantics: only a CUSTOM-checked
+        // request carries provider-owned names), but when another plugin on
+        // the route owns this name as a gateway assertion, the provider's
+        // verified decision IS its current authorized state: record the
+        // install (or the removal) so the final gateway-assertion pass keeps
+        // exactly this value.
+        let route_owned = ctx
+            .route_owned_request_assertion_headers()
+            .is_some_and(|owned| {
+                owned.iter().any(|owned| {
+                    crate::proxy::headers::field_names_equivalent_for_backends(owned, &name)
+                })
+            });
+        match value {
+            Some(value) => {
+                if route_owned {
+                    ctx.record_installed_request_assertion(&name, &value);
+                }
+                headers.insert(name, value);
+            }
+            None if route_owned => ctx.record_cleared_request_assertion(&name),
+            None => {}
+        }
+    }
 }
 
 /// Merge an allowed check's `headersToDownstreamOnAllow` result into a client

@@ -5394,7 +5394,7 @@ fn node_waypoint_route_branch_verdicts_gate_every_destination_decision() {
         "fn reject_unauthorized_node_waypoint_rule_destination(",
         "\n}",
     );
-    assert!(admission.contains("enforce_node_waypoint_route_branch("));
+    assert!(admission.contains("admit_node_waypoint_route_branch("));
     let preview = item_body(
         &production,
         "fn node_waypoint_rule_destination_vetoed(",
@@ -5406,9 +5406,15 @@ fn node_waypoint_route_branch_verdicts_gate_every_destination_decision() {
             .contains("node_waypoint_rule_destination_vetoed(ctx, &rule.destination)"),
         "early route-total planning must use the verdict-aware preview"
     );
-    assert!(
+    assert_eq!(
         production
-            .contains("reject_unauthorized_node_waypoint_rule_destination(ctx, &rule.destination)"),
-        "matched-rule admission must use the verdict-aware check"
+            .matches("reject_unauthorized_node_waypoint_rule_destination(")
+            .count(),
+        2,
+        "matched-rule admission must use the verdict-aware check (definition + one call)"
+    );
+    assert!(
+        production.contains("admit_node_waypoint_route_branch_for_effective_destination(ctx"),
+        "an unmatched request must be admitted on its effective destination's verdict"
     );
 }
