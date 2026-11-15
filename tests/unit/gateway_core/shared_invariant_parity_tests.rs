@@ -5470,7 +5470,22 @@ fn allowed_ws_origins_grandfathering_warning_never_precedes_an_admission_refusal
         ("src/grpc/dp_client.rs", (1, 0)),
         ("src/proxy/mod.rs", (1, 0)),
     ]);
-    let actual: BTreeMap<String, (usize, usize)> = production_sources()
+    // `validate_all_fields` delegates to the warning variant. No production
+    // caller may use it, so every caller names a variant and lands in the
+    // table below.
+    const PLAIN_CALL: &str = ".validate_all_fields(";
+    let sources = production_sources();
+    let plain_callers: Vec<&str> = sources
+        .iter()
+        .filter(|(_, text)| text.contains(PLAIN_CALL))
+        .map(|(path, _)| path.as_str())
+        .collect();
+    assert!(
+        plain_callers.is_empty(),
+        "production code must call a named field-validation variant, not \
+         `validate_all_fields`: {plain_callers:?}"
+    );
+    let actual: BTreeMap<String, (usize, usize)> = sources
         .into_iter()
         .filter_map(|(path, text)| {
             let counts = (
