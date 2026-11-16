@@ -1784,13 +1784,17 @@ async fn correctly_signed_token_with_unsupported_crit_header_rejects() {
     let mut ctx = bearer_ctx(&sign(&Header::default()));
     assert_continue(plugin.authenticate(&mut ctx, &consumer_index).await);
 
-    let mut crit_exp = Header::default();
-    crit_exp.crit = Some(vec!["exp".to_string()]);
+    let crit_exp = Header {
+        crit: Some(vec!["exp".to_string()]),
+        ..Header::default()
+    };
     let mut b64_false = Header::default();
     b64_false.extras.insert("b64", false);
-    let mut crit_b64_false = Header::default();
+    let mut crit_b64_false = Header {
+        crit: Some(vec!["b64".to_string()]),
+        ..Header::default()
+    };
     crit_b64_false.extras.insert("b64", false);
-    crit_b64_false.crit = Some(vec!["b64".to_string()]);
     for header in [crit_exp, b64_false, crit_b64_false] {
         let mut ctx = bearer_ctx(&sign(&header));
         assert_reject(
