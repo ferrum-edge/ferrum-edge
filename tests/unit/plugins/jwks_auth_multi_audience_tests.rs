@@ -286,9 +286,10 @@ async fn unconfigured_audiences_keep_jsonwebtoken_aud_default() {
     assert_reject(with_result, Some(401));
 }
 
-/// With no audience configured, malformed `aud` values that jsonwebtoken
-/// treats as absent or unparsed (null, number, object, mixed array) are still
-/// rejected at the verified-claims boundary in `jwt_verifier`.
+/// With no audience configured, malformed `aud` values (null, number, object,
+/// mixed array) are rejected. jsonwebtoken 12 refuses the non-null shapes
+/// itself and reads `null` as absent, which the verified-claims boundary in
+/// `jwt_verifier` then refuses.
 #[tokio::test]
 async fn unconfigured_audiences_reject_malformed_aud_shapes() {
     let private_key_pem = include_bytes!("../../../tests/fixtures/test_rsa_private.pem");

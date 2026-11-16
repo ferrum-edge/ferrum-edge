@@ -387,8 +387,9 @@ async fn token_missing_issuer_and_audience_succeeds_when_not_configured() {
 // With no audiences configured, a validly signed token that carries an `aud`
 // claim was minted for some other audience and must be rejected (strict
 // jsonwebtoken default, matching `jwt_verifier.rs` and the admin verifier).
-// With audiences configured, a malformed `aud` that jsonwebtoken would treat
-// as unparsed must still be rejected.
+// With audiences configured, a malformed `aud` must still be rejected
+// (jsonwebtoken 12 refuses these shapes itself; Ferrum's shape check backs it
+// up).
 #[tokio::test]
 async fn malformed_audience_rejects_when_audience_configured() {
     let plugin = JwtAuth::new(&json!({"audiences": ["my-api"]})).unwrap();
