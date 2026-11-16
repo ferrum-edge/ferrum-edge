@@ -198,7 +198,7 @@ tower = { version = "0.5", features = ["util"] }
 # `crypto-bigint` 0.5 (RUSTSEC-2026-0387), and would sign ES256/ES384/RS*
 # outbound assertions and JWT-SVIDs on those implementations.
 # `.github/scripts/check_fips_feature_policy.py` enforces both.
-jsonwebtoken = { version = "11", default-features = false, features = ["use_pem", "aws_lc_rs"] }
+jsonwebtoken = { version = "12", default-features = false, features = ["use_pem", "aws_lc_rs"] }
 # NOTE: `argon2` was declared here and referenced by nothing in `src/` or
 # `custom_plugins/`. Argon2 is not an SP 800-132 approved KDF, so an unused
 # declaration was a non-approved primitive sitting in the dependency graph for
