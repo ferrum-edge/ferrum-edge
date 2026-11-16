@@ -16112,7 +16112,7 @@ fn scope_request_auth_to_node_waypoint_destinations(
             })
             .chain(global_route_dispatch.iter().copied())
             .collect();
-        for dispatch in dispatch_configs.iter().copied() {
+        for &dispatch in &dispatch_configs {
             for rule in dispatch
                 .get("rules")
                 .and_then(serde_json::Value::as_array)
