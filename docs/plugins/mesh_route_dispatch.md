@@ -190,6 +190,8 @@ receives.
 - **Final destination only.** The leg is picked once, after every instance has
   run, so a split an earlier instance selected and a later one replaced is never
   resolved, and a request is never sent through the split upstream itself.
+  An instance whose execution `trigger` skipped the request resolves none of
+  its splits, exactly as it routes nothing.
 - **Authorization.** On a NodeWaypoint, each leg is a candidate destination of
   the route's per-destination verdicts (`mesh_authz`
   `node_waypoint_route_branches`): the dispatch finalizer and proxy core judge the

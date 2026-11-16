@@ -12557,6 +12557,18 @@ pub trait Plugin: Any + Send + Sync {
         None
     }
 
+    /// The weighted-split tables this instance resolves for THIS request:
+    /// `None` when the instance did not run for it (its execution trigger
+    /// skipped it), so a skipped instance never selects a leg. Read by the
+    /// dispatch finalizer only; allocation-free.
+    #[doc(hidden)]
+    fn mesh_route_weighted_splits_for_request(
+        &self,
+        _ctx: &RequestContext,
+    ) -> Option<&mesh_route_dispatch::MeshRouteWeightedSplits> {
+        None
+    }
+
     /// Pure preview of the route total deadline this instance would publish
     /// in `before_proxy`, for the body collectors that run before it (issue
     /// #6008). Never runs a hook or mutates the request. `None` (the default)

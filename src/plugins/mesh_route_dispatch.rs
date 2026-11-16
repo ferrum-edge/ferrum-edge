@@ -1910,11 +1910,15 @@ fn weighted_split_stride(total: u64) -> u64 {
 /// `upstream_id`. On a route without per-destination verdicts the leg passes
 /// the same single-destination override guard as a matched rule. `Some` is
 /// that guard's refusal.
+///
+/// Only the tables of instances that ran for this request are consulted
+/// (`Plugin::mesh_route_weighted_splits_for_request`): an instance its
+/// execution trigger skipped resolves nothing, exactly as it routes nothing.
 pub(crate) fn select_weighted_split_leg(
     ctx: &mut RequestContext,
-    tables: &[Arc<MeshRouteWeightedSplits>],
+    instances: &[Arc<dyn Plugin>],
 ) -> Option<PluginResult> {
-    if tables.is_empty() {
+    if instances.is_empty() {
         return None;
     }
     let leg = {
@@ -1927,8 +1931,9 @@ pub(crate) fn select_weighted_split_leg(
             (None, None, None) => ctx.matched_proxy.as_deref()?.upstream_id.as_deref()?,
             _ => return None,
         };
-        tables
+        instances
             .iter()
+            .filter_map(|instance| instance.mesh_route_weighted_splits_for_request(ctx))
             .find_map(|table| table.split(split_id))?
             .select()?
     };
@@ -2896,6 +2901,13 @@ impl Plugin for MeshRouteDispatch {
 
     fn mesh_route_weighted_splits(&self) -> Option<Arc<MeshRouteWeightedSplits>> {
         self.weighted_splits.clone()
+    }
+
+    fn mesh_route_weighted_splits_for_request(
+        &self,
+        _ctx: &RequestContext,
+    ) -> Option<&MeshRouteWeightedSplits> {
+        self.weighted_splits.as_deref()
     }
 
     fn enable_deferred_unmatched_rejection(&self) {
