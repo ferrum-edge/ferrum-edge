@@ -65,12 +65,13 @@ pub struct JwtAuth {
     hide_credentials: bool,
     /// Precomputed `auth.strip_query_param.<name>` key for query lookups.
     strip_query_metadata_key: Option<String>,
-    /// Per-instance random secret for the equalizing verification run when
-    /// the token names no Consumer that has an eligible JWT secret. Drawn from
-    /// the CSPRNG at construction and never exposed, so no client can sign a
-    /// token that passes it: the run always stops at the signature check,
-    /// exactly like a wrong-signature attempt on the real path.
-    timing_equalization_secret: Zeroizing<[u8; 32]>,
+    /// Per-instance random key for the equalizing verification run when the
+    /// token names no Consumer that has an eligible JWT secret. Its 32-byte
+    /// secret is drawn from the CSPRNG at construction and never exposed, so
+    /// no client can sign a token that passes it: the run always stops at the
+    /// signature check, exactly like a wrong-signature attempt on the real
+    /// path. Built once here so the decoy run cannot be skipped per request.
+    timing_equalization_key: DecodingKey,
 }
 
 enum TokenLookup {
@@ -118,6 +119,8 @@ impl JwtAuth {
         SystemRandom::new()
             .fill(timing_equalization_secret.as_mut())
             .map_err(|_| "jwt_auth: failed to generate the timing-equalization key".to_string())?;
+        let timing_equalization_key = DecodingKey::from_secret(&timing_equalization_secret[..])
+            .map_err(|_| "jwt_auth: failed to build the timing-equalization key".to_string())?;
 
         // The algorithm is pinned here and never read from the token header:
         // `jsonwebtoken` refuses a token whose header names any other
@@ -181,22 +184,18 @@ impl JwtAuth {
             audiences_configured: !audiences.is_empty(),
             hide_credentials,
             strip_query_metadata_key,
-            timing_equalization_secret,
+            timing_equalization_key,
         })
     }
 
     /// Spend one signature verification when the token names no Consumer
     /// with an eligible JWT secret, doing what one wrong-signature attempt on
-    /// the real path does (build the key, run `decode`, fail at the signature
-    /// because the secret is unknowable), so an unknown identity costs about
-    /// what a known identity with a single wrong key does. The result is
-    /// discarded either way.
+    /// the real path does (run `decode`, fail at the signature because the
+    /// key is unknowable), so an unknown identity costs about what a known
+    /// identity with a single wrong key does. The run is unconditional and its
+    /// result is discarded either way.
     fn equalize_verification_work(&self, token: &str) {
-        // The equalization secret is random and non-empty, so the key always
-        // builds; a failure would only skip the decoy work.
-        if let Ok(key) = DecodingKey::from_secret(&self.timing_equalization_secret[..]) {
-            let _ = decode::<Value>(token, &key, &self.validation);
-        }
+        let _ = decode::<Value>(token, &self.timing_equalization_key, &self.validation);
     }
 
     /// Whether `before_proxy` should remove the value it found under the

@@ -1733,8 +1733,9 @@ fn equalizing_verification_key_is_random_per_instance() {
         .expect("JwtAuth::new body");
     assert!(
         constructor.contains("SystemRandom::new()")
-            && constructor.contains(".fill(timing_equalization_secret.as_mut())"),
-        "the equalization key must be drawn from the CSPRNG at construction"
+            && constructor.contains(".fill(timing_equalization_secret.as_mut())")
+            && constructor.contains("DecodingKey::from_secret(&timing_equalization_secret[..])"),
+        "the equalization key must be built from a CSPRNG secret at construction"
     );
     let equalize = JWT_AUTH_SOURCE
         .split("fn equalize_verification_work(&self, token: &str) {")
@@ -1742,8 +1743,60 @@ fn equalizing_verification_key_is_random_per_instance() {
         .and_then(|rest| rest.split("\n    }\n").next())
         .expect("equalize_verification_work body");
     assert!(
-        equalize.contains("DecodingKey::from_secret(&self.timing_equalization_secret[..])")
-            && equalize.contains("decode::<Value>(token, &key, &self.validation)"),
+        equalize
+            .contains("decode::<Value>(token, &self.timing_equalization_key, &self.validation)"),
         "the equalizing run must mirror one real-path attempt"
     );
+    // The decoy must run on every call: nothing may guard or skip it.
+    let statements: Vec<&str> = equalize
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with("//"))
+        .collect();
+    assert_eq!(
+        statements,
+        ["let _ = decode::<Value>(token, &self.timing_equalization_key, &self.validation);"],
+        "the equalizing run must be a single unconditional decode"
+    );
+}
+
+/// jsonwebtoken 12 rejects a JWS whose protected header declares a critical
+/// extension it does not understand (RFC 7515 §4.1.11), or `b64: false`
+/// (RFC 7797). A correctly signed token for a known consumer must therefore
+/// fail closed rather than authenticate.
+#[tokio::test]
+async fn correctly_signed_token_with_unsupported_crit_header_rejects() {
+    use jsonwebtoken::{EncodingKey, Header, encode};
+    let plugin = JwtAuth::new(&json!({})).unwrap();
+    let consumer_index = ConsumerIndex::new(&[create_test_consumer()]);
+    let secret = "test-jwt-secret-0123456789abcdefghij";
+    let claims = json!({"sub": "testuser", "exp": 9_999_999_999u64, "nbf": 0});
+    let sign = |header: &Header| {
+        encode(
+            header,
+            &claims,
+            &EncodingKey::from_secret(secret.as_bytes()).unwrap(),
+        )
+        .unwrap()
+    };
+
+    // Control: the same claims and key under a plain header authenticate.
+    let mut ctx = bearer_ctx(&sign(&Header::default()));
+    assert_continue(plugin.authenticate(&mut ctx, &consumer_index).await);
+
+    let mut crit_exp = Header::default();
+    crit_exp.crit = Some(vec!["exp".to_string()]);
+    let mut b64_false = Header::default();
+    b64_false.extras.insert("b64", false);
+    let mut crit_b64_false = Header::default();
+    crit_b64_false.extras.insert("b64", false);
+    crit_b64_false.crit = Some(vec!["b64".to_string()]);
+    for header in [crit_exp, b64_false, crit_b64_false] {
+        let mut ctx = bearer_ctx(&sign(&header));
+        assert_reject(
+            plugin.authenticate(&mut ctx, &consumer_index).await,
+            Some(401),
+        );
+        assert!(ctx.identified_consumer.is_none());
+    }
 }
