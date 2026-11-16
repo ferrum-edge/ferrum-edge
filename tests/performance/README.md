@@ -13,7 +13,7 @@ duration, build profile, and comparison baseline.
 
 | Suite | Entry point | Measures | Result/provenance docs |
 |---|---|---|---|
-| CI HTTP overhead gate | `ci_overhead_bench.py` | Short self-relative HTTP overhead regression check run by `performance-regression.yml`, against a file-mode gateway loaded from [`perf_config.yaml`](perf_config.yaml). | CI artifacts under `tests/performance/ci_results/`. |
+| CI HTTP overhead gate | `ci_overhead_bench.py` | Short self-relative HTTP overhead regression check run by `performance-regression.yml`, against a file-mode gateway loaded from [`tests/fixtures/performance_regression_gateway.yaml`](../fixtures/performance_regression_gateway.yaml). | CI artifacts under `tests/performance/ci_results/`. |
 | Published multi-protocol numbers | [`multi_protocol/run_published_benchmark.sh`](multi_protocol/run_published_benchmark.sh) | Repeated, provenance-stamped runs of the multi-protocol matrix: throughput per payload size, light-load added latency, and gateway CPU per request, summarized as medians with spread. | [`multi_protocol/README.md#publishing-numbers`](multi_protocol/README.md#publishing-numbers). |
 | Multi-protocol matrix | [`multi_protocol/`](multi_protocol/) | HTTP/1.1, HTTPS, HTTP/2, HTTP/3, WebSocket, gRPC, TCP, TCP+TLS, UDP, and UDP+DTLS through Ferrum and direct backend baselines. Also includes Envoy comparison and connection saturation harnesses. | [`multi_protocol/README.md`](multi_protocol/README.md). |
 | Payload-size matrix | [`payload_size/`](payload_size/) | Content-type and payload-size sweeps across HTTP, gRPC, WebSocket, TCP, UDP, and TLS variants. | [`payload_size/README.md`](payload_size/README.md). |

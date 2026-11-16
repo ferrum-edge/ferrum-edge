@@ -3,9 +3,17 @@ version: "1"
 # Gateway configuration for the daily CI HTTP overhead gate. The "Start
 # gateway" step of .github/workflows/performance-regression.yml loads it with
 # FERRUM_MODE=file, and ci_overhead_bench.py drives /health and /api/users
-# through it against backend_server on 127.0.0.1:3001. verify_required_ci.py
-# fails when a file that job reads is missing, so this cannot be deleted while
-# the workflow still names it.
+# through it against backend_server on 127.0.0.1:3001.
+#
+# That workflow never runs on a pull request, so two pull-request checks hold
+# this file to it instead:
+# - verify_required_ci.py fails when a file the job reads is missing;
+# - tests/unit/config/performance_regression_gateway_config_tests.rs loads it
+#   through the production file loader, so a schema change that stops it
+#   loading fails the Rust lane.
+# It lives under tests/fixtures/ rather than tests/performance/ because the
+# planner schedules the Rust lane for tests/fixtures/ changes and not for the
+# standalone benchmark tree.
 
 proxies:
   - id: "proxy-health"
