@@ -30,6 +30,12 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 LOCKFILE = REPO_ROOT / "Cargo.lock"
+# Standalone workspaces that path-depend on the root crate. They compile the
+# committed index too, so they must lock the same `psl` it was generated from.
+STANDALONE_LOCKFILES = (
+    REPO_ROOT / "fuzz" / "Cargo.lock",
+    REPO_ROOT / "tests" / "performance" / "mesh" / "Cargo.lock",
+)
 INDEX = REPO_ROOT / "src" / "plugins" / "cors_psl_ancestors.rs"
 CRATE_URL = "https://static.crates.io/crates/psl/psl-{version}.crate"
 
@@ -48,10 +54,26 @@ HEADER = """\
 """
 
 
+def locked_psl_packages(lockfile: Path) -> list[dict]:
+    lock = tomllib.loads(lockfile.read_text(encoding="utf-8"))
+    return [p for p in lock.get("package", []) if p.get("name") == "psl"]
+
+
+def standalone_psl_drift(version: str) -> list[str]:
+    """Describe each standalone lockfile whose `psl` differs from `version`."""
+    drift = []
+    for lockfile in STANDALONE_LOCKFILES:
+        if not lockfile.is_file():
+            continue
+        versions = [p.get("version") for p in locked_psl_packages(lockfile)]
+        if versions and versions != [version]:
+            drift.append(f"{lockfile.relative_to(REPO_ROOT)} locks psl {versions}")
+    return drift
+
+
 def locked_psl() -> tuple[str, str]:
     """Return (version, sha256) of the single locked `psl` package."""
-    lock = tomllib.loads(LOCKFILE.read_text(encoding="utf-8"))
-    packages = [p for p in lock.get("package", []) if p.get("name") == "psl"]
+    packages = locked_psl_packages(LOCKFILE)
     if len(packages) != 1:
         versions = [p.get("version") for p in packages]
         sys.exit(f"error: expected exactly one locked psl package, found {versions}")
@@ -165,10 +187,19 @@ def main() -> int:
     relative = INDEX.relative_to(REPO_ROOT)
 
     if args.check:
+        drift = standalone_psl_drift(version)
+        for line in drift:
+            print(
+                f"::error::{line} but Cargo.lock locks psl {version}; run "
+                f"cargo update -p psl --precise {version} in that workspace",
+                file=sys.stderr,
+            )
         committed = INDEX.read_text(encoding="utf-8")
-        if committed == generated:
+        if committed == generated and not drift:
             print(f"{relative} matches psl {version}")
             return 0
+        if committed == generated:
+            return 1
         sys.stdout.writelines(
             difflib.unified_diff(
                 committed.splitlines(keepends=True),
