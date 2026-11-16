@@ -11,6 +11,15 @@ downloads that crate from static.crates.io (or reads a local `.crate` given
 with --crate), verifies its SHA-256 against the lockfile, and renders the
 index. Nothing is compiled.
 
+Standalone Cargo workspaces (`fuzz/`, the `tests/performance/**` harnesses)
+keep their own `Cargo.lock`. The ones that path-depend on the root crate
+compile this same index, so `--check` also fails when such a lock resolves a
+different `psl` than the root Cargo.lock (or none at all). The workspace list
+comes from `.github/scripts/standalone_cargo_manifests.py`, the inventory the
+`standalone-cargo` and dependency-audit lanes use; any standalone lock that
+lists `psl` is held to the root version too, and a standalone workspace with
+no committed `Cargo.lock` is an error rather than a silent pass.
+
     python3 scripts/generate_cors_psl_ancestors.py          # rewrite the index
     python3 scripts/generate_cors_psl_ancestors.py --check  # CI parity gate
 """
@@ -20,6 +29,7 @@ from __future__ import annotations
 import argparse
 import difflib
 import hashlib
+import importlib.util
 import io
 import sys
 import tarfile
@@ -30,12 +40,8 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 LOCKFILE = REPO_ROOT / "Cargo.lock"
-# Standalone workspaces that path-depend on the root crate. They compile the
-# committed index too, so they must lock the same `psl` it was generated from.
-STANDALONE_LOCKFILES = (
-    REPO_ROOT / "fuzz" / "Cargo.lock",
-    REPO_ROOT / "tests" / "performance" / "mesh" / "Cargo.lock",
-)
+STANDALONE_INVENTORY = REPO_ROOT / ".github" / "scripts" / "standalone_cargo_manifests.py"
+ROOT_CRATE = "ferrum-edge"
 INDEX = REPO_ROOT / "src" / "plugins" / "cors_psl_ancestors.rs"
 CRATE_URL = "https://static.crates.io/crates/psl/psl-{version}.crate"
 
@@ -54,20 +60,58 @@ HEADER = """\
 """
 
 
+def locked_packages(lockfile: Path) -> list[dict]:
+    return tomllib.loads(lockfile.read_text(encoding="utf-8")).get("package", [])
+
+
 def locked_psl_packages(lockfile: Path) -> list[dict]:
-    lock = tomllib.loads(lockfile.read_text(encoding="utf-8"))
-    return [p for p in lock.get("package", []) if p.get("name") == "psl"]
+    return [p for p in locked_packages(lockfile) if p.get("name") == "psl"]
+
+
+def standalone_lockfiles() -> list[Path]:
+    """Return the `Cargo.lock` path of every standalone workspace root."""
+    spec = importlib.util.spec_from_file_location(
+        "standalone_cargo_manifests", STANDALONE_INVENTORY
+    )
+    if spec is None or spec.loader is None:
+        sys.exit(f"error: cannot load {STANDALONE_INVENTORY.relative_to(REPO_ROOT)}")
+    inventory = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(inventory)
+    manifests = inventory.standalone_workspace_roots(REPO_ROOT)
+    if not manifests:
+        sys.exit("error: the standalone Cargo workspace inventory is empty")
+    return [(REPO_ROOT / manifest).parent / "Cargo.lock" for manifest in manifests]
 
 
 def standalone_psl_drift(version: str) -> list[str]:
-    """Describe each standalone lockfile whose `psl` differs from `version`."""
+    """Return one error per standalone lockfile that does not lock `psl` `version`.
+
+    A lock that builds the root crate as a path package compiles the index and
+    must resolve exactly `version`; any other lock that lists `psl` is held to
+    the same version. A standalone workspace without a committed lock fails.
+    """
     drift = []
-    for lockfile in STANDALONE_LOCKFILES:
+    for lockfile in standalone_lockfiles():
+        relative = lockfile.relative_to(REPO_ROOT)
         if not lockfile.is_file():
+            drift.append(
+                f"{relative} is missing; every standalone Cargo workspace commits its "
+                "lockfile, so this one cannot be checked against the index"
+            )
             continue
-        versions = [p.get("version") for p in locked_psl_packages(lockfile)]
-        if versions and versions != [version]:
-            drift.append(f"{lockfile.relative_to(REPO_ROOT)} locks psl {versions}")
+        packages = locked_packages(lockfile)
+        builds_root_crate = any(
+            p.get("name") == ROOT_CRATE and "source" not in p for p in packages
+        )
+        versions = [p.get("version") for p in packages if p.get("name") == "psl"]
+        if (builds_root_crate or versions) and versions != [version]:
+            drift.append(
+                f"{relative} locks psl {versions} but Cargo.lock locks psl {version}; "
+                f"align this workspace's psl to {version} (cargo update -p psl "
+                f"--precise {version} in that workspace), or lift the root lock to the "
+                "workspace's psl and regenerate the index with "
+                "python3 scripts/generate_cors_psl_ancestors.py"
+            )
     return drift
 
 
@@ -189,11 +233,7 @@ def main() -> int:
     if args.check:
         drift = standalone_psl_drift(version)
         for line in drift:
-            print(
-                f"::error::{line} but Cargo.lock locks psl {version}; run "
-                f"cargo update -p psl --precise {version} in that workspace",
-                file=sys.stderr,
-            )
+            print(f"::error::{line}", file=sys.stderr)
         committed = INDEX.read_text(encoding="utf-8")
         if committed == generated and not drift:
             print(f"{relative} matches psl {version}")
