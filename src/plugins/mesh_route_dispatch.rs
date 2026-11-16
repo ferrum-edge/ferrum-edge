@@ -173,13 +173,23 @@ impl MeshRouteDispatchConfig {
     }
 
     pub fn references_upstream_id(&self, upstream_id: &str) -> bool {
+        self.referenced_upstream_ids().any(|id| id == upstream_id)
+    }
+
+    /// Every upstream id this config names, in order: each rule's
+    /// `destination.upstream_id`, then each `weighted_splits` entry's id
+    /// followed by its legs (issue #7387). The one enumerator behind upstream
+    /// delete protection, API-spec replacement protection and load-time
+    /// reference validation, so a destination kind cannot be covered by one
+    /// and missed by another.
+    pub fn referenced_upstream_ids(&self) -> impl Iterator<Item = &str> {
         self.rules
             .iter()
-            .any(|rule| rule.destination.upstream_id.as_deref() == Some(upstream_id))
-            || self.weighted_splits.iter().any(|split| {
-                split.upstream_id == upstream_id
-                    || split.legs.iter().any(|leg| leg.upstream_id == upstream_id)
-            })
+            .filter_map(|rule| rule.destination.upstream_id.as_deref())
+            .chain(self.weighted_splits.iter().flat_map(|split| {
+                std::iter::once(split.upstream_id.as_str())
+                    .chain(split.legs.iter().map(|leg| leg.upstream_id.as_str()))
+            }))
     }
 
     fn normalize_and_validate(&mut self) -> Result<(), String> {

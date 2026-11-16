@@ -5369,8 +5369,10 @@ fn final_request_body_hook_context_hand_back_has_one_implementation() {
 /// place that enumerates the destinations an instance names must read both,
 /// or a leg is left unauthorized (candidate threading), un-probed (HBONE
 /// capability enrollment), pruned (route upstream references), deletable
-/// while referenced (store references), or uncounted against the per-route
-/// candidate bound (slice binding). RequestAuthentication destination
+/// while referenced (store references, API-spec replacement), dangling
+/// (runtime and admin-write reference validation), untracked (adaptive
+/// concurrency route-override destinations), or uncounted against the
+/// per-route candidate bound (slice binding). RequestAuthentication destination
 /// scoping is the deliberate exception: it resolves the split upstream
 /// itself, which keeps every leg's workloads, so the route's set already
 /// covers each leg.
@@ -5380,7 +5382,40 @@ fn mesh_route_dispatch_destination_enumerators_cover_weighted_split_legs() {
     let slice = source("src/modes/mesh/slice.rs");
     let proxy = source("src/proxy/mod.rs");
     let dispatch = source("src/plugins/mesh_route_dispatch.rs");
+    let store_policy = source("src/config/store_policy.rs");
+    let crud = source("src/admin/crud.rs");
+    let cache = source("src/plugin_cache.rs");
     for (file, text, signature, needle) in [
+        (
+            "src/proxy/mod.rs",
+            &proxy,
+            "pub(crate) fn validate_mesh_route_dispatch_upstream_references(",
+            ".weighted_splits",
+        ),
+        (
+            "src/admin/crud.rs",
+            &crud,
+            "pub(crate) async fn validate_mesh_route_dispatch_plugin_upstream_references(",
+            ".weighted_splits",
+        ),
+        (
+            "src/config/store_policy.rs",
+            &store_policy,
+            "pub fn mesh_route_dispatch_referenced_upstream(",
+            ".referenced_upstream_ids()",
+        ),
+        (
+            "src/plugin_cache.rs",
+            &cache,
+            "fn collect_route_override_destinations(",
+            "\"weighted_splits\"",
+        ),
+        (
+            "src/plugin_cache.rs",
+            &cache,
+            "fn route_override_destination_fingerprint(",
+            "\"weighted_splits\"",
+        ),
         (
             "src/modes/mesh/mod.rs",
             &mesh,
@@ -5409,6 +5444,12 @@ fn mesh_route_dispatch_destination_enumerators_cover_weighted_split_legs() {
             "src/plugins/mesh_route_dispatch.rs",
             &dispatch,
             "pub fn references_upstream_id(",
+            "self.referenced_upstream_ids()",
+        ),
+        (
+            "src/plugins/mesh_route_dispatch.rs",
+            &dispatch,
+            "pub fn referenced_upstream_ids(",
             "self.weighted_splits",
         ),
     ] {

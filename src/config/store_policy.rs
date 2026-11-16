@@ -66,7 +66,9 @@ pub fn mesh_route_dispatch_references_upstream_id(
 
 /// The first spec-owned upstream id (from `upstream_ids`) that an enabled
 /// `mesh_route_dispatch` plugin config outside the spec routes to, in rule
-/// order. Same enabled/plugin-name/parse filter as
+/// order, then weighted-split order (split id, then its legs). Same
+/// enabled/plugin-name/parse filter and the same enumerator
+/// (`MeshRouteDispatchConfig::referenced_upstream_ids`) as
 /// [`mesh_route_dispatch_references_upstream_id`].
 pub fn mesh_route_dispatch_referenced_upstream(
     plugin: &PluginConfig,
@@ -77,9 +79,7 @@ pub fn mesh_route_dispatch_referenced_upstream(
     }
     let config = MeshRouteDispatchConfig::from_value(&plugin.config).ok()?;
     config
-        .rules
-        .iter()
-        .filter_map(|rule| rule.destination.upstream_id.as_deref())
+        .referenced_upstream_ids()
         .find(|upstream_id| upstream_ids.contains(*upstream_id))
         .map(ToOwned::to_owned)
 }

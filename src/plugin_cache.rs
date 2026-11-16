@@ -4574,13 +4574,19 @@ fn route_override_destination_fingerprint(pc: &PluginConfig) -> serde_json::Valu
                         .collect::<Vec<_>>()
                 })
                 .unwrap_or_default();
-            serde_json::json!({
+            let mut fingerprint = serde_json::json!({
                 "reject_unmatched": fingerprint_config
                     .get("reject_unmatched")
                     .and_then(serde_json::Value::as_bool)
                     .unwrap_or(false),
                 "rules": rules
-            })
+            });
+            // Weighted-split legs (issue #7387) are route-override
+            // destinations too.
+            if let Some(splits) = fingerprint_config.get("weighted_splits") {
+                fingerprint["weighted_splits"] = splits.clone();
+            }
+            fingerprint
         }
         "ai_stream_router" => {
             let enabled = pc
@@ -4790,6 +4796,32 @@ fn collect_route_override_destinations(
                 ) {
                     push_direct_route_key(keys, key_by, proxy, host, port);
                 }
+            }
+            // Weighted-split legs (issue #7387) are dispatched through their
+            // own upstreams exactly like a rule's `upstream_id`.
+            for leg_id in route_pc
+                .config
+                .get("weighted_splits")
+                .and_then(serde_json::Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(|split| split.get("legs").and_then(serde_json::Value::as_array))
+                .flatten()
+                .filter_map(|leg| leg.get("upstream_id").and_then(serde_json::Value::as_str))
+            {
+                let upstream = config.upstreams.iter().find(|upstream| {
+                    upstream.id == leg_id && upstream.namespace == proxy.namespace
+                });
+                push_upstream_route(
+                    keys,
+                    upstream_routes,
+                    adaptive_concurrency_scope(key_by, proxy, Some(leg_id)),
+                    &proxy.namespace,
+                    leg_id,
+                    None,
+                    proxy.backend_port,
+                    upstream,
+                );
             }
         }
         "ai_stream_router" => {

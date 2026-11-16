@@ -3786,10 +3786,36 @@ pub(crate) async fn validate_mesh_route_dispatch_plugin_upstream_references(
     };
 
     let mut errors = Vec::new();
-    for (rule_idx, rule) in dispatch_config.rules.iter().enumerate() {
-        let Some(upstream_id) = rule.destination.upstream_id.as_deref() else {
-            continue;
-        };
+    // Every upstream the config names: each rule's destination, then each
+    // weighted split and its legs (issue #7387), which dispatch reaches the
+    // same way.
+    let named = dispatch_config
+        .rules
+        .iter()
+        .enumerate()
+        .filter_map(|(rule_idx, rule)| {
+            rule.destination
+                .upstream_id
+                .as_deref()
+                .map(|upstream_id| (format!("rule {rule_idx}"), upstream_id))
+        })
+        .chain(dispatch_config.weighted_splits.iter().enumerate().flat_map(
+            |(split_idx, split)| {
+                std::iter::once((
+                    format!("weighted_splits[{split_idx}]"),
+                    split.upstream_id.as_str(),
+                ))
+                .chain(split.legs.iter().enumerate().map(
+                    move |(leg_idx, leg)| {
+                        (
+                            format!("weighted_splits[{split_idx}].legs[{leg_idx}]"),
+                            leg.upstream_id.as_str(),
+                        )
+                    },
+                ))
+            },
+        ));
+    for (position, upstream_id) in named {
         if batch_upstream_ids.is_some_and(|ids| ids.contains(upstream_id)) {
             continue;
         }
@@ -3801,8 +3827,8 @@ pub(crate) async fn validate_mesh_route_dispatch_plugin_upstream_references(
                 // namespace reports as non-existent (cross-namespace
                 // references are equally forbidden either way).
                 errors.push(format!(
-                    "PluginConfig '{}' (mesh_route_dispatch) rule {} references upstream_id '{}' that does not exist in namespace '{}'",
-                    plugin_config.id, rule_idx, upstream_id, namespace
+                    "PluginConfig '{}' (mesh_route_dispatch) {} references upstream_id '{}' that does not exist in namespace '{}'",
+                    plugin_config.id, position, upstream_id, namespace
                 ));
             }
             Err(error) => return Err(error),

@@ -818,8 +818,9 @@ fn node_waypoint_listener_uid_fallback_allowed(error: &NodeWaypointIdentityError
     )
 }
 
-/// Validate that every `mesh_route_dispatch` rule's
-/// `destination.upstream_id` points at a real upstream in the config.
+/// Validate that every upstream a `mesh_route_dispatch` config names (each
+/// rule's `destination.upstream_id`, and each `weighted_splits` entry and leg,
+/// issue #7387) points at a real upstream in the config.
 ///
 /// Treated as a rejecting validator (same bucket as
 /// `validate_upstream_references` for `Proxy.upstream_id`): a typo in a
@@ -894,14 +895,42 @@ pub(crate) fn validate_mesh_route_dispatch_upstream_references(
         } else {
             std::iter::once(plugin.namespace.as_str()).collect()
         };
+        let proxy_id = plugin.proxy_id.as_deref().unwrap_or("<none>");
         for (rule_idx, rule) in dispatch_config.rules.iter().enumerate() {
             if let Some(upstream_id) = rule.destination.upstream_id.as_deref() {
                 for namespace in &target_namespaces {
                     if !upstream_ids.contains(&(*namespace, upstream_id)) {
-                        let proxy_id = plugin.proxy_id.as_deref().unwrap_or("<none>");
                         errors.push(format!(
                             "PluginConfig '{}' (mesh_route_dispatch) rule {} for proxy_id '{}' references upstream_id '{}' that is not present in namespace '{}'",
                             plugin.id, rule_idx, proxy_id, upstream_id, namespace
+                        ));
+                    }
+                }
+            }
+        }
+        // A weighted split's legs are dispatched exactly like a rule's
+        // `upstream_id`, so a missing leg would fall back to the proxy's
+        // direct backend the same way; the split id itself must resolve too.
+        for (split_idx, split) in dispatch_config.weighted_splits.iter().enumerate() {
+            let named = std::iter::once((None, split.upstream_id.as_str())).chain(
+                split
+                    .legs
+                    .iter()
+                    .enumerate()
+                    .map(|(leg_idx, leg)| (Some(leg_idx), leg.upstream_id.as_str())),
+            );
+            for (leg_idx, upstream_id) in named {
+                for namespace in &target_namespaces {
+                    if !upstream_ids.contains(&(*namespace, upstream_id)) {
+                        let position = match leg_idx {
+                            Some(leg_idx) => {
+                                format!("weighted_splits[{split_idx}].legs[{leg_idx}]")
+                            }
+                            None => format!("weighted_splits[{split_idx}]"),
+                        };
+                        errors.push(format!(
+                            "PluginConfig '{}' (mesh_route_dispatch) {} for proxy_id '{}' references upstream_id '{}' that is not present in namespace '{}'",
+                            plugin.id, position, proxy_id, upstream_id, namespace
                         ));
                     }
                 }
