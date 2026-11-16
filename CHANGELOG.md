@@ -341,7 +341,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `Dockerfile.test`, which could not build and no workflow used (#7296).
 - The dead `tests/performance/run_perf_test.sh` HTTP smoke harness, its
   committed result files, `perf_config.yaml` and
-  `multi_protocol/run_all_protocol_tests.sh` (#7300).
+  `multi_protocol/run_all_protocol_tests.sh` (#7300). The overhead gate's
+  gateway config was restored at
+  `tests/fixtures/performance_regression_gateway.yaml` (#7397).
 - Comparison report: the native-Kong label and advice, and the
   `kong_native`/`envoy_native` metadata (#7306).
 - The unused `tracing-appender` dependency, with its `symlink` dependency,
@@ -868,6 +870,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   different builds refuse each other at `Subscribe`.
 
 ### Fixed
+- CI: restore the gateway config that the daily `performance-regression.yml`
+  overhead gate loads, now at `tests/fixtures/performance_regression_gateway.yaml`
+  (formerly `tests/performance/perf_config.yaml`). #7300 deleted it as dead and
+  every scheduled run failed at "Start gateway" from 2026-11-12.
+  `verify_required_ci.py` now fails a pull request that removes a file that job
+  reads, and a unit test loads the config on every pull request (#7397).
+- CI: the required Fuzz Smoke property build adds the bounded 12 GiB `/mnt`
+  swap step the eBPF, netns and coverage compiles use; without it the
+  one-rustc `ferrum-edge` compile intermittently lost the 16 GB runner on
+  `main` (#7398).
+- CI: the protocol benchmark no longer exports its BuildKit layers to the
+  Actions cache (`cache-to: type=gha,mode=max`); they took 4.2 GB of the
+  10 GB quota and evicted the Rust CI caches (#7400).
 - **Security: a NodeWaypoint VirtualService split leg to an external host now
   originates the TLS its DestinationRule requires** (#7387, #7371). The rule's
   TLS settings were applied to the leg's upstream (before #7387, to the whole
