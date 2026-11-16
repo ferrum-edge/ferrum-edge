@@ -2162,14 +2162,15 @@ fn projected_connect_timeout(
         .and_then(|slot| slot.connect_timeout_ms)
 }
 
-/// Issue #7387 review round 4 (sol F1): DestinationRule host matching is ONE
-/// function with Istio's semantics (exact and Service aliases, `*.suffix`,
-/// `*`; exact beats wildcard, the longest suffix wins), and the carried-route
-/// binding and rule application agree on it. The matcher table pins the
-/// semantics; each prepared row checks that the binding sends the split leg
-/// by leg exactly when application lands the rule on that destination.
+/// Issue #7387 review rounds 4-5: the data plane applies only exact-host
+/// DestinationRules (and Service aliases); `destination_rule_host_specificity`
+/// only DETECTS wildcard coverage, with Istio's wildcard shape. The matcher
+/// table pins that detection; the prepared rows check that an exact rule on
+/// an external host still sends the split leg by leg and lands on the leg,
+/// that a wildcard covering an external host refuses the route (fail closed),
+/// and that a wildcard over a Service is not applied (main's behaviour).
 #[test]
-fn destination_rule_binding_and_application_agree_on_host_matching() {
+fn wildcard_destination_rules_are_detected_but_not_applied() {
     use ferrum_edge::_test_support::destination_rule_host_specificity_for_test as specificity;
     let fqdn = "ratings.default.svc.cluster.local";
     for (rule_host, rule_namespace, candidate, expected) in [
@@ -2244,17 +2245,18 @@ fn destination_rule_binding_and_application_agree_on_host_matching() {
     assert!(ranked.iter().all(Option::is_some));
     assert!(ranked[0].unwrap() < ranked[1].unwrap() && ranked[1].unwrap() < ranked[2].unwrap());
 
-    // External hosts: the binding isolates the host on a residual leg exactly
-    // when application lands the rule on that residual.
-    for (rule_host, external, applies) in [
-        ("api.wild.example", "api.wild.example", true),
-        ("*.wild.example", "api.wild.example", true),
-        ("*.example", "api.wild.example", true),
-        ("*", "api.wild.example", true),
+    // External hosts: an exact rule sends the split leg by leg and lands on
+    // the residual leg; a covering wildcard refuses the route (the host keeps
+    // its Service route); a non-covering wildcard leaves the plain split.
+    for (rule_host, external, outcome) in [
+        ("api.wild.example", "api.wild.example", "applied"),
+        ("*.wild.example", "api.wild.example", "refused"),
+        ("*.example", "api.wild.example", "refused"),
+        ("*", "api.wild.example", "refused"),
         // The apex is not under its own wildcard. (A two-label external host
         // would read as `<svc>.<ns>`, so the apex here has three labels.)
-        ("*.api.wild.example", "api.wild.example", false),
-        ("*.other.example", "api.wild.example", false),
+        ("*.api.wild.example", "api.wild.example", "plain"),
+        ("*.other.example", "api.wild.example", "plain"),
     ] {
         let objects = vec![
             split_virtual_service(
@@ -2268,12 +2270,26 @@ fn destination_rule_binding_and_application_agree_on_host_matching() {
             tcp_destination_rule("wild-dr", rule_host, json!({"connectTimeout": "3s"})),
         ];
         let (_, prepared) = prepare(&objects, Vec::new());
+        if outcome == "refused" {
+            assert!(
+                carried_routes(&prepared).is_empty(),
+                "{rule_host} vs {external}: a wildcard-covered leg refuses the route"
+            );
+            assert!(
+                prepared
+                    .proxies
+                    .iter()
+                    .any(|proxy| proxy.upstream_id.as_deref() == Some(REVIEWS_UPSTREAM)),
+                "{rule_host}: the host keeps its Service route"
+            );
+            continue;
+        }
         assert_eq!(
             route_is_leg_dispatched(&prepared),
-            applies,
+            outcome == "applied",
             "binding: {rule_host} vs {external}"
         );
-        if applies {
+        if outcome == "applied" {
             let split_id = carried_split_route(&prepared)
                 .upstream_id
                 .expect("split id");
@@ -2285,137 +2301,85 @@ fn destination_rule_binding_and_application_agree_on_host_matching() {
         }
     }
 
-    // Service legs: every alias form and a wildcard both bind and apply.
-    for rule_host in [
-        "ratings",
-        "ratings.default",
-        "ratings.default.svc",
-        fqdn,
-        "*.svc.cluster.local",
+    // Service legs: every alias form binds and applies; a wildcard is not
+    // applied (as on main), and the route is still served.
+    for (rule_host, applied) in [
+        ("ratings", true),
+        ("ratings.default", true),
+        ("ratings.default.svc", true),
+        (fqdn, true),
+        ("*.svc.cluster.local", false),
     ] {
         let objects = vec![
             reviews_ratings_split(50, 50),
             tcp_destination_rule("ratings-dr", rule_host, json!({"connectTimeout": "3s"})),
         ];
         let (_, prepared) = prepare(&objects, Vec::new());
-        assert!(route_is_leg_dispatched(&prepared), "binding: {rule_host}");
+        carried_split_route(&prepared);
+        if applied {
+            assert!(route_is_leg_dispatched(&prepared), "binding: {rule_host}");
+        }
         assert_eq!(
             projected_connect_timeout(&prepared, RATINGS_UPSTREAM, 8080),
-            Some(3000),
+            applied.then_some(3000),
             "application: {rule_host}"
         );
     }
 }
 
-/// Issue #7387 review round 4 (sol F1): an external leg governed only by a
-/// wildcard DestinationRule originates that rule's TLS; the longest wildcard
-/// suffix wins (MUTUAL over SIMPLE); an exact rule beats the wildcard (no
-/// TLS); and a Service leg a wildcard TLS rule governs keeps the plaintext
-/// scheme its mesh transport needs. Followed through selection, route
-/// overrides, the effective proxy and the backend URL.
-#[tokio::test]
-async fn wildcard_destination_rules_govern_external_legs_and_their_tls() {
-    let objects = vec![
-        split_virtual_service(
-            "split",
-            "reviews.default.svc.cluster.local",
-            &[
-                ("reviews.default.svc.cluster.local", 8080, 40),
-                ("api.one.wild.example", 443, 20),
-                ("api.exact.wild.example", 443, 20),
-                ("api.longer.wild.example", 443, 20),
-            ],
-        ),
-        traffic_policy_rule(
-            "service-wildcard",
-            "*.cluster.local",
-            json!({"tls": {"mode": "SIMPLE"}}),
-        ),
-        traffic_policy_rule(
+/// Issue #7387 review round 5: an external split leg a wildcard
+/// DestinationRule covers refuses its route, whatever the rule's TLS mode and
+/// even beside an exact rule for the same host, because the data plane does
+/// not apply wildcard rules and the leg would otherwise be dialed in
+/// plaintext past it. The host keeps its Service route.
+#[test]
+fn a_wildcard_covered_external_leg_refuses_its_split() {
+    for extra in [
+        vec![traffic_policy_rule(
             "wildcard",
             "*.wild.example",
             json!({"tls": {"mode": "SIMPLE"}}),
-        ),
-        tcp_destination_rule(
-            "exact",
-            "api.exact.wild.example",
-            json!({"connectTimeout": "3s"}),
-        ),
-        mutual_tls_rule("longer-wildcard", "*.longer.wild.example"),
-    ];
-    let (_, prepared) = prepare(&objects, Vec::new());
-    let route = carried_split_route(&prepared);
-    let split_id = route.upstream_id.clone().expect("split id");
-    let leg = |index: usize| format!("{split_id}-external-{index}");
-    assert_eq!(
-        leg_origination(&prepared, &route, &split_id),
+        )],
+        vec![mutual_tls_rule("wildcard", "*.wild.example")],
         vec![
-            (REVIEWS_UPSTREAM.to_string(), false),
-            (leg(0), true),
-            (leg(1), false),
-            (leg(2), true),
+            simple_tls_rule("exact", "api.one.wild.example"),
+            traffic_policy_rule(
+                "wildcard",
+                "*.wild.example",
+                json!({"tls": {"mode": "DISABLE"}}),
+            ),
         ],
-        "wildcard TLS reaches its external legs; the exact rule wins its host"
-    );
-    assert_eq!(
-        projected_connect_timeout(&prepared, &leg(1), 443),
-        Some(3000),
-        "the exact rule governs its host"
-    );
-
-    let authz = Arc::new(MeshAuthz::new(&authz_config(&prepared)).expect("mesh_authz builds"));
-    let plugins = chain(vec![
-        Arc::clone(&authz) as Arc<dyn Plugin>,
-        route_dispatch_instance(&prepared, &route),
-    ]);
-    let upstreams = upstream_map(&prepared);
-    let mut counts: HashMap<String, usize> = HashMap::new();
-    for _ in 0..100 {
-        let (result, ctx, _) = serve(&authz, &plugins, &route, TRUSTED).await;
-        assert!(matches!(result, PluginResult::Continue), "{result:?}");
-        let selected = selected_leg(&ctx);
-        let (effective, url) = leg_dispatch(&ctx, &route, &prepared, &upstreams);
-        if selected == leg(0) || selected == leg(2) {
-            assert_eq!(
-                effective.dispatch_kind,
-                DispatchKind::HttpsPool,
-                "{selected}"
-            );
-            assert!(url.starts_with("https://"), "{selected} dials {url}");
-            assert!(!effective.resolved_tls.tls_refused, "{selected}");
-        } else {
-            assert_eq!(ctx.route_override_backend_scheme, None, "{selected}");
-            assert_eq!(
-                effective.dispatch_kind,
-                DispatchKind::HttpPool,
-                "{selected}"
-            );
-            assert!(url.starts_with("http://"), "{selected} dials {url}");
-        }
-        if selected == leg(2) {
-            assert!(
-                effective.resolved_tls.client_cert_path.is_some(),
-                "the longest wildcard suffix (MUTUAL) wins: {:?}",
-                effective.resolved_tls
-            );
-        }
-        if selected == leg(0) {
-            assert!(effective.resolved_tls.client_cert_path.is_none());
-        }
-        *counts.entry(selected).or_default() += 1;
+    ] {
+        let mut objects = vec![
+            split_virtual_service(
+                "split",
+                "reviews.default.svc.cluster.local",
+                &[
+                    ("reviews.default.svc.cluster.local", 8080, 50),
+                    ("api.one.wild.example", 443, 50),
+                ],
+            ),
+            pool_destination_rule("reviews-dr", "reviews.default.svc.cluster.local", 3, "1s"),
+        ];
+        objects.extend(extra);
+        let (_, prepared) = prepare(&objects, Vec::new());
+        assert!(carried_routes(&prepared).is_empty());
+        assert!(
+            prepared
+                .proxies
+                .iter()
+                .any(|proxy| proxy.upstream_id.as_deref() == Some(REVIEWS_UPSTREAM)),
+            "the host keeps its Service route"
+        );
     }
-    assert_eq!(counts[REVIEWS_UPSTREAM], 40);
-    assert_eq!(counts[&leg(0)], 20);
-    assert_eq!(counts[&leg(1)], 20);
-    assert_eq!(counts[&leg(2)], 20);
 }
 
-/// Issue #7387 review round 4 (sol F1): a direct external backend whose only
-/// DestinationRule is a TLS-originating wildcard is refused, like an exact
-/// one (round three); a non-matching wildcard keeps the route.
+/// Issue #7387 review round 5: a direct external backend (the route's own or
+/// a dispatch rule's) that a wildcard DestinationRule covers is refused,
+/// whatever the rule sets; a non-covering wildcard keeps the route.
 #[test]
-fn a_direct_external_backend_under_a_wildcard_tls_rule_is_refused() {
-    let route = k8s_object(
+fn a_direct_external_backend_a_wildcard_rule_covers_is_refused() {
+    let own_backend = k8s_object(
         "VirtualService",
         "direct",
         json!({
@@ -2425,20 +2389,60 @@ fn a_direct_external_backend_under_a_wildcard_tls_rule_is_refused() {
             }]
         }),
     );
-    for (rule_host, refused) in [
-        ("*.wild.example", true),
-        ("*", true),
-        ("*.other.example", false),
-    ] {
-        let objects = vec![
-            route.clone(),
-            traffic_policy_rule("wildcard", rule_host, json!({"tls": {"mode": "SIMPLE"}})),
-        ];
-        let (_, prepared) = prepare(&objects, Vec::new());
-        assert_eq!(
-            carried_routes_reach_host(&prepared, "api.one.wild.example"),
-            !refused,
-            "{rule_host}"
-        );
+    let rule_backend = k8s_object(
+        "VirtualService",
+        "guarded",
+        json!({
+            "hosts": ["reviews.default.svc.cluster.local"],
+            "http": [
+                {
+                    "match": [{"headers": {"x-external": {"exact": "1"}}}],
+                    "route": [{"destination": {"host": "api.one.wild.example", "port": {"number": 443}}}]
+                },
+                {
+                    "route": [{"destination": {"host": "reviews.default.svc.cluster.local", "port": {"number": 8080}}}]
+                }
+            ]
+        }),
+    );
+    for (shape, route) in [("own backend", own_backend), ("rule backend", rule_backend)] {
+        for (rule, refused) in [
+            (
+                traffic_policy_rule(
+                    "wildcard",
+                    "*.wild.example",
+                    json!({"tls": {"mode": "SIMPLE"}}),
+                ),
+                true,
+            ),
+            (
+                tcp_destination_rule(
+                    "wildcard",
+                    "*.wild.example",
+                    json!({"connectTimeout": "3s"}),
+                ),
+                true,
+            ),
+            (
+                traffic_policy_rule("wildcard", "*", json!({"tls": {"mode": "SIMPLE"}})),
+                true,
+            ),
+            (
+                traffic_policy_rule(
+                    "wildcard",
+                    "*.other.example",
+                    json!({"tls": {"mode": "SIMPLE"}}),
+                ),
+                false,
+            ),
+        ] {
+            let host = rule.spec["host"].clone();
+            let (_, prepared) = prepare(&[route.clone(), rule], Vec::new());
+            assert_eq!(
+                carried_routes_reach_host(&prepared, "api.one.wild.example"),
+                !refused,
+                "{shape}: {host}"
+            );
+        }
     }
 }

@@ -9369,8 +9369,8 @@ fn normalize_mesh_fields_internal(
         normalize_mesh_export_to(&mut dr.export_to);
     }
     // Same treatment as DestinationRule hosts: synthesis matches
-    // `policy.host` against service FQDNs via `destination_rule_host_specificity`
-    // (exact matches only), so an un-normalized native/file host
+    // `policy.host` against service FQDNs via `destination_rule_host_matches`
+    // (no trimming/lowercasing there), so an un-normalized native/file host
     // like `" Svc.Default "` would silently attach no CORS plugin.
     for policy in virtual_service_cors_policies {
         policy.host = normalize_mesh_hostname_like(&policy.host);

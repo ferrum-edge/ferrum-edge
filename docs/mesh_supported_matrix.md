@@ -109,7 +109,8 @@ enrolled rows and required live assertion IDs; fixture detail is in the
   external host is dispatched leg by leg, each leg through its own rule-bearing
   upstream and authorized on its own policy; an external leg whose rule
   originates TLS is dialed over TLS, and a direct external backend whose rule
-  originates TLS is refused (issue #7387). Sidecar and Ambient slices do not carry
+  originates TLS, or an external destination a wildcard DestinationRule covers
+  (wildcard rules are not applied on the data plane), is refused (issue #7387). Sidecar and Ambient slices do not carry
   `http[]` routes yet. See [mesh.md → Mesh data planes: NodeWaypoint route
   carriage](mesh.md#mesh-data-planes-nodewaypoint-route-carriage).
 
