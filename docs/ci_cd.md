@@ -2364,8 +2364,11 @@ unreviewed place to set a target linker, runner, or rustflags.
 The whole job is frozen, so neither moving the lane nor extending its target
 list can be an edit. `CI_FUZZ_SMOKE_JOB_GENERATIONS` therefore lists the job's
 admitted texts oldest first, and a generation retires once its successor is on
-`main`. No transition is open, so one generation remains:
+`main`. One transition is open (#7398):
 
+- `CI_FUZZ_SMOKE_PROPERTY_GATE_WITHOUT_SWAP_JOB` (retired end) — the property
+  gate as #7100 left it, without a swap extension. Delete it, with its tuple
+  entry, once its successor is on `main`.
 - `CI_FUZZ_SMOKE_JOB` — the deterministic property smoke alone
   (`cargo test --locked` in `fuzz/`), the required gate on `pull_request`,
   `merge_group`, the push to `main`, and `workflow_dispatch`, cached under the
@@ -2394,40 +2397,11 @@ and `Trusted Cross Build Policy` ("trusted cross-build policy files cannot be
 changed by a pull request"), so the policy half lands first through the owner's
 reviewed policy migration (admin merge), with `main`'s existing `ci.yml` still
 validating against it. The workflow half then passes `Trusted Cross Build
-Policy` as an ordinary pull request. Alternatively, as the Ambient host-UDP fix
-did (#7385), the workflow and the policy constant land together in one
-admin-merged commit; `main` then moves atomically to the new generation, the
-retired end would be spent on arrival, and the constant is replaced in place.
-
-###### Fuzz lane runner losses (2026-11)
-
-Both fuzz smoke lanes compile the whole `ferrum-edge` library as one rustc
-process, and on the 16 GB `ubuntu-26.04` runner that compile intermittently
-took the runner down with no job log ("The hosted runner lost communication
-with the server", or exit 143 with "The runner has received a shutdown
-signal"). Main pushes 2026-11-13..16:
-
-- `Fuzz Smoke` (property gate, required in `Tests`): 3 of 27 attempts died in
-  `Run deterministic property smoke tests` (exit 143 on `4560df06b` with a
-  warm `fuzz-property-smoke` cache, during the `ferrum-edge` compile; runner
-  lost on `f351f1c38` and `0bf12260d`). It already ran at two jobs and
-  line-tables-only debuginfo, but its only swap step left with the sanitizer
-  budget in the 2026-11-09 sweep (#7100), so it compiled against the image's
-  3 GB swap. It now provisions the same bounded 12 GiB `/mnt` swap file as the
-  eBPF, netns and coverage compiles. The swap step changes no `CARGO_*`
-  variable, so the `fuzz-property-smoke` cache key is unchanged.
-- `Fuzz sanitizer smoke` (`fuzz-smoke-main.yml`, not required): 8 of 30 runs
-  lost the runner inside `Run bounded libFuzzer smoke budget` at 58-60
-  minutes, even with its 12 GiB swap file. Its resource observer shows why: in
-  a passing run the AddressSanitizer release compile of `ferrum-edge` climbed
-  from about 3 GiB to 15 GiB resident plus 9 GiB of swap within five minutes of
-  `Compiling ferrum-edge`, left under 200 MiB available, and paged about 28 GiB
-  out over the compile. Capping that step at `CARGO_BUILD_JOBS=2` with
-  `CARGO_PROFILE_RELEASE_DEBUG=line-tables-only` was tried on a branch
-  (`workflow_dispatch` run 43900143614) and lost the runner the same way, so it
-  was not adopted. The lane stays as it is; it needs a smaller compile (for
-  example a fuzz-only slice of the crate) or a larger runner, not another swap
-  or job-cap tweak.
+Policy` as an ordinary pull request. The two halves may instead land together in
+one admin-merged pull request (#7398 did); the append-a-successor shape is the
+same either way, and the retired end is deleted by the next policy edit. Only a
+frozen job with no generation list, such as `AMBIENT_HOST_UDP_LIVE_JOB`
+(#7385), is changed by replacing its constant in place.
 
 What is invariant across every generation:
 
@@ -2494,6 +2468,36 @@ the retired step did (the planner sets every gate on a push to `main`).
 
 Delete a retired generation from `CI_FUZZ_SMOKE_JOB_GENERATIONS`, with any
 self-test row that names it, once its successor is on `main`.
+
+###### Fuzz lane runner losses (2026-11)
+
+Both fuzz smoke lanes compile the whole `ferrum-edge` library as one rustc
+process, and on the 16 GB `ubuntu-26.04` runner that compile intermittently
+took the runner down with no job log ("The hosted runner lost communication
+with the server", or exit 143 with "The runner has received a shutdown
+signal"). Main pushes 2026-11-13..16:
+
+- `Fuzz Smoke` (property gate, required in `Tests`): 3 of 27 attempts died in
+  `Run deterministic property smoke tests` (exit 143 on `4560df06b` with a
+  warm `fuzz-property-smoke` cache, during the `ferrum-edge` compile; runner
+  lost on `f351f1c38` and `0bf12260d`). It already ran at two jobs and
+  line-tables-only debuginfo, but its only swap step left with the sanitizer
+  budget in the 2026-11-09 sweep (#7100), so it compiled against the image's
+  3 GB swap. It now provisions the same bounded 12 GiB `/mnt` swap file as the
+  eBPF, netns and coverage compiles. The swap step changes no `CARGO_*`
+  variable, so the `fuzz-property-smoke` cache key is unchanged.
+- `Fuzz sanitizer smoke` (`fuzz-smoke-main.yml`, not required): 8 of 30 runs
+  lost the runner inside `Run bounded libFuzzer smoke budget` at 58-60
+  minutes, even with its 12 GiB swap file. Its resource observer shows why: in
+  a passing run the AddressSanitizer release compile of `ferrum-edge` climbed
+  from about 3 GiB to 15 GiB resident plus 9 GiB of swap within five minutes of
+  `Compiling ferrum-edge`, left under 200 MiB available, and paged about 28 GiB
+  out over the compile. Capping that step at `CARGO_BUILD_JOBS=2` with
+  `CARGO_PROFILE_RELEASE_DEBUG=line-tables-only` was tried on a branch
+  (`workflow_dispatch` run 43900143614) and lost the runner the same way, so it
+  was not adopted. The lane stays as it is; it needs a smaller compile (for
+  example a fuzz-only slice of the crate) or a larger runner, not another swap
+  or job-cap tweak.
 
 ##### Release image-family contract (`-ebpf-tools`)
 
