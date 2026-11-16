@@ -559,9 +559,11 @@ control plane (`invalid_slice_json`) and keeps its last-good slice until it is
 upgraded. On NodeWaypoint, mesh-bound VirtualService `http[]` routes in the
 waypoint's namespace now take effect: their in-mesh destinations dial over the
 NodeWaypoint transport, a route whose destination is an in-cluster Service the
-waypoint does not model (including a two-label `<svc>.<ns>` host) or whose
-weighted split names a DestinationRule-governed Service is refused (the host
-keeps its Service route), a malformed or empty `spec.gateways` no longer counts
+waypoint does not model (including a two-label `<svc>.<ns>` host), or whose
+direct external backend has a TLS-originating or wildcard DestinationRule, is
+refused (the host keeps its Service route), a weighted split that names a
+DestinationRule-governed Service or external host is dispatched leg by leg
+(#7387; see the section below), a malformed or empty `spec.gateways` no longer counts
 as `mesh`, and when a merged route's `mesh_route_dispatch` rules can select a
 destination other than the route's own, each destination's `AuthorizationPolicy`
 (CUSTOM delegations included) decides the requests that reach it (#7383): a
@@ -570,6 +572,46 @@ that policy's refusal, and a destination the route's candidate table does not
 name is refused. See
 [Per-destination authorization for dispatch branches](mesh.md#per-destination-authorization-for-dispatch-branches). Review VirtualServices bound to the mesh before upgrading
 NodeWaypoints.
+
+### Weighted splits across DestinationRule-governed Services (#7387)
+
+On a NodeWaypoint, a VirtualService weighted split that names a Service a
+DestinationRule governs is no longer refused. It is served leg by leg (see
+[Weighted splits across DestinationRule-governed Services](mesh.md#weighted-splits-across-destinationrule-governed-services)),
+unless it cannot be represented: a split with an unmodeled, unreachable or
+cross-namespace Service leg, more than 32 legs, more than 64 candidate
+destinations, more than 64 leg-dispatched splits on one route, a residual
+upstream id already in use, or an external leg a wildcard DestinationRule
+covers is still refused, and the host keeps its Service route.
+
+- **Policy per leg.** Each leg gets only its own Service's DestinationRule.
+- **Authorization per leg.** Each leg's own AuthorizationPolicy, CUSTOM checks
+  included, decides the requests that reach it. A DENY that names one leg's
+  workloads used to refuse the whole split route; it now refuses only that
+  leg's share of requests.
+- **Connect timeout.** A DestinationRule's top-level `connectTimeout` now
+  applies to the destination a `mesh_route_dispatch` rule or leg selects. A
+  route that can reach several destinations keeps its own connect timeout for
+  destinations whose rule sets none.
+- **`weighted_splits` key.** `mesh_route_dispatch` gains `weighted_splits`
+  (legs may set `originate_tls`); the data plane writes it, and a slice that
+  already carries it on a VirtualService route is refused.
+- **External hosts and TLS origination.** A split whose external host an exact
+  DestinationRule names is dispatched leg by leg as well, and an external leg
+  whose rule asks for TLS origination (`SIMPLE`, `MUTUAL`, `ISTIO_MUTUAL`,
+  per-port precedence) is now dialed over TLS; it used to be dialed in
+  plaintext. A route whose *direct* external backend has such a rule is refused
+  instead (no DestinationRule applies to a direct backend); move TLS
+  origination for that host to an EgressGateway.
+- **Wildcard DestinationRules.** Wildcard DestinationRule hosts are still not
+  applied on the data plane (#7395). A NodeWaypoint VirtualService route whose
+  external split leg or direct backend a wildcard rule covers is now refused,
+  and the host keeps its Service route. An exact DestinationRule alongside the
+  wildcard does not lift the refusal: narrow or remove the wildcard rule so it
+  no longer covers the host, or route such hosts through an EgressGateway.
+
+Review AuthorizationPolicies on Services that weighted splits name before
+upgrading NodeWaypoints.
 
 Per-release sections below are written when a release is cut. Changes already
 on `main` but not yet released, including breaking ones, are listed under
