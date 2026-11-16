@@ -95,6 +95,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   already protected by the vendored patch.
 
 ### Added
+- **`mesh_route_dispatch` `weighted_splits`** (#7387). A new config table
+  `[{upstream_id, legs: [{upstream_id, weight, originate_tls}]}]` resolves a
+  weighted split leg by leg. Once the whole dispatch group's destination is
+  final, the dispatch finalizer picks one leg by exact, interleaved weight and
+  publishes it as the route override; an instance whose `trigger` skipped the
+  request resolves none of its splits. A leg with `originate_tls: true` is
+  dialed over `https` with its upstream's backend TLS. Limits: at most 64
+  splits, 1–32 distinct legs per split, weight ≥ 1. Split ids and legs must
+  name upstreams in the plugin's namespace (refused at admin write and config
+  load), and a referenced upstream cannot be deleted or removed by an API-spec
+  replacement.
 - **`jwks_auth` and `oidc_relying_party` read admin-managed JWKS records**
   (issue #7277). `providers[].jwks_source: "managed://jwks/<id>#jwks"` names a
   JWKS document stored through `/admin/tls/jwks`. In `jwks_auth` it is a
@@ -364,6 +375,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `test-support` feature.
 
 ### Changed
+- **BREAKING — NodeWaypoint dispatches a VirtualService weighted split across
+  DestinationRule-governed Services leg by leg** (issue #7387). Such a split was
+  refused and the host fell back to its Service route; it is now served.
+  - Each in-mesh leg is the Service port's own upstream, so it gets exactly its
+    own Service's DestinationRule (connection pool, connect timeout, load
+    balancer, outlier detection, TLS); each external host becomes a residual
+    upstream holding only that host. Configured ratios hold exactly.
+  - Each leg is a candidate destination of the per-destination authorization
+    from #7383; the split itself never is. The selected leg's own
+    AuthorizationPolicy, CUSTOM check included, decides the requests that
+    reach it. A split never resolved to a leg is refused
+    (`route_branch_unauthorized`).
+  - Still refused (the host keeps its Service route): an unmodeled,
+    unreachable or cross-namespace Service leg; more than 32 legs, 64
+    candidate destinations or 64 leg-dispatched splits on one route; a
+    residual id already in use. A carried route that already carries
+    `weighted_splits` refuses the slice.
+  - A split whose external host an exact DestinationRule names is dispatched
+    leg by leg too, so that rule applies to the host's leg alone.
+  - Splits no DestinationRule names keep the workload rebinding. Sidecar and
+    Ambient are unchanged.
+- **BREAKING — a NodeWaypoint carried route whose external destination a
+  wildcard DestinationRule covers is refused** (issue #7387). The data plane
+  does not apply wildcard DestinationRule hosts (`*`, `*.example.com`; see
+  #7395), so such a rule, TLS origination included, was bypassed and the host
+  dialed in plaintext. A carried route whose external split leg or direct
+  backend (its own or a `mesh_route_dispatch` rule's) a visible wildcard rule
+  covers is now refused, and the host keeps its Service route
+  (`wildcard_destination_rule_refused` in the refusal warning).
+- **BREAKING — a NodeWaypoint carried route whose direct external backend has a
+  TLS-originating DestinationRule is refused** (issue #7387). Carried routes dial
+  plain HTTP and no DestinationRule applies to a direct backend, so such a
+  route used to send plaintext. It is now refused when the rule's effective
+  `tls.mode` on that port (per-port, else top-level) is `SIMPLE`, `MUTUAL` or
+  `ISTIO_MUTUAL`; the host keeps its Service route.
 - **NodeWaypoint authorizes each `mesh_route_dispatch` branch of a VirtualService
   route against its own destination** (#7383). When the translator merges a
   header-matched route into a fallback route, the carried route's dispatch rules
@@ -815,6 +861,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   different builds refuse each other at `Subscribe`.
 
 ### Fixed
+- **Security: a NodeWaypoint VirtualService split leg to an external host now
+  originates the TLS its DestinationRule requires** (#7387, #7371). The rule's
+  TLS settings were applied to the leg's upstream (before #7387, to the whole
+  split), but the carried route dialed it over plain HTTP. An external leg
+  whose exact DestinationRule's effective `tls.mode` on its port is `SIMPLE`,
+  `MUTUAL` or `ISTIO_MUTUAL` is now dialed over `https` with that rule's SNI,
+  CA and client certificate; `DISABLE` (including a per-port `DISABLE` under a
+  top-level mode) or no `tls` keeps it plaintext. Service legs keep the mesh
+  transport.
+- **A DestinationRule's top-level `connectTimeout` now follows the destination a
+  route override selects** (#7387). A `mesh_route_dispatch` rule destination or
+  weighted-split leg used to keep the route's own destination's timeout; the
+  last matching rule's timeout now lands on every upstream a route override
+  can reach (ports without a `portLevelSettings` timeout), for dispatch
+  instances of any scope. Proxyless TCP/UDP relay upstreams take the last
+  matching rule's top-level timeout too, instead of the first.
 - **The hosted protocol benchmark flags the samples a host disturbance
   touched.** A shared runner takes CPU for its own housekeeping and sometimes
   does less work per CPU-second, and either moves a sample without the gateway
