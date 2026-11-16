@@ -340,8 +340,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (#7291).
 - `Dockerfile.test`, which could not build and no workflow used (#7296).
 - The dead `tests/performance/run_perf_test.sh` HTTP smoke harness, its
-  committed result files and `multi_protocol/run_all_protocol_tests.sh`
-  (#7300).
+  committed result files, `perf_config.yaml` and
+  `multi_protocol/run_all_protocol_tests.sh` (#7300). The overhead gate's
+  gateway config was restored at
+  `tests/fixtures/performance_regression_gateway.yaml` (#7397).
 - Comparison report: the native-Kong label and advice, and the
   `kong_native`/`envoy_native` metadata (#7306).
 - The unused `tracing-appender` dependency, with its `symlink` dependency,
