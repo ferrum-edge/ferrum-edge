@@ -126,7 +126,7 @@ fn mint_token_with_ttl(exp_shape: ExpShape, ttl_secs: i64) -> String {
     encode(
         &Header::new(jsonwebtoken::Algorithm::HS256),
         &claims,
-        &EncodingKey::from_secret(JWT_SECRET.as_bytes()),
+        &EncodingKey::from_secret(JWT_SECRET.as_bytes()).unwrap(),
     )
     .expect("encode short-lived consumer JWT")
 }

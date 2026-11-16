@@ -1050,7 +1050,7 @@ fn mint_jwt(secret: &str, issuer: &str) -> String {
         "jti": Uuid::new_v4().to_string(),
     });
     let header = Header::new(jsonwebtoken::Algorithm::HS256);
-    let key = EncodingKey::from_secret(secret.as_bytes());
+    let key = EncodingKey::from_secret(secret.as_bytes()).unwrap();
     encode(&header, &claims, &key).expect("encode admin JWT")
 }
 

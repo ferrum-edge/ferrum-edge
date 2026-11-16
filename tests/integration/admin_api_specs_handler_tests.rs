@@ -69,7 +69,7 @@ fn make_token() -> String {
         "exp": (now + chrono::Duration::seconds(3600i64)).timestamp(),
         "jti": uuid::Uuid::new_v4().to_string(),
     });
-    let key = EncodingKey::from_secret(JWT_SECRET.as_bytes());
+    let key = EncodingKey::from_secret(JWT_SECRET.as_bytes()).unwrap();
     encode(&Header::new(jsonwebtoken::Algorithm::HS256), &claims, &key).unwrap()
 }
 

@@ -69,7 +69,7 @@ fn sign(claims: &Value, secret: &str, algorithm: Algorithm) -> String {
     encode(
         &Header::new(algorithm),
         claims,
-        &EncodingKey::from_secret(secret.as_bytes()),
+        &EncodingKey::from_secret(secret.as_bytes()).unwrap(),
     )
     .unwrap()
 }

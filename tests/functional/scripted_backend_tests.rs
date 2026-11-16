@@ -2792,7 +2792,7 @@ fn diagnostic_token(extra: serde_json::Value) -> String {
         }
     }
     let header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::HS256);
-    let key = jsonwebtoken::EncodingKey::from_secret(DIAGNOSTIC_JWT_SECRET.as_bytes());
+    let key = jsonwebtoken::EncodingKey::from_secret(DIAGNOSTIC_JWT_SECRET.as_bytes()).unwrap();
     jsonwebtoken::encode(&header, &claims, &key).expect("encode diagnostics JWT")
 }
 

@@ -1524,7 +1524,8 @@ impl CpDpVerifier {
                 if secret.is_empty() {
                     return Err(TenantAuthRejectReason::TokenValidation);
                 }
-                let key = DecodingKey::from_secret(secret.as_bytes());
+                let key = DecodingKey::from_secret(secret.as_bytes())
+                    .map_err(|_| TenantAuthRejectReason::TokenValidation)?;
                 let identity = credential_identity(None, Algorithm::HS256, secret.as_bytes());
                 Ok(f(&key, Algorithm::HS256, None, &identity))
             }
@@ -2152,8 +2153,16 @@ impl TrustBundleKeyDocument {
             if fleet_secret.is_some_and(|fleet| !fleet.is_empty() && fleet == secret.as_str()) {
                 return Err(fleet_secret_reuse_error(origin, &kid));
             }
+            // Unreachable for an empty secret (the length floor above), but
+            // jsonwebtoken 12 makes the constructor fallible.
+            let decoding_key = DecodingKey::from_secret(secret.as_bytes()).map_err(|_| {
+                format!(
+                    "CP/DP trust bundle {origin:?}: key {kid:?} symmetric secret is not a \
+                     usable HMAC key"
+                )
+            })?;
             (
-                DecodingKey::from_secret(secret.as_bytes()),
+                decoding_key,
                 credential_identity(Some(&kid), algorithm, secret.as_bytes()),
             )
         } else {

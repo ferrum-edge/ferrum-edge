@@ -1108,7 +1108,7 @@ mod tests {
         validation.set_audience(&[MESH_LOCAL_SUBSCRIBE_AUDIENCE]);
         let decoded = jsonwebtoken::decode::<serde_json::Value>(
             &token,
-            &jsonwebtoken::DecodingKey::from_secret(b"test-secret"),
+            &jsonwebtoken::DecodingKey::from_secret(b"test-secret").expect("non-empty HMAC key"),
             &validation,
         )
         .expect("token should decode");

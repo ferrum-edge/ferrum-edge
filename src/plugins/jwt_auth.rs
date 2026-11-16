@@ -192,8 +192,11 @@ impl JwtAuth {
     /// what a known identity with a single wrong key does. The result is
     /// discarded either way.
     fn equalize_verification_work(&self, token: &str) {
-        let key = DecodingKey::from_secret(&self.timing_equalization_secret[..]);
-        let _ = decode::<Value>(token, &key, &self.validation);
+        // The equalization secret is random and non-empty, so the key always
+        // builds; a failure would only skip the decoy work.
+        if let Ok(key) = DecodingKey::from_secret(&self.timing_equalization_secret[..]) {
+            let _ = decode::<Value>(token, &key, &self.validation);
+        }
     }
 
     /// Whether `before_proxy` should remove the value it found under the
@@ -355,7 +358,11 @@ impl AuthMechanism for JwtAuth {
                 .filter(|secret| jwt_secret_meets_minimum_strength(secret))
             {
                 verification_attempted = true;
-                let key = DecodingKey::from_secret(secret.as_bytes());
+                // The strength floor above rules out an empty secret, the only
+                // input jsonwebtoken 12 refuses as an HMAC key.
+                let Ok(key) = DecodingKey::from_secret(secret.as_bytes()) else {
+                    continue;
+                };
                 if let Ok(token_data) = decode::<serde_json::Value>(&token, &key, &self.validation)
                 {
                     // `jsonwebtoken` matches a multi-valued `iss` by set

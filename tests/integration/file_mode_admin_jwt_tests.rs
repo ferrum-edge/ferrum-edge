@@ -118,7 +118,7 @@ fn mint_external_admin_token(secret: &str, issuer: &str) -> String {
     encode(
         &Header::new(jsonwebtoken::Algorithm::HS256),
         &claims,
-        &EncodingKey::from_secret(secret.as_bytes()),
+        &EncodingKey::from_secret(secret.as_bytes()).unwrap(),
     )
     .expect("encode external admin JWT")
 }

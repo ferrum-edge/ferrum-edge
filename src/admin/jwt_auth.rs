@@ -538,7 +538,9 @@ impl JwtManager {
         secret: &str,
         algorithm: Algorithm,
     ) -> Result<TokenData<AdminClaims>, JwtEncodeError> {
-        let key = DecodingKey::from_secret(secret.as_bytes());
+        // jsonwebtoken 12 refuses an empty HMAC key; that error rejects the
+        // token like any other verification failure.
+        let key = DecodingKey::from_secret(secret.as_bytes())?;
 
         // Configure validation with required claims. `Validation::new` makes
         // `algorithm` the only accepted `alg`, so the header cannot select a

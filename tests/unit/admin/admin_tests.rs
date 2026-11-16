@@ -654,7 +654,7 @@ fn generate_test_token_with_role(config: &TestConfig, subject: &str, role: &str)
     });
 
     let header = Header::new(jsonwebtoken::Algorithm::HS256);
-    let key = EncodingKey::from_secret(config.jwt_secret.as_bytes());
+    let key = EncodingKey::from_secret(config.jwt_secret.as_bytes()).unwrap();
 
     encode(&header, &claims, &key).unwrap()
 }
@@ -719,7 +719,7 @@ fn generate_invalid_token(config: &TestConfig, subject: &str) -> String {
     });
 
     let header = Header::new(jsonwebtoken::Algorithm::HS256);
-    let key = EncodingKey::from_secret("wrong-secret".as_bytes());
+    let key = EncodingKey::from_secret("wrong-secret".as_bytes()).unwrap();
 
     encode(&header, &claims, &key).unwrap()
 }

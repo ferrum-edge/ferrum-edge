@@ -67,7 +67,7 @@ fn mint_token_with_ns_and_audience(
     encode(
         &Header::new(Algorithm::HS256),
         &claims,
-        &EncodingKey::from_secret(TEST_JWT_SECRET.as_bytes()),
+        &EncodingKey::from_secret(TEST_JWT_SECRET.as_bytes()).unwrap(),
     )
     .expect("test JWT must encode")
 }

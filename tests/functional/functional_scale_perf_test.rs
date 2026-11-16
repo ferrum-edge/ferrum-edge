@@ -358,7 +358,7 @@ impl ScalePerfHarness {
             "jti": Uuid::new_v4().to_string()
         });
         let header = Header::new(jsonwebtoken::Algorithm::HS256);
-        let key = EncodingKey::from_secret(self.jwt_secret.as_bytes());
+        let key = EncodingKey::from_secret(self.jwt_secret.as_bytes()).unwrap();
         Ok(encode(&header, &claims, &key)?)
     }
 }

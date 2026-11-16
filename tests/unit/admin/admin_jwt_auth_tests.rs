@@ -19,7 +19,7 @@ fn test_jwt_config() -> JwtConfig {
 
 fn encode_json_claims(claims: serde_json::Value, secret: &str, algorithm: Algorithm) -> String {
     let header = Header::new(algorithm);
-    let key = EncodingKey::from_secret(secret.as_bytes());
+    let key = EncodingKey::from_secret(secret.as_bytes()).unwrap();
     encode(&header, &claims, &key).unwrap()
 }
 
@@ -40,7 +40,7 @@ fn test_jwt_verification() {
     };
 
     let header = Header::new(Algorithm::HS256);
-    let key = EncodingKey::from_secret("test-secret".as_bytes());
+    let key = EncodingKey::from_secret("test-secret".as_bytes()).unwrap();
     let token = encode(&header, &claims, &key).unwrap();
 
     // Verify token
@@ -381,7 +381,7 @@ fn test_jwt_invalid_issuer() {
     };
 
     let header = Header::new(Algorithm::HS256);
-    let key = EncodingKey::from_secret("test-secret".as_bytes());
+    let key = EncodingKey::from_secret("test-secret".as_bytes()).unwrap();
     let token = encode(&header, &claims, &key).unwrap();
 
     // Try to verify with issuer-2 (should fail)
@@ -414,7 +414,7 @@ fn test_jwt_expired_token() {
     };
 
     let header = Header::new(Algorithm::HS256);
-    let key = EncodingKey::from_secret("test-secret".as_bytes());
+    let key = EncodingKey::from_secret("test-secret".as_bytes()).unwrap();
     let token = encode(&header, &claims, &key).unwrap();
 
     // Should fail verification
@@ -448,7 +448,7 @@ fn test_jwt_negative_ttl_rejected() {
     };
 
     let header = Header::new(Algorithm::HS256);
-    let key = EncodingKey::from_secret("test-secret".as_bytes());
+    let key = EncodingKey::from_secret("test-secret".as_bytes()).unwrap();
     let token = encode(&header, &claims, &key).unwrap();
 
     let result = manager.verify_token(&token);
@@ -484,7 +484,7 @@ fn test_jwt_zero_ttl_rejected() {
     };
 
     let header = Header::new(Algorithm::HS256);
-    let key = EncodingKey::from_secret("test-secret".as_bytes());
+    let key = EncodingKey::from_secret("test-secret".as_bytes()).unwrap();
     let token = encode(&header, &claims, &key).unwrap();
 
     let result = manager.verify_token(&token);
@@ -518,7 +518,7 @@ fn test_jwt_valid_ttl_within_max() {
     };
 
     let header = Header::new(Algorithm::HS256);
-    let key = EncodingKey::from_secret("test-secret".as_bytes());
+    let key = EncodingKey::from_secret("test-secret".as_bytes()).unwrap();
     let token = encode(&header, &claims, &key).unwrap();
 
     let result = manager.verify_token(&token);
@@ -552,7 +552,7 @@ fn test_jwt_ttl_exceeds_max_rejected() {
     };
 
     let header = Header::new(Algorithm::HS256);
-    let key = EncodingKey::from_secret("test-secret".as_bytes());
+    let key = EncodingKey::from_secret("test-secret".as_bytes()).unwrap();
     let token = encode(&header, &claims, &key).unwrap();
 
     let result = manager.verify_token(&token);
@@ -590,7 +590,7 @@ fn test_jwt_future_iat_within_cap_rejected() {
     };
 
     let header = Header::new(Algorithm::HS256);
-    let key = EncodingKey::from_secret("test-secret".as_bytes());
+    let key = EncodingKey::from_secret("test-secret".as_bytes()).unwrap();
     let token = encode(&header, &claims, &key).unwrap();
 
     let result = manager.verify_token(&token);
@@ -626,7 +626,7 @@ fn test_jwt_future_iat_beyond_clock_skew_rejected() {
     };
 
     let header = Header::new(Algorithm::HS256);
-    let key = EncodingKey::from_secret("test-secret".as_bytes());
+    let key = EncodingKey::from_secret("test-secret".as_bytes()).unwrap();
     let token = encode(&header, &claims, &key).unwrap();
 
     let result = manager.verify_token(&token);
@@ -662,7 +662,7 @@ fn test_jwt_iat_within_clock_skew_accepted() {
     };
 
     let header = Header::new(Algorithm::HS256);
-    let key = EncodingKey::from_secret("test-secret".as_bytes());
+    let key = EncodingKey::from_secret("test-secret".as_bytes()).unwrap();
     let token = encode(&header, &claims, &key).unwrap();
 
     let result = manager.verify_token(&token);
@@ -699,7 +699,7 @@ fn test_jwt_zero_max_ttl_disables_cap() {
     };
 
     let header = Header::new(Algorithm::HS256);
-    let key = EncodingKey::from_secret("test-secret".as_bytes());
+    let key = EncodingKey::from_secret("test-secret".as_bytes()).unwrap();
     let token = encode(&header, &claims, &key).unwrap();
 
     let result = manager.verify_token(&token);
@@ -727,7 +727,7 @@ fn config_with_max_ttl(max_ttl_seconds: u64) -> JwtConfig {
 /// Sign claims with the shared test key/issuer used by `test_jwt_config()`.
 fn sign_claims(claims: &AdminClaims) -> String {
     let header = Header::new(Algorithm::HS256);
-    let key = EncodingKey::from_secret("test-secret".as_bytes());
+    let key = EncodingKey::from_secret("test-secret".as_bytes()).unwrap();
     encode(&header, claims, &key).unwrap()
 }
 

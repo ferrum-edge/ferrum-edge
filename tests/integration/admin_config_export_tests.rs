@@ -69,7 +69,7 @@ fn token(secret: &str, algorithm: Algorithm, role: &str, ns: Option<Value>) -> S
     encode(
         &Header::new(algorithm),
         &claims,
-        &EncodingKey::from_secret(secret.as_bytes()),
+        &EncodingKey::from_secret(secret.as_bytes()).unwrap(),
     )
     .unwrap()
 }
@@ -546,7 +546,7 @@ fn scoped_token(secret: &str) -> String {
     encode(
         &Header::new(Algorithm::HS256),
         &claims,
-        &EncodingKey::from_secret(secret.as_bytes()),
+        &EncodingKey::from_secret(secret.as_bytes()).unwrap(),
     )
     .unwrap()
 }

@@ -4151,7 +4151,7 @@ async fn test_websocket_active_jwt_session_closes_at_credential_expiry() {
             "exp": expires_at,
             "nbf": 0,
         }),
-        &jsonwebtoken::EncodingKey::from_secret(WS_JWT_SECRET.as_bytes()),
+        &jsonwebtoken::EncodingKey::from_secret(WS_JWT_SECRET.as_bytes()).unwrap(),
     )
     .unwrap_or_else(|_| panic!("failed to sign short-lived functional-test JWT"));
 

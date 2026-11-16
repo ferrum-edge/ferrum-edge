@@ -563,7 +563,7 @@ impl LoadTestHarness {
             "jti": Uuid::new_v4().to_string()
         });
         let header = Header::new(jsonwebtoken::Algorithm::HS256);
-        let key = EncodingKey::from_secret(self.jwt_secret.as_bytes());
+        let key = EncodingKey::from_secret(self.jwt_secret.as_bytes()).unwrap();
         Ok(encode(&header, &claims, &key)?)
     }
 }
@@ -630,7 +630,7 @@ fn generate_consumer_jwt(username: &str, secret: &str) -> String {
         "exp": (now + chrono::Duration::seconds(3600)).timestamp(),
     });
     let header = Header::new(jsonwebtoken::Algorithm::HS256);
-    let key = EncodingKey::from_secret(secret.as_bytes());
+    let key = EncodingKey::from_secret(secret.as_bytes()).unwrap();
     encode(&header, &claims, &key).expect("Failed to encode consumer JWT")
 }
 
