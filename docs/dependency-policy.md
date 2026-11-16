@@ -1052,7 +1052,15 @@ Build Policy`'s pin rotation check. The rules:
   executes PR content, and holds only the built-in `GITHUB_TOKEN`. No stored
   credential exists. Both the queuing and the withdrawing job request
   `contents: write` and `pull-requests: write` at job level, because GitHub
-  requires both to enable or to disable auto-merge;
+  requires both to enable or to disable auto-merge. Those two jobs run only
+  the runner's `gh`. The third-party `dependabot/fetch-metadata` action runs
+  in a separate `metadata` job with `pull-requests: read` only and hands the
+  update type to the queuing job as a job output, so a compromised release
+  of it never holds a write token;
+- this is one of the repository's two `pull_request_target` workflows (the
+  other is `cross-build-policy.yml`). GitHub's default Actions event policy
+  blocks that event in public repositories from 2026-12-02, so the explicit
+  allow policy must name both files by path;
 - the repository setting **Allow auto-merge** must stay enabled.
 
 A merge that GitHub performs for a `GITHUB_TOKEN`-queued auto-merge does not
