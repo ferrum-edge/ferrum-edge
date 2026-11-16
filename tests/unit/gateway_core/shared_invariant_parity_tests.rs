@@ -5372,10 +5372,10 @@ fn final_request_body_hook_context_hand_back_has_one_implementation() {
 /// while referenced (store references, API-spec replacement), dangling
 /// (runtime and admin-write reference validation), untracked (adaptive
 /// concurrency route-override destinations), or uncounted against the
-/// per-route candidate bound (slice binding). RequestAuthentication destination
-/// scoping is the deliberate exception: it resolves the split upstream
-/// itself, which keeps every leg's workloads, so the route's set already
-/// covers each leg.
+/// per-route candidate bound (slice binding), or missing from the route's
+/// RequestAuthentication set (destination scoping). The split upstream itself
+/// keeps only its Service legs' workloads, so no enumerator may stand it in
+/// for an external leg.
 #[test]
 fn mesh_route_dispatch_destination_enumerators_cover_weighted_split_legs() {
     let mesh = source("src/modes/mesh/mod.rs");
@@ -5459,15 +5459,14 @@ fn mesh_route_dispatch_destination_enumerators_cover_weighted_split_legs() {
             "{file}: `{signature}` must enumerate weighted-split legs too"
         );
     }
-    let request_auth = item_body(
-        &mesh,
-        "fn scope_request_auth_to_node_waypoint_destinations(",
-        "\n}\n",
-    );
     assert!(
-        request_auth.contains("node_waypoint_authz_route_upstreams(config)"),
-        "RequestAuthentication scoping resolves a split upstream (every leg's workloads) \
-         through the post-binding route upstream index"
+        item_body(
+            &mesh,
+            "fn scope_request_auth_to_node_waypoint_destinations(",
+            "\n}\n",
+        )
+        .contains("\"weighted_splits\""),
+        "RequestAuthentication scoping must expand a weighted split into its legs"
     );
 }
 

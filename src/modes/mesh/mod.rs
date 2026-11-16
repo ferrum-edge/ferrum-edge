@@ -4537,10 +4537,10 @@ fn service_has_destination_rule(
 ///   carries the DestinationRule) or, for an external host, a residual
 ///   upstream holding only that host, and the dispatch finalizer picks a leg by weight
 ///   once routing is final, so each leg gets exactly its own Service's policy.
-///   The split upstream keeps its workload targets only as the route's own
-///   destination identity (destination policy indexes and RequestAuthentication
-///   scoping read every leg's workloads through it); no request is dispatched
-///   through it.
+///   The split upstream keeps only its Service legs' workload targets, as the
+///   route's own destination identity; no request is dispatched through it,
+///   and RequestAuthentication scoping and authorization expand it into its
+///   legs.
 ///
 /// A route with a destination that is an in-cluster Service the slice does not
 /// model, or a modeled Service port with no materialized upstream, is dropped
@@ -4601,6 +4601,9 @@ fn bind_carried_http_routes_to_node_waypoint_transport(
         // weight, and the external targets.
         let mut service_legs: WeightedSplitLegs = Vec::new();
         let mut external_targets: Vec<UpstreamTarget> = Vec::new();
+        // The Service legs' rebound targets alone: what a leg-dispatched
+        // split upstream keeps (see below).
+        let mut service_targets: Vec<(u32, Vec<UpstreamTarget>)> = Vec::new();
         let mut rebound = true;
         let mut governed_by_destination_rule = false;
         let mut cross_namespace_leg = false;
@@ -4669,6 +4672,7 @@ fn bind_carried_http_routes_to_node_waypoint_transport(
                         Some(leg) => leg.1 = leg.1.saturating_add(target.weight),
                         None => service_legs.push((service_upstream_id, target.weight)),
                     }
+                    service_targets.push((target.weight, leg_targets.clone()));
                     legs.push((target.weight, leg_targets));
                 }
             }
@@ -4687,6 +4691,15 @@ fn bind_carried_http_routes_to_node_waypoint_transport(
                 Some((split_legs, residuals)) => {
                     residual_upstreams.extend(residuals);
                     leg_dispatched.insert((namespace.clone(), id.clone()), split_legs);
+                    // A leg-dispatched split is never dialed: it is only the
+                    // route's own destination identity. It keeps the Service
+                    // legs' workload targets (for the destination indexes) and
+                    // drops its external hosts, which each residual upstream
+                    // carries alone. Left in place, they would make
+                    // DestinationRule application see one upstream spanning
+                    // hosts with different winning rules and refuse the whole
+                    // slice.
+                    legs = service_targets;
                 }
                 None => {
                     unrepresentable_splits += 1;
@@ -9614,33 +9627,53 @@ impl RouteOverrideConnectTimeouts {
             if !plugin.enabled || plugin.plugin_name != "mesh_route_dispatch" {
                 continue;
             }
-            for id in slice::mesh_route_dispatch_rule_upstream_ids(&plugin.config) {
+            let named = slice::mesh_route_dispatch_rule_upstream_ids(&plugin.config);
+            for id in &named {
                 upstreams
                     .entry(plugin.namespace.clone())
                     .or_default()
-                    .insert(id.to_string());
+                    .insert((*id).to_string());
             }
-            if plugin.scope != PluginScope::Proxy {
-                continue;
-            }
-            let Some(proxy) = plugin.proxy_id.as_deref().and_then(|proxy_id| {
-                config
+            // Every route the instance effectively runs on, resolved as the
+            // plugin cache resolves it: a proxy-scoped instance names its
+            // proxy; a global or proxy-group instance reaches every proxy it
+            // attaches to and that no same-type scoped instance replaces.
+            let effective: Vec<&Proxy> = match plugin.scope {
+                PluginScope::Proxy => plugin
+                    .proxy_id
+                    .as_deref()
+                    .and_then(|proxy_id| {
+                        config.proxies.iter().find(|proxy| {
+                            proxy.namespace == plugin.namespace && proxy.id == proxy_id
+                        })
+                    })
+                    .into_iter()
+                    .collect(),
+                PluginScope::Global | PluginScope::ProxyGroup => config
                     .proxies
                     .iter()
-                    .find(|proxy| proxy.namespace == plugin.namespace && proxy.id == proxy_id)
-            }) else {
-                continue;
+                    .filter(|proxy| {
+                        crate::plugin_cache::plugin_config_effectively_applies_to_proxy(
+                            plugin, proxy, config,
+                        )
+                    })
+                    .collect(),
             };
-            if let Some(upstream_id) = proxy.upstream_id.as_deref() {
-                upstreams
+            for proxy in effective {
+                // An override resolves in the reached route's namespace.
+                let reachable = upstreams.entry(proxy.namespace.clone()).or_default();
+                reachable.extend(named.iter().map(|id| (*id).to_string()));
+                if let Some(upstream_id) = proxy.upstream_id.as_deref() {
+                    upstreams
+                        .entry(proxy.namespace.clone())
+                        .or_default()
+                        .insert(upstream_id.to_string());
+                }
+                proxies
                     .entry(proxy.namespace.clone())
                     .or_default()
-                    .insert(upstream_id.to_string());
+                    .insert(proxy.id.clone());
             }
-            proxies
-                .entry(proxy.namespace.clone())
-                .or_default()
-                .insert(proxy.id.clone());
         }
         for proxy in &config.proxies {
             if proxy.upstream_subset.is_some() {
@@ -16066,7 +16099,7 @@ fn scope_request_auth_to_node_waypoint_destinations(
             proxy.backend_host.as_str(),
             proxy.backend_port,
         )];
-        let dispatch_configs = proxy
+        let dispatch_configs: Vec<&serde_json::Value> = proxy
             .plugins
             .iter()
             .filter_map(|association| {
@@ -16077,8 +16110,9 @@ fn scope_request_auth_to_node_waypoint_destinations(
                     ))
                     .copied()
             })
-            .chain(global_route_dispatch.iter().copied());
-        for dispatch in dispatch_configs {
+            .chain(global_route_dispatch.iter().copied())
+            .collect();
+        for dispatch in dispatch_configs.iter().copied() {
             for rule in dispatch
                 .get("rules")
                 .and_then(serde_json::Value::as_array)
@@ -16114,6 +16148,52 @@ fn scope_request_auth_to_node_waypoint_destinations(
                 }
             }
         }
+
+        // A weighted split dispatched leg by leg (issue #7387) is reached only
+        // through its legs: each Service leg's workloads and each residual
+        // external leg (which stands for the waypoint's own set, like any
+        // external destination) must carry the route's one set.
+        let weighted_splits: Vec<&serde_json::Value> = dispatch_configs
+            .iter()
+            .copied()
+            .flat_map(|dispatch| {
+                dispatch
+                    .get("weighted_splits")
+                    .and_then(serde_json::Value::as_array)
+                    .into_iter()
+                    .flatten()
+            })
+            .collect();
+        let destinations: Vec<(Option<&str>, &str, u16)> = destinations
+            .into_iter()
+            .flat_map(|(upstream_id, backend_host, backend_port)| {
+                let legs: Vec<&str> = upstream_id
+                    .and_then(|id| {
+                        weighted_splits.iter().find(|split| {
+                            split.get("upstream_id").and_then(serde_json::Value::as_str) == Some(id)
+                        })
+                    })
+                    .map(|split| {
+                        split
+                            .get("legs")
+                            .and_then(serde_json::Value::as_array)
+                            .into_iter()
+                            .flatten()
+                            .filter_map(|leg| {
+                                leg.get("upstream_id").and_then(serde_json::Value::as_str)
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                if legs.is_empty() {
+                    vec![(upstream_id, backend_host, backend_port)]
+                } else {
+                    legs.into_iter()
+                        .map(|leg| (Some(leg), backend_host, backend_port))
+                        .collect()
+                }
+            })
+            .collect();
 
         // Every workload the route can reach must carry the SAME set: the
         // backend is chosen after authentication, so a union would let one

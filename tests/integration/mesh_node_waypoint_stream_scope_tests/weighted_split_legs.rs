@@ -1368,3 +1368,229 @@ async fn a_leg_without_its_own_timeout_does_not_inherit_another_services_rule() 
     }
     assert_eq!(seen.len(), 2, "both legs were reached: {seen:?}");
 }
+
+/// Issue #7387 review round 2 (sol F1): a leg-dispatched split keeps only its
+/// Service legs' workloads, so two external legs whose hosts have different
+/// DestinationRules no longer make DestinationRule application refuse the
+/// whole slice; each residual external leg carries its own host's rule.
+#[test]
+fn external_legs_with_different_destination_rules_each_keep_their_own() {
+    let objects = vec![
+        split_virtual_service(
+            "split",
+            "reviews.default.svc.cluster.local",
+            &[
+                ("reviews.default.svc.cluster.local", 8080, 34),
+                ("api.one.example", 443, 33),
+                ("api.two.example", 443, 33),
+            ],
+        ),
+        pool_destination_rule("reviews-dr", "reviews.default.svc.cluster.local", 3, "1s"),
+        tcp_destination_rule(
+            "api-one-dr",
+            "api.one.example",
+            json!({"connectTimeout": "1s"}),
+        ),
+        tcp_destination_rule(
+            "api-two-dr",
+            "api.two.example",
+            json!({"connectTimeout": "2s"}),
+        ),
+    ];
+    let slice = slice_for(&translated_config(&objects, Vec::new()));
+    assert_eq!(
+        slice.destination_rules.len(),
+        3,
+        "every rule reaches the waypoint"
+    );
+    let prepared = prepare_gateway_config_from_mesh_slice(&slice, &node_waypoint_runtime())
+        .expect("distinct external rules no longer refuse the slice");
+    let route = carried_split_route(&prepared);
+    let split_id = route.upstream_id.clone().expect("split id");
+    let split = prepared
+        .upstreams
+        .iter()
+        .find(|upstream| upstream.id == split_id)
+        .expect("the split stays the route's own destination");
+    assert!(
+        split
+            .targets
+            .iter()
+            .all(|target| !target.host.contains("example")),
+        "the never-dialed split keeps no external host: {:?}",
+        split
+            .targets
+            .iter()
+            .map(|target| &target.host)
+            .collect::<Vec<_>>()
+    );
+    for (index, host, timeout) in [(0, "api.one.example", 1000), (1, "api.two.example", 2000)] {
+        let residual = prepared
+            .upstreams
+            .iter()
+            .find(|upstream| upstream.id == format!("{split_id}-external-{index}"))
+            .expect("residual external leg");
+        assert_eq!(residual.targets.len(), 1);
+        assert_eq!(residual.targets[0].host, host);
+        assert_eq!(
+            residual
+                .port_overrides
+                .get(&443)
+                .and_then(|slot| slot.connect_timeout_ms),
+            Some(timeout),
+            "{host} carries its own rule"
+        );
+    }
+}
+
+/// Issue #7387 review round 2 (sol F2): a dispatch instance its execution
+/// trigger skipped selects no weighted-split leg; the same instance selects
+/// one when its trigger matches. Built through the production plugin cache.
+#[tokio::test]
+async fn a_trigger_skipped_instance_selects_no_leg() {
+    let upstream = |id: &str| -> Upstream {
+        serde_json::from_value(json!({
+            "id": id,
+            "name": id,
+            "targets": [{"host": "127.0.0.1", "port": 8080, "weight": 1}],
+            "algorithm": "round_robin"
+        }))
+        .expect("upstream")
+    };
+    let mut config = GatewayConfig {
+        proxies: vec![
+            serde_json::from_value(json!({
+                "id": "p1",
+                "listen_path": "/",
+                "backend_scheme": "http",
+                "backend_host": "127.0.0.1",
+                "backend_port": 8080,
+                "upstream_id": "split",
+                "plugins": [{"plugin_config_id": "mrd"}]
+            }))
+            .expect("proxy"),
+        ],
+        upstreams: vec![upstream("split"), upstream("leg-a"), upstream("leg-b")],
+        plugin_configs: vec![
+            serde_json::from_value(json!({
+                "id": "mrd",
+                "plugin_name": "mesh_route_dispatch",
+                "scope": "proxy",
+                "proxy_id": "p1",
+                "enabled": true,
+                "config": {
+                    "weighted_splits": [{
+                        "upstream_id": "split",
+                        "legs": [
+                            {"upstream_id": "leg-a", "weight": 1},
+                            {"upstream_id": "leg-b", "weight": 1}
+                        ]
+                    }]
+                },
+                "trigger": {"when": {"match": {"path": {"prefix": ["/canary"]}}}}
+            }))
+            .expect("plugin config"),
+        ],
+        ..Default::default()
+    };
+    config.normalize_fields();
+    let cache = ferrum_edge::PluginCache::new(&config).expect("cache builds");
+    let proxy = config.proxies[0].clone();
+    let plugins = ferrum_edge::_test_support::plugins_for_protocol_for_test(
+        &cache,
+        &proxy.namespace,
+        &proxy.id,
+        ferrum_edge::plugins::ProxyProtocol::Http,
+    );
+
+    for path in ["/ordinary", "/canary/x"] {
+        let mut ctx =
+            RequestContext::new("127.0.0.1".to_string(), "GET".to_string(), path.to_string());
+        ctx.matched_proxy = Some(Arc::new(proxy.clone()));
+        let mut headers = HashMap::from([("host".to_string(), "example.test".to_string())]);
+        ctx.headers = headers.clone();
+        let result = run_before_proxy_hooks_for_test(&plugins, &mut ctx, &mut headers).await;
+        assert!(
+            matches!(result, PluginResult::Continue),
+            "{path}: {result:?}"
+        );
+        if path == "/ordinary" {
+            assert_eq!(
+                ctx.route_override_upstream_id, None,
+                "a skipped instance selects nothing"
+            );
+        } else {
+            assert!(
+                matches!(
+                    ctx.route_override_upstream_id.as_deref(),
+                    Some("leg-a" | "leg-b")
+                ),
+                "the instance that ran selects a leg: {:?}",
+                ctx.route_override_upstream_id
+            );
+        }
+    }
+}
+
+/// Issue #7387 review round 2 (dsf F2): a global `mesh_route_dispatch`
+/// instance makes a route reach other destinations just like a proxy-scoped
+/// one, so the route keeps its own connect timeout and its own destination's
+/// DestinationRule timeout rides that upstream instead.
+#[test]
+fn a_global_dispatch_instance_keeps_route_owned_connect_timeouts() {
+    let objects = vec![
+        k8s_object(
+            "VirtualService",
+            "direct",
+            json!({
+                "hosts": ["reviews.default.svc.cluster.local"],
+                "http": [{
+                    "route": [{"destination": {"host": "reviews.default.svc.cluster.local", "port": {"number": 8080}}}]
+                }]
+            }),
+        ),
+        tcp_destination_rule(
+            "reviews-dr",
+            "reviews.default.svc.cluster.local",
+            json!({"connectTimeout": "1s"}),
+        ),
+    ];
+    let mut config = translated_config(&objects, Vec::new());
+    config.plugin_configs.push(
+        serde_json::from_value(json!({
+            "id": "operator-dispatch",
+            "namespace": DEFAULT_NAMESPACE,
+            "plugin_name": "mesh_route_dispatch",
+            "scope": "global",
+            "enabled": true,
+            "config": {
+                "rules": [{
+                    "match": {"headers": {"x-ratings": {"exact": "1"}}},
+                    "destination": {"upstream_id": RATINGS_UPSTREAM}
+                }]
+            }
+        }))
+        .expect("global dispatch config"),
+    );
+    let prepared = ferrum_edge::modes::mesh::prepare_gateway_config_via_mesh_slice_with_fixtures(
+        config,
+        &node_waypoint_runtime(),
+    )
+    .expect("slice materializes");
+    let route = carried_routes(&prepared)
+        .into_iter()
+        .find(|route| route.upstream_id.as_deref() == Some(REVIEWS_UPSTREAM))
+        .expect("the direct route is served")
+        .clone();
+    assert_ne!(
+        route.backend_connect_timeout_ms, 1000,
+        "the route keeps its own timeout"
+    );
+    let reviews_slot = prepared
+        .upstreams
+        .iter()
+        .find(|upstream| upstream.id == REVIEWS_UPSTREAM)
+        .and_then(|upstream| upstream.port_overrides.get(&8080))
+        .and_then(|slot| slot.connect_timeout_ms);
+    assert_eq!(reviews_slot, Some(1000), "reviews' rule rides its upstream");
+}
