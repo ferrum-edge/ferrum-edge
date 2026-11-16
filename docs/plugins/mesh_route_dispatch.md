@@ -36,7 +36,7 @@ type column says so. Unknown keys are rejected at every level.
 | Parameter | Type | Default | Description |
 |---|---|---|---|
 | `upstream_id` | String | — | Required. The split destination this entry resolves (a rule's `destination.upstream_id`, or the route's own `upstream_id`); unique per instance |
-| `legs` | Object[] | — | Required, 1–32 entries: `upstream_id` (required, distinct, never itself a split) and `weight` (required, ≥ 1, the leg's share relative to the other legs) |
+| `legs` | Object[] | — | Required, 1–32 entries: `upstream_id` (required, distinct, never itself a split), `weight` (required, ≥ 1, the leg's share relative to the other legs) and `originate_tls` (optional, default `false`: when `true`, the selected leg is dialed over `https` with its upstream's backend TLS settings; a leg without it keeps the route's own scheme) |
 
 Every split id and leg must name an upstream in the plugin's namespace (every namespace a global instance applies to), exactly like a rule's `destination.upstream_id`: admin writes and config loads refuse a missing or foreign one, and an upstream a split or leg names cannot be deleted or removed by an API-spec replacement.
 
@@ -181,6 +181,14 @@ resolves the leg's own upstream: its targets, load balancer, TLS and
 DestinationRule projection (per-port overrides, connection limits, timeouts,
 outlier detection). So each leg's policy applies to exactly the requests it
 receives.
+
+- **Scheme.** The selected leg also decides the backend scheme: a leg with
+  `originate_tls: true` publishes `https` beside its upstream override (TLS
+  material comes from that upstream), and every other leg publishes none, so
+  the route's own scheme applies. NodeWaypoint slice preparation sets it on an
+  external host's leg whose DestinationRule `tls.mode` originates TLS on that
+  port, never on a Service leg (the mesh transport needs the plaintext scheme;
+  a mesh-tagged target dialed with `https` fails closed).
 
 - **Ratios.** Selection is an exact weighted cycle: every `sum(weight)`
   consecutive requests on one split send exactly `weight` requests to each leg,

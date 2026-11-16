@@ -28762,7 +28762,8 @@ components:
             requests it receives. A split no leg was selected for is never
             dispatched. NodeWaypoint mesh slice preparation writes this for a
             VirtualService split that names a DestinationRule-governed Service
-            and refuses a carried route that already carries it.
+            or external host and refuses a carried route that already carries
+            it.
           items:
             type: object
             additionalProperties: false
@@ -28792,6 +28793,18 @@ components:
                       minimum: 1
                       maximum: 4294967295
                       description: The leg's share, relative to the other legs.
+                    originate_tls:
+                      type: boolean
+                      default: false
+                      description: |
+                        Dial this leg over TLS (backend scheme `https`) with
+                        its upstream's backend TLS settings. The selected leg
+                        decides the request's backend scheme; a leg without
+                        it keeps the route's own scheme. NodeWaypoint slice
+                        preparation sets it on an external host's leg whose
+                        DestinationRule `tls.mode` originates TLS (`SIMPLE`,
+                        `MUTUAL`, `ISTIO_MUTUAL`) on that port, never on a
+                        Service leg, which keeps the mesh transport.
 
     WorkloadMetricsConfig:
       type: object

@@ -57,7 +57,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::config::types::{
-    BackendTlsConfig, BackoffStrategy, MAX_BACKEND_HOST_LENGTH,
+    BackendScheme, BackendTlsConfig, BackoffStrategy, MAX_BACKEND_HOST_LENGTH,
     MAX_BACKEND_TLS_SAN_ALLOW_LIST_ENTRIES, RetryConfig,
     normalize_backend_tls_san_allow_list_entry, validate_backend_tls_san_allow_list_entry,
     validate_backend_tls_sni, validate_system_trust_roots_verify_pairing,
@@ -123,7 +123,7 @@ pub struct MeshRouteDispatchConfig {
     /// leg's policy (DestinationRule projection, authorization) applies to
     /// exactly the requests it receives. NodeWaypoint slice preparation
     /// writes this for a VirtualService split that names a
-    /// DestinationRule-governed Service.
+    /// DestinationRule-governed Service or external host.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     #[serde(deserialize_with = "crate::util::json_object::deserialize_object_vec")]
     pub weighted_splits: Vec<WeightedSplitConfig>,
@@ -149,6 +149,15 @@ pub struct WeightedSplitLegConfig {
     pub upstream_id: String,
     /// The leg's share of the split, relative to the other legs' weights.
     pub weight: u32,
+    /// Dial this leg over TLS (backend scheme `https`) with its upstream's
+    /// backend TLS settings. Every selected leg decides the request's
+    /// backend scheme: a leg without it keeps the route's own scheme.
+    /// NodeWaypoint slice preparation sets it on an external host's leg
+    /// whose DestinationRule `tls.mode` originates TLS (`SIMPLE`, `MUTUAL`,
+    /// `ISTIO_MUTUAL`) on that host's port, and never on a Service leg,
+    /// which keeps the mesh transport.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub originate_tls: bool,
 }
 
 /// Most `weighted_splits` entries one instance may carry.
@@ -1807,6 +1816,9 @@ struct CompiledWeightedSplitLeg {
     upstream_id: String,
     /// Exclusive end of this leg's slot range: slots `[previous, cumulative)`.
     cumulative: u64,
+    /// The backend scheme the leg publishes: `https` when the leg originates
+    /// TLS, otherwise none (the route's own scheme).
+    scheme: Option<BackendScheme>,
     /// The leg as a route destination, for the single-destination override
     /// guard on a route without per-destination verdicts.
     destination: RouteDestination,
@@ -1829,6 +1841,7 @@ impl MeshRouteWeightedSplits {
                         CompiledWeightedSplitLeg {
                             upstream_id: leg.upstream_id.clone(),
                             cumulative,
+                            scheme: leg.originate_tls.then_some(BackendScheme::Https),
                             destination: RouteDestination {
                                 upstream_id: Some(leg.upstream_id.clone()),
                                 requires_node_waypoint_authz: true,
@@ -1950,6 +1963,11 @@ pub(crate) fn select_weighted_split_leg(
         }
         None => ctx.route_override_upstream_id = Some(leg.upstream_id.clone()),
     }
+    // The leg decides the scheme its upstream is dialed with: `https` for a
+    // leg that originates TLS (its upstream's backend TLS settings come with
+    // the upstream override), none for every other leg, so a Service leg
+    // always keeps the route's plaintext scheme its mesh transport requires.
+    ctx.route_override_backend_scheme = leg.scheme;
     None
 }
 

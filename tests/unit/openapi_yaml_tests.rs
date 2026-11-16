@@ -14074,7 +14074,7 @@ fn mesh_route_dispatch_runtime_and_openapi_contracts_match() {
             "upstream_id": "split",
             "legs": [
                 {"upstream_id": "reviews", "weight": 90},
-                {"upstream_id": "ratings", "weight": 10}
+                {"upstream_id": "ratings", "weight": 10, "originate_tls": true}
             ]
         }]
     });
@@ -14090,6 +14090,10 @@ fn mesh_route_dispatch_runtime_and_openapi_contracts_match() {
         json!({"weighted_splits": [{
             "upstream_id": "split",
             "legs": [{"upstream_id": "reviews", "weight": 1, "subset": "v1"}]
+        }]}),
+        json!({"weighted_splits": [{
+            "upstream_id": "split",
+            "legs": [{"upstream_id": "reviews", "weight": 1, "originate_tls": "yes"}]
         }]}),
     ] {
         assert_component_validity(&spec, "MeshRouteDispatchConfig", &invalid_splits, false);

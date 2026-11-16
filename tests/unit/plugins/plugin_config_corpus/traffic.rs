@@ -301,7 +301,7 @@ pub(super) fn contract(name: &str) -> Option<PluginConfigContract> {
                     "upstream_id": "split",
                     "legs": [
                         {"upstream_id": "reviews", "weight": 90},
-                        {"upstream_id": "ratings", "weight": 10}
+                        {"upstream_id": "ratings", "weight": 10, "originate_tls": true}
                     ]
                 }]
             }),
