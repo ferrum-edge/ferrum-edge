@@ -1,4 +1,4 @@
-//! Generated from the Public Suffix List bundled with `psl` 2.1.248
+//! Generated from the Public Suffix List bundled with `psl` 2.1.253
 //! (`data/rules.txt`). Do not edit by hand: regenerate with
 //! `python3 scripts/generate_cors_psl_ancestors.py`.
 //!
