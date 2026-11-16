@@ -2314,9 +2314,7 @@ shapes and nothing else:
   `queue: max` (GitHub's default `queue: single` would replace the pending run
   whenever a third push arrives, so a commit whose fast `CI` went green could
   skip its own sanitizer run), read-only, secret-free, clears every wrapper input and `RUSTFLAGS`, extends
-  swap by 12 GiB, caps the sanitizer compile at `CARGO_BUILD_JOBS=2` with
-  `CARGO_PROFILE_RELEASE_DEBUG=line-tables-only` (see
-  [Fuzz lane runner losses](#fuzz-lane-runner-losses-2026-11)), caches only the Cargo registry (`cache-targets: "false"`,
+  swap by 12 GiB, caches only the Cargo registry (`cache-targets: "false"`,
   main-only `save-if`), and carries `CI_FUZZ_SMOKE_BOUNDED_BUDGET`,
   `CI_FUZZ_SMOKE_PARSER_BUDGET`, and `CI_FUZZ_SMOKE_DATAGRAM_BUDGET` verbatim
   exactly once each. `fuzz_budget_placement_errors` refuses a `ci.yml` whose
@@ -2418,16 +2416,18 @@ signal"). Main pushes 2026-11-13..16:
   3 GB swap. It now provisions the same bounded 12 GiB `/mnt` swap file as the
   eBPF, netns and coverage compiles. The swap step changes no `CARGO_*`
   variable, so the `fuzz-property-smoke` cache key is unchanged.
-- `Fuzz sanitizer smoke` (`fuzz-smoke-main.yml`): 8 of 30 runs lost the runner
-  inside `Run bounded libFuzzer smoke budget` at 58-60 minutes. Its resource
-  observer shows why: in a passing run the AddressSanitizer release compile
-  of `ferrum-edge` held about 15 GiB resident plus 9 GiB of swap, left under
-  200 MiB available, and paged about 28 GiB out over the compile. The job now
-  sets `CARGO_BUILD_JOBS=2` (the jobserver also limits rustc's parallel LLVM
-  workers, which default to the runner's four CPUs) and
-  `CARGO_PROFILE_RELEASE_DEBUG=line-tables-only` on that step only, so the
-  rust-cache key and every libFuzzer bound are unchanged. The next main run's
-  `Fuzz build resources:` records are the check.
+- `Fuzz sanitizer smoke` (`fuzz-smoke-main.yml`, not required): 8 of 30 runs
+  lost the runner inside `Run bounded libFuzzer smoke budget` at 58-60
+  minutes, even with its 12 GiB swap file. Its resource observer shows why: in
+  a passing run the AddressSanitizer release compile of `ferrum-edge` climbed
+  from about 3 GiB to 15 GiB resident plus 9 GiB of swap within five minutes of
+  `Compiling ferrum-edge`, left under 200 MiB available, and paged about 28 GiB
+  out over the compile. Capping that step at `CARGO_BUILD_JOBS=2` with
+  `CARGO_PROFILE_RELEASE_DEBUG=line-tables-only` was tried on a branch
+  (`workflow_dispatch` run 43900143614) and lost the runner the same way, so it
+  was not adopted. The lane stays as it is; it needs a smaller compile (for
+  example a fuzz-only slice of the crate) or a larger runner, not another swap
+  or job-cap tweak.
 
 What is invariant across every generation:
 

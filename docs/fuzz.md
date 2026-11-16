@@ -202,13 +202,7 @@ OOM counters with the runner's termination annotation.
 Both sanitizer lanes (`fuzz-smoke-main.yml` on main/manual and the scheduled `fuzz.yml`)
 add a bounded 12 GiB swap file under `/mnt` before building, because the
 AddressSanitizer release compile exceeds a 16 GiB RAM + 3 GiB swap runner (the
-2026-10-01 observer sample recorded a 14.6 GiB rustc RSS peak). The smoke
-step also caps that compile at `CARGO_BUILD_JOBS=2` with
-`CARGO_PROFILE_RELEASE_DEBUG=line-tables-only`: at four jobs a passing run still
-needed about 24 GiB of RAM plus swap, and 8 of 30 main runs (2026-11-13..16)
-lost the runner mid-compile. The `Fuzz Smoke` property gate in `ci.yml` adds
-the same 12 GiB swap file before its `ferrum-edge` compile. See
-[ci_cd.md](ci_cd.md#fuzz-lane-runner-losses-2026-11). Provisioning
+2026-10-01 observer sample recorded a 14.6 GiB rustc RSS peak). Provisioning
 fails visibly if allocation or activation fails; toolchain, profile, sanitizer,
 targets, and every libFuzzer bound are unchanged. Trial data and the scheduled
 lane's failure history are on issue

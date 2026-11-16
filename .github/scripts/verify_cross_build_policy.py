@@ -3490,20 +3490,7 @@ jobs:
         # it is not a required check. The scheduled `fuzz.yml` lane fuzzes
         # every target for 300 s; this one replays each corpus plus a few
         # hundred mutations under AddressSanitizer on every merged change.
-        #
-        # The AddressSanitizer release compile of the ferrum-edge library is
-        # one rustc process. At the runner's default four jobs it needed about
-        # 24 GiB (15 GiB resident plus 9 GiB of the extended swap) and paged
-        # about 28 GiB out and back, and 8 of 30 main runs between 2026-11-13
-        # and 2026-11-16 lost the runner inside this step with no log. Cap
-        # Cargo's jobserver, which also caps rustc's parallel LLVM workers, at
-        # two, and emit line tables only, as the property gate and the
-        # coverage shards do. Sanitizer reports keep file:line frames; the
-        # target list, codegen units and every libFuzzer bound are unchanged.
         working-directory: fuzz
-        env:
-          CARGO_BUILD_JOBS: "2"
-          CARGO_PROFILE_RELEASE_DEBUG: "line-tables-only"
         run: |
           set -euo pipefail
 
@@ -29177,17 +29164,6 @@ pre_build = []
         ),
         "missing runner swap": (
             "          sudo swapon /mnt/ferrum-fuzz-swapfile\n",
-            "",
-        ),
-        # The capped compile is what keeps the sanitizer build inside the
-        # runner; restoring four LLVM workers or limited debuginfo regrows the
-        # ~24 GiB footprint that lost the runner on main.
-        "uncapped sanitizer compile": (
-            '          CARGO_BUILD_JOBS: "2"\n',
-            "",
-        ),
-        "fuller sanitizer debuginfo": (
-            '          CARGO_PROFILE_RELEASE_DEBUG: "line-tables-only"\n',
             "",
         ),
         "reduced compilation parallelism": ("--codegen-units 16", "--codegen-units 1"),
