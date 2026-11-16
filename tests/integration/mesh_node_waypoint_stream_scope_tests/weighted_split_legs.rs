@@ -2242,7 +2242,9 @@ fn destination_rule_binding_and_application_agree_on_host_matching() {
         ("*.wild.example", "api.wild.example", true),
         ("*.example", "api.wild.example", true),
         ("*", "api.wild.example", true),
-        ("*.wild.example", "wild.example", false),
+        // The apex is not under its own wildcard. (A two-label external host
+        // would read as `<svc>.<ns>`, so the apex here has three labels.)
+        ("*.api.wild.example", "api.wild.example", false),
         ("*.other.example", "api.wild.example", false),
     ] {
         let objects = vec![
