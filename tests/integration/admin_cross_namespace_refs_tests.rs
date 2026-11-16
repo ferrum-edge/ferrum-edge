@@ -483,6 +483,65 @@ async fn mesh_route_dispatch_missing_destination_upstream_is_rejected() {
     );
 }
 
+/// Issue #7387 review (sol F1 sweep): a `weighted_splits` leg is checked at
+/// admin write time like a rule destination, so a missing leg is refused
+/// before it can ever reach a data plane.
+#[tokio::test]
+async fn mesh_route_dispatch_missing_weighted_split_leg_is_rejected() {
+    let tc = TestConfig::default();
+    let (state, _tmp) = build_admin_state(&tc).await;
+    let (base_url, _shutdown) = start_admin(state).await;
+    let token = make_token(&tc);
+
+    let (status, body) = ns_post(
+        &base_url,
+        "/upstreams",
+        NAMESPACE_A,
+        &token,
+        &upstream_payload("up-split", "up-split"),
+    )
+    .await;
+    assert_eq!(status, 201, "seed upstream failed: {:?}", body);
+    let (status, body) = ns_post(
+        &base_url,
+        "/proxies",
+        NAMESPACE_A,
+        &token,
+        &proxy_with_upstream("p-a-split", "/split", "up-split"),
+    )
+    .await;
+    assert_eq!(status, 201, "seed proxy failed: {:?}", body);
+
+    let plugin = json!({
+        "id": "pc-split",
+        "plugin_name": "mesh_route_dispatch",
+        "scope": "proxy",
+        "proxy_id": "p-a-split",
+        "config": {
+            "rules": [],
+            "weighted_splits": [{
+                "upstream_id": "up-split",
+                "legs": [{"upstream_id": "missing-leg", "weight": 1}]
+            }]
+        },
+        "enabled": true,
+    });
+    let (status, body) = ns_post(&base_url, "/plugins/config", NAMESPACE_A, &token, &plugin).await;
+    assert_eq!(
+        status, 400,
+        "a missing weighted-split leg must be rejected: {:?}",
+        body
+    );
+    let err = err_string(&body);
+    assert!(
+        err.contains("mesh_route_dispatch")
+            && err.contains("weighted_splits[0].legs[0]")
+            && err.contains("missing-leg"),
+        "error must name the leg; got: {}",
+        err
+    );
+}
+
 #[tokio::test]
 async fn mesh_route_dispatch_cross_namespace_destination_upstream_is_rejected() {
     let tc = TestConfig::default();

@@ -634,12 +634,14 @@ fn a_route_to_an_unmodeled_cluster_service_is_refused() {
     );
 }
 
-/// Review findings dsf F2 (round 1) and sol F2 (round 2): a split across
-/// Services that DestinationRules govern would dial their workloads without
-/// the rules, so the split route is refused; the slice still materializes and
-/// both Services keep their own routes (which do carry the rules).
+/// Review findings dsf F2 (round 1) and sol F2 (round 2), resolved by issue
+/// #7387: a split across Services that DestinationRules govern is served,
+/// and each leg is dispatched through its own Service's upstream (which
+/// carries its rule) instead of the split's workload targets. See
+/// `weighted_split_legs` for the per-leg policy, ratio and authorization
+/// coverage.
 #[test]
-fn a_split_across_destination_rule_governed_services_is_refused_not_the_slice() {
+fn a_split_across_destination_rule_governed_services_is_dispatched_leg_by_leg() {
     let config = translated_config(&[
         virtual_service("split", split_spec(json!({}))),
         destination_rule("reviews-dr", "reviews.default.svc.cluster.local", "RANDOM"),
@@ -653,25 +655,28 @@ fn a_split_across_destination_rule_governed_services_is_refused_not_the_slice() 
     let slice = node_waypoint_slice(&config, &runtime);
     assert_eq!(slice.destination_rules.len(), 2);
     let split_id = carried_ids(&slice.http_routes.upstreams).remove(0);
-    let prepared = prepare_gateway_config_from_mesh_slice(&slice, &runtime)
-        .expect("the slice materializes without the refused split");
-    assert!(carried_route_proxies(&prepared).is_empty());
-    assert!(
-        !prepared
-            .upstreams
-            .iter()
-            .any(|upstream| upstream.id == split_id),
-        "the refused split's upstream is pruned"
+    let prepared =
+        prepare_gateway_config_from_mesh_slice(&slice, &runtime).expect("slice materializes");
+    let routes = carried_route_proxies(&prepared);
+    assert_eq!(routes.len(), 1, "the split route is served");
+    assert_eq!(routes[0].upstream_id.as_deref(), Some(split_id.as_str()));
+    let legs: Vec<&str> = prepared
+        .plugin_configs
+        .iter()
+        .filter(|plugin| plugin.plugin_name == "mesh_route_dispatch")
+        .filter_map(|plugin| plugin.config.get("weighted_splits"))
+        .flat_map(|splits| splits.as_array().into_iter().flatten())
+        .filter(|split| split["upstream_id"] == json!(split_id))
+        .flat_map(|split| split["legs"].as_array().into_iter().flatten())
+        .filter_map(|leg| leg["upstream_id"].as_str())
+        .collect();
+    assert_eq!(
+        legs,
+        vec![
+            "__mesh-out-upstream-default-reviews-8080",
+            "__mesh-out-upstream-default-ratings-8080"
+        ]
     );
-    for service in ["reviews", "ratings"] {
-        assert!(
-            prepared.proxies.iter().any(|proxy| proxy
-                .upstream_id
-                .as_deref()
-                .is_some_and(|id| id.starts_with("__mesh-out") && id.contains(service))),
-            "{service} keeps its Service route"
-        );
-    }
 }
 
 fn add_reviews_replica(config: &mut GatewayConfig, address: &'static str) {

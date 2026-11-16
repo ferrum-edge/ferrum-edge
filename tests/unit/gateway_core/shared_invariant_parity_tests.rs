@@ -5359,10 +5359,117 @@ fn final_request_body_hook_context_hand_back_has_one_implementation() {
 /// decides which destination a carried VirtualService route reaches must
 /// consult the request's per-destination verdicts before the blanket
 /// single-destination guard. The siblings are route dispatch's matched-rule
-/// admission, its early route-total preview, and proxy core's final check in
+/// admission, its early route-total preview, the dispatch finalizer's
+/// weighted-split leg selection (issue #7387), and proxy core's final check in
 /// the one `before_proxy` runner every transport (H1/H2, native gRPC,
 /// WebSocket, H3, deferred passes) converges on. A new call site of the
 /// blanket guard, or a runner without the final check, fails here.
+/// Issue #7387: a `mesh_route_dispatch` instance can reach destinations
+/// through `weighted_splits` legs as well as through rule destinations. Every
+/// place that enumerates the destinations an instance names must read both,
+/// or a leg is left unauthorized (candidate threading), un-probed (HBONE
+/// capability enrollment), pruned (route upstream references), deletable
+/// while referenced (store references, API-spec replacement), dangling
+/// (runtime and admin-write reference validation), untracked (adaptive
+/// concurrency route-override destinations), or uncounted against the
+/// per-route candidate bound (slice binding), or missing from the route's
+/// RequestAuthentication set (destination scoping). The split upstream itself
+/// keeps only its Service legs' workloads, so no enumerator may stand it in
+/// for an external leg.
+#[test]
+fn mesh_route_dispatch_destination_enumerators_cover_weighted_split_legs() {
+    let mesh = source("src/modes/mesh/mod.rs");
+    let slice = source("src/modes/mesh/slice.rs");
+    let proxy = source("src/proxy/mod.rs");
+    let dispatch = source("src/plugins/mesh_route_dispatch.rs");
+    let store_policy = source("src/config/store_policy.rs");
+    let crud = source("src/admin/crud.rs");
+    let cache = source("src/plugin_cache.rs");
+    for (file, text, signature, needle) in [
+        (
+            "src/proxy/mod.rs",
+            &proxy,
+            "pub(crate) fn validate_mesh_route_dispatch_upstream_references(",
+            ".weighted_splits",
+        ),
+        (
+            "src/admin/crud.rs",
+            &crud,
+            "pub(crate) async fn validate_mesh_route_dispatch_plugin_upstream_references(",
+            ".weighted_splits",
+        ),
+        (
+            "src/config/store_policy.rs",
+            &store_policy,
+            "pub fn mesh_route_dispatch_referenced_upstream(",
+            ".referenced_upstream_ids()",
+        ),
+        (
+            "src/plugin_cache.rs",
+            &cache,
+            "fn collect_route_override_destinations(",
+            "\"weighted_splits\"",
+        ),
+        (
+            "src/plugin_cache.rs",
+            &cache,
+            "fn route_override_destination_fingerprint(",
+            "\"weighted_splits\"",
+        ),
+        (
+            "src/modes/mesh/mod.rs",
+            &mesh,
+            "fn thread_node_waypoint_route_branches_to_authz(",
+            "\"weighted_splits\"",
+        ),
+        (
+            "src/modes/mesh/mod.rs",
+            &mesh,
+            "fn bind_carried_http_routes_to_node_waypoint_transport(",
+            "leg_dispatched",
+        ),
+        (
+            "src/modes/mesh/slice.rs",
+            &slice,
+            "pub(crate) fn mesh_route_dispatch_rule_upstream_ids(",
+            "\"weighted_splits\"",
+        ),
+        (
+            "src/proxy/mod.rs",
+            &proxy,
+            "fn collect_mesh_route_dispatch_capability_targets(",
+            ".weighted_splits",
+        ),
+        (
+            "src/plugins/mesh_route_dispatch.rs",
+            &dispatch,
+            "pub fn references_upstream_id(",
+            "self.referenced_upstream_ids()",
+        ),
+        (
+            "src/plugins/mesh_route_dispatch.rs",
+            &dispatch,
+            "pub fn referenced_upstream_ids(",
+            "self.weighted_splits",
+        ),
+    ] {
+        assert!(
+            item_body(text, signature, "\n    }\n").contains(needle)
+                || item_body(text, signature, "\n}\n").contains(needle),
+            "{file}: `{signature}` must enumerate weighted-split legs too"
+        );
+    }
+    assert!(
+        item_body(
+            &mesh,
+            "fn scope_request_auth_to_node_waypoint_destinations(",
+            "\n}\n",
+        )
+        .contains("\"weighted_splits\""),
+        "RequestAuthentication scoping must expand a weighted split into its legs"
+    );
+}
+
 #[test]
 fn node_waypoint_route_branch_verdicts_gate_every_destination_decision() {
     let proxy = admission_source_without_line_comments(&source("src/proxy/mod.rs"));
@@ -5408,6 +5515,34 @@ fn node_waypoint_route_branch_verdicts_gate_every_destination_decision() {
         finalizer.contains("finalize_node_waypoint_route_branch(ctx, headers)"),
         "the dispatch finalizer must admit the selected destination after the last instance"
     );
+    // Issue #7387: a weighted split dispatched leg by leg resolves to its leg
+    // in the finalizer, once routing is final and BEFORE the destination is
+    // admitted, so the leg (never the split, never an unselected leg) is what
+    // the finalizer and proxy core judge.
+    let leg_selection = finalizer
+        .find("select_weighted_split_leg(")
+        .expect("the dispatch finalizer must resolve weighted splits to a leg");
+    let admission = finalizer
+        .find("finalize_node_waypoint_route_branch(ctx, headers)")
+        .expect("admission call");
+    assert!(
+        leg_selection < admission,
+        "the leg is selected before the group's destination is admitted"
+    );
+    assert_eq!(
+        production.matches("fn select_weighted_split_leg(").count(),
+        1,
+        "weighted-split legs are selected in one place"
+    );
+    assert!(
+        item_body(
+            &production,
+            "pub(crate) fn select_weighted_split_leg(",
+            "\n}"
+        )
+        .contains("reject_unauthorized_node_waypoint_rule_destination(ctx, &leg.destination)"),
+        "a selected leg passes the same verdict-aware guard as a matched rule"
+    );
     let preview = item_body(
         &production,
         "fn node_waypoint_rule_destination_vetoed(",
@@ -5426,8 +5561,9 @@ fn node_waypoint_route_branch_verdicts_gate_every_destination_decision() {
         production
             .matches("reject_unauthorized_node_waypoint_rule_destination(")
             .count(),
-        3,
-        "matched-rule admission and the preview share the verdict-aware check (definition + two calls)"
+        4,
+        "matched-rule admission, the preview and weighted-split leg selection share the \
+         verdict-aware check (definition + three calls)"
     );
     assert_eq!(
         production
@@ -5529,5 +5665,66 @@ fn allowed_ws_origins_grandfathering_warning_never_precedes_an_admission_refusal
     assert!(
         refusal < pipeline,
         "file mode must refuse before the warning-emitting field validators run"
+    );
+}
+
+/// Issue #7387 review rounds 4-5: DestinationRule host matching has ONE exact
+/// implementation, and wildcard coverage is DETECTED, never applied, on the
+/// data plane. `destination_rule_host_matches` (exact hosts and Service
+/// aliases) decides rule application; `destination_rule_host_specificity`
+/// reuses it for its exact arm and adds only wildcard detection, which the
+/// NodeWaypoint carried-route binding uses to refuse a wildcard-covered
+/// external leg or direct backend (it would otherwise be dialed in plaintext
+/// past an unapplied rule). Applying wildcard rules is a separate feature;
+/// this pins that it is not half-enabled here.
+#[test]
+fn destination_rule_host_matching_has_one_implementation() {
+    let mesh = source("src/modes/mesh/mod.rs");
+    for (signature, needle) in [
+        (
+            "pub(crate) fn destination_rule_host_specificity(",
+            "destination_rule_host_matches(",
+        ),
+        (
+            "fn destination_rules_naming_host<'a>(",
+            "DestinationRuleHostSpecificity::Exact",
+        ),
+        (
+            "fn wildcard_destination_rule_covers_host(",
+            "DestinationRuleHostSpecificity::Wildcard(_)",
+        ),
+        (
+            "pub(crate) fn apply_destination_rules_with_tenant_file_roots(",
+            "destination_rule_host_matches(",
+        ),
+    ] {
+        let body = item_body(&mesh, signature, "\n}\n");
+        assert!(body.contains(needle), "`{signature}` must reach `{needle}`");
+    }
+    let apply = item_body(
+        &mesh,
+        "pub(crate) fn apply_destination_rules_with_tenant_file_roots(",
+        "\n}\n",
+    );
+    assert!(
+        !apply.contains("destination_rule_host_specificity(")
+            && !apply.contains("strip_prefix('*')"),
+        "DestinationRule application must not apply wildcard rules"
+    );
+    let bind = item_body(
+        &mesh,
+        "fn bind_carried_http_routes_to_node_waypoint_transport(",
+        "\n}\n",
+    );
+    assert_eq!(
+        bind.matches("wildcard_destination_rule_covers_host(")
+            .count(),
+        3,
+        "the binding refuses a wildcard-covered split leg, own backend and rule backend"
+    );
+    assert_eq!(
+        mesh.matches("strip_prefix('*')").count(),
+        1,
+        "the one wildcard rule lives in `destination_rule_host_specificity`"
     );
 }

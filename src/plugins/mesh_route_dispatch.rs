@@ -57,7 +57,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::config::types::{
-    BackendTlsConfig, BackoffStrategy, MAX_BACKEND_HOST_LENGTH,
+    BackendScheme, BackendTlsConfig, BackoffStrategy, MAX_BACKEND_HOST_LENGTH,
     MAX_BACKEND_TLS_SAN_ALLOW_LIST_ENTRIES, RetryConfig,
     normalize_backend_tls_san_allow_list_entry, validate_backend_tls_san_allow_list_entry,
     validate_backend_tls_sni, validate_system_trust_roots_verify_pairing,
@@ -115,7 +115,55 @@ pub struct MeshRouteDispatchConfig {
     /// operators who configure the plugin directly as a soft override.
     #[serde(default)]
     pub reject_unmatched: bool,
+    /// Weighted splits dispatched leg by leg (issue #7387). When the
+    /// destination the whole dispatch group selects is one of these upstream
+    /// ids (a matched rule's `upstream_id`, or the route's own `upstream_id`
+    /// when no rule overrides it), the dispatch finalizer picks one leg by
+    /// weight and sends the request through that leg's own upstream, so the
+    /// leg's policy (DestinationRule projection, authorization) applies to
+    /// exactly the requests it receives. NodeWaypoint slice preparation
+    /// writes this for a VirtualService split that names a
+    /// DestinationRule-governed Service or external host.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(deserialize_with = "crate::util::json_object::deserialize_object_vec")]
+    pub weighted_splits: Vec<WeightedSplitConfig>,
 }
+
+/// One weighted split resolved by leg selection (`weighted_splits[]`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WeightedSplitConfig {
+    /// The split destination this entry resolves: the upstream id a rule or
+    /// the route names. No request is dispatched through it directly.
+    pub upstream_id: String,
+    /// The legs, each sent through its own upstream.
+    #[serde(deserialize_with = "crate::util::json_object::deserialize_object_vec")]
+    pub legs: Vec<WeightedSplitLegConfig>,
+}
+
+/// One leg of a [`WeightedSplitConfig`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WeightedSplitLegConfig {
+    /// The upstream this leg's requests are dispatched through.
+    pub upstream_id: String,
+    /// The leg's share of the split, relative to the other legs' weights.
+    pub weight: u32,
+    /// Dial this leg over TLS (backend scheme `https`) with its upstream's
+    /// backend TLS settings. Every selected leg decides the request's
+    /// backend scheme: a leg without it keeps the route's own scheme.
+    /// NodeWaypoint slice preparation sets it on an external host's leg
+    /// whose DestinationRule `tls.mode` originates TLS (`SIMPLE`, `MUTUAL`,
+    /// `ISTIO_MUTUAL`) on that host's port, and never on a Service leg,
+    /// which keeps the mesh transport.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub originate_tls: bool,
+}
+
+/// Most `weighted_splits` entries one instance may carry.
+pub const MAX_WEIGHTED_SPLITS: usize = 64;
+/// Most legs one weighted split may have.
+pub const MAX_WEIGHTED_SPLIT_LEGS: usize = 32;
 
 impl MeshRouteDispatchConfig {
     pub fn from_value(config: &Value) -> Result<Self, String> {
@@ -134,15 +182,30 @@ impl MeshRouteDispatchConfig {
     }
 
     pub fn references_upstream_id(&self, upstream_id: &str) -> bool {
+        self.referenced_upstream_ids().any(|id| id == upstream_id)
+    }
+
+    /// Every upstream id this config names, in order: each rule's
+    /// `destination.upstream_id`, then each `weighted_splits` entry's id
+    /// followed by its legs (issue #7387). The one enumerator behind upstream
+    /// delete protection, API-spec replacement protection and load-time
+    /// reference validation, so a destination kind cannot be covered by one
+    /// and missed by another.
+    pub fn referenced_upstream_ids(&self) -> impl Iterator<Item = &str> {
         self.rules
             .iter()
-            .any(|rule| rule.destination.upstream_id.as_deref() == Some(upstream_id))
+            .filter_map(|rule| rule.destination.upstream_id.as_deref())
+            .chain(self.weighted_splits.iter().flat_map(|split| {
+                std::iter::once(split.upstream_id.as_str())
+                    .chain(split.legs.iter().map(|leg| leg.upstream_id.as_str()))
+            }))
     }
 
     fn normalize_and_validate(&mut self) -> Result<(), String> {
-        if self.rules.is_empty() {
+        if self.rules.is_empty() && self.weighted_splits.is_empty() {
             return Err("`mesh_route_dispatch.rules` cannot be empty".to_string());
         }
+        validate_weighted_splits(&self.weighted_splits)?;
         for (idx, rule) in self.rules.iter_mut().enumerate() {
             validate_rule_name(idx, rule.name.as_deref())?;
             normalize_header_match_keys(idx, "match.headers", &mut rule.match_.headers)?;
@@ -1643,12 +1706,278 @@ pub struct RouteDestination {
 }
 
 impl RouteDestination {
+    /// A destination naming only `upstream_id`.
+    pub(crate) fn upstream(upstream_id: String) -> Self {
+        Self {
+            upstream_id: Some(upstream_id),
+            ..Self::default()
+        }
+    }
+
     fn is_empty(&self) -> bool {
         self.upstream_id.is_none()
             && self.backend_host.is_none()
             && self.backend_port.is_none()
             && self.backend_tls.is_none()
     }
+}
+
+/// Validate `weighted_splits`. Diagnostics name the entry and leg by position
+/// only, never a document value.
+fn validate_weighted_splits(splits: &[WeightedSplitConfig]) -> Result<(), String> {
+    if splits.len() > MAX_WEIGHTED_SPLITS {
+        return Err(format!(
+            "`mesh_route_dispatch.weighted_splits` exceeds {MAX_WEIGHTED_SPLITS} entries"
+        ));
+    }
+    for (index, split) in splits.iter().enumerate() {
+        if split.upstream_id.trim().is_empty() || split.upstream_id.trim() != split.upstream_id {
+            return Err(format!(
+                "`mesh_route_dispatch.weighted_splits[{index}].upstream_id` must be a non-empty \
+                 id without surrounding whitespace"
+            ));
+        }
+        if splits[..index]
+            .iter()
+            .any(|earlier| earlier.upstream_id == split.upstream_id)
+        {
+            return Err(format!(
+                "`mesh_route_dispatch.weighted_splits[{index}].upstream_id` repeats an earlier entry"
+            ));
+        }
+        if split.legs.is_empty() || split.legs.len() > MAX_WEIGHTED_SPLIT_LEGS {
+            return Err(format!(
+                "`mesh_route_dispatch.weighted_splits[{index}].legs` must list 1 to \
+                 {MAX_WEIGHTED_SPLIT_LEGS} legs"
+            ));
+        }
+        for (leg_index, leg) in split.legs.iter().enumerate() {
+            if leg.upstream_id.trim().is_empty() || leg.upstream_id.trim() != leg.upstream_id {
+                return Err(format!(
+                    "`mesh_route_dispatch.weighted_splits[{index}].legs[{leg_index}].upstream_id` \
+                     must be a non-empty id without surrounding whitespace"
+                ));
+            }
+            if leg.weight == 0 {
+                return Err(format!(
+                    "`mesh_route_dispatch.weighted_splits[{index}].legs[{leg_index}].weight` must \
+                     be greater than zero"
+                ));
+            }
+            // A leg is dispatched through its own upstream: never the split
+            // itself, another split (no nesting), or a repeated leg.
+            if splits
+                .iter()
+                .any(|other| other.upstream_id == leg.upstream_id)
+                || split.legs[..leg_index]
+                    .iter()
+                    .any(|earlier| earlier.upstream_id == leg.upstream_id)
+            {
+                return Err(format!(
+                    "`mesh_route_dispatch.weighted_splits[{index}].legs[{leg_index}].upstream_id` \
+                     must name a distinct upstream that is not itself a weighted split"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The weighted splits one `mesh_route_dispatch` instance resolves, compiled
+/// once per plugin generation (issue #7387). The dispatch finalizer holds the
+/// tables of its chain's instances and selects a leg without allocating a
+/// table or a key per request.
+#[doc(hidden)]
+pub struct MeshRouteWeightedSplits {
+    splits: Vec<CompiledWeightedSplit>,
+}
+
+impl std::fmt::Debug for MeshRouteWeightedSplits {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MeshRouteWeightedSplits")
+            .field("splits", &self.splits.len())
+            .finish()
+    }
+}
+
+struct CompiledWeightedSplit {
+    upstream_id: String,
+    legs: Vec<CompiledWeightedSplitLeg>,
+    /// Sum of the leg weights.
+    total: u64,
+    /// Coprime with `total`: turn `n` lands on slot `n * stride mod total`,
+    /// a permutation of every slot per `total` turns, so each cycle sends
+    /// exactly `weight` requests to each leg, interleaved rather than in runs.
+    stride: u64,
+    cursor: std::sync::atomic::AtomicU64,
+}
+
+struct CompiledWeightedSplitLeg {
+    upstream_id: String,
+    /// Exclusive end of this leg's slot range: slots `[previous, cumulative)`.
+    cumulative: u64,
+    /// The backend scheme the leg publishes: `https` when the leg originates
+    /// TLS, otherwise none (the route's own scheme).
+    scheme: Option<BackendScheme>,
+    /// The leg as a route destination, for the single-destination override
+    /// guard on a route without per-destination verdicts.
+    destination: RouteDestination,
+}
+
+impl MeshRouteWeightedSplits {
+    fn compile(splits: &[WeightedSplitConfig]) -> Option<Arc<Self>> {
+        if splits.is_empty() {
+            return None;
+        }
+        let splits = splits
+            .iter()
+            .map(|split| {
+                let mut cumulative = 0u64;
+                let legs = split
+                    .legs
+                    .iter()
+                    .map(|leg| {
+                        cumulative += u64::from(leg.weight);
+                        CompiledWeightedSplitLeg {
+                            upstream_id: leg.upstream_id.clone(),
+                            cumulative,
+                            scheme: leg.originate_tls.then_some(BackendScheme::Https),
+                            destination: RouteDestination {
+                                upstream_id: Some(leg.upstream_id.clone()),
+                                requires_node_waypoint_authz: true,
+                                ..RouteDestination::default()
+                            },
+                        }
+                    })
+                    .collect();
+                CompiledWeightedSplit {
+                    upstream_id: split.upstream_id.clone(),
+                    legs,
+                    total: cumulative,
+                    stride: weighted_split_stride(cumulative),
+                    cursor: std::sync::atomic::AtomicU64::new(0),
+                }
+            })
+            .collect();
+        Some(Arc::new(Self { splits }))
+    }
+
+    fn split(&self, upstream_id: &str) -> Option<&CompiledWeightedSplit> {
+        self.splits
+            .iter()
+            .find(|split| split.upstream_id == upstream_id)
+    }
+}
+
+impl CompiledWeightedSplit {
+    /// The next leg in the weighted cycle: one atomic increment, no
+    /// allocation. `None` only for an empty split, which validation refuses.
+    fn select(&self) -> Option<&CompiledWeightedSplitLeg> {
+        if self.total == 0 {
+            return None;
+        }
+        let turn = self.cursor.fetch_add(1, Ordering::Relaxed) % self.total;
+        // `turn < total` and `stride < total`, so the product fits in u128
+        // and the slot is below `total`.
+        let slot =
+            u64::try_from(u128::from(turn) * u128::from(self.stride) % u128::from(self.total))
+                .unwrap_or(0);
+        let index = self.legs.partition_point(|leg| leg.cumulative <= slot);
+        self.legs.get(index).or(self.legs.last())
+    }
+}
+
+/// A stride coprime with `total`, near the golden-ratio fraction of it, so
+/// consecutive turns spread over the slot range.
+fn weighted_split_stride(total: u64) -> u64 {
+    fn gcd(mut a: u64, mut b: u64) -> u64 {
+        while b != 0 {
+            (a, b) = (b, a % b);
+        }
+        a
+    }
+    if total <= 2 {
+        return 1;
+    }
+    let mut stride = u64::try_from(u128::from(total) * 618_034 / 1_000_000)
+        .unwrap_or(1)
+        .max(1);
+    // Terminates: `total - 1` is coprime with `total`.
+    while gcd(stride, total) != 1 {
+        stride += 1;
+    }
+    stride
+}
+
+/// Pick the weighted-split leg for a request whose final destination is a
+/// weighted split (issue #7387), then publish that leg's upstream as the
+/// route override, exactly as a matched rule publishes its destination, so
+/// the dispatch finalizer and proxy core judge the leg and dispatch sends the
+/// request through the leg's own upstream (its DestinationRule policy
+/// included).
+///
+/// Runs once, in the dispatch finalizer, after every `mesh_route_dispatch`
+/// instance: a split an earlier instance selected but a later one replaced is
+/// never resolved. The final destination is a split when it is a matched
+/// rule's `upstream_id` or, with no override at all, the route's own
+/// `upstream_id`. On a route without per-destination verdicts the leg passes
+/// the same single-destination override guard as a matched rule. `Some` is
+/// that guard's refusal.
+///
+/// Only the tables of instances that ran for this request are consulted
+/// (`Plugin::mesh_route_weighted_splits_for_request`): an instance its
+/// execution trigger skipped resolves nothing, exactly as it routes nothing.
+pub(crate) fn select_weighted_split_leg(
+    ctx: &mut RequestContext,
+    instances: &[Arc<dyn Plugin>],
+) -> Option<PluginResult> {
+    if instances.is_empty() {
+        return None;
+    }
+    let leg = {
+        let split_id = match (
+            ctx.route_override_upstream_id.as_deref(),
+            ctx.route_override_backend_host.as_deref(),
+            ctx.route_override_backend_port,
+        ) {
+            (Some(upstream_id), None, None) => upstream_id,
+            (None, None, None) => ctx.matched_proxy.as_deref()?.upstream_id.as_deref()?,
+            _ => return None,
+        };
+        instances
+            .iter()
+            .filter_map(|instance| instance.mesh_route_weighted_splits_for_request(ctx))
+            .find_map(|table| table.split(split_id))?
+            .select()?
+    };
+    if let Some(refusal) = reject_unauthorized_node_waypoint_rule_destination(ctx, &leg.destination)
+    {
+        withdraw_matched_rule_response(ctx);
+        return Some(refusal);
+    }
+    // Reuse the rule's override buffer when one is set.
+    match ctx.route_override_upstream_id.as_mut() {
+        Some(upstream_id) => {
+            upstream_id.clear();
+            upstream_id.push_str(&leg.upstream_id);
+        }
+        None => ctx.route_override_upstream_id = Some(leg.upstream_id.clone()),
+    }
+    // The leg decides the scheme its upstream is dialed with: `https` for a
+    // leg that originates TLS (its upstream's backend TLS settings come with
+    // the upstream override), none for every other leg, so a Service leg
+    // always keeps the route's plaintext scheme its mesh transport requires.
+    ctx.route_override_backend_scheme = leg.scheme;
+    None
+}
+
+/// A security refusal is not a response a rule generates: withdraw the
+/// matched rule's response header list and match metadata.
+fn withdraw_matched_rule_response(ctx: &mut RequestContext) {
+    ctx.route_override_response_transform = None;
+    ctx.route_override_response_transform_published = false;
+    ctx.metadata.remove(RULE_INDEX_METADATA_KEY);
+    ctx.metadata.remove(RULE_NAME_METADATA_KEY);
 }
 
 /// Admit or refuse a matched rule's destination under NodeWaypoint
@@ -1684,10 +2013,7 @@ pub(crate) async fn finalize_node_waypoint_route_branch(
     headers: &mut HashMap<String, String>,
 ) -> Option<PluginResult> {
     let result = admit_node_waypoint_route_branch_for_effective_destination(ctx, headers).await?;
-    ctx.route_override_response_transform = None;
-    ctx.route_override_response_transform_published = false;
-    ctx.metadata.remove(RULE_INDEX_METADATA_KEY);
-    ctx.metadata.remove(RULE_NAME_METADATA_KEY);
+    withdraw_matched_rule_response(ctx);
     Some(result)
 }
 
@@ -1964,6 +2290,8 @@ pub struct MeshRouteDispatch {
     /// Whether any rule carries `response_transform` (plugin-cache composition
     /// requires a configured `response_transformer` for these).
     publishes_response_transforms: bool,
+    /// Compiled `weighted_splits`, handed to the dispatch finalizer.
+    weighted_splits: Option<Arc<MeshRouteWeightedSplits>>,
 }
 
 impl MeshRouteDispatch {
@@ -1981,12 +2309,14 @@ impl MeshRouteDispatch {
             .rules
             .iter()
             .any(|rule| rule.response_transform_compiled.is_some());
+        let weighted_splits = MeshRouteWeightedSplits::compile(&parsed.weighted_splits);
         Ok(Self {
             config: parsed,
             aggregate_reject_unmatched: AtomicBool::new(false),
             has_query_predicates,
             publishes_request_transforms,
             publishes_response_transforms,
+            weighted_splits,
         })
     }
 
@@ -2585,6 +2915,17 @@ impl Plugin for MeshRouteDispatch {
 
     fn publishes_route_response_header_transforms(&self) -> bool {
         self.publishes_response_transforms
+    }
+
+    fn mesh_route_weighted_splits(&self) -> Option<Arc<MeshRouteWeightedSplits>> {
+        self.weighted_splits.clone()
+    }
+
+    fn mesh_route_weighted_splits_for_request(
+        &self,
+        _ctx: &RequestContext,
+    ) -> Option<&MeshRouteWeightedSplits> {
+        self.weighted_splits.as_deref()
     }
 
     fn enable_deferred_unmatched_rejection(&self) {

@@ -3397,10 +3397,10 @@ fn serialize_virtual_service_l4_upstreams<'a>(
 /// Upstream id prefix of a VirtualService HTTP weighted-split upstream.
 pub(crate) const VIRTUAL_SERVICE_HTTP_ROUTE_UPSTREAM_ID_PREFIX: &str = "istio-vs-upstream-";
 
-/// The upstream ids a `mesh_route_dispatch` plugin config's rules can rewrite
-/// a request to.
+/// The upstream ids a `mesh_route_dispatch` plugin config names: its rules'
+/// destinations, and each `weighted_splits` entry with its legs (issue #7387).
 pub(crate) fn mesh_route_dispatch_rule_upstream_ids(config: &serde_json::Value) -> Vec<&str> {
-    config
+    let rules = config
         .get("rules")
         .and_then(serde_json::Value::as_array)
         .into_iter()
@@ -3409,8 +3409,29 @@ pub(crate) fn mesh_route_dispatch_rule_upstream_ids(config: &serde_json::Value) 
             rule.get("destination")
                 .and_then(|destination| destination.get("upstream_id"))
                 .and_then(serde_json::Value::as_str)
-        })
-        .collect()
+        });
+    let splits = config
+        .get("weighted_splits")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .flat_map(|split| {
+            split
+                .get("upstream_id")
+                .and_then(serde_json::Value::as_str)
+                .into_iter()
+                .chain(
+                    split
+                        .get("legs")
+                        .and_then(serde_json::Value::as_array)
+                        .into_iter()
+                        .flatten()
+                        .filter_map(|leg| {
+                            leg.get("upstream_id").and_then(serde_json::Value::as_str)
+                        }),
+                )
+        });
+    rules.chain(splits).collect()
 }
 
 /// Project the VirtualService HTTP routes a NodeWaypoint serves (issue #7233).

@@ -2122,3 +2122,7 @@ mod http_routes;
 /// Per-destination authorization for `mesh_route_dispatch` branches of a
 /// carried VirtualService route (issue #7383).
 mod route_branch_authz;
+
+/// Weighted VirtualService splits dispatched leg by leg through each
+/// DestinationRule-governed Service's own upstream (issue #7387).
+mod weighted_split_legs;

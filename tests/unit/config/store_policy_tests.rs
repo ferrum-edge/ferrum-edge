@@ -225,6 +225,42 @@ fn mesh_route_dispatch_referenced_upstream_shares_the_reference_filter() {
     }
 }
 
+/// Issue #7387 review (sol F2): a weighted-split leg (and the split id) is a
+/// reference for API-spec replacement and deletion exactly as it is for an
+/// ordinary upstream delete, so a spec cannot remove an upstream a weighted
+/// split still dispatches to.
+#[test]
+fn mesh_route_dispatch_weighted_split_legs_are_references_for_both_checks() {
+    let weighted = json!({
+        "rules": [],
+        "weighted_splits": [{
+            "upstream_id": "split",
+            "legs": [
+                {"upstream_id": "foreign", "weight": 90},
+                {"upstream_id": "owned-leg", "weight": 10}
+            ]
+        }]
+    });
+    let plugin_config = plugin("mesh_route_dispatch", true, weighted);
+    for upstream_id in ["split", "foreign", "owned-leg"] {
+        assert!(
+            mesh_route_dispatch_references_upstream_id(&plugin_config, upstream_id),
+            "{upstream_id} is referenced"
+        );
+        let spec_upstreams: HashSet<String> = [upstream_id.to_string()].into_iter().collect();
+        assert_eq!(
+            mesh_route_dispatch_referenced_upstream(&plugin_config, &spec_upstreams).as_deref(),
+            Some(upstream_id),
+            "spec replacement and deletion see {upstream_id} too"
+        );
+    }
+    let unrelated: HashSet<String> = ["other".to_string()].into_iter().collect();
+    assert_eq!(
+        mesh_route_dispatch_referenced_upstream(&plugin_config, &unrelated),
+        None
+    );
+}
+
 // ── API-spec store resource hash ───────────────────────────────────────────
 
 #[test]

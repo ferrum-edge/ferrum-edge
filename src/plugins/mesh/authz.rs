@@ -184,6 +184,11 @@ pub struct MeshAuthz {
     /// than the route's own (`node_waypoint_route_branches`, issue #7383),
     /// keyed by the route proxy's `(namespace, id)`. Empty off NodeWaypoint.
     node_waypoint_route_branches: NamespacedUpstreamMap<Arc<NodeWaypointRouteBranches>>,
+    /// Whether any branch table records verdicts even when no policy is
+    /// loaded (a weighted-split route, issue #7387). Precomputed so a
+    /// generation without such a route and without policies never looks a
+    /// table up.
+    route_branches_evaluate_always: bool,
     /// Distinct lowercase request-header names referenced by any loaded
     /// `to.headers` predicate, precomputed at construction. The request path
     /// resolves ONLY these names (via [`http_request_header_value`]) instead of
@@ -584,6 +589,17 @@ struct NodeWaypointRouteBranchConfig {
     proxy_id: String,
     #[serde(deserialize_with = "crate::util::json_object::deserialize_object_vec")]
     destinations: Vec<NodeWaypointRouteBranchDestinationConfig>,
+    /// The route reaches some candidates only through weighted-split leg
+    /// selection (issue #7387): verdicts are recorded even when no policy is
+    /// loaded, so a split no leg was selected for is refused at both
+    /// enforcement points.
+    #[serde(default)]
+    weighted_split: bool,
+    /// The route's own destination (candidate 0) is a weighted split. No
+    /// request reaches it unselected, so it is never judged or admitted; each
+    /// leg's own verdict decides the requests that reach that leg.
+    #[serde(default)]
+    own_is_weighted_split: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -675,6 +691,12 @@ struct NodeWaypointRouteBranch {
 /// verdicts it indexes.
 pub(crate) struct NodeWaypointRouteBranches {
     branches: Vec<NodeWaypointRouteBranch>,
+    /// Whether candidate 0 (the route's own destination) may be reached.
+    /// `false` when it is a weighted split (issue #7387): the dispatch
+    /// finalizer always replaces it with a leg.
+    own_admissible: bool,
+    /// Record verdicts even when no policy is loaded (a weighted-split route).
+    evaluate_always: bool,
     /// This waypoint's identity, for the policy-deny drilldown row a refused
     /// branch records when route dispatch selects it.
     deny_destination: Option<String>,
@@ -690,7 +712,7 @@ impl std::fmt::Debug for NodeWaypointRouteBranches {
 
 impl NodeWaypointRouteBranches {
     fn position(&self, destination: NodeWaypointBranchDestination<'_>) -> Option<usize> {
-        match destination {
+        let index = match destination {
             NodeWaypointBranchDestination::Own => Some(0),
             NodeWaypointBranchDestination::Upstream(upstream_id) => self
                 .branches
@@ -701,7 +723,10 @@ impl NodeWaypointRouteBranches {
                 .iter()
                 .position(|branch| branch.key.is_backend(host, port)),
             NodeWaypointBranchDestination::Unknown => None,
-        }
+        };
+        // A weighted-split own destination is never reached unselected: it
+        // has no verdict, so reaching it is refused.
+        index.filter(|index| *index != 0 || self.own_admissible)
     }
 }
 
@@ -3369,6 +3394,7 @@ impl MeshAuthz {
             node_waypoint_capture_destination_scopes,
             has_route_upstream_metadata,
             node_waypoint_route_branches: NamespacedUpstreamMap::default(),
+            route_branches_evaluate_always: false,
             header_rule_names,
             relay_policy_superset_header_rule_names,
             trust_domain_aliases,
@@ -3384,6 +3410,9 @@ impl MeshAuthz {
             udp_principal_pod_mismatch_warn_last_ms: std::sync::atomic::AtomicU64::new(0),
         };
         if per_pod_policy_scoping {
+            authz.route_branches_evaluate_always = route_branch_configs
+                .iter()
+                .any(|config| config.weighted_split || config.own_is_weighted_split);
             authz.node_waypoint_route_branches = authz.route_branch_tables(route_branch_configs);
         }
         Ok(authz)
@@ -3441,6 +3470,8 @@ impl MeshAuthz {
                 config.proxy_id,
                 Arc::new(NodeWaypointRouteBranches {
                     branches,
+                    own_admissible: !config.own_is_weighted_split,
+                    evaluate_always: config.weighted_split || config.own_is_weighted_split,
                     deny_destination: self.slice.workload_spiffe_id.clone(),
                 }),
             );
@@ -4147,6 +4178,15 @@ impl MeshAuthz {
         source_for_log: Option<&str>,
     ) -> Option<bool> {
         let (mut record, mut pending) = self.route_branch_record(table, request, source_scope);
+        if !table.own_admissible {
+            // The own destination is a weighted split (issue #7387): it is
+            // never reached unselected, so it has no verdict, and the request
+            // always continues to dispatch, where the selected leg's own
+            // verdict (and only its CUSTOM check) decides, even when every
+            // leg refuses. Nothing is stamped.
+            self.install_route_branch_record(ctx, record, pending, request, source_for_log);
+            return Some(false);
+        }
         let (own_allowed, own_outcome, own_pending) =
             branch_outcome_from_evaluation(evaluation.clone());
         if !own_allowed && record.allowed == 0 {
@@ -5080,8 +5120,10 @@ impl Plugin for MeshAuthz {
         // the destination port), so candidates are evaluated whenever one is
         // loaded. A request with no source scope is still admitted only by
         // the census below and judged mesh-wide, like the own destination.
+        // A weighted-split route (issue #7387) records verdicts even with no
+        // policy loaded, so a split no leg was selected for is never admitted.
         let route_branches = if self.per_pod_policy_scoping
-            && !self.slice.mesh_policies.is_empty()
+            && (!self.slice.mesh_policies.is_empty() || self.route_branches_evaluate_always)
             && !relay_policy_superset_request
             && !connect_relay
             && !asserted_identity_rejected
@@ -5090,9 +5132,15 @@ impl Plugin for MeshAuthz {
             ctx.matched_proxy
                 .as_ref()
                 .and_then(|proxy| self.route_branch_table_for_proxy(proxy))
+                .filter(|table| !self.slice.mesh_policies.is_empty() || table.evaluate_always)
         } else {
             None
         };
+        // The route's own destination is a weighted split no request reaches
+        // unselected (issue #7387): it is not evaluated, each leg is.
+        let own_is_weighted_split = route_branches
+            .as_ref()
+            .is_some_and(|table| !table.own_admissible);
         let branch_source_scope = route_branches
             .as_ref()
             .and_then(|_| ctx.node_waypoint_policy_scope.clone());
@@ -5240,12 +5288,21 @@ impl Plugin for MeshAuthz {
                 && let Some(destination_scope_match) = destination_scope_match
             {
                 authorized_destination = Some(destination_scope_match.authorized_destination);
-                evaluate_destination_policy_scopes(
-                    &self.slice.mesh_policies,
-                    destination_scope_match.scopes,
-                    self.waypoint_attachment(),
-                    &request,
-                )
+                if own_is_weighted_split {
+                    // Never used: `defer_route_branches` judges the legs.
+                    MeshAuthzEvaluation {
+                        custom: None,
+                        custom_provider_conflict: false,
+                        decision: MeshAuthzDecision::Allow,
+                    }
+                } else {
+                    evaluate_destination_policy_scopes(
+                        &self.slice.mesh_policies,
+                        destination_scope_match.scopes,
+                        self.waypoint_attachment(),
+                        &request,
+                    )
+                }
             } else {
                 scope_missing = ctx.node_waypoint_policy_scope.is_none();
                 // Fail closed when scoped policies exist and this request's pod has
@@ -5304,15 +5361,20 @@ impl Plugin for MeshAuthz {
                             &mut request,
                             branch_source_scope.as_deref(),
                         );
-                        if record.allowed != 0 {
-                            record.evaluated |= 1;
-                            record.outcomes.push((
-                                0,
-                                NodeWaypointBranchOutcome::Deny {
-                                    policy: "destination_scope_missing".to_string(),
-                                    kind: NodeWaypointBranchDenyKind::DestinationScopeMissing,
-                                },
-                            ));
+                        // A weighted-split own destination is never reached,
+                        // so its missing scope refuses nothing: the selected
+                        // leg's own verdict decides.
+                        if record.allowed != 0 || own_is_weighted_split {
+                            if !own_is_weighted_split {
+                                record.evaluated |= 1;
+                                record.outcomes.push((
+                                    0,
+                                    NodeWaypointBranchOutcome::Deny {
+                                        policy: "destination_scope_missing".to_string(),
+                                        kind: NodeWaypointBranchDenyKind::DestinationScopeMissing,
+                                    },
+                                ));
+                            }
                             self.install_route_branch_record(
                                 ctx,
                                 record,

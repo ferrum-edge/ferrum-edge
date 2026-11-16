@@ -295,6 +295,16 @@ pub(super) fn contract(name: &str) -> Option<PluginConfigContract> {
                     }
                 }]
             }),
+            json!({
+                "rules": [],
+                "weighted_splits": [{
+                    "upstream_id": "split",
+                    "legs": [
+                        {"upstream_id": "reviews", "weight": 90},
+                        {"upstream_id": "ratings", "weight": 10, "originate_tls": true}
+                    ]
+                }]
+            }),
         ])
         // Header and query-parameter match maps are keyed by request field
         // names; each matcher value is still walked and probed.

@@ -442,6 +442,10 @@ fn warn_if_cors_ws_origin_policy_gap(proxy: &Proxy, merged: &[Arc<dyn Plugin>]) 
 /// match nor an override from an earlier routing plugin.
 struct MeshRouteDispatchFinalizer {
     priority: u16,
+    /// The chain's dispatch instances that carry weighted-split tables (issue
+    /// #7387), collected once when the chain is assembled. Each is asked per
+    /// request, so an instance its trigger skipped selects nothing.
+    weighted_split_instances: Vec<Arc<dyn Plugin>>,
 }
 
 #[async_trait]
@@ -477,6 +481,12 @@ impl Plugin for MeshRouteDispatchFinalizer {
         true
     }
 
+    /// A chain whose dispatch instances carry weighted splits (issue #7387)
+    /// has its split resolved to a leg here, which moves the destination.
+    fn modifies_request_destination(&self) -> bool {
+        !self.weighted_split_instances.is_empty()
+    }
+
     async fn before_proxy(
         &self,
         ctx: &mut RequestContext,
@@ -487,6 +497,16 @@ impl Plugin for MeshRouteDispatchFinalizer {
             && !ctx.has_route_overrides()
         {
             return crate::plugins::mesh_route_dispatch::reject_unmatched_result();
+        }
+        // Weighted split dispatched leg by leg (issue #7387): every instance
+        // has run, so the destination is final. When it is a weighted split,
+        // pick its leg now and route the request through the leg's own
+        // upstream, before the leg is judged below.
+        if let Some(refusal) = crate::plugins::mesh_route_dispatch::select_weighted_split_leg(
+            ctx,
+            &self.weighted_split_instances,
+        ) {
+            return refusal;
         }
         // NodeWaypoint per-destination authorization (issue #7383): every
         // instance has run, so the effective destination is final. Admit it
@@ -534,16 +554,23 @@ pub(crate) fn install_mesh_route_dispatch_finalizer(
         );
     }
 
+    let mut weighted_split_instances = Vec::new();
     for plugin in plugins
         .iter()
         .filter(|plugin| is_builtin_named(plugin, MESH_ROUTE_DISPATCH_NAME))
     {
         plugin.enable_deferred_unmatched_rejection();
+        if plugin.mesh_route_weighted_splits().is_some() {
+            weighted_split_instances.push(Arc::clone(plugin));
+        }
     }
     let priority = plugins[last_index].priority();
     plugins.insert(
         last_index + 1,
-        Arc::new(MeshRouteDispatchFinalizer { priority }),
+        Arc::new(MeshRouteDispatchFinalizer {
+            priority,
+            weighted_split_instances,
+        }),
     );
     Ok(())
 }
@@ -1920,6 +1947,21 @@ impl Plugin for PluginInstanceWrapper {
     }
     fn enable_deferred_unmatched_rejection(&self) {
         self.inner.enable_deferred_unmatched_rejection();
+    }
+    fn mesh_route_weighted_splits(
+        &self,
+    ) -> Option<Arc<crate::plugins::mesh_route_dispatch::MeshRouteWeightedSplits>> {
+        self.inner.mesh_route_weighted_splits()
+    }
+    /// Gated: a trigger-skipped instance resolves no weighted split.
+    fn mesh_route_weighted_splits_for_request(
+        &self,
+        ctx: &RequestContext,
+    ) -> Option<&crate::plugins::mesh_route_dispatch::MeshRouteWeightedSplits> {
+        if !self.runs_cached(ctx) {
+            return None;
+        }
+        self.inner.mesh_route_weighted_splits_for_request(ctx)
     }
     fn is_backend_admission_plugin(&self) -> bool {
         self.inner.is_backend_admission_plugin()
@@ -4545,13 +4587,19 @@ fn route_override_destination_fingerprint(pc: &PluginConfig) -> serde_json::Valu
                         .collect::<Vec<_>>()
                 })
                 .unwrap_or_default();
-            serde_json::json!({
+            let mut fingerprint = serde_json::json!({
                 "reject_unmatched": fingerprint_config
                     .get("reject_unmatched")
                     .and_then(serde_json::Value::as_bool)
                     .unwrap_or(false),
                 "rules": rules
-            })
+            });
+            // Weighted-split legs (issue #7387) are route-override
+            // destinations too.
+            if let Some(splits) = fingerprint_config.get("weighted_splits") {
+                fingerprint["weighted_splits"] = splits.clone();
+            }
+            fingerprint
         }
         "ai_stream_router" => {
             let enabled = pc
@@ -4713,15 +4761,14 @@ fn collect_route_override_destinations(
             }
         }
         "mesh_route_dispatch" => {
-            let Some(rules) = route_pc
+            // `rules` is optional when `weighted_splits` is set (issue
+            // #7387): never return before the legs below are walked.
+            for destination in route_pc
                 .config
                 .get("rules")
                 .and_then(serde_json::Value::as_array)
-            else {
-                return;
-            };
-            for destination in rules
-                .iter()
+                .into_iter()
+                .flatten()
                 .filter(|rule| rule.get("redirect").is_none_or(serde_json::Value::is_null))
                 .filter_map(|rule| {
                     rule.get("destination")
@@ -4761,6 +4808,32 @@ fn collect_route_override_destinations(
                 ) {
                     push_direct_route_key(keys, key_by, proxy, host, port);
                 }
+            }
+            // Weighted-split legs (issue #7387) are dispatched through their
+            // own upstreams exactly like a rule's `upstream_id`.
+            for leg_id in route_pc
+                .config
+                .get("weighted_splits")
+                .and_then(serde_json::Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(|split| split.get("legs").and_then(serde_json::Value::as_array))
+                .flatten()
+                .filter_map(|leg| leg.get("upstream_id").and_then(serde_json::Value::as_str))
+            {
+                let upstream = config.upstreams.iter().find(|upstream| {
+                    upstream.id == leg_id && upstream.namespace == proxy.namespace
+                });
+                push_upstream_route(
+                    keys,
+                    upstream_routes,
+                    adaptive_concurrency_scope(key_by, proxy, Some(leg_id)),
+                    &proxy.namespace,
+                    leg_id,
+                    None,
+                    proxy.backend_port,
+                    upstream,
+                );
             }
         }
         "ai_stream_router" => {

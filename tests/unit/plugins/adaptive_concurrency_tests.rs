@@ -1800,6 +1800,90 @@ fn adaptive_concurrency_route_override_change_resets_target_key_space() {
     drop(held);
 }
 
+/// Issue #7387 review round 2 (sol F3 = dsf F1): a `mesh_route_dispatch`
+/// config that carries only `weighted_splits` (no `rules` key) still makes
+/// each leg a route-override destination, so replacing a leg's target resets
+/// the tracked key space instead of leaving the new target untracked.
+#[test]
+fn adaptive_concurrency_weighted_leg_without_rules_resets_on_target_change() {
+    let mut config = cache_config(
+        "proxy",
+        json!({
+            "max_tracked_keys": 1,
+            "min_limit": 1,
+            "initial_limit": 1,
+            "max_limit": 1
+        }),
+    );
+    config.proxies[0].upstream_id = Some("split".to_string());
+    for (id, host) in [("split", "split.local"), ("leg", "first-leg.local")] {
+        config.upstreams.push(
+            serde_json::from_value(json!({
+                "id": id,
+                "namespace": "default",
+                "targets": [{"host": host, "port": 8080}]
+            }))
+            .expect("upstream should deserialize"),
+        );
+    }
+    config.plugin_configs.push(
+        serde_json::from_value(json!({
+            "id": "route-dispatch-1",
+            "namespace": "default",
+            "plugin_name": "mesh_route_dispatch",
+            "scope": "proxy_group",
+            "enabled": true,
+            "config": {
+                "weighted_splits": [{
+                    "upstream_id": "split",
+                    "legs": [{"upstream_id": "leg", "weight": 1}]
+                }]
+            }
+        }))
+        .expect("route dispatch config should deserialize"),
+    );
+    config.proxies[0].plugins.push(
+        serde_json::from_value(json!({"plugin_config_id": "route-dispatch-1"}))
+            .expect("route dispatch association should deserialize"),
+    );
+    let cache = PluginCache::new(&config).expect("initial cache should build");
+    let mut leg_proxy = config.proxies[0].clone();
+    leg_proxy.upstream_id = Some("leg".to_string());
+    let first_target = config.upstreams[1].targets[0].clone();
+    drop(expect_admitted(acquire_from_plugin(
+        &adaptive_plugin_from_cache(&cache),
+        &leg_proxy,
+        Some(&first_target),
+    )));
+
+    let mut reloaded = config.clone();
+    reloaded.upstreams[1].targets[0].host = "replacement-leg.local".to_string();
+    cache
+        .apply_delta(
+            &reloaded,
+            &HashSet::from([NamespacedResourceId::new("default", "proxy-1")]),
+            &[],
+            false,
+        )
+        .expect("leg target change should publish");
+
+    let replacement_plugin = adaptive_plugin_from_cache(&cache);
+    let mut replacement_proxy = reloaded.proxies[0].clone();
+    replacement_proxy.upstream_id = Some("leg".to_string());
+    let replacement_target = reloaded.upstreams[1].targets[0].clone();
+    let held = expect_admitted(acquire_from_plugin(
+        &replacement_plugin,
+        &replacement_proxy,
+        Some(&replacement_target),
+    ));
+    assert_rejected(acquire_from_plugin(
+        &replacement_plugin,
+        &replacement_proxy,
+        Some(&replacement_target),
+    ));
+    drop(held);
+}
+
 #[test]
 fn adaptive_concurrency_unchanged_upstream_subset_stays_compatible() {
     let mut config = cache_config(

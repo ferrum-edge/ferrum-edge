@@ -4345,6 +4345,16 @@ fn decode_http_route_set(
                     "Mesh slice HTTP route plugin config {index} has invalid ownership"
                 ));
             }
+            // Leg-by-leg dispatch of a weighted split (issue #7387) is decided
+            // by the data plane from its own slice view, never carried.
+            if plugin.plugin_name == "mesh_route_dispatch"
+                && plugin.config.get("weighted_splits").is_some()
+            {
+                return Err(anyhow::anyhow!(
+                    "Mesh slice HTTP route plugin config {index} carries data-plane-owned \
+                     `weighted_splits`"
+                ));
+            }
             Ok(plugin)
         })
         .collect::<Result<_, _>>()?;
@@ -4480,9 +4490,10 @@ impl CarriedRouteHostIndex {
 
 /// Whether a visible DestinationRule names this Service's host. A weighted
 /// split dials the Service's workloads through its own upstream, which a
-/// Service-host DestinationRule does not match, so such a split is refused
-/// instead of silently running without the rule (fail-closed; over-matching
-/// only refuses more).
+/// Service-host DestinationRule does not match, so a split naming such a
+/// Service is dispatched leg by leg through each Service's own (rule-bearing)
+/// upstream instead (issue #7387). Over-matching only sends more splits leg
+/// by leg, which applies the same policy.
 fn service_has_destination_rule(
     mesh_slice: &MeshSlice,
     namespace: &str,
@@ -4492,15 +4503,65 @@ fn service_has_destination_rule(
     let fqdn = format!(
         "{name}.{namespace}.svc.{}",
         cluster_domain.trim_matches('.')
-    )
-    .to_ascii_lowercase();
+    );
+    // A wildcard rule is never applied on the data plane, but naming the
+    // Service only sends the split leg by leg, which applies the same policy.
+    mesh_slice
+        .destination_rules
+        .iter()
+        .any(|rule| destination_rule_host_specificity(&rule.host, &rule.namespace, &fqdn).is_some())
+}
+
+/// The visible DestinationRules that name `host` exactly or as a Service
+/// alias: the rules DestinationRule application applies to it
+/// ([`destination_rule_host_matches`]). Every such rule is returned, whatever
+/// its tier: over-matching only sends more splits leg by leg or refuses more
+/// routes.
+fn destination_rules_naming_host<'a>(
+    mesh_slice: &'a MeshSlice,
+    host: &str,
+) -> impl Iterator<Item = &'a MeshDestinationRule> + use<'a> {
+    let host = host.to_string();
+    mesh_slice.destination_rules.iter().filter(move |rule| {
+        destination_rule_host_specificity(&rule.host, &rule.namespace, &host)
+            == Some(DestinationRuleHostSpecificity::Exact)
+    })
+}
+
+/// Whether a visible wildcard DestinationRule (`*`, `*.example.com`) covers
+/// external `host`. The data plane does not apply wildcard rules (that is
+/// its own feature), so a carried route cannot honour one, TLS origination
+/// included: a split leg or direct backend it covers is refused instead, and
+/// the host keeps its Service route, rather than dialed in plaintext.
+fn wildcard_destination_rule_covers_host(mesh_slice: &MeshSlice, host: &str) -> bool {
     mesh_slice.destination_rules.iter().any(|rule| {
-        let host = rule.host.trim().trim_end_matches('.').to_ascii_lowercase();
-        host == "*"
-            || host
-                .strip_prefix('*')
-                .is_some_and(|suffix| fqdn.ends_with(suffix))
-            || destination_rule_host_matches(&host, &rule.namespace, &fqdn)
+        matches!(
+            destination_rule_host_specificity(&rule.host, &rule.namespace, host),
+            Some(DestinationRuleHostSpecificity::Wildcard(_))
+        )
+    })
+}
+
+/// Whether a visible DestinationRule for external `host` asks the client to
+/// originate TLS on `port` (its `portLevelSettings` entry's `tls`, else its
+/// top-level `tls`, is `SIMPLE`, `MUTUAL` or `ISTIO_MUTUAL`). A carried route
+/// dials such a host directly over plain HTTP and no DestinationRule applies
+/// to a direct backend, so the route is refused instead (see
+/// [`bind_carried_http_routes_to_node_waypoint_transport`]). Over-matching
+/// (any naming rule) only refuses more.
+fn destination_rule_originates_tls_for_host(mesh_slice: &MeshSlice, host: &str, port: u16) -> bool {
+    destination_rules_naming_host(mesh_slice, host).any(|rule| {
+        let mode = rule
+            .port_level_settings
+            .get(&port)
+            .and_then(|policy| policy.tls.as_ref())
+            .or_else(|| {
+                rule.traffic_policy
+                    .as_ref()
+                    .and_then(|policy| policy.tls.as_ref())
+            })
+            .map(|tls| tls.mode);
+        client_tls_mode_originates(mode)
     })
 }
 
@@ -4518,22 +4579,40 @@ fn service_has_destination_rule(
 ///   becomes that upstream's id;
 /// * a weighted-split upstream's Service targets become the Service's
 ///   workload targets, each leg's weight divided across its workloads, with
-///   the Service attribution kept on every target. DestinationRule policy
-///   therefore applies per Service route, never across a split.
+///   the Service attribution kept on every target;
+/// * a weighted split that names a Service a DestinationRule governs is
+///   dispatched leg by leg instead (issue #7387): the route's
+///   `mesh_route_dispatch` instance gets the split's legs
+///   (`weighted_splits`), each the Service port's materialized upstream (which
+///   carries the DestinationRule) or, for an external host, a residual
+///   upstream holding only that host, and the dispatch finalizer picks a leg by weight
+///   once routing is final, so each leg gets exactly its own Service's policy.
+///   The split upstream keeps only its Service legs' workload targets, as the
+///   route's own destination identity; no request is dispatched through it,
+///   and RequestAuthentication scoping and authorization expand it into its
+///   legs. A split whose external host a DestinationRule names is dispatched
+///   leg by leg too, so that rule (its TLS origination included, see
+///   [`project_node_waypoint_leg_origination`]) applies to that host's
+///   residual leg alone instead of to the whole split.
 ///
 /// A route with a destination that is an in-cluster Service the slice does not
 /// model, or a modeled Service port with no materialized upstream, is dropped
 /// with its plugins, fail-closed; its host then gets the materialized Service
-/// route. External hosts are left as they are.
+/// route. So is a leg-dispatched route that cannot be represented (more legs
+/// or candidate destinations than authorization tracks, or a residual
+/// upstream id already in use), and a route with a direct external backend
+/// (its own, or a dispatch rule's) whose DestinationRule asks to originate
+/// TLS on that port: no DestinationRule applies to a direct backend, and the
+/// carried route would dial it in plaintext. So is a route with an external
+/// destination (a split leg or a direct backend) that a wildcard
+/// DestinationRule covers: the data plane does not apply wildcard rules, so
+/// that rule (TLS origination included) could not be honoured. Other external
+/// hosts are left as they are.
 fn bind_carried_http_routes_to_node_waypoint_transport(
     config: &mut GatewayConfig,
     runtime: &MeshRuntimeConfig,
     mesh_slice: &MeshSlice,
 ) {
-    use crate::config::types::{
-        UPSTREAM_TARGET_SERVICE_NAME_TAG, UPSTREAM_TARGET_SERVICE_NAMESPACE_TAG,
-        UPSTREAM_TARGET_SERVICE_PORT_TAG,
-    };
     if runtime.topology != MeshTopology::NodeWaypoint || mesh_slice.http_routes.is_empty() {
         return;
     }
@@ -4551,7 +4630,8 @@ fn bind_carried_http_routes_to_node_waypoint_transport(
     // 1. Weighted splits. Each leg is resolved to its dial targets first, then
     // ONE scale is applied to every leg (external legs included) so the
     // configured ratios survive, and each leg's share is divided across its
-    // targets.
+    // targets. A split naming a DestinationRule-governed Service also gets
+    // its legs for leg-by-leg dispatch.
     let split_ids: Vec<(String, String)> = config
         .upstreams
         .iter()
@@ -4563,7 +4643,12 @@ fn bind_carried_http_routes_to_node_waypoint_transport(
         .map(|upstream| (upstream.namespace.clone(), upstream.id.clone()))
         .collect();
     let mut failed_splits: HashSet<(String, String)> = HashSet::new();
-    let mut policy_refused_splits = 0usize;
+    // (namespace, split id) -> legs `(leg upstream id, weight)`.
+    let mut leg_dispatched: HashMap<(String, String), WeightedSplitLegs> = HashMap::new();
+    let mut residual_upstreams: Vec<Upstream> = Vec::new();
+    let mut unrepresentable_splits = 0usize;
+    // Splits and direct backends a wildcard DestinationRule covers.
+    let mut wildcard_destination_rule_refused = 0usize;
     for (namespace, id) in split_ids {
         let Some(split) = config
             .upstreams
@@ -4573,12 +4658,39 @@ fn bind_carried_http_routes_to_node_waypoint_transport(
             continue;
         };
         // (leg weight, dial targets for that leg)
-        let mut legs: Vec<(u32, Vec<crate::config::types::UpstreamTarget>)> = Vec::new();
+        let mut legs: Vec<(u32, Vec<UpstreamTarget>)> = Vec::new();
+        // Leg-by-leg dispatch: each Service port's upstream with its summed
+        // weight, and the external targets.
+        let mut service_legs: WeightedSplitLegs = Vec::new();
+        let mut external_targets: Vec<UpstreamTarget> = Vec::new();
+        // The Service legs' rebound targets alone: what a leg-dispatched
+        // split upstream keeps (see below).
+        let mut service_targets: Vec<(u32, Vec<UpstreamTarget>)> = Vec::new();
         let mut rebound = true;
         let mut governed_by_destination_rule = false;
+        let mut cross_namespace_leg = false;
+        let mut wildcard_covered = false;
         for target in &split.targets {
             match hosts.classify(&namespace, &target.host) {
-                CarriedRouteHost::External => legs.push((target.weight, vec![target.clone()])),
+                CarriedRouteHost::External => {
+                    // A wildcard rule covering the host cannot be applied,
+                    // so the split is refused rather than dialed in
+                    // plaintext past it.
+                    if wildcard_destination_rule_covers_host(mesh_slice, &target.host) {
+                        wildcard_covered = true;
+                    }
+                    // An external host's own DestinationRule (TLS
+                    // origination included) applies only to an upstream
+                    // holding that host alone: its residual leg.
+                    if destination_rules_naming_host(mesh_slice, &target.host)
+                        .next()
+                        .is_some()
+                    {
+                        governed_by_destination_rule = true;
+                    }
+                    legs.push((target.weight, vec![target.clone()]));
+                    external_targets.push(target.clone());
+                }
                 CarriedRouteHost::UnmodeledService => rebound = false,
                 CarriedRouteHost::Service(service_namespace, service_name) => {
                     if service_has_destination_rule(
@@ -4627,16 +4739,66 @@ fn bind_carried_http_routes_to_node_waypoint_transport(
                         rebound = false;
                         continue;
                     }
+                    // A leg is dispatched through its Service upstream by a
+                    // namespace-local route override, so a Service in another
+                    // namespace cannot be a leg.
+                    cross_namespace_leg |= service_namespace != namespace;
+                    match service_legs
+                        .iter_mut()
+                        .find(|(leg_id, _)| *leg_id == service_upstream_id)
+                    {
+                        Some(leg) => leg.1 = leg.1.saturating_add(target.weight),
+                        None => service_legs.push((service_upstream_id, target.weight)),
+                    }
+                    service_targets.push((target.weight, leg_targets.clone()));
                     legs.push((target.weight, leg_targets));
                 }
             }
         }
-        if governed_by_destination_rule {
-            policy_refused_splits += 1;
-        }
-        if !rebound || governed_by_destination_rule || legs.is_empty() {
+        if !rebound || legs.is_empty() {
             failed_splits.insert((namespace, id));
             continue;
+        }
+        if wildcard_covered {
+            wildcard_destination_rule_refused += 1;
+            failed_splits.insert((namespace, id));
+            continue;
+        }
+        if governed_by_destination_rule {
+            let first_external = external_targets.first().cloned();
+            let legs_for_dispatch = if cross_namespace_leg {
+                None
+            } else {
+                weighted_split_legs(config, split, service_legs, external_targets)
+            };
+            match legs_for_dispatch {
+                Some((split_legs, residuals)) => {
+                    residual_upstreams.extend(residuals);
+                    leg_dispatched.insert((namespace.clone(), id.clone()), split_legs);
+                    // A leg-dispatched split is never dialed: it is only the
+                    // route's own destination identity. It keeps the Service
+                    // legs' workload targets (for the destination indexes) and
+                    // drops its external hosts, which each residual upstream
+                    // carries alone. Left in place, they would make
+                    // DestinationRule application see one upstream spanning
+                    // hosts with different winning rules and refuse the whole
+                    // slice. A split with no Service leg keeps only its first
+                    // external host (an upstream needs a target; one host has
+                    // one winning rule set).
+                    legs = if service_targets.is_empty() {
+                        first_external
+                            .map(|target| vec![(target.weight, vec![target])])
+                            .unwrap_or_default()
+                    } else {
+                        service_targets
+                    };
+                }
+                None => {
+                    unrepresentable_splits += 1;
+                    failed_splits.insert((namespace, id));
+                    continue;
+                }
+            }
         }
         let targets = split_targets_with_common_scale(legs);
         let weighted = targets
@@ -4653,11 +4815,18 @@ fn bind_carried_http_routes_to_node_waypoint_transport(
             }
         }
     }
+    config.upstreams.extend(residual_upstreams);
 
     // 2. Route proxies and their dispatch rules.
     let mut dropped: HashSet<(String, String)> = HashSet::new();
     let mut upstream_updates: Vec<(usize, String)> = Vec::new();
     let mut rule_updates: Vec<(usize, usize, String)> = Vec::new();
+    // Routes that dispatch a weighted split leg by leg: (proxy index, the
+    // route's first `mesh_route_dispatch` instance if any, split ids).
+    let mut weighted_routes: Vec<(usize, Option<usize>, Vec<String>)> = Vec::new();
+    let mut oversized_weighted_routes = 0usize;
+    // Direct external backends a DestinationRule asks to dial over TLS.
+    let mut tls_origination_refused = 0usize;
     for index in 0..config.proxies.len() {
         let proxy = &config.proxies[index];
         if !config::is_virtual_service_http_route_proxy_id(&proxy.id) {
@@ -4669,15 +4838,47 @@ fn bind_carried_http_routes_to_node_waypoint_transport(
         let backend_port = proxy.backend_port;
         let mut keep = true;
         let mut proxy_upstream: Option<String> = None;
+        // Every destination the route can reach, as authorization lists
+        // candidates: the own destination, each weighted split's legs (never
+        // the split itself), and each rule destination.
+        let mut candidates: HashSet<String> = HashSet::new();
+        let mut route_splits: Vec<String> = Vec::new();
+        let note_split =
+            |split_id: &str, candidates: &mut HashSet<String>, route_splits: &mut Vec<String>| {
+                if let Some(legs) = leg_dispatched.get(&(namespace.clone(), split_id.to_string())) {
+                    candidates.extend(legs.iter().map(|(leg, _)| leg.clone()));
+                    if !route_splits.iter().any(|known| known == split_id) {
+                        route_splits.push(split_id.to_string());
+                    }
+                    true
+                } else {
+                    false
+                }
+            };
         match proxy.upstream_id.as_deref() {
             Some(upstream_id) => {
                 if failed_splits.contains(&(namespace.clone(), upstream_id.to_string())) {
                     keep = false;
                 }
+                candidates.insert(upstream_id.to_string());
+                note_split(upstream_id, &mut candidates, &mut route_splits);
             }
             None if !backend_host.is_empty() && backend_port != 0 => {
                 match hosts.classify(&namespace, &backend_host) {
-                    CarriedRouteHost::External => {}
+                    CarriedRouteHost::External => {
+                        if wildcard_destination_rule_covers_host(mesh_slice, &backend_host) {
+                            wildcard_destination_rule_refused += 1;
+                            keep = false;
+                        } else if destination_rule_originates_tls_for_host(
+                            mesh_slice,
+                            &backend_host,
+                            backend_port,
+                        ) {
+                            tls_origination_refused += 1;
+                            keep = false;
+                        }
+                        candidates.insert(format!("{backend_host}|{backend_port}"));
+                    }
                     CarriedRouteHost::UnmodeledService => keep = false,
                     CarriedRouteHost::Service(service_namespace, service_name) => {
                         match service_upstream(
@@ -4686,7 +4887,10 @@ fn bind_carried_http_routes_to_node_waypoint_transport(
                             &service_name,
                             backend_port,
                         ) {
-                            Some(id) => proxy_upstream = Some(id),
+                            Some(id) => {
+                                candidates.insert(id.clone());
+                                proxy_upstream = Some(id);
+                            }
                             None => keep = false,
                         }
                     }
@@ -4699,6 +4903,7 @@ fn bind_carried_http_routes_to_node_waypoint_transport(
             .iter()
             .map(|association| association.plugin_config_id.clone())
             .collect();
+        let mut route_dispatch_plugin: Option<usize> = None;
         let mut rule_rewrites: Vec<(usize, usize, String)> = Vec::new();
         for plugin_index in 0..config.plugin_configs.len() {
             let plugin = &config.plugin_configs[plugin_index];
@@ -4707,6 +4912,9 @@ fn bind_carried_http_routes_to_node_waypoint_transport(
                 || !dispatch_ids.contains(&plugin.id)
             {
                 continue;
+            }
+            if route_dispatch_plugin.is_none() && plugin.scope == PluginScope::Proxy {
+                route_dispatch_plugin = Some(plugin_index);
             }
             for (rule_index, rule) in plugin
                 .config
@@ -4726,6 +4934,9 @@ fn bind_carried_http_routes_to_node_waypoint_transport(
                     if failed_splits.contains(&(namespace.clone(), upstream_id.to_string())) {
                         keep = false;
                     }
+                    if !note_split(upstream_id, &mut candidates, &mut route_splits) {
+                        candidates.insert(upstream_id.to_string());
+                    }
                     continue;
                 }
                 let host = destination
@@ -4741,14 +4952,52 @@ fn bind_carried_http_routes_to_node_waypoint_transport(
                     continue;
                 }
                 match hosts.classify(&namespace, host) {
-                    CarriedRouteHost::External => {}
+                    CarriedRouteHost::External => {
+                        if wildcard_destination_rule_covers_host(mesh_slice, host) {
+                            wildcard_destination_rule_refused += 1;
+                            keep = false;
+                        } else if destination_rule_originates_tls_for_host(mesh_slice, host, port) {
+                            tls_origination_refused += 1;
+                            keep = false;
+                        }
+                        candidates.insert(format!("{host}|{port}"));
+                    }
                     CarriedRouteHost::UnmodeledService => keep = false,
                     CarriedRouteHost::Service(service_namespace, service_name) => {
                         match service_upstream(config, &service_namespace, &service_name, port) {
-                            Some(id) => rule_rewrites.push((plugin_index, rule_index, id)),
+                            Some(id) => {
+                                candidates.insert(id.clone());
+                                rule_rewrites.push((plugin_index, rule_index, id));
+                            }
                             None => keep = false,
                         }
                     }
+                }
+            }
+        }
+        if keep && !route_splits.is_empty() {
+            // Leg-by-leg dispatch is authorized per leg, so every candidate
+            // must fit the verdict table, and every split must fit the one
+            // dispatch instance's table; otherwise the route is refused (the
+            // host keeps its Service route) instead of the generated instance
+            // failing construction and refusing the whole generation.
+            if candidates.len() > crate::plugins::mesh::authz::MAX_NODE_WAYPOINT_ROUTE_BRANCHES
+                || route_splits.len() > crate::plugins::mesh_route_dispatch::MAX_WEIGHTED_SPLITS
+            {
+                oversized_weighted_routes += 1;
+                keep = false;
+            }
+            // A route without a dispatch instance gets one under the
+            // translator's id; refuse rather than reuse an id in use.
+            if route_dispatch_plugin.is_none() {
+                let carrier_id = weighted_split_dispatch_plugin_id(&proxy_id);
+                if config
+                    .plugin_configs
+                    .iter()
+                    .any(|plugin| plugin.namespace == namespace && plugin.id == carrier_id)
+                {
+                    keep = false;
+                    unrepresentable_splits += 1;
                 }
             }
         }
@@ -4760,6 +5009,9 @@ fn bind_carried_http_routes_to_node_waypoint_transport(
             upstream_updates.push((index, upstream_id));
         }
         rule_updates.extend(rule_rewrites);
+        if !route_splits.is_empty() {
+            weighted_routes.push((index, route_dispatch_plugin, route_splits));
+        }
     }
     for (index, upstream_id) in upstream_updates {
         if let Some(proxy) = config.proxies.get_mut(index) {
@@ -4786,14 +5038,82 @@ fn bind_carried_http_routes_to_node_waypoint_transport(
             serde_json::Value::String(upstream_id),
         );
     }
+    // Give each leg-dispatched route its legs, on its own dispatch instance
+    // (or a new one under the translator's id), so the dispatch finalizer of
+    // that route's chain resolves the split.
+    for (proxy_index, route_dispatch_plugin, route_splits) in weighted_routes {
+        let Some(proxy) = config.proxies.get(proxy_index) else {
+            continue;
+        };
+        let namespace = proxy.namespace.clone();
+        let proxy_id = proxy.id.clone();
+        let entries: Vec<serde_json::Value> = route_splits
+            .iter()
+            .filter_map(|split_id| {
+                let legs = leg_dispatched.get(&(namespace.clone(), split_id.clone()))?;
+                Some(serde_json::json!({
+                    "upstream_id": split_id,
+                    "legs": legs
+                        .iter()
+                        .map(|(leg, weight)| serde_json::json!({
+                            "upstream_id": leg,
+                            "weight": weight,
+                        }))
+                        .collect::<Vec<_>>(),
+                }))
+            })
+            .collect();
+        match route_dispatch_plugin.and_then(|index| config.plugin_configs.get_mut(index)) {
+            Some(plugin) => {
+                if let Some(plugin_config) = plugin.config.as_object_mut() {
+                    plugin_config.insert(
+                        "weighted_splits".to_string(),
+                        serde_json::Value::Array(entries),
+                    );
+                }
+            }
+            None => {
+                let now = chrono::Utc::now();
+                let plugin_id = weighted_split_dispatch_plugin_id(&proxy_id);
+                config.plugin_configs.push(PluginConfig {
+                    labels: Default::default(),
+                    id: plugin_id.clone(),
+                    plugin_name: "mesh_route_dispatch".to_string(),
+                    namespace: namespace.clone(),
+                    config: serde_json::json!({
+                        "rules": [],
+                        "weighted_splits": entries,
+                    }),
+                    scope: PluginScope::Proxy,
+                    proxy_id: Some(proxy_id),
+                    enabled: true,
+                    priority_override: None,
+                    trigger: None,
+                    api_spec_id: None,
+                    created_at: now,
+                    updated_at: now,
+                });
+                if let Some(proxy) = config.proxies.get_mut(proxy_index) {
+                    proxy.plugins.push(PluginAssociation {
+                        plugin_config_id: plugin_id,
+                    });
+                }
+            }
+        }
+    }
     if !dropped.is_empty() {
         warn!(
             routes = dropped.len(),
-            destination_rule_splits = policy_refused_splits,
+            unrepresentable_weighted_splits = unrepresentable_splits,
+            oversized_weighted_routes,
+            tls_origination_refused,
+            wildcard_destination_rule_refused,
             "NodeWaypoint VirtualService routes refused: a destination is an in-cluster Service \
-             this waypoint cannot reach over its mesh transport, or a weighted split names a \
-             Service governed by a DestinationRule; their hosts use the materialized Service \
-             routes"
+             this waypoint cannot reach over its mesh transport, a weighted split that must \
+             be dispatched leg by leg cannot be represented, a direct external backend's \
+             DestinationRule asks for TLS origination a direct backend cannot carry, or a \
+             wildcard DestinationRule (not applied on the data plane) covers an external \
+             destination; their hosts use the materialized Service routes"
         );
         config
             .proxies
@@ -4804,9 +5124,10 @@ fn bind_carried_http_routes_to_node_waypoint_transport(
             })
         });
     }
-    // Prune carried split upstreams no surviving route or dispatch rule names
-    // (failed splits included): a leftover still names Service DNS hosts and
-    // would reach DestinationRule application.
+    // Prune carried split upstreams (and residual external legs) no surviving
+    // route, dispatch rule or weighted split names (failed splits included):
+    // a leftover still names Service DNS hosts and would reach
+    // DestinationRule application.
     let mut referenced_splits: HashSet<(String, String)> = config
         .proxies
         .iter()
@@ -4843,6 +5164,61 @@ fn bind_carried_http_routes_to_node_waypoint_transport(
     }
 }
 
+/// A leg-dispatched split's legs: `(leg upstream id, weight)` (issue #7387).
+type WeightedSplitLegs = Vec<(String, u32)>;
+
+/// The `mesh_route_dispatch` instance id a leg-dispatched carried route gets
+/// when it has none: the translator's own id for that route's instance.
+fn weighted_split_dispatch_plugin_id(proxy_id: &str) -> String {
+    format!("istio-vs-mrd-{proxy_id}")
+}
+
+/// The residual upstream holding external host `index` of a leg-dispatched
+/// split (issue #7387). A clash with any existing id refuses the split.
+fn weighted_split_external_upstream_id(split_id: &str, index: usize) -> String {
+    format!("{split_id}-external-{index}")
+}
+
+/// The legs of a weighted split dispatched leg by leg (issue #7387): each
+/// Service port's materialized upstream with its configured weight (summed
+/// when several split targets name one Service port), plus one residual
+/// upstream per external host, a copy of the split holding only that target
+/// (so it keeps the split's upstream settings, a DestinationRule for that
+/// host applies to it, and authorization judges it on that host's own port).
+/// `None` when the split cannot be represented: too many legs, or a residual
+/// id already in use.
+fn weighted_split_legs(
+    config: &GatewayConfig,
+    split: &Upstream,
+    mut legs: WeightedSplitLegs,
+    external_targets: Vec<UpstreamTarget>,
+) -> Option<(WeightedSplitLegs, Vec<Upstream>)> {
+    let mut residuals = Vec::with_capacity(external_targets.len());
+    for (index, target) in external_targets.into_iter().enumerate() {
+        let residual_id = weighted_split_external_upstream_id(&split.id, index);
+        if config
+            .upstreams
+            .iter()
+            .any(|upstream| upstream.namespace == split.namespace && upstream.id == residual_id)
+        {
+            return None;
+        }
+        legs.push((residual_id.clone(), target.weight));
+        let mut upstream = split.clone();
+        upstream.id = residual_id.clone();
+        upstream.name = Some(residual_id);
+        upstream.targets = vec![target];
+        residuals.push(upstream);
+    }
+    if legs.is_empty()
+        || legs.len() > crate::plugins::mesh_route_dispatch::MAX_WEIGHTED_SPLIT_LEGS
+        || legs.iter().any(|(_, weight)| *weight == 0)
+    {
+        return None;
+    }
+    Some((legs, residuals))
+}
+
 /// Give the managed `mesh_authz` instance every carried VirtualService route's
 /// candidate destinations (`node_waypoint_route_branches`, issue #7383).
 ///
@@ -4859,8 +5235,16 @@ fn bind_carried_http_routes_to_node_waypoint_transport(
 /// [`crate::plugins::mesh::authz::MAX_NODE_WAYPOINT_ROUTE_BRANCHES`] candidates
 /// is left out too, so its other branches stay refused (fail closed).
 ///
+/// A weighted split dispatched leg by leg (`weighted_splits`, issue #7387) is
+/// never a candidate itself: each of its legs is, so the leg the dispatch
+/// finalizer selects is judged on its own verdict. Such a route is always
+/// listed (`weighted_split`), and when the split is the route's own
+/// destination, candidate 0 is marked never reachable
+/// (`own_is_weighted_split`).
+///
 /// Without the managed instance (an operator global `mesh_authz` replaced
-/// it) nothing is threaded and the blanket refusal stays.
+/// it) nothing is threaded and the blanket refusal stays: a selected leg is
+/// then held to the same single-destination guard as a matched rule.
 fn thread_node_waypoint_route_branches_to_authz(
     config: &mut GatewayConfig,
     runtime: &MeshRuntimeConfig,
@@ -4891,6 +5275,9 @@ fn thread_node_waypoint_route_branches_to_authz(
         .map(|plugin| &plugin.config)
         .collect();
     let mut entries: Vec<serde_json::Value> = Vec::new();
+    // Residual external legs of leg-dispatched splits (issue #7387): route
+    // upstreams created after `node_waypoint_route_upstreams` was written.
+    let mut route_upstream_legs: HashSet<(String, String)> = HashSet::new();
     let mut oversized_routes = 0usize;
     for proxy in &config.proxies {
         if !config::is_virtual_service_http_route_proxy_id(&proxy.id) {
@@ -4907,7 +5294,7 @@ fn thread_node_waypoint_route_branches_to_authz(
             None => continue,
         };
         let mut destinations = vec![own];
-        let dispatch_configs = proxy
+        let dispatch_configs: Vec<&serde_json::Value> = proxy
             .plugins
             .iter()
             .filter_map(|association| {
@@ -4918,7 +5305,63 @@ fn thread_node_waypoint_route_branches_to_authz(
                     ))
                     .copied()
             })
-            .chain(global_route_dispatch.iter().copied());
+            .chain(global_route_dispatch.iter().copied())
+            .collect();
+        // The weighted splits these instances dispatch leg by leg.
+        let weighted_splits: Vec<&serde_json::Value> = dispatch_configs
+            .iter()
+            .copied()
+            .flat_map(|dispatch| {
+                dispatch
+                    .get("weighted_splits")
+                    .and_then(serde_json::Value::as_array)
+                    .into_iter()
+                    .flatten()
+            })
+            .collect();
+        let split_legs = |upstream_id: &str| {
+            weighted_splits
+                .iter()
+                .find(|split| {
+                    split.get("upstream_id").and_then(serde_json::Value::as_str)
+                        == Some(upstream_id)
+                })
+                .map(|split| {
+                    split
+                        .get("legs")
+                        .and_then(serde_json::Value::as_array)
+                        .into_iter()
+                        .flatten()
+                        .filter_map(|leg| {
+                            leg.get("upstream_id").and_then(serde_json::Value::as_str)
+                        })
+                        .map(|leg| serde_json::json!({ "upstream_id": leg }))
+                        .collect::<Vec<_>>()
+                })
+        };
+        let own_is_weighted_split =
+            proxy
+                .upstream_id
+                .as_deref()
+                .is_some_and(|upstream_id| match split_legs(upstream_id) {
+                    Some(legs) => {
+                        for leg in legs {
+                            if !destinations.contains(&leg) {
+                                destinations.push(leg);
+                            }
+                        }
+                        true
+                    }
+                    None => false,
+                });
+        let mut weighted_split = own_is_weighted_split;
+        for leg in destinations.iter().skip(1) {
+            if let Some(leg) = leg.get("upstream_id").and_then(serde_json::Value::as_str)
+                && leg.starts_with(slice::VIRTUAL_SERVICE_HTTP_ROUTE_UPSTREAM_ID_PREFIX)
+            {
+                route_upstream_legs.insert((proxy.namespace.clone(), leg.to_string()));
+            }
+        }
         for dispatch in dispatch_configs {
             for destination in dispatch
                 .get("rules")
@@ -4937,6 +5380,21 @@ fn thread_node_waypoint_route_branches_to_authz(
                     .get("backend_port")
                     .and_then(serde_json::Value::as_u64)
                     .and_then(|port| u16::try_from(port).ok());
+                // A weighted split is reached only through its legs.
+                if let Some(legs) = upstream_id.and_then(split_legs) {
+                    weighted_split = true;
+                    for leg in legs {
+                        if let Some(id) = leg.get("upstream_id").and_then(serde_json::Value::as_str)
+                            && id.starts_with(slice::VIRTUAL_SERVICE_HTTP_ROUTE_UPSTREAM_ID_PREFIX)
+                        {
+                            route_upstream_legs.insert((proxy.namespace.clone(), id.to_string()));
+                        }
+                        if !destinations.contains(&leg) {
+                            destinations.push(leg);
+                        }
+                    }
+                    continue;
+                }
                 // `mesh_route_dispatch` refuses any other shape at
                 // construction; an empty destination keeps the route's own.
                 let candidate = match (upstream_id, backend_host, backend_port) {
@@ -4954,18 +5412,25 @@ fn thread_node_waypoint_route_branches_to_authz(
                 }
             }
         }
-        if destinations.len() < 2 {
+        if destinations.len() < 2 && !weighted_split {
             continue;
         }
         if destinations.len() > crate::plugins::mesh::authz::MAX_NODE_WAYPOINT_ROUTE_BRANCHES {
             oversized_routes += 1;
             continue;
         }
-        entries.push(serde_json::json!({
+        let mut entry = serde_json::json!({
             "namespace": proxy.namespace,
             "proxy_id": proxy.id,
             "destinations": destinations,
-        }));
+        });
+        if weighted_split {
+            entry["weighted_split"] = serde_json::Value::Bool(true);
+        }
+        if own_is_weighted_split {
+            entry["own_is_weighted_split"] = serde_json::Value::Bool(true);
+        }
+        entries.push(entry);
     }
     if oversized_routes > 0 {
         warn!(
@@ -4987,6 +5452,27 @@ fn thread_node_waypoint_route_branches_to_authz(
     let Some(authz_config) = authz.config.as_object_mut() else {
         return;
     };
+    // Index each residual external leg like every other route upstream, so
+    // its candidate is judged on its own host and port.
+    if !route_upstream_legs.is_empty()
+        && let Some(route_upstreams) = authz_config
+            .get_mut("node_waypoint_route_upstreams")
+            .and_then(serde_json::Value::as_array_mut)
+    {
+        for upstream in &config.upstreams {
+            if !route_upstream_legs.contains(&(upstream.namespace.clone(), upstream.id.clone())) {
+                continue;
+            }
+            let listed = route_upstreams.iter().any(|entry| {
+                entry.get("id").and_then(serde_json::Value::as_str) == Some(upstream.id.as_str())
+                    && entry.get("namespace").and_then(serde_json::Value::as_str)
+                        == Some(upstream.namespace.as_str())
+            });
+            if !listed {
+                route_upstreams.push(node_waypoint_authz_route_upstream(upstream));
+            }
+        }
+    }
     if entries.is_empty() {
         authz_config.remove("node_waypoint_route_branches");
     } else {
@@ -9230,6 +9716,118 @@ pub(crate) fn mesh_external_udp_upstream_id(
         .replace(['/', '.', ':'], "-")
 }
 
+/// Where a DestinationRule's top-level `connectTimeout` is projected onto
+/// upstream port slots instead of onto the referencing proxies (issue #7387).
+///
+/// A route override (a `mesh_route_dispatch` rule destination or a
+/// weighted-split leg) changes the request's upstream but keeps the route
+/// proxy's own connect timeout, and re-resolves only the destination's
+/// `port_overrides`. So, for every upstream a route can reach that way (and
+/// the own upstream of every route that carries a proxy-scoped dispatch
+/// instance), the timeout lands on the upstream's port slots, and those
+/// routes keep their route-owned connect timeout: each destination then
+/// carries exactly its own rule's timeout, and a destination whose rule sets
+/// none falls back to the route's own value, never to another destination's
+/// rule. An upstream a subset-bound proxy references keeps the proxy-level
+/// projection (a port slot would outrank that subset's own connect timeout).
+struct RouteOverrideConnectTimeouts {
+    upstreams: HashMap<String, HashSet<String>>,
+    proxies: HashMap<String, HashSet<String>>,
+}
+
+impl RouteOverrideConnectTimeouts {
+    fn new(config: &GatewayConfig) -> Self {
+        let mut upstreams: HashMap<String, HashSet<String>> = HashMap::new();
+        let mut proxies: HashMap<String, HashSet<String>> = HashMap::new();
+        for plugin in &config.plugin_configs {
+            if !plugin.enabled || plugin.plugin_name != "mesh_route_dispatch" {
+                continue;
+            }
+            let named = slice::mesh_route_dispatch_rule_upstream_ids(&plugin.config);
+            for id in &named {
+                upstreams
+                    .entry(plugin.namespace.clone())
+                    .or_default()
+                    .insert((*id).to_string());
+            }
+            // Every route the instance effectively runs on, resolved as the
+            // plugin cache resolves it: a proxy-scoped instance names its
+            // proxy; a global or proxy-group instance reaches every proxy it
+            // attaches to and that no same-type scoped instance replaces.
+            let effective: Vec<&Proxy> = match plugin.scope {
+                PluginScope::Proxy => plugin
+                    .proxy_id
+                    .as_deref()
+                    .and_then(|proxy_id| {
+                        config.proxies.iter().find(|proxy| {
+                            proxy.namespace == plugin.namespace && proxy.id == proxy_id
+                        })
+                    })
+                    .into_iter()
+                    .collect(),
+                PluginScope::Global | PluginScope::ProxyGroup => config
+                    .proxies
+                    .iter()
+                    .filter(|proxy| {
+                        crate::plugin_cache::plugin_config_effectively_applies_to_proxy(
+                            plugin, proxy, config,
+                        )
+                    })
+                    .collect(),
+            };
+            for proxy in effective {
+                // An override resolves in the reached route's namespace.
+                let reachable = upstreams.entry(proxy.namespace.clone()).or_default();
+                reachable.extend(named.iter().map(|id| (*id).to_string()));
+                if let Some(upstream_id) = proxy.upstream_id.as_deref() {
+                    upstreams
+                        .entry(proxy.namespace.clone())
+                        .or_default()
+                        .insert(upstream_id.to_string());
+                }
+                proxies
+                    .entry(proxy.namespace.clone())
+                    .or_default()
+                    .insert(proxy.id.clone());
+            }
+        }
+        for proxy in &config.proxies {
+            if proxy.upstream_subset.is_some() {
+                if let Some(upstream_id) = proxy.upstream_id.as_deref()
+                    && let Some(ids) = upstreams.get_mut(proxy.namespace.as_str())
+                {
+                    ids.remove(upstream_id);
+                }
+                if let Some(ids) = proxies.get_mut(proxy.namespace.as_str()) {
+                    ids.remove(proxy.id.as_str());
+                }
+            }
+        }
+        Self { upstreams, proxies }
+    }
+
+    /// Whether `upstream_id` carries the rule's top-level timeout on its port
+    /// slots.
+    fn projects_onto(&self, namespace: &str, upstream_id: &str) -> bool {
+        self.upstreams
+            .get(namespace)
+            .is_some_and(|ids| ids.contains(upstream_id))
+    }
+
+    /// Whether `proxy` keeps its route-owned connect timeout: it can reach
+    /// other destinations through a route override, and its own upstream
+    /// carries the rule's timeout on its port slots instead.
+    fn keeps_route_timeout(&self, proxy: &Proxy) -> bool {
+        self.proxies
+            .get(proxy.namespace.as_str())
+            .is_some_and(|ids| ids.contains(proxy.id.as_str()))
+            && proxy
+                .upstream_id
+                .as_deref()
+                .is_some_and(|upstream_id| self.projects_onto(&proxy.namespace, upstream_id))
+    }
+}
+
 /// True for the mesh egress upstream families that no `config.proxies` entry
 /// references: each is dialed only through a relay proxy the router table
 /// synthesizes, which reads per-port DestinationRule policy from its
@@ -11413,6 +12011,13 @@ pub(crate) fn apply_destination_rules_with_tenant_file_roots(
         .collect();
     sorted_destination_rules
         .sort_by(|a, b| (&a.namespace, &a.name, &a.host).cmp(&(&b.namespace, &b.name, &b.host)));
+    let route_override_timeouts = RouteOverrideConnectTimeouts::new(config);
+    // Top-level `connectTimeout` projected onto port slots, by upstream index:
+    // the LAST matching rule's value (the sorted application order, like the
+    // proxy-level projection), seeded once every rule has applied so an
+    // earlier rule's seed never shadows a later one, and only onto slots no
+    // `portLevelSettings.connectTimeout` set.
+    let mut seeded_connect_timeouts: HashMap<usize, u64> = HashMap::new();
 
     // Owning Service port per materialized per-port outbound upstream
     // (forward-derived from the slice, like `mesh_outbound_service_groups`).
@@ -12058,26 +12663,21 @@ pub(crate) fn apply_destination_rules_with_tenant_file_roots(
             // Per-port entries written above already win (only unset slots are
             // seeded). HTTP upstreams are deliberately not seeded: they reach
             // config proxies below, and a seeded port slot would outrank a
-            // selected subset's `connectTimeout` there. Keyed by the selected
-            // target's policy port because the relay dials receive both the dial
-            // app port and the owning Service-port policy key for
-            // targetPort-remapped services.
+            // selected subset's `connectTimeout` there. The exception is an
+            // upstream a request reaches through a route override (a
+            // `mesh_route_dispatch` rule destination or weighted-split leg,
+            // issue #7387) and no subset-bound proxy references: the override
+            // keeps the route proxy's own connect timeout and re-resolves only
+            // the destination's `port_overrides`, so without the seed the
+            // top-level connectTimeout would not follow the request there.
+            // Keyed by the selected target's policy port because the relay
+            // dials receive both the dial app port and the owning Service-port
+            // policy key for targetPort-remapped services.
             if let Some(timeout_ms) = connect_timeout_ms
-                && is_proxyless_mesh_relay_upstream_id(&upstream.id)
+                && (is_proxyless_mesh_relay_upstream_id(&upstream.id)
+                    || route_override_timeouts.projects_onto(&upstream.namespace, &upstream.id))
             {
-                let mut target_policy_ports: Vec<u16> = upstream
-                    .targets
-                    .iter()
-                    .map(UpstreamTarget::dispatch_policy_port)
-                    .collect();
-                target_policy_ports.sort_unstable();
-                target_policy_ports.dedup();
-                for port in target_policy_ports {
-                    let slot = upstream.port_overrides.entry(port).or_default();
-                    if slot.connect_timeout_ms.is_none() {
-                        slot.connect_timeout_ms = Some(timeout_ms);
-                    }
-                }
+                seeded_connect_timeouts.insert(idx, timeout_ms);
             }
 
             // Per-subset `connectionPool.tcp.connectTimeout` overrides the DR
@@ -12109,6 +12709,10 @@ pub(crate) fn apply_destination_rules_with_tenant_file_roots(
                 for proxy in &mut config.proxies {
                     if proxy.upstream_id.as_deref() != Some(upstream_id.as_str())
                         || proxy.namespace != upstream_namespace
+                        // A route that can reach other destinations keeps its
+                        // own timeout; its upstream's port slots carry this
+                        // rule's (issue #7387).
+                        || route_override_timeouts.keeps_route_timeout(proxy)
                     {
                         continue;
                     }
@@ -12200,6 +12804,30 @@ pub(crate) fn apply_destination_rules_with_tenant_file_roots(
         }
     }
 
+    // Seed each projected top-level `connectTimeout` (see
+    // `seeded_connect_timeouts`) onto every target policy port without an
+    // explicit per-port timeout. Keyed by the selected target's policy port
+    // because the dials receive both the dial app port and the owning
+    // Service-port policy key for targetPort-remapped services.
+    for (idx, timeout_ms) in seeded_connect_timeouts {
+        let Some(upstream) = config.upstreams.get_mut(idx) else {
+            continue;
+        };
+        let mut target_policy_ports: Vec<u16> = upstream
+            .targets
+            .iter()
+            .map(UpstreamTarget::dispatch_policy_port)
+            .collect();
+        target_policy_ports.sort_unstable();
+        target_policy_ports.dedup();
+        for port in target_policy_ports {
+            let slot = upstream.port_overrides.entry(port).or_default();
+            if slot.connect_timeout_ms.is_none() {
+                slot.connect_timeout_ms = Some(timeout_ms);
+            }
+        }
+    }
+
     if refused_out_of_lookup_path > 0 {
         // Bounded and value-free: only the count and the subscriber's own
         // namespace. A slice-built path refuses these at admission, so
@@ -12228,8 +12856,87 @@ pub(crate) fn apply_destination_rules_with_tenant_file_roots(
     }
 
     project_egress_gateway_origination(config, runtime, mesh_slice, &applied_client_tls_modes);
+    project_node_waypoint_leg_origination(config, runtime, &applied_client_tls_modes);
 
     Ok(())
+}
+
+/// Let the DestinationRule drive the backend scheme of every external
+/// weighted-split leg a NodeWaypoint carried route dispatches (issue #7387,
+/// Istio semantics).
+///
+/// A leg-dispatched split sends each external host through its own residual
+/// upstream (`<split>-external-<n>`, one target), where that host's
+/// DestinationRule applied its TLS material. Carried routes are plain HTTP,
+/// so once rules have applied, a residual whose effective `tls.mode` on its
+/// target's port (the `portLevelSettings` entry, else the top-level `tls`) is
+/// `SIMPLE`, `MUTUAL` or `ISTIO_MUTUAL` gets `originate_tls` on every leg
+/// naming it: when the dispatch finalizer selects that leg it publishes the
+/// `https` scheme beside the upstream override, so the request originates TLS
+/// with the residual's own backend TLS. `DISABLE` or no `tls` keeps the leg
+/// plaintext. Service legs are never marked: they ride the mesh transport.
+fn project_node_waypoint_leg_origination(
+    config: &mut GatewayConfig,
+    runtime: &MeshRuntimeConfig,
+    applied: &HashMap<usize, AppliedClientTlsModes>,
+) {
+    if runtime.topology != MeshTopology::NodeWaypoint || applied.is_empty() {
+        return;
+    }
+    let originating: HashSet<(String, String)> = applied
+        .iter()
+        .filter_map(|(idx, modes)| {
+            let upstream = config.upstreams.get(*idx)?;
+            if !upstream
+                .id
+                .starts_with(slice::VIRTUAL_SERVICE_HTTP_ROUTE_UPSTREAM_ID_PREFIX)
+            {
+                return None;
+            }
+            let [target] = upstream.targets.as_slice() else {
+                return None;
+            };
+            modes
+                .originates_tls(target.dispatch_policy_port())
+                .then(|| (upstream.namespace.clone(), upstream.id.clone()))
+        })
+        .collect();
+    if originating.is_empty() {
+        return;
+    }
+    for plugin in &mut config.plugin_configs {
+        if plugin.plugin_name != "mesh_route_dispatch" {
+            continue;
+        }
+        let namespace = plugin.namespace.clone();
+        let Some(splits) = plugin
+            .config
+            .get_mut("weighted_splits")
+            .and_then(serde_json::Value::as_array_mut)
+        else {
+            continue;
+        };
+        for leg in splits
+            .iter_mut()
+            .filter_map(|split| split.get_mut("legs"))
+            .filter_map(serde_json::Value::as_array_mut)
+            .flatten()
+        {
+            let Some(leg) = leg.as_object_mut() else {
+                continue;
+            };
+            let Some(leg_id) = leg.get("upstream_id").and_then(serde_json::Value::as_str) else {
+                continue;
+            };
+            if originating.contains(&(namespace.clone(), leg_id.to_string())) {
+                debug!(
+                    upstream = %sanitize_startup_scalar(leg_id),
+                    "DestinationRule tls.mode originates TLS for a weighted split's external leg"
+                );
+                leg.insert("originate_tls".to_string(), serde_json::Value::Bool(true));
+            }
+        }
+    }
 }
 
 /// Fail an upstream's backend TLS closed at every scope (upstream, per-port,
@@ -12655,6 +13362,57 @@ fn upstream_uses_mesh_transport(upstream: &Upstream) -> bool {
         // every one mesh-tagged.
         None => !upstream.targets.is_empty() && all_static_targets_mesh,
     }
+}
+
+/// How a DestinationRule `host` names a destination host.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum DestinationRuleHostSpecificity {
+    /// `*` (suffix length 0) or `*.<suffix>`, by suffix length in bytes. The
+    /// data plane does not apply wildcard rules; a NodeWaypoint carried route
+    /// refuses an external destination one covers.
+    Wildcard(usize),
+    /// The exact host, or a Service alias of it (short name, `<svc>.<ns>`,
+    /// `<svc>.<ns>.svc[.<domain>]`): what [`destination_rule_host_matches`],
+    /// and therefore DestinationRule application, matches.
+    Exact,
+}
+
+/// Whether, and how, DestinationRule `rule_host` (declared in `namespace`)
+/// names destination host `candidate`. The exact arm is
+/// [`destination_rule_host_matches`] itself, so it agrees with
+/// DestinationRule application by construction; the wildcard arm only
+/// DETECTS coverage (Istio semantics: `*.example.com` names
+/// `api.example.com` and `a.b.example.com`, never `example.com`; `*` names
+/// every DNS host name; never an IP literal or a dotless id).
+pub(crate) fn destination_rule_host_specificity(
+    rule_host: &str,
+    namespace: &str,
+    candidate: &str,
+) -> Option<DestinationRuleHostSpecificity> {
+    let rule_host = rule_host.trim().trim_end_matches('.').to_ascii_lowercase();
+    let candidate = candidate.trim().trim_end_matches('.').to_ascii_lowercase();
+    if let Some(suffix) = rule_host.strip_prefix('*') {
+        let is_dns_name = candidate.contains('.')
+            && candidate
+                .trim_start_matches('[')
+                .trim_end_matches(']')
+                .parse::<std::net::IpAddr>()
+                .is_err();
+        if !is_dns_name {
+            return None;
+        }
+        if suffix.is_empty() {
+            return Some(DestinationRuleHostSpecificity::Wildcard(0));
+        }
+        // `*` must stand for whole leading labels.
+        if !suffix.starts_with('.') {
+            return None;
+        }
+        return (candidate.len() > suffix.len() && candidate.ends_with(suffix))
+            .then_some(DestinationRuleHostSpecificity::Wildcard(suffix.len()));
+    }
+    destination_rule_host_matches(&rule_host, namespace, &candidate)
+        .then_some(DestinationRuleHostSpecificity::Exact)
 }
 
 fn destination_rule_host_matches(rule_host: &str, namespace: &str, candidate: &str) -> bool {
@@ -14165,11 +14923,17 @@ impl AppliedClientTlsModes {
     /// absent `tls`, and a server-side mode (ignored with a warning when the
     /// rule applied) all leave the port plaintext.
     fn originates_tls(&self, service_port: u16) -> bool {
-        matches!(
-            self.per_port.get(&service_port).copied().or(self.top_level),
-            Some(MtlsMode::Simple | MtlsMode::Mutual | MtlsMode::IstioMutual)
-        )
+        client_tls_mode_originates(self.per_port.get(&service_port).copied().or(self.top_level))
     }
+}
+
+/// True for a DestinationRule client TLS mode that asks the client to
+/// originate TLS: `SIMPLE`, `MUTUAL` or `ISTIO_MUTUAL`.
+fn client_tls_mode_originates(mode: Option<MtlsMode>) -> bool {
+    matches!(
+        mode,
+        Some(MtlsMode::Simple | MtlsMode::Mutual | MtlsMode::IstioMutual)
+    )
 }
 
 /// Let the DestinationRule drive the EgressGateway backend scheme of every
@@ -14693,8 +15457,13 @@ fn node_waypoint_authz_route_upstreams(config: &GatewayConfig) -> Vec<serde_json
         .upstreams
         .iter()
         .filter(|upstream| node_waypoint_route_upstream_for_authz(&upstream.id))
-        .map(|upstream| {
-            serde_json::json!({
+        .map(node_waypoint_authz_route_upstream)
+        .collect()
+}
+
+/// One `node_waypoint_route_upstreams` entry.
+fn node_waypoint_authz_route_upstream(upstream: &Upstream) -> serde_json::Value {
+    serde_json::json!({
                 "id": upstream.id.clone(),
                 "namespace": upstream.namespace.clone(),
                 "targets": upstream.targets.iter().map(|target| {
@@ -14723,9 +15492,7 @@ fn node_waypoint_authz_route_upstreams(config: &GatewayConfig) -> Vec<serde_json
                     }
                     target_config
                 }).collect::<Vec<_>>(),
-            })
-        })
-        .collect()
+    })
 }
 
 fn inject_mesh_global_plugins(
@@ -15584,7 +16351,7 @@ fn scope_request_auth_to_node_waypoint_destinations(
             proxy.backend_host.as_str(),
             proxy.backend_port,
         )];
-        let dispatch_configs = proxy
+        let dispatch_configs: Vec<&serde_json::Value> = proxy
             .plugins
             .iter()
             .filter_map(|association| {
@@ -15595,8 +16362,9 @@ fn scope_request_auth_to_node_waypoint_destinations(
                     ))
                     .copied()
             })
-            .chain(global_route_dispatch.iter().copied());
-        for dispatch in dispatch_configs {
+            .chain(global_route_dispatch.iter().copied())
+            .collect();
+        for &dispatch in &dispatch_configs {
             for rule in dispatch
                 .get("rules")
                 .and_then(serde_json::Value::as_array)
@@ -15632,6 +16400,52 @@ fn scope_request_auth_to_node_waypoint_destinations(
                 }
             }
         }
+
+        // A weighted split dispatched leg by leg (issue #7387) is reached only
+        // through its legs: each Service leg's workloads and each residual
+        // external leg (which stands for the waypoint's own set, like any
+        // external destination) must carry the route's one set.
+        let weighted_splits: Vec<&serde_json::Value> = dispatch_configs
+            .iter()
+            .copied()
+            .flat_map(|dispatch| {
+                dispatch
+                    .get("weighted_splits")
+                    .and_then(serde_json::Value::as_array)
+                    .into_iter()
+                    .flatten()
+            })
+            .collect();
+        let destinations: Vec<(Option<&str>, &str, u16)> = destinations
+            .into_iter()
+            .flat_map(|(upstream_id, backend_host, backend_port)| {
+                let legs: Vec<&str> = upstream_id
+                    .and_then(|id| {
+                        weighted_splits.iter().find(|split| {
+                            split.get("upstream_id").and_then(serde_json::Value::as_str) == Some(id)
+                        })
+                    })
+                    .map(|split| {
+                        split
+                            .get("legs")
+                            .and_then(serde_json::Value::as_array)
+                            .into_iter()
+                            .flatten()
+                            .filter_map(|leg| {
+                                leg.get("upstream_id").and_then(serde_json::Value::as_str)
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                if legs.is_empty() {
+                    vec![(upstream_id, backend_host, backend_port)]
+                } else {
+                    legs.into_iter()
+                        .map(|leg| (Some(leg), backend_host, backend_port))
+                        .collect()
+                }
+            })
+            .collect();
 
         // Every workload the route can reach must carry the SAME set: the
         // backend is chosen after authentication, so a union would let one
