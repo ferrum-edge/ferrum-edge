@@ -4503,15 +4503,51 @@ fn service_has_destination_rule(
     let fqdn = format!(
         "{name}.{namespace}.svc.{}",
         cluster_domain.trim_matches('.')
-    )
-    .to_ascii_lowercase();
-    mesh_slice.destination_rules.iter().any(|rule| {
-        let host = rule.host.trim().trim_end_matches('.').to_ascii_lowercase();
-        host == "*"
-            || host
+    );
+    destination_rules_naming_host(mesh_slice, &fqdn)
+        .next()
+        .is_some()
+}
+
+/// The visible DestinationRules whose `host` names `host` (exactly, by a
+/// wildcard, or as a short name in the rule's namespace). Over-matching is
+/// the safe direction for every caller: it only sends more splits leg by
+/// leg or refuses more routes.
+fn destination_rules_naming_host<'a>(
+    mesh_slice: &'a MeshSlice,
+    host: &str,
+) -> impl Iterator<Item = &'a MeshDestinationRule> + use<'a> {
+    let host = host.trim().trim_end_matches('.').to_ascii_lowercase();
+    mesh_slice.destination_rules.iter().filter(move |rule| {
+        let rule_host = rule.host.trim().trim_end_matches('.').to_ascii_lowercase();
+        rule_host == "*"
+            || rule_host
                 .strip_prefix('*')
-                .is_some_and(|suffix| fqdn.ends_with(suffix))
-            || destination_rule_host_matches(&host, &rule.namespace, &fqdn)
+                .is_some_and(|suffix| host.ends_with(suffix))
+            || destination_rule_host_matches(&rule_host, &rule.namespace, &host)
+    })
+}
+
+/// Whether a visible DestinationRule for external `host` asks the client to
+/// originate TLS on `port` (its `portLevelSettings` entry's `tls`, else its
+/// top-level `tls`, is `SIMPLE`, `MUTUAL` or `ISTIO_MUTUAL`). A carried route
+/// dials such a host directly over plain HTTP and no DestinationRule applies
+/// to a direct backend, so the route is refused instead (see
+/// [`bind_carried_http_routes_to_node_waypoint_transport`]). Over-matching
+/// (any naming rule) only refuses more.
+fn destination_rule_originates_tls_for_host(mesh_slice: &MeshSlice, host: &str, port: u16) -> bool {
+    destination_rules_naming_host(mesh_slice, host).any(|rule| {
+        let mode = rule
+            .port_level_settings
+            .get(&port)
+            .and_then(|policy| policy.tls.as_ref())
+            .or_else(|| {
+                rule.traffic_policy
+                    .as_ref()
+                    .and_then(|policy| policy.tls.as_ref())
+            })
+            .map(|tls| tls.mode);
+        client_tls_mode_originates(mode)
     })
 }
 
@@ -4540,14 +4576,21 @@ fn service_has_destination_rule(
 ///   The split upstream keeps only its Service legs' workload targets, as the
 ///   route's own destination identity; no request is dispatched through it,
 ///   and RequestAuthentication scoping and authorization expand it into its
-///   legs.
+///   legs. A split whose external host a DestinationRule names is dispatched
+///   leg by leg too, so that rule (its TLS origination included, see
+///   [`project_node_waypoint_leg_origination`]) applies to that host's
+///   residual leg alone instead of to the whole split.
 ///
 /// A route with a destination that is an in-cluster Service the slice does not
 /// model, or a modeled Service port with no materialized upstream, is dropped
 /// with its plugins, fail-closed; its host then gets the materialized Service
 /// route. So is a leg-dispatched route that cannot be represented (more legs
 /// or candidate destinations than authorization tracks, or a residual
-/// upstream id already in use). External hosts are left as they are.
+/// upstream id already in use), and a route with a direct external backend
+/// (its own, or a dispatch rule's) whose DestinationRule asks to originate
+/// TLS on that port: no DestinationRule applies to a direct backend, and the
+/// carried route would dial it in plaintext. Other external hosts are left as
+/// they are.
 fn bind_carried_http_routes_to_node_waypoint_transport(
     config: &mut GatewayConfig,
     runtime: &MeshRuntimeConfig,
@@ -4610,6 +4653,15 @@ fn bind_carried_http_routes_to_node_waypoint_transport(
         for target in &split.targets {
             match hosts.classify(&namespace, &target.host) {
                 CarriedRouteHost::External => {
+                    // An external host's own DestinationRule (TLS
+                    // origination included) applies only to an upstream
+                    // holding that host alone: its residual leg.
+                    if destination_rules_naming_host(mesh_slice, &target.host)
+                        .next()
+                        .is_some()
+                    {
+                        governed_by_destination_rule = true;
+                    }
                     legs.push((target.weight, vec![target.clone()]));
                     external_targets.push(target.clone());
                 }
@@ -4682,6 +4734,7 @@ fn bind_carried_http_routes_to_node_waypoint_transport(
             continue;
         }
         if governed_by_destination_rule {
+            let first_external = external_targets.first().cloned();
             let legs_for_dispatch = if cross_namespace_leg {
                 None
             } else {
@@ -4698,8 +4751,16 @@ fn bind_carried_http_routes_to_node_waypoint_transport(
                     // carries alone. Left in place, they would make
                     // DestinationRule application see one upstream spanning
                     // hosts with different winning rules and refuse the whole
-                    // slice.
-                    legs = service_targets;
+                    // slice. A split with no Service leg keeps only its first
+                    // external host (an upstream needs a target; one host has
+                    // one winning rule set).
+                    legs = if service_targets.is_empty() {
+                        first_external
+                            .map(|target| vec![(target.weight, vec![target])])
+                            .unwrap_or_default()
+                    } else {
+                        service_targets
+                    };
                 }
                 None => {
                     unrepresentable_splits += 1;
@@ -4733,6 +4794,8 @@ fn bind_carried_http_routes_to_node_waypoint_transport(
     // route's first `mesh_route_dispatch` instance if any, split ids).
     let mut weighted_routes: Vec<(usize, Option<usize>, Vec<String>)> = Vec::new();
     let mut oversized_weighted_routes = 0usize;
+    // Direct external backends a DestinationRule asks to dial over TLS.
+    let mut tls_origination_refused = 0usize;
     for index in 0..config.proxies.len() {
         let proxy = &config.proxies[index];
         if !config::is_virtual_service_http_route_proxy_id(&proxy.id) {
@@ -4772,6 +4835,14 @@ fn bind_carried_http_routes_to_node_waypoint_transport(
             None if !backend_host.is_empty() && backend_port != 0 => {
                 match hosts.classify(&namespace, &backend_host) {
                     CarriedRouteHost::External => {
+                        if destination_rule_originates_tls_for_host(
+                            mesh_slice,
+                            &backend_host,
+                            backend_port,
+                        ) {
+                            tls_origination_refused += 1;
+                            keep = false;
+                        }
                         candidates.insert(format!("{backend_host}|{backend_port}"));
                     }
                     CarriedRouteHost::UnmodeledService => keep = false,
@@ -4848,6 +4919,10 @@ fn bind_carried_http_routes_to_node_waypoint_transport(
                 }
                 match hosts.classify(&namespace, host) {
                     CarriedRouteHost::External => {
+                        if destination_rule_originates_tls_for_host(mesh_slice, host, port) {
+                            tls_origination_refused += 1;
+                            keep = false;
+                        }
                         candidates.insert(format!("{host}|{port}"));
                     }
                     CarriedRouteHost::UnmodeledService => keep = false,
@@ -4994,10 +5069,12 @@ fn bind_carried_http_routes_to_node_waypoint_transport(
             routes = dropped.len(),
             unrepresentable_weighted_splits = unrepresentable_splits,
             oversized_weighted_routes,
+            tls_origination_refused,
             "NodeWaypoint VirtualService routes refused: a destination is an in-cluster Service \
-             this waypoint cannot reach over its mesh transport, or a weighted split that must \
-             be dispatched leg by leg cannot be represented; their hosts use the materialized \
-             Service routes"
+             this waypoint cannot reach over its mesh transport, a weighted split that must \
+             be dispatched leg by leg cannot be represented, or a direct external backend's \
+             DestinationRule asks for TLS origination a direct backend cannot carry; their \
+             hosts use the materialized Service routes"
         );
         config
             .proxies
@@ -12740,8 +12817,87 @@ pub(crate) fn apply_destination_rules_with_tenant_file_roots(
     }
 
     project_egress_gateway_origination(config, runtime, mesh_slice, &applied_client_tls_modes);
+    project_node_waypoint_leg_origination(config, runtime, &applied_client_tls_modes);
 
     Ok(())
+}
+
+/// Let the DestinationRule drive the backend scheme of every external
+/// weighted-split leg a NodeWaypoint carried route dispatches (issue #7387,
+/// Istio semantics).
+///
+/// A leg-dispatched split sends each external host through its own residual
+/// upstream (`<split>-external-<n>`, one target), where that host's
+/// DestinationRule applied its TLS material. Carried routes are plain HTTP,
+/// so once rules have applied, a residual whose effective `tls.mode` on its
+/// target's port (the `portLevelSettings` entry, else the top-level `tls`) is
+/// `SIMPLE`, `MUTUAL` or `ISTIO_MUTUAL` gets `originate_tls` on every leg
+/// naming it: when the dispatch finalizer selects that leg it publishes the
+/// `https` scheme beside the upstream override, so the request originates TLS
+/// with the residual's own backend TLS. `DISABLE` or no `tls` keeps the leg
+/// plaintext. Service legs are never marked: they ride the mesh transport.
+fn project_node_waypoint_leg_origination(
+    config: &mut GatewayConfig,
+    runtime: &MeshRuntimeConfig,
+    applied: &HashMap<usize, AppliedClientTlsModes>,
+) {
+    if runtime.topology != MeshTopology::NodeWaypoint || applied.is_empty() {
+        return;
+    }
+    let originating: HashSet<(String, String)> = applied
+        .iter()
+        .filter_map(|(idx, modes)| {
+            let upstream = config.upstreams.get(*idx)?;
+            if !upstream
+                .id
+                .starts_with(slice::VIRTUAL_SERVICE_HTTP_ROUTE_UPSTREAM_ID_PREFIX)
+            {
+                return None;
+            }
+            let [target] = upstream.targets.as_slice() else {
+                return None;
+            };
+            modes
+                .originates_tls(target.dispatch_policy_port())
+                .then(|| (upstream.namespace.clone(), upstream.id.clone()))
+        })
+        .collect();
+    if originating.is_empty() {
+        return;
+    }
+    for plugin in &mut config.plugin_configs {
+        if plugin.plugin_name != "mesh_route_dispatch" {
+            continue;
+        }
+        let namespace = plugin.namespace.clone();
+        let Some(splits) = plugin
+            .config
+            .get_mut("weighted_splits")
+            .and_then(serde_json::Value::as_array_mut)
+        else {
+            continue;
+        };
+        for leg in splits
+            .iter_mut()
+            .filter_map(|split| split.get_mut("legs"))
+            .filter_map(serde_json::Value::as_array_mut)
+            .flatten()
+        {
+            let Some(leg) = leg.as_object_mut() else {
+                continue;
+            };
+            let Some(leg_id) = leg.get("upstream_id").and_then(serde_json::Value::as_str) else {
+                continue;
+            };
+            if originating.contains(&(namespace.clone(), leg_id.to_string())) {
+                debug!(
+                    upstream = %sanitize_startup_scalar(leg_id),
+                    "DestinationRule tls.mode originates TLS for a weighted split's external leg"
+                );
+                leg.insert("originate_tls".to_string(), serde_json::Value::Bool(true));
+            }
+        }
+    }
 }
 
 /// Fail an upstream's backend TLS closed at every scope (upstream, per-port,
@@ -14677,11 +14833,17 @@ impl AppliedClientTlsModes {
     /// absent `tls`, and a server-side mode (ignored with a warning when the
     /// rule applied) all leave the port plaintext.
     fn originates_tls(&self, service_port: u16) -> bool {
-        matches!(
-            self.per_port.get(&service_port).copied().or(self.top_level),
-            Some(MtlsMode::Simple | MtlsMode::Mutual | MtlsMode::IstioMutual)
-        )
+        client_tls_mode_originates(self.per_port.get(&service_port).copied().or(self.top_level))
     }
+}
+
+/// True for a DestinationRule client TLS mode that asks the client to
+/// originate TLS: `SIMPLE`, `MUTUAL` or `ISTIO_MUTUAL`.
+fn client_tls_mode_originates(mode: Option<MtlsMode>) -> bool {
+    matches!(
+        mode,
+        Some(MtlsMode::Simple | MtlsMode::Mutual | MtlsMode::IstioMutual)
+    )
 }
 
 /// Let the DestinationRule drive the EgressGateway backend scheme of every

@@ -453,6 +453,16 @@ pub mod _test_support {
         Ok((*config).clone())
     }
 
+    /// The effective proxy dispatch builds for the LB-selected `target`
+    /// (per-port TLS, timeouts and HTTP overlays projected onto the route),
+    /// as an owned value.
+    pub fn resolve_effective_proxy_for_target_for_test(
+        proxy: &crate::config::types::Proxy,
+        target: Option<&crate::config::types::UpstreamTarget>,
+    ) -> crate::config::types::Proxy {
+        crate::proxy::resolve_effective_proxy_for_target(proxy, target).into_owned()
+    }
+
     /// The origin-form request target the direct HTTP/1.1 pool sends for an
     /// absolute backend URL (issue #5588), for parity checks against the `url`
     /// serialization reqwest used.

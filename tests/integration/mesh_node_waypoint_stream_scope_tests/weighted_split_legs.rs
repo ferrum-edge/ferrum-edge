@@ -22,18 +22,21 @@ use ferrum_edge::_test_support::{
     run_before_proxy_hooks_for_test,
 };
 use ferrum_edge::config::db_backend::namespaced_runtime_key;
-use ferrum_edge::config::types::{GatewayConfig, Proxy, Upstream};
+use ferrum_edge::config::types::{BackendScheme, DispatchKind, GatewayConfig, Proxy, Upstream};
 use ferrum_edge::config_sources::k8s::{
     K8sMetadata, K8sObject, K8sTranslationOptions, translate_k8s_objects,
 };
 use ferrum_edge::identity::spiffe::{SpiffeId, TrustDomain};
 use ferrum_edge::modes::mesh::config::{
-    MeshExtAuthzProvider, MeshPolicy, MeshRule, PolicyAction, PolicyScope, WorkloadSelector,
+    MeshExtAuthzProvider, MeshJwtRule, MeshPolicy, MeshRequestAuthentication, MeshRule,
+    PolicyAction, PolicyScope, WorkloadSelector,
 };
 use ferrum_edge::modes::mesh::runtime::PolicyScopeCache;
 use ferrum_edge::modes::mesh::slice::MeshSlice;
 use ferrum_edge::modes::mesh::{
-    MESH_AUTHZ_PLUGIN_ID, MeshRuntimeConfig, MeshTopology, prepare_gateway_config_from_mesh_slice,
+    MESH_AUTHZ_PLUGIN_ID, MESH_REQUEST_AUTH_DESTINATION_PLUGIN_ID_PREFIX,
+    MESH_REQUEST_AUTH_REFUSED_PLUGIN_ID, MeshRuntimeConfig, MeshTopology,
+    prepare_gateway_config_from_mesh_slice,
 };
 use ferrum_edge::plugins::mesh::authz::MeshAuthz;
 use ferrum_edge::plugins::{Plugin, PluginHttpClient, PluginResult, RequestContext, create_plugin};
@@ -1593,4 +1596,531 @@ fn a_global_dispatch_instance_keeps_route_owned_connect_timeouts() {
         .and_then(|upstream| upstream.port_overrides.get(&8080))
         .and_then(|slot| slot.connect_timeout_ms);
     assert_eq!(reviews_slot, Some(1000), "reviews' rule rides its upstream");
+}
+
+/// A DestinationRule whose `trafficPolicy` is `traffic_policy`.
+fn traffic_policy_rule(name: &str, host: &str, traffic_policy: serde_json::Value) -> K8sObject {
+    k8s_object(
+        "DestinationRule",
+        name,
+        json!({"host": host, "trafficPolicy": traffic_policy}),
+    )
+}
+
+/// `tls.mode: SIMPLE` with an SNI.
+fn simple_tls_rule(name: &str, host: &str) -> K8sObject {
+    traffic_policy_rule(name, host, json!({"tls": {"mode": "SIMPLE", "sni": host}}))
+}
+
+/// `tls.mode: MUTUAL` with a client certificate and key.
+fn mutual_tls_rule(name: &str, host: &str) -> K8sObject {
+    traffic_policy_rule(
+        name,
+        host,
+        json!({"tls": {
+            "mode": "MUTUAL",
+            "clientCertificate": "k8s://default/client-tls#tls.crt",
+            "privateKey": "k8s://default/client-tls#tls.key"
+        }}),
+    )
+}
+
+/// Top-level `SIMPLE`, but `DISABLE` on port 443: the port-level entry wins.
+fn port_disabled_tls_rule(name: &str, host: &str) -> K8sObject {
+    traffic_policy_rule(
+        name,
+        host,
+        json!({
+            "tls": {"mode": "SIMPLE"},
+            "portLevelSettings": [{"port": {"number": 443}, "tls": {"mode": "DISABLE"}}]
+        }),
+    )
+}
+
+/// The `originate_tls` flag of each leg of `split_id`, by leg id.
+fn leg_origination(prepared: &GatewayConfig, route: &Proxy, split_id: &str) -> Vec<(String, bool)> {
+    let config = route_dispatch_config(prepared, route);
+    config["weighted_splits"]
+        .as_array()
+        .expect("weighted splits written")
+        .iter()
+        .find(|split| split["upstream_id"] == json!(split_id))
+        .expect("the split is resolved leg by leg")["legs"]
+        .as_array()
+        .expect("legs")
+        .iter()
+        .map(|leg| {
+            (
+                leg["upstream_id"].as_str().expect("leg id").to_string(),
+                leg["originate_tls"].as_bool().unwrap_or(false),
+            )
+        })
+        .collect()
+}
+
+/// What dispatch builds for the leg `ctx` selected: the effective proxy
+/// (route overrides, then the leg target's per-port projection) and the
+/// backend URL it dials.
+fn leg_dispatch(
+    ctx: &RequestContext,
+    route: &Proxy,
+    prepared: &GatewayConfig,
+    upstreams: &HashMap<String, Arc<Upstream>>,
+) -> (Proxy, String) {
+    let leg = selected_leg(ctx);
+    let target = prepared
+        .upstreams
+        .iter()
+        .find(|upstream| upstream.namespace == route.namespace && upstream.id == leg)
+        .and_then(|upstream| upstream.targets.first())
+        .expect("the leg's upstream has a target")
+        .clone();
+    let overridden = ctx.apply_route_overrides_with_upstreams(Arc::new(route.clone()), upstreams);
+    let effective = ferrum_edge::_test_support::resolve_effective_proxy_for_target_for_test(
+        &overridden,
+        Some(&target),
+    );
+    let url = ferrum_edge::proxy::build_backend_url_with_target(
+        &effective,
+        "/",
+        "",
+        &target.host,
+        target.port,
+        0,
+        None,
+    )
+    .expect("backend URL builds");
+    (effective, url)
+}
+
+/// Issue #7387 review round 3 (sol F1): an external leg whose
+/// DestinationRule originates TLS (`SIMPLE`, `MUTUAL`) is dialed over TLS
+/// with that rule's material; per-port `DISABLE` wins over a top-level mode;
+/// a host without a rule and the Service leg keep the route's plaintext
+/// scheme (the Service leg's mesh transport is untouched). Followed through
+/// the dispatch finalizer, route-override resolution, the leg target's
+/// effective proxy and the backend URL dispatch builds.
+#[tokio::test]
+async fn external_legs_originate_the_tls_their_destination_rules_require() {
+    let objects = vec![
+        split_virtual_service(
+            "split",
+            "reviews.default.svc.cluster.local",
+            &[
+                ("reviews.default.svc.cluster.local", 8080, 40),
+                ("api.simple.example", 443, 20),
+                ("api.mutual.example", 443, 20),
+                ("api.disabled.example", 443, 10),
+                ("api.plain.example", 80, 10),
+            ],
+        ),
+        pool_destination_rule("reviews-dr", "reviews.default.svc.cluster.local", 3, "1s"),
+        simple_tls_rule("simple-dr", "api.simple.example"),
+        mutual_tls_rule("mutual-dr", "api.mutual.example"),
+        port_disabled_tls_rule("disabled-dr", "api.disabled.example"),
+    ];
+    let (_, prepared) = prepare(&objects, Vec::new());
+    let route = carried_split_route(&prepared);
+    let split_id = route.upstream_id.clone().expect("split id");
+    let leg = |index: usize| format!("{split_id}-external-{index}");
+    assert_eq!(
+        leg_origination(&prepared, &route, &split_id),
+        vec![
+            (REVIEWS_UPSTREAM.to_string(), false),
+            (leg(0), true),
+            (leg(1), true),
+            (leg(2), false),
+            (leg(3), false),
+        ],
+        "only the external legs whose rule originates TLS on their port are marked"
+    );
+
+    let authz = Arc::new(MeshAuthz::new(&authz_config(&prepared)).expect("mesh_authz builds"));
+    let plugins = chain(vec![
+        Arc::clone(&authz) as Arc<dyn Plugin>,
+        route_dispatch_instance(&prepared, &route),
+    ]);
+    let upstreams = upstream_map(&prepared);
+    let mut counts: HashMap<String, usize> = HashMap::new();
+    for _ in 0..100 {
+        let (result, ctx, _) = serve(&authz, &plugins, &route, TRUSTED).await;
+        assert!(matches!(result, PluginResult::Continue), "{result:?}");
+        let selected = selected_leg(&ctx);
+        let (effective, url) = leg_dispatch(&ctx, &route, &prepared, &upstreams);
+        if selected == leg(0) || selected == leg(1) {
+            assert_eq!(
+                ctx.route_override_backend_scheme,
+                Some(BackendScheme::Https),
+                "{selected}"
+            );
+            assert_eq!(
+                effective.dispatch_kind,
+                DispatchKind::HttpsPool,
+                "{selected}"
+            );
+            assert_eq!(effective.backend_scheme, Some(BackendScheme::Https));
+            assert!(url.starts_with("https://"), "{selected} dials {url}");
+            assert!(!effective.resolved_tls.tls_refused, "{selected}");
+        } else {
+            assert_eq!(ctx.route_override_backend_scheme, None, "{selected}");
+            assert_eq!(
+                effective.dispatch_kind,
+                DispatchKind::HttpPool,
+                "{selected}"
+            );
+            assert!(url.starts_with("http://"), "{selected} dials {url}");
+        }
+        if selected == leg(0) {
+            assert!(url.starts_with("https://api.simple.example:443"), "{url}");
+            assert_eq!(
+                effective.resolved_tls.sni.as_deref(),
+                Some("api.simple.example"),
+                "the SIMPLE leg carries its rule's SNI"
+            );
+            assert!(effective.resolved_tls.client_cert_path.is_none());
+        }
+        if selected == leg(1) {
+            assert!(url.starts_with("https://api.mutual.example:443"), "{url}");
+            assert!(
+                effective.resolved_tls.client_cert_path.is_some()
+                    && effective.resolved_tls.client_key_path.is_some(),
+                "the MUTUAL leg presents its rule's client certificate: {:?}",
+                effective.resolved_tls
+            );
+        }
+        if selected == REVIEWS_UPSTREAM {
+            assert!(url.starts_with("http://10.0.0.11:"), "{url}");
+        }
+        *counts.entry(selected).or_default() += 1;
+    }
+    assert_eq!(counts[REVIEWS_UPSTREAM], 40);
+    assert_eq!(counts[&leg(0)], 20);
+    assert_eq!(counts[&leg(1)], 20);
+    assert_eq!(counts[&leg(2)], 10);
+    assert_eq!(counts[&leg(3)], 10);
+}
+
+/// Issue #7387 review round 3 (sol F1, the #7371 gap on main): a split whose
+/// only DestinationRule names its external host is dispatched leg by leg
+/// too, so that host's TLS origination applies to its own leg (main dialed
+/// it in plaintext through the split). A split with no Service leg at all is
+/// served, keeping one external host as its never-dialed identity.
+#[tokio::test]
+async fn an_external_hosts_destination_rule_alone_puts_its_split_leg_by_leg() {
+    for (name, legs, service_leg) in [
+        (
+            "mixed",
+            vec![
+                ("reviews.default.svc.cluster.local", 8080, 50),
+                ("api.simple.example", 443, 50),
+            ],
+            true,
+        ),
+        (
+            "external-only",
+            vec![
+                ("api.simple.example", 443, 50),
+                ("api.plain.example", 80, 50),
+            ],
+            false,
+        ),
+    ] {
+        let objects = vec![
+            split_virtual_service("split", "reviews.default.svc.cluster.local", &legs),
+            simple_tls_rule("simple-dr", "api.simple.example"),
+        ];
+        let (_, prepared) = prepare(&objects, Vec::new());
+        let route = carried_split_route(&prepared);
+        let split_id = route.upstream_id.clone().expect("split id");
+        let tls_leg = format!("{split_id}-external-0");
+        let expected = if service_leg {
+            vec![
+                (REVIEWS_UPSTREAM.to_string(), false),
+                (tls_leg.clone(), true),
+            ]
+        } else {
+            vec![
+                (tls_leg.clone(), true),
+                (format!("{split_id}-external-1"), false),
+            ]
+        };
+        assert_eq!(
+            leg_origination(&prepared, &route, &split_id),
+            expected,
+            "{name}"
+        );
+        let split = prepared
+            .upstreams
+            .iter()
+            .find(|upstream| upstream.id == split_id)
+            .expect("the split stays the route's own destination");
+        if service_leg {
+            assert!(
+                split
+                    .targets
+                    .iter()
+                    .all(|target| !target.host.contains("example")),
+                "{name}: the never-dialed split keeps no external host"
+            );
+        } else {
+            assert_eq!(split.targets.len(), 1, "{name}: one identity target");
+        }
+
+        let authz = Arc::new(MeshAuthz::new(&authz_config(&prepared)).expect("mesh_authz builds"));
+        let plugins = chain(vec![
+            Arc::clone(&authz) as Arc<dyn Plugin>,
+            route_dispatch_instance(&prepared, &route),
+        ]);
+        let upstreams = upstream_map(&prepared);
+        // One full weighted cycle (the weights sum to 100).
+        let mut tls_requests = 0;
+        for _ in 0..100 {
+            let (result, ctx, _) = serve(&authz, &plugins, &route, TRUSTED).await;
+            assert!(
+                matches!(result, PluginResult::Continue),
+                "{name}: {result:?}"
+            );
+            let (effective, url) = leg_dispatch(&ctx, &route, &prepared, &upstreams);
+            if selected_leg(&ctx) == tls_leg {
+                tls_requests += 1;
+                assert_eq!(effective.dispatch_kind, DispatchKind::HttpsPool, "{name}");
+                assert!(url.starts_with("https://api.simple.example:443"), "{url}");
+            } else {
+                assert_eq!(effective.dispatch_kind, DispatchKind::HttpPool, "{name}");
+                assert!(url.starts_with("http://"), "{url}");
+            }
+        }
+        assert_eq!(tls_requests, 50, "{name}");
+    }
+}
+
+/// Whether a surviving carried route can still dial `host`: as its own
+/// direct backend, or through one of its `mesh_route_dispatch` rules.
+fn carried_routes_reach_host(prepared: &GatewayConfig, host: &str) -> bool {
+    let routes = carried_routes(prepared);
+    routes.iter().any(|route| route.backend_host == host)
+        || prepared.plugin_configs.iter().any(|plugin| {
+            plugin.plugin_name == "mesh_route_dispatch"
+                && plugin.proxy_id.as_deref().is_some_and(|proxy_id| {
+                    routes
+                        .iter()
+                        .any(|route| route.id == proxy_id && route.namespace == plugin.namespace)
+                })
+                && plugin.config.to_string().contains(host)
+        })
+}
+
+/// Issue #7387 review round 3 (sol F1, the #7371 gap on main): a carried
+/// route dials a direct external backend (its own, or a dispatch rule's)
+/// over plain HTTP, and no DestinationRule applies to a direct backend. A
+/// route whose external backend's rule originates TLS on that port is
+/// therefore refused (the host keeps its Service route); per-port `DISABLE`
+/// and a host without a rule keep the route.
+#[test]
+fn a_direct_external_backend_whose_rule_originates_tls_is_refused() {
+    let own_backend = k8s_object(
+        "VirtualService",
+        "direct",
+        json!({
+            "hosts": ["reviews.default.svc.cluster.local"],
+            "http": [{
+                "route": [{"destination": {"host": "api.simple.example", "port": {"number": 443}}}]
+            }]
+        }),
+    );
+    let rule_backend = k8s_object(
+        "VirtualService",
+        "guarded",
+        json!({
+            "hosts": ["reviews.default.svc.cluster.local"],
+            "http": [
+                {
+                    "match": [{"headers": {"x-external": {"exact": "1"}}}],
+                    "route": [{"destination": {"host": "api.simple.example", "port": {"number": 443}}}]
+                },
+                {
+                    "route": [{"destination": {"host": "reviews.default.svc.cluster.local", "port": {"number": 8080}}}]
+                }
+            ]
+        }),
+    );
+    for (shape, route) in [("own backend", own_backend), ("rule backend", rule_backend)] {
+        for (rule, refused) in [
+            (
+                Some(simple_tls_rule("simple-dr", "api.simple.example")),
+                true,
+            ),
+            (
+                Some(port_disabled_tls_rule("simple-dr", "api.simple.example")),
+                false,
+            ),
+            (None, false),
+        ] {
+            let mut objects = vec![route.clone()];
+            objects.extend(rule);
+            let (_, prepared) = prepare(&objects, Vec::new());
+            assert_eq!(
+                carried_routes_reach_host(&prepared, "api.simple.example"),
+                !refused,
+                "{shape}: refused={refused}"
+            );
+            if refused {
+                assert!(
+                    carried_routes(&prepared).is_empty(),
+                    "{shape}: the refused route is dropped with its plugins"
+                );
+                assert!(
+                    prepared
+                        .proxies
+                        .iter()
+                        .any(|proxy| proxy.upstream_id.as_deref() == Some(REVIEWS_UPSTREAM)),
+                    "{shape}: the host gets its Service route back"
+                );
+            }
+        }
+    }
+}
+
+/// `jwks_auth` RequestAuthentication `name` (issuer `https://<name>.example.com`).
+fn request_auth(name: &str, scope: PolicyScope) -> MeshRequestAuthentication {
+    MeshRequestAuthentication {
+        name: name.to_string(),
+        namespace: DEFAULT_NAMESPACE.to_string(),
+        scope,
+        jwt_rules: vec![MeshJwtRule {
+            issuer: format!("https://{name}.example.com"),
+            audiences: Vec::new(),
+            jwks_uri: None,
+            jwks: Some(r#"{"keys":[]}"#.to_string()),
+            from_headers: Vec::new(),
+            from_params: Vec::new(),
+            forward_original_token: false,
+            output_claim_to_headers: Vec::new(),
+        }],
+        refused: false,
+    }
+}
+
+/// `objects` prepared with `reviews` and `ratings` labelled `tier=backend`
+/// and `request_auth` loaded; the one carried split route.
+fn prepare_with_request_auth(
+    objects: &[K8sObject],
+    request_auth: MeshRequestAuthentication,
+) -> (GatewayConfig, Proxy) {
+    let mut config = translated_config(objects, Vec::new());
+    for workload in &mut config.mesh.as_mut().expect("mesh block").workloads {
+        if matches!(workload.service_name.as_str(), "reviews" | "ratings") {
+            workload
+                .selector
+                .labels
+                .insert("tier".to_string(), "backend".to_string());
+        }
+    }
+    let mut slice = slice_for(&config);
+    slice.request_authentications = vec![request_auth];
+    let prepared = prepare_gateway_config_from_mesh_slice(&slice, &node_waypoint_runtime())
+        .expect("slice materializes");
+    let route = carried_split_route(&prepared);
+    (prepared, route)
+}
+
+/// Whether the RequestAuthentication refusal is scoped to `route`.
+fn request_auth_refuses(prepared: &GatewayConfig, route: &Proxy) -> bool {
+    prepared
+        .plugin_configs
+        .iter()
+        .find(|plugin| plugin.id == MESH_REQUEST_AUTH_REFUSED_PLUGIN_ID)
+        .and_then(|plugin| plugin.trigger.as_ref())
+        .is_some_and(|trigger| {
+            serde_json::to_value(trigger)
+                .expect("trigger serializes")
+                .to_string()
+                .contains(&route.id)
+        })
+}
+
+/// Issue #7387 review round 3 (dsf F2): RequestAuthentication destination
+/// scoping (#6670) holds for every leg a weighted split is dispatched to. A
+/// resource selecting both Service legs governs the route through its
+/// destination instance; one selecting only one leg refuses the route; and
+/// an external leg, which stands for the waypoint's own set, makes the same
+/// both-legs resource divergent too, so a request dispatched to the external
+/// leg never runs the Service legs' providers or claim headers.
+#[test]
+fn request_authentication_holds_for_every_weighted_leg() {
+    let backend_tier = PolicyScope::WorkloadSelector {
+        selector: WorkloadSelector {
+            labels: HashMap::from([("tier".to_string(), "backend".to_string())]),
+            namespace: None,
+        },
+    };
+    let mut service_split = vec![reviews_ratings_split(50, 50)];
+    service_split.extend(reviews_and_ratings_rules());
+
+    let (prepared, route) = prepare_with_request_auth(
+        &service_split,
+        request_auth("backend-jwt", backend_tier.clone()),
+    );
+    assert_eq!(
+        route_dispatch_config(&prepared, &route)["weighted_splits"][0]["legs"]
+            .as_array()
+            .map(Vec::len),
+        Some(2),
+        "the split is dispatched leg by leg"
+    );
+    let association = route
+        .plugins
+        .iter()
+        .find(|association| {
+            association
+                .plugin_config_id
+                .starts_with(MESH_REQUEST_AUTH_DESTINATION_PLUGIN_ID_PREFIX)
+        })
+        .expect("both legs share the resource, so the route gets its destination instance");
+    let instance = prepared
+        .plugin_configs
+        .iter()
+        .find(|plugin| plugin.id == association.plugin_config_id)
+        .expect("destination instance exists");
+    assert_eq!(instance.plugin_name, "jwks_auth");
+    assert_eq!(
+        instance.config["providers"][0]["issuer"],
+        json!("https://backend-jwt.example.com")
+    );
+    assert!(!request_auth_refuses(&prepared, &route));
+
+    let (prepared, route) = prepare_with_request_auth(
+        &service_split,
+        request_auth("ratings-jwt", selector("ratings")),
+    );
+    assert!(
+        request_auth_refuses(&prepared, &route),
+        "legs selected by different sets refuse the route"
+    );
+
+    let with_external = vec![
+        split_virtual_service(
+            "split",
+            "reviews.default.svc.cluster.local",
+            &[
+                ("reviews.default.svc.cluster.local", 8080, 34),
+                ("ratings.default.svc.cluster.local", 8080, 33),
+                ("api.example.com", 443, 33),
+            ],
+        ),
+        pool_destination_rule("reviews-dr", "reviews.default.svc.cluster.local", 3, "1s"),
+        pool_destination_rule("ratings-dr", "ratings.default.svc.cluster.local", 7, "2s"),
+    ];
+    let (prepared, route) =
+        prepare_with_request_auth(&with_external, request_auth("backend-jwt", backend_tier));
+    assert!(
+        route.plugins.iter().all(|association| !association
+            .plugin_config_id
+            .starts_with(MESH_REQUEST_AUTH_DESTINATION_PLUGIN_ID_PREFIX)),
+        "the Service legs' providers are not attached to a route that reaches the external leg"
+    );
+    assert!(
+        request_auth_refuses(&prepared, &route),
+        "the external leg's own set differs from the Service legs' set"
+    );
 }

@@ -139,7 +139,11 @@ destination a request finally reaches is admitted only on its own verdict
 DestinationRule-governed Service is dispatched leg by leg: the dispatch
 finalizer picks a leg by weight once routing is final and sends the request
 through that Service's own rule-bearing upstream, and the leg is authorized as
-one of the route's candidate destinations (issue #7387). Sidecar, Ambient and
+one of the route's candidate destinations (issue #7387). A split whose external
+host a DestinationRule names is dispatched the same way; an external leg whose
+rule originates TLS is dialed over `https` with that rule's TLS, and a direct
+external backend whose rule originates TLS is refused, because carried routes
+dial plain HTTP and no rule applies to a direct backend. Sidecar, Ambient and
 ServiceWaypoint slices carry no HTTP routes. See `docs/mesh.md` ("Mesh data
 planes: NodeWaypoint route carriage").
 
