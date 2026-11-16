@@ -2314,7 +2314,9 @@ shapes and nothing else:
   `queue: max` (GitHub's default `queue: single` would replace the pending run
   whenever a third push arrives, so a commit whose fast `CI` went green could
   skip its own sanitizer run), read-only, secret-free, clears every wrapper input and `RUSTFLAGS`, extends
-  swap by 12 GiB, caches only the Cargo registry (`cache-targets: "false"`,
+  swap by 12 GiB, caps the sanitizer compile at `CARGO_BUILD_JOBS=2` with
+  `CARGO_PROFILE_RELEASE_DEBUG=line-tables-only` (see
+  [Fuzz lane runner losses](#fuzz-lane-runner-losses-2026-11)), caches only the Cargo registry (`cache-targets: "false"`,
   main-only `save-if`), and carries `CI_FUZZ_SMOKE_BOUNDED_BUDGET`,
   `CI_FUZZ_SMOKE_PARSER_BUDGET`, and `CI_FUZZ_SMOKE_DATAGRAM_BUDGET` verbatim
   exactly once each. `fuzz_budget_placement_errors` refuses a `ci.yml` whose
@@ -2370,7 +2372,8 @@ admitted texts oldest first, and a generation retires once its successor is on
   (`cargo test --locked` in `fuzz/`), the required gate on `pull_request`,
   `merge_group`, the push to `main`, and `workflow_dispatch`, cached under the
   `fuzz-property-smoke` key at line-tables-only debuginfo, with a 60-minute
-  deadline. The bounded libFuzzer budget lives verbatim in
+  deadline and a bounded 12 GiB `/mnt` swap extension before the build (see
+  [Fuzz lane runner losses](#fuzz-lane-runner-losses-2026-11)). The bounded libFuzzer budget lives verbatim in
   `FUZZ_SANITIZER_SMOKE_WORKFLOW`. Measured reason (2026-11-09 test sweep):
   over 14 main runs the in-CI sanitizer shape took 44–78 minutes against a
   next-longest job of 20–30 minutes, because its sanitizer build (~47 minutes
@@ -2393,7 +2396,38 @@ and `Trusted Cross Build Policy` ("trusted cross-build policy files cannot be
 changed by a pull request"), so the policy half lands first through the owner's
 reviewed policy migration (admin merge), with `main`'s existing `ci.yml` still
 validating against it. The workflow half then passes `Trusted Cross Build
-Policy` as an ordinary pull request.
+Policy` as an ordinary pull request. Alternatively, as the Ambient host-UDP fix
+did (#7385), the workflow and the policy constant land together in one
+admin-merged commit; `main` then moves atomically to the new generation, the
+retired end would be spent on arrival, and the constant is replaced in place.
+
+###### Fuzz lane runner losses (2026-11)
+
+Both fuzz smoke lanes compile the whole `ferrum-edge` library as one rustc
+process, and on the 16 GB `ubuntu-26.04` runner that compile intermittently
+took the runner down with no job log ("The hosted runner lost communication
+with the server", or exit 143 with "The runner has received a shutdown
+signal"). Main pushes 2026-11-13..16:
+
+- `Fuzz Smoke` (property gate, required in `Tests`): 3 of 27 attempts died in
+  `Run deterministic property smoke tests` (exit 143 on `4560df06b` with a
+  warm `fuzz-property-smoke` cache, during the `ferrum-edge` compile; runner
+  lost on `f351f1c38` and `0bf12260d`). It already ran at two jobs and
+  line-tables-only debuginfo, but its only swap step left with the sanitizer
+  budget in the 2026-11-09 sweep (#7100), so it compiled against the image's
+  3 GB swap. It now provisions the same bounded 12 GiB `/mnt` swap file as the
+  eBPF, netns and coverage compiles. The swap step changes no `CARGO_*`
+  variable, so the `fuzz-property-smoke` cache key is unchanged.
+- `Fuzz sanitizer smoke` (`fuzz-smoke-main.yml`): 8 of 30 runs lost the runner
+  inside `Run bounded libFuzzer smoke budget` at 58-60 minutes. Its resource
+  observer shows why: in a passing run the AddressSanitizer release compile
+  of `ferrum-edge` held about 15 GiB resident plus 9 GiB of swap, left under
+  200 MiB available, and paged about 28 GiB out over the compile. The job now
+  sets `CARGO_BUILD_JOBS=2` (the jobserver also limits rustc's parallel LLVM
+  workers, which default to the runner's four CPUs) and
+  `CARGO_PROFILE_RELEASE_DEBUG=line-tables-only` on that step only, so the
+  rust-cache key and every libFuzzer bound are unchanged. The next main run's
+  `Fuzz build resources:` records are the check.
 
 What is invariant across every generation:
 

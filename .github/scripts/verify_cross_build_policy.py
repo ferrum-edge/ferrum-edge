@@ -3016,6 +3016,22 @@ CI_FUZZ_SMOKE_JOB = r"""  fuzz-smoke:
         with:
           persist-credentials: false
 
+      - name: Extend runner swap for the property build
+        run: |
+          set -euo pipefail
+          # The property build compiles the whole ferrum-edge library in one
+          # rustc process. Even at two jobs and line-tables-only debuginfo it
+          # ran this 16 GB runner out of memory on `main`, warm cache included
+          # (exit 143 on 4560df06b; runner lost on f351f1c38 and 0bf12260d).
+          # The 2026-11-09 sweep took this job's only swap step away with the
+          # sanitizer budget. Add the same bounded 12 GiB extension the eBPF,
+          # netns and coverage compiles use.
+          sudo fallocate -l 12G /mnt/ferrum-swapfile
+          sudo chmod 600 /mnt/ferrum-swapfile
+          sudo mkswap /mnt/ferrum-swapfile
+          sudo swapon /mnt/ferrum-swapfile
+          free -h
+
       - name: Install required build dependency
         run: |
           set -euo pipefail
@@ -3474,7 +3490,20 @@ jobs:
         # it is not a required check. The scheduled `fuzz.yml` lane fuzzes
         # every target for 300 s; this one replays each corpus plus a few
         # hundred mutations under AddressSanitizer on every merged change.
+        #
+        # The AddressSanitizer release compile of the ferrum-edge library is
+        # one rustc process. At the runner's default four jobs it needed about
+        # 24 GiB (15 GiB resident plus 9 GiB of the extended swap) and paged
+        # about 28 GiB out and back, and 8 of 30 main runs between 2026-11-13
+        # and 2026-11-16 lost the runner inside this step with no log. Cap
+        # Cargo's jobserver, which also caps rustc's parallel LLVM workers, at
+        # two, and emit line tables only, as the property gate and the
+        # coverage shards do. Sanitizer reports keep file:line frames; the
+        # target list, codegen units and every libFuzzer bound are unchanged.
         working-directory: fuzz
+        env:
+          CARGO_BUILD_JOBS: "2"
+          CARGO_PROFILE_RELEASE_DEBUG: "line-tables-only"
         run: |
           set -euo pipefail
 
@@ -28547,6 +28576,12 @@ pre_build = []
             "          shared-key: fuzz-property-smoke\n",
             "          shared-key: fuzz-smoke\n",
         ),
+        # The property build's one-rustc ferrum-edge compile outgrows the
+        # runner's RAM and 3 GiB image swap without the 12 GiB extension.
+        "missing property-build swap": (
+            "          sudo swapon /mnt/ferrum-swapfile\n",
+            "",
+        ),
         # The adopted generation is the property gate alone. Running any
         # libFuzzer budget in it again puts the sanitizer compile back on the
         # required CI critical path; a generation transition is the only way.
@@ -29142,6 +29177,17 @@ pre_build = []
         ),
         "missing runner swap": (
             "          sudo swapon /mnt/ferrum-fuzz-swapfile\n",
+            "",
+        ),
+        # The capped compile is what keeps the sanitizer build inside the
+        # runner; restoring four LLVM workers or limited debuginfo regrows the
+        # ~24 GiB footprint that lost the runner on main.
+        "uncapped sanitizer compile": (
+            '          CARGO_BUILD_JOBS: "2"\n',
+            "",
+        ),
+        "fuller sanitizer debuginfo": (
+            '          CARGO_PROFILE_RELEASE_DEBUG: "line-tables-only"\n',
             "",
         ),
         "reduced compilation parallelism": ("--codegen-units 16", "--codegen-units 1"),

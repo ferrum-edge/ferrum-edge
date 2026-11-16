@@ -6953,6 +6953,22 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Extend runner swap for the property build
+        run: |
+          set -euo pipefail
+          # The property build compiles the whole ferrum-edge library in one
+          # rustc process. Even at two jobs and line-tables-only debuginfo it
+          # ran this 16 GB runner out of memory on `main`, warm cache included
+          # (exit 143 on 4560df06b; runner lost on f351f1c38 and 0bf12260d).
+          # The 2026-11-09 sweep took this job's only swap step away with the
+          # sanitizer budget. Add the same bounded 12 GiB extension the eBPF,
+          # netns and coverage compiles use.
+          sudo fallocate -l 12G /mnt/ferrum-swapfile
+          sudo chmod 600 /mnt/ferrum-swapfile
+          sudo mkswap /mnt/ferrum-swapfile
+          sudo swapon /mnt/ferrum-swapfile
+          free -h
+
       - name: Install required build dependency
         run: |
           set -euo pipefail
