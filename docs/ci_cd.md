@@ -2364,11 +2364,8 @@ unreviewed place to set a target linker, runner, or rustflags.
 The whole job is frozen, so neither moving the lane nor extending its target
 list can be an edit. `CI_FUZZ_SMOKE_JOB_GENERATIONS` therefore lists the job's
 admitted texts oldest first, and a generation retires once its successor is on
-`main`. One transition is open (#7398):
+`main`. No transition is open, so one generation remains:
 
-- `CI_FUZZ_SMOKE_PROPERTY_GATE_WITHOUT_SWAP_JOB` (retired end) — the property
-  gate as #7100 left it, without a swap extension. Delete it, with its tuple
-  entry, once its successor is on `main`.
 - `CI_FUZZ_SMOKE_JOB` — the deterministic property smoke alone
   (`cargo test --locked` in `fuzz/`), the required gate on `pull_request`,
   `merge_group`, the push to `main`, and `workflow_dispatch`, cached under the
@@ -2385,8 +2382,11 @@ Every earlier generation is retired: #3902/#4238's lane split (the budget
 moved off pull requests and then the merge queue), #4442's seventh bounded
 invocation for `datagram_client_address` (its own 64 KiB `-max_len`, every
 other bound identical to the loop's), #6584's `ocsp_response` / `jwt_svid` /
-`tls_material` loop, #6573's BoringCache retirement, and the in-CI sanitizer
-shape that the 2026-11-09 sweep moved to `fuzz-smoke-main.yml`.
+`tls_material` loop, #6573's BoringCache retirement, the in-CI sanitizer
+shape that the 2026-11-09 sweep moved to `fuzz-smoke-main.yml`, and #7100's
+property gate without the swap extension
+(`CI_FUZZ_SMOKE_PROPERTY_GATE_WITHOUT_SWAP_JOB`), retired after #7398's swap
+step reached `main`.
 
 A change to what the job runs edits the byte-frozen `fuzz-smoke` job together
 with the policy that admits it: the new text becomes `CI_FUZZ_SMOKE_JOB`, and
@@ -2723,21 +2723,19 @@ its surface and is refused. `WORKFLOW_DIRECTORY_JOB_GENERATION_TRANSITIONS` in
 `.github/scripts/verify_cross_build_policy.py` admits exact retired→adopted
 pairs for those jobs, keyed by the workflow filename AND the job name.
 
-The table holds one entry, PR #7400's `gateways-protocol-benchmark.yml`
-`benchmark` pair
-(`4c2b4900fec25e45a2af4330dfe66d3ac4ce530f445f061d642de460561c3008` →
-`70b612bb967eda2827bcc5708133a30c27508be6ffd581e82150d8be5bde3ec8`). That PR
-drops the job's BuildKit `cache-to: type=gha,mode=max` export and the buildx
-step that existed only for it. The exported builder layers were 4.2 GB of the
-10 GB Actions cache, and evicting them sent the Rust CI caches cold. The job's
-Cross-sensitive command lines are unchanged. The workflow and the policy land
-in one admin-merged pull request, so the tuple is spent on arrival and is
-deleted by the next policy edit.
+The table is currently **empty**. Its retired entries:
 
-Earlier entries were both `coverage.yml` `coverage-merge` pairs: PR #3917's
-(issue #3907), retired after #3917 merged and a later action-pin bump moved the
-job off that digest, and PR #6958's 45 → 75-minute timeout pair, retired once
-the 75-minute job was main's.
+- PR #7400's `gateways-protocol-benchmark.yml` `benchmark` pair
+  (`4c2b4900fec25e45a2af4330dfe66d3ac4ce530f445f061d642de460561c3008` →
+  `70b612bb967eda2827bcc5708133a30c27508be6ffd581e82150d8be5bde3ec8`), which
+  dropped the job's BuildKit `cache-to: type=gha,mode=max` export and the
+  buildx step that existed only for it (the exported builder layers were
+  4.2 GB of the 10 GB Actions cache and sent the Rust CI caches cold). It was
+  retired once its pin-normalized destination was main's live job.
+- Two `coverage.yml` `coverage-merge` pairs: PR #3917's (issue #3907), retired
+  after #3917 merged and a later action-pin bump moved the job off that
+  digest, and PR #6958's 45 → 75-minute timeout pair, retired once the
+  75-minute job was main's.
 
 A future entry follows the same rules: each digest is the SHA-256 of
 `extract_job_block` text, both ends are exact, the binding includes the
