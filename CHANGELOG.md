@@ -150,8 +150,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   a carried route answers every spelling of its Service host. A route is
   refused (the host keeps its Service route) when a destination is an
   in-cluster Service the waypoint does not model (any alias form, two-label
-  `<svc>.<ns>` included) or when a weighted split names a Service a
-  DestinationRule governs. Only an omitted or well-formed `spec.gateways`
+  `<svc>.<ns>` included); a weighted split across DestinationRule-governed
+  Services is dispatched leg by leg (#7387). Only an omitted or well-formed `spec.gateways`
   naming `mesh` binds a VirtualService to the mesh. Sidecar and Ambient slices
   still carry no `http[]` routes.
 - **`plugin_request_view` benchmark and the `Plugin Request View Comparison`

@@ -577,7 +577,12 @@ NodeWaypoints.
 
 On a NodeWaypoint, a VirtualService weighted split that names a Service a
 DestinationRule governs is no longer refused. It is served leg by leg (see
-[Weighted splits across DestinationRule-governed Services](mesh.md#weighted-splits-across-destinationrule-governed-services)):
+[Weighted splits across DestinationRule-governed Services](mesh.md#weighted-splits-across-destinationrule-governed-services)),
+unless it cannot be represented: a split with an unmodeled, unreachable or
+cross-namespace Service leg, more than 32 legs, more than 64 candidate
+destinations, more than 64 leg-dispatched splits on one route, a residual
+upstream id already in use, or an external leg a wildcard DestinationRule
+covers is still refused, and the host keeps its Service route.
 
 - **Policy per leg.** Each leg gets only its own Service's DestinationRule.
 - **Authorization per leg.** Each leg's own AuthorizationPolicy, CUSTOM checks
@@ -601,8 +606,9 @@ DestinationRule governs is no longer refused. It is served leg by leg (see
 - **Wildcard DestinationRules.** Wildcard DestinationRule hosts are still not
   applied on the data plane (#7395). A NodeWaypoint VirtualService route whose
   external split leg or direct backend a wildcard rule covers is now refused,
-  and the host keeps its Service route. Give such hosts an exact
-  DestinationRule, or route them through an EgressGateway.
+  and the host keeps its Service route. An exact DestinationRule alongside the
+  wildcard does not lift the refusal: narrow or remove the wildcard rule so it
+  no longer covers the host, or route such hosts through an EgressGateway.
 
 Review AuthorizationPolicies on Services that weighted splits name before
 upgrading NodeWaypoints.
