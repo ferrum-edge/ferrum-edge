@@ -4852,8 +4852,13 @@ fn bind_carried_http_routes_to_node_waypoint_transport(
         }
         if keep && !route_splits.is_empty() {
             // Leg-by-leg dispatch is authorized per leg, so every candidate
-            // must fit the verdict table; otherwise the route is refused.
-            if candidates.len() > crate::plugins::mesh::authz::MAX_NODE_WAYPOINT_ROUTE_BRANCHES {
+            // must fit the verdict table, and every split must fit the one
+            // dispatch instance's table; otherwise the route is refused (the
+            // host keeps its Service route) instead of the generated instance
+            // failing construction and refusing the whole generation.
+            if candidates.len() > crate::plugins::mesh::authz::MAX_NODE_WAYPOINT_ROUTE_BRANCHES
+                || route_splits.len() > crate::plugins::mesh_route_dispatch::MAX_WEIGHTED_SPLITS
+            {
                 oversized_weighted_routes += 1;
                 keep = false;
             }
@@ -9582,32 +9587,96 @@ pub(crate) fn mesh_external_udp_upstream_id(
         .replace(['/', '.', ':'], "-")
 }
 
-/// Upstreams a request reaches through a route override (`mesh_route_dispatch`
-/// rule destinations and weighted-split legs, issue #7387), by namespace,
-/// excluding any a subset-bound proxy also references (a seeded port slot
-/// would outrank that subset's own connect timeout).
-fn route_override_only_upstreams(config: &GatewayConfig) -> HashMap<String, HashSet<String>> {
-    let mut upstreams: HashMap<String, HashSet<String>> = HashMap::new();
-    for plugin in &config.plugin_configs {
-        if !plugin.enabled || plugin.plugin_name != "mesh_route_dispatch" {
-            continue;
-        }
-        for id in slice::mesh_route_dispatch_rule_upstream_ids(&plugin.config) {
-            upstreams
-                .entry(plugin.namespace.clone())
+/// Where a DestinationRule's top-level `connectTimeout` is projected onto
+/// upstream port slots instead of onto the referencing proxies (issue #7387).
+///
+/// A route override (a `mesh_route_dispatch` rule destination or a
+/// weighted-split leg) changes the request's upstream but keeps the route
+/// proxy's own connect timeout, and re-resolves only the destination's
+/// `port_overrides`. So, for every upstream a route can reach that way (and
+/// the own upstream of every route that carries a proxy-scoped dispatch
+/// instance), the timeout lands on the upstream's port slots, and those
+/// routes keep their route-owned connect timeout: each destination then
+/// carries exactly its own rule's timeout, and a destination whose rule sets
+/// none falls back to the route's own value, never to another destination's
+/// rule. An upstream a subset-bound proxy references keeps the proxy-level
+/// projection (a port slot would outrank that subset's own connect timeout).
+struct RouteOverrideConnectTimeouts {
+    upstreams: HashMap<String, HashSet<String>>,
+    proxies: HashMap<String, HashSet<String>>,
+}
+
+impl RouteOverrideConnectTimeouts {
+    fn new(config: &GatewayConfig) -> Self {
+        let mut upstreams: HashMap<String, HashSet<String>> = HashMap::new();
+        let mut proxies: HashMap<String, HashSet<String>> = HashMap::new();
+        for plugin in &config.plugin_configs {
+            if !plugin.enabled || plugin.plugin_name != "mesh_route_dispatch" {
+                continue;
+            }
+            for id in slice::mesh_route_dispatch_rule_upstream_ids(&plugin.config) {
+                upstreams
+                    .entry(plugin.namespace.clone())
+                    .or_default()
+                    .insert(id.to_string());
+            }
+            if plugin.scope != PluginScope::Proxy {
+                continue;
+            }
+            let Some(proxy) = plugin.proxy_id.as_deref().and_then(|proxy_id| {
+                config
+                    .proxies
+                    .iter()
+                    .find(|proxy| proxy.namespace == plugin.namespace && proxy.id == proxy_id)
+            }) else {
+                continue;
+            };
+            if let Some(upstream_id) = proxy.upstream_id.as_deref() {
+                upstreams
+                    .entry(proxy.namespace.clone())
+                    .or_default()
+                    .insert(upstream_id.to_string());
+            }
+            proxies
+                .entry(proxy.namespace.clone())
                 .or_default()
-                .insert(id.to_string());
+                .insert(proxy.id.clone());
         }
-    }
-    for proxy in &config.proxies {
-        if proxy.upstream_subset.is_some()
-            && let Some(upstream_id) = proxy.upstream_id.as_deref()
-            && let Some(ids) = upstreams.get_mut(proxy.namespace.as_str())
-        {
-            ids.remove(upstream_id);
+        for proxy in &config.proxies {
+            if proxy.upstream_subset.is_some() {
+                if let Some(upstream_id) = proxy.upstream_id.as_deref()
+                    && let Some(ids) = upstreams.get_mut(proxy.namespace.as_str())
+                {
+                    ids.remove(upstream_id);
+                }
+                if let Some(ids) = proxies.get_mut(proxy.namespace.as_str()) {
+                    ids.remove(proxy.id.as_str());
+                }
+            }
         }
+        Self { upstreams, proxies }
     }
-    upstreams
+
+    /// Whether `upstream_id` carries the rule's top-level timeout on its port
+    /// slots.
+    fn projects_onto(&self, namespace: &str, upstream_id: &str) -> bool {
+        self.upstreams
+            .get(namespace)
+            .is_some_and(|ids| ids.contains(upstream_id))
+    }
+
+    /// Whether `proxy` keeps its route-owned connect timeout: it can reach
+    /// other destinations through a route override, and its own upstream
+    /// carries the rule's timeout on its port slots instead.
+    fn keeps_route_timeout(&self, proxy: &Proxy) -> bool {
+        self.proxies
+            .get(proxy.namespace.as_str())
+            .is_some_and(|ids| ids.contains(proxy.id.as_str()))
+            && proxy
+                .upstream_id
+                .as_deref()
+                .is_some_and(|upstream_id| self.projects_onto(&proxy.namespace, upstream_id))
+    }
 }
 
 /// True for the mesh egress upstream families that no `config.proxies` entry
@@ -11793,7 +11862,13 @@ pub(crate) fn apply_destination_rules_with_tenant_file_roots(
         .collect();
     sorted_destination_rules
         .sort_by(|a, b| (&a.namespace, &a.name, &a.host).cmp(&(&b.namespace, &b.name, &b.host)));
-    let route_override_upstreams = route_override_only_upstreams(config);
+    let route_override_timeouts = RouteOverrideConnectTimeouts::new(config);
+    // Top-level `connectTimeout` projected onto port slots, by upstream index:
+    // the LAST matching rule's value (the sorted application order, like the
+    // proxy-level projection), seeded once every rule has applied so an
+    // earlier rule's seed never shadows a later one, and only onto slots no
+    // `portLevelSettings.connectTimeout` set.
+    let mut seeded_connect_timeouts: HashMap<usize, u64> = HashMap::new();
 
     // Owning Service port per materialized per-port outbound upstream
     // (forward-derived from the slice, like `mesh_outbound_service_groups`).
@@ -12451,23 +12526,9 @@ pub(crate) fn apply_destination_rules_with_tenant_file_roots(
             // policy key for targetPort-remapped services.
             if let Some(timeout_ms) = connect_timeout_ms
                 && (is_proxyless_mesh_relay_upstream_id(&upstream.id)
-                    || route_override_upstreams
-                        .get(upstream.namespace.as_str())
-                        .is_some_and(|ids| ids.contains(upstream.id.as_str())))
+                    || route_override_timeouts.projects_onto(&upstream.namespace, &upstream.id))
             {
-                let mut target_policy_ports: Vec<u16> = upstream
-                    .targets
-                    .iter()
-                    .map(UpstreamTarget::dispatch_policy_port)
-                    .collect();
-                target_policy_ports.sort_unstable();
-                target_policy_ports.dedup();
-                for port in target_policy_ports {
-                    let slot = upstream.port_overrides.entry(port).or_default();
-                    if slot.connect_timeout_ms.is_none() {
-                        slot.connect_timeout_ms = Some(timeout_ms);
-                    }
-                }
+                seeded_connect_timeouts.insert(idx, timeout_ms);
             }
 
             // Per-subset `connectionPool.tcp.connectTimeout` overrides the DR
@@ -12499,6 +12560,10 @@ pub(crate) fn apply_destination_rules_with_tenant_file_roots(
                 for proxy in &mut config.proxies {
                     if proxy.upstream_id.as_deref() != Some(upstream_id.as_str())
                         || proxy.namespace != upstream_namespace
+                        // A route that can reach other destinations keeps its
+                        // own timeout; its upstream's port slots carry this
+                        // rule's (issue #7387).
+                        || route_override_timeouts.keeps_route_timeout(proxy)
                     {
                         continue;
                     }
@@ -12586,6 +12651,30 @@ pub(crate) fn apply_destination_rules_with_tenant_file_roots(
                         proxy.tcp_idle_timeout_seconds = Some(idle);
                     }
                 }
+            }
+        }
+    }
+
+    // Seed each projected top-level `connectTimeout` (see
+    // `seeded_connect_timeouts`) onto every target policy port without an
+    // explicit per-port timeout. Keyed by the selected target's policy port
+    // because the dials receive both the dial app port and the owning
+    // Service-port policy key for targetPort-remapped services.
+    for (idx, timeout_ms) in seeded_connect_timeouts {
+        let Some(upstream) = config.upstreams.get_mut(idx) else {
+            continue;
+        };
+        let mut target_policy_ports: Vec<u16> = upstream
+            .targets
+            .iter()
+            .map(UpstreamTarget::dispatch_policy_port)
+            .collect();
+        target_policy_ports.sort_unstable();
+        target_policy_ports.dedup();
+        for port in target_policy_ports {
+            let slot = upstream.port_overrides.entry(port).or_default();
+            if slot.connect_timeout_ms.is_none() {
+                slot.connect_timeout_ms = Some(timeout_ms);
             }
         }
     }

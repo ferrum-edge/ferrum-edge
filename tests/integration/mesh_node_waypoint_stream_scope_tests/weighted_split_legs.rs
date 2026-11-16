@@ -18,7 +18,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use ferrum_edge::_test_support::{
-    install_plugin_finalizers_for_test, run_before_proxy_hooks_for_test,
+    collect_rejecting_runtime_config_errors_for_test, install_plugin_finalizers_for_test,
+    run_before_proxy_hooks_for_test,
 };
 use ferrum_edge::config::db_backend::namespaced_runtime_key;
 use ferrum_edge::config::types::{GatewayConfig, Proxy, Upstream};
@@ -305,7 +306,11 @@ fn route_branches(prepared: &GatewayConfig, route: &Proxy) -> serde_json::Value 
 }
 
 fn request(route: &Proxy, source: &str) -> RequestContext {
-    let mut ctx = RequestContext::new("127.0.0.1".to_string(), "GET".to_string(), "/".to_string());
+    request_at(route, source, "/")
+}
+
+fn request_at(route: &Proxy, source: &str, path: &str) -> RequestContext {
+    let mut ctx = RequestContext::new("127.0.0.1".to_string(), "GET".to_string(), path.to_string());
     let identity = SpiffeId::new(source).expect("spiffe");
     ctx.peer_spiffe_id = Some(identity.clone());
     ctx.node_waypoint_policy_scope = Some(Arc::new(PolicyScopeCache::new(
@@ -1041,4 +1046,325 @@ fn a_split_without_destination_rules_keeps_workload_rebinding() {
         .collect();
     hosts.sort_unstable();
     assert_eq!(hosts, vec!["10.0.0.11", "10.0.0.12"]);
+}
+
+/// A DestinationRule whose `trafficPolicy.connectionPool.tcp` is `tcp`.
+fn tcp_destination_rule(name: &str, host: &str, tcp: serde_json::Value) -> K8sObject {
+    k8s_object(
+        "DestinationRule",
+        name,
+        json!({"host": host, "trafficPolicy": {"connectionPool": {"tcp": tcp}}}),
+    )
+}
+
+/// The index of the route's `mesh_route_dispatch` config in `config`.
+fn route_dispatch_index(config: &GatewayConfig, route: &Proxy) -> usize {
+    config
+        .plugin_configs
+        .iter()
+        .position(|plugin| {
+            plugin.plugin_name == "mesh_route_dispatch"
+                && plugin.namespace == route.namespace
+                && route
+                    .plugins
+                    .iter()
+                    .any(|association| association.plugin_config_id == plugin.id)
+        })
+        .expect("the route has a mesh_route_dispatch instance")
+}
+
+/// Issue #7387 review (sol F1 = dsf F1): a weighted-split leg is validated
+/// like a rule's `upstream_id`. A leg naming no upstream, or one that exists
+/// only in another namespace, refuses the configuration instead of falling
+/// back to the route's direct backend at dispatch.
+#[test]
+fn a_weighted_leg_must_name_an_upstream_in_the_route_namespace() {
+    let mut objects = vec![reviews_ratings_split(90, 10)];
+    objects.extend(reviews_and_ratings_rules());
+    let (_, prepared) = prepare(&objects, Vec::new());
+    let route = carried_split_route(&prepared);
+    let dispatch = route_dispatch_index(&prepared, &route);
+    let leg_errors = |config: &GatewayConfig| -> Vec<String> {
+        collect_rejecting_runtime_config_errors_for_test(config)
+            .into_iter()
+            .filter(|error| error.contains("weighted_splits"))
+            .collect()
+    };
+    assert_eq!(
+        leg_errors(&prepared),
+        Vec::<String>::new(),
+        "generated legs resolve"
+    );
+
+    let mut typo = prepared.clone();
+    typo.plugin_configs[dispatch].config["weighted_splits"][0]["legs"][0]["upstream_id"] =
+        json!("typo");
+    assert!(
+        leg_errors(&typo)
+            .iter()
+            .any(|error| error.contains("weighted_splits[0].legs[0]")),
+        "a missing leg refuses the config: {:?}",
+        leg_errors(&typo)
+    );
+
+    let mut foreign = prepared.clone();
+    let mut elsewhere = foreign
+        .upstreams
+        .iter()
+        .find(|upstream| upstream.id == REVIEWS_UPSTREAM)
+        .expect("reviews upstream")
+        .clone();
+    elsewhere.namespace = "other".to_string();
+    elsewhere.id = "elsewhere".to_string();
+    elsewhere.name = Some("elsewhere".to_string());
+    foreign.upstreams.push(elsewhere);
+    foreign.plugin_configs[dispatch].config["weighted_splits"][0]["legs"][1]["upstream_id"] =
+        json!("elsewhere");
+    assert!(
+        leg_errors(&foreign)
+            .iter()
+            .any(|error| error.contains("weighted_splits[0].legs[1]")),
+        "a leg in another namespace refuses the config: {:?}",
+        leg_errors(&foreign)
+    );
+}
+
+/// A slice carrying one header-guarded split route, plus `extra` more
+/// header-guarded rules on the same route, each to its own split between
+/// `reviews` and `ratings`. `reviews` is DestinationRule-governed.
+fn slice_with_guarded_splits(extra: usize) -> MeshSlice {
+    let mut objects = vec![k8s_object(
+        "VirtualService",
+        "guarded",
+        json!({
+            "hosts": ["reviews.default.svc.cluster.local"],
+            "http": [{
+                "match": [{"uri": {"prefix": "/api"}, "headers": {"x-version": {"exact": "v2"}}}],
+                "route": [
+                    {"destination": {"host": "reviews.default.svc.cluster.local", "port": {"number": 8080}}, "weight": 50},
+                    {"destination": {"host": "ratings.default.svc.cluster.local", "port": {"number": 8080}}, "weight": 50}
+                ]
+            }]
+        }),
+    )];
+    objects.extend(reviews_and_ratings_rules());
+    let mut slice = slice_for(&translated_config(&objects, Vec::new()));
+    let base = slice.http_routes.upstreams[0].clone();
+    let base_id = base["id"].as_str().expect("split id").to_string();
+    let ids: Vec<String> = (0..extra).map(|n| format!("{base_id}-x{n}")).collect();
+    for id in &ids {
+        let mut upstream = base.clone();
+        upstream["id"] = json!(id);
+        upstream["name"] = json!(id);
+        slice.http_routes.upstreams.push(upstream);
+    }
+    let dispatch = slice
+        .http_routes
+        .plugin_configs
+        .iter_mut()
+        .find(|plugin| plugin["plugin_name"] == json!("mesh_route_dispatch"))
+        .expect("the guarded route carries its dispatch rules");
+    let rules = dispatch["config"]["rules"]
+        .as_array_mut()
+        .expect("dispatch rules");
+    for (n, id) in ids.iter().enumerate() {
+        rules.push(json!({
+            "match": {"headers": {"x-split": {"exact": n.to_string()}}},
+            "destination": {"upstream_id": id}
+        }));
+    }
+    slice
+}
+
+/// Issue #7387 review (sol F3): one route may name at most as many
+/// leg-dispatched splits as one `mesh_route_dispatch` instance accepts. At
+/// the limit the route is served and its instance constructs; past it the
+/// route is refused (the host keeps its Service route) instead of the
+/// generated instance failing construction for the whole generation.
+#[test]
+fn a_route_with_more_splits_than_one_dispatch_instance_accepts_is_refused() {
+    let at_limit = slice_with_guarded_splits(63);
+    let prepared = prepare_gateway_config_from_mesh_slice(&at_limit, &node_waypoint_runtime())
+        .expect("slice materializes");
+    let routes = carried_routes(&prepared);
+    assert_eq!(routes.len(), 1, "64 splits fit one instance");
+    let route = routes[0].clone();
+    let splits = route_dispatch_config(&prepared, &route)["weighted_splits"]
+        .as_array()
+        .expect("weighted splits")
+        .len();
+    assert_eq!(splits, 64);
+    let _ = route_dispatch_instance(&prepared, &route);
+
+    let past_limit = slice_with_guarded_splits(64);
+    let prepared = prepare_gateway_config_from_mesh_slice(&past_limit, &node_waypoint_runtime())
+        .expect("the slice materializes without the refused route");
+    assert!(carried_routes(&prepared).is_empty());
+    assert!(
+        prepared
+            .proxies
+            .iter()
+            .any(|proxy| proxy.upstream_id.as_deref() == Some(REVIEWS_UPSTREAM)),
+        "reviews keeps its Service route"
+    );
+}
+
+/// Issue #7387 review (sol F4): with two same-tier DestinationRules on one
+/// leg's Service, the leg's projected connect timeout is the last rule's,
+/// exactly what the Service's own route uses, not the first rule's.
+#[test]
+fn a_leg_connect_timeout_follows_the_last_matching_rule() {
+    let objects = vec![
+        split_virtual_service(
+            "split",
+            "details.default.svc.cluster.local",
+            &[
+                ("reviews.default.svc.cluster.local", 8080, 50),
+                ("ratings.default.svc.cluster.local", 8080, 50),
+            ],
+        ),
+        tcp_destination_rule(
+            "a-reviews",
+            "reviews.default.svc.cluster.local",
+            json!({"connectTimeout": "1s"}),
+        ),
+        tcp_destination_rule(
+            "z-reviews",
+            "reviews.default.svc.cluster.local",
+            json!({"connectTimeout": "2s"}),
+        ),
+    ];
+    let (_, prepared) = prepare(&objects, Vec::new());
+    let _ = carried_split_route(&prepared);
+    let reviews = prepared
+        .upstreams
+        .iter()
+        .find(|upstream| upstream.id == REVIEWS_UPSTREAM)
+        .expect("reviews upstream");
+    let seeded = reviews
+        .port_overrides
+        .get(&8080)
+        .and_then(|slot| slot.connect_timeout_ms);
+    assert_eq!(seeded, Some(2000), "the last rule's timeout is projected");
+    let service_route = prepared
+        .proxies
+        .iter()
+        .find(|proxy| {
+            !proxy.id.starts_with("istio-vs-")
+                && proxy.upstream_id.as_deref() == Some(REVIEWS_UPSTREAM)
+        })
+        .expect("reviews keeps its Service route");
+    assert_eq!(
+        Some(service_route.backend_connect_timeout_ms),
+        seeded,
+        "the leg and the Service's own route use the same timeout"
+    );
+}
+
+/// Issue #7387 review (sol F5): on a merged route whose own destination's
+/// DestinationRule sets a connect timeout, a weighted-split leg whose own
+/// rule sets none uses the route's own timeout, never the other Service's;
+/// the own destination keeps its rule through its upstream's port slots.
+#[tokio::test]
+async fn a_leg_without_its_own_timeout_does_not_inherit_another_services_rule() {
+    let objects = vec![
+        k8s_object(
+            "VirtualService",
+            "merged",
+            json!({
+                "hosts": ["reviews.default.svc.cluster.local"],
+                "http": [
+                    {
+                        "match": [{"uri": {"prefix": "/api"}, "headers": {"x-version": {"exact": "v2"}}}],
+                        "route": [
+                            {"destination": {"host": "ratings.default.svc.cluster.local", "port": {"number": 8080}}, "weight": 50},
+                            {"destination": {"host": "details.default.svc.cluster.local", "port": {"number": 8080}}, "weight": 50}
+                        ]
+                    },
+                    {
+                        "match": [{"uri": {"prefix": "/api"}}],
+                        "route": [{"destination": {"host": "reviews.default.svc.cluster.local", "port": {"number": 8080}}}]
+                    }
+                ]
+            }),
+        ),
+        tcp_destination_rule(
+            "reviews-dr",
+            "reviews.default.svc.cluster.local",
+            json!({"connectTimeout": "1s"}),
+        ),
+        tcp_destination_rule(
+            "ratings-dr",
+            "ratings.default.svc.cluster.local",
+            json!({"maxConnections": 3}),
+        ),
+        tcp_destination_rule(
+            "details-dr",
+            "details.default.svc.cluster.local",
+            json!({"connectTimeout": "2s"}),
+        ),
+    ];
+    let (_, prepared) = prepare(&objects, Vec::new());
+    let routes = carried_routes(&prepared);
+    assert_eq!(
+        routes.len(),
+        1,
+        "the guarded split is merged into the fallback"
+    );
+    let route = routes[0].clone();
+    assert_eq!(route.upstream_id.as_deref(), Some(REVIEWS_UPSTREAM));
+    assert_ne!(
+        route.backend_connect_timeout_ms, 1000,
+        "the route keeps its own timeout; reviews' rule rides its upstream"
+    );
+    let reviews_slot = prepared
+        .upstreams
+        .iter()
+        .find(|upstream| upstream.id == REVIEWS_UPSTREAM)
+        .and_then(|upstream| upstream.port_overrides.get(&8080))
+        .and_then(|slot| slot.connect_timeout_ms);
+    assert_eq!(
+        reviews_slot,
+        Some(1000),
+        "the own destination keeps its rule"
+    );
+
+    let plugins = chain(vec![route_dispatch_instance(&prepared, &route)]);
+    let upstreams = upstream_map(&prepared);
+    let mut seen = HashMap::new();
+    for _ in 0..10 {
+        let mut ctx = request_at(&route, TRUSTED, "/api");
+        let mut headers = request_headers();
+        headers.insert("x-version".to_string(), "v2".to_string());
+        ctx.headers = headers.clone();
+        let result = run_before_proxy_hooks_for_test(&plugins, &mut ctx, &mut headers).await;
+        assert!(matches!(result, PluginResult::Continue), "{result:?}");
+        let leg = selected_leg(&ctx);
+        let effective =
+            ctx.apply_route_overrides_with_upstreams(Arc::new(route.clone()), &upstreams);
+        let slot = effective
+            .dispatch_port_overrides
+            .as_ref()
+            .and_then(|overrides| overrides.get(&8080));
+        match leg.as_str() {
+            RATINGS_UPSTREAM => {
+                assert_eq!(slot.and_then(|slot| slot.max_connections), Some(3));
+                assert_eq!(
+                    slot.and_then(|slot| slot.connect_timeout_ms),
+                    None,
+                    "ratings' rule sets no timeout"
+                );
+                assert_eq!(
+                    effective.backend_connect_timeout_ms, route.backend_connect_timeout_ms,
+                    "ratings uses the route's own timeout, not reviews' rule"
+                );
+            }
+            DETAILS_UPSTREAM => {
+                assert_eq!(slot.and_then(|slot| slot.connect_timeout_ms), Some(2000));
+            }
+            other => panic!("the guarded rule reaches only the split's legs: {other}"),
+        }
+        *seen.entry(leg).or_insert(0) += 1;
+    }
+    assert_eq!(seen.len(), 2, "both legs were reached: {seen:?}");
 }

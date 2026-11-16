@@ -38,6 +38,8 @@ type column says so. Unknown keys are rejected at every level.
 | `upstream_id` | String | — | Required. The split destination this entry resolves (a rule's `destination.upstream_id`, or the route's own `upstream_id`); unique per instance |
 | `legs` | Object[] | — | Required, 1–32 entries: `upstream_id` (required, distinct, never itself a split) and `weight` (required, ≥ 1, the leg's share relative to the other legs) |
 
+Every split id and leg must name an upstream in the plugin's namespace (every namespace a global instance applies to), exactly like a rule's `destination.upstream_id`: admin writes and config loads refuse a missing or foreign one, and an upstream a split or leg names cannot be deleted or removed by an API-spec replacement.
+
 **`rules[]`**
 
 | Parameter | Type | Default | Description |
