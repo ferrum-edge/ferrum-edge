@@ -378,12 +378,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 - JWT verification uses jsonwebtoken 12 (#7404). Every JWT verifier (admin API,
-  `jwt_auth`, `jwks_auth`/OIDC, CP/DP gRPC and JWT-SVID) now rejects a token
-  whose header declares a `crit` extension other than `b64`, or `b64: false`.
-  A malformed `aud`, `iss` or `sub` claim is rejected inside the library as
-  `InvalidClaimFormat` before Ferrum's own shape checks run, so logs report that
-  category instead of the audience- or issuer-specific one. An empty HMAC
-  secret is now refused when a key is built, instead of being used to sign.
+  `jwt_auth`, `jwks_auth`/OIDC, DPoP proofs, CP/DP gRPC and JWT-SVID) now
+  rejects a token whose header declares a `crit` extension other than `b64`, or
+  `b64: false`. Where the library validates a claim itself (`aud` when audience
+  validation is on, `iss` when an expected issuer is configured), a non-null
+  value of the wrong JSON type (a number, an object, or an array with a
+  non-string member) is now rejected there as `InvalidClaimFormat`; Ferrum's own
+  claim-shape checks and error categories still cover every other case. An
+  empty HMAC secret is now refused when a key is built, instead of being used
+  to sign.
 - **BREAKING — NodeWaypoint dispatches a VirtualService weighted split across
   DestinationRule-governed Services leg by leg** (issue #7387). Such a split was
   refused and the host fell back to its Service route; it is now served.
