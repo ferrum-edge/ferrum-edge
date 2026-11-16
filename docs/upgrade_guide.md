@@ -617,7 +617,7 @@ upgrading NodeWaypoints.
 
 The bundled Public Suffix List moves to `psl` 2.1.255 and the regenerated CORS
 ancestor index gains `amba.host` (the list now carries rules beneath it). With
-`allow_credentials: true`, a wildcard origin `"https://*.amba.host"` is now
+`allow_credentials: true`, the wildcard origin `"*.amba.host"` is now
 refused as effectively universal, so a config that carries one fails
 validation the same way as the matchers listed under PR #6639. Use exact
 origins, or drop credentials for that matcher.
