@@ -2125,17 +2125,26 @@ fn request_authentication_holds_for_every_weighted_leg() {
     );
 }
 
-/// Whether a prepared route dispatches its split leg by leg.
+/// Whether a prepared route dispatches its split leg by leg. A split route
+/// that is not leg-dispatched has no `mesh_route_dispatch` instance at all
+/// (the binding adds one only for leg dispatch), which also means no.
 fn route_is_leg_dispatched(prepared: &GatewayConfig) -> bool {
     let route = carried_split_route(prepared);
     let split_id = route.upstream_id.clone().expect("split id");
-    route_dispatch_config(prepared, &route)["weighted_splits"]
-        .as_array()
-        .is_some_and(|splits| {
-            splits
-                .iter()
-                .any(|split| split["upstream_id"] == json!(split_id))
+    prepared
+        .plugin_configs
+        .iter()
+        .filter(|plugin| {
+            plugin.plugin_name == "mesh_route_dispatch"
+                && plugin.namespace == route.namespace
+                && route
+                    .plugins
+                    .iter()
+                    .any(|association| association.plugin_config_id == plugin.id)
         })
+        .filter_map(|plugin| plugin.config["weighted_splits"].as_array())
+        .flatten()
+        .any(|split| split["upstream_id"] == json!(split_id))
 }
 
 /// The connect timeout a DestinationRule projected onto `upstream_id`'s
