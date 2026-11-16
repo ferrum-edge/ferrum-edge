@@ -12476,7 +12476,18 @@ CI_JOB_GENERATION_TRANSITIONS: tuple[tuple[str, str, str], ...] = (
 WORKFLOW_DIRECTORY_JOB_GENERATION_TRANSITIONS: tuple[
     tuple[str, str, str, str], ...
 ] = (
-    # Empty: no workflow-directory job generation transition is admitted.
+    # PR #7400: `gateways-protocol-benchmark.yml` `benchmark` drops its
+    # BuildKit `cache-from` / `cache-to: type=gha,mode=max` lines and the
+    # docker-container buildx step that existed only for them. The exported
+    # builder layers were 4.2 GB of the repository's 10 GB Actions cache and
+    # evicted the Rust CI caches. The job's Cross-sensitive command lines are
+    # unchanged. Retire this tuple once the destination is on `main`.
+    (
+        "gateways-protocol-benchmark.yml",
+        "benchmark",
+        "47a369a0075ab8a6eb3d817f30d3d2f19cc800c2ea75746e017080fb535b5300",
+        "1a4b8f005b3e59641b3f83ff3e5e2a85d25bc0a477cc758be17fde3519807076",
+    ),
     #
     # PR #6958's `coverage.yml` `coverage-merge` timeout pair (45 -> 75
     # minutes) was retired here once its 75-minute destination was main's
