@@ -2899,14 +2899,21 @@ NODE_WAYPOINT_RELEVANCE_CONTRACT = {
 # a new image family: as two byte-frozen GENERATIONS with a one-way transition
 # between them (`CI_FUZZ_SMOKE_JOB_GENERATIONS`, oldest first).
 #
-# Every transition is spent: the newest generation reached `main`, and the
-# rule is to retire a generation once its successor is on `main`. #4238's
-# shape, the #4442 datagram-target shape, the pre-parser-target shape, the
-# BoringCache rollout retired by issue #6573 and the in-CI sanitizer shape
+# The rule is to retire a generation once its successor is on `main`.
+# #4238's shape, the #4442 datagram-target shape, the pre-parser-target shape,
+# the BoringCache rollout retired by issue #6573 and the in-CI sanitizer shape
 # retired after the 2026-11-09 test sweep are therefore gone from this file.
-# One generation remains:
+# One transition is open (2026-11-16, #7398):
 #
-#   * `CI_FUZZ_SMOKE_JOB` is the property gate alone, on every event, with a
+#   * `CI_FUZZ_SMOKE_PROPERTY_GATE_WITHOUT_SWAP_JOB` (retired end) is the
+#     property gate as #7100 left it: no swap extension, so the one-rustc
+#     `ferrum-edge` compile ran against the image's 3 GB swap and lost the
+#     runner on `main` (exit 143 on 4560df06b with a warm cache; runner lost
+#     on f351f1c38 and 0bf12260d). Delete it, with its tuple entry, once the
+#     successor is on `main`.
+#   * `CI_FUZZ_SMOKE_JOB` is the same property gate plus the bounded 12 GiB
+#     `/mnt` swap step the eBPF, netns and coverage compiles use. It is the
+#     property gate alone, on every event, with a
 #     slim `fuzz-property-smoke` cache. The bounded libFuzzer budget lives in
 #     `FUZZ_SANITIZER_SMOKE_WORKFLOW`
 #     (`.github/workflows/fuzz-smoke-main.yml`), a whole-file contract that
@@ -2947,7 +2954,9 @@ NODE_WAYPOINT_RELEVANCE_CONTRACT = {
 #
 # A change to the job appends its successor as `CI_FUZZ_SMOKE_JOB` and keeps
 # the current text, renamed, as the retired end until the successor is on
-# `main`.
+# `main`. That holds whether the workflow half lands as a later ordinary pull
+# request or in the same admin-merged commit as this policy; in the second
+# case the retired end is deleted by the next policy edit.
 #
 # While a transition is open, both generations are admitted so the trusted base
 # stays valid while it lands, and so the destination revision validates against a policy
@@ -2964,7 +2973,7 @@ NODE_WAYPOINT_RELEVANCE_CONTRACT = {
 # / `-max_len` / `-timeout` / `-rss_limit_mb` bounds cannot drift while a
 # generation is added or the budget moves.
 CI_FUZZ_SMOKE_JOB_NAME = "fuzz-smoke"
-CI_FUZZ_SMOKE_JOB = r"""  fuzz-smoke:
+CI_FUZZ_SMOKE_PROPERTY_GATE_WITHOUT_SWAP_JOB = r"""  fuzz-smoke:
     # Byte-frozen by the trusted Cross build policy
     # (.github/scripts/verify_cross_build_policy.py, CI_FUZZ_SMOKE_JOB). Issue
     # #2461 requires a short deterministic property/fuzz smoke in ordinary CI;
@@ -3063,9 +3072,127 @@ CI_FUZZ_SMOKE_JOB = r"""  fuzz-smoke:
           echo "Fuzz lane shape: deterministic property gate (sanitizer budget runs in fuzz-smoke-main.yml)"
 """
 
+CI_FUZZ_SMOKE_JOB = r"""  fuzz-smoke:
+    # Byte-frozen by the trusted Cross build policy
+    # (.github/scripts/verify_cross_build_policy.py, CI_FUZZ_SMOKE_JOB). Issue
+    # #2461 requires a short deterministic property/fuzz smoke in ordinary CI;
+    # issue #3902 decides where each half of it runs, and issue #4442 decides
+    # which targets it covers. This is its entire
+    # permitted shape. Every command, action pin, toolchain pin, tool version,
+    # and cache key below is part of the contract, so a pull request cannot
+    # add a step, drop the property gate, or redirect this job at a
+    # repository-supplied script.
+    #
+    # Lane split (#3902, narrowed by #4238, moved out of CI by the 2026-11-09
+    # test sweep): this job is the deterministic property smoke only. It is the
+    # required gate on pull_request, merge_group, the push to `main`, and
+    # manual dispatch. The sanitizer-instrumented libFuzzer budget, which
+    # spent ~47 minutes compiling plus ~8 minutes of serial per-target
+    # rebuilds to buy under ten seconds of fuzzing, lives in
+    # `.github/workflows/fuzz-smoke-main.yml`. That workflow runs on every push
+    # to `main` and on manual dispatch, with the same frozen target list and
+    # libFuzzer bounds, so every merged change is still fuzzed at
+    # byte-identical bounds. It is not in this workflow's required `Tests`
+    # aggregate, so it no longer holds main's serialized CI run open for
+    # ~50 minutes after every other job has finished.
+    #
+    # Cache (2026-11-09 sweep): the property build alone, at
+    # line-tables-only debuginfo, under its own `fuzz-property-smoke` key. The
+    # retired shape cached the sanitizer release targets alongside it under
+    # `fuzz-smoke`, a 7.2 GB entry (~70% of the 10 GB repository quota) that
+    # evicted, and was evicted by, `ci-standalone-cargo` on alternate main runs.
+    name: Fuzz Smoke
+    needs: ci-plan
+    if: needs.ci-plan.outputs.mode == 'full' && needs.ci-plan.outputs.run_fuzz_smoke == 'true' && (github.event_name == 'pull_request' || github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch')
+    runs-on: ubuntu-26.04
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    # The repository-root Cargo config also selects the mold linker through
+    # per-target rustflags, and a runner- or user-level rustc-wrapper may
+    # select sccache, but this isolated lane installs neither: like the
+    # scheduled and push-to-main fuzz lanes, it clears both Cargo wrapper
+    # inputs and the inherited rustflags explicitly. Its compiler reuse is the
+    # restored `fuzz-property-smoke` target directory alone; a local sccache
+    # store measured 0 hits here because nothing persisted it (#7285).
+    env:
+      RUSTC_WRAPPER: ""
+      CARGO_BUILD_RUSTC_WRAPPER: ""
+      RUSTFLAGS: ""
+    steps:
+      - uses: actions/checkout@0000000000000000000000000000000000000000
+        with:
+          persist-credentials: false
+
+      - name: Extend runner swap for the property build
+        run: |
+          set -euo pipefail
+          # The property build compiles the whole ferrum-edge library in one
+          # rustc process. Even at two jobs and line-tables-only debuginfo it
+          # ran this 16 GB runner out of memory on `main`, warm cache included
+          # (exit 143 on 4560df06b; runner lost on f351f1c38 and 0bf12260d).
+          # The 2026-11-09 sweep took this job's only swap step away with the
+          # sanitizer budget. Add the same bounded 12 GiB extension the eBPF,
+          # netns and coverage compiles use.
+          sudo fallocate -l 12G /mnt/ferrum-swapfile
+          sudo chmod 600 /mnt/ferrum-swapfile
+          sudo mkswap /mnt/ferrum-swapfile
+          sudo swapon /mnt/ferrum-swapfile
+          free -h
+
+      - name: Install required build dependency
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends protobuf-compiler
+
+      - name: Install pinned nightly toolchain
+        uses: dtolnay/rust-toolchain@0000000000000000000000000000000000000000
+        with:
+          toolchain: nightly-2026-09-30
+
+      - uses: Swatinem/rust-cache@0000000000000000000000000000000000000000
+        with:
+          workspaces: fuzz -> target
+          shared-key: fuzz-property-smoke
+          # Only a push to `main` may write this lane's cache. GitHub already
+          # scopes a pull request's cache writes to its own ref; writing
+          # nothing at all from an untrusted ref is the stronger statement,
+          # and it keeps every compiler artifact the property build reuses
+          # attributable to code that has already merged.
+          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+
+      - name: Run deterministic property smoke tests
+        working-directory: fuzz
+        # From nightly-2026-09-30 the cold property-suite compile exhausts the
+        # hosted runner's memory at full parallelism ("The runner has received
+        # a shutdown signal" + exit 143, reproduced twice on #5971 while the
+        # fuzz crate overlapped the ferrum-edge lib codegen). Cap jobs as the
+        # coverage shard does (#4368). Line-tables-only debuginfo keeps
+        # file:line backtraces, matches the `ci-debug` lane's setting, and
+        # keeps the cached dependency graph near that lane's ~1 GB.
+        env:
+          CARGO_BUILD_JOBS: "2"
+          CARGO_PROFILE_DEV_DEBUG: "line-tables-only"
+        run: |
+          set -euo pipefail
+
+          property_started=$SECONDS
+          cargo test --locked
+          echo "Fuzz property smoke seconds: $((SECONDS - property_started))"
+
+      - name: Report fuzz lane shape
+        if: always()
+        run: |
+          echo "Fuzz lane shape: deterministic property gate (sanitizer budget runs in fuzz-smoke-main.yml)"
+"""
+
 # Oldest first. The index of a revision's job text in this tuple is its
 # generation; a higher index may replace a lower one, never the reverse.
-CI_FUZZ_SMOKE_JOB_GENERATIONS = (CI_FUZZ_SMOKE_JOB,)
+CI_FUZZ_SMOKE_JOB_GENERATIONS = (
+    CI_FUZZ_SMOKE_PROPERTY_GATE_WITHOUT_SWAP_JOB,
+    CI_FUZZ_SMOKE_JOB,
+)
 
 # The bounded libFuzzer budget, verbatim. Whichever frozen text hosts the
 # push-to-main budget must carry it exactly once, wherever in it it runs.
@@ -28348,10 +28475,20 @@ pre_build = []
             "the adopted fuzz-smoke generation still runs libFuzzer; its "
             "push-to-main budget belongs to FUZZ_SANITIZER_SMOKE_WORKFLOW"
         )
-    if not any(
-        all(admitted.count(budget) == 1 for budget in CI_FUZZ_SMOKE_BUDGET_TEXTS)
+    # Only a transition that moves the budget out of the job (#7099's shape)
+    # must keep it whole in its retired end. A transition between two
+    # property-gate-only generations (#7398's swap step) retires no budget, so
+    # it has nothing to carry; `fuzz_budget_hosts` above still holds every
+    # host that does run libFuzzer to the frozen bounds.
+    retired_budget_hosts = [
+        admitted
         for admitted in CI_FUZZ_SMOKE_JOB_GENERATIONS[:-1]
-    ) and len(CI_FUZZ_SMOKE_JOB_GENERATIONS) > 1:
+        if "cargo fuzz" in admitted
+    ]
+    if retired_budget_hosts and not any(
+        all(admitted.count(budget) == 1 for budget in CI_FUZZ_SMOKE_BUDGET_TEXTS)
+        for admitted in retired_budget_hosts
+    ):
         failures.append(
             "the retired fuzz-smoke generation of the open transition no longer "
             "carries the push-to-main budget it is retiring"
@@ -28701,6 +28838,12 @@ pre_build = []
         "retired fat cache key": (
             "          shared-key: fuzz-property-smoke\n",
             "          shared-key: fuzz-smoke\n",
+        ),
+        # The property build's one-rustc ferrum-edge compile outgrows the
+        # runner's RAM and 3 GiB image swap without the 12 GiB extension.
+        "missing property-build swap": (
+            "          sudo swapon /mnt/ferrum-swapfile\n",
+            "",
         ),
         # The adopted generation is the property gate alone. Running any
         # libFuzzer budget in it again puts the sanitizer compile back on the

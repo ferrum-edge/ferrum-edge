@@ -307,6 +307,9 @@ shares.
   them (the scheduled `fuzz.yml` `fuzz-sanitized` cache is a separate frozen
   contract). `fuzz-smoke-main.yml` uses `queue: max` so every push to `main`
   gets its own sanitizer run; do not drop it.
+- Both smoke lanes compile the whole `ferrum-edge` library in one rustc process
+  and need the bounded 12 GiB `/mnt` swap step on the 16 GB runner
+  (`docs/ci_cd.md` → "Fuzz lane runner losses (2026-11)").
 - Longer sanitizer-backed runs remain scheduled in `.github/workflows/fuzz.yml`.
 
 ## CI Expectations
