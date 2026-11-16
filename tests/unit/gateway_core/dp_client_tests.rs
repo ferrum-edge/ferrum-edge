@@ -116,6 +116,20 @@ fn generate_dp_jwt_wrong_secret_fails_validation() {
     assert!(result.is_err());
 }
 
+/// jsonwebtoken 12 refuses an empty HMAC key, so minting with an empty secret
+/// fails instead of signing a token with it, while a non-empty secret still
+/// mints. `GrpcJwtSecret::mint` goes through the same helper.
+#[test]
+fn generate_dp_jwt_refuses_an_empty_secret() {
+    assert!(generate_dp_jwt("", "node-1").is_err());
+    assert!(
+        GrpcJwtSecret::new(String::new())
+            .mint("node-1", None, None)
+            .is_err()
+    );
+    assert!(generate_dp_jwt("s", "node-1").is_ok());
+}
+
 /// Default-issuer minting must include the `iss` claim with the documented
 /// default. Regression-protects the issuer enforcement security fix: a
 /// reverted DP that drops `iss` would silently fail to authenticate to the

@@ -1126,3 +1126,79 @@ fn test_audience_unset_rejects_aud_bearing_token() {
         "with no audience configured, a token carrying aud must be rejected (strict RFC 7519 handling)"
     );
 }
+
+/// A correctly signed admin token whose protected header declares a critical
+/// extension the verifier does not understand (RFC 7515 §4.1.11), or
+/// `b64: false` (RFC 7797), is rejected; jsonwebtoken 12 refuses it before
+/// claim validation.
+#[test]
+fn test_admin_token_with_unsupported_crit_header_is_rejected() {
+    let manager = JwtManager::new(test_jwt_config());
+    let now = Utc::now();
+    let claims = AdminClaims {
+        iss: "test-issuer".to_string(),
+        sub: "admin-user".to_string(),
+        iat: now.timestamp(),
+        nbf: now.timestamp(),
+        exp: (now + Duration::seconds(1800)).timestamp(),
+        jti: uuid::Uuid::new_v4().to_string(),
+        additional: json!({"role": "admin"}),
+    };
+    let key = EncodingKey::from_secret("test-secret".as_bytes()).unwrap();
+
+    // Control: the same claims and key under a plain header verify.
+    let plain = encode(&Header::new(Algorithm::HS256), &claims, &key).unwrap();
+    assert!(manager.verify_token(&plain).is_ok());
+
+    let mut crit_exp = Header::new(Algorithm::HS256);
+    crit_exp.crit = Some(vec!["exp".to_string()]);
+    let mut b64_false = Header::new(Algorithm::HS256);
+    b64_false.extras.insert("b64", false);
+    for header in [crit_exp, b64_false] {
+        let token = encode(&header, &claims, &key).unwrap();
+        assert!(
+            manager.verify_token(&token).is_err(),
+            "a token with an unsupported critical header must not verify"
+        );
+        let Err(JwtError::VerificationFailed(category)) =
+            manager.verify_request(Some(&format!("Bearer {token}")))
+        else {
+            panic!("a token with an unsupported critical header must fail verification");
+        };
+        assert_eq!(category, "InvalidToken");
+    }
+}
+
+/// `JwtManager::new` accepts any configured secret (the length floor lives in
+/// `create_jwt_manager_from_env`), so a manager built directly with an empty
+/// secret reaches `verify_with_key`'s key construction. jsonwebtoken 12
+/// refuses the empty HMAC key there, and the token is rejected instead of
+/// being checked against an empty key.
+#[test]
+fn test_admin_manager_with_empty_secret_rejects_every_token() {
+    let manager = JwtManager::new(JwtConfig {
+        secret: String::new(),
+        ..test_jwt_config()
+    });
+    let now = Utc::now();
+    let token = encode_json_claims(
+        json!({
+            "iss": "test-issuer",
+            "sub": "admin-user",
+            "iat": now.timestamp(),
+            "nbf": now.timestamp(),
+            "exp": (now + Duration::seconds(1800)).timestamp(),
+            "jti": uuid::Uuid::new_v4().to_string(),
+            "role": "admin",
+        }),
+        "some-other-secret",
+        Algorithm::HS256,
+    );
+    let error = manager
+        .verify_token(&token)
+        .expect_err("an empty admin secret must not verify any token");
+    assert_eq!(
+        error.kind(),
+        &jsonwebtoken::errors::ErrorKind::InvalidKeyFormat
+    );
+}
