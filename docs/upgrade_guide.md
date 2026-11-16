@@ -613,6 +613,15 @@ covers is still refused, and the host keeps its Service route.
 Review AuthorizationPolicies on Services that weighted splits name before
 upgrading NodeWaypoints.
 
+### `cors`: Public Suffix List refreshed to `psl` 2.1.255 (#7402)
+
+The bundled Public Suffix List moves to `psl` 2.1.255 and the regenerated CORS
+ancestor index gains `amba.host` (the list now carries rules beneath it). With
+`allow_credentials: true`, a wildcard origin `"https://*.amba.host"` is now
+refused as effectively universal, so a config that carries one fails
+validation the same way as the matchers listed under PR #6639. Use exact
+origins, or drop credentials for that matcher.
+
 Per-release sections below are written when a release is cut. Changes already
 on `main` but not yet released, including breaking ones, are listed under
 `[Unreleased]` in [CHANGELOG.md](../CHANGELOG.md); review that section before
