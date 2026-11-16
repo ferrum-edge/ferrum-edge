@@ -459,7 +459,7 @@ async fn each_leg_carries_only_its_own_destination_rule_and_the_ratio_holds() {
             REVIEWS_UPSTREAM => assert_eq!(policy, (Some(3), Some(1000)), "reviews' own rule"),
             RATINGS_UPSTREAM => {
                 assert_eq!(policy, (Some(7), Some(2000)), "ratings' own rule");
-                first_ratings.get_or_insert(turn);
+                first_ratings = first_ratings.or(Some(turn));
             }
             other => panic!("no other destination is dispatched: {other}"),
         }

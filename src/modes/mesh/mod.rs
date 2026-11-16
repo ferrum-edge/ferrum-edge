@@ -4584,7 +4584,7 @@ fn bind_carried_http_routes_to_node_waypoint_transport(
         .collect();
     let mut failed_splits: HashSet<(String, String)> = HashSet::new();
     // (namespace, split id) -> legs `(leg upstream id, weight)`.
-    let mut leg_dispatched: HashMap<(String, String), Vec<(String, u32)>> = HashMap::new();
+    let mut leg_dispatched: HashMap<(String, String), WeightedSplitLegs> = HashMap::new();
     let mut residual_upstreams: Vec<Upstream> = Vec::new();
     let mut unrepresentable_splits = 0usize;
     for (namespace, id) in split_ids {
@@ -4599,7 +4599,7 @@ fn bind_carried_http_routes_to_node_waypoint_transport(
         let mut legs: Vec<(u32, Vec<UpstreamTarget>)> = Vec::new();
         // Leg-by-leg dispatch: each Service port's upstream with its summed
         // weight, and the external targets.
-        let mut service_legs: Vec<(String, u32)> = Vec::new();
+        let mut service_legs: WeightedSplitLegs = Vec::new();
         let mut external_targets: Vec<UpstreamTarget> = Vec::new();
         let mut rebound = true;
         let mut governed_by_destination_rule = false;
@@ -5030,6 +5030,9 @@ fn bind_carried_http_routes_to_node_waypoint_transport(
     }
 }
 
+/// A leg-dispatched split's legs: `(leg upstream id, weight)` (issue #7387).
+type WeightedSplitLegs = Vec<(String, u32)>;
+
 /// The `mesh_route_dispatch` instance id a leg-dispatched carried route gets
 /// when it has none: the translator's own id for that route's instance.
 fn weighted_split_dispatch_plugin_id(proxy_id: &str) -> String {
@@ -5053,9 +5056,9 @@ fn weighted_split_external_upstream_id(split_id: &str, index: usize) -> String {
 fn weighted_split_legs(
     config: &GatewayConfig,
     split: &Upstream,
-    mut legs: Vec<(String, u32)>,
+    mut legs: WeightedSplitLegs,
     external_targets: Vec<UpstreamTarget>,
-) -> Option<(Vec<(String, u32)>, Vec<Upstream>)> {
+) -> Option<(WeightedSplitLegs, Vec<Upstream>)> {
     let mut residuals = Vec::with_capacity(external_targets.len());
     for (index, target) in external_targets.into_iter().enumerate() {
         let residual_id = weighted_split_external_upstream_id(&split.id, index);
