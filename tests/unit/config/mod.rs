@@ -61,6 +61,7 @@ mod namespace_filter_tests;
 mod namespace_registry_tests;
 mod namespace_snapshot_digest_tests;
 mod peer_auth_mtls_tests;
+mod performance_regression_gateway_config_tests;
 mod plugin_migration_split_tests;
 mod plugin_migration_tests;
 mod plugin_trigger_tests;

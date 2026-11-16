@@ -3,12 +3,15 @@
 
 from __future__ import annotations
 
+import ast
 import json
 import os
 import re
+import shlex
 import sys
 import textwrap
-from pathlib import Path
+import tomllib
+from pathlib import Path, PurePosixPath
 
 from test_ci_policy_parallel import run_self_test as ci_policy_parallel_self_test
 from test_release_dispatch import run_self_test as release_dispatch_self_test
@@ -52,6 +55,10 @@ from verify_coverage_workflow import (
 )
 from verify_mesh_performance_baselines_workflow import (
     main as mesh_baselines_workflow_main,
+)
+from verify_protocol_perf_regression_workflow import (
+    self_test as protocol_perf_workflow_self_test,
+    validate_repository_contract as protocol_perf_repository_contract,
 )
 from verify_main_latest_image_workflow import (
     main as main_latest_image_workflow_main,
@@ -1702,6 +1709,324 @@ def artifact_gate_wiring_errors(
     return errors
 
 
+# Checked-in files a job reads from the checkout: scripts, configs, manifests,
+# lockfiles and sources under `.github/scripts/` and `tests/`. Paths under
+# `target/` (build outputs) and `ci_results/` (files the job writes) are
+# produced by the run itself and are not inputs.
+_WORKFLOW_INPUT_PATH_RE = re.compile(
+    r"(?:\.github/scripts|tests)/[A-Za-z0-9._/-]+"
+    r"\.(?:ya?ml|json|py|sh|toml|lock|rs)\b"
+)
+_WORKFLOW_GENERATED_PATH_PARTS = ("/target/", "/ci_results/")
+# `[cd <dir> &&] cargo <build|bench|run|test> <args>` on one shell line.
+_CARGO_INVOCATION_RE = re.compile(
+    r"(?:\bcd\s+(?P<dir>[A-Za-z0-9._/-]+)\s*&&\s*)?"
+    r"\bcargo\s+(?:build|bench|run|test)\b(?P<args>[^\n;&|]*)"
+)
+_CARGO_TARGET_FLAGS = {"--bin": "bin", "--bench": "bench"}
+PERFORMANCE_GATEWAY_FIXTURE_TEST = (
+    "tests/unit/config/performance_regression_gateway_config_tests.rs"
+)
+_FILE_CONFIG_PATH_RE = re.compile(r'FERRUM_FILE_CONFIG_PATH="\$\(pwd\)/([^"]+)"')
+
+
+def _is_workflow_input(relative: str) -> bool:
+    return not any(part in relative for part in _WORKFLOW_GENERATED_PATH_PARTS)
+
+
+def _named_inputs(text: str) -> set[str]:
+    return {
+        relative
+        for relative in _WORKFLOW_INPUT_PATH_RE.findall(text)
+        if _is_workflow_input(relative)
+    }
+
+
+def _cargo_target_inputs(text: str, root: Path) -> set[str]:
+    """Manifests, lockfiles and target sources the cargo calls in `text` need.
+
+    A cargo call reads its manifest, the committed `Cargo.lock` beside it and
+    the source file of every `--bin` / `--bench` target it names, and the
+    command line never has to spell any of them out:
+    `cd tests/performance && cargo build --release --bin backend_server`.
+    The target source comes from the manifest's `[[bin]]` / `[[bench]]` table
+    or from Cargo's default layout. A manifest path built from a shell
+    variable names a copy the script makes at run time, not a checkout file,
+    so it is skipped.
+    """
+
+    inputs: set[str] = set()
+    for match in _CARGO_INVOCATION_RE.finditer(text):
+        raw_args = match.group("args")
+        try:
+            args = shlex.split(raw_args)
+        except ValueError:
+            args = raw_args.split()
+        manifest: str | None = None
+        targets: list[tuple[str, str]] = []
+        index = 0
+        while index < len(args):
+            arg = args[index]
+            value = args[index + 1] if index + 1 < len(args) else None
+            if arg == "--manifest-path" and value is not None:
+                manifest = value
+                index += 2
+                continue
+            if arg.startswith("--manifest-path="):
+                manifest = arg.split("=", 1)[1]
+            elif (
+                arg in _CARGO_TARGET_FLAGS
+                and value is not None
+                and not value.startswith("-")
+            ):
+                targets.append((_CARGO_TARGET_FLAGS[arg], value))
+                index += 2
+                continue
+            index += 1
+        if manifest is None:
+            directory = match.group("dir")
+            manifest = f"{directory}/Cargo.toml" if directory else "Cargo.toml"
+        if "$" in manifest:
+            continue
+        manifest = manifest.removeprefix("./")
+        base = PurePosixPath(manifest).parent
+        inputs.add(manifest)
+        inputs.add((base / "Cargo.lock").as_posix())
+        try:
+            data = tomllib.loads((root / manifest).read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError):
+            # A missing manifest is already reported; cargo itself rejects a
+            # malformed one.
+            continue
+        package = data.get("package", {}).get("name")
+        for kind, name in targets:
+            declared = next(
+                (
+                    entry.get("path")
+                    for entry in data.get(kind, [])
+                    if isinstance(entry, dict) and entry.get("name") == name
+                ),
+                None,
+            )
+            if declared is None:
+                if kind == "bin":
+                    declared = "src/main.rs" if name == package else f"src/bin/{name}.rs"
+                else:
+                    declared = f"benches/{name}.rs"
+            inputs.add((base / declared).as_posix())
+    return inputs
+
+
+def _python_import_inputs(script: str, root: Path) -> set[str]:
+    """Sibling modules a checked-in Python script imports.
+
+    The scripts the performance job runs import only the standard library and
+    modules from their own directory. Any other top-level import must resolve
+    to a sibling `<name>.py` or `<name>/__init__.py`, so deleting one fails
+    here instead of as an `ImportError` in the scheduled run.
+    """
+
+    try:
+        tree = ast.parse((root / script).read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, SyntaxError):
+        return set()
+    names: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            names.update(alias.name.split(".")[0] for alias in node.names)
+        elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
+            names.add(node.module.split(".")[0])
+    base = PurePosixPath(script).parent
+    inputs: set[str] = set()
+    for name in names:
+        if name in sys.stdlib_module_names:
+            continue
+        package_init = base / name / "__init__.py"
+        if (root / package_init).is_file():
+            inputs.add(package_init.as_posix())
+        else:
+            inputs.add((base / f"{name}.py").as_posix())
+    return inputs
+
+
+def workflow_inputs(job_body: str, root: Path) -> set[str]:
+    """Every checked-in file a job reads, directly or one step removed.
+
+    - Paths the job body names.
+    - Paths named by the shell scripts the job runs (one hop).
+    - Each cargo call's manifest, lockfile and `--bin` / `--bench` source,
+      both in the job body and in those shell scripts.
+    - The sibling modules every collected Python script imports.
+
+    Files the Python verifiers locate from their own repository-root
+    constants are not listed here. `main()` runs those verifiers' contract
+    checks against the checkout instead.
+    """
+
+    inputs = _named_inputs(job_body)
+    texts = [job_body]
+    for script in sorted(relative for relative in inputs if relative.endswith(".sh")):
+        try:
+            text = (root / script).read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            continue
+        texts.append(text)
+        inputs.update(_named_inputs(text))
+    for text in texts:
+        inputs.update(_cargo_target_inputs(text, root))
+    for script in sorted(relative for relative in inputs if relative.endswith(".py")):
+        inputs.update(_python_import_inputs(script, root))
+    return inputs
+
+
+def missing_workflow_inputs(job_body: str, root: Path) -> list[str]:
+    """Return the checked-in files a job reads that do not exist.
+
+    `performance-regression.yml` runs only on its daily schedule and on manual
+    dispatch, never on a pull request. A pull request that deletes a file the
+    job reads therefore goes green, and the next scheduled run fails instead.
+    #7300 deleted `tests/performance/perf_config.yaml` as dead while the job's
+    "Start gateway" step still loaded it. Every scheduled run from 2026-11-12
+    then failed with `Configuration file not found`. Checking here moves that
+    failure onto the pull request that removes the file, including inputs the
+    job reaches only through a manifest, a script or an import
+    (`workflow_inputs`).
+
+    This checks existence only. Whether the gateway config still loads is
+    covered by `PERFORMANCE_GATEWAY_FIXTURE_TEST`.
+    """
+
+    return sorted(
+        relative
+        for relative in workflow_inputs(job_body, root)
+        if not (root / relative).is_file()
+    )
+
+
+def performance_gateway_fixture_errors(job_body: str, test_source: str) -> list[str]:
+    """The gateway config the job starts from is the one the Rust test loads."""
+
+    paths = _FILE_CONFIG_PATH_RE.findall(job_body)
+    if len(paths) != 1:
+        return [
+            "jobs.performance-regression must start its gateway from exactly one "
+            'FERRUM_FILE_CONFIG_PATH="$(pwd)/<checked-in file>"'
+        ]
+    if f'"/{paths[0]}"' not in test_source:
+        return [
+            f"jobs.performance-regression starts its gateway from {paths[0]}, but "
+            f"{PERFORMANCE_GATEWAY_FIXTURE_TEST} does not load that file through "
+            "the file loader; point the test at the file the workflow uses"
+        ]
+    return []
+
+
+def missing_workflow_inputs_self_test() -> list[str]:
+    """Each input class is required, and generated paths are ignored."""
+
+    import tempfile
+
+    failures: list[str] = []
+    job_body = textwrap.dedent(
+        """\
+        steps:
+          - run: python3 .github/scripts/verify_contract.py --self-test
+          - run: cargo bench --manifest-path tests/performance/mesh/Cargo.toml --bench rr_selection
+          - run: bash .github/scripts/run_compare.sh
+          - run: |
+              cargo build --profile ci-release --bin ferrum-edge
+              cd tests/performance && cargo build --release --bin backend_server
+          - run: |
+              FERRUM_FILE_CONFIG_PATH="$(pwd)/tests/fixtures/gateway.yaml" \\
+              ./target/ci-release/ferrum-edge run
+          - run: |
+              python3 tests/performance/ci_overhead_bench.py \\
+                --output tests/performance/ci_results/overhead_results.json
+              ls tests/performance/mesh/target/criterion/fixture.json
+        """
+    )
+    tree = {
+        "Cargo.toml": (
+            '[package]\nname = "ferrum-edge"\n\n'
+            '[[bin]]\nname = "ferrum-edge"\npath = "src/main.rs"\n'
+        ),
+        "Cargo.lock": "",
+        "src/main.rs": "",
+        "tests/performance/Cargo.toml": (
+            '[package]\nname = "backend_server"\n\n'
+            '[[bin]]\nname = "backend_server"\npath = "backend_server.rs"\n'
+        ),
+        "tests/performance/Cargo.lock": "",
+        "tests/performance/backend_server.rs": "",
+        "tests/performance/ci_overhead_bench.py": "import json\n",
+        "tests/performance/mesh/Cargo.toml": (
+            '[package]\nname = "mesh"\n\n'
+            '[[bench]]\nname = "rr_selection"\nharness = false\n'
+        ),
+        "tests/performance/mesh/Cargo.lock": "",
+        "tests/performance/mesh/benches/rr_selection.rs": "",
+        "tests/fixtures/gateway.yaml": "",
+        ".github/scripts/verify_contract.py": "import sys\nfrom pathlib import Path\n",
+        ".github/scripts/run_compare.sh": (
+            "python3 .github/scripts/compare_helper.py\n"
+            'cargo bench --manifest-path "$SRC/tests/performance/mesh/Cargo.toml" '
+            "--bench rr_selection --no-run\n"
+        ),
+        ".github/scripts/compare_helper.py": "import json\nfrom compare_lib import load\n",
+        ".github/scripts/compare_lib.py": "",
+    }
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        for relative, content in tree.items():
+            (root / relative).parent.mkdir(parents=True, exist_ok=True)
+            (root / relative).write_text(content, encoding="utf-8")
+        missing = missing_workflow_inputs(job_body, root)
+        if missing:
+            failures.append(
+                "workflow input self-test reported inputs that exist or are "
+                f"generated by the job: {missing}"
+            )
+        expected_inputs = set(tree)
+        found = workflow_inputs(job_body, root)
+        if found != expected_inputs:
+            failures.append(
+                "workflow input self-test collected the wrong input set "
+                f"(missing: {sorted(expected_inputs - found)}, "
+                f"unexpected: {sorted(found - expected_inputs)})"
+            )
+        # Deleting any one input, whether named or reached through a
+        # manifest, a script or an import, is reported, and nothing else is.
+        for relative in sorted(tree):
+            path = root / relative
+            content = path.read_text(encoding="utf-8")
+            path.unlink()
+            missing = missing_workflow_inputs(job_body, root)
+            path.write_text(content, encoding="utf-8")
+            if missing != [relative]:
+                failures.append(
+                    f"workflow input self-test expected exactly {relative} to be "
+                    f"reported once deleted, got {missing}"
+                )
+
+    test_source = (
+        'const CONFIG: &str = concat!(env!("CARGO_MANIFEST_DIR"), '
+        '"/tests/fixtures/gateway.yaml");\n'
+    )
+    if performance_gateway_fixture_errors(job_body, test_source):
+        failures.append(
+            "gateway fixture parity self-test rejected a test that loads the "
+            "workflow's config"
+        )
+    if not performance_gateway_fixture_errors(
+        job_body, test_source.replace("gateway.yaml", "other.yaml")
+    ):
+        failures.append(
+            "gateway fixture parity self-test accepted a test that loads a "
+            "different file than the workflow"
+        )
+    return failures
+
+
 PKCS11_JOB = "test-pkcs11-softhsm"
 PKCS11_PRECOMPILE_STEP = "Precompile PKCS#11 signer and pairing test binaries"
 PKCS11_SIGNER_STEP = "Run PKCS#11 signer smoke test"
@@ -2243,6 +2568,35 @@ def main() -> int:
             "jobs.performance-regression must run mesh baseline workflow "
             "contracts after checkout and before the benchmark toolchain setup"
         )
+    # The job never runs on a pull request, so a deleted input would otherwise
+    # surface only as a red scheduled run on `main`.
+    planner_errors.extend(missing_workflow_inputs_self_test())
+    for relative in missing_workflow_inputs(performance_regression_body, Path(".")):
+        planner_errors.append(
+            "jobs.performance-regression reads "
+            f"{relative}, which does not exist in the checkout; restore it or "
+            "change the workflow in the same pull request"
+        )
+    fixture_test = Path(PERFORMANCE_GATEWAY_FIXTURE_TEST)
+    planner_errors.extend(
+        performance_gateway_fixture_errors(
+            performance_regression_body,
+            fixture_test.read_text(encoding="utf-8") if fixture_test.is_file() else "",
+        )
+    )
+    # The job's static protocol-perf step runs this verifier, which reads its
+    # inputs (budgets, runbook, harness, configs) from repository-root
+    # constants that `workflow_inputs` cannot see. Run the same contract here
+    # so a pull request that breaks it fails before the scheduled run does.
+    # The mesh baselines verifier, the other such step, is run further down.
+    if protocol_perf_workflow_self_test() != 0:
+        planner_errors.append("protocol-perf-regression workflow verifier self-test failed")
+    protocol_perf_errors: list[str] = []
+    protocol_perf_repository_contract(protocol_perf_errors)
+    planner_errors.extend(
+        f"protocol-perf-regression workflow contract: {error}"
+        for error in protocol_perf_errors
+    )
 
     for output in sorted(set(PATH_GATED_JOBS.values())):
         if not re.search(rf"(?m)^      {re.escape(output)}:", ci_plan_body):
