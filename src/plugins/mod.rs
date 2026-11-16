@@ -12545,6 +12545,18 @@ pub trait Plugin: Any + Send + Sync {
     /// standalone behavior while coordinating multiple cached instances.
     fn enable_deferred_unmatched_rejection(&self) {}
 
+    /// The weighted-split leg tables this instance resolves
+    /// (`mesh_route_dispatch` `weighted_splits`, issue #7387). The plugin
+    /// cache hands them to the dispatch finalizer it installs after the last
+    /// `mesh_route_dispatch` instance, which picks a leg once the group's
+    /// destination is final. `None` (the default) for every other plugin.
+    #[doc(hidden)]
+    fn mesh_route_weighted_splits(
+        &self,
+    ) -> Option<Arc<mesh_route_dispatch::MeshRouteWeightedSplits>> {
+        None
+    }
+
     /// Pure preview of the route total deadline this instance would publish
     /// in `before_proxy`, for the body collectors that run before it (issue
     /// #6008). Never runs a hook or mutates the request. `None` (the default)

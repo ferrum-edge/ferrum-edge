@@ -442,6 +442,9 @@ fn warn_if_cors_ws_origin_policy_gap(proxy: &Proxy, merged: &[Arc<dyn Plugin>]) 
 /// match nor an override from an earlier routing plugin.
 struct MeshRouteDispatchFinalizer {
     priority: u16,
+    /// The weighted-split leg tables of the chain's dispatch instances
+    /// (issue #7387), collected once when the chain is assembled.
+    weighted_splits: Vec<Arc<crate::plugins::mesh_route_dispatch::MeshRouteWeightedSplits>>,
 }
 
 #[async_trait]
@@ -477,6 +480,12 @@ impl Plugin for MeshRouteDispatchFinalizer {
         true
     }
 
+    /// A chain whose dispatch instances carry weighted splits (issue #7387)
+    /// has its split resolved to a leg here, which moves the destination.
+    fn modifies_request_destination(&self) -> bool {
+        !self.weighted_splits.is_empty()
+    }
+
     async fn before_proxy(
         &self,
         ctx: &mut RequestContext,
@@ -487,6 +496,16 @@ impl Plugin for MeshRouteDispatchFinalizer {
             && !ctx.has_route_overrides()
         {
             return crate::plugins::mesh_route_dispatch::reject_unmatched_result();
+        }
+        // Weighted split dispatched leg by leg (issue #7387): every instance
+        // has run, so the destination is final. When it is a weighted split,
+        // pick its leg now and route the request through the leg's own
+        // upstream, before the leg is judged below.
+        if let Some(refusal) = crate::plugins::mesh_route_dispatch::select_weighted_split_leg(
+            ctx,
+            &self.weighted_splits,
+        ) {
+            return refusal;
         }
         // NodeWaypoint per-destination authorization (issue #7383): every
         // instance has run, so the effective destination is final. Admit it
@@ -534,16 +553,21 @@ pub(crate) fn install_mesh_route_dispatch_finalizer(
         );
     }
 
+    let mut weighted_splits = Vec::new();
     for plugin in plugins
         .iter()
         .filter(|plugin| is_builtin_named(plugin, MESH_ROUTE_DISPATCH_NAME))
     {
         plugin.enable_deferred_unmatched_rejection();
+        weighted_splits.extend(plugin.mesh_route_weighted_splits());
     }
     let priority = plugins[last_index].priority();
     plugins.insert(
         last_index + 1,
-        Arc::new(MeshRouteDispatchFinalizer { priority }),
+        Arc::new(MeshRouteDispatchFinalizer {
+            priority,
+            weighted_splits,
+        }),
     );
     Ok(())
 }
@@ -1920,6 +1944,11 @@ impl Plugin for PluginInstanceWrapper {
     }
     fn enable_deferred_unmatched_rejection(&self) {
         self.inner.enable_deferred_unmatched_rejection();
+    }
+    fn mesh_route_weighted_splits(
+        &self,
+    ) -> Option<Arc<crate::plugins::mesh_route_dispatch::MeshRouteWeightedSplits>> {
+        self.inner.mesh_route_weighted_splits()
     }
     fn is_backend_admission_plugin(&self) -> bool {
         self.inner.is_backend_admission_plugin()

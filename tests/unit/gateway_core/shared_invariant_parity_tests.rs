@@ -5359,10 +5359,77 @@ fn final_request_body_hook_context_hand_back_has_one_implementation() {
 /// decides which destination a carried VirtualService route reaches must
 /// consult the request's per-destination verdicts before the blanket
 /// single-destination guard. The siblings are route dispatch's matched-rule
-/// admission, its early route-total preview, and proxy core's final check in
+/// admission, its early route-total preview, the dispatch finalizer's
+/// weighted-split leg selection (issue #7387), and proxy core's final check in
 /// the one `before_proxy` runner every transport (H1/H2, native gRPC,
 /// WebSocket, H3, deferred passes) converges on. A new call site of the
 /// blanket guard, or a runner without the final check, fails here.
+/// Issue #7387: a `mesh_route_dispatch` instance can reach destinations
+/// through `weighted_splits` legs as well as through rule destinations. Every
+/// place that enumerates the destinations an instance names must read both,
+/// or a leg is left unauthorized (candidate threading), un-probed (HBONE
+/// capability enrollment), pruned (route upstream references), deletable
+/// while referenced (store references), or uncounted against the per-route
+/// candidate bound (slice binding). RequestAuthentication destination
+/// scoping is the deliberate exception: it resolves the split upstream
+/// itself, which keeps every leg's workloads, so the route's set already
+/// covers each leg.
+#[test]
+fn mesh_route_dispatch_destination_enumerators_cover_weighted_split_legs() {
+    let mesh = source("src/modes/mesh/mod.rs");
+    let slice = source("src/modes/mesh/slice.rs");
+    let proxy = source("src/proxy/mod.rs");
+    let dispatch = source("src/plugins/mesh_route_dispatch.rs");
+    for (file, text, signature, needle) in [
+        (
+            "src/modes/mesh/mod.rs",
+            &mesh,
+            "fn thread_node_waypoint_route_branches_to_authz(",
+            "\"weighted_splits\"",
+        ),
+        (
+            "src/modes/mesh/mod.rs",
+            &mesh,
+            "fn bind_carried_http_routes_to_node_waypoint_transport(",
+            "leg_dispatched",
+        ),
+        (
+            "src/modes/mesh/slice.rs",
+            &slice,
+            "pub(crate) fn mesh_route_dispatch_rule_upstream_ids(",
+            "\"weighted_splits\"",
+        ),
+        (
+            "src/proxy/mod.rs",
+            &proxy,
+            "fn collect_mesh_route_dispatch_capability_targets(",
+            ".weighted_splits",
+        ),
+        (
+            "src/plugins/mesh_route_dispatch.rs",
+            &dispatch,
+            "pub fn references_upstream_id(",
+            "self.weighted_splits",
+        ),
+    ] {
+        assert!(
+            item_body(text, signature, "\n    }\n").contains(needle)
+                || item_body(text, signature, "\n}\n").contains(needle),
+            "{file}: `{signature}` must enumerate weighted-split legs too"
+        );
+    }
+    let request_auth = item_body(
+        &mesh,
+        "fn scope_request_auth_to_node_waypoint_destinations(",
+        "\n}\n",
+    );
+    assert!(
+        request_auth.contains("node_waypoint_authz_route_upstreams(config)"),
+        "RequestAuthentication scoping resolves a split upstream (every leg's workloads) \
+         through the post-binding route upstream index"
+    );
+}
+
 #[test]
 fn node_waypoint_route_branch_verdicts_gate_every_destination_decision() {
     let proxy = admission_source_without_line_comments(&source("src/proxy/mod.rs"));
@@ -5408,6 +5475,34 @@ fn node_waypoint_route_branch_verdicts_gate_every_destination_decision() {
         finalizer.contains("finalize_node_waypoint_route_branch(ctx, headers)"),
         "the dispatch finalizer must admit the selected destination after the last instance"
     );
+    // Issue #7387: a weighted split dispatched leg by leg resolves to its leg
+    // in the finalizer, once routing is final and BEFORE the destination is
+    // admitted, so the leg (never the split, never an unselected leg) is what
+    // the finalizer and proxy core judge.
+    let leg_selection = finalizer
+        .find("select_weighted_split_leg(")
+        .expect("the dispatch finalizer must resolve weighted splits to a leg");
+    let admission = finalizer
+        .find("finalize_node_waypoint_route_branch(ctx, headers)")
+        .expect("admission call");
+    assert!(
+        leg_selection < admission,
+        "the leg is selected before the group's destination is admitted"
+    );
+    assert_eq!(
+        production.matches("fn select_weighted_split_leg(").count(),
+        1,
+        "weighted-split legs are selected in one place"
+    );
+    assert!(
+        item_body(
+            &production,
+            "pub(crate) fn select_weighted_split_leg(",
+            "\n}"
+        )
+        .contains("reject_unauthorized_node_waypoint_rule_destination(ctx, &leg.destination)"),
+        "a selected leg passes the same verdict-aware guard as a matched rule"
+    );
     let preview = item_body(
         &production,
         "fn node_waypoint_rule_destination_vetoed(",
@@ -5426,8 +5521,9 @@ fn node_waypoint_route_branch_verdicts_gate_every_destination_decision() {
         production
             .matches("reject_unauthorized_node_waypoint_rule_destination(")
             .count(),
-        3,
-        "matched-rule admission and the preview share the verdict-aware check (definition + two calls)"
+        4,
+        "matched-rule admission, the preview and weighted-split leg selection share the \
+         verdict-aware check (definition + three calls)"
     );
     assert_eq!(
         production

@@ -14066,6 +14066,36 @@ fn mesh_route_dispatch_runtime_and_openapi_contracts_match() {
     assert_component_validity(&spec, "MeshRouteDispatchConfig", &tiny_fault, true);
     MeshRouteDispatch::new(&tiny_fault).expect("tiny positive percentage is runtime-valid");
 
+    // Weighted splits dispatched leg by leg (issue #7387): an instance may
+    // carry only splits, and both contracts refuse the same malformed tables.
+    let weighted_splits = json!({
+        "rules": [],
+        "weighted_splits": [{
+            "upstream_id": "split",
+            "legs": [
+                {"upstream_id": "reviews", "weight": 90},
+                {"upstream_id": "ratings", "weight": 10}
+            ]
+        }]
+    });
+    assert_component_validity(&spec, "MeshRouteDispatchConfig", &weighted_splits, true);
+    MeshRouteDispatch::new(&weighted_splits).expect("a splits-only instance is runtime-valid");
+    for invalid_splits in [
+        json!({"rules": []}),
+        json!({"weighted_splits": [{"upstream_id": "split", "legs": []}]}),
+        json!({"weighted_splits": [{
+            "upstream_id": "split",
+            "legs": [{"upstream_id": "reviews", "weight": 0}]
+        }]}),
+        json!({"weighted_splits": [{
+            "upstream_id": "split",
+            "legs": [{"upstream_id": "reviews", "weight": 1, "subset": "v1"}]
+        }]}),
+    ] {
+        assert_component_validity(&spec, "MeshRouteDispatchConfig", &invalid_splits, false);
+        assert!(MeshRouteDispatch::new(&invalid_splits).is_err());
+    }
+
     let overlong_fault = json!({
         "rules": [{
             "match": {"methods": ["GET"]},

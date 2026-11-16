@@ -27,8 +27,16 @@ type column says so. Unknown keys are rejected at every level.
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
-| `rules` | Object[] | — | Required, at least one entry. Ordered; **first match wins** and evaluation stops there |
+| `rules` | Object[] | — | Required, at least one entry, unless `weighted_splits` is set. Ordered; **first match wins** and evaluation stops there |
 | `reject_unmatched` | bool | `false` | `true` answers `404` when no rule matched instead of falling through to the proxy's own backend. The translator sets this; a hand-written soft override normally leaves it `false` |
+| `weighted_splits` | Object[] | `[]` | Weighted splits dispatched leg by leg (see [Weighted splits dispatched leg by leg](#weighted-splits-dispatched-leg-by-leg)). At most 64 entries. NodeWaypoint mesh slice preparation writes it; a carried route that already carries it refuses the slice |
+
+**`weighted_splits[]`**
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `upstream_id` | String | — | Required. The split destination this entry resolves (a rule's `destination.upstream_id`, or the route's own `upstream_id`); unique per instance |
+| `legs` | Object[] | — | Required, 1–32 entries: `upstream_id` (required, distinct, never itself a split) and `weight` (required, ≥ 1, the leg's share relative to the other legs) |
 
 **`rules[]`**
 
@@ -157,6 +165,34 @@ still rejected at admission.
 - **Whole-destination replacement.** A matching instance replaces all four
   override fields (`upstream_id`, `backend_host`, `backend_port`, `backend_tls`);
   a non-matching instance leaves an earlier instance's override intact.
+
+### Weighted splits dispatched leg by leg
+
+`weighted_splits` (issue #7387) turns a weighted split into a choice between
+upstreams instead of one load-balanced upstream. When the destination the whole
+dispatch group selects is one of the listed `upstream_id`s (a matched rule's
+`destination.upstream_id`, or, with no override at all, the route's own
+`upstream_id`), the dispatch finalizer the plugin cache installs after the last
+instance picks one leg and publishes the leg's `upstream_id` as the route
+override, exactly as a matched rule publishes its destination. Dispatch then
+resolves the leg's own upstream: its targets, load balancer, TLS and
+DestinationRule projection (per-port overrides, connection limits, timeouts,
+outlier detection). So each leg's policy applies to exactly the requests it
+receives.
+
+- **Ratios.** Selection is an exact weighted cycle: every `sum(weight)`
+  consecutive requests on one split send exactly `weight` requests to each leg,
+  interleaved by a stride coprime with the sum, with one atomic increment per
+  request and no allocation beyond the route override a matched rule also
+  publishes.
+- **Final destination only.** The leg is picked once, after every instance has
+  run, so a split an earlier instance selected and a later one replaced is never
+  resolved, and a request is never sent through the split upstream itself.
+- **Authorization.** On a NodeWaypoint, each leg is a candidate destination of
+  the route's per-destination verdicts (`mesh_authz`
+  `node_waypoint_route_branches`): the dispatch finalizer and proxy core judge the
+  selected leg on its own verdict and run only its CUSTOM check. Without those
+  verdicts the leg passes the same single-destination guard as a matched rule.
 - **`Host` ownership.** A matching rule without `rewrite.authority` undoes only a
   `Host` rewrite an earlier dispatch instance made, restoring the value that was
   live just before that rewrite. A `Host` another plugin set before the dispatch

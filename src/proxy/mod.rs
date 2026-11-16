@@ -12374,11 +12374,29 @@ impl ProxyState {
                 continue;
             };
 
+            // Weighted-split legs (issue #7387) are dispatched through their
+            // own upstreams exactly like a rule's `upstream_id`.
+            let leg_destinations: Vec<crate::plugins::mesh_route_dispatch::RouteDestination> =
+                dispatch_config
+                    .weighted_splits
+                    .iter()
+                    .flat_map(|split| split.legs.iter())
+                    .map(|leg| {
+                        crate::plugins::mesh_route_dispatch::RouteDestination::upstream(
+                            leg.upstream_id.clone(),
+                        )
+                    })
+                    .collect();
             for base_proxy in base_proxies {
-                for rule in &dispatch_config.rules {
+                for destination in dispatch_config
+                    .rules
+                    .iter()
+                    .map(|rule| &rule.destination)
+                    .chain(leg_destinations.iter())
+                {
                     Self::collect_mesh_route_dispatch_rule_targets(
                         base_proxy,
-                        &rule.destination,
+                        destination,
                         upstream_map,
                         seen,
                         targets,

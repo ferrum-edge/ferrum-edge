@@ -27,7 +27,7 @@ impl Schema {
         match self {
             Self::Slice => SLICE,
             Self::Policy => "name namespace scope rules",
-            Self::Route => "rules reject_unmatched",
+            Self::Route => "rules reject_unmatched weighted_splits",
             Self::Registry => {
                 "registry reject_status outbound_listen_ports namespace wildcard_match"
             }
@@ -186,6 +186,8 @@ impl Schema {
             }
             (Self::Fields(SERVICE), "workloads") => Self::Fields("spiffe_id"),
             (Self::Route, "rules") => Self::Fields(ROUTE_RULE),
+            (Self::Route, "weighted_splits") => Self::Fields("upstream_id legs"),
+            (Self::Fields("upstream_id legs"), "legs") => Self::Fields("upstream_id weight"),
             (Self::Fields(ROUTE_RULE), "match") => Self::Fields(ROUTE_MATCH),
             (Self::Fields(ROUTE_MATCH), "methods" | "authority" | "uri") => {
                 Self::Fields("exact prefix regex")

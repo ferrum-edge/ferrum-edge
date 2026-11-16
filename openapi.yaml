@@ -27513,7 +27513,9 @@ components:
             destination a request finally reaches is admitted only on its own
             verdict. Every entry and destination is closed; a destination
             names exactly one of `upstream_id` or `backend_host` +
-            `backend_port`.
+            `backend_port`. A weighted split the route dispatches leg by leg
+            (`mesh_route_dispatch` `weighted_splits`, issue #7387) is listed
+            through its legs, never as a candidate of its own.
           items:
             type: object
             required: [namespace, proxy_id, destinations]
@@ -27523,6 +27525,21 @@ components:
                 type: string
               proxy_id:
                 type: string
+              weighted_split:
+                type: boolean
+                default: false
+                description: |
+                  The route reaches some candidates only through
+                  weighted-split leg selection, so verdicts are recorded even
+                  when no AuthorizationPolicy is loaded and a split no leg was
+                  selected for is refused.
+              own_is_weighted_split:
+                type: boolean
+                default: false
+                description: |
+                  The route's own destination (the first entry) is a weighted
+                  split: it is never judged or admitted, and each selected
+                  leg's own verdict decides.
               destinations:
                 type: array
                 minItems: 1
@@ -27775,7 +27792,7 @@ components:
         identity; only downstream `before_proxy` plugins and backend
         dispatch see the effective override destination.
 
-        At least one rule is required. When multiple plugin instances run on
+        At least one rule is required unless `weighted_splits` is set. When multiple plugin instances run on
         one proxy, each matching instance replaces the override destination
         set by earlier instances. Per-rule `backend_tls` is direct-backend
         only (`upstream_id` destinations inherit TLS from the referenced
@@ -27787,11 +27804,19 @@ components:
         gateway `RetryConfig` and `BackendTlsConfig` schemas remain open for
         other consumers; mesh routes use `MeshRouteRetryConfig` and
         `MeshRouteBackendTlsConfig`.
-      required: [rules]
+
+        `rules` may be empty only when `weighted_splits` lists at least one
+        split (an instance that only resolves weighted splits).
+      anyOf:
+        - required: [rules]
+          properties:
+            rules: {type: array, minItems: 1}
+        - required: [weighted_splits]
+          properties:
+            weighted_splits: {type: array, minItems: 1}
       properties:
         rules:
           type: array
-          minItems: 1
           items:
             type: object
             additionalProperties: false
@@ -28722,6 +28747,51 @@ components:
             misses those predicates. Across multiple attached instances, the
             decision is finalized only after all instances run and only when
             no instance matched and no earlier route override exists.
+        weighted_splits:
+          type: array
+          maxItems: 64
+          description: |
+            Weighted splits dispatched leg by leg (issue #7387). When the
+            destination the whole dispatch group selects is one of these
+            `upstream_id`s (a matched rule's `destination.upstream_id`, or the
+            route's own `upstream_id` when no rule overrides it), the dispatch
+            finalizer the plugin cache installs after the last instance picks
+            one leg by weight (an exact, interleaved weighted cycle) and sends
+            the request through that leg's own upstream, so the leg's own
+            DestinationRule projection and authorization apply to exactly the
+            requests it receives. A split no leg was selected for is never
+            dispatched. NodeWaypoint mesh slice preparation writes this for a
+            VirtualService split that names a DestinationRule-governed Service
+            and refuses a carried route that already carries it.
+          items:
+            type: object
+            additionalProperties: false
+            required: [upstream_id, legs]
+            properties:
+              upstream_id:
+                type: string
+                minLength: 1
+                description: The split destination this entry resolves; unique per instance.
+              legs:
+                type: array
+                minItems: 1
+                maxItems: 32
+                items:
+                  type: object
+                  additionalProperties: false
+                  required: [upstream_id, weight]
+                  properties:
+                    upstream_id:
+                      type: string
+                      minLength: 1
+                      description: |
+                        The upstream this leg dispatches through. Distinct
+                        within the split and never itself a weighted split.
+                    weight:
+                      type: integer
+                      minimum: 1
+                      maximum: 4294967295
+                      description: The leg's share, relative to the other legs.
 
     WorkloadMetricsConfig:
       type: object
