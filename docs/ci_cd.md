@@ -2685,10 +2685,21 @@ its surface and is refused. `WORKFLOW_DIRECTORY_JOB_GENERATION_TRANSITIONS` in
 `.github/scripts/verify_cross_build_policy.py` admits exact retired→adopted
 pairs for those jobs, keyed by the workflow filename AND the job name.
 
-The table is currently **empty**. Both of its entries were `coverage.yml`
-`coverage-merge` pairs: PR #3917's (issue #3907), retired after #3917 merged
-and a later action-pin bump moved the job off that digest, and PR #6958's
-45 → 75-minute timeout pair, retired once the 75-minute job was main's.
+The table holds one entry, PR #7400's `gateways-protocol-benchmark.yml`
+`benchmark` pair
+(`4c2b4900fec25e45a2af4330dfe66d3ac4ce530f445f061d642de460561c3008` →
+`70b612bb967eda2827bcc5708133a30c27508be6ffd581e82150d8be5bde3ec8`). That PR
+drops the job's BuildKit `cache-to: type=gha,mode=max` export and the buildx
+step that existed only for it. The exported builder layers were 4.2 GB of the
+10 GB Actions cache, and evicting them sent the Rust CI caches cold. The job's
+Cross-sensitive command lines are unchanged. The workflow and the policy land
+in one admin-merged pull request, so the tuple is spent on arrival and is
+deleted by the next policy edit.
+
+Earlier entries were both `coverage.yml` `coverage-merge` pairs: PR #3917's
+(issue #3907), retired after #3917 merged and a later action-pin bump moved the
+job off that digest, and PR #6958's 45 → 75-minute timeout pair, retired once
+the 75-minute job was main's.
 
 A future entry follows the same rules: each digest is the SHA-256 of
 `extract_job_block` text, both ends are exact, the binding includes the

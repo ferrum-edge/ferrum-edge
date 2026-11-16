@@ -251,14 +251,17 @@ jobs:
           echo "list=$gws" >> "$GITHUB_OUTPUT"
           echo "Gateways: $gws"
 
-      # buildx with the docker-container driver is required for
-      # cache-from/cache-to type=gha — the default docker driver on
-      # ubuntu-26.04 only supports inline cache and will error out with
-      # "Cache export is not supported for the docker driver".
-      - name: Set up Docker Buildx
-        if: steps.skip_check.outputs.skip != 'true'
-        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
-
+      # No BuildKit cache (#7398 follow-up). `cache-to: type=gha,mode=max`
+      # exported every builder-stage layer, including the release `target/`
+      # directories: about 4.2 GB of the repository's 10 GB Actions cache,
+      # which evicted the Rust CI caches (`ci-debug`, `fuzz-property-smoke`)
+      # and sent CI lanes cold. On the daily run (a new `main` SHA) it saved
+      # about 5 minutes per matrix job on the dependency layer and cost about
+      # 4 minutes per job to export (11-14 vs 11-15 udp-dtls logs); the 30-minute
+      # source compile never hits. `mode=min` would export only the runtime
+      # stage, which saves nothing in this multi-stage build. Without a cache
+      # backend the default docker driver loads the image directly, so the
+      # separate buildx (docker-container) step is gone too.
       - name: Build Ferrum Docker image
         if: steps.skip_check.outputs.skip != 'true'
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
@@ -267,12 +270,8 @@ jobs:
           file: Dockerfile
           tags: ferrum-edge:bench
           # `load: true` imports the built image into the local Docker daemon
-          # so subsequent `docker run` calls in the harness can find it. The
-          # default buildx behaviour is to leave the image in the buildkit
-          # builder only, which `docker run` does not see.
+          # so subsequent `docker run` calls in the harness can find it.
           load: true
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
 
       - name: Verify Ferrum image loaded
         if: steps.skip_check.outputs.skip != 'true'
