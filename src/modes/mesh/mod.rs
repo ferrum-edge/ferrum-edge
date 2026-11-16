@@ -4509,22 +4509,19 @@ fn service_has_destination_rule(
         .is_some()
 }
 
-/// The visible DestinationRules whose `host` names `host` (exactly, by a
-/// wildcard, or as a short name in the rule's namespace). Over-matching is
-/// the safe direction for every caller: it only sends more splits leg by
-/// leg or refuses more routes.
+/// The visible DestinationRules whose `host` names `host` (exactly, as a
+/// Service alias, or by a wildcard), through the same
+/// [`destination_rule_host_specificity`] that DestinationRule application
+/// uses. Every naming rule is returned, whatever its tier or specificity:
+/// over-matching is the safe direction for every caller (it only sends more
+/// splits leg by leg or refuses more routes).
 fn destination_rules_naming_host<'a>(
     mesh_slice: &'a MeshSlice,
     host: &str,
 ) -> impl Iterator<Item = &'a MeshDestinationRule> + use<'a> {
-    let host = host.trim().trim_end_matches('.').to_ascii_lowercase();
+    let host = host.to_string();
     mesh_slice.destination_rules.iter().filter(move |rule| {
-        let rule_host = rule.host.trim().trim_end_matches('.').to_ascii_lowercase();
-        rule_host == "*"
-            || rule_host
-                .strip_prefix('*')
-                .is_some_and(|suffix| host.ends_with(suffix))
-            || destination_rule_host_matches(&rule_host, &rule.namespace, &host)
+        destination_rule_host_specificity(&rule.host, &rule.namespace, &host).is_some()
     })
 }
 
@@ -11773,7 +11770,8 @@ fn mesh_sd_selected_service_port(upstream: &Upstream, mesh_slice: &MeshSlice) ->
 /// so the policy attaches to the egress routes; application is HOST-LEVEL
 /// (materialized routes are host-routed `/`). Policy hosts resolve against
 /// each service's FQDN with DestinationRule host semantics
-/// (`destination_rule_host_matches`: bare name, `name.namespace`, FQDN).
+/// (`destination_rule_host_specificity`, exact matches only: bare name,
+/// `name.namespace`, FQDN; a wildcard VirtualService host attaches nothing).
 ///
 /// Determinism + conflict handling mirror `apply_destination_rules`: policies
 /// are sorted by `(namespace, name)` and the FIRST match per service wins
@@ -11799,9 +11797,9 @@ fn synthesize_mesh_outbound_cors_plugins(
     }
     // Normalize the host MATCH KEY here, not just in `MeshConfig::normalize()`:
     // a slice arriving over the native/xDS carriers never passes config-source
-    // normalization on this DP, and `destination_rule_host_matches` lowercases
-    // and strips trailing dots but does NOT trim whitespace — a padded carried
-    // host would silently match no service and synthesize no plugin.
+    // normalization on this DP; normalizing once here keeps the match key
+    // canonical for `destination_rule_host_specificity` and the policy's own
+    // recorded host alike.
     let client_namespace = mesh_slice.namespace.as_str();
     let mut sorted_policies: Vec<(String, &config::MeshVirtualServiceCorsPolicy)> = mesh_slice
         .virtual_service_cors_policies
@@ -11831,7 +11829,8 @@ fn synthesize_mesh_outbound_cors_plugins(
         let matching: Vec<&(String, &config::MeshVirtualServiceCorsPolicy)> = sorted_policies
             .iter()
             .filter(|(host, policy)| {
-                destination_rule_host_matches(host, &policy.namespace, &service_fqdn)
+                destination_rule_host_specificity(host, &policy.namespace, &service_fqdn)
+                    == Some(DestinationRuleHostSpecificity::Exact)
             })
             .collect();
         let Some((_, policy)) = matching.first() else {
@@ -12089,6 +12088,11 @@ pub(crate) fn apply_destination_rules_with_tenant_file_roots(
     // tier for `upstream_destination_rule_match_hosts(config.upstreams[i])[j]`;
     // the host list is derived from the same helper at both computation and
     // use, so the parallel indexes cannot drift.
+    //
+    // Within the winning tier, Istio's most-specific-host rule picks the
+    // rules (`destination_rule_host_specificity`): an exact host or Service
+    // alias beats any wildcard, and a longer wildcard suffix beats a shorter
+    // one. The winner per host is therefore `(tier, specificity)`.
     let tier_scope = MaterializationTierScope {
         client_namespace,
         root_namespace: mesh_slice.istio_root_namespace.trim(),
@@ -12109,11 +12113,11 @@ pub(crate) fn apply_destination_rules_with_tenant_file_roots(
     // service because `beta` sorts later — so this refuses instead, before any
     // upstream is mutated. See `docs/mesh.md` "An upstream that spans two
     // destinations".
-    let mut winning_tier_by_upstream_host: Vec<Vec<Option<DestinationRuleLookupTier>>> =
+    let mut winning_tier_by_upstream_host: Vec<Vec<Option<DestinationRuleWinner>>> =
         Vec::with_capacity(config.upstreams.len());
     for upstream in &config.upstreams {
         let hosts = upstream_destination_rule_match_hosts(upstream);
-        let mut winners: Vec<Option<DestinationRuleLookupTier>> = Vec::with_capacity(hosts.len());
+        let mut winners: Vec<Option<DestinationRuleWinner>> = Vec::with_capacity(hosts.len());
         // The winning rule SET (indexes into `sorted_destination_rules`, which
         // is deterministically ordered) for each host that resolved one. Hosts
         // with NO winner contribute nothing: a destination no visible rule
@@ -12122,28 +12126,27 @@ pub(crate) fn apply_destination_rules_with_tenant_file_roots(
         // shape that has always inherited the upstream-wide policy.
         let mut winning_rule_sets: Vec<Vec<usize>> = Vec::new();
         for host in hosts {
-            let mut winner: Option<DestinationRuleLookupTier> = None;
+            let mut winner: Option<DestinationRuleWinner> = None;
             for dr in sorted_destination_rules.iter().copied() {
-                if !destination_rule_host_matches(&dr.host, &dr.namespace, host) {
-                    continue;
-                }
-                let Some(tier) = tier_scope.eligible_tier(dr, upstream, host) else {
+                let Some(candidate) =
+                    destination_rule_winner_candidate(&tier_scope, dr, upstream, host)
+                else {
                     continue;
                 };
                 winner = Some(match winner {
-                    Some(current) => current.min(tier),
-                    None => tier,
+                    Some(current) if current.outranks_or_ties(candidate) => current,
+                    _ => candidate,
                 });
             }
-            if let Some(tier) = winner {
+            if let Some(winner) = winner {
                 winning_rule_sets.push(
                     sorted_destination_rules
                         .iter()
                         .copied()
                         .enumerate()
                         .filter(|&(_, dr)| {
-                            destination_rule_host_matches(&dr.host, &dr.namespace, host)
-                                && tier_scope.eligible_tier(dr, upstream, host) == Some(tier)
+                            destination_rule_winner_candidate(&tier_scope, dr, upstream, host)
+                                == Some(winner)
                         })
                         .map(|(idx, _)| idx)
                         .collect(),
@@ -12198,18 +12201,21 @@ pub(crate) fn apply_destination_rules_with_tenant_file_roots(
                 let hosts = upstream_destination_rule_match_hosts(upstream);
                 let mut wins_a_host = false;
                 for (host_idx, host) in hosts.into_iter().enumerate() {
-                    if !destination_rule_host_matches(&dr.host, &dr.namespace, host) {
+                    if destination_rule_host_specificity(&dr.host, &dr.namespace, host).is_none() {
                         continue;
                     }
                     matched_any_host = true;
                     // A rule outside the lookup path is refused outright; a
-                    // rule from a lower-priority tier must not overwrite the
-                    // winning tier's policy for THIS host.
-                    let Some(tier) = tier_scope.eligible_tier(dr, upstream, host) else {
+                    // rule from a lower-priority tier, or a less specific
+                    // host in the winning tier, must not overwrite the
+                    // winning rules' policy for THIS host.
+                    let Some(candidate) =
+                        destination_rule_winner_candidate(&tier_scope, dr, upstream, host)
+                    else {
                         continue;
                     };
                     eligible_any_host = true;
-                    if winners.get(host_idx).copied().flatten() == Some(tier) {
+                    if winners.get(host_idx).copied().flatten() == Some(candidate) {
                         wins_a_host = true;
                     }
                 }
@@ -13325,27 +13331,101 @@ fn upstream_uses_mesh_transport(upstream: &Upstream) -> bool {
     }
 }
 
-fn destination_rule_host_matches(rule_host: &str, namespace: &str, candidate: &str) -> bool {
-    let rule_host = rule_host.trim_end_matches('.').to_ascii_lowercase();
-    let candidate = candidate.trim_end_matches('.').to_ascii_lowercase();
-    if candidate == rule_host {
-        return true;
-    }
+/// How specifically a DestinationRule `host` names a destination host, for
+/// Istio's most-specific-host precedence: an exact host or one of its Service
+/// aliases beats every wildcard, and a longer wildcard suffix beats a shorter
+/// one (`*.svc.cluster.local` beats `*.cluster.local` beats `*`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum DestinationRuleHostSpecificity {
+    /// `*` (suffix length 0) or `*.<suffix>`, by suffix length in bytes.
+    Wildcard(usize),
+    /// The exact host, or a Service alias of it (short name, `<svc>.<ns>`,
+    /// `<svc>.<ns>.svc[.<domain>]`).
+    Exact,
+}
 
-    if !rule_host.contains('.') {
+/// Whether, and how specifically, DestinationRule `rule_host` (declared in
+/// `namespace`) names destination host `candidate`. The ONE host matcher for
+/// every DestinationRule selection: rule application
+/// (`apply_destination_rules`) and NodeWaypoint carried-route binding
+/// (`destination_rules_naming_host`) both use it, so they agree by
+/// construction.
+///
+/// A wildcard (`*`, `*.example.com`) names DNS host names only: never an IP
+/// literal or a dotless identifier (an upstream id), which no Istio host
+/// lookup sees. `*.example.com` names `api.example.com` and
+/// `a.b.example.com`, never `example.com`.
+pub(crate) fn destination_rule_host_specificity(
+    rule_host: &str,
+    namespace: &str,
+    candidate: &str,
+) -> Option<DestinationRuleHostSpecificity> {
+    let rule_host = rule_host.trim().trim_end_matches('.').to_ascii_lowercase();
+    let candidate = candidate.trim().trim_end_matches('.').to_ascii_lowercase();
+    if let Some(suffix) = rule_host.strip_prefix('*') {
+        let is_dns_name = candidate.contains('.')
+            && candidate
+                .trim_start_matches('[')
+                .trim_end_matches(']')
+                .parse::<std::net::IpAddr>()
+                .is_err();
+        if !is_dns_name {
+            return None;
+        }
+        if suffix.is_empty() {
+            return Some(DestinationRuleHostSpecificity::Wildcard(0));
+        }
+        // `*` must stand for whole leading labels.
+        if !suffix.starts_with('.') {
+            return None;
+        }
+        return (candidate.len() > suffix.len() && candidate.ends_with(suffix))
+            .then_some(DestinationRuleHostSpecificity::Wildcard(suffix.len()));
+    }
+    let exact = if candidate == rule_host {
+        true
+    } else if !rule_host.contains('.') {
         let namespaced = format!("{rule_host}.{namespace}");
-        return candidate == namespaced || candidate.starts_with(&format!("{namespaced}.svc."));
-    }
+        candidate == namespaced || candidate.starts_with(&format!("{namespaced}.svc."))
+    } else if rule_host.bytes().filter(|byte| *byte == b'.').count() == 1 {
+        candidate.starts_with(&format!("{rule_host}.svc."))
+    } else if rule_host.ends_with(".svc") {
+        candidate.starts_with(&format!("{rule_host}."))
+    } else {
+        false
+    };
+    exact.then_some(DestinationRuleHostSpecificity::Exact)
+}
 
-    let dot_count = rule_host.bytes().filter(|byte| *byte == b'.').count();
-    if dot_count == 1 {
-        return candidate.starts_with(&format!("{rule_host}.svc."));
-    }
-    if rule_host.ends_with(".svc") {
-        return candidate.starts_with(&format!("{rule_host}."));
-    }
+/// The rules that win one destination host: the most specific lookup tier
+/// (client, then service, then root namespace), then, within it, the most
+/// specific host match. Rules tied on both apply together, in the sorted
+/// application order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DestinationRuleWinner {
+    tier: DestinationRuleLookupTier,
+    specificity: DestinationRuleHostSpecificity,
+}
 
-    false
+impl DestinationRuleWinner {
+    /// True when `self` wins over, or ties with, `other`.
+    fn outranks_or_ties(self, other: Self) -> bool {
+        self.tier < other.tier || (self.tier == other.tier && self.specificity >= other.specificity)
+    }
+}
+
+/// `dr`'s claim on destination host `host` of `upstream`: its lookup tier and
+/// host specificity, or `None` when it does not name the host or is outside
+/// the lookup path.
+fn destination_rule_winner_candidate(
+    tier_scope: &MaterializationTierScope<'_>,
+    dr: &MeshDestinationRule,
+    upstream: &Upstream,
+    host: &str,
+) -> Option<DestinationRuleWinner> {
+    let specificity = destination_rule_host_specificity(&dr.host, &dr.namespace, host)?;
+    let tier = tier_scope.eligible_tier(dr, upstream, host)?;
+    Some(DestinationRuleWinner { tier, specificity })
 }
 
 /// Apply a `MeshTrafficPolicy` onto a Ferrum `Upstream`.

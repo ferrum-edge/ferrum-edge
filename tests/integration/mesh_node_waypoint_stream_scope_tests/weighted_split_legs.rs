@@ -2124,3 +2124,310 @@ fn request_authentication_holds_for_every_weighted_leg() {
         "the external leg's own set differs from the Service legs' set"
     );
 }
+
+/// Whether a prepared route dispatches its split leg by leg.
+fn route_is_leg_dispatched(prepared: &GatewayConfig) -> bool {
+    let route = carried_split_route(prepared);
+    let split_id = route.upstream_id.clone().expect("split id");
+    route_dispatch_config(prepared, &route)["weighted_splits"]
+        .as_array()
+        .is_some_and(|splits| {
+            splits
+                .iter()
+                .any(|split| split["upstream_id"] == json!(split_id))
+        })
+}
+
+/// The connect timeout a DestinationRule projected onto `upstream_id`'s
+/// `port` slot, if any.
+fn projected_connect_timeout(
+    prepared: &GatewayConfig,
+    upstream_id: &str,
+    port: u16,
+) -> Option<u64> {
+    prepared
+        .upstreams
+        .iter()
+        .find(|upstream| upstream.id == upstream_id)
+        .and_then(|upstream| upstream.port_overrides.get(&port))
+        .and_then(|slot| slot.connect_timeout_ms)
+}
+
+/// Issue #7387 review round 4 (sol F1): DestinationRule host matching is ONE
+/// function with Istio's semantics (exact and Service aliases, `*.suffix`,
+/// `*`; exact beats wildcard, the longest suffix wins), and the carried-route
+/// binding and rule application agree on it. The matcher table pins the
+/// semantics; each prepared row checks that the binding sends the split leg
+/// by leg exactly when application lands the rule on that destination.
+#[test]
+fn destination_rule_binding_and_application_agree_on_host_matching() {
+    use ferrum_edge::_test_support::destination_rule_host_specificity_for_test as specificity;
+    let fqdn = "ratings.default.svc.cluster.local";
+    for (rule_host, rule_namespace, candidate, expected) in [
+        (fqdn, "default", fqdn, Some(None)),
+        ("ratings", "default", fqdn, Some(None)),
+        ("ratings.default", "default", fqdn, Some(None)),
+        ("ratings.default.svc", "default", fqdn, Some(None)),
+        // A short name resolves in the RULE's namespace.
+        ("ratings", "other", fqdn, None),
+        (
+            "*.svc.cluster.local",
+            "default",
+            fqdn,
+            Some(Some(".svc.cluster.local".len())),
+        ),
+        (
+            "*.cluster.local",
+            "other",
+            fqdn,
+            Some(Some(".cluster.local".len())),
+        ),
+        ("*", "default", fqdn, Some(Some(0))),
+        (
+            "*.wild.example",
+            "default",
+            "api.wild.example",
+            Some(Some(".wild.example".len())),
+        ),
+        (
+            "*.wild.example",
+            "default",
+            "a.b.wild.example",
+            Some(Some(".wild.example".len())),
+        ),
+        (
+            "*.WILD.example.",
+            "default",
+            "API.wild.example",
+            Some(Some(".wild.example".len())),
+        ),
+        ("*.wild.example", "default", "wild.example", None),
+        ("*.wild.example", "default", "api.other.example", None),
+        ("*wild.example", "default", "api.wild.example", None),
+        (
+            "api.wild.example",
+            "default",
+            "api.wild.example",
+            Some(None),
+        ),
+        // A wildcard never names an IP literal or a dotless upstream id.
+        ("*", "default", "10.0.0.11", None),
+        ("*", "default", "[::1]", None),
+        (
+            "*",
+            "default",
+            "__mesh-out-upstream-default-ratings-8080",
+            None,
+        ),
+    ] {
+        assert_eq!(
+            specificity(rule_host, rule_namespace, candidate),
+            expected,
+            "{rule_host} ({rule_namespace}) vs {candidate}"
+        );
+    }
+    // Exact beats every wildcard, and a longer suffix beats a shorter one.
+    let ranked = [
+        specificity("*", "default", "api.long.wild.example"),
+        specificity("*.wild.example", "default", "api.long.wild.example"),
+        specificity("*.long.wild.example", "default", "api.long.wild.example"),
+    ];
+    assert!(ranked.iter().all(Option::is_some));
+    assert!(ranked[0].unwrap() < ranked[1].unwrap() && ranked[1].unwrap() < ranked[2].unwrap());
+
+    // External hosts: the binding isolates the host on a residual leg exactly
+    // when application lands the rule on that residual.
+    for (rule_host, external, applies) in [
+        ("api.wild.example", "api.wild.example", true),
+        ("*.wild.example", "api.wild.example", true),
+        ("*.example", "api.wild.example", true),
+        ("*", "api.wild.example", true),
+        ("*.wild.example", "wild.example", false),
+        ("*.other.example", "api.wild.example", false),
+    ] {
+        let objects = vec![
+            split_virtual_service(
+                "split",
+                "reviews.default.svc.cluster.local",
+                &[
+                    ("reviews.default.svc.cluster.local", 8080, 50),
+                    (external, 443, 50),
+                ],
+            ),
+            tcp_destination_rule("wild-dr", rule_host, json!({"connectTimeout": "3s"})),
+        ];
+        let (_, prepared) = prepare(&objects, Vec::new());
+        assert_eq!(
+            route_is_leg_dispatched(&prepared),
+            applies,
+            "binding: {rule_host} vs {external}"
+        );
+        if applies {
+            let split_id = carried_split_route(&prepared)
+                .upstream_id
+                .expect("split id");
+            assert_eq!(
+                projected_connect_timeout(&prepared, &format!("{split_id}-external-0"), 443),
+                Some(3000),
+                "application: {rule_host} vs {external}"
+            );
+        }
+    }
+
+    // Service legs: every alias form and a wildcard both bind and apply.
+    for rule_host in [
+        "ratings",
+        "ratings.default",
+        "ratings.default.svc",
+        fqdn,
+        "*.svc.cluster.local",
+    ] {
+        let objects = vec![
+            reviews_ratings_split(50, 50),
+            tcp_destination_rule("ratings-dr", rule_host, json!({"connectTimeout": "3s"})),
+        ];
+        let (_, prepared) = prepare(&objects, Vec::new());
+        assert!(route_is_leg_dispatched(&prepared), "binding: {rule_host}");
+        assert_eq!(
+            projected_connect_timeout(&prepared, RATINGS_UPSTREAM, 8080),
+            Some(3000),
+            "application: {rule_host}"
+        );
+    }
+}
+
+/// Issue #7387 review round 4 (sol F1): an external leg governed only by a
+/// wildcard DestinationRule originates that rule's TLS; the longest wildcard
+/// suffix wins (MUTUAL over SIMPLE); an exact rule beats the wildcard (no
+/// TLS); and a Service leg a wildcard TLS rule governs keeps the plaintext
+/// scheme its mesh transport needs. Followed through selection, route
+/// overrides, the effective proxy and the backend URL.
+#[tokio::test]
+async fn wildcard_destination_rules_govern_external_legs_and_their_tls() {
+    let objects = vec![
+        split_virtual_service(
+            "split",
+            "reviews.default.svc.cluster.local",
+            &[
+                ("reviews.default.svc.cluster.local", 8080, 40),
+                ("api.one.wild.example", 443, 20),
+                ("api.exact.wild.example", 443, 20),
+                ("api.longer.wild.example", 443, 20),
+            ],
+        ),
+        traffic_policy_rule(
+            "service-wildcard",
+            "*.cluster.local",
+            json!({"tls": {"mode": "SIMPLE"}}),
+        ),
+        traffic_policy_rule(
+            "wildcard",
+            "*.wild.example",
+            json!({"tls": {"mode": "SIMPLE"}}),
+        ),
+        tcp_destination_rule(
+            "exact",
+            "api.exact.wild.example",
+            json!({"connectTimeout": "3s"}),
+        ),
+        mutual_tls_rule("longer-wildcard", "*.longer.wild.example"),
+    ];
+    let (_, prepared) = prepare(&objects, Vec::new());
+    let route = carried_split_route(&prepared);
+    let split_id = route.upstream_id.clone().expect("split id");
+    let leg = |index: usize| format!("{split_id}-external-{index}");
+    assert_eq!(
+        leg_origination(&prepared, &route, &split_id),
+        vec![
+            (REVIEWS_UPSTREAM.to_string(), false),
+            (leg(0), true),
+            (leg(1), false),
+            (leg(2), true),
+        ],
+        "wildcard TLS reaches its external legs; the exact rule wins its host"
+    );
+    assert_eq!(
+        projected_connect_timeout(&prepared, &leg(1), 443),
+        Some(3000),
+        "the exact rule governs its host"
+    );
+
+    let authz = Arc::new(MeshAuthz::new(&authz_config(&prepared)).expect("mesh_authz builds"));
+    let plugins = chain(vec![
+        Arc::clone(&authz) as Arc<dyn Plugin>,
+        route_dispatch_instance(&prepared, &route),
+    ]);
+    let upstreams = upstream_map(&prepared);
+    let mut counts: HashMap<String, usize> = HashMap::new();
+    for _ in 0..100 {
+        let (result, ctx, _) = serve(&authz, &plugins, &route, TRUSTED).await;
+        assert!(matches!(result, PluginResult::Continue), "{result:?}");
+        let selected = selected_leg(&ctx);
+        let (effective, url) = leg_dispatch(&ctx, &route, &prepared, &upstreams);
+        if selected == leg(0) || selected == leg(2) {
+            assert_eq!(
+                effective.dispatch_kind,
+                DispatchKind::HttpsPool,
+                "{selected}"
+            );
+            assert!(url.starts_with("https://"), "{selected} dials {url}");
+            assert!(!effective.resolved_tls.tls_refused, "{selected}");
+        } else {
+            assert_eq!(ctx.route_override_backend_scheme, None, "{selected}");
+            assert_eq!(
+                effective.dispatch_kind,
+                DispatchKind::HttpPool,
+                "{selected}"
+            );
+            assert!(url.starts_with("http://"), "{selected} dials {url}");
+        }
+        if selected == leg(2) {
+            assert!(
+                effective.resolved_tls.client_cert_path.is_some(),
+                "the longest wildcard suffix (MUTUAL) wins: {:?}",
+                effective.resolved_tls
+            );
+        }
+        if selected == leg(0) {
+            assert!(effective.resolved_tls.client_cert_path.is_none());
+        }
+        *counts.entry(selected).or_default() += 1;
+    }
+    assert_eq!(counts[REVIEWS_UPSTREAM], 40);
+    assert_eq!(counts[&leg(0)], 20);
+    assert_eq!(counts[&leg(1)], 20);
+    assert_eq!(counts[&leg(2)], 20);
+}
+
+/// Issue #7387 review round 4 (sol F1): a direct external backend whose only
+/// DestinationRule is a TLS-originating wildcard is refused, like an exact
+/// one (round three); a non-matching wildcard keeps the route.
+#[test]
+fn a_direct_external_backend_under_a_wildcard_tls_rule_is_refused() {
+    let route = k8s_object(
+        "VirtualService",
+        "direct",
+        json!({
+            "hosts": ["reviews.default.svc.cluster.local"],
+            "http": [{
+                "route": [{"destination": {"host": "api.one.wild.example", "port": {"number": 443}}}]
+            }]
+        }),
+    );
+    for (rule_host, refused) in [
+        ("*.wild.example", true),
+        ("*", true),
+        ("*.other.example", false),
+    ] {
+        let objects = vec![
+            route.clone(),
+            traffic_policy_rule("wildcard", rule_host, json!({"tls": {"mode": "SIMPLE"}})),
+        ];
+        let (_, prepared) = prepare(&objects, Vec::new());
+        assert_eq!(
+            carried_routes_reach_host(&prepared, "api.one.wild.example"),
+            !refused,
+            "{rule_host}"
+        );
+    }
+}

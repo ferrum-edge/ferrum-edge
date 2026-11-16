@@ -453,6 +453,24 @@ pub mod _test_support {
         Ok((*config).clone())
     }
 
+    /// How specifically DestinationRule `rule_host` (declared in `namespace`)
+    /// names `candidate`: `None` for no match, `Some(None)` for an exact host
+    /// or Service alias, `Some(Some(n))` for a wildcard with an `n`-byte suffix.
+    pub fn destination_rule_host_specificity_for_test(
+        rule_host: &str,
+        namespace: &str,
+        candidate: &str,
+    ) -> Option<Option<usize>> {
+        crate::modes::mesh::destination_rule_host_specificity(rule_host, namespace, candidate).map(
+            |specificity| match specificity {
+                crate::modes::mesh::DestinationRuleHostSpecificity::Exact => None,
+                crate::modes::mesh::DestinationRuleHostSpecificity::Wildcard(suffix) => {
+                    Some(suffix)
+                }
+            },
+        )
+    }
+
     /// The effective proxy dispatch builds for the LB-selected `target`
     /// (per-port TLS, timeouts and HTTP overlays projected onto the route),
     /// as an owned value.

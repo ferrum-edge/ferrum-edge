@@ -5667,3 +5667,53 @@ fn allowed_ws_origins_grandfathering_warning_never_precedes_an_admission_refusal
         "file mode must refuse before the warning-emitting field validators run"
     );
 }
+
+/// Issue #7387 review round 4 (sol F1): DestinationRule host matching has ONE
+/// implementation. NodeWaypoint carried-route binding (which decides that an
+/// external host's rule needs its own residual leg) and DestinationRule
+/// application (which lands the rule, TLS origination included, on that leg)
+/// must both go through `destination_rule_host_specificity`; a second matcher
+/// with its own wildcard rule let a wildcard-governed leg be isolated but
+/// never receive its rule. The selection-path helpers must reach it too, and
+/// no hand-rolled wildcard test may reappear beside them.
+#[test]
+fn destination_rule_host_matching_has_one_implementation() {
+    let mesh = source("src/modes/mesh/mod.rs");
+    for (signature, needle) in [
+        (
+            "fn destination_rules_naming_host<'a>(",
+            "destination_rule_host_specificity(",
+        ),
+        (
+            "fn destination_rule_winner_candidate(",
+            "destination_rule_host_specificity(",
+        ),
+        (
+            "pub(crate) fn apply_destination_rules_with_tenant_file_roots(",
+            "destination_rule_winner_candidate(",
+        ),
+        (
+            "pub(crate) fn apply_destination_rules_with_tenant_file_roots(",
+            "destination_rule_host_specificity(",
+        ),
+    ] {
+        let body = item_body(&mesh, signature, "\n}\n");
+        assert!(
+            body.contains(needle),
+            "`{signature}` must select DestinationRules through `{needle}`"
+        );
+        assert!(
+            !body.contains("strip_prefix('*')") && !body.contains("destination_rule_host_matches("),
+            "`{signature}` must not carry its own DestinationRule host matcher"
+        );
+    }
+    assert!(
+        !mesh.contains("fn destination_rule_host_matches("),
+        "the exact-only matcher is gone; every caller uses the specificity matcher"
+    );
+    assert_eq!(
+        mesh.matches("rule_host.strip_prefix('*')").count(),
+        1,
+        "the one wildcard rule lives in `destination_rule_host_specificity`"
+    );
+}
