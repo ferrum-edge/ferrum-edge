@@ -12485,8 +12485,8 @@ WORKFLOW_DIRECTORY_JOB_GENERATION_TRANSITIONS: tuple[
     (
         "gateways-protocol-benchmark.yml",
         "benchmark",
-        "47a369a0075ab8a6eb3d817f30d3d2f19cc800c2ea75746e017080fb535b5300",
-        "1a4b8f005b3e59641b3f83ff3e5e2a85d25bc0a477cc758be17fde3519807076",
+        "4c2b4900fec25e45a2af4330dfe66d3ac4ce530f445f061d642de460561c3008",
+        "70b612bb967eda2827bcc5708133a30c27508be6ffd581e82150d8be5bde3ec8",
     ),
     #
     # PR #6958's `coverage.yml` `coverage-merge` timeout pair (45 -> 75
@@ -19555,6 +19555,150 @@ pre_build = []
                 f"{directory_workflow_name!r}/{directory_job_name!r} names a "
                 "workflow the pull-request comparison never reaches"
             )
+
+    # A directory-job tuple is matched against the text production loads, not
+    # the committed bytes: `load_workflow_directory` -> `load_workflow`
+    # pin-normalizes every `.yml` before the admission hashes the job, so a
+    # tuple taken over the raw file never matches (#7400 review). Drive the
+    # real loader and scan over a job that carries a pinned external action.
+    def directory_job_digest(
+        workflows: dict[str, str], workflow_name: str, job_name: str
+    ) -> str | None:
+        block, block_failures = extract_job_block(
+            workflows.get(workflow_name, ""),
+            f"self-test/{workflow_name}",
+            job_name,
+            required=False,
+        )
+        if block_failures or block is None:
+            return None
+        return workflow_generation_digest(block)
+
+    pinned_fixture_name = "pinned-directory-job-fixture.yml"
+    pinned_fixture_action = "actions/checkout@" + "a" * 40 + " # v0.0.0"
+
+    def pinned_directory_fixture(marker: str) -> str:
+        return (
+            "name: Pinned directory job fixture\n"
+            "on:\n"
+            "  workflow_dispatch:\n"
+            "permissions:\n"
+            "  contents: read\n"
+            "jobs:\n"
+            "  benchmark:\n"
+            "    runs-on: ubuntu-26.04\n"
+            "    steps:\n"
+            f"      - uses: {pinned_fixture_action}\n"
+            "      - run: cross build --target aarch64-unknown-linux-gnu\n"
+            f"        # {marker}\n"
+        )
+
+    pinned_texts = {
+        "base": pinned_directory_fixture("retired-generation"),
+        "head": pinned_directory_fixture("adopted-generation"),
+    }
+    with tempfile.TemporaryDirectory(prefix="ferrum-directory-job-") as scratch:
+        pinned_loaded: dict[str, dict[str, str]] = {}
+        for side, text in pinned_texts.items():
+            side_directory = Path(scratch) / side
+            side_directory.mkdir()
+            (side_directory / pinned_fixture_name).write_text(text, encoding="utf-8")
+            pinned_loaded[side], pinned_load_failures = load_workflow_directory(
+                side_directory, f"self-test {side} workflows"
+            )
+            failures.extend(pinned_load_failures)
+    pinned_raw = {
+        side: directory_job_digest({pinned_fixture_name: text}, pinned_fixture_name, "benchmark")
+        for side, text in pinned_texts.items()
+    }
+    pinned_normalized = {
+        side: directory_job_digest(pinned_loaded.get(side, {}), pinned_fixture_name, "benchmark")
+        for side in pinned_texts
+    }
+    if None in pinned_raw.values() or None in pinned_normalized.values():
+        failures.append("the pinned directory-job fixture has no benchmark job")
+    elif pinned_raw["base"] == pinned_normalized["base"]:
+        failures.append(
+            "the pinned directory-job fixture is not pin-normalized by "
+            "load_workflow_directory; the loader self-test would be vacuous"
+        )
+    else:
+        pinned_base = pinned_loaded["base"]
+        pinned_head = pinned_loaded["head"]
+        normalized_pair = (
+            (
+                pinned_fixture_name,
+                "benchmark",
+                str(pinned_normalized["base"]),
+                str(pinned_normalized["head"]),
+            ),
+        )
+        raw_pair = (
+            (
+                pinned_fixture_name,
+                "benchmark",
+                str(pinned_raw["base"]),
+                str(pinned_raw["head"]),
+            ),
+        )
+        if not scan_pr_workflow_collection_cross_surfaces(
+            pinned_base, pinned_head, "self-test workflows",
+            directory_job_transitions=(),
+        ):
+            failures.append(
+                "the pinned directory-job fixture is not Cross-sensitive; the "
+                "loader self-test would be vacuous"
+            )
+        if scan_pr_workflow_collection_cross_surfaces(
+            pinned_base, pinned_head, "self-test workflows",
+            directory_job_transitions=normalized_pair,
+        ):
+            failures.append(
+                "a directory-job tuple over the loader's pin-normalized job text "
+                "was rejected"
+            )
+        if not scan_pr_workflow_collection_cross_surfaces(
+            pinned_base, pinned_head, "self-test workflows",
+            directory_job_transitions=raw_pair,
+        ):
+            failures.append(
+                "a directory-job tuple over the raw, unnormalized job text was "
+                "admitted"
+            )
+        if not any(
+            "cannot return to a retired generation" in error
+            for error in scan_pr_workflow_collection_cross_surfaces(
+                pinned_head, pinned_base, "self-test workflows",
+                directory_job_transitions=normalized_pair,
+            )
+        ):
+            failures.append(
+                "reverting an admitted directory-job generation through the "
+                "loader was not refused"
+            )
+    # Every production tuple must name the job as this checkout's loader sees
+    # it: the retired end before the workflow half lands, the adopted end after.
+    tree_workflows_directory = Path(".github/workflows")
+    if WORKFLOW_DIRECTORY_JOB_GENERATION_TRANSITIONS and tree_workflows_directory.is_dir():
+        tree_workflows, _ = load_workflow_directory(
+            tree_workflows_directory, "self-test tree workflows"
+        )
+        for (
+            tree_workflow_name,
+            tree_job_name,
+            tree_retired_digest,
+            tree_adopted_digest,
+        ) in WORKFLOW_DIRECTORY_JOB_GENERATION_TRANSITIONS:
+            tree_digest = directory_job_digest(
+                tree_workflows, tree_workflow_name, tree_job_name
+            )
+            if tree_digest not in (tree_retired_digest, tree_adopted_digest):
+                failures.append(
+                    "workflow-directory job generation "
+                    f"{tree_workflow_name!r}/{tree_job_name!r} names neither "
+                    "end of the job as load_workflow_directory reads it "
+                    f"(pin-normalized digest {tree_digest})"
+                )
 
     job_gen_prologue = (
         "name: CI\n"

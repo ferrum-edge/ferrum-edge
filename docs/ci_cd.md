@@ -2687,8 +2687,8 @@ pairs for those jobs, keyed by the workflow filename AND the job name.
 
 The table holds one entry, PR #7400's `gateways-protocol-benchmark.yml`
 `benchmark` pair
-(`47a369a0075ab8a6eb3d817f30d3d2f19cc800c2ea75746e017080fb535b5300` →
-`1a4b8f005b3e59641b3f83ff3e5e2a85d25bc0a477cc758be17fde3519807076`). That PR
+(`4c2b4900fec25e45a2af4330dfe66d3ac4ce530f445f061d642de460561c3008` →
+`70b612bb967eda2827bcc5708133a30c27508be6ffd581e82150d8be5bde3ec8`). That PR
 drops the job's BuildKit `cache-to: type=gha,mode=max` export and the buildx
 step that existed only for it. The exported builder layers were 4.2 GB of the
 10 GB Actions cache, and evicting them sent the Rust CI caches cold. The job's
