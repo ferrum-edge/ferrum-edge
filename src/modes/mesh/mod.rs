@@ -12079,7 +12079,8 @@ pub(crate) fn apply_destination_rules_with_tenant_file_roots(
         .iter()
         .filter(|entry| service_entry_exported_to_namespace(entry, client_namespace))
         .collect();
-    let service_entry_hosts = index_service_entry_host_owners(visible_service_entries);
+    let service_entry_hosts =
+        index_service_entry_host_owners(visible_service_entries.iter().copied());
 
     // Istio resolves the DestinationRule for a destination HOST, so tier
     // arbitration is per destination host, not per upstream. Arbitrating per
@@ -12124,7 +12125,13 @@ pub(crate) fn apply_destination_rules_with_tenant_file_roots(
     let logical_service_upstreams: Vec<bool> = config
         .upstreams
         .iter()
-        .map(|upstream| is_logical_destination_upstream(upstream, &outbound_upstream_owner_port))
+        .map(|upstream| {
+            is_logical_destination_upstream(
+                upstream,
+                &outbound_upstream_owner_port,
+                &visible_service_entries,
+            )
+        })
         .collect();
     let mut winning_tier_by_upstream_host: Vec<Vec<Option<DestinationRuleWinner>>> =
         Vec::with_capacity(config.upstreams.len());
@@ -13384,18 +13391,26 @@ impl DestinationRuleMatchHost<'_> {
 }
 
 /// Whether an upstream is arbitrated on its logical destination host alone
-/// (see [`upstream_destination_rule_match_hosts`]): a materialized per-port
-/// Service upstream (`outbound_upstream_owner_port`), or any other
-/// mesh-generated upstream (reserved `__mesh` id, the same provenance
-/// [`TrustedMeshGeneratedResourceIds`] trusts) that is named with a destination
-/// host distinct from its id: an EgressGateway upstream named with its
-/// ServiceEntry host, or a source-side external UDP upstream named with its
-/// ServiceEntry host. Their targets are transport endpoints (workload or
-/// STATIC endpoint addresses, DNS endpoints, gateway endpoints, cross-cluster
-/// transport identities), never independent destinations a rule names.
+/// (see [`upstream_destination_rule_match_hosts`]). Every case is
+/// forward-derived from the slice or the reserved mesh id space, never parsed
+/// out of an operator id:
+///
+/// * a materialized per-port Service upstream (`outbound_upstream_owner_port`);
+/// * an EgressGateway ServiceEntry upstream: its id is exactly
+///   `mesh_egress_upstream_id` of a visible ServiceEntry, one of that entry's
+///   hosts (the upstream's `name`) and one of its ports;
+/// * any other mesh-generated upstream (reserved `__mesh` id, the provenance
+///   [`TrustedMeshGeneratedResourceIds`] trusts) named with a destination host
+///   distinct from its id, such as a source-side external UDP upstream named
+///   with its ServiceEntry host.
+///
+/// Their targets are transport endpoints (workload or STATIC endpoint
+/// addresses, DNS endpoints, gateway endpoints, cross-cluster transport
+/// identities), never independent destinations a rule names.
 fn is_logical_destination_upstream(
     upstream: &Upstream,
     outbound_upstream_owner_port: &HashMap<NamespacedResourceId, u16>,
+    service_entries: &[&ServiceEntry],
 ) -> bool {
     if outbound_upstream_owner_port.contains_key(&NamespacedResourceId::new(
         upstream.namespace.as_str(),
@@ -13403,11 +13418,24 @@ fn is_logical_destination_upstream(
     )) {
         return true;
     }
+    let Some(name) = upstream.name.as_deref() else {
+        return false;
+    };
+    if name == upstream.id {
+        return false;
+    }
+    let is_egress_service_entry_upstream = service_entries.iter().any(|entry| {
+        entry.hosts.iter().any(|host| host == name)
+            && entry.ports.iter().any(|port| {
+                mesh_egress_upstream_id(&entry.namespace, &entry.name, name, port.port)
+                    == upstream.id
+            })
+    });
+    if is_egress_service_entry_upstream {
+        return true;
+    }
     upstream.id.starts_with("__mesh")
-        && upstream.name.as_deref().is_some_and(|name| {
-            let name = name.trim().trim_end_matches('.').to_ascii_lowercase();
-            name != upstream.id && is_wildcard_matchable_host(&name)
-        })
+        && is_wildcard_matchable_host(&name.trim().trim_end_matches('.').to_ascii_lowercase())
 }
 
 /// True when EVERY target of this upstream dispatches through an SVID-backed
