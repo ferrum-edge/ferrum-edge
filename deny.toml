@@ -142,8 +142,8 @@ ignore = [
     { id = "RUSTSEC-2026-0459", reason = "libsqlite3-sys 0.30.1 bundles SQLite < 3.54.0 (CVE-2026-119375, crafted db + -wal pair returns uninitialized page-cache bytes; local, needs the victim to open attacker-written files). Fixed in 0.39.0, unreachable: sqlx-sqlite 0.8.6 requires ^0.30.1 and 0.9.0 requires <0.38.0 (checked 2026-11-09). Production opens SQLite only at operator-configured URLs (FERRUM_DB_URL, FERRUM_DB_FAILOVER_URLS, FERRUM_DB_READ_REPLICA_URL). Accepted on the condition that every such database, its -wal/-shm and directory have only trusted writers; a SQLite read replica written by a less-trusted account is NOT covered and needs patched SQLite. Retire when an SQLx release allows libsqlite3-sys >= 0.39. [expires:2026-12-31]" },
 
     # ── chrono 0.4.45 — RUSTSEC-2026-0543, unmaintained (announced in
-    # chronotope/chrono#1768 on 2026-11-17; all versions affected, no patched
-    # release). An informational advisory, not a known vulnerability, and there
+    # chronotope/chrono#1768, opened 2026-01-22; RustSec advisory issued
+    # 2026-11-17; all versions affected, no patched release). An informational advisory, not a known vulnerability, and there
     # is no maintained drop-in replacement. Parents (root, fuzz/ and
     # tests/performance/mesh/ lockfiles; not ebpf/ or the other
     # tests/performance/* workspaces):
