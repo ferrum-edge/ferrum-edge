@@ -28,8 +28,8 @@ use super::utils::sse::{
     SseEventName, SseForwardedPrefix, SseReassembler, SseText, SseTextKind, UTF8_BOM,
     classify_forwarded_sse_prefix, encode_sse_error_event, is_cohere_v2_stream_frame,
     is_gemini_stream_frame, is_tgi_stream_frame, last_paragraph_boundary, last_sentence_boundary,
-    parse_sse_data_frames_checked, sse_event_end, sse_event_end_after, sse_event_on_fresh_line,
-    sse_line_end,
+    parse_sse_data_frames_checked, sse_data_payloads_are_ambiguous, sse_event_end,
+    sse_event_end_after, sse_event_on_fresh_line, sse_line_end,
 };
 use super::{
     HTTP_ONLY_PROTOCOLS, Plugin, PluginHttpClient, PluginResult, RequestContext,
@@ -1493,6 +1493,17 @@ impl AiSemanticFirewall {
             );
         }
         let segments = if event_stream {
+            // Each `data:` payload is folded from the LAST duplicate member
+            // while a first-key-wins client reads the FIRST, so a
+            // duplicate-member event is uninspectable (GHSA-49cr-v28q-9hgp).
+            if std::str::from_utf8(body).is_ok_and(sse_data_payloads_are_ambiguous) {
+                self.set_response_hash(ctx, digest.into_hex());
+                return self.engine.handle_uninspectable_body(
+                    ctx,
+                    Direction::Response,
+                    "ambiguous_json",
+                );
+            }
             let (segments, fully_parsed) =
                 reassemble_sse_response_segments(body, &self.engine.extraction);
             let streaming_inspection_requested = buffer_streaming_marker_set(ctx)
@@ -1521,6 +1532,14 @@ impl AiSemanticFirewall {
             let armed = self.governed_stream_armed(ctx);
             if !was_governed && !armed {
                 return PluginResult::Continue;
+            }
+            if ndjson_records_are_ambiguous(body) {
+                self.set_response_hash(ctx, digest.into_hex());
+                return self.engine.handle_uninspectable_body(
+                    ctx,
+                    Direction::Response,
+                    "ambiguous_json",
+                );
             }
             let (segments, fully_parsed) =
                 reassemble_ndjson_response_segments(body, &self.engine.extraction);
@@ -4292,6 +4311,19 @@ const NDJSON_INCREMENTAL_RESPONSE_PATHS: &[&str] = &[
     "$.message.thinking",
 ];
 
+/// Whether any NDJSON record of `body` is a duplicate-member JSON document.
+/// Records are split exactly as [`reassemble_ndjson_response_segments`] splits
+/// them (`\n`, trimmed, blank lines skipped).
+fn ndjson_records_are_ambiguous(body: &[u8]) -> bool {
+    let Ok(text) = std::str::from_utf8(strip_json_bom(body)) else {
+        return false;
+    };
+    text.split('\n')
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .any(|line| crate::util::json_dup_keys::str_ambiguity(line).is_some())
+}
+
 /// Reassemble a buffered newline-delimited JSON stream (Ollama
 /// `application/x-ndjson`) into response segments.
 ///
@@ -4930,6 +4962,10 @@ impl StreamWindowEngine {
             // holding rather than releasing bytes no verdict ever covered.
             let inspectable = parse == EventParse::Whole
                 && parsed.fully_parsed
+                // A duplicate-member `data:` payload was folded from its LAST
+                // member while the client reads the FIRST (GHSA-49cr-v28q-9hgp).
+                && !std::str::from_utf8(&raw[parse_from..])
+                    .is_ok_and(sse_data_payloads_are_ambiguous)
                 && !self.reassembler.provider_stream_uninspectable()
                 // Gemini candidates are independent client-visible streams, but
                 // release() retains one aggregate overlap. Until overlap is
