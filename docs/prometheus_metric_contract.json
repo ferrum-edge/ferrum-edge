@@ -2544,6 +2544,16 @@
     "emission": "conditional"
   },
   {
+    "name": "ferrum_k8s_controller_watch_evidence_refresh_relists_total",
+    "type": "counter",
+    "help": "Watch-scope reflector rebuilds started by a demand-driven revision-evidence refresh; the scope's live watch keeps delivering while the replacement lists.",
+    "labels": [],
+    "subsystem": "k8s_controller",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "conditional"
+  },
+  {
     "name": "ferrum_k8s_controller_watch_idle_relists_total",
     "type": "counter",
     "help": "Watch-scope reflector rebuilds triggered because a scope delivered no event for the configured idle window, or because a replacement generation never finished its initial list.",
