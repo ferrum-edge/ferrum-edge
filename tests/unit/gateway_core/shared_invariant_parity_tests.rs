@@ -5691,7 +5691,7 @@ fn destination_rule_host_matching_has_one_implementation() {
         (
             &mesh,
             "fn destination_rule_winner_candidate(",
-            "destination_rule_host_specificity(",
+            "host.specificity(dr)",
         ),
         (
             &mesh,
