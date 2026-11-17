@@ -2302,6 +2302,14 @@ pub struct EnvConfig {
     /// through `create_jwt_manager_from_env()`; this field is the startup
     /// validation.
     pub admin_jwt_viewer_namespaces: Option<String>,
+    /// Optional `FERRUM_ADMIN_CONFIG_EXPORT_FINGERPRINT_SECRET`: the key root
+    /// for `GET /config/export` credential fingerprints
+    /// (GHSA-crqx-mp2f-v8c8). At least 32 characters, and distinct from
+    /// `FERRUM_ADMIN_JWT_SECRET`, `FERRUM_ADMIN_JWT_VIEWER_SECRET`, and
+    /// `FERRUM_CP_DP_GRPC_JWT_SECRET`. Unset uses a random per-process key.
+    /// The admin plane reads it through `create_jwt_manager_from_env()`; this
+    /// field is the startup validation.
+    pub admin_config_export_fingerprint_secret: Option<String>,
     /// JWT issuer claim (iss) for Admin API tokens. Tokens with a different issuer
     /// are rejected during verification. Default: "ferrum-edge".
     /// Note: Also resolved via `resolve_ferrum_var()` in `jwt_auth.rs` for use sites
@@ -4466,6 +4474,7 @@ impl Default for EnvConfig {
             admin_jwt_secret: None,
             admin_jwt_viewer_secret: None,
             admin_jwt_viewer_namespaces: None,
+            admin_config_export_fingerprint_secret: None,
             admin_jwt_issuer: "ferrum-edge".into(),
             admin_jwt_max_ttl: 3600,
             admin_jwt_audience: None,
@@ -4965,6 +4974,7 @@ impl EnvConfig {
                 => required_for(["database", "cp", "dp"]) min_len(crate::config::types::MIN_JWT_SECRET_LENGTH);
             admin_jwt_viewer_secret: Option<String> = "FERRUM_ADMIN_JWT_VIEWER_SECRET";
             admin_jwt_viewer_namespaces: Option<String> = "FERRUM_ADMIN_JWT_VIEWER_NAMESPACES";
+            admin_config_export_fingerprint_secret: Option<String> = "FERRUM_ADMIN_CONFIG_EXPORT_FINGERPRINT_SECRET";
             admin_jwt_issuer: String = "FERRUM_ADMIN_JWT_ISSUER" => "ferrum-edge".to_string();
             admin_jwt_max_ttl: u64 = "FERRUM_ADMIN_JWT_MAX_TTL" => 3600u64;
             admin_jwt_audience: Option<String> = "FERRUM_ADMIN_JWT_AUDIENCE";
@@ -6060,6 +6070,7 @@ impl EnvConfig {
             admin_jwt_secret,
             admin_jwt_viewer_secret,
             admin_jwt_viewer_namespaces,
+            admin_config_export_fingerprint_secret,
             admin_jwt_issuer,
             admin_jwt_max_ttl,
             admin_jwt_audience,
@@ -8487,6 +8498,36 @@ impl EnvConfig {
                     "FERRUM_ADMIN_JWT_VIEWER_SECRET and FERRUM_CP_DP_GRPC_JWT_SECRET must be \
                      distinct secrets; identical HMAC keys are rejected because issuer claims \
                      do not domain-separate shared signing material"
+                        .into(),
+                );
+            }
+        }
+
+        // The configuration-export fingerprint secret keys MACs that every
+        // export reader (viewer-key tokens included) receives, so it must be
+        // strong and must not reuse any JWT signing secret: reuse would hand
+        // readers an offline verifier for guesses of that signing secret
+        // (GHSA-crqx-mp2f-v8c8). Diagnostics name settings, never values.
+        if let Some(fingerprint_secret) = self
+            .admin_config_export_fingerprint_secret
+            .as_deref()
+            .filter(|s| !s.is_empty())
+        {
+            if fingerprint_secret.len() < crate::config::types::MIN_JWT_SECRET_LENGTH {
+                return Err(format!(
+                    "FERRUM_ADMIN_CONFIG_EXPORT_FINGERPRINT_SECRET must be at least {} characters (got {})",
+                    crate::config::types::MIN_JWT_SECRET_LENGTH,
+                    fingerprint_secret.len()
+                ));
+            }
+            let signing_secrets = [
+                self.admin_jwt_secret.as_deref(),
+                self.admin_jwt_viewer_secret.as_deref(),
+                self.cp_dp_grpc_jwt_secret.as_deref(),
+            ];
+            if signing_secrets.contains(&Some(fingerprint_secret)) {
+                return Err(
+                    crate::admin::jwt_auth::ADMIN_CONFIG_EXPORT_FINGERPRINT_SECRET_REUSED_ERROR
                         .into(),
                 );
             }

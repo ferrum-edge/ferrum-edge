@@ -2481,20 +2481,22 @@ paths:
         that hidden credentials changed without revealing whether any exist.
 
         Fingerprints are HMAC-SHA-256 under a subkey derived from
-        `FERRUM_ADMIN_JWT_SECRET` (never from the viewer secret), bound to the
-        resource kind, namespace, id, and the field's JSON pointer, over a
-        key-sorted canonical JSON of the stored value. Equal values in two
-        fields fingerprint differently, and each JSON pointer is fingerprinted
-        once (an ancestor's fingerprint may still cover a child's).
-        An unchanged credential fingerprints identically across calls and
-        across replicas sharing `FERRUM_ADMIN_JWT_SECRET`; a changed one
-        fingerprints differently; the value cannot be recovered or
-        offline-guessed from it. `redaction.fingerprint_key_id` changes when
-        the admin secret rotates, marking exports as not comparable. In
-        `file`/`mesh`/`node_agent` mode without `FERRUM_ADMIN_JWT_SECRET` the
-        key is random per process, so fingerprints are stable only for that
-        process's lifetime; a CP and a DP with different admin secrets never
-        agree. A principal with write access to a field can confirm a guess
+        `FERRUM_ADMIN_CONFIG_EXPORT_FINGERPRINT_SECRET` — never from
+        `FERRUM_ADMIN_JWT_SECRET` or the viewer secret, which that setting must
+        differ from (GHSA-crqx-mp2f-v8c8) — bound to the resource kind,
+        namespace, id, and the field's JSON pointer, over a key-sorted
+        canonical JSON of the stored value. Equal values in two fields
+        fingerprint differently, and each JSON pointer is fingerprinted once
+        (an ancestor's fingerprint may still cover a child's). An unchanged
+        credential fingerprints identically across calls and across replicas
+        sharing the fingerprint secret; a changed one fingerprints
+        differently; the value cannot be recovered or offline-guessed from it,
+        and no fingerprint or key id can be used to test guesses of an admin
+        JWT signing secret. `redaction.fingerprint_key_id` changes when the
+        fingerprint secret rotates, marking exports as not comparable. Without
+        `FERRUM_ADMIN_CONFIG_EXPORT_FINGERPRINT_SECRET` the key is random per
+        process, so fingerprints are stable only for that process's lifetime;
+        replicas whose fingerprint secrets differ never agree. A principal with write access to a field can confirm a guess
         of its previous value by writing the guess and comparing fingerprints.
 
         The document is not restorable and is not accepted by
@@ -20748,7 +20750,8 @@ components:
               description: >-
                 Keyed label of the fingerprint key (not the key). Two exports
                 are comparable only when this matches; it changes when
-                `FERRUM_ADMIN_JWT_SECRET` rotates.
+                `FERRUM_ADMIN_CONFIG_EXPORT_FINGERPRINT_SECRET` rotates, and
+                on every restart of a process without that setting.
         counts:
           type: object
           required: [proxies, consumers, plugin_configs, upstreams]

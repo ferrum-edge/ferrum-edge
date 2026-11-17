@@ -402,6 +402,108 @@ async fn fingerprints_are_stable_and_change_when_the_credential_changes() {
     assert_eq!(first.body["upstreams"], rotated.body["upstreams"]);
 }
 
+const FINGERPRINT_SECRET: &str = "config-export-fingerprint-secret-0123456789";
+
+fn admin_state_with_manager(
+    cached: Arc<ArcSwap<GatewayConfig>>,
+    manager: JwtManager,
+) -> AdminState {
+    let mut state = admin_state(cached, false);
+    state.jwt_manager = manager;
+    state
+}
+
+/// GHSA-crqx-mp2f-v8c8: no export value is a MAC keyed by
+/// `FERRUM_ADMIN_JWT_SECRET`, so a viewer-key holder cannot test offline
+/// guesses of the secret that mints `admin` tokens. Replicas that share
+/// `FERRUM_ADMIN_CONFIG_EXPORT_FINGERPRINT_SECRET` still publish identical,
+/// comparable exports.
+#[tokio::test]
+async fn export_fingerprints_are_keyed_by_the_dedicated_secret_not_the_admin_secret() {
+    use ferrum_edge::admin::config_export::{
+        FingerprintRendering, fingerprint_key, fingerprint_key_id,
+    };
+
+    let primary_key = fingerprint_key(PRIMARY_SECRET).expect("non-empty secret");
+    let primary_key_id = fingerprint_key_id(&primary_key);
+    // Known inputs: the staging consumer stores no hidden credential type.
+    let primary_hidden =
+        FingerprintRendering::new(&primary_key, "consumer", "staging", "consumer-staging")
+            .fingerprint("/hidden_credentials", &json!({}));
+    let dedicated_key_id =
+        fingerprint_key_id(&fingerprint_key(FINGERPRINT_SECRET).expect("non-empty secret"));
+
+    let replica = || {
+        jwt_manager()
+            .with_config_export_fingerprint_secret(FINGERPRINT_SECRET.to_string())
+            .expect("a distinct fingerprint secret is accepted")
+    };
+    let (base_a, _sd_a) = start_admin(admin_state_with_manager(
+        cached(two_tenant_config(STAGING_KEY)),
+        replica(),
+    ))
+    .await;
+    let (base_b, _sd_b) = start_admin(admin_state_with_manager(
+        cached(two_tenant_config(STAGING_KEY)),
+        replica(),
+    ))
+    .await;
+    // Without the dedicated secret each process keys from a random value.
+    let (base_random, _sd_random) =
+        start_admin(admin_state(cached(two_tenant_config(STAGING_KEY)), false)).await;
+
+    let viewer_key = token(VIEWER_SECRET, Algorithm::HS256, "viewer", None);
+    let ns_bounded_viewer_key = token(
+        VIEWER_SECRET,
+        Algorithm::HS256,
+        "viewer",
+        Some(json!("staging")),
+    );
+    let primary_admin = token(PRIMARY_SECRET, Algorithm::HS256, "admin", None);
+
+    let mut replica_exports = Vec::new();
+    for (base, bearer, expected_key_id) in [
+        (&base_a, &viewer_key, Some(&dedicated_key_id)),
+        (&base_a, &ns_bounded_viewer_key, Some(&dedicated_key_id)),
+        (&base_a, &primary_admin, Some(&dedicated_key_id)),
+        (&base_b, &viewer_key, Some(&dedicated_key_id)),
+        (&base_random, &viewer_key, None),
+        (&base_random, &primary_admin, None),
+    ] {
+        let export = get(base, EXPORT, Some(bearer), Some("staging")).await;
+        assert_eq!(export.status, 200);
+        let key_id = export.body["redaction"]["fingerprint_key_id"]
+            .as_str()
+            .expect("key id is published")
+            .to_string();
+        assert_ne!(
+            key_id, primary_key_id,
+            "the published key id must not be keyed by the admin JWT secret"
+        );
+        let hidden = export
+            .body
+            .pointer("/consumers/0/hidden_credentials_fingerprint")
+            .and_then(Value::as_str)
+            .expect("every consumer carries the hidden-credentials fingerprint");
+        assert!(is_fingerprint(&json!(hidden)));
+        assert_ne!(
+            hidden, primary_hidden,
+            "a known-input fingerprint must not be keyed by the admin JWT secret"
+        );
+        match expected_key_id {
+            Some(expected) => {
+                assert_eq!(&key_id, expected);
+                replica_exports.push(export.text);
+            }
+            None => assert_ne!(key_id, dedicated_key_id),
+        }
+    }
+    assert!(
+        replica_exports.windows(2).all(|pair| pair[0] == pair[1]),
+        "replicas sharing the fingerprint secret publish identical exports to every reader"
+    );
+}
+
 #[tokio::test]
 async fn export_is_namespace_scoped_and_honours_ns_claims() {
     let config = cached(two_tenant_config(STAGING_KEY));
