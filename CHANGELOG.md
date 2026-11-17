@@ -142,7 +142,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   replica whose exports a drift tool compares, and re-baseline once, because
   fingerprints and `fingerprint_key_id` change.
 - **BREAKING: only a `charges:collect`-scoped token acknowledges `/charges`
-  delivery** (GHSA-jjvr-vvwv-8qmh). Any authenticated `GET /charges`, including
+  delivery** (issue #7413) (GHSA-jjvr-vvwv-8qmh). Any authenticated `GET /charges`, including
   viewer-role and viewer-key reads, counted toward the two-delivery rule that
   lets idle `api_chargeback` rows be evicted. Two dashboard reads during a
   collector outage could therefore drop rows the collector never received. Now
@@ -157,7 +157,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   logs and diagnostics. The value is now decoded before it is split. An entry
   without a decoded `:`, or with a name that is still encoded, is redacted
   whole.
-- **BREAKING:** `mcp_gateway` OpenAPI bridge calls are confined to the matched
+- **BREAKING:** (issue #7410) `mcp_gateway` OpenAPI bridge calls are confined to the matched
   proxy's listen prefix whether or not `strip_listen_path` is set. Before, a
   non-stripping prefix proxy forwarded any `openapi.operations[].path` to its
   backend. Calls outside the route now get JSON-RPC `-32603`. Bridged calls on
@@ -175,7 +175,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`jwks_auth`, `ldap_auth`, `oauth2_introspection`, `oidc_relying_party`,
   `soap_ws_security`) that spells the same string, and external principals from
   different realms no longer share a bucket.
-- **BREAKING:** A Kubernetes AuthorizationPolicy, PeerAuthentication or Sidecar
+- **BREAKING:** (issue #7415) A Kubernetes AuthorizationPolicy, PeerAuthentication or Sidecar
   that Ferrum refuses is no longer dropped from enforcement
   (GHSA-2r85-85hh-23mw). Dropping it silently removed DENY rules, CUSTOM
   external-authorization delegation, the ALLOW implicit-deny floor, workload
@@ -193,7 +193,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `412`, writing nothing. An indexed delete conditioned on the read it was
   chosen from can no longer remove a different credential after a concurrent
   append or removal (#7393).
-- **BREAKING:** `DELETE` of managed TLS records
+- **BREAKING:** (issue #7394) `DELETE` of managed TLS records
   (`/admin/tls/{certificates,ca-bundles,crls,ocsp-responses,jwks}/{id}`) and
   ACME certificates (`/admin/tls/acme/certificates/{id}`) now checks references
   in every namespace of the configuration store, not only the namespaces the
@@ -994,31 +994,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `virtual_service_http_routes` and `MeshSlice` gained `http_routes`, so the
   ConfigSync build identity moves to `configsync.r5`; a CP and DP from
   different builds refuse each other at `Subscribe`.
-- **BREAKING:** `ai_prompt_shield` in `content` / `all` scan modes refuses
+- **BREAKING:** (issue #7417) `ai_prompt_shield` in `content` / `all` scan modes refuses
   (reject/redact, 400 `ambiguous_json`) or records (warn) request bodies with
   duplicate JSON member names. (#7417)
-- **BREAKING:** ConfigSync protocol revision is now 6 (new plugin-trigger
+- **BREAKING:** (issue #7417) ConfigSync protocol revision is now 6 (new plugin-trigger
   predicates); upgrade CPs and DPs together. (#7417)
-- **BREAKING:** `ai_semantic_firewall` treats request bodies, buffered JSON
+- **BREAKING:** (issue #7417) `ai_semantic_firewall` treats request bodies, buffered JSON
   responses, and SSE / NDJSON stream frames with duplicate member names as
   uninspectable (`uninspectable_body=ambiguous_json`, routed through
   `fail_on_uninspectable_body`). (#7417)
-- **BREAKING:** `a2a_gateway` refuses JSON-RPC bodies with duplicate member
+- **BREAKING:** (issue #7417) `a2a_gateway` refuses JSON-RPC bodies with duplicate member
   names under a policy that can deny (`-32001`,
   `a2a.error=request_body_uninspectable`) and leaves them unclassified
   otherwise. (#7417)
-- **BREAKING:** `ai_rate_limiter` treats request bodies with duplicate member
+- **BREAKING:** (issue #7417) `ai_rate_limiter` treats request bodies with duplicate member
   names as unparseable (refused with 400 while `model_limits` is set). (#7417)
-- **BREAKING:** WAF `global_exemptions.consumers` and rule
+- **BREAKING:** (issue #7417) WAF `global_exemptions.consumers` and rule
   `conditions.consumers`, `openapi_validator` `bypass.consumers`,
   `rate_limiting` `scope: consumers`, `ai_rate_limiter` `consumer_limits`, and
   the trigger `consumer` predicate match mapped Consumer usernames only. (#7417)
-- **BREAKING:** `limit_by: consumer` in `rate_limiting`, `ws_rate_limiting`,
+- **BREAKING:** (issue #7417) `limit_by: consumer` in `rate_limiting`, `ws_rate_limiting`,
   `graphql`, `grpc_method_router`, `ai_rate_limiter`, and
   `tcp_connection_throttle` keys unmapped external identities as
   `external:<mechanism>:<authority>:<identity>`; their existing counters (local
   and Redis) restart. (#7417)
-- **BREAKING:** **Wildcard DestinationRule hosts are applied with Istio
+- **BREAKING:** (issue #7395) **Wildcard DestinationRule hosts are applied with Istio
   semantics on every mesh topology** (#7395). A rule host of `*.example.com` or
   `*` was admitted and then ignored by the data plane, so its TLS origination,
   connection pool, load balancer, outlier detection and timeouts never applied,
@@ -2713,7 +2713,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   upgrades, as on the HTTP path. The dial address, TLS SNI and certificate
   verification still use the selected target, and an invalid client Host falls
   back to the target authority.
-- **BREAKING:** The `mcp_gateway` endpoint-scope overlap check now matches the
+- **BREAKING:** (issue #7406) The `mcp_gateway` endpoint-scope overlap check now matches the
   runtime claim: canonical path, ASCII case-insensitive, and path template
   parameters treated as any value. `POST`/`PUT /api-specs` with `x-ferrum-mcp`
   rejects a document where any operation path (bridged or not, under any
