@@ -96,7 +96,7 @@ const ADAPTIVE_STREAM_WINDOW_SIZE: u32 = 16 * 1024 * 1024;
 const ADAPTIVE_CONNECTION_WINDOW_SIZE: u32 = 64 * 1024 * 1024;
 /// Bounded poll for the peer's `SETTINGS_ENABLE_CONNECT_PROTOCOL` acknowledgement
 /// when opening a WebSocket Extended CONNECT over a freshly handshaked H2
-/// connection (see [`open_h2_ws_connect_stream`]). The setting rides the peer's
+/// connection (see [`open_h2_ws_connect_stream_within`]). The setting rides the peer's
 /// initial SETTINGS frame, processed asynchronously by the connection driver, so
 /// one yield + a few short sleeps let a capable peer's frame land before the dial
 /// fails closed. The interval is tiny and the count small: SETTINGS is the first
@@ -3285,8 +3285,18 @@ pub struct H2WsConnectTunnel {
 /// Fails closed: if the peer never acknowledged
 /// `SETTINGS_ENABLE_CONNECT_PROTOCOL`, sending an Extended CONNECT would be a
 /// protocol violation, so we return [`HbonePoolError::ExtendedConnectUnsupported`]
-/// before sending anything. A non-200 response also fails closed.
-pub(crate) async fn open_h2_ws_connect_stream(
+/// before sending anything. A non-200 response also fails closed; a `3xx`-`5xx`
+/// one carries the peer's refusal ([`HbonePoolError::WebSocketUpgradeRefused`]).
+///
+/// `head_timeout` bounds the Extended CONNECT up to and including the peer's
+/// response HEAD only. The optional body read of a refusal
+/// ([`read_ws_upgrade_refusal_body`]) runs after that deadline with its own
+/// short bound, so a refusal head that arrived in time is always relayed: a
+/// slow refusal body can never turn it into a connect-timeout `502`
+/// (GHSA-7x2j-3389-2h35).
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn open_h2_ws_connect_stream_within(
+    head_timeout: Duration,
     transport: MeshH2Transport,
     authority: &str,
     path_and_query: &str,
@@ -3294,6 +3304,80 @@ pub(crate) async fn open_h2_ws_connect_stream(
     baggage: Option<&str>,
     marker: Option<&'static str>,
 ) -> Result<H2WsConnectTunnel, HbonePoolError> {
+    let head = tokio::time::timeout(
+        head_timeout,
+        open_h2_ws_connect_stream_head(
+            transport,
+            authority,
+            path_and_query,
+            ws_handshake_headers,
+            baggage,
+            marker,
+        ),
+    )
+    .await
+    .map_err(|_| HbonePoolError::ConnectStream {
+        authority: authority.to_string(),
+        message: format!(
+            "timed out after {}ms waiting for sidecar mesh-mTLS WebSocket Extended CONNECT \
+             response",
+            head_timeout.as_millis()
+        ),
+    })??;
+    finish_ws_connect_head(head).await
+}
+
+/// The outcome of an Extended CONNECT once the peer's response head arrived:
+/// an open tunnel, or a `3xx`-`5xx` refusal whose body is still to be read.
+pub(crate) enum WsConnectHead {
+    Open(Box<H2WsConnectTunnel>),
+    Refused {
+        authority: String,
+        status: StatusCode,
+        headers: http::HeaderMap,
+        body: RecvStream,
+    },
+}
+
+/// Turn a [`WsConnectHead`] into the opener result: an open tunnel, or the
+/// carried [`HbonePoolError::WebSocketUpgradeRefused`] with the refusal body
+/// when it ended within [`WS_UPGRADE_REFUSAL_BODY_WAIT`].
+pub(crate) async fn finish_ws_connect_head(
+    head: WsConnectHead,
+) -> Result<H2WsConnectTunnel, HbonePoolError> {
+    let (authority, status, headers, body) = match head {
+        WsConnectHead::Open(tunnel) => return Ok(*tunnel),
+        WsConnectHead::Refused {
+            authority,
+            status,
+            headers,
+            body,
+        } => (authority, status, headers, body),
+    };
+    let complete_body = read_ws_upgrade_refusal_body(body).await;
+    match super::WebSocketBackendRefusal::from_response_parts(status, &headers, complete_body) {
+        Some(refusal) => Err(HbonePoolError::WebSocketUpgradeRefused {
+            authority,
+            status: status.as_u16(),
+            refusal: Box::new(refusal),
+        }),
+        None => Err(HbonePoolError::ConnectRejected {
+            authority,
+            status: status.as_u16(),
+        }),
+    }
+}
+
+/// Open the Extended CONNECT and wait for the peer's response head; see
+/// [`open_h2_ws_connect_stream_within`].
+async fn open_h2_ws_connect_stream_head(
+    transport: MeshH2Transport,
+    authority: &str,
+    path_and_query: &str,
+    ws_handshake_headers: &[(String, String)],
+    baggage: Option<&str>,
+    marker: Option<&'static str>,
+) -> Result<WsConnectHead, HbonePoolError> {
     // Synchronous refusal (issue #3859): a transport retired between checkout
     // and Extended CONNECT may not open a new stream.
     if transport.is_retired() {
@@ -3421,21 +3505,16 @@ pub(crate) async fn open_h2_ws_connect_stream(
     let status = response.status();
     if status != StatusCode::OK {
         // A `3xx`-`5xx` is the destination's application answer to the
-        // upgrade (GHSA-7x2j-3389-2h35): carry it so the bridge relays it.
+        // upgrade (GHSA-7x2j-3389-2h35): hand back its head so the caller can
+        // carry it to the relay after the head deadline, body read included.
         if (300..=599).contains(&status.as_u16()) {
             let (parts, body) = response.into_parts();
-            let complete_body = read_ws_upgrade_refusal_body(body).await;
-            if let Some(refusal) = super::WebSocketBackendRefusal::from_response_parts(
+            return Ok(WsConnectHead::Refused {
+                authority,
                 status,
-                &parts.headers,
-                complete_body,
-            ) {
-                return Err(HbonePoolError::WebSocketUpgradeRefused {
-                    authority,
-                    status: status.as_u16(),
-                    refusal: Box::new(refusal),
-                });
-            }
+                headers: parts.headers,
+                body,
+            });
         }
         return Err(HbonePoolError::ConnectRejected {
             authority,
@@ -3449,7 +3528,7 @@ pub(crate) async fn open_h2_ws_connect_stream(
     let backend_extensions = super::backend_extensions_answer(response.headers());
     let mut backend_response_headers = std::collections::HashMap::new();
     super::collect_hyper_response_headers(response.headers(), &mut backend_response_headers);
-    Ok(H2WsConnectTunnel {
+    Ok(WsConnectHead::Open(Box::new(H2WsConnectTunnel {
         tunnel: H2ConnectTunnel {
             recv_stream: response.into_body(),
             send_stream,
@@ -3466,14 +3545,14 @@ pub(crate) async fn open_h2_ws_connect_stream(
         negotiated_subprotocol,
         backend_extensions,
         backend_response_headers,
-    })
+    })))
 }
 
 /// How long a Sidecar mesh-mTLS WebSocket refusal may wait for its body after
 /// the refusal head arrived. A peer gateway writes the head and its small body
-/// together, so this only absorbs frame-processing skew; it is kept far below
-/// any connect budget so a stalled body never turns the refusal into a
-/// connect-timeout `502`.
+/// together, so this only absorbs frame-processing skew. It runs after the
+/// head deadline ([`open_h2_ws_connect_stream_within`]), so a stalled or failed
+/// body read only drops the body, never the refusal.
 const WS_UPGRADE_REFUSAL_BODY_WAIT: Duration = Duration::from_millis(100);
 
 /// The complete body of a refused Extended CONNECT, or `None` when it did not
@@ -5513,7 +5592,8 @@ mod tests {
         });
 
         let sender = h2_client_to(addr).await;
-        let result = open_h2_ws_connect_stream(
+        let result = open_h2_ws_connect_stream_within(
+            Duration::from_secs(10),
             sender,
             "orders.default.svc.cluster.local:8080",
             "/",
@@ -5573,7 +5653,8 @@ mod tests {
         });
 
         let sender = h2_client_to(addr).await;
-        let error = open_h2_ws_connect_stream(
+        let error = open_h2_ws_connect_stream_within(
+            Duration::from_secs(10),
             sender,
             "orders.default.svc.cluster.local:8080",
             "/ws",
@@ -5595,6 +5676,75 @@ mod tests {
         );
         assert!(!refusal.headers.contains_key("x-gateway-error"));
         assert_eq!(refusal.body.as_ref(), body.as_bytes());
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn ws_extended_connect_refusal_head_survives_a_slow_body_past_the_deadline() {
+        // Round-2 review (sol F1): the head deadline must not erase a refusal
+        // whose head arrived in time. The peer sends the 401 head at once and
+        // its body only after both the head deadline and the body wait, so
+        // the refusal is relayed with an empty body and no representation
+        // headers instead of a connect-timeout ConnectStream (a 502).
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind h2 server");
+        let addr = listener.local_addr().expect("server addr");
+        let server = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.expect("server accept");
+            let mut builder = h2::server::Builder::new();
+            builder.enable_connect_protocol();
+            let mut conn = builder
+                .handshake::<_, Bytes>(tcp)
+                .await
+                .expect("server handshake");
+            let (_request, mut respond) = conn
+                .accept()
+                .await
+                .expect("server has a stream")
+                .expect("accepted request");
+            let response = http::Response::builder()
+                .status(StatusCode::UNAUTHORIZED)
+                .header("www-authenticate", "Bearer realm=\"ws\"")
+                .header("content-type", "application/json")
+                .body(())
+                .expect("build response");
+            let mut send = respond
+                .send_response(response, false)
+                .expect("send response");
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(800)).await;
+                let _ = send.send_data(Bytes::from_static(b"{}"), true);
+            });
+            while conn.accept().await.is_some() {}
+        });
+
+        let sender = h2_client_to(addr).await;
+        let error = open_h2_ws_connect_stream_within(
+            Duration::from_millis(250),
+            sender,
+            "orders.default.svc.cluster.local:8080",
+            "/ws",
+            &[],
+            None,
+            None,
+        )
+        .await
+        .expect_err("a 401 is not an open tunnel");
+        match error {
+            HbonePoolError::WebSocketUpgradeRefused {
+                status, refusal, ..
+            } => {
+                assert_eq!(status, 401);
+                assert_eq!(
+                    refusal.headers.get("www-authenticate").map(String::as_str),
+                    Some("Bearer realm=\"ws\"")
+                );
+                assert!(refusal.body.is_empty());
+                assert!(!refusal.headers.contains_key("content-type"));
+            }
+            other => panic!("the in-time refusal head must be kept, got {other:?}"),
+        }
         server.abort();
     }
 
@@ -5689,7 +5839,8 @@ mod tests {
         });
 
         let sender = h2_client_to(addr).await;
-        let ws = open_h2_ws_connect_stream(
+        let ws = open_h2_ws_connect_stream_within(
+            Duration::from_secs(10),
             sender,
             "orders.default.svc.cluster.local:8080",
             "/ws?room=1",

@@ -51,7 +51,7 @@ use crate::tls::spiffe::build_spiffe_outbound_config;
 use super::hbone_pool::{
     H2ConnectTunnel, H2WsConnectTunnel, HbonePoolError, MESH_SPIFFE_ID_TAG,
     authority_for_host_port, dial_h2_connect_sender, entry_idle_expired, matches_boolish_true,
-    open_h2_connect_stream, open_h2_ws_connect_stream, svid_fingerprint,
+    open_h2_connect_stream, open_h2_ws_connect_stream_within, svid_fingerprint,
     target_expected_peer_spiffe, unix_secs, write_pool_config_key,
 };
 
@@ -1461,26 +1461,19 @@ impl MeshMtlsConnectionPool {
             crate::proxy::hbone_pool::HBONE_DEFAULT_MAX_HEADER_LIST_SIZE,
         )
         .await?;
-        tokio::time::timeout(
+        // The connect budget bounds the Extended CONNECT up to the peer's
+        // response head; a refusal's optional body read runs after it, so an
+        // in-time refusal is always relayed (GHSA-7x2j-3389-2h35).
+        open_h2_ws_connect_stream_within(
             Duration::from_millis(proxy.backend_connect_timeout_ms),
-            open_h2_ws_connect_stream(
-                transport,
-                authority,
-                path_and_query,
-                ws_handshake_headers,
-                None,
-                None,
-            ),
+            transport,
+            authority,
+            path_and_query,
+            ws_handshake_headers,
+            None,
+            None,
         )
         .await
-        .map_err(|_| HbonePoolError::ConnectStream {
-            authority: authority.to_string(),
-            message: format!(
-                "timed out after {}ms waiting for sidecar mesh-mTLS WebSocket Extended CONNECT \
-                 response",
-                proxy.backend_connect_timeout_ms
-            ),
-        })?
     }
 
     #[allow(clippy::too_many_arguments)]
