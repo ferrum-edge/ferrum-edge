@@ -2669,6 +2669,21 @@ pub trait DatabaseBackend: NamespaceConfigAdmissionLeaseBackend + Send + Sync {
         namespace: &str,
     ) -> Result<GatewayConfig, anyhow::Error>;
 
+    /// Load the resources that can name a TLS source (proxies, upstreams and
+    /// plugin configs) from the primary, without consumers or trust bundles.
+    ///
+    /// The managed TLS / ACME delete guard scans every namespace with it
+    /// (issue #7394), so a large or partly undecodable Consumer table cannot
+    /// make a TLS delete expensive or unavailable. The default falls back to
+    /// [`Self::load_namespace_snapshot`], which loads a superset; the SQL and
+    /// MongoDB backends override it with the three families only.
+    async fn load_namespace_tls_reference_graph(
+        &self,
+        namespace: &str,
+    ) -> Result<GatewayConfig, anyhow::Error> {
+        self.load_namespace_snapshot(namespace).await
+    }
+
     /// Forget that `namespace`'s last full load quarantined nothing, so its
     /// next consumer change escalates to a full reload. Pollers call this when
     /// a loaded full snapshot is rejected or not published: the live consumer

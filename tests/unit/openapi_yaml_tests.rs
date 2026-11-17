@@ -165,6 +165,61 @@ fn openapi_info_version_matches_crate_version() {
     );
 }
 
+/// Exponent floats must carry a sign so every YAML resolver reads them as
+/// numbers (issue #7408). The YAML 1.2 Core Schema accepts `1.0e288` (its
+/// exponent sign is optional), but the YAML 1.1 float type requires
+/// `[eE][-+][0-9]+`, and widely used loaders resolve with YAML 1.1 rules
+/// (libyaml/Psych, PyYAML). They read `maximum: 1.0e288` as the string
+/// `"1.0e288"`, which breaks JSON Schema validators downstream. `1.0e+288` is
+/// a float under both. Scan the raw text, since `serde_yaml` accepts both
+/// spellings.
+#[test]
+fn openapi_plain_scalars_avoid_yaml_1_1_only_exponent_syntax() {
+    // A whole plain scalar after `key: ` or a `- ` sequence entry, with an
+    // optional trailing comment, that is a signless-exponent float.
+    let signless_exponent = Regex::new(
+        r"^\s*(?:-\s+)?(?:[^\s'#\x22][^:#]*:\s+|-\s+)?[-+]?(?:\.[0-9]+|[0-9]+(?:\.[0-9]*)?)[eE][0-9]+\s*(?:#.*)?$",
+    )
+    .expect("regex compiles");
+    let offenders: Vec<usize> = include_str!("../../openapi.yaml")
+        .lines()
+        .enumerate()
+        .filter(|(_, line)| signless_exponent.is_match(line))
+        .map(|(index, _)| index + 1)
+        .collect();
+    assert!(
+        offenders.is_empty(),
+        "openapi.yaml has signless exponent floats, which YAML 1.1 resolvers read as strings (write e.g. `1.0e+288`), on lines {offenders:?}"
+    );
+
+    // The chargeback price bounds that #7408 found must still parse as the
+    // runtime ceiling.
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+    let mut bounds = 0;
+    let mut stack = vec![&spec];
+    while let Some(value) = stack.pop() {
+        match value {
+            serde_json::Value::Object(map) => {
+                for (key, child) in map {
+                    if key == "maximum" && child.as_f64().is_some_and(|max| max > 1.0e+200) {
+                        assert_eq!(
+                            child.as_f64(),
+                            Some(ferrum_edge::plugins::chargeback::pricing::MAX_UNIT_PRICE),
+                            "large numeric maximum must equal the chargeback unit-price ceiling"
+                        );
+                        bounds += 1;
+                    }
+                    stack.push(child);
+                }
+            }
+            serde_json::Value::Array(items) => stack.extend(items),
+            _ => {}
+        }
+    }
+    assert_eq!(bounds, 14, "expected the 14 chargeback price maximums");
+}
+
 /// Every runtime Redis key-prefix default is derived from `FERRUM_NAMESPACE`
 /// (and, for the limiters, the plugin-config id), which no static schema
 /// `default` can express. A client that fills in defaults would write the
@@ -1549,6 +1604,59 @@ fn consumer_credential_surface_schemas_match_runtime_redaction() {
         Some(&json!("#/components/schemas/ConsumerRestore")),
         "the restore item surface must compose the restore credential contract"
     );
+}
+
+/// The row `If-Match` contract is documented on exactly the operations the
+/// admin router evaluates it on (`if_match_route` in `src/admin/mod.rs`),
+/// each with its `412`. The consumer credential sub-routes joined that set in
+/// issue #7393; the integration suite (`admin_conditional_write_tests`)
+/// drives the runtime side.
+#[test]
+fn row_if_match_operations_match_the_router_and_document_412() {
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+    let paths = spec["paths"].as_object().expect("paths object");
+    let mut documented = BTreeSet::new();
+    for (path, item) in paths {
+        for method in OPENAPI_HTTP_METHODS {
+            let Some(operation) = item.get(*method) else {
+                continue;
+            };
+            let has_if_match = operation["parameters"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .any(|parameter| parameter["$ref"] == "#/components/parameters/IfMatch");
+            if !has_if_match {
+                continue;
+            }
+            // Most operations reference the shared response; DELETE
+            // /proxies/{id} documents its deployment-profile 412 inline.
+            assert!(
+                operation["responses"]["412"].is_object(),
+                "{method} {path} takes If-Match and must document 412"
+            );
+            documented.insert(format!("{} {path}", method.to_uppercase()));
+        }
+    }
+    let expected: BTreeSet<String> = [
+        "PUT /proxies/{id}",
+        "DELETE /proxies/{id}",
+        "PUT /upstreams/{id}",
+        "DELETE /upstreams/{id}",
+        "PUT /consumers/{id}",
+        "DELETE /consumers/{id}",
+        "PUT /plugins/config/{id}",
+        "DELETE /plugins/config/{id}",
+        "PUT /consumers/{consumer_id}/credentials/{cred_type}",
+        "POST /consumers/{consumer_id}/credentials/{cred_type}",
+        "DELETE /consumers/{consumer_id}/credentials/{cred_type}",
+        "DELETE /consumers/{consumer_id}/credentials/{cred_type}/{index}",
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect();
+    assert_eq!(documented, expected);
 }
 
 #[test]

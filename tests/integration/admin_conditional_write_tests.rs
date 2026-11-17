@@ -738,6 +738,295 @@ async fn if_match_on_a_route_that_does_not_evaluate_it_is_refused() {
     assert_eq!(batch.status, 400, "{}", batch.body);
 }
 
+// Fixture credential values for the credential sub-route tests (issue #7393).
+const ENTRY_A: &str = "fixture-entry-a-0123456789abcdef";
+const ENTRY_B: &str = "fixture-entry-b-0123456789abcdef";
+const ENTRY_C: &str = "fixture-entry-c-0123456789abcdef";
+const ENTRY_D: &str = "fixture-entry-d-0123456789abcdef";
+const ROTATING_PATH: &str = "/consumers/rotating";
+
+/// The stored `keyauth` entries, in order, read straight from the store:
+/// every admin response redacts them.
+async fn stored_entries(db: &dyn DatabaseBackend) -> Vec<String> {
+    db.get_consumer("ferrum", "rotating")
+        .await
+        .expect("read consumer")
+        .expect("consumer exists")
+        .credential_entries("keyauth")
+        .iter()
+        .map(|entry| entry["key"].as_str().expect("string entry").to_string())
+        .collect()
+}
+
+async fn seed_rotating_consumer(base: &str, entries: &[&str]) {
+    let keyauth: Vec<Value> = entries.iter().map(|entry| json!({"key": entry})).collect();
+    create(
+        base,
+        "/consumers",
+        json!({"id": "rotating", "username": "rotating", "credentials": {"keyauth": keyauth}}),
+    )
+    .await;
+}
+
+/// The race from issue #7393. The operator reads `[A, B]` and selects index 0
+/// to revoke A. Before the delete lands, automation removes A and appends C,
+/// so index 0 is now B. The operator's delete carries the tag of the read it
+/// selected from and is refused; without it Edge would revoke B and report
+/// success. A fresh read then removes exactly the selected entry.
+#[tokio::test]
+async fn indexed_credential_delete_with_a_stale_tag_removes_nothing() {
+    let dir = TempDir::new().expect("tempdir");
+    let db = make_store(&dir).await;
+    let (base, _shutdown) = start_admin(admin_state(db.clone(), JWT_SECRET)).await;
+    seed_rotating_consumer(&base, &[ENTRY_A, ENTRY_B]).await;
+
+    let operator_read = get(&base, ROTATING_PATH).await;
+    let stale = operator_read.etag.expect("consumer GET issues an ETag");
+
+    // Concurrent automation, unconditioned: remove A, append C.
+    let removed = send(
+        Method::DELETE,
+        &base,
+        "/consumers/rotating/credentials/keyauth/0",
+        &admin_token(),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(removed.status, 200, "automation delete: {}", removed.body);
+    let appended = send(
+        Method::POST,
+        &base,
+        "/consumers/rotating/credentials/keyauth",
+        &admin_token(),
+        None,
+        Some(&json!({"key": ENTRY_C})),
+    )
+    .await;
+    assert_eq!(appended.status, 200, "automation append: {}", appended.body);
+    assert!(
+        stored_entries(db.as_ref()).await == [ENTRY_B, ENTRY_C],
+        "automation left B at index 0"
+    );
+
+    let refused = send(
+        Method::DELETE,
+        &base,
+        "/consumers/rotating/credentials/keyauth/0",
+        &admin_token(),
+        Some(&stale),
+        None,
+    )
+    .await;
+    assert_eq!(
+        refused.status, 412,
+        "stale indexed delete: {}",
+        refused.body
+    );
+    let message = refused.body["error"].as_str().unwrap_or_default();
+    assert!(
+        message.contains("rotating") && message.contains("re-read"),
+        "the refusal names the consumer and the recovery: {message}"
+    );
+    assert!(
+        stored_entries(db.as_ref()).await == [ENTRY_B, ENTRY_C],
+        "a refused indexed delete must not remove any entry"
+    );
+
+    // Re-read and select again: index 1 is C now, and only C goes.
+    let fresh = get(&base, ROTATING_PATH)
+        .await
+        .etag
+        .expect("consumer GET issues an ETag");
+    assert_ne!(fresh, stale, "the credential writes advanced the tag");
+    let deleted = send(
+        Method::DELETE,
+        &base,
+        "/consumers/rotating/credentials/keyauth/1",
+        &admin_token(),
+        Some(&fresh),
+        None,
+    )
+    .await;
+    assert_eq!(
+        deleted.status, 200,
+        "current indexed delete: {}",
+        deleted.body
+    );
+    assert!(
+        stored_entries(db.as_ref()).await == [ENTRY_B],
+        "the conditioned delete removes exactly the selected entry"
+    );
+}
+
+/// The comparison and the removal run under the namespace admission lease, so
+/// two indexed deletes holding one tag cannot both commit (each would
+/// otherwise remove a different entry from the same read).
+#[tokio::test]
+async fn concurrent_indexed_deletes_holding_one_tag_commit_exactly_once() {
+    let dir = TempDir::new().expect("tempdir");
+    let db = make_store(&dir).await;
+    let (base, _shutdown) = start_admin(admin_state(db.clone(), JWT_SECRET)).await;
+    seed_rotating_consumer(&base, &[ENTRY_A, ENTRY_B]).await;
+    let tag = get(&base, ROTATING_PATH)
+        .await
+        .etag
+        .expect("consumer GET issues an ETag");
+
+    // Spawn every writer before awaiting any, and release them together, so
+    // the deletes really compete for the comparison (review sol F2).
+    let start = Arc::new(tokio::sync::Barrier::new(4));
+    let writers: Vec<_> = (0..4)
+        .map(|_| {
+            let base = base.clone();
+            let tag = tag.clone();
+            let start = start.clone();
+            tokio::spawn(async move {
+                start.wait().await;
+                send(
+                    Method::DELETE,
+                    &base,
+                    "/consumers/rotating/credentials/keyauth/0",
+                    &admin_token(),
+                    Some(&tag),
+                    None,
+                )
+                .await
+                .status
+            })
+        })
+        .collect();
+    let mut accepted = 0;
+    for writer in writers {
+        match writer.await.expect("writer task") {
+            200 => accepted += 1,
+            412 => {}
+            other => panic!("unexpected status {other}"),
+        }
+    }
+    assert_eq!(accepted, 1, "exactly one conditioned delete commits");
+    assert!(
+        stored_entries(db.as_ref()).await == [ENTRY_B],
+        "only the entry selected from the tagged read was removed"
+    );
+}
+
+/// `PUT`, `POST` and per-type `DELETE` on the credential sub-route take the
+/// same Consumer tag: stale is `412` with nothing written, current succeeds,
+/// and a malformed header is `400` rather than treated as absent.
+#[tokio::test]
+async fn credential_sub_routes_evaluate_the_consumer_tag() {
+    let dir = TempDir::new().expect("tempdir");
+    let db = make_store(&dir).await;
+    let (base, _shutdown) = start_admin(admin_state(db.clone(), JWT_SECRET)).await;
+    seed_rotating_consumer(&base, &[ENTRY_A]).await;
+    let stale = get(&base, ROTATING_PATH)
+        .await
+        .etag
+        .expect("consumer GET issues an ETag");
+    // Any change to the Consumer advances the tag, not only credential writes.
+    // The redaction placeholder keeps the stored entry across the whole PUT.
+    let edited = send(
+        Method::PUT,
+        &base,
+        ROTATING_PATH,
+        &admin_token(),
+        None,
+        Some(&json!({
+            "id": "rotating",
+            "username": "rotating",
+            "custom_id": "changed",
+            "credentials": {"keyauth": [{"key": "[REDACTED]"}]},
+        })),
+    )
+    .await;
+    assert_eq!(edited.status, 200, "{}", edited.body);
+    assert!(
+        stored_entries(db.as_ref()).await == [ENTRY_A],
+        "the metadata edit kept the stored entry"
+    );
+
+    let path = "/consumers/rotating/credentials/keyauth";
+    let cases = [
+        (Method::PUT, Some(json!([{"key": ENTRY_D}]))),
+        (Method::POST, Some(json!({"key": ENTRY_D}))),
+        (Method::DELETE, None),
+    ];
+    for (method, body) in &cases {
+        let refused = send(
+            method.clone(),
+            &base,
+            path,
+            &admin_token(),
+            Some(&stale),
+            body.as_ref(),
+        )
+        .await;
+        assert_eq!(refused.status, 412, "{method} stale: {}", refused.body);
+        let malformed = send(
+            method.clone(),
+            &base,
+            path,
+            &admin_token(),
+            Some("unquoted"),
+            body.as_ref(),
+        )
+        .await;
+        assert_eq!(
+            malformed.status, 400,
+            "{method} malformed: {}",
+            malformed.body
+        );
+        assert!(
+            stored_entries(db.as_ref()).await == [ENTRY_A],
+            "a refused {method} must not change the credentials"
+        );
+    }
+
+    let current = get(&base, ROTATING_PATH).await.etag.expect("tag");
+    let appended = send(
+        Method::POST,
+        &base,
+        path,
+        &admin_token(),
+        Some(&current),
+        Some(&json!({"key": ENTRY_B})),
+    )
+    .await;
+    assert_eq!(appended.status, 200, "current append: {}", appended.body);
+    let current = get(&base, ROTATING_PATH).await.etag.expect("tag");
+    let replaced = send(
+        Method::PUT,
+        &base,
+        path,
+        &admin_token(),
+        Some(&current),
+        Some(&json!([{"key": ENTRY_C}])),
+    )
+    .await;
+    assert_eq!(replaced.status, 200, "current replace: {}", replaced.body);
+    assert!(
+        stored_entries(db.as_ref()).await == [ENTRY_C],
+        "the conditioned replace stored its body"
+    );
+    let removed = send(Method::DELETE, &base, path, &admin_token(), Some("*"), None).await;
+    assert_eq!(removed.status, 204, "star delete: {}", removed.body);
+    assert!(stored_entries(db.as_ref()).await.is_empty());
+
+    // The role gate still answers before the header is parsed.
+    let operator = token_with_role(JWT_SECRET, "operator");
+    let gated = send(
+        Method::DELETE,
+        &base,
+        "/consumers/rotating/credentials/keyauth/0",
+        &operator,
+        Some("unquoted"),
+        None,
+    )
+    .await;
+    assert_eq!(gated.status, 403, "{}", gated.body);
+}
+
 #[tokio::test]
 async fn consumer_verification_is_complete_admin_only_and_uses_the_existing_tag() {
     let (_dir, base, _shutdown) = serve().await;

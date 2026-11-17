@@ -731,6 +731,23 @@ paths:
     delete:
       operationId: deleteAcmeCertificate
       summary: Delete an unreferenced ACME-issued TLS certificate
+      description: |
+        Returns `409 Conflict`, with the referencing resources in `used_by`,
+        while any configuration still names the record. The check covers this
+        node's environment and served configuration and, on a node with a
+        configuration store (database and CP modes), every namespace in that
+        store, because every gateway sharing the store reads the record
+        whatever namespace it serves; `used_by[].namespace` names the
+        namespace of a reference found in the store. If the store cannot be
+        read the delete is refused with `503` rather than guessed.
+        The scan pins the config store topology and holds the
+        namespace-registry lease and every namespace's config admission lease
+        until the record is removed, so no write in a scanned namespace commits
+        in between; the TLS store re-checks that fence before removing the
+        record and after persisting the removal (restoring the record if it
+        lapsed meanwhile), and answers `503` if it lapsed. A first write into a namespace
+        with no rows can still race the delete. See docs/admin_api.md
+        "Managed record deletion".
       tags: [TLS]
       parameters:
         - $ref: "#/components/parameters/ResourceId"
@@ -1218,6 +1235,23 @@ paths:
     delete:
       operationId: deleteManagedTlsCertificate
       summary: Delete an unreferenced admin-managed TLS certificate
+      description: |
+        Returns `409 Conflict`, with the referencing resources in `used_by`,
+        while any configuration still names the record. The check covers this
+        node's environment and served configuration and, on a node with a
+        configuration store (database and CP modes), every namespace in that
+        store, because every gateway sharing the store reads the record
+        whatever namespace it serves; `used_by[].namespace` names the
+        namespace of a reference found in the store. If the store cannot be
+        read the delete is refused with `503` rather than guessed.
+        The scan pins the config store topology and holds the
+        namespace-registry lease and every namespace's config admission lease
+        until the record is removed, so no write in a scanned namespace commits
+        in between; the TLS store re-checks that fence before removing the
+        record and after persisting the removal (restoring the record if it
+        lapsed meanwhile), and answers `503` if it lapsed. A first write into a namespace
+        with no rows can still race the delete. See docs/admin_api.md
+        "Managed record deletion".
       tags: [TLS]
       parameters:
         - $ref: "#/components/parameters/ResourceId"
@@ -1380,6 +1414,23 @@ paths:
     delete:
       operationId: deleteManagedTlsCaBundle
       summary: Delete an unreferenced admin-managed TLS CA bundle
+      description: |
+        Returns `409 Conflict`, with the referencing resources in `used_by`,
+        while any configuration still names the record. The check covers this
+        node's environment and served configuration and, on a node with a
+        configuration store (database and CP modes), every namespace in that
+        store, because every gateway sharing the store reads the record
+        whatever namespace it serves; `used_by[].namespace` names the
+        namespace of a reference found in the store. If the store cannot be
+        read the delete is refused with `503` rather than guessed.
+        The scan pins the config store topology and holds the
+        namespace-registry lease and every namespace's config admission lease
+        until the record is removed, so no write in a scanned namespace commits
+        in between; the TLS store re-checks that fence before removing the
+        record and after persisting the removal (restoring the record if it
+        lapsed meanwhile), and answers `503` if it lapsed. A first write into a namespace
+        with no rows can still race the delete. See docs/admin_api.md
+        "Managed record deletion".
       tags: [TLS]
       parameters:
         - $ref: "#/components/parameters/ResourceId"
@@ -1538,6 +1589,23 @@ paths:
     delete:
       operationId: deleteManagedTlsCrl
       summary: Delete an unreferenced admin-managed TLS CRL bundle
+      description: |
+        Returns `409 Conflict`, with the referencing resources in `used_by`,
+        while any configuration still names the record. The check covers this
+        node's environment and served configuration and, on a node with a
+        configuration store (database and CP modes), every namespace in that
+        store, because every gateway sharing the store reads the record
+        whatever namespace it serves; `used_by[].namespace` names the
+        namespace of a reference found in the store. If the store cannot be
+        read the delete is refused with `503` rather than guessed.
+        The scan pins the config store topology and holds the
+        namespace-registry lease and every namespace's config admission lease
+        until the record is removed, so no write in a scanned namespace commits
+        in between; the TLS store re-checks that fence before removing the
+        record and after persisting the removal (restoring the record if it
+        lapsed meanwhile), and answers `503` if it lapsed. A first write into a namespace
+        with no rows can still race the delete. See docs/admin_api.md
+        "Managed record deletion".
       tags: [TLS]
       parameters:
         - $ref: "#/components/parameters/ResourceId"
@@ -1696,6 +1764,23 @@ paths:
     delete:
       operationId: deleteManagedTlsOcspResponse
       summary: Delete an unreferenced admin-managed OCSP response
+      description: |
+        Returns `409 Conflict`, with the referencing resources in `used_by`,
+        while any configuration still names the record. The check covers this
+        node's environment and served configuration and, on a node with a
+        configuration store (database and CP modes), every namespace in that
+        store, because every gateway sharing the store reads the record
+        whatever namespace it serves; `used_by[].namespace` names the
+        namespace of a reference found in the store. If the store cannot be
+        read the delete is refused with `503` rather than guessed.
+        The scan pins the config store topology and holds the
+        namespace-registry lease and every namespace's config admission lease
+        until the record is removed, so no write in a scanned namespace commits
+        in between; the TLS store re-checks that fence before removing the
+        record and after persisting the removal (restoring the record if it
+        lapsed meanwhile), and answers `503` if it lapsed. A first write into a namespace
+        with no rows can still race the delete. See docs/admin_api.md
+        "Managed record deletion".
       tags: [TLS]
       parameters:
         - $ref: "#/components/parameters/ResourceId"
@@ -1864,11 +1949,25 @@ paths:
       operationId: deleteManagedTlsJwks
       summary: Delete an unreferenced admin-managed JWKS document
       description: |
-        Returns `409 Conflict` while an enabled `jwks_auth` or
-        `oidc_relying_party` config (or any other inventory reference) still
-        names the record. A record removed anyway (another node sharing the
-        store, or an out-of-band edit) withdraws every key from its consumers,
-        which then refuse tokens until it is restored.
+        Returns `409 Conflict`, with the referencing resources in `used_by`,
+        while an enabled `jwks_auth` or `oidc_relying_party` config (or any
+        other inventory reference) still names the record. The check covers
+        this node's environment and served configuration and, on a node with
+        a configuration store (database and CP modes), every namespace in that
+        store: a node serving one namespace still refuses to delete a record
+        another namespace's consumer reads. `used_by[].namespace` names the
+        namespace of a reference found in the store. If the store cannot be
+        read the delete is refused with `503`. A record removed anyway (an
+        out-of-band edit of the shared store) withdraws every key from its
+        consumers, which then refuse tokens until it is restored.
+        The scan pins the config store topology and holds the
+        namespace-registry lease and every namespace's config admission lease
+        until the record is removed, so no write in a scanned namespace commits
+        in between; the TLS store re-checks that fence before removing the
+        record and after persisting the removal (restoring the record if it
+        lapsed meanwhile), and answers `503` if it lapsed. A first write into a namespace
+        with no rows can still race the delete. See docs/admin_api.md
+        "Managed record deletion".
       tags: [TLS]
       parameters:
         - $ref: "#/components/parameters/ResourceId"
@@ -6547,6 +6646,7 @@ paths:
             Built-in credential type to replace. Matches runtime
             `ALLOWED_CREDENTIAL_TYPES`; any other path segment returns `400`.
         - $ref: "#/components/parameters/LiveApplyMode"
+        - $ref: "#/components/parameters/IfMatch"
       requestBody:
         required: true
         content:
@@ -6584,6 +6684,8 @@ paths:
           $ref: "#/components/responses/ReadOnly"
         "404":
           $ref: "#/components/responses/NotFound"
+        "412":
+          $ref: "#/components/responses/PreconditionFailed"
         "408":
           $ref: "#/components/responses/RequestTimeout"
         "409":
@@ -6617,6 +6719,7 @@ paths:
             Built-in credential type to append to. Matches runtime
             `ALLOWED_CREDENTIAL_TYPES`; any other path segment returns `400`.
         - $ref: "#/components/parameters/LiveApplyMode"
+        - $ref: "#/components/parameters/IfMatch"
       requestBody:
         required: true
         content:
@@ -6645,6 +6748,8 @@ paths:
           $ref: "#/components/responses/ReadOnly"
         "404":
           $ref: "#/components/responses/NotFound"
+        "412":
+          $ref: "#/components/responses/PreconditionFailed"
         "408":
           $ref: "#/components/responses/RequestTimeout"
         "409":
@@ -6684,6 +6789,7 @@ paths:
             `POST` on this path advertise only `BuiltInCredentialType`; this
             `DELETE` parameter stays the broader `CredentialTypeName`.
         - $ref: "#/components/parameters/LiveApplyMode"
+        - $ref: "#/components/parameters/IfMatch"
       responses:
         "202":
           $ref: "#/components/responses/AcceptedDeferred"
@@ -6702,6 +6808,8 @@ paths:
           $ref: "#/components/responses/ReadOnly"
         "404":
           $ref: "#/components/responses/NotFound"
+        "412":
+          $ref: "#/components/responses/PreconditionFailed"
         "409":
           $ref: "#/components/responses/Conflict"
         "503":
@@ -6737,9 +6845,22 @@ paths:
       description: |
         Removes a single credential entry at the given index. When the array
         becomes empty after removal, the credential type is removed.
+
+        The index is a position in the array as the caller last read it, and
+        every entry reads back redacted, so the index alone cannot identify a
+        credential once another writer has appended or removed one: the entry
+        now at that position would be removed instead. Send `If-Match` with the
+        Consumer's `ETag` from the `GET /consumers/{id}` the index was chosen
+        from. The tag is compared with the stored Consumer under the namespace
+        admission lease the removal commits under, so any change to the
+        Consumer since that read (including another credential write) is
+        refused with `412` and nothing is removed; re-read the Consumer and
+        choose the entry again. Omitting `If-Match` keeps the removal
+        unconditional.
       tags: [Consumers]
       parameters:
         - $ref: "#/components/parameters/LiveApplyMode"
+        - $ref: "#/components/parameters/IfMatch"
       responses:
         "202":
           $ref: "#/components/responses/AcceptedDeferred"
@@ -6762,6 +6883,8 @@ paths:
           $ref: "#/components/responses/ReadOnly"
         "404":
           $ref: "#/components/responses/NotFound"
+        "412":
+          $ref: "#/components/responses/PreconditionFailed"
         "409":
           $ref: "#/components/responses/Conflict"
         "503":
@@ -8215,10 +8338,22 @@ paths:
           X-Forwarded-*, MCP transport, Ferrum-internal), cookie / `content`
           / non-default-style / object parameters, and required non-JSON
           bodies are rejected with `400` naming the operation (exclude it to
-          proceed). An embedded `mcp_gateway` in `x-ferrum-plugins` is merged
-          over the generated config (the `openapi` server id is reserved).
-          Cannot be combined with `x-ferrum-validate` in one document, and
-          requires a literal-prefix `listen_path`.
+          proceed). The endpoint must sit under the literal `listen_path`
+          and reserves its whole subtree the way the running gateway claims
+          it (canonical request path, ASCII case-insensitively), so a
+          document with ANY operation path that can fall inside it, bridged
+          or not and under any effective server base (for example
+          `/MCP/status`, `/%6d%63p`, or `/{name}/status` beside `/mcp`; a
+          whole-segment `{name}` stands for any non-empty value, repeats of
+          one name share it, and an expression inside a segment may be
+          empty), is rejected with `400`; so is a document whose operations
+          times effective server bases exceed 65,536 paths or 16 MiB of path
+          text. An embedded `mcp_gateway` in `x-ferrum-plugins` is
+          merged over the generated config (the `openapi` server id is
+          reserved; its `endpoint` merges key by key and an `endpoint.path`
+          other than the generated one is rejected with `400`). Cannot be
+          combined with `x-ferrum-validate` in one document, and requires a
+          literal-prefix `listen_path`.
         - **`x-ferrum-external-refs`** (optional) — `true` or an object
           (`enabled`, optional `document_base`, optional `allowed_origins`)
           to opt this document into external / cross-document `$ref`
@@ -9003,10 +9138,18 @@ components:
         because all of them serialize on the namespace config admission lease
         the comparison runs under.
 
+        The `/consumers/{consumer_id}/credentials/{cred_type}` mutations
+        (`PUT`, `POST`, `DELETE`) and the indexed
+        `DELETE /consumers/{consumer_id}/credentials/{cred_type}/{index}`
+        rewrite the whole Consumer, so they take the Consumer's own `ETag`
+        from `GET /consumers/{id}`: any change to the Consumer since that read
+        refuses them with `412`.
+
         Omitting the header keeps the write unconditional. A malformed or
         empty header is `400`, never treated as absent. `If-Match` is only
         evaluated on `PUT`/`DELETE` of `/proxies/{id}`, `/upstreams/{id}`,
-        `/consumers/{id}`, and `/plugins/config/{id}`. `POST /restore` uses
+        `/consumers/{id}`, and `/plugins/config/{id}`, and on the consumer
+        credential mutations above. `POST /restore` uses
         the separate NamespaceIfMatch contract; any other `POST`,
         `PUT`, `PATCH`, or `DELETE` carrying it is refused with `400` rather
         than applied unconditionally. As RFC 9110 §13.2.1 requires, a request
@@ -41629,7 +41772,17 @@ components:
             The operation's PUBLIC request path on this proxy (listen path
             included), with `{name}` path parameters each occupying a whole
             segment. It is mapped onto the backend exactly as a direct request
-            to that path would be (strip_listen_path, backend_path). Path
+            to that path would be (strip_listen_path, backend_path). It must
+            sit under the matched proxy's listen path on a segment boundary
+            whether or not strip_listen_path is set; a call whose path does
+            not is refused with JSON-RPC -32603 and nothing is dispatched.
+            On an exact (`=`) or regex (`~`) route every bridged call is
+            refused the same way. It must not be able to fall inside
+            endpoint.path's reserved subtree (ASCII case-insensitive, like the
+            runtime claim; a `{name}` segment matches any endpoint segment,
+            and repeats of one name must match the same text);
+            load rejects it, and a substituted path inside the scope is
+            refused with JSON-RPC -32602 before dispatch. Path
             arguments are percent-encoded per segment and the result must be a
             canonical policy path, so an argument can never add `/`, a dot
             segment, `?`, or `#`.
@@ -41872,13 +42025,13 @@ components:
                         price_per_byte_sent:
                           type: number
                           exclusiveMinimum: 0
-                          maximum: 1.0e288
+                          maximum: 1.0e+288
                     - required: [price_per_byte_received]
                       properties:
                         price_per_byte_received:
                           type: number
                           exclusiveMinimum: 0
-                          maximum: 1.0e288
+                          maximum: 1.0e+288
             - required: [stream_connection_pricing]
               properties:
                 stream_connection_pricing:
@@ -41888,7 +42041,7 @@ components:
                     price_per_connection:
                       type: number
                       exclusiveMinimum: 0
-                      maximum: 1.0e288
+                      maximum: 1.0e+288
         # `schema` and `schema_ref` are mutually exclusive projections.
         - not:
             required: [schema, schema_ref]
@@ -41923,7 +42076,7 @@ components:
               price_per_call:
                 type: number
                 minimum: 0
-                maximum: 1.0e288
+                maximum: 1.0e+288
                 description: |
                   Charge per HTTP API call (e.g. 0.00001). Must be finite,
                   non-negative, and at most 1e288 so `u64` counter × price stays
@@ -41953,7 +42106,7 @@ components:
             price_per_byte_sent:
               type: number
               minimum: 0
-              maximum: 1.0e288
+              maximum: 1.0e+288
               default: 0.0
               description: |
                 Per-byte charge for bytes flowed client->backend. Finite,
@@ -41962,7 +42115,7 @@ components:
             price_per_byte_received:
               type: number
               minimum: 0
-              maximum: 1.0e288
+              maximum: 1.0e+288
               default: 0.0
               description: |
                 Per-byte charge for bytes flowed backend->client. Finite,
@@ -41981,7 +42134,7 @@ components:
             price_per_connection:
               type: number
               minimum: 0
-              maximum: 1.0e288
+              maximum: 1.0e+288
               description: |
                 Per-session charge applied at stream disconnect. Finite,
                 non-negative, at most 1e288 (same binary64 counter×price bound
@@ -42238,13 +42391,13 @@ components:
                         price_per_byte_sent:
                           type: number
                           exclusiveMinimum: 0
-                          maximum: 1.0e288
+                          maximum: 1.0e+288
                     - required: [price_per_byte_received]
                       properties:
                         price_per_byte_received:
                           type: number
                           exclusiveMinimum: 0
-                          maximum: 1.0e288
+                          maximum: 1.0e+288
             - required: [stream_connection_pricing]
               properties:
                 stream_connection_pricing:
@@ -42254,7 +42407,7 @@ components:
                     price_per_connection:
                       type: number
                       exclusiveMinimum: 0
-                      maximum: 1.0e288
+                      maximum: 1.0e+288
         - if:
             required: [mode]
             properties:
@@ -42455,7 +42608,7 @@ components:
               price_per_call:
                 type: number
                 minimum: 0
-                maximum: 1.0e288
+                maximum: 1.0e+288
                 description: |
                   Finite non-negative per-call price at most 1e288 (shared
                   chargeback binary64 counter×price bound).
@@ -42467,12 +42620,12 @@ components:
             price_per_byte_sent:
               type: number
               minimum: 0
-              maximum: 1.0e288
+              maximum: 1.0e+288
               default: 0.0
             price_per_byte_received:
               type: number
               minimum: 0
-              maximum: 1.0e288
+              maximum: 1.0e+288
               default: 0.0
           description: Optional per-byte pricing for client->backend and backend->client bytes. When this is the only pricing dimension, at least one rate must be strictly greater than zero (has_any_pricing).
         stream_connection_pricing:
@@ -42483,7 +42636,7 @@ components:
             price_per_connection:
               type: number
               minimum: 0
-              maximum: 1.0e288
+              maximum: 1.0e+288
           description: Optional flat per-session charge for TCP/TCP+TLS/UDP/DTLS disconnects. When this is the only pricing dimension, price_per_connection must be strictly greater than zero (has_any_pricing).
         clickhouse:
           type: object

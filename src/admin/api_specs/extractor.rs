@@ -716,10 +716,14 @@ pub fn extract_with_external_refs(
                     .to_string(),
             ));
         }
+        let endpoint_path = mcp_bridge_endpoint_path(&mcp_ext, listen_prefix)?;
         let operations = extract_mcp_bridge_operations(
             &root,
             &version,
-            listen_prefix,
+            McpBridgeRoute {
+                listen_prefix,
+                endpoint_scope: endpoint_path.trim_end_matches('/'),
+            },
             proxy.allowed_methods.as_deref(),
             &effective.document_base,
             &external_docs,
@@ -731,7 +735,7 @@ pub fn extract_with_external_refs(
             namespace,
             mcp_ext,
             operations,
-            listen_prefix,
+            endpoint_path,
         )?;
     }
 
@@ -1575,8 +1579,52 @@ fn mcp_tool_name_slug(text: &str) -> String {
     truncate_utf8(slug, MAX_MCP_BRIDGE_TOOL_NAME_BYTES)
 }
 
+/// Most (operation, effective server base) public paths one document may
+/// make the `x-ferrum-mcp` generator check against the MCP endpoint scope.
+/// Every operation is served under every effective base, so the check is a
+/// product; without a bound, a small document with many bases and many
+/// unselected operations would cost unbounded work (each path is checked and
+/// dropped, never retained).
+const MAX_MCP_ENDPOINT_OVERLAP_CHECKS: usize = 65_536;
+
+/// Total bytes of public paths the endpoint-scope overlap check may build for
+/// one document, for the same reason as [`MAX_MCP_ENDPOINT_OVERLAP_CHECKS`].
+const MAX_MCP_ENDPOINT_OVERLAP_BYTES: usize = 16 * 1024 * 1024;
+
+/// The generated gateway's `endpoint.path`: `x-ferrum-mcp.endpoint.path`, or
+/// the listen prefix + `/mcp`. The endpoint is served by this proxy, so it
+/// must sit under the proxy's literal listen prefix.
+fn mcp_bridge_endpoint_path(
+    extension: &McpBridgeExtension,
+    listen_prefix: &str,
+) -> Result<String, ExtractError> {
+    let endpoint_path = extension
+        .endpoint_path
+        .clone()
+        .unwrap_or_else(|| format!("{listen_prefix}/mcp"));
+    if !listen_prefix.is_empty()
+        && endpoint_path != listen_prefix
+        && !endpoint_path.starts_with(&format!("{listen_prefix}/"))
+    {
+        return Err(mcp_extension_error(
+            "`x-ferrum-mcp.endpoint.path` must be under the proxy's `listen_path`".to_string(),
+        ));
+    }
+    Ok(endpoint_path)
+}
+
+/// Where the generated gateway is served: the proxy's literal listen prefix
+/// (empty for none) and the MCP endpoint scope (`endpoint.path` without a
+/// trailing slash).
+#[derive(Clone, Copy)]
+struct McpBridgeRoute<'a> {
+    listen_prefix: &'a str,
+    endpoint_scope: &'a str,
+}
+
 /// Generate one `mcp_gateway` bridge operation per selected OpenAPI 3.x
-/// operation.
+/// operation, and refuse the document when the MCP endpoint scope can claim
+/// the public path of ANY of its operations, under any effective server base.
 ///
 /// `$ref`s are resolved with the SAME resolver, depth limit, and
 /// document-scoped expansion budget the `x-ferrum-validate` generator uses,
@@ -1584,12 +1632,16 @@ fn mcp_tool_name_slug(text: &str) -> String {
 fn extract_mcp_bridge_operations(
     root: &Value,
     version: &str,
-    listen_prefix: &str,
+    route: McpBridgeRoute<'_>,
     allowed_methods: Option<&[String]>,
     document_base: &Url,
     externals: &HashMap<String, LoadedExternalDocument>,
     extension: &McpBridgeExtension,
 ) -> Result<Vec<Value>, ExtractError> {
+    let McpBridgeRoute {
+        listen_prefix,
+        endpoint_scope,
+    } = route;
     if version == "2.0" {
         return Err(mcp_extension_error(
             "`x-ferrum-mcp` requires an OpenAPI 3.x document; Swagger 2.0 is not supported"
@@ -1607,6 +1659,8 @@ fn extract_mcp_bridge_operations(
     };
     let mut resolution_state = ResolutionState::new();
     let mut operations = Vec::new();
+    let mut overlap_checks = 0usize;
+    let mut overlap_bytes = 0usize;
     let mut tool_names = HashSet::new();
     for (path_template, path_item) in paths {
         let resolved_path_item = resolve_path_item(
@@ -1631,6 +1685,52 @@ fn extract_mcp_bridge_operations(
                 continue;
             };
             let location = format!("paths.{path_template}.{method}");
+            // Operation servers > Path Item servers > root servers, exactly
+            // as the validator resolves them. The first effective base is the
+            // one the bridge dispatches under. Borrowed, not cloned: this runs
+            // for every operation, and the inherited lists can be long.
+            let operation_bases =
+                openapi_server_bases(operation.get("servers"), &format!("{location}.servers"))?;
+            let effective_bases: &[String] = match operation_bases.as_deref() {
+                Some(bases) => bases,
+                None => path_item_bases
+                    .as_deref()
+                    .unwrap_or(root_server_bases.as_slice()),
+            };
+            let public_path_under = |base: &str| -> Result<String, ExtractError> {
+                let spec_path = join_server_base_and_path(base, path_template)?;
+                Ok(if !listen_prefix.is_empty() && spec_path == "/" {
+                    listen_prefix.to_string()
+                } else {
+                    format!("{listen_prefix}{spec_path}")
+                })
+            };
+            // Every operation of the document is served on this proxy under
+            // EVERY effective server base, so the MCP endpoint's reserved
+            // subtree must miss all of those paths, bridged or not (#7406).
+            // Each path is checked as it is built and never retained, inside
+            // a document-wide budget. The bridge itself dispatches under the
+            // first base only.
+            for base in effective_bases.iter().skip(1) {
+                let path = public_path_under(base)?;
+                check_mcp_endpoint_overlap(
+                    endpoint_scope,
+                    &path,
+                    &mut overlap_checks,
+                    &mut overlap_bytes,
+                )?;
+            }
+            let base = effective_bases
+                .first()
+                .map(String::as_str)
+                .unwrap_or(SERVER_BASE_ROOT);
+            let public_path = public_path_under(base)?;
+            check_mcp_endpoint_overlap(
+                endpoint_scope,
+                &public_path,
+                &mut overlap_checks,
+                &mut overlap_bytes,
+            )?;
             let operation_extension = parse_operation_mcp_extension(operation, &location)?;
             if !mcp_operation_selected(extension, operation, &operation_extension, method) {
                 continue;
@@ -1656,28 +1756,6 @@ fn extract_mcp_bridge_operations(
                     "`{location}` is selected as an MCP tool but its method is not in `x-ferrum-proxy.allowed_methods`; exclude the operation or allow the method"
                 )));
             }
-            // Operation servers > Path Item servers > root servers, exactly
-            // as the validator resolves them. The first effective base is the
-            // one the bridge dispatches under.
-            let effective_bases = match openapi_server_bases(
-                operation.get("servers"),
-                &format!("{location}.servers"),
-            )? {
-                Some(bases) => bases,
-                None => path_item_bases
-                    .clone()
-                    .unwrap_or_else(|| root_server_bases.clone()),
-            };
-            let base = effective_bases
-                .first()
-                .map(String::as_str)
-                .unwrap_or(SERVER_BASE_ROOT);
-            let spec_path = join_server_base_and_path(base, path_template)?;
-            let public_path = if !listen_prefix.is_empty() && spec_path == "/" {
-                listen_prefix.to_string()
-            } else {
-                format!("{listen_prefix}{spec_path}")
-            };
             let generated = generate_mcp_bridge_operation(
                 &resolver,
                 &mut resolution_state,
@@ -1712,6 +1790,32 @@ fn extract_mcp_bridge_operations(
         )));
     }
     Ok(operations)
+}
+
+/// Charge one public operation path to the document's overlap budget and
+/// refuse the document when the MCP endpoint scope can claim it. Shared
+/// with `mcp_gateway`'s own load check, so import, plugin admission, and the
+/// runtime claim agree.
+fn check_mcp_endpoint_overlap(
+    endpoint_scope: &str,
+    path: &str,
+    checks: &mut usize,
+    bytes: &mut usize,
+) -> Result<(), ExtractError> {
+    *checks = checks.saturating_add(1);
+    *bytes = bytes.saturating_add(path.len());
+    if *checks > MAX_MCP_ENDPOINT_OVERLAP_CHECKS || *bytes > MAX_MCP_ENDPOINT_OVERLAP_BYTES {
+        return Err(mcp_extension_error(format!(
+            "`x-ferrum-mcp` must check every operation path under every effective server base against the MCP endpoint, and this document exceeds that budget ({MAX_MCP_ENDPOINT_OVERLAP_CHECKS} paths or {MAX_MCP_ENDPOINT_OVERLAP_BYTES} bytes); reduce the operations or `servers` entries"
+        )));
+    }
+    if crate::plugins::mcp_gateway::path_template_may_enter_endpoint_scope(endpoint_scope, path) {
+        return Err(mcp_extension_error(
+            "`x-ferrum-mcp.endpoint.path` overlaps an operation path of this document (a literal match, or a path template expression that can spell it); the MCP endpoint reserves its whole path subtree ASCII case-insensitively, so move it to a path no operation can produce"
+                .to_string(),
+        ));
+    }
+    Ok(())
 }
 
 /// One selected operation, as the bridge generator reads it.
@@ -2080,7 +2184,7 @@ fn auto_inject_mcp_gateway(
     namespace: &str,
     extension: McpBridgeExtension,
     operations: Vec<Value>,
-    listen_prefix: &str,
+    endpoint_path: String,
 ) -> Result<(), ExtractError> {
     if operations.is_empty() {
         return Err(mcp_extension_error(
@@ -2088,30 +2192,8 @@ fn auto_inject_mcp_gateway(
                 .to_string(),
         ));
     }
-    let endpoint_path = extension
-        .endpoint_path
-        .unwrap_or_else(|| format!("{listen_prefix}/mcp"));
-    // The endpoint is served by this proxy, so it must sit under the proxy's
-    // literal listen prefix, and it reserves its whole subtree, so no bridged
-    // operation may live there.
-    if !listen_prefix.is_empty()
-        && endpoint_path != listen_prefix
-        && !endpoint_path.starts_with(&format!("{listen_prefix}/"))
-    {
-        return Err(mcp_extension_error(
-            "`x-ferrum-mcp.endpoint.path` must be under the proxy's `listen_path`".to_string(),
-        ));
-    }
-    let endpoint_scope = endpoint_path.trim_end_matches('/');
-    for operation in &operations {
-        let path = operation.get("path").and_then(Value::as_str).unwrap_or("");
-        if path == endpoint_scope || path.starts_with(&format!("{endpoint_scope}/")) {
-            return Err(mcp_extension_error(
-                "`x-ferrum-mcp.endpoint.path` overlaps a bridged operation path; the MCP endpoint reserves its whole path subtree"
-                    .to_string(),
-            ));
-        }
-    }
+    // `endpoint_path` was checked against the listen prefix and every
+    // operation path of the document while the operations were extracted.
 
     let mut bridge = extension.limits;
     if !extension.forward_request_headers.is_empty() {
@@ -2168,6 +2250,8 @@ fn auto_inject_mcp_gateway(
                     .to_string(),
             ));
         }
+        // The merge refuses an embedded `endpoint.path` that differs from
+        // the one validated above (GHSA-26x8-8jq5-f73p).
         let merged = merge_mcp_gateway_config(auto_config, &existing.config)?;
         validate_generated_config_budget("x-ferrum-mcp", "mcp_gateway", &merged)?;
         existing.config = merged;
@@ -2198,7 +2282,10 @@ fn auto_inject_mcp_gateway(
 ///
 /// Operator blocks replace the generated block of the same name, except
 /// `servers`, which is merged (the generated `openapi` server id is reserved),
-/// and `mode`, which must stay `aggregate_router`.
+/// `mode`, which must stay `aggregate_router`, and `endpoint`, which is merged
+/// key by key: its `path` was checked against the proxy's `listen_path` and
+/// every operation of the document, so an embedded `endpoint.path` must equal
+/// it (GHSA-26x8-8jq5-f73p); set `x-ferrum-mcp.endpoint.path` instead.
 fn merge_mcp_gateway_config(
     auto_config: Value,
     operator_config: &Value,
@@ -2219,6 +2306,29 @@ fn merge_mcp_gateway_config(
                         "the embedded `mcp_gateway` must use mode `aggregate_router` to serve `x-ferrum-mcp` tools"
                             .to_string(),
                     ));
+                }
+            }
+            "endpoint" => {
+                let Some(operator_endpoint) = value.as_object() else {
+                    return Err(mcp_extension_error(
+                        "the embedded `mcp_gateway` `endpoint` must be an object".to_string(),
+                    ));
+                };
+                let Some(Value::Object(endpoint)) = base.get_mut("endpoint") else {
+                    return Err(mcp_extension_error(
+                        "generated mcp_gateway config has no `endpoint` object".to_string(),
+                    ));
+                };
+                if let Some(path) = operator_endpoint.get("path")
+                    && endpoint.get("path") != Some(path)
+                {
+                    return Err(mcp_extension_error(
+                        "the embedded `mcp_gateway` may not set a different `endpoint.path`; set `x-ferrum-mcp.endpoint.path`, which is checked against the proxy's `listen_path` and the document's operation paths"
+                            .to_string(),
+                    ));
+                }
+                for (endpoint_key, endpoint_value) in operator_endpoint {
+                    endpoint.insert(endpoint_key.clone(), endpoint_value.clone());
                 }
             }
             "servers" => {

@@ -10783,6 +10783,36 @@ mod inner {
             self.load_mtls_dns_policy_candidate(namespace).await
         }
 
+        /// Proxies, upstreams and plugin configs only (issue #7394). The TLS
+        /// delete guard calls this while it holds the namespace's admission
+        /// lease, so no admin writer can change these rows between the three
+        /// reads and no snapshot transaction is needed.
+        async fn load_namespace_tls_reference_graph(
+            &self,
+            namespace: &str,
+        ) -> Result<GatewayConfig, anyhow::Error> {
+            let loaded_at = Utc::now();
+            let proxies = self
+                .load_full_proxies_opt_session(namespace, None, true)
+                .await?;
+            let plugin_configs = self
+                .load_full_plugin_configs_opt_session(namespace, None, true)
+                .await?;
+            let upstreams = self
+                .load_full_upstreams_opt_session(namespace, None, true)
+                .await?;
+            let mut config = GatewayConfig {
+                version: crate::config::types::CURRENT_CONFIG_VERSION.to_string(),
+                proxies,
+                plugin_configs,
+                upstreams,
+                loaded_at,
+                ..Default::default()
+            };
+            config.normalize_fields();
+            Ok(config)
+        }
+
         async fn load_namespace_policy_neighborhood(
             &self,
             namespace: &str,

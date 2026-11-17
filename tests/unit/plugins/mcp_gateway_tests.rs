@@ -16914,6 +16914,186 @@ async fn openapi_bridge_listen_prefix_equal_to_the_operation_path_maps_to_the_ba
     assert!(!ctx.route_override_path_is_absolute);
 }
 
+/// Call `pets.getPet` (operation path `operation_path`) through a gateway at
+/// `/petstore/mcp` on a proxy whose listen path is `/petstore`.
+async fn bridge_get_on_petstore_route(
+    operation_path: &str,
+    strip_listen_path: bool,
+    request_id: i64,
+) -> (PluginResult, ferrum_edge::plugins::RequestContext) {
+    bridge_get_on_route(
+        "/petstore",
+        "/petstore".len(),
+        operation_path,
+        strip_listen_path,
+        request_id,
+    )
+    .await
+}
+
+/// Call `pets.getPet` through a gateway at `/petstore/mcp` on a proxy with
+/// `listen_path`, whose router match left `strip_len` as the matched offset.
+async fn bridge_get_on_route(
+    listen_path: &str,
+    strip_len: usize,
+    operation_path: &str,
+    strip_listen_path: bool,
+    request_id: i64,
+) -> (PluginResult, ferrum_edge::plugins::RequestContext) {
+    let plugin = bridge_plugin_with(|config| {
+        config["endpoint"]["path"] = json!("/petstore/mcp");
+        bridge_operation(config, 0)["path"] = json!(operation_path);
+    });
+    let mut proxy = super::plugin_utils::create_test_proxy();
+    proxy.listen_path = Some(listen_path.to_string());
+    proxy.strip_listen_path = strip_listen_path;
+    let proxy = Arc::new(proxy);
+    let session = {
+        let (mut ctx, mut headers) = mcp_ctx(initialize_request_body());
+        ctx.path = "/petstore/mcp".to_string();
+        let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+        let (_, _, response_headers) = reject_json(result);
+        response_headers.get("mcp-session-id").unwrap().clone()
+    };
+    let request = bridge_tool_call(request_id, "pets.getPet", json!({ "petId": "7" }));
+    let (mut ctx, mut headers) = mcp_ctx(request);
+    ctx.path = "/petstore/mcp".to_string();
+    ctx.matched_proxy = Some(Arc::clone(&proxy));
+    ctx.set_matched_path_strip_len(strip_len);
+    headers.insert("mcp-session-id".to_string(), session);
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    (result, ctx)
+}
+
+#[tokio::test]
+async fn openapi_bridge_refuses_every_call_on_exact_and_regex_routes() {
+    // The router's matched offset is a listen PREFIX only on a literal-prefix
+    // route. An exact route serves only the endpoint itself, and a regex
+    // route is anchored to the whole request path, so neither can reach
+    // another public path: every bridged call is refused, whatever
+    // `strip_listen_path` says, rather than forwarded unchecked.
+    for listen_path in ["=/petstore/mcp", "~/petstore/.*"] {
+        for strip in [false, true] {
+            let (result, ctx) = bridge_get_on_route(
+                listen_path,
+                "/petstore/mcp".len(),
+                "/petstore/pets/{petId}",
+                strip,
+                99,
+            )
+            .await;
+            let (status, body, _) = reject_json(result);
+            assert_eq!(status, 200, "{listen_path} strip={strip}");
+            assert_eq!(body["error"]["code"], json!(-32603), "{body}");
+            assert!(ctx.route_override_path.is_none(), "{listen_path}");
+            assert!(!mcp_bridge_is_claimed_for_test(&ctx));
+        }
+    }
+}
+
+#[tokio::test]
+async fn openapi_bridge_refuses_paths_outside_the_listen_prefix_without_strip_listen_path() {
+    // GHSA-26x8-8jq5-f73p: a non-stripping proxy forwards the full public
+    // path, so the listen-prefix boundary must still be enforced; otherwise
+    // a bridged operation reaches backend paths no direct request to this
+    // route could.
+    for (strip, operation_path) in [
+        (false, "/internal/admin/{petId}"),
+        (false, "/petstorefront/{petId}"),
+        (true, "/internal/admin/{petId}"),
+        (true, "/petstorefront/{petId}"),
+    ] {
+        let (result, ctx) = bridge_get_on_petstore_route(operation_path, strip, 97).await;
+        let (status, body, _) = reject_json(result);
+        assert_eq!(status, 200, "{operation_path} strip={strip}");
+        assert_eq!(body["error"]["code"], json!(-32603), "{body}");
+        assert_eq!(
+            body["error"]["message"], "OpenAPI bridge operation path is outside this proxy's route",
+            "{body}"
+        );
+        assert!(ctx.route_override_path.is_none(), "{operation_path}");
+        assert!(backend_method_override_for_test(&ctx).is_none());
+        assert!(!mcp_bridge_is_claimed_for_test(&ctx));
+    }
+
+    // Inside the prefix a non-stripping proxy forwards the public path as is.
+    let (result, ctx) = bridge_get_on_petstore_route("/petstore/pets/{petId}", false, 98).await;
+    assert!(matches!(result, PluginResult::Continue), "{result:?}");
+    assert_eq!(ctx.route_override_path.as_deref(), Some("/petstore/pets/7"));
+    assert!(!ctx.route_override_path_is_absolute);
+}
+
+#[test]
+fn openapi_bridge_operations_inside_the_endpoint_scope_are_refused() {
+    // Issue #7406: the endpoint reserves its subtree ASCII
+    // case-insensitively, so an operation there is unreachable to direct
+    // clients of the same route.
+    // Operation 0 declares a `petId` path parameter; operation 1 none.
+    for (index, path) in [
+        (1, "/mcp"),
+        (1, "/MCP"),
+        (1, "/Mcp/status"),
+        (0, "/Mcp/pets/{petId}"),
+        (0, "/mcp/{petId}"),
+    ] {
+        let error = bridge_config_error(|config| {
+            bridge_operation(config, index)["path"] = json!(path);
+        });
+        assert!(
+            error.contains("inside the `endpoint.path` scope"),
+            "{path}: {error}"
+        );
+    }
+    for path in ["/mcpx/{petId}", "/mcp-tools/{petId}"] {
+        let mut config = bridge_config();
+        bridge_operation(&mut config, 0)["path"] = json!(path);
+        assert!(
+            create_plugin("mcp_gateway", &config).unwrap().is_some(),
+            "{path}"
+        );
+    }
+
+    // A whole-segment path parameter stands for any value, so it can spell
+    // the endpoint: `{"petId": "MCP"}` would reach `/MCP/status`, which a
+    // direct client of this route is refused with 404.
+    for (endpoint, path) in [
+        ("/mcp", "/{petId}/status"),
+        ("/mcp", "/{petId}"),
+        ("/api/mcp", "/api/{petId}/status"),
+        ("/api/mcp", "/{petId}/mcp"),
+        ("/api/mcp", "/api/{petId}"),
+        // Both repeats of one parameter carry the same value.
+        ("/one/one", "/{petId}/{petId}"),
+    ] {
+        let error = bridge_config_error(|config| {
+            config["endpoint"]["path"] = json!(endpoint);
+            bridge_operation(config, 0)["path"] = json!(path);
+        });
+        assert!(
+            error.contains("inside the `endpoint.path` scope"),
+            "{endpoint} {path}: {error}"
+        );
+    }
+    // A parameter path that is too short to reach the scope, or whose literal
+    // segments differ, is not inside it.
+    for (endpoint, path) in [
+        ("/mcp/v1", "/{petId}"),
+        ("/api/mcp", "/{petId}"),
+        ("/api/mcp", "/other/{petId}/status"),
+        // `/{petId}/{petId}` repeats ONE value, so it can never spell two
+        // different endpoint segments.
+        ("/one/two", "/{petId}/{petId}"),
+    ] {
+        let mut config = bridge_config();
+        config["endpoint"]["path"] = json!(endpoint);
+        bridge_operation(&mut config, 0)["path"] = json!(path);
+        assert!(
+            create_plugin("mcp_gateway", &config).unwrap().is_some(),
+            "{endpoint} {path}"
+        );
+    }
+}
+
 /// Admit one bridged `tools/call` like [`bridge_call`], after `prepare` has
 /// set up the request context and the client's request headers.
 async fn bridge_call_with(
