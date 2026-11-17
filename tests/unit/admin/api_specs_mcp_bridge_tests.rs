@@ -476,3 +476,78 @@ fn x_ferrum_mcp_forward_request_headers_reach_the_generated_bridge() {
     let error = extract_error(&spec(extension, pet_paths()));
     assert!(error.contains("forward_request_headers"), "{error}");
 }
+
+#[test]
+fn x_ferrum_mcp_embedded_gateway_cannot_move_the_validated_endpoint() {
+    // GHSA-26x8-8jq5-f73p: the generated `endpoint.path` was checked against
+    // the proxy's `listen_path` and the document's operations; an embedded
+    // `mcp_gateway` entry may not replace it with an unchecked path.
+    for override_path in ["/internal/mcp", "/pets-api/v1/pets", "/PETS-API/mcp"] {
+        let mut document = spec(json!({ "namespace": "pets" }), pet_paths());
+        document["x-ferrum-plugins"] = json!([{
+            "id": "pets-mcp",
+            "plugin_name": "mcp_gateway",
+            "config": {
+                "mode": "aggregate_router",
+                "endpoint": { "path": override_path }
+            }
+        }]);
+        let error = extract_error(&document);
+        assert!(
+            error.contains("may not set a different `endpoint.path`"),
+            "{override_path}: {error}"
+        );
+    }
+
+    let mut document = spec(json!({ "namespace": "pets" }), pet_paths());
+    document["x-ferrum-plugins"] = json!([{
+        "id": "pets-mcp",
+        "plugin_name": "mcp_gateway",
+        "config": { "mode": "aggregate_router", "endpoint": "/internal/mcp" }
+    }]);
+    let error = extract_error(&document);
+    assert!(error.contains("`endpoint` must be an object"), "{error}");
+
+    // Other endpoint keys still merge, and restating the validated path is
+    // harmless.
+    let mut document = spec(json!({ "namespace": "pets" }), pet_paths());
+    document["x-ferrum-plugins"] = json!([{
+        "id": "pets-mcp",
+        "plugin_name": "mcp_gateway",
+        "config": {
+            "mode": "aggregate_router",
+            "endpoint": { "path": "/pets-api/mcp", "protocol_versions": ["2025-11-25"] }
+        }
+    }]);
+    let plugins = extract_value(&document).unwrap();
+    let gateway = plugins
+        .iter()
+        .find(|plugin| plugin.plugin_name == "mcp_gateway")
+        .expect("merged gateway");
+    assert_eq!(gateway.config["endpoint"]["path"], "/pets-api/mcp");
+    assert_eq!(
+        gateway.config["endpoint"]["protocol_versions"],
+        json!(["2025-11-25"])
+    );
+    assert!(
+        create_plugin("mcp_gateway", &gateway.config)
+            .unwrap()
+            .is_some()
+    );
+
+    let mut document = spec(json!({ "namespace": "pets" }), pet_paths());
+    document["x-ferrum-plugins"] = json!([{
+        "id": "pets-mcp",
+        "plugin_name": "mcp_gateway",
+        "config": {
+            "mode": "aggregate_router",
+            "endpoint": { "protocol_versions": ["2025-11-25"] }
+        }
+    }]);
+    let plugins = extract_value(&document).unwrap();
+    let gateway = plugins
+        .iter()
+        .find(|plugin| plugin.plugin_name == "mcp_gateway")
+        .expect("merged gateway");
+    assert_eq!(gateway.config["endpoint"]["path"], "/pets-api/mcp");
+}

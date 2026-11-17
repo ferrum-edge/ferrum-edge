@@ -41607,7 +41607,12 @@ components:
             The operation's PUBLIC request path on this proxy (listen path
             included), with `{name}` path parameters each occupying a whole
             segment. It is mapped onto the backend exactly as a direct request
-            to that path would be (strip_listen_path, backend_path). Path
+            to that path would be (strip_listen_path, backend_path). It must
+            sit under the matched proxy's listen path on a segment boundary
+            whether or not strip_listen_path is set; a call whose path does
+            not is refused with JSON-RPC -32603 and nothing is dispatched.
+            It must not fall inside endpoint.path's reserved subtree (ASCII
+            case-insensitive, like the runtime claim); load rejects it. Path
             arguments are percent-encoded per segment and the result must be a
             canonical policy path, so an argument can never add `/`, a dot
             segment, `?`, or `#`.

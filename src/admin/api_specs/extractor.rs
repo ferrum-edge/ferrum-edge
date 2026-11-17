@@ -2168,6 +2168,8 @@ fn auto_inject_mcp_gateway(
                     .to_string(),
             ));
         }
+        // The merge refuses an embedded `endpoint.path` that differs from
+        // the one validated above (GHSA-26x8-8jq5-f73p).
         let merged = merge_mcp_gateway_config(auto_config, &existing.config)?;
         validate_generated_config_budget("x-ferrum-mcp", "mcp_gateway", &merged)?;
         existing.config = merged;
@@ -2198,7 +2200,10 @@ fn auto_inject_mcp_gateway(
 ///
 /// Operator blocks replace the generated block of the same name, except
 /// `servers`, which is merged (the generated `openapi` server id is reserved),
-/// and `mode`, which must stay `aggregate_router`.
+/// `mode`, which must stay `aggregate_router`, and `endpoint`, which is merged
+/// key by key: its `path` was checked against the proxy's `listen_path` and
+/// every operation of the document, so an embedded `endpoint.path` must equal
+/// it (GHSA-26x8-8jq5-f73p); set `x-ferrum-mcp.endpoint.path` instead.
 fn merge_mcp_gateway_config(
     auto_config: Value,
     operator_config: &Value,
@@ -2219,6 +2224,29 @@ fn merge_mcp_gateway_config(
                         "the embedded `mcp_gateway` must use mode `aggregate_router` to serve `x-ferrum-mcp` tools"
                             .to_string(),
                     ));
+                }
+            }
+            "endpoint" => {
+                let Some(operator_endpoint) = value.as_object() else {
+                    return Err(mcp_extension_error(
+                        "the embedded `mcp_gateway` `endpoint` must be an object".to_string(),
+                    ));
+                };
+                let Some(Value::Object(endpoint)) = base.get_mut("endpoint") else {
+                    return Err(mcp_extension_error(
+                        "generated mcp_gateway config has no `endpoint` object".to_string(),
+                    ));
+                };
+                if let Some(path) = operator_endpoint.get("path")
+                    && endpoint.get("path") != Some(path)
+                {
+                    return Err(mcp_extension_error(
+                        "the embedded `mcp_gateway` may not set a different `endpoint.path`; set `x-ferrum-mcp.endpoint.path`, which is checked against the proxy's `listen_path` and the document's operation paths"
+                            .to_string(),
+                    ));
+                }
+                for (endpoint_key, endpoint_value) in operator_endpoint {
+                    endpoint.insert(endpoint_key.clone(), endpoint_value.clone());
                 }
             }
             "servers" => {

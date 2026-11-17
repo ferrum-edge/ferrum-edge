@@ -11834,32 +11834,39 @@ fn bridge_method_is_allowed(allowed_methods: Option<&[String]>, method: &str) ->
 /// the proxy dispatches for a direct request to that same public path.
 ///
 /// The router matched this MCP request's own path, so its strip offset names
-/// the proxy's literal listen prefix. With `strip_listen_path` an operation
-/// path under that prefix loses it exactly as a direct request would, and the
-/// proxy then joins the remainder onto its `backend_path` as usual (a
-/// non-absolute route override). `None` when the operation path is not under
-/// the prefix: a direct request to it could never reach this proxy, so the
-/// bridge refuses rather than inventing a route.
+/// the proxy's listen prefix whether or not the proxy strips it. An operation
+/// path must sit under that prefix on a segment boundary: otherwise a direct
+/// request to it could never reach this proxy, so the bridge refuses (`None`)
+/// rather than inventing a route. That containment is decided BEFORE
+/// `strip_listen_path` is consulted (GHSA-26x8-8jq5-f73p): a non-stripping
+/// proxy forwards the full public path, so skipping the check there let an
+/// operation reach any backend path outside the route. With
+/// `strip_listen_path` the operation path then loses the prefix exactly as a
+/// direct request would, and the proxy joins the remainder onto its
+/// `backend_path` as usual (a non-absolute route override). A host-only route
+/// (offset 0) has no path boundary to enforce.
 fn bridge_backend_path(ctx: &RequestContext, public_path: &str) -> Option<String> {
     let strip_len = ctx.matched_path_strip_len();
-    let strips = strip_len > 0
-        && ctx
-            .matched_proxy
-            .as_deref()
-            .is_some_and(|proxy| proxy.strip_listen_path);
-    if !strips {
+    if strip_len == 0 {
         return Some(public_path.to_string());
     }
     let prefix = ctx.path.get(..strip_len)?;
     let rest = public_path.strip_prefix(prefix)?;
-    if rest.is_empty() {
+    if !(rest.is_empty() || rest.starts_with('/') || prefix.ends_with('/')) {
+        return None;
+    }
+    let strips = ctx
+        .matched_proxy
+        .as_deref()
+        .is_some_and(|proxy| proxy.strip_listen_path);
+    if !strips {
+        Some(public_path.to_string())
+    } else if rest.is_empty() {
         Some("/".to_string())
     } else if rest.starts_with('/') {
         Some(rest.to_string())
-    } else if prefix.ends_with('/') {
-        Some(format!("/{rest}"))
     } else {
-        None
+        Some(format!("/{rest}"))
     }
 }
 
