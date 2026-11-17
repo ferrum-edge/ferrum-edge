@@ -1493,10 +1493,19 @@ impl AiSemanticFirewall {
             );
         }
         let segments = if event_stream {
+            let streaming_inspection_requested = buffer_streaming_marker_set(ctx)
+                || windowed_streaming_marker_set(ctx)
+                || self.undeclared_stream_armed(ctx);
             // Each `data:` payload is folded from the LAST duplicate member
             // while a first-key-wins client reads the FIRST, so a
-            // duplicate-member event is uninspectable (GHSA-49cr-v28q-9hgp).
-            if std::str::from_utf8(body).is_ok_and(sse_data_payloads_are_ambiguous) {
+            // duplicate-member event leaves a stream this instance governs
+            // uninspectable (GHSA-49cr-v28q-9hgp). The same scope as the
+            // unparseable-payload refusal below: an event stream this instance
+            // does not govern (an unrelated EventSource route, or one
+            // `streaming_response: skip` opted out) keeps streaming untouched.
+            if (was_governed || streaming_inspection_requested)
+                && std::str::from_utf8(body).is_ok_and(sse_data_payloads_are_ambiguous)
+            {
                 self.set_response_hash(ctx, digest.into_hex());
                 return self.engine.handle_uninspectable_body(
                     ctx,
@@ -1506,9 +1515,6 @@ impl AiSemanticFirewall {
             }
             let (segments, fully_parsed) =
                 reassemble_sse_response_segments(body, &self.engine.extraction);
-            let streaming_inspection_requested = buffer_streaming_marker_set(ctx)
-                || windowed_streaming_marker_set(ctx)
-                || self.undeclared_stream_armed(ctx);
             if (!fully_parsed && (was_governed || streaming_inspection_requested))
                 || (segments.is_empty() && streaming_inspection_requested)
             {
