@@ -822,6 +822,9 @@ async fn test_registry_renders_k8s_controller_istio_status_counters() {
         .last_reconcile_duration_ms
         .store(14, Ordering::Relaxed);
     metrics.watch_idle_relists.store(15, Ordering::Relaxed);
+    metrics
+        .watch_evidence_refresh_relists
+        .store(22, Ordering::Relaxed);
     metrics.watch_deletes.store(17, Ordering::Relaxed);
     metrics.config_publications.store(18, Ordering::Relaxed);
     metrics.watch_errors.store(19, Ordering::Relaxed);
@@ -872,6 +875,10 @@ async fn test_registry_renders_k8s_controller_istio_status_counters() {
             "16",
         ),
         ("ferrum_k8s_controller_watch_idle_relists_total", "15"),
+        (
+            "ferrum_k8s_controller_watch_evidence_refresh_relists_total",
+            "22",
+        ),
         ("ferrum_k8s_controller_watch_deletes_total", "17"),
         ("ferrum_k8s_controller_config_publications_total", "18"),
         ("ferrum_k8s_controller_watch_errors_total", "19"),

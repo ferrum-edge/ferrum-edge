@@ -2723,7 +2723,19 @@ its surface and is refused. `WORKFLOW_DIRECTORY_JOB_GENERATION_TRANSITIONS` in
 `.github/scripts/verify_cross_build_policy.py` admits exact retired→adopted
 pairs for those jobs, keyed by the workflow filename AND the job name.
 
-The table is currently **empty**. Its retired entries:
+The table holds one entry, issue #7405's `gateways-protocol-benchmark.yml`
+`benchmark` pair
+(`70b612bb967eda2827bcc5708133a30c27508be6ffd581e82150d8be5bde3ec8` →
+`2e12a83bd3541987b20799a4bca524a336021790f38781c4ab5dee8bd65bbc67`). It
+matches the `skip_protocols`, `skip_payload_sizes` and `skip_gateways`
+dispatch inputs, and the competitor image pre-pull list, as whole
+space-delimited tokens with `case` instead of `grep -qw`. `grep -w` treats `-`
+as a word boundary, so skipping `udp-dtls` also skipped the `udp` leg. The
+job's Cross-sensitive command lines are unchanged. The workflow and the policy
+land in one admin-merged pull request, so the tuple is spent on arrival and is
+deleted by the next policy edit.
+
+Its retired entries:
 
 - PR #7400's `gateways-protocol-benchmark.yml` `benchmark` pair
   (`4c2b4900fec25e45a2af4330dfe66d3ac4ce530f445f061d642de460561c3008` →

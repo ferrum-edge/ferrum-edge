@@ -30,6 +30,8 @@ on:
       - comparison/scripts/**
       - comparison/configs/**
       - .github/workflows/benchmark-harness-tests.yml
+      # test_dispatch_skip_inputs.py executes this workflow's step scripts.
+      - .github/workflows/gateways-protocol-benchmark.yml
   push:
     branches: [main]
     paths:
@@ -38,6 +40,8 @@ on:
       - comparison/scripts/**
       - comparison/configs/**
       - .github/workflows/benchmark-harness-tests.yml
+      # test_dispatch_skip_inputs.py executes this workflow's step scripts.
+      - .github/workflows/gateways-protocol-benchmark.yml
   workflow_dispatch:
 
 permissions:
