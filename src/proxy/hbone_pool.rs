@@ -3219,6 +3219,9 @@ pub struct H2WsConnectTunnel {
     /// proxy that offered the extension forwards only its `permessage-deflate`
     /// part, and a `terminate` proxy validates all of it.
     pub backend_extensions: Option<http::HeaderValue>,
+    /// The peer's end-to-end `200` response headers, collected with the
+    /// backend-response strip (issue #7391).
+    pub backend_response_headers: std::collections::HashMap<String, String>,
 }
 
 /// Open one HTTP/2 **Extended** CONNECT stream (RFC 8441 — `:method=CONNECT`
@@ -3397,6 +3400,8 @@ pub(crate) async fn open_h2_ws_connect_stream(
         .get(http::header::SEC_WEBSOCKET_PROTOCOL)
         .cloned();
     let backend_extensions = super::backend_extensions_answer(response.headers());
+    let mut backend_response_headers = std::collections::HashMap::new();
+    super::collect_hyper_response_headers(response.headers(), &mut backend_response_headers);
     Ok(H2WsConnectTunnel {
         tunnel: H2ConnectTunnel {
             recv_stream: response.into_body(),
@@ -3413,6 +3418,7 @@ pub(crate) async fn open_h2_ws_connect_stream(
         },
         negotiated_subprotocol,
         backend_extensions,
+        backend_response_headers,
     })
 }
 

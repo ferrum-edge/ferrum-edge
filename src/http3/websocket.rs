@@ -1641,7 +1641,11 @@ pub(crate) async fn handle_h3_websocket(
     // No Upgrade / Connection / Sec-WebSocket-Accept headers (those
     // are HTTP/1.1 only). The QUIC stream becomes the WebSocket
     // transport as soon as the client sees the 200.
-    let mut response_headers = HashMap::new();
+    // Seed the client handshake response from the backend's own end-to-end
+    // handshake headers (issue #7391), as on H1/H2, then let response policy
+    // govern them.
+    let mut backend_handshake = backend_handshake;
+    let mut response_headers = backend_handshake.take_backend_response_headers();
     crate::proxy::finalize_successful_websocket_response_headers(
         &plugins,
         &ctx,

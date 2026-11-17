@@ -18116,7 +18116,11 @@ async fn handle_websocket_request_authenticated(
     } else {
         StatusCode::SWITCHING_PROTOCOLS
     };
-    let mut response_headers = HashMap::new();
+    // Seed the client handshake response from the backend's own end-to-end
+    // handshake headers (issue #7391: a backend `Set-Cookie` on its `101` must
+    // reach the client), then let response policy govern them.
+    let mut backend_handshake = backend_handshake;
+    let mut response_headers = backend_handshake.take_backend_response_headers();
     finalize_successful_websocket_response_headers(
         &plugins,
         &ctx,
@@ -19554,6 +19558,7 @@ pub(crate) struct BackendWsHandshake {
     pub stream: BackendWsStream,
     pub negotiated_subprotocol: Option<hyper::header::HeaderValue>,
     pub backend_extensions: Option<hyper::header::HeaderValue>,
+    pub backend_response_headers: HashMap<String, String>,
 }
 
 /// Backend WebSocket transport for a mesh egress session: the raw WebSocket
@@ -19568,6 +19573,10 @@ pub(crate) struct MeshBackendWsHandshake {
     pub stream: MeshBackendWsStream,
     pub negotiated_subprotocol: Option<hyper::header::HeaderValue>,
     pub backend_extensions: Option<hyper::header::HeaderValue>,
+    /// The backend's end-to-end handshake response headers (issue #7391),
+    /// collected with the backend-response strip. See
+    /// [`WsBackendHandshake::take_backend_response_headers`].
+    pub backend_response_headers: HashMap<String, String>,
 }
 
 /// Backend WebSocket transport for a sidecar-ingress Unix-domain backend
@@ -19584,6 +19593,7 @@ pub(crate) struct UnixBackendWsHandshake {
     pub stream: UnixBackendWsStream,
     pub negotiated_subprotocol: Option<hyper::header::HeaderValue>,
     pub backend_extensions: Option<hyper::header::HeaderValue>,
+    pub backend_response_headers: HashMap<String, String>,
     conn_lease: unix_backend_pool::UnixWebSocketConnLease,
 }
 
@@ -19639,6 +19649,24 @@ impl WsBackendHandshake {
     pub(crate) fn negotiated_permessage_deflate(&self) -> Option<hyper::header::HeaderValue> {
         self.backend_extensions()
             .and_then(permessage_deflate_answer_from)
+    }
+
+    /// Move out the backend's end-to-end handshake response headers (issue
+    /// #7391): its `101` headers for an H1 upgrade (direct, Unix socket, or
+    /// the inner HBONE handshake), or the peer's Extended CONNECT `200`
+    /// headers for a Sidecar mesh-mTLS tunnel. They were collected with the
+    /// backend-response strip (hop-by-hop, `Connection`-listed, gateway-owned
+    /// diagnostic names). The successful handshake response is seeded from
+    /// them BEFORE response policy runs, so policy plugins govern them like
+    /// any HTTP response header, and the WebSocket transport strip still
+    /// removes `Upgrade` / `Connection` / `Sec-WebSocket-*` / `Content-Length`.
+    pub(crate) fn take_backend_response_headers(&mut self) -> HashMap<String, String> {
+        match self {
+            Self::Direct(handshake) => std::mem::take(&mut handshake.backend_response_headers),
+            Self::Mesh(handshake) => std::mem::take(&mut handshake.backend_response_headers),
+            #[cfg(unix)]
+            Self::Unix(handshake) => std::mem::take(&mut handshake.backend_response_headers),
+        }
     }
 }
 
@@ -19877,11 +19905,14 @@ pub(crate) async fn connect_websocket_backend(
         .get(hyper::header::SEC_WEBSOCKET_PROTOCOL)
         .cloned();
     let backend_extensions = backend_extensions_answer(backend_response.headers());
+    let mut backend_response_headers = HashMap::new();
+    collect_hyper_response_headers(backend_response.headers(), &mut backend_response_headers);
 
     Ok(BackendWsHandshake {
         stream: backend_ws_stream,
         negotiated_subprotocol,
         backend_extensions,
+        backend_response_headers,
     })
 }
 
@@ -20048,11 +20079,14 @@ async fn connect_unix_websocket_backend(
         .get(hyper::header::SEC_WEBSOCKET_PROTOCOL)
         .cloned();
     let backend_extensions = backend_extensions_answer(response.headers());
+    let mut backend_response_headers = HashMap::new();
+    collect_hyper_response_headers(response.headers(), &mut backend_response_headers);
 
     Ok(UnixBackendWsHandshake {
         stream,
         negotiated_subprotocol,
         backend_extensions,
+        backend_response_headers,
         conn_lease,
     })
 }
@@ -20388,6 +20422,7 @@ pub(crate) async fn connect_mesh_websocket_backend(
                 stream,
                 negotiated_subprotocol: ws_tunnel.negotiated_subprotocol,
                 backend_extensions: ws_tunnel.backend_extensions,
+                backend_response_headers: ws_tunnel.backend_response_headers,
             })
         }
         MeshWsEgress::AmbientHbone => {
@@ -20609,11 +20644,14 @@ pub(crate) async fn connect_mesh_websocket_backend(
                 .get(hyper::header::SEC_WEBSOCKET_PROTOCOL)
                 .cloned();
             let backend_extensions = backend_extensions_answer(response.headers());
+            let mut backend_response_headers = HashMap::new();
+            collect_hyper_response_headers(response.headers(), &mut backend_response_headers);
 
             Ok(MeshBackendWsHandshake {
                 stream,
                 negotiated_subprotocol,
                 backend_extensions,
+                backend_response_headers,
             })
         }
     }
