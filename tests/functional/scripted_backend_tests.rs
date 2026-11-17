@@ -3749,13 +3749,13 @@ async fn diagnostic_refs_all_mode_marks_grpc_web_rejections_on_every_protocol() 
             phase: "allowed_methods",
             plugin: None,
         },
-        // HTTP/1.1 and HTTP/2 classify a gRPC-Web request as gRPC before the
-        // non-`POST` gate; HTTP/3 applies that gate to native gRPC only.
+        // Every frontend classifies a gRPC-Web request as gRPC before the
+        // non-`POST` gate.
         ExpectedRejection {
             method: http::Method::GET,
             path: "/grpcweb/diag.Echo/Call",
             content_types: &[GRPC_WEB_BINARY, GRPC_WEB_TEXT],
-            protocols: &["http1", "http2"],
+            protocols: ALL_PROTOCOLS,
             grpc_status: Some(3),
             proxy_id: Some("diag-grpc-web"),
             source: "gateway",

@@ -37719,8 +37719,6 @@ async fn handle_proxy_request_inner(
     // gRPC spec mandates POST method. Reject non-POST gRPC requests with a proper
     // gRPC trailers-only error rather than forwarding an invalid request to the backend.
     if is_grpc_request && method != "POST" {
-        ctx.terminal_record.mark_counted();
-        state.request_count.fetch_add(1, Ordering::Relaxed);
         warn!(method = %method, path = %path, "Rejected gRPC request: method must be POST");
         let mut reject = normalize_reject_response(
             StatusCode::BAD_REQUEST,
@@ -37752,7 +37750,11 @@ async fn handle_proxy_request_inner(
             0,
         )
         .await;
-        record_status(&state, reject.http_status.as_u16());
+        // Counted after the log, like every other terminal: a client abort
+        // during that log is settled by the client-abort scope (issue #6768),
+        // which counts an uncounted request with the status it carried.
+        ctx.terminal_record.mark_counted();
+        record_request(&state, wire_status);
         if let Some(response) = grpc_web_response {
             return Ok(response);
         }

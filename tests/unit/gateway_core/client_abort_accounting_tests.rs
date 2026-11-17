@@ -1198,6 +1198,46 @@ fn vendored_h2_exposes_the_reset_origin_hyper_patch_006_reads() {
     let _ = accessor;
 }
 
+/// Issue #7407 review (sol F1): the H1/H2 gRPC non-`POST` refusal awaits its
+/// transaction log, so it must count the request only after that log, in one
+/// `record_request` with the status it sends. Counting first and recording the
+/// status after the await left a request a client abort dropped mid-log
+/// counted but without any status: the client-abort scope skips a request
+/// already marked counted.
+#[test]
+fn h1_h2_grpc_post_refusal_counts_after_its_log() {
+    let source = include_str!("../../../src/proxy/mod.rs");
+    let gate = source
+        .split("if is_grpc_request && method != \"POST\" {")
+        .nth(1)
+        .expect("H1/H2 gRPC non-POST gate")
+        .split("return Ok(build_response_from_normalized_reject(reject));")
+        .next()
+        .expect("bounded gRPC non-POST gate");
+    let log = gate
+        .find("log_pre_backend_rejected_request(")
+        .expect("the refusal is logged through the rejection funnel");
+    assert!(gate[log..].contains("crate::diagnostic_ref::GRPC_POST_REQUIRED_PHASE"));
+    let mark = gate
+        .find("ctx.terminal_record.mark_counted();")
+        .expect("the refusal marks its terminal counted");
+    let record = gate
+        .find("record_request(&state, wire_status);")
+        .expect("the refusal records its request and wire status together");
+    assert!(
+        log < mark,
+        "mark the terminal counted only after the awaited log"
+    );
+    assert!(
+        mark < record,
+        "record the request right after marking it counted"
+    );
+    assert!(
+        !gate.contains("request_count.fetch_add") && !gate.contains("record_status("),
+        "no split request/status increments around the awaited log"
+    );
+}
+
 /// Issue #7156: the H1/H2 "Invalid backend path coordinates" 500s (three in
 /// `handle_proxy_request_inner`, one in the WebSocket upgrade handler) and the
 /// WebSocket missing-`OnUpgrade` 500 mark the terminal counted and record the
