@@ -1083,7 +1083,8 @@ pub fn withhold_tls_material_with(
 /// `not: {match: {header: {name: x-skip-waf, value: {exact: [<shared value>]}}}}`.
 /// The other leaf predicates (`method`, `path`, `host`, `sni`, `protocol`,
 /// `source_cidr`, `namespace`, `proxy_id`, `listen_port`, `consumer`,
-/// `external_identity`, `auth_method`, `spiffe_id`) compare routing facts or authenticated identity
+/// `external_identity`, `external_identity_authority`, `auth_method`,
+/// `spiffe_id`) compare routing facts or authenticated identity
 /// that a client cannot simply assert, and stay visible.
 pub const TRIGGER_CLIENT_FIELD_PREDICATES: &[&str] = &["header", "query", "cookie"];
 
@@ -1102,6 +1103,7 @@ const TRIGGER_VISIBLE_PREDICATES: &[&str] = &[
     "listen_port",
     "consumer",
     "external_identity",
+    "external_identity_authority",
     "auth_method",
     "spiffe_id",
 ];

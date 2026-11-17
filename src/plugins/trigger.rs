@@ -23,7 +23,7 @@
 //! # Phase safety
 //!
 //! A trigger that reads authenticated identity (`consumer`, `external_identity`,
-//! `auth_method`, `spiffe_id`) is not authoritative before the authentication boundary. Such a
+//! `external_identity_authority`, `auth_method`, `spiffe_id`) is not authoritative before the authentication boundary. Such a
 //! trigger simply **does not gate** hooks at or before `authenticate`
 //! ([`TriggerPhase::PreAuth`]): the instance runs, and no decision is memoized,
 //! so the first `authorize`-or-later hook makes the real decision. Failing
@@ -521,6 +521,15 @@ impl TriggerFacts for HttpTriggerFacts<'_> {
         principal::external_identity(self.ctx)
     }
 
+    /// The private realm the authentication boundary committed with the
+    /// external identity, never anything a plugin or client can write.
+    fn external_identity_authority(&self) -> Option<[u8; 32]> {
+        principal::external_identity(self.ctx)?;
+        self.ctx
+            .authenticated_identity_realm()
+            .and_then(|realm| realm.authority().copied())
+    }
+
     fn auth_method(&self) -> Option<&str> {
         self.ctx.auth_method
     }
@@ -768,6 +777,11 @@ impl TriggerFacts for StreamTriggerFacts<'_> {
 
     fn external_identity(&self) -> Option<&str> {
         principal::stream_external_identity(self.ctx)
+    }
+
+    /// Always `None`: a stream connection carries no committed realm.
+    fn external_identity_authority(&self) -> Option<[u8; 32]> {
+        None
     }
 
     fn auth_method(&self) -> Option<&str> {

@@ -3573,6 +3573,29 @@ fn principal_keys_separate_consumers_external_identities_and_realms() {
     assert_ne!(consumer_key, jwks_key);
     assert_ne!(jwks_key, ldap_key);
 
+    // Two providers of one mechanism (one multi-issuer `jwks_auth`) stay apart.
+    let mut issuer_a = create_test_context();
+    super::plugin_utils::commit_external_identity_with_authority(
+        &mut issuer_a,
+        "alice",
+        "jwks_auth",
+        Some([0x11; 32]),
+    );
+    let mut issuer_b = create_test_context();
+    super::plugin_utils::commit_external_identity_with_authority(
+        &mut issuer_b,
+        "alice",
+        "jwks_auth",
+        Some([0x22; 32]),
+    );
+    let key_a = Principal::of_request(&issuer_a).expect("issuer a").key();
+    let key_b = Principal::of_request(&issuer_b).expect("issuer b").key();
+    assert_eq!(
+        key_a,
+        format!("external:jwks_auth:{}:alice", "11".repeat(32))
+    );
+    assert_ne!(key_a, key_b);
+
     // An unmapped identity without a committed realm is still never a
     // Consumer key.
     let mut bare = create_test_context();

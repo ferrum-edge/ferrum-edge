@@ -1372,7 +1372,8 @@ Available `match` predicates:
 | `namespace` / `proxy_id` | matched proxy identity | list is an OR |
 | `listen_port` | accepting frontend port | list is an OR |
 | `consumer` | mapped gateway Consumer username only (never an unmapped external identity that spells the same string) | **post-authentication only**; never gates a stream connection; refused on auth and stream-only plugins |
-| `external_identity` | unmapped external identity, only when no Consumer is mapped (combine with `auth_method` under `all` to scope it to one mechanism) | same as `consumer` |
+| `external_identity` | unmapped external identity, only when no Consumer is mapped (combine with `external_identity_authority` under `all` to scope it to one verifying authority) | same as `consumer` |
+| `external_identity_authority` | committed verifying-authority digest of the external identity (64 hex characters; `opa`'s `input.consumer.realm.authority`), so two providers of one mechanism are told apart | same as `consumer` |
 | `auth_method` | successful mechanism name | **post-authentication only**; never gates a stream connection; refused on auth and stream-only plugins |
 | `spiffe_id` | peer SPIFFE ID | **post-authentication only**; no authoritative stream fact, so it never gates a stream connection; refused on auth and stream-only plugins |
 
@@ -1453,7 +1454,7 @@ phase of that instance reuses it. This is what makes a skip *symmetric*: a
 from "skipped its request hooks" to "runs its response hooks", which would leave
 half-initialized plugin state behind.
 
-Identity predicates (`consumer`, `external_identity`, `auth_method`, `spiffe_id`) are not
+Identity predicates (`consumer`, `external_identity`, `external_identity_authority`, `auth_method`, `spiffe_id`) are not
 authoritative before the authentication boundary. A trigger that uses them
 therefore **does not gate** hooks at or before `authenticate` — the instance runs
 and no decision is memoized, so the first `authorize`-or-later hook makes the
@@ -1616,7 +1617,7 @@ a trigger, so a skipped instance would still see the override applied while its
 request-conditional trailer policy stood down; such a trigger is refused.
 
 An **authentication** plugin may not carry an identity predicate: `authenticate`
-is the phase that establishes `consumer` / `external_identity` / `auth_method` / `spiffe_id`, so such a
+is the phase that establishes `consumer` / `external_identity` / `external_identity_authority` / `auth_method` / `spiffe_id`, so such a
 trigger could only read another mechanism's committed identity and would make the
 effective auth chain order-dependent. That composition is rejected at
 publication, as is an identity predicate on a **stream-only** plugin (see

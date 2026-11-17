@@ -30,6 +30,7 @@ struct Facts {
     listen_port: Option<u16>,
     consumer: Option<String>,
     external_identity: Option<String>,
+    external_identity_authority: Option<[u8; 32]>,
     auth_method: Option<String>,
     spiffe_id: Option<String>,
     headers: Vec<(String, String)>,
@@ -119,6 +120,9 @@ impl TriggerFacts for Facts {
     }
     fn external_identity(&self) -> Option<&str> {
         self.external_identity.as_deref()
+    }
+    fn external_identity_authority(&self) -> Option<[u8; 32]> {
+        self.external_identity_authority
     }
     fn auth_method(&self) -> Option<&str> {
         self.auth_method.as_deref()
@@ -929,4 +933,41 @@ fn external_identity_predicate_reads_only_the_external_identity() {
 
     facts.auth_method = Some("ldap_auth".to_string());
     assert!(!trigger.evaluate(&facts));
+}
+
+/// `external_identity_authority` compares the committed realm digest, so two
+/// authorities of one mechanism are told apart; a principal with no authority
+/// never matches, and malformed digests are refused without being echoed.
+#[test]
+fn external_identity_authority_predicate_compares_the_committed_digest() {
+    let trusted = [0xab_u8; 32];
+    let trigger = compile(serde_json::json!({
+        "when": {"match": {"external_identity_authority": [hex::encode_upper(trusted)]}}
+    }));
+    assert!(trigger.reads_authenticated_identity());
+    let mut facts = Facts::http();
+    facts.external_identity = Some("alice".to_string());
+    assert!(
+        !trigger.evaluate(&facts),
+        "no committed authority never matches"
+    );
+    facts.external_identity_authority = Some([0xcd; 32]);
+    assert!(!trigger.evaluate(&facts));
+    facts.external_identity_authority = Some(trusted);
+    assert!(trigger.evaluate(&facts));
+
+    for bad in [
+        serde_json::json!([]),
+        serde_json::json!(["abcd"]),
+        serde_json::json!(["zz".repeat(32)]),
+    ] {
+        let error = compile_error(serde_json::json!({
+            "when": {"match": {"external_identity_authority": bad}}
+        }));
+        assert!(error.contains("external_identity_authority"), "{error}");
+        assert!(
+            !error.contains("zzzz"),
+            "the entry must not be echoed: {error}"
+        );
+    }
 }

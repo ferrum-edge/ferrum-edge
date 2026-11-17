@@ -12909,10 +12909,30 @@ components:
             Unmapped external identity (a `jwks_auth`, `oidc_relying_party`,
             `oauth2_introspection`, `ldap_auth`, or `soap_ws_security`
             principal), present only when no gateway Consumer is mapped. Combine
-            it with `auth_method` under `all` to scope it to one mechanism.
+            it with `external_identity_authority` (or, for a single-authority
+            mechanism, `auth_method`) under `all` to scope it to one verifying
+            authority.
             Post-authentication only, with the same stream limitation and the
             same refusals as `consumer`.
           $ref: "#/components/schemas/PluginTriggerIdentityMatch"
+        external_identity_authority:
+          type: array
+          minItems: 1
+          maxItems: 64
+          description: >-
+            Verifying authority of the unmapped external identity: the opaque
+            64-character hex realm digest committed with it at the
+            authentication boundary (the value `opa` exposes as
+            `input.consumer.realm.authority`). Two providers of one mechanism
+            have different digests, so combining this with
+            `external_identity` keeps an equal subject from another authority
+            out of an exemption. The list is an OR, comparison is
+            case-insensitive, and a principal without a committed authority
+            never matches. Post-authentication only, with the same stream
+            limitation and the same refusals as `consumer`.
+          items:
+            type: string
+            pattern: "^[0-9A-Fa-f]{64}$"
         auth_method:
           type: array
           minItems: 1

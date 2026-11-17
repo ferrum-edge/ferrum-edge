@@ -2162,3 +2162,51 @@ async fn consumer_and_external_identity_predicates_never_cross_namespaces() {
     assert!(stamped(&external_gated, with_external()).await);
     assert!(!stamped(&external_gated, with_consumer()).await);
 }
+
+/// sol F1 (GHSA-rxwj-x6c6-f4j5): one `jwks_auth` instance can accept several
+/// providers, which commit the same mechanism with different authority
+/// digests. An exemption written with `external_identity` and
+/// `external_identity_authority` is not claimed by an equal subject that a
+/// different provider of the same mechanism verified.
+#[tokio::test]
+async fn an_external_identity_exemption_is_bound_to_its_verifying_authority() {
+    let corporate = [0x11_u8; 32];
+    let public = [0x22_u8; 32];
+    let plugins = published(
+        &config(
+            vec![make_proxy("api", "/api", vec!["stamp"])],
+            vec![with_trigger(
+                header_stamper("stamp", PluginScope::Proxy, Some("api"), "x-stamp"),
+                json!({"when": {"not": {"all": [
+                    {"match": {"external_identity": {"value": {"exact": ["security-scanner"]}}}},
+                    {"match": {"external_identity_authority": [hex::encode(corporate)]}}
+                ]}}}),
+            )],
+        ),
+        "api",
+    );
+
+    async fn stamped(plugins: &[Arc<dyn Plugin>], authority: [u8; 32]) -> bool {
+        let mut ctx = request("GET", "/api");
+        super::plugin_utils::commit_external_identity_with_authority(
+            &mut ctx,
+            "security-scanner",
+            "jwks_auth",
+            Some(authority),
+        );
+        let mut headers = HashMap::new();
+        for plugin in plugins {
+            plugin.before_proxy(&mut ctx, &mut headers).await;
+        }
+        headers.contains_key("x-stamp")
+    }
+
+    assert!(
+        !stamped(&plugins, corporate).await,
+        "the corporate provider's scanner is exempt"
+    );
+    assert!(
+        stamped(&plugins, public).await,
+        "the same subject and mechanism from another provider must not be exempt"
+    );
+}

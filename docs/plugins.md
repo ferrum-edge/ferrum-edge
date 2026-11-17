@@ -262,7 +262,7 @@ cookie jar, so the field is named in the error instead of being reinterpreted as
 empty — fixed core request/response body ceilings, contextless
 response-trailer ownership, and a response route-header finalizer (the rules-free
 `response_transformer` route-override consumer). An identity predicate (`consumer` /
-`external_identity` / `auth_method` / `spiffe_id`) also never gates a stream connection at all — the one gated stream
+`external_identity` / `external_identity_authority` / `auth_method` / `spiffe_id`) also never gates a stream connection at all — the one gated stream
 phase is where stream authentication itself runs — so on a plugin that serves
 both families it governs the HTTP half only. A triggered response-presentation
 transform makes finalized response-cache/dedup replay provenance unprovable;

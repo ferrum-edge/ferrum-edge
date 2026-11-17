@@ -147,13 +147,29 @@ pub fn create_test_context() -> RequestContext {
 /// that verified realm — what `jwks_auth`, `ldap_auth`, and the other external
 /// mechanisms leave behind (GHSA-rxwj-x6c6-f4j5).
 pub fn commit_external_identity(ctx: &mut RequestContext, identity: &str, mechanism: &'static str) {
+    commit_external_identity_with_authority(ctx, identity, mechanism, None);
+}
+
+/// [`commit_external_identity`] with a staged verifying-authority digest, the
+/// way a multi-provider `jwks_auth` / `oauth2_introspection` commits one per
+/// accepted issuer.
+pub fn commit_external_identity_with_authority(
+    ctx: &mut RequestContext,
+    identity: &str,
+    mechanism: &'static str,
+    authority: Option<[u8; 32]>,
+) {
     use ferrum_edge::plugins::utils::auth_attempt::AuthenticationAttempt;
     use ferrum_edge::plugins::utils::auth_flow::{VerifyOutcome, commit_authentication_attempt};
 
     ctx.identified_consumer = None;
+    let mut attempt = AuthenticationAttempt::new();
+    if let Some(authority) = authority {
+        attempt.stage_identity_realm_authority(authority);
+    }
     let committed = commit_authentication_attempt(
         ctx,
-        AuthenticationAttempt::new(),
+        attempt,
         VerifyOutcome::success(None, Some(identity.to_string()), None),
         mechanism,
         true,

@@ -887,8 +887,13 @@ An exemption with no `paths`/`methods`/`ips`/`consumers` exempts nothing.
   login, ...) never matches, even one that spells a listed username, so a
   self-registered IdP user named like an exempted Consumer is still scanned.
   To exempt an external principal, gate the WAF instance with an execution
-  trigger such as `not: {all: [{match: {external_identity: ...}}, {match:
-  {auth_method: [jwks_auth]}}]}`.
+  trigger that names both the identity and its verifying authority, such as
+  `not: {all: [{match: {external_identity: ...}}, {match:
+  {external_identity_authority: [<realm digest>]}}]}`. The digest is the
+  `input.consumer.realm.authority` value `opa` reports for that provider; it
+  differs between two providers of one mechanism, so `auth_method` alone is
+  not enough when one `jwks_auth` / `oauth2_introspection` instance accepts
+  several issuers.
 - `header_present` — suppress every rule, and every disposition that would
   otherwise refuse (`fail_closed` and `block` for `on_body_too_large`,
   `on_unlisted_content_type`, `on_unlisted_response_content_type`, and
