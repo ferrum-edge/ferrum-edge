@@ -620,14 +620,27 @@ token:
 - routing `404`s (no route matched) and mesh `REGISTRY_ONLY` route misses.
 
 gRPC Trailers-Only rejections (HTTP `200` with a non-zero `grpc-status`) count
-as error responses. A gRPC-Web rejection whose `grpc-status` is carried only in
-the body's trailer frame (an HTTP `200` head without `grpc-status`) is not
-recognized as an error when the head is stamped, so it carries no reference:
-such a rejection can be under-marked, but it never gets a false reference. A
+as error responses. So do gRPC-Web rejections (issue #7407), whose
+`grpc-status` is carried only in the body's trailer frame under an HTTP `200`
+head: the head cannot show the error, so the rejection funnel records, for a
+request that keeps its gRPC-Web representation, that the rejection's gRPC
+status is not `OK`, and the stamp accepts the `200` gRPC-Web head
+(`application/grpc-web`, `application/grpc-web-text`) as the one it authored.
+The reference resolves with `status: 200`, the status the client saw. A
+gRPC-Web rejection without that record (no gRPC status, or `OK`) carries no
+reference: it can be under-marked, but it never gets a false reference. A
 response is gateway-authored only when its rejection site recorded it in the
 request's diagnostic slot before the head was written, and
-only on a head whose status is the one that rejection recorded (a rejection a
-later phase replaced marks nothing). An ordinary relayed backend `5xx` receives
+only on a head whose status is the one that rejection recorded, or the `200`
+head of a recorded gRPC-Web rejection (a rejection a later phase replaced
+marks nothing).
+
+Every stamped gRPC-Web response, tokened or not, also lists
+`x-ferrum-diagnostic-ref` in its `Access-Control-Expose-Headers` (next to
+`grpc-status`, `grpc-message` and `grpc-status-details-bin`), so a
+cross-origin browser `fetch()` client can read the reference without
+configuring `expose_headers`. The name is appended once, only to a response
+that already carries that field. An ordinary relayed backend `5xx` receives
 a compiled gateway token (`backend_timeout` for a relayed `504`, `backend_error`
 for any other `5xx`) and may carry a diagnostic reference when diagnostics are
 enabled. Backend `4xx` responses do not receive a reference.
