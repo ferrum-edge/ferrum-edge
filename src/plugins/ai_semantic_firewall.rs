@@ -1530,6 +1530,17 @@ impl AiSemanticFirewall {
             }
             segments
         } else {
+            // The client receives these exact bytes; a duplicate member would be
+            // scored as the LAST value and read by a first-key-wins client as the
+            // FIRST (see the request-side screen in `before_proxy`).
+            if ctx.json_scan_memo.ambiguity(strip_json_bom(body)).is_some() {
+                self.set_response_hash(ctx, digest.into_hex());
+                return self.engine.handle_uninspectable_body(
+                    ctx,
+                    Direction::Response,
+                    "ambiguous_json",
+                );
+            }
             let json: Value = match serde_json::from_slice(strip_json_bom(body)) {
                 Ok(json) => json,
                 Err(_) => {
@@ -2740,6 +2751,24 @@ impl Plugin for AiSemanticFirewall {
                 .engine
                 .handle_uninspectable_body(ctx, Direction::Request, "empty_body");
         }
+        // Duplicate member names make the evaluated document and the forwarded
+        // bytes two different documents: `serde_json` keeps the LAST value
+        // while a first-key-wins backend acts on the FIRST, so a prompt the
+        // packs scored as benign could deliver the injection they would have
+        // caught (GHSA-c78j-5w9p-cpq6, GHSA-49cr-v28q-9hgp). Screen the exact
+        // bytes the parse below sees; ordinary malformed JSON (which this
+        // screen leaves alone) keeps its own disposition.
+        if ctx
+            .json_scan_memo
+            .ambiguity(strip_json_bom(buffered.as_bytes()))
+            .is_some()
+        {
+            return self.engine.handle_uninspectable_body(
+                ctx,
+                Direction::Request,
+                "ambiguous_json",
+            );
+        }
         // Parse and hash while the buffered body is still borrowed from
         // `ctx.metadata`, instead of copying the body to end that borrow
         // (issue #7132). The digest is computed only when request rules will
@@ -2819,6 +2848,15 @@ impl Plugin for AiSemanticFirewall {
                 .handle_uninspectable_body(ctx, Direction::Request, "encoded_body");
         }
 
+        // The backend receives exactly these bytes, so they must be one
+        // unambiguous document (see the matching screen in `before_proxy`).
+        if ctx.json_scan_memo.ambiguity(strip_json_bom(body)).is_some() {
+            return self.engine.handle_uninspectable_body(
+                ctx,
+                Direction::Request,
+                "ambiguous_json",
+            );
+        }
         let json: Value = match serde_json::from_slice(strip_json_bom(body)) {
             Ok(json) => json,
             Err(_) => {
