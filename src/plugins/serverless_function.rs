@@ -3220,7 +3220,11 @@ fn sanitize_function_response_headers(
         {
             continue;
         }
-        let Ok(value) = value.to_str() else {
+        // GHSA-j26x-88q2-wq5m: keep UTF-8 obs-text (a non-ASCII
+        // `Content-Disposition` filename) exactly as every backend-response
+        // collector does; only a value that is not valid UTF-8 is dropped,
+        // and that drop is counted.
+        let Some(value) = crate::proxy::backend_response_field_value_str(name, value) else {
             continue;
         };
         if let Some(kind) = UrlValuedResponseHeader::from_name(lower) {

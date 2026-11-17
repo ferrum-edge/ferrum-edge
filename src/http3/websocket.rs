@@ -408,6 +408,30 @@ async fn send_h3_backend_failure_body<S>(
         .await;
 }
 
+/// Relay a backend's own `3xx`-`5xx` refusal of the WebSocket upgrade
+/// (GHSA-7x2j-3389-2h35) on the H3 stream: the backend's status, its headers
+/// under the initial response header policy and the WebSocket transport strip,
+/// and its complete body (or an empty one) with an authoritative length. No
+/// `X-Gateway-Error`: the backend answered.
+async fn send_h3_backend_refusal<S>(
+    stream: &mut RequestStream<S, Bytes>,
+    refusal: crate::proxy::WebSocketBackendRefusal,
+    initial_response_header_policy_plugins: &[Arc<dyn Plugin>],
+) where
+    S: h3::quic::RecvStream + h3::quic::SendStream<Bytes>,
+{
+    let crate::proxy::WebSocketBackendRefusal {
+        status,
+        mut headers,
+        body,
+    } = refusal;
+    crate::plugins::apply_initial_response_header_policies(
+        initial_response_header_policy_plugins,
+        &mut headers,
+    );
+    write_h3_finalized_reject_body(stream, status, body, headers).await;
+}
+
 pub(crate) async fn send_h3_reject_body<S>(
     stream: &mut RequestStream<S, Bytes>,
     status: StatusCode,
@@ -972,7 +996,7 @@ pub(crate) async fn handle_h3_websocket(
                 start_time,
                 &current_backend_url,
                 crate::proxy::websocket_dns_resolution_host(&proxy, current_target.as_deref()),
-                retry::ErrorClass::DispatchPolicyRejected,
+                Some(retry::ErrorClass::DispatchPolicyRejected),
                 &original_request_path,
                 502,
             )
@@ -1200,6 +1224,10 @@ pub(crate) async fn handle_h3_websocket(
                     state.websocket_write_buffer_size,
                     ws_idle_tracker.clone(),
                     Some(&state.dns_cache),
+                    crate::proxy::websocket_preserved_backend_host(
+                        proxy.preserve_host_header,
+                        ws_client_host.as_deref(),
+                    ),
                 )
                 .await
                 .map(|handshake| crate::proxy::WsBackendHandshake::Direct(Box::new(handshake))),
@@ -1239,6 +1267,15 @@ pub(crate) async fn handle_h3_websocket(
                 // handshake timeout is 504 (#6770), everything else 502.
                 let (ws_failure_status, ws_failure_body) =
                     crate::proxy::websocket_backend_failure_status_and_body(ws_error_class);
+                // A backend that answered the upgrade with its own 3xx-5xx
+                // (GHSA-7x2j-3389-2h35) is relayed with its real status, and
+                // every outcome below is charged with that status and no error
+                // class, exactly as on the H1/H2 path.
+                let ws_backend_refusal = crate::proxy::websocket_backend_refusal(e.as_ref());
+                let ws_failure_status = ws_backend_refusal
+                    .as_ref()
+                    .map_or(ws_failure_status, |refusal| refusal.status);
+                let ws_outcome_error_class = ws_backend_refusal.is_none().then_some(ws_error_class);
                 // A gateway-side egress-policy denial (denied literal/rebound H3
                 // WebSocket backend) never reached a backend: non-retryable AND
                 // neutral to backend health (no CB trip, no backend-admission
@@ -1248,7 +1285,13 @@ pub(crate) async fn handle_h3_websocket(
                 // Every failed handshake ends its attempt, retried or not. A
                 // dial refused before its attempt began has none (issue #5875).
                 if ws_attempt_dispatched {
-                    ctx.record_backend_attempt(Some(ws_error_class), !ws_is_pre_wire, None);
+                    ctx.record_backend_attempt(
+                        ws_outcome_error_class,
+                        !ws_is_pre_wire,
+                        ws_backend_refusal
+                            .as_ref()
+                            .map(|refusal| refusal.status.as_u16()),
+                    );
                 }
                 let retry_delay = proxy.retry.as_ref().and_then(|retry_config| {
                     let route_retry_ceiling =
@@ -1428,14 +1471,23 @@ pub(crate) async fn handle_h3_websocket(
                     }
                 }
 
-                error!(
-                    proxy_id = %proxy.id,
-                    backend_url = %crate::proxy::strip_query_params(&current_backend_url),
-                    error_kind = retry::error_class_log_kind(ws_error_class),
-                    error_class = %ws_error_class,
-                    error = %e,
-                    "H3 WebSocket backend connection failed"
-                );
+                if ws_backend_refusal.is_some() {
+                    debug!(
+                        proxy_id = %proxy.id,
+                        backend_url = %crate::proxy::strip_query_params(&current_backend_url),
+                        status = ws_failure_status.as_u16(),
+                        "H3 WebSocket backend refused the upgrade; relaying its response"
+                    );
+                } else {
+                    error!(
+                        proxy_id = %proxy.id,
+                        backend_url = %crate::proxy::strip_query_params(&current_backend_url),
+                        error_kind = retry::error_class_log_kind(ws_error_class),
+                        error_class = %ws_error_class,
+                        error = %e,
+                        "H3 WebSocket backend connection failed"
+                    );
+                }
                 if !backend_outcome_already_recorded
                     && !ws_egress_denied
                     && let Some(permits) = backend_admission_permits.take()
@@ -1443,7 +1495,7 @@ pub(crate) async fn handle_h3_websocket(
                     permits.record_backend_outcome(BackendAdmissionOutcome {
                         response_status: ws_failure_status.as_u16(),
                         connection_error: ws_is_pre_wire,
-                        error_class: Some(ws_error_class),
+                        error_class: ws_outcome_error_class,
                         backend_elapsed: backend_admission_start.elapsed(),
                     });
                 }
@@ -1456,7 +1508,18 @@ pub(crate) async fn handle_h3_websocket(
                         current_cb_target_key.as_deref(),
                     )
                 {
-                    if ws_egress_denied {
+                    if ws_backend_refusal.is_some() {
+                        // The backend answered: classify its status against
+                        // `failure_status_codes` exactly as the HTTP path does,
+                        // so a 401/403/404/429 refusal can never open the breaker.
+                        crate::proxy::backend_dispatch::apply_circuit_breaker_outcome(
+                            &cb,
+                            ws_failure_status.as_u16(),
+                            false,
+                            None,
+                            cb_probe.take_slot(),
+                        );
+                    } else if ws_egress_denied {
                         // Gateway-side egress denial dialed no backend: release any
                         // admitted HALF_OPEN probe slot NEUTRALLY so the breaker can
                         // recover, rather than leaking it by skipping the record.
@@ -1493,13 +1556,31 @@ pub(crate) async fn handle_h3_websocket(
                             &proxy,
                             current_target.as_deref(),
                         ),
-                        ws_error_class,
+                        ws_outcome_error_class,
                         &original_request_path,
                         ws_failure_status.as_u16(),
                     )
                     .await;
                 }
 
+                if let Some(refusal) = ws_backend_refusal {
+                    // Boxed trampoline: this future is polled inside
+                    // `handle_h3_request`'s stack budget, so the writer's
+                    // future must be built inside the heap-allocated block
+                    // rather than as a stack temporary of this frame
+                    // (`Box::pin(writer(..))` would still materialize it here).
+                    Box::pin(async {
+                        send_h3_backend_refusal(
+                            &mut stream,
+                            refusal,
+                            &initial_response_header_policy_plugins,
+                        )
+                        .await;
+                    })
+                    .await;
+                    drop(ws_connection_permit);
+                    return Ok(());
+                }
                 let ws_body = if is_ws_dns_error {
                     r#"{"error":"DNS resolution for backend failed"}"#
                 } else {
@@ -1641,7 +1722,11 @@ pub(crate) async fn handle_h3_websocket(
     // No Upgrade / Connection / Sec-WebSocket-Accept headers (those
     // are HTTP/1.1 only). The QUIC stream becomes the WebSocket
     // transport as soon as the client sees the 200.
-    let mut response_headers = HashMap::new();
+    // Seed the client handshake response from the backend's own end-to-end
+    // handshake headers (issue #7391), as on H1/H2, then let response policy
+    // govern them.
+    let mut backend_handshake = backend_handshake;
+    let mut response_headers = backend_handshake.take_backend_response_headers();
     crate::proxy::finalize_successful_websocket_response_headers(
         &plugins,
         &ctx,
@@ -2156,7 +2241,9 @@ async fn emit_failed_upgrade_summary(
     start_time: Instant,
     backend_url: &str,
     resolve_host: &str,
-    error_class: retry::ErrorClass,
+    // `None` for a relayed backend refusal (GHSA-7x2j-3389-2h35): the backend
+    // answered, so the transaction carries its status and no error class.
+    error_class: Option<retry::ErrorClass>,
     // The client-requested path before any VirtualService `rewrite.uri` was
     // applied. Logged as `request_path` so access logs record what the client
     // sent, not the backend-rewritten path in `ctx.path`.
@@ -2185,10 +2272,12 @@ async fn emit_failed_upgrade_summary(
         .map(|ip| ip.to_string());
 
     let mut metadata = crate::proxy::clone_log_metadata(ctx);
-    metadata.insert(
-        "rejection_phase".to_string(),
-        "websocket_backend_error".to_string(),
-    );
+    if error_class.is_some() {
+        metadata.insert(
+            "rejection_phase".to_string(),
+            "websocket_backend_error".to_string(),
+        );
+    }
 
     let summary = TransactionSummary {
         namespace: proxy.namespace.clone(),
@@ -2213,7 +2302,7 @@ async fn emit_failed_upgrade_summary(
         latency_plugin_external_io_ms: plugin_external_io_ms,
         latency_gateway_overhead_ms: gateway_overhead_ms,
         request_user_agent: proxy_headers.get("user-agent").cloned(),
-        error_class: Some(error_class),
+        error_class,
         metadata,
         ai_usage_export: ctx.ai_usage_export.clone(),
         proxy_lifecycle_generation: ctx.proxy_lifecycle_generation,

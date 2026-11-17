@@ -16701,6 +16701,174 @@ pub(crate) fn websocket_backend_failure_status_and_body(
     }
 }
 
+/// Largest backend refusal body the gateway relays to the client. The body is
+/// what the backend coalesced with its refusal head, so it is already bounded by
+/// the handshake read; this cap keeps the relay small regardless.
+pub(crate) const WEBSOCKET_BACKEND_REFUSAL_MAX_BODY_BYTES: usize = 64 * 1024;
+
+/// A backend's own `3xx`-`5xx` answer to the gateway's WebSocket upgrade
+/// request (GHSA-7x2j-3389-2h35): an RFC 6455 non-`101` response, or a non-`2xx`
+/// response to a Sidecar mesh-mTLS RFC 8441 Extended CONNECT.
+///
+/// The backend is healthy and declined the upgrade (its own authentication, an
+/// Origin check, `404`, `429`, a redirect, ...). The gateway relays that answer
+/// instead of a synthetic `502`, and charges the circuit breaker and backend
+/// admission with the backend's real status, exactly as the HTTP path does for
+/// the same status: a `4xx` is never a backend failure.
+///
+/// A `1xx`/`2xx` non-`101` answer is not a refusal: relaying a `2xx` to an
+/// RFC 8441 / RFC 9220 Extended CONNECT client would tell it the tunnel is open.
+/// It stays the `502` protocol failure, as do a missing/invalid
+/// `Sec-WebSocket-Accept` and a malformed response.
+#[derive(Clone)]
+pub struct WebSocketBackendRefusal {
+    pub(crate) status: StatusCode,
+    /// The backend's headers after the backend-response strip (hop-by-hop,
+    /// `Connection`-listed and gateway-owned diagnostic names). The response
+    /// builders still apply the initial response header policy and the
+    /// WebSocket transport strip, and derive the framing themselves.
+    pub(crate) headers: HashMap<String, String>,
+    /// The backend's complete refusal body, or empty when it was not complete
+    /// in the handshake read (then the representation headers are dropped).
+    pub(crate) body: Bytes,
+}
+
+/// Header names and the body length only: values (`Set-Cookie`,
+/// `WWW-Authenticate` parameters) and body bytes can carry credentials, and
+/// this type rides inside `HbonePoolError`, whose `Debug` may be formatted.
+impl std::fmt::Debug for WebSocketBackendRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut header_names: Vec<&str> = self.headers.keys().map(String::as_str).collect();
+        header_names.sort_unstable();
+        f.debug_struct("WebSocketBackendRefusal")
+            .field("status", &self.status)
+            .field("header_names", &header_names)
+            .field("body_len", &self.body.len())
+            .finish()
+    }
+}
+
+impl WebSocketBackendRefusal {
+    /// The refusal for a backend answer with `status` and `headers`, or `None`
+    /// when the status is not a relayable `3xx`-`5xx`. `complete_body` is the
+    /// backend's whole body when the transport read all of it (at most
+    /// [`WEBSOCKET_BACKEND_REFUSAL_MAX_BODY_BYTES`]); `None` relays an empty body
+    /// and drops the fields describing the representation the client will not
+    /// receive. Shared by every WebSocket transport that can carry a refusal.
+    pub(crate) fn from_response_parts(
+        status: StatusCode,
+        headers: &hyper::HeaderMap,
+        complete_body: Option<Bytes>,
+    ) -> Option<Self> {
+        if !(300..=599).contains(&status.as_u16()) {
+            return None;
+        }
+        let mut collected = HashMap::new();
+        collect_hyper_response_headers(headers, &mut collected);
+        let body = match complete_body {
+            Some(body) => body,
+            None => {
+                collected.retain(|name, _| {
+                    !name.eq_ignore_ascii_case("content-type")
+                        && !name.eq_ignore_ascii_case("content-encoding")
+                        && !name.eq_ignore_ascii_case("content-range")
+                });
+                Bytes::new()
+            }
+        };
+        Some(Self {
+            status,
+            headers: collected,
+            body,
+        })
+    }
+}
+
+/// The backend refusal carried by a failed WebSocket dial, if the backend
+/// answered the upgrade with a relayable status. Walks the error chain for
+/// tungstenite's `Error::Http`, which every H1 upgrade transport (direct
+/// TCP/TLS, admitted Unix socket, and the inner HBONE handshake) returns for a
+/// non-`101` answer, and for the Sidecar mesh-mTLS Extended CONNECT refusal
+/// ([`HbonePoolError::WebSocketUpgradeRefused`]).
+pub(crate) fn websocket_backend_refusal(
+    error: &(dyn std::error::Error + 'static),
+) -> Option<WebSocketBackendRefusal> {
+    let mut current = Some(error);
+    while let Some(err) = current {
+        if let Some(tokio_tungstenite::tungstenite::Error::Http(response)) =
+            err.downcast_ref::<tokio_tungstenite::tungstenite::Error>()
+        {
+            let status = response.status();
+            let body = websocket_backend_refusal_body(status, response.headers(), response.body());
+            return WebSocketBackendRefusal::from_response_parts(status, response.headers(), body);
+        }
+        if let Some(HbonePoolError::WebSocketUpgradeRefused { refusal, .. }) =
+            err.downcast_ref::<HbonePoolError>()
+        {
+            return Some(refusal.as_ref().clone());
+        }
+        current = err.source();
+    }
+    None
+}
+
+/// The complete body of a backend refusal, or `None` when the bytes
+/// tungstenite read with the head do not hold exactly the declared body.
+fn websocket_backend_refusal_body(
+    status: StatusCode,
+    headers: &hyper::HeaderMap,
+    tail: &Option<Vec<u8>>,
+) -> Option<Bytes> {
+    // Only `3xx`-`5xx` reach here, so `304` is the one bodiless status.
+    if status == StatusCode::NOT_MODIFIED {
+        return Some(Bytes::new());
+    }
+    if headers.contains_key(hyper::header::TRANSFER_ENCODING) {
+        return None;
+    }
+    let mut lengths = headers.get_all(hyper::header::CONTENT_LENGTH).iter();
+    let declared = lengths.next()?;
+    if lengths.next().is_some() {
+        return None;
+    }
+    let declared: usize = std::str::from_utf8(declared.as_bytes())
+        .ok()?
+        .trim()
+        .parse()
+        .ok()?;
+    if declared > WEBSOCKET_BACKEND_REFUSAL_MAX_BODY_BYTES {
+        return None;
+    }
+    let tail = tail.as_deref().unwrap_or_default();
+    (tail.len() >= declared).then(|| Bytes::copy_from_slice(&tail[..declared]))
+}
+
+/// The H1/H2 client response relaying a [`WebSocketBackendRefusal`]: the
+/// backend's status, its headers under the same initial response header policy
+/// and WebSocket transport strip as every other failed handshake, and an
+/// authoritative `Content-Length` for the relayed body.
+pub(crate) fn build_websocket_backend_refusal_response(
+    refusal: WebSocketBackendRefusal,
+    initial_response_header_policy_plugins: &[Arc<dyn Plugin>],
+) -> Response<ProxyBody> {
+    let WebSocketBackendRefusal {
+        status,
+        mut headers,
+        body,
+    } = refusal;
+    finalize_websocket_response_headers(initial_response_header_policy_plugins, &mut headers);
+    headers_mod::apply_sanitized_response_headers(
+        Response::builder().status(status),
+        &mut headers,
+        headers_mod::ClientResponseFraming::ExactBody {
+            status: status.as_u16(),
+            len: body.len() as u64,
+        },
+    )
+    .body(ProxyBody::full(body))
+    .unwrap_or_else(|_| build_websocket_error_fallback_response(StatusCode::BAD_GATEWAY))
+}
+
 fn build_websocket_error_fallback_response(status: StatusCode) -> Response<ProxyBody> {
     let mut response = Response::new(ProxyBody::from_string(
         r#"{"error":"Internal server error"}"#,
@@ -17447,6 +17615,10 @@ async fn handle_websocket_request_authenticated(
                         state.websocket_write_buffer_size,
                         ws_idle_tracker.clone(),
                         Some(&state.dns_cache),
+                        websocket_preserved_backend_host(
+                            proxy.preserve_host_header,
+                            ws_client_host.as_deref(),
+                        ),
                     )
                     .await
                     .map(|handshake| WsBackendHandshake::Direct(Box::new(handshake))),
@@ -17499,6 +17671,17 @@ async fn handle_websocket_request_authenticated(
                 // else keeps the 502.
                 let (ws_failure_status, ws_failure_body) =
                     websocket_backend_failure_status_and_body(ws_error_class);
+                // A backend that answered the upgrade with its own 3xx-5xx
+                // (GHSA-7x2j-3389-2h35) is a healthy backend's answer, not a
+                // gateway failure: it is relayed to the client, and the breaker,
+                // backend admission, metrics and the transaction log all see the
+                // backend's real status with no error class, exactly as the HTTP
+                // path records the same status.
+                let ws_backend_refusal = websocket_backend_refusal(e.as_ref());
+                let ws_failure_status = ws_backend_refusal
+                    .as_ref()
+                    .map_or(ws_failure_status, |refusal| refusal.status);
+                let ws_outcome_error_class = ws_backend_refusal.is_none().then_some(ws_error_class);
                 // A gateway-side egress-policy rejection (denied literal-IP
                 // backend) never reached a backend: it must be non-retryable AND
                 // neutral to backend health — no circuit-breaker trip and no
@@ -17509,7 +17692,13 @@ async fn handle_websocket_request_authenticated(
                 // Every failed handshake ends its attempt, retried or not. A
                 // dial refused before its attempt began has none (issue #5875).
                 if ws_attempt_dispatched {
-                    ctx.record_backend_attempt(Some(ws_error_class), !ws_is_pre_wire, None);
+                    ctx.record_backend_attempt(
+                        ws_outcome_error_class,
+                        !ws_is_pre_wire,
+                        ws_backend_refusal
+                            .as_ref()
+                            .map(|refusal| refusal.status.as_u16()),
+                    );
                 }
 
                 // Retry only on PRE-WIRE failures (DNS / TCP refused / TLS
@@ -17747,14 +17936,23 @@ async fn handle_websocket_request_authenticated(
                 // rejected the upgrade will now log
                 // `error_kind=protocol_error` or `request_error` rather
                 // than the misleading hardcoded `connect_failure`.
-                error!(
-                    proxy_id = %proxy.id,
-                    backend_url = %strip_query_params(&current_backend_url),
-                    error_kind = retry::error_class_log_kind(ws_error_class),
-                    error_class = %ws_error_class,
-                    error = %e,
-                    "WebSocket backend connection failed"
-                );
+                if ws_backend_refusal.is_some() {
+                    debug!(
+                        proxy_id = %proxy.id,
+                        backend_url = %strip_query_params(&current_backend_url),
+                        status = ws_failure_status.as_u16(),
+                        "WebSocket backend refused the upgrade; relaying its response"
+                    );
+                } else {
+                    error!(
+                        proxy_id = %proxy.id,
+                        backend_url = %strip_query_params(&current_backend_url),
+                        error_kind = retry::error_class_log_kind(ws_error_class),
+                        error_class = %ws_error_class,
+                        error = %e,
+                        "WebSocket backend connection failed"
+                    );
+                }
                 // Record the failure so the breaker / passive health see it
                 // and a claimed HALF_OPEN probe slot is released. Previously
                 // only the retry branch recorded — with retries unconfigured
@@ -17769,7 +17967,19 @@ async fn handle_websocket_request_authenticated(
                         current_cb_target_key.as_deref(),
                     )
                 {
-                    if ws_egress_denied {
+                    if ws_backend_refusal.is_some() {
+                        // The backend answered: classify its status against
+                        // `failure_status_codes` exactly as the HTTP path does,
+                        // so a 401/403/404/429 refusal can never open the
+                        // breaker (GHSA-7x2j-3389-2h35).
+                        backend_dispatch::apply_circuit_breaker_outcome(
+                            &cb,
+                            ws_failure_status.as_u16(),
+                            false,
+                            None,
+                            cb_probe.take_slot(),
+                        );
+                    } else if ws_egress_denied {
                         // Gateway-side egress denial dialed no backend: release any
                         // admitted HALF_OPEN probe slot NEUTRALLY (no failure count)
                         // so the breaker can recover, rather than leaking it by
@@ -17792,7 +18002,7 @@ async fn handle_websocket_request_authenticated(
                     permits.record_backend_outcome(BackendAdmissionOutcome {
                         response_status: ws_failure_status.as_u16(),
                         connection_error: ws_is_pre_wire,
-                        error_class: Some(ws_error_class),
+                        error_class: ws_outcome_error_class,
                         backend_elapsed: backend_admission_start.elapsed(),
                     });
                 }
@@ -17815,10 +18025,14 @@ async fn handle_websocket_request_authenticated(
                         let ws_gateway_overhead_ms =
                             (ws_total_ms - ws_plugin_execution_ms).max(0.0);
                         let mut metadata = clone_log_metadata(&ctx);
-                        metadata.insert(
-                            "rejection_phase".to_string(),
-                            "websocket_backend_error".to_string(),
-                        );
+                        // A relayed backend refusal is the backend's answer,
+                        // not a gateway rejection.
+                        if ws_backend_refusal.is_none() {
+                            metadata.insert(
+                                "rejection_phase".to_string(),
+                                "websocket_backend_error".to_string(),
+                            );
+                        }
                         let ws_err_method = if is_h2_websocket { "CONNECT" } else { "GET" };
                         let summary = TransactionSummary {
                             namespace: proxy.namespace.clone(),
@@ -17846,7 +18060,7 @@ async fn handle_websocket_request_authenticated(
                             request_user_agent: ctx
                                 .effective_request_header("user-agent")
                                 .map(str::to_owned),
-                            error_class: Some(ws_error_class),
+                            error_class: ws_outcome_error_class,
                             metadata,
                             ai_usage_export: ctx.ai_usage_export.clone(),
                             proxy_lifecycle_generation: ctx.proxy_lifecycle_generation,
@@ -17857,11 +18071,17 @@ async fn handle_websocket_request_authenticated(
                         )
                         .await;
                     }
-                } else {
+                } else if let Some(error_class) = ws_outcome_error_class {
                     crate::runtime_metrics::global_ref()
-                        .record_http_error(Some(&proxy.id), ws_error_class);
+                        .record_http_error(Some(&proxy.id), error_class);
                 }
 
+                if let Some(refusal) = ws_backend_refusal {
+                    return Ok(build_websocket_backend_refusal_response(
+                        refusal,
+                        &initial_response_header_policy_plugins,
+                    ));
+                }
                 return Ok(build_websocket_backend_failure_response(
                     ws_failure_status,
                     ws_failure_body,
@@ -18116,7 +18336,11 @@ async fn handle_websocket_request_authenticated(
     } else {
         StatusCode::SWITCHING_PROTOCOLS
     };
-    let mut response_headers = HashMap::new();
+    // Seed the client handshake response from the backend's own end-to-end
+    // handshake headers (issue #7391: a backend `Set-Cookie` on its `101` must
+    // reach the client), then let response policy govern them.
+    let mut backend_handshake = backend_handshake;
+    let mut response_headers = backend_handshake.take_backend_response_headers();
     finalize_successful_websocket_response_headers(
         &plugins,
         &ctx,
@@ -19554,6 +19778,10 @@ pub(crate) struct BackendWsHandshake {
     pub stream: BackendWsStream,
     pub negotiated_subprotocol: Option<hyper::header::HeaderValue>,
     pub backend_extensions: Option<hyper::header::HeaderValue>,
+    /// The backend's end-to-end handshake response headers (issue #7391),
+    /// collected with the backend-response strip. See
+    /// [`WsBackendHandshake::take_backend_response_headers`].
+    pub backend_response_headers: HashMap<String, String>,
 }
 
 /// Backend WebSocket transport for a mesh egress session: the raw WebSocket
@@ -19568,6 +19796,7 @@ pub(crate) struct MeshBackendWsHandshake {
     pub stream: MeshBackendWsStream,
     pub negotiated_subprotocol: Option<hyper::header::HeaderValue>,
     pub backend_extensions: Option<hyper::header::HeaderValue>,
+    pub backend_response_headers: HashMap<String, String>,
 }
 
 /// Backend WebSocket transport for a sidecar-ingress Unix-domain backend
@@ -19584,6 +19813,7 @@ pub(crate) struct UnixBackendWsHandshake {
     pub stream: UnixBackendWsStream,
     pub negotiated_subprotocol: Option<hyper::header::HeaderValue>,
     pub backend_extensions: Option<hyper::header::HeaderValue>,
+    pub backend_response_headers: HashMap<String, String>,
     conn_lease: unix_backend_pool::UnixWebSocketConnLease,
 }
 
@@ -19639,6 +19869,24 @@ impl WsBackendHandshake {
     pub(crate) fn negotiated_permessage_deflate(&self) -> Option<hyper::header::HeaderValue> {
         self.backend_extensions()
             .and_then(permessage_deflate_answer_from)
+    }
+
+    /// Move out the backend's end-to-end handshake response headers (issue
+    /// #7391): its `101` headers for an H1 upgrade (direct, Unix socket, or
+    /// the inner HBONE handshake), or the peer's Extended CONNECT `200`
+    /// headers for a Sidecar mesh-mTLS tunnel. They were collected with the
+    /// backend-response strip (hop-by-hop, `Connection`-listed, gateway-owned
+    /// diagnostic names). The successful handshake response is seeded from
+    /// them BEFORE response policy runs, so policy plugins govern them like
+    /// any HTTP response header, and the WebSocket transport strip still
+    /// removes `Upgrade` / `Connection` / `Sec-WebSocket-*` / `Content-Length`.
+    pub(crate) fn take_backend_response_headers(&mut self) -> HashMap<String, String> {
+        match self {
+            Self::Direct(handshake) => std::mem::take(&mut handshake.backend_response_headers),
+            Self::Mesh(handshake) => std::mem::take(&mut handshake.backend_response_headers),
+            #[cfg(unix)]
+            Self::Unix(handshake) => std::mem::take(&mut handshake.backend_response_headers),
+        }
     }
 }
 
@@ -19724,6 +19972,12 @@ pub(crate) async fn connect_websocket_backend(
     // safe) and that exact IP is dialed. `None` (test helpers only) keeps OS
     // resolution. Literal-IP backends are screened explicitly regardless.
     dns_cache: Option<&crate::dns::DnsCache>,
+    // The `Host` the upgrade request carries instead of the backend URL
+    // authority: the validated client Host under `preserve_host_header`
+    // ([`websocket_preserved_backend_host`], issue #7392). The dial address,
+    // request-target, TLS SNI and certificate verification still come from
+    // `backend_url`.
+    preserved_host: Option<&str>,
 ) -> Result<BackendWsHandshake, Box<dyn std::error::Error + Send + Sync>> {
     let mut ws_config = WebSocketConfig::default();
     ws_config.max_frame_size = Some(max_websocket_frame_size_bytes);
@@ -19734,6 +19988,15 @@ pub(crate) async fn connect_websocket_backend(
     ws_config.auto_pong = false;
 
     let mut ws_request = backend_url.into_client_request()?;
+    // tungstenite writes the request's `Host` header verbatim and derives the
+    // TLS server name from the request URI, never from `Host`, so replacing
+    // the header changes only the virtual host the backend sees.
+    if let Some(host) = preserved_host {
+        ws_request.headers_mut().insert(
+            hyper::header::HOST,
+            hyper::header::HeaderValue::from_str(host)?,
+        );
+    }
     for (name, value) in client_headers {
         if let (Ok(header_name), Ok(header_value)) = (
             hyper::header::HeaderName::from_bytes(name.as_bytes()),
@@ -19877,12 +20140,34 @@ pub(crate) async fn connect_websocket_backend(
         .get(hyper::header::SEC_WEBSOCKET_PROTOCOL)
         .cloned();
     let backend_extensions = backend_extensions_answer(backend_response.headers());
+    let mut backend_response_headers = HashMap::new();
+    collect_hyper_response_headers(backend_response.headers(), &mut backend_response_headers);
 
     Ok(BackendWsHandshake {
         stream: backend_ws_stream,
         negotiated_subprotocol,
         backend_extensions,
+        backend_response_headers,
     })
+}
+
+/// The `Host` a direct TCP/TLS WebSocket backend handshake sends in place of
+/// the backend URL authority (issue #7392).
+///
+/// With `preserve_host_header` on, the backend sees the client's Host, exactly
+/// as on the HTTP, gRPC, direct-H2 and H3 paths of the same proxy. The value
+/// passes the same `validated_outbound_host` screen those paths use; a missing
+/// or invalid client Host (userinfo, bad authority, unbracketed IPv6) returns
+/// `None`, so the handshake falls back to the backend authority. Shared by the
+/// H1/H2 and H3 WebSocket bridges.
+pub(crate) fn websocket_preserved_backend_host(
+    preserve_host_header: bool,
+    client_host: Option<&str>,
+) -> Option<&str> {
+    if !preserve_host_header {
+        return None;
+    }
+    client_host.and_then(validated_outbound_host)
 }
 
 /// Open an RFC 6455 WebSocket to a sidecar-ingress Unix-domain backend
@@ -20048,11 +20333,14 @@ async fn connect_unix_websocket_backend(
         .get(hyper::header::SEC_WEBSOCKET_PROTOCOL)
         .cloned();
     let backend_extensions = backend_extensions_answer(response.headers());
+    let mut backend_response_headers = HashMap::new();
+    collect_hyper_response_headers(response.headers(), &mut backend_response_headers);
 
     Ok(UnixBackendWsHandshake {
         stream,
         negotiated_subprotocol,
         backend_extensions,
+        backend_response_headers,
         conn_lease,
     })
 }
@@ -20388,6 +20676,7 @@ pub(crate) async fn connect_mesh_websocket_backend(
                 stream,
                 negotiated_subprotocol: ws_tunnel.negotiated_subprotocol,
                 backend_extensions: ws_tunnel.backend_extensions,
+                backend_response_headers: ws_tunnel.backend_response_headers,
             })
         }
         MeshWsEgress::AmbientHbone => {
@@ -20609,11 +20898,14 @@ pub(crate) async fn connect_mesh_websocket_backend(
                 .get(hyper::header::SEC_WEBSOCKET_PROTOCOL)
                 .cloned();
             let backend_extensions = backend_extensions_answer(response.headers());
+            let mut backend_response_headers = HashMap::new();
+            collect_hyper_response_headers(response.headers(), &mut backend_response_headers);
 
             Ok(MeshBackendWsHandshake {
                 stream,
                 negotiated_subprotocol,
                 backend_extensions,
+                backend_response_headers,
             })
         }
     }
@@ -56753,6 +57045,79 @@ pub(crate) fn record_request(state: &ProxyState, status: u16) {
     record_status(state, status);
 }
 
+/// Backend response header and trailer field values dropped because they are
+/// not valid UTF-8 (GHSA-j26x-88q2-wq5m), since process start.
+static BACKEND_RESPONSE_NON_UTF8_FIELD_DROPS: AtomicU64 = AtomicU64::new(0);
+/// Monotonic millisecond stamp of the last non-UTF-8 drop warning (`0` = none).
+static BACKEND_RESPONSE_NON_UTF8_LAST_WARN_MS: AtomicU64 = AtomicU64::new(0);
+/// At most one non-UTF-8 drop warning per window, across every backend.
+const BACKEND_RESPONSE_NON_UTF8_WARN_WINDOW_MS: u64 = 60_000;
+
+/// The text form of one backend response header or trailer value, as every
+/// backend-response collector (H1/H2 reqwest and direct hyper, native gRPC
+/// headers and trailers, native H3, and the H3 cross-protocol bridge) reads it.
+///
+/// RFC 9110 §5.5 allows obs-text (0x80-0xFF) in a field value and requires a
+/// recipient to treat it as opaque data. `HeaderValue::to_str` accepts only
+/// visible ASCII, so a raw UTF-8 `Content-Disposition` filename or a `Set-Cookie`
+/// with a UTF-8 byte used to vanish from the client response
+/// (GHSA-j26x-88q2-wq5m). Any valid UTF-8 value is kept byte for byte; the
+/// downstream `HeaderValue::from_str` builders accept obs-text, so the client
+/// receives the exact bytes the backend sent.
+///
+/// A value that is not valid UTF-8 (for example ISO-8859-1 bytes) cannot be
+/// carried by the `HashMap<String, String>` response representation. It is
+/// dropped, counted ([`backend_response_non_utf8_field_drops_total`]) and
+/// reported by a rate-limited warning that names the field, never its value.
+///
+/// Allocation-free: the ASCII fast path of `str::from_utf8` costs the same scan
+/// `to_str` performed.
+#[inline]
+pub(crate) fn backend_response_field_value_str<'a>(
+    name: &http::header::HeaderName,
+    value: &'a http::header::HeaderValue,
+) -> Option<&'a str> {
+    match std::str::from_utf8(value.as_bytes()) {
+        Ok(text) => Some(text),
+        Err(_) => {
+            note_dropped_non_utf8_backend_response_field(name);
+            None
+        }
+    }
+}
+
+#[cold]
+#[inline(never)]
+fn note_dropped_non_utf8_backend_response_field(name: &http::header::HeaderName) {
+    let total = BACKEND_RESPONSE_NON_UTF8_FIELD_DROPS
+        .fetch_add(1, Ordering::Relaxed)
+        .saturating_add(1);
+    let now = crate::socket_opts::monotonic_now_ms();
+    let last = BACKEND_RESPONSE_NON_UTF8_LAST_WARN_MS.load(Ordering::Relaxed);
+    if last != 0 && now.saturating_sub(last) < BACKEND_RESPONSE_NON_UTF8_WARN_WINDOW_MS {
+        return;
+    }
+    if BACKEND_RESPONSE_NON_UTF8_LAST_WARN_MS
+        .compare_exchange(last, now.max(1), Ordering::Relaxed, Ordering::Relaxed)
+        .is_err()
+    {
+        return;
+    }
+    warn!(
+        header = %name,
+        dropped_total = total,
+        "Dropped a backend response header value that is not valid UTF-8; the gateway \
+         forwards UTF-8 obs-text but cannot carry other non-ASCII bytes (further drops \
+         in the next 60s are counted, not logged)"
+    );
+}
+
+/// Backend response header and trailer values dropped since process start
+/// because they were not valid UTF-8 (see [`backend_response_field_value_str`]).
+pub fn backend_response_non_utf8_field_drops_total() -> u64 {
+    BACKEND_RESPONSE_NON_UTF8_FIELD_DROPS.load(Ordering::Relaxed)
+}
+
 /// Collect backend response headers into a HashMap.
 ///
 /// RFC 7230 Section 3.2.2 allows folding multi-valued headers with commas,
@@ -56786,7 +57151,7 @@ fn collect_response_headers_generic<'a, I>(
         if connection_listed_strip.iter().any(|n| n == k) {
             continue;
         }
-        if let Ok(vs) = v.to_str() {
+        if let Some(vs) = backend_response_field_value_str(k, v) {
             // Determine multi-value separator before allocating the key String.
             // HeaderName comparison is zero-cost (pointer/length check on
             // pre-interned names), saving a String allocation when the header
@@ -75326,17 +75691,28 @@ mod tests {
     }
 
     #[test]
-    fn collect_response_headers_skips_invalid_utf8_values() {
+    fn collect_response_headers_keeps_utf8_obs_text_and_skips_invalid_utf8_values() {
+        // GHSA-j26x-88q2-wq5m: UTF-8 obs-text is forwarded byte for byte; only
+        // a value the string representation cannot carry is dropped.
         let mut source = reqwest::header::HeaderMap::new();
         source.insert(
             "x-non-utf8",
             HeaderValue::from_bytes(&[0x80, 0x81]).expect("valid raw header value"),
+        );
+        source.insert(
+            "content-disposition",
+            HeaderValue::from_bytes("attachment; filename=\"résumé.pdf\"".as_bytes())
+                .expect("valid obs-text header value"),
         );
 
         let mut target = HashMap::new();
         collect_response_headers(&source, &mut target);
 
         assert!(!target.contains_key("x-non-utf8"));
+        assert_eq!(
+            target.get("content-disposition").map(String::as_str),
+            Some("attachment; filename=\"résumé.pdf\"")
+        );
     }
 
     #[test]

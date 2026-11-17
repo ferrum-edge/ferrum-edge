@@ -199,7 +199,11 @@ Carrying the port matters for two reasons:
   violates RFC 9112 §3.2.
 
 Set `preserve_host_header: true` on a proxy to forward the **client's** `Host` verbatim instead.
-For ordinary direct backends, the backend sees exactly what the client sent. A selected mesh
+For ordinary direct backends, the backend sees exactly what the client sent. This includes the
+direct `ws://` / `wss://` WebSocket backend handshake on every frontend (HTTP/1.1 Upgrade, HTTP/2
+and HTTP/3 Extended CONNECT); the dial address, TLS SNI and certificate verification still use the
+selected target. A client Host that is not a valid authority (userinfo, unbracketed IPv6, bad port)
+falls back to the target authority, as on the HTTP path. A selected mesh
 sidecar mTLS target with a pinned `mesh.mtls_authority_host` uses that service authority instead;
 for native gRPC the `Host` header is synchronized with the resolved URI authority.
 
