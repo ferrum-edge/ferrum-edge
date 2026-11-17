@@ -410,6 +410,73 @@ fn redact_url_redacts_mongodb_auth_mechanism_properties_tokens() {
     assert!(redacted_ports.contains("AWS_SESSION_TOKEN:***"));
 }
 
+/// GHSA-wqrm-jcch-972x: URI builders percent-encode `:` and `,` inside
+/// `authMechanismProperties`, and drivers decode the value before splitting
+/// it. The scrubber must match the decoded properties, not the raw text.
+#[test]
+fn redact_url_redacts_percent_encoded_auth_mechanism_properties() {
+    let cases = [
+        // Encoded `:` delimiter (upper and lower case hex).
+        "authMechanismProperties=AWS_SESSION_TOKEN%3Afixture-session-value",
+        "authMechanismProperties=AWS_SESSION_TOKEN%3afixture-session-value",
+        // Encoded `,` between a benign and a credential-bearing property.
+        "authMechanismProperties=CANONICALIZE_HOST_NAME%3Atrue%2CAWS_SESSION_TOKEN%3Afixture-session-value",
+        "authMechanismProperties=CANONICALIZE_HOST_NAME:true%2cAWS_SESSION_TOKEN:fixture-session-value",
+        // Percent-encoded property name.
+        "authMechanismProperties=AWS_SESSION_TOK%45N:fixture-session-value",
+        // Doubly encoded name: still unreadable after one decode, so redacted.
+        "authMechanismProperties=AWS_SESSION_TOK%2545N:fixture-session-value",
+        // OIDC-style credential property.
+        "authMechanismProperties=ENVIRONMENT%3Aazure%2CTOKEN_RESOURCE%3Afixture-session-value",
+        // Doubly encoded delimiter: no decoded `:`, so the entry fails closed.
+        "authMechanismProperties=AWS_SESSION_TOKEN%253Afixture-session-value",
+        // Encoded key name as well as encoded delimiter.
+        "authMechanismPropert%69es=AWS_SESSION_TOKEN%3Afixture-session-value",
+    ];
+    for query in cases {
+        for prefix in [
+            // Single host: parsed by `url::Url`.
+            "mongodb://u:p@db0/ferrum?authMechanism=MONGODB-AWS&",
+            // Multi-host with ports: the fallback redactor.
+            "mongodb://u:p@db0:27017,db1:27017/ferrum?authMechanism=MONGODB-AWS&",
+        ] {
+            let redacted = redact_url(&format!("{prefix}{query}"));
+            assert!(
+                !redacted.contains("fixture-session-value"),
+                "encoded mechanism property leaked for case {query}"
+            );
+            assert!(
+                redacted.contains("authMechanism=MONGODB-AWS"),
+                "unrelated option was lost for case {query}"
+            );
+        }
+    }
+
+    // Benign properties stay readable once decoded; the credential is masked.
+    let redacted = redact_url(concat!(
+        "mongodb://u:p@db0/ferrum?authMechanismProperties=",
+        "CANONICALIZE_HOST_NAME%3Atrue%2CAWS_SESSION_TOKEN%3Afixture-session-value"
+    ));
+    assert!(
+        redacted
+            .contains("authMechanismProperties=CANONICALIZE_HOST_NAME:true,AWS_SESSION_TOKEN:***"),
+        "unexpected redaction shape: {redacted}"
+    );
+
+    // A malformed entry with no decoded delimiter is withheld whole.
+    let malformed = redact_url(
+        "mongodb://u:p@db0/ferrum?authMechanismProperties=SERVICE_NAME:mongodb%2Cfixture-bare-value",
+    );
+    assert!(
+        !malformed.contains("fixture-bare-value"),
+        "malformed entry leaked: {malformed}"
+    );
+    assert!(
+        malformed.contains("SERVICE_NAME:mongodb,***"),
+        "{malformed}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // extract_known_ids — tests
 // ---------------------------------------------------------------------------

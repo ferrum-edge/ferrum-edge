@@ -250,7 +250,7 @@ The reqwest request-phase and buffered classifier, `classify_reqwest_error`, app
 
 A `Capacity` / `FrameTooLong` / `MessageTooLong` error is always a size-policy violation, mapped directionally to `RequestBodyTooLarge` (client→backend) or `ResponseBodyTooLarge` (backend→client) with an RFC 6455 Close 1009. That holds even for a valid 63-bit payload length above `u32::MAX`: RFC 6455 §5.2 permits any 63-bit length — only the most-significant bit of the 64-bit extended length must be zero — so a large advertised length is not itself malformed. Genuine protocol junk (for example issue #4058's stray continuation frame, whose well-formed 63-bit length masks an invalid Continue opcode with no fragmented message in progress) is parsed as `Error::Protocol`, so `classify_boxed_error` reports `ProtocolError`.
 
-Handshake failures already populate `TransactionSummary.error_class` on the HTTP `log()` row. After a successful upgrade, in-session faults are classified into `WsDisconnectContext.error_class`. `stdout_logging` implements `on_ws_disconnect` and writes a second HTTP-family `TransactionSummary` JSON line using the admission-time handshake (`GET`/`101` for HTTP/1.1, `CONNECT`/`200` for RFC 8441/9220 Extended CONNECT, original client `request_path`) plus `error_class` from the disconnect context (BASE schema) so operators grepping access logs for `error_class` see the session-end class. `filter.errors_only` matches because `is_terminal_failure` is true when `error_class` is set. This is not the `websocket_disconnect` capability family used by `ws_logging`.
+Handshake failures already populate `TransactionSummary.error_class` on the HTTP `log()` row. A backend that answers the upgrade with its own `3xx`-`5xx` is not a handshake failure: the gateway relays that response with no `X-Gateway-Error`, logs it with the backend's status and no `error_class`, and charges the circuit breaker and backend admission by that status exactly as the HTTP path does, so a `4xx` refusal is never a backend failure (GHSA-7x2j-3389-2h35). A `2xx` other than `101`, an invalid `Sec-WebSocket-Accept`, and a malformed response stay the `502` `ProtocolError` / `RequestError` failure. After a successful upgrade, in-session faults are classified into `WsDisconnectContext.error_class`. `stdout_logging` implements `on_ws_disconnect` and writes a second HTTP-family `TransactionSummary` JSON line using the admission-time handshake (`GET`/`101` for HTTP/1.1, `CONNECT`/`200` for RFC 8441/9220 Extended CONNECT, original client `request_path`) plus `error_class` from the disconnect context (BASE schema) so operators grepping access logs for `error_class` see the session-end class. `filter.errors_only` matches because `is_terminal_failure` is true when `error_class` is set. This is not the `websocket_disconnect` capability family used by `ws_logging`.
 
 `GracefulRemoteClose` is shared with the HTTP/3 graceful-close path: operators see one label whether the peer closed an H3 connection with `H3_NO_ERROR` or a WS connection with a normal Close frame.
 
@@ -613,21 +613,44 @@ token:
 - plugin rejections (for example a `key_auth` `401`, an `access_control`
   `403`, a `rate_limiting` `429`, a request-validation `400`), in every plugin
   phase;
-- gateway policy fences (allowed methods, WebSocket connection limits,
+- gateway policy fences (allowed methods, route protocol admission, the gRPC
+  non-`POST` refusal, WebSocket connection limits,
   backend connection limits, and the HTTP/1.1 and HTTP/2 frontend admission
   fences: unverifiable HTTP/1 framing, withdrawn client-certificate trust,
   overload, stale configuration);
 - routing `404`s (no route matched) and mesh `REGISTRY_ONLY` route misses.
 
 gRPC Trailers-Only rejections (HTTP `200` with a non-zero `grpc-status`) count
-as error responses. A gRPC-Web rejection whose `grpc-status` is carried only in
-the body's trailer frame (an HTTP `200` head without `grpc-status`) is not
-recognized as an error when the head is stamped, so it carries no reference:
-such a rejection can be under-marked, but it never gets a false reference. A
+as error responses. So do gRPC-Web rejections (issue #7407), whose
+`grpc-status` is carried only in the body's trailer frame under an HTTP `200`
+head: the head cannot show the error, so each recording site says so when it
+records the rejection, and the stamp accepts the `200` gRPC-Web head
+(`application/grpc-web`, `application/grpc-web-text`) as the one it authored.
+The plugin and policy rejection funnel marks a request that keeps its gRPC-Web
+representation when the rejection's gRPC status is not `OK` (plugin
+rejections, `allowed_methods`, route protocol admission, the query trigger
+refusal, and the gRPC non-`POST` refusal, `grpc_post_required`); routing misses and mesh
+`REGISTRY_ONLY` misses mark it from the request's gRPC-Web classification,
+which is made before routing. The pre-plugin `allowed_methods` and route
+protocol admission refusals record the head the client gets (`200` for native
+gRPC Trailers-Only and gRPC-Web) even though their transaction log keeps the
+admission status (`405` / `403`), and HTTP/3 records them, and its gRPC
+non-`POST` refusal, before their heads are sent.
+The reference resolves with `status: 200`, the status the client saw. A
+gRPC-Web rejection without that record (no gRPC status, or `OK`) carries no
+reference: it can be under-marked, but it never gets a false reference. A
 response is gateway-authored only when its rejection site recorded it in the
 request's diagnostic slot before the head was written, and
-only on a head whose status is the one that rejection recorded (a rejection a
-later phase replaced marks nothing). An ordinary relayed backend `5xx` receives
+only on a head whose status is the one that rejection recorded, or the `200`
+head of a recorded gRPC-Web rejection (a rejection a later phase replaced
+marks nothing).
+
+Every stamped gRPC-Web response, tokened or not, also lists
+`x-ferrum-diagnostic-ref` in its `Access-Control-Expose-Headers` (next to
+`grpc-status`, `grpc-message` and `grpc-status-details-bin`), so a
+cross-origin browser `fetch()` client can read the reference without
+configuring `expose_headers`. The name is appended once, only to a response
+that already carries that field. An ordinary relayed backend `5xx` receives
 a compiled gateway token (`backend_timeout` for a relayed `504`, `backend_error`
 for any other `5xx`) and may carry a diagnostic reference when diagnostics are
 enabled. Backend `4xx` responses do not receive a reference.

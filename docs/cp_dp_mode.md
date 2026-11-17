@@ -216,9 +216,11 @@ marks trust reload degraded on authenticated `/health` and in the
 `ferrum_cp_dp_trust_reload_worker_stalled` without failing readiness inside the
 bound. At the bound the CP fails readiness, refuses new ConfigSync,
 MeshSubscribe, and xDS streams, and ends established ones with `trust_stale`.
-Admin-JWT-authenticated `/health`/`/status` also carry `active_generation`, a
-keyed HMAC-SHA-256 identifier for replica convergence. Metrics bearer tokens
-and metrics-allowlisted source addresses receive the remaining detailed trust
+`/health`/`/status` authenticated by a fleet-wide admin JWT that
+`FERRUM_ADMIN_JWT_SECRET` verified also carry `active_generation`, a keyed
+HMAC-SHA-256 identifier for replica convergence. Tokens verified by
+`FERRUM_ADMIN_JWT_VIEWER_SECRET`, metrics bearer tokens, and
+metrics-allowlisted source addresses receive the remaining detailed trust
 diagnostics with this field set to `null`. See
 [cp_namespace_tenancy.md](cp_namespace_tenancy.md#retention-of-an-unrevalidatable-verifier-is-bounded-issue-3813).
 

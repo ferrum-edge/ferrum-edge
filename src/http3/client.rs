@@ -769,7 +769,7 @@ pub(crate) fn collect_h3_response_headers(source: &http::HeaderMap) -> HashMap<S
         if connection_listed.iter().any(|n| n == name) {
             continue;
         }
-        if let Ok(value_str) = value.to_str() {
+        if let Some(value_str) = crate::proxy::backend_response_field_value_str(name, value) {
             let sep = if name == http::header::SET_COOKIE {
                 "\n"
             } else {

@@ -226,8 +226,9 @@ admission gate before either kind of hook, even if `allowed_methods` permits
 that method. H1, H2, and H3 share the ordinary-hook blind spots for unmatched
 404 and gRPC non-POST admission; matched-proxy `allowed_methods` 405 responses
 are included in transaction logs, unmatched 404 responses reach global
-`stdout_logging` as described above, and gRPC non-POST refusals are not yet
-logged. Unmatched-route 404s (and mesh `REGISTRY_ONLY` route-miss refusals) are
+`stdout_logging` as described above, and gRPC non-POST refusals are logged once
+with `rejection_phase: "grpc_post_required"` and the status the wire carries
+(`200` for native gRPC and gRPC-Web). Unmatched-route 404s (and mesh `REGISTRY_ONLY` route-miss refusals) are
 also counted on `/metrics` by the shared route-miss path as
 `ferrum_unmatched_requests_total`, independent of any plugin. Terminal
 transaction logging is separate from
@@ -1039,7 +1040,13 @@ WebSocket connections go through the normal HTTP plugin pipeline during the upgr
 
 Successful upgrade responses do not run the general asynchronous `after_proxy`
 chain. They run the ordered `apply_websocket_handshake_response_headers`
-boundary instead, with status 101 for H1 and 200 for H2/H3. The hook cannot
+boundary instead, with status 101 for H1 and 200 for H2/H3. The header map
+that boundary sees starts from the backend's own handshake response headers
+(its `101`, or a mesh peer's Extended CONNECT `200`), after the backend
+response strip (hop-by-hop, `Connection`-listed and gateway-owned diagnostic
+names), so a backend `Set-Cookie` on the upgrade reaches the client and
+response policy such as `security_headers.remove` governs it like any HTTP
+response header (issue #7391). The hook cannot
 reject or perform I/O after the backend has accepted the session. Ferrum then
 strips connection/framing/WebSocket transport fields, adds the authoritative
 H1 Upgrade fields or Extended CONNECT response, preserves the verified backend

@@ -2813,6 +2813,49 @@ pub mod _test_support {
         crate::proxy::websocket_backend_failure_status_and_body(class)
     }
 
+    /// The backend refusal (status, collected headers, relayed body) the H1/H2
+    /// and H3 WebSocket bridges relay for a failed upgrade dial, or `None` when
+    /// the failure is a gateway-side `502`/`504` (GHSA-7x2j-3389-2h35).
+    pub fn websocket_backend_refusal_for_test(
+        error: &(dyn std::error::Error + 'static),
+    ) -> Option<(u16, HashMap<String, String>, bytes::Bytes)> {
+        crate::proxy::websocket_backend_refusal(error)
+            .map(|refusal| (refusal.status.as_u16(), refusal.headers, refusal.body))
+    }
+
+    /// The H1/H2 client response for a relayed WebSocket backend refusal, after
+    /// the given initial response header policy plugins.
+    pub fn websocket_backend_refusal_response_for_test(
+        error: &(dyn std::error::Error + 'static),
+        initial_response_header_policy_plugins: &[Arc<dyn crate::plugins::Plugin>],
+    ) -> Option<hyper::Response<crate::proxy::ProxyBody>> {
+        crate::proxy::websocket_backend_refusal(error).map(|refusal| {
+            crate::proxy::build_websocket_backend_refusal_response(
+                refusal,
+                initial_response_header_policy_plugins,
+            )
+        })
+    }
+
+    /// The validated client Host a direct WebSocket dial sends under
+    /// `preserve_host_header` (issue #7392), or `None` for the backend authority.
+    pub fn websocket_preserved_backend_host_for_test(
+        preserve_host_header: bool,
+        client_host: Option<&str>,
+    ) -> Option<String> {
+        crate::proxy::websocket_preserved_backend_host(preserve_host_header, client_host)
+            .map(str::to_owned)
+    }
+
+    /// Backend response trailers as the buffered native gRPC path collects them.
+    pub fn collect_buffered_grpc_trailers_for_test(
+        source: &http::HeaderMap,
+    ) -> HashMap<String, String> {
+        let mut collected = HashMap::new();
+        crate::proxy::grpc_proxy::collect_buffered_grpc_trailers(source, &mut collected);
+        collected
+    }
+
     pub fn grpc_bridge_failure_health_for_test(
         err: &crate::proxy::grpc_proxy::GrpcProxyError,
         error_class: crate::retry::ErrorClass,
@@ -2831,6 +2874,19 @@ pub mod _test_support {
         response: hyper::Response<http_body_util::Full<bytes::Bytes>>,
     ) -> bytes::Bytes {
         crate::admin::collect_guarded_admin_response_for_test(response).await
+    }
+
+    /// `GET /charges` exactly as the admin dispatcher answers it for
+    /// `authorization` (collector-scope decision included), rendered from
+    /// `registry` instead of the process-global one. `None` when the token
+    /// does not verify.
+    pub async fn charges_response_for_test(
+        jwt_manager: &crate::admin::jwt_auth::JwtManager,
+        authorization: &str,
+        registry: std::sync::Arc<crate::plugins::api_chargeback::ChargebackRegistry>,
+        query: Option<&str>,
+    ) -> Option<hyper::Response<http_body_util::Full<bytes::Bytes>>> {
+        crate::admin::charges_response_for_test(jwt_manager, authorization, registry, query).await
     }
 
     /// Wrap an admin response as the admin listener does, then drop it
@@ -6024,9 +6080,40 @@ pub mod _test_support {
             4_096,
             None,
             None,
+            None,
         )
         .await?;
         Ok(handshake.stream)
+    }
+
+    /// Dial a direct WebSocket backend through the production
+    /// `connect_websocket_backend`, sending `preserved_host` as `Host` exactly
+    /// as the bridges do under `preserve_host_header` (issue #7392). Returns
+    /// the backend's collected handshake response headers (issue #7391), or
+    /// the dial error unchanged so a test can classify a backend refusal.
+    pub async fn connect_websocket_backend_headers_for_test(
+        backend_url: &str,
+        proxy: &crate::config::types::Proxy,
+        preserved_host: Option<&str>,
+    ) -> Result<HashMap<String, String>, Box<dyn std::error::Error + Send + Sync>> {
+        let env_config = crate::config::EnvConfig::default();
+        let tls_configs = websocket_backend_tls_configs_for_test(&env_config);
+        let handshake = crate::proxy::connect_websocket_backend(
+            backend_url,
+            proxy,
+            &env_config,
+            &[],
+            &tls_configs,
+            65_536,
+            262_144,
+            4_096,
+            None,
+            None,
+            preserved_host,
+        )
+        .await?;
+        let mut handshake = crate::proxy::WsBackendHandshake::Direct(Box::new(handshake));
+        Ok(handshake.take_backend_response_headers())
     }
 
     /// Exercise the production bounded WebSocket close/queued-echo path.
@@ -6443,6 +6530,7 @@ pub mod _test_support {
             65_536,
             262_144,
             4_096,
+            None,
             None,
             None,
         )
@@ -19090,6 +19178,17 @@ pub mod _test_support {
         /// increment this long-standing metric.
         pub fn watch_idle_relists(&self) -> u64 {
             self.metrics.snapshot().watch_idle_relists
+        }
+
+        /// Reflector rebuilds a demand-driven revision-evidence refresh started
+        /// (issue #7399), counted apart from idle relists.
+        pub fn watch_evidence_refresh_relists(&self) -> u64 {
+            self.metrics.snapshot().watch_evidence_refresh_relists
+        }
+
+        /// Watch `Delete` events the production watcher observed (issue #4491).
+        pub fn watch_deletes(&self) -> u64 {
+            self.metrics.snapshot().watch_deletes
         }
 
         /// Watch stream errors the production watcher counted (issue #4491),

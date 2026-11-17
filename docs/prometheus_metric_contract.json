@@ -1030,7 +1030,7 @@
   {
     "name": "ferrum_api_chargeback_uncollected_retained_entries",
     "type": "gauge",
-    "help": "Billing rows the last eviction pass kept past stale_entry_ttl_seconds because no completed /charges export has collected their current counters.",
+    "help": "Billing rows the last eviction pass kept past stale_entry_ttl_seconds because no /charges delivery to a charges:collect-scoped collector has collected their current counters.",
     "labels": [],
     "subsystem": "api_chargeback",
     "export_surface": "/charges",
@@ -2537,6 +2537,16 @@
     "name": "ferrum_k8s_controller_watch_errors_total",
     "type": "counter",
     "help": "Kubernetes watch stream errors observed across every watched scope, including refused initial lists and failed watch starts.",
+    "labels": [],
+    "subsystem": "k8s_controller",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "conditional"
+  },
+  {
+    "name": "ferrum_k8s_controller_watch_evidence_refresh_relists_total",
+    "type": "counter",
+    "help": "Watch-scope reflector rebuilds started by a demand-driven revision-evidence refresh; the scope's live watch keeps delivering while the replacement lists.",
     "labels": [],
     "subsystem": "k8s_controller",
     "export_surface": "/metrics",

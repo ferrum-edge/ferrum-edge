@@ -101,7 +101,7 @@ use tracing::warn;
 
 use crate::config_sources::k8s::{
     K8sObject, K8sTranslateError, K8sTranslation, K8sTranslationOptions, SidecarOutboundPolicy,
-    classify_sidecar_outbound_traffic_policy, route_local_fault_delay_for_rule,
+    classify_sidecar_outbound_traffic_policy, refused_sidecar, route_local_fault_delay_for_rule,
     service_entry_endpoint_is_network_gateway_only, service_entry_port_protocol_is_udp,
     service_entry_spec_has_unresolvable_stream_wildcard_host, sidecar_selector_from_istio,
     translate_k8s_objects_collecting_skips, workload_entry_service_key_from_host,
@@ -955,10 +955,28 @@ fn authorization_policy_status(
             }
         }
         Err(error) => {
-            let message = format!("Ferrum rejected this AuthorizationPolicy: {error}");
+            // GHSA-2r85-85hh-23mw: the rejected policy is published as a
+            // fail-closed marker (`refused_authorization_policy`), so state its
+            // effect on the workloads it selects.
+            let action_value = object.spec.get("action");
+            let (enforcement, consequence) = match action_value.map(Value::as_str) {
+                None | Some(Some("ALLOW")) => (
+                    "allow_nothing",
+                    "; it is enforced as allow-nothing until it is fixed (fail closed): the \
+                     workloads it selects accept only what their other ALLOW policies grant",
+                ),
+                Some(Some("AUDIT")) => ("none", ""),
+                Some(_) => (
+                    "deny_all",
+                    "; every request and connection to the workloads it selects is denied \
+                     until it is fixed (fail closed)",
+                ),
+            };
+            let message = format!("Ferrum rejected this AuthorizationPolicy: {error}{consequence}");
             let detail = json!({
                 "translation": {
                     "action": action,
+                    "enforcement": enforcement,
                     "error": format!("{error}"),
                 }
             });
@@ -1034,11 +1052,18 @@ fn peer_authentication_status(
             (true, "Accepted", message, Some(detail))
         }
         Err(error) => {
-            let message = format!("Ferrum rejected this PeerAuthentication: {error}");
+            // GHSA-2r85-85hh-23mw: the rejected resource is published as a
+            // STRICT marker (`refused_peer_authentication`) instead of being
+            // dropped, which would let its workloads fall back to a laxer tier.
+            let message = format!(
+                "Ferrum rejected this PeerAuthentication: {error}; the workloads it selects are \
+                 held at STRICT mTLS until it is fixed (fail closed)"
+            );
             let detail = json!({
                 "translation": {
                     "scope": scope,
                     "configured_mtls_mode": resolved_mode,
+                    "enforcement": "strict",
                     "error": format!("{error}"),
                 }
             });
@@ -2035,9 +2060,11 @@ fn workload_entry_status(
 /// present-but-unrepresentable block is reported in `deferred_fields` with the
 /// enforced fail-closed outcome (`REGISTRY_ONLY`) named explicitly; the
 /// classification comes from the same shared predicate the translator applies.
-/// A REJECTED Sidecar reports the classified mode with an explicit
-/// `outbound_traffic_policy_enforced: false` — a dropped resource enforces
-/// nothing, and an absent qualifier could read as "enforced".
+/// A REJECTED Sidecar is published as a fail-closed marker
+/// ([`refused_sidecar`], GHSA-2r85-85hh-23mw), so its detail reports what that
+/// marker enforces: its `outbound_traffic_policy` (REGISTRY_ONLY when `egress`
+/// did not translate), `outbound_traffic_policy_enforced` under the same gate as
+/// an accepted Sidecar, and `egress_blocked` / `ingress_blocked`.
 fn sidecar_status(
     object: &K8sObject,
     result: Result<&K8sTranslation, &K8sTranslateError>,
@@ -2150,18 +2177,35 @@ fn sidecar_status(
             accepted_status(object, true, "Accepted", &message, Some(detail))
         }
         Err(error) => {
-            let message = format!("Ferrum rejected this Sidecar: {error}");
-            // A rejected Sidecar is dropped from the translation entirely, so it
-            // enforces nothing regardless of the rollout gate. State that
-            // explicitly: an `outbound_traffic_policy` with no
-            // `outbound_traffic_policy_enforced` sibling reads as enforced to
-            // anyone (or anything) diffing the two Sidecar detail shapes.
+            // GHSA-2r85-85hh-23mw: a rejected Sidecar is not dropped (that would
+            // widen the egress scope, REGISTRY_ONLY registry, and inbound
+            // listeners of the workloads it selects). Translation publishes the
+            // fail-closed marker built here, under the same rollout gate as an
+            // accepted Sidecar, so report what that marker enforces.
+            let marker = refused_sidecar(object);
+            // Whether the published marker blocks all egress / all inbound
+            // listeners (an untranslatable block, or an explicit empty one).
+            let egress_blocked = !marker.egress_inherits_defaults && marker.egress.is_empty();
+            let ingress_blocked = marker.ingress_declared && marker.ingress.is_empty();
+            let marker_outbound = SidecarOutboundPolicy {
+                policy: marker.outbound_traffic_policy,
+                deferred: None,
+            };
+            let message = format!(
+                "Ferrum rejected this Sidecar: {error}; it is enforced fail closed until it is \
+                 fixed: a block that does not translate takes its most restrictive form \
+                 (egress: [] with REGISTRY_ONLY, ingress: []) for the workloads it selects"
+            );
             let detail = json!({
                 "translation": {
                     "scope": scope,
                     "egress_entries": egress_entry_count,
-                    "outbound_traffic_policy": outbound_mode,
-                    "outbound_traffic_policy_enforced": false,
+                    "outbound_traffic_policy": sidecar_outbound_policy_label(&marker_outbound),
+                    "outbound_traffic_policy_enforced":
+                        marker.outbound_traffic_policy.is_some() && ingress_enforced,
+                    "enforcement": "fail_closed",
+                    "egress_blocked": egress_blocked,
+                    "ingress_blocked": ingress_blocked,
                     "error": format!("{error}"),
                 }
             });

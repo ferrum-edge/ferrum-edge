@@ -796,6 +796,15 @@ fn allow_nothing_rule() -> MeshRule {
     }
 }
 
+/// A DENY rule with no source, operation, or condition: it matches every
+/// request and connection, like Istio's `rules: [{}]`.
+fn deny_everything_rule() -> MeshRule {
+    MeshRule {
+        action: PolicyAction::Deny,
+        ..MeshRule::default()
+    }
+}
+
 fn mesh_rules(
     object: &K8sObject,
     rule: &Value,
@@ -1283,21 +1292,96 @@ fn peer_authentication(
 ///     [`classify_sidecar_outbound_traffic_policy`] so the status writer's
 ///     `deferred_fields` report can never disagree with what is enforced.
 fn sidecar(object: &K8sObject) -> Result<MeshSidecar, K8sTranslateError> {
-    let workload_selector = match object.spec.get("workloadSelector") {
-        Some(selector_value) => {
-            let labels = sidecar_selector_from_istio(Some(selector_value));
-            if labels.is_empty() {
-                None
-            } else {
-                Some(WorkloadSelector {
-                    labels,
-                    namespace: Some(object.metadata.namespace.clone()),
-                })
-            }
-        }
-        None => None,
-    };
+    let workload_selector = sidecar_workload_selector(object);
+    let (egress_inherits_defaults, egress) = sidecar_egress(object)?;
+    let (ingress_declared, ingress) = sidecar_ingress(object)?;
 
+    // `spec.outboundTrafficPolicy` (issue #3262). A present-but-unrepresentable
+    // block resolves to REGISTRY_ONLY rather than rejecting the resource — see
+    // `classify_sidecar_outbound_traffic_policy` for why dropping the Sidecar
+    // would WIDEN egress instead of failing closed.
+    let outbound_policy = classify_sidecar_outbound_traffic_policy(&object.spec);
+    if let Some(reason) = outbound_policy.deferred {
+        report_sidecar_outbound_policy_degradation(
+            &object.metadata.namespace,
+            &object.metadata.name,
+            reason,
+        );
+    }
+
+    Ok(MeshSidecar {
+        name: object.metadata.name.clone(),
+        namespace: object.metadata.namespace.clone(),
+        workload_selector,
+        egress_inherits_defaults,
+        egress,
+        ingress_declared,
+        ingress,
+        outbound_traffic_policy: outbound_policy.policy,
+    })
+}
+
+/// Fail-closed stand-in for a Sidecar that translation refused
+/// (GHSA-2r85-85hh-23mw).
+///
+/// Dropping a refused Sidecar WIDENS the workloads it selects: their egress
+/// scope and `REGISTRY_ONLY` registry fall back to the namespace or mesh
+/// default, and a declared `ingress[]` falls back to the default inbound
+/// listeners. So the resource keeps its place in Sidecar selection (same name,
+/// namespace and `workloadSelector`) and every block that could not be
+/// translated takes its most restrictive form:
+///
+/// * a declared `egress` that does not translate becomes an explicit empty
+///   `egress: []` (block all) with `outboundTrafficPolicy` `REGISTRY_ONLY`;
+/// * a declared `ingress` that does not translate becomes an explicit empty
+///   `ingress: []`, which replaces the default inbound listeners with none.
+///
+/// A block that does translate, or that was omitted, is published exactly as
+/// an accepted Sidecar would publish it. The skip map still carries the
+/// translation error, so status keeps reporting the resource as rejected.
+pub(crate) fn refused_sidecar(object: &K8sObject) -> MeshSidecar {
+    let workload_selector = sidecar_workload_selector(object);
+    let (egress_inherits_defaults, egress, outbound_traffic_policy) = match sidecar_egress(object) {
+        Ok((inherits, egress)) => (
+            inherits,
+            egress,
+            classify_sidecar_outbound_traffic_policy(&object.spec).policy,
+        ),
+        Err(_) => (
+            false,
+            Vec::new(),
+            Some(crate::modes::mesh::config::OutboundTrafficPolicy::RegistryOnly),
+        ),
+    };
+    let (ingress_declared, ingress) =
+        sidecar_ingress(object).unwrap_or_else(|_| (true, Vec::new()));
+    MeshSidecar {
+        name: object.metadata.name.clone(),
+        namespace: object.metadata.namespace.clone(),
+        workload_selector,
+        egress_inherits_defaults,
+        egress,
+        ingress_declared,
+        ingress,
+        outbound_traffic_policy,
+    }
+}
+
+fn sidecar_workload_selector(object: &K8sObject) -> Option<WorkloadSelector> {
+    let selector_value = object.spec.get("workloadSelector")?;
+    let labels = sidecar_selector_from_istio(Some(selector_value));
+    if labels.is_empty() {
+        None
+    } else {
+        Some(WorkloadSelector {
+            labels,
+            namespace: Some(object.metadata.namespace.clone()),
+        })
+    }
+}
+
+/// Translate `spec.egress[]`, returning `(egress_inherits_defaults, egress)`.
+fn sidecar_egress(object: &K8sObject) -> Result<(bool, Vec<MeshSidecarEgress>), K8sTranslateError> {
     let mut egress = Vec::new();
     let mut egress_inherits_defaults = false;
     match object.spec.get("egress") {
@@ -1353,7 +1437,13 @@ fn sidecar(object: &K8sObject) -> Result<MeshSidecar, K8sTranslateError> {
             }
         }
     }
+    Ok((egress_inherits_defaults, egress))
+}
 
+/// Translate `spec.ingress[]`, returning `(ingress_declared, ingress)`.
+fn sidecar_ingress(
+    object: &K8sObject,
+) -> Result<(bool, Vec<MeshSidecarIngress>), K8sTranslateError> {
     // `spec.ingress[]` — custom inbound listeners. Each entry MUST declare a
     // `port.number`; `defaultEndpoint` and everything else are optional. We
     // translate the entry shape here (parse + validate the required fields) and
@@ -1425,30 +1515,7 @@ fn sidecar(object: &K8sObject) -> Result<MeshSidecar, K8sTranslateError> {
             });
         }
     }
-
-    // `spec.outboundTrafficPolicy` (issue #3262). A present-but-unrepresentable
-    // block resolves to REGISTRY_ONLY rather than rejecting the resource — see
-    // `classify_sidecar_outbound_traffic_policy` for why dropping the Sidecar
-    // would WIDEN egress instead of failing closed.
-    let outbound_policy = classify_sidecar_outbound_traffic_policy(&object.spec);
-    if let Some(reason) = outbound_policy.deferred {
-        report_sidecar_outbound_policy_degradation(
-            &object.metadata.namespace,
-            &object.metadata.name,
-            reason,
-        );
-    }
-
-    Ok(MeshSidecar {
-        name: object.metadata.name.clone(),
-        namespace: object.metadata.namespace.clone(),
-        workload_selector,
-        egress_inherits_defaults,
-        egress,
-        ingress_declared,
-        ingress,
-        outbound_traffic_policy: outbound_policy.policy,
-    })
+    Ok((ingress_declared, ingress))
 }
 
 fn request_authentication(
@@ -1495,17 +1562,94 @@ pub(crate) fn refused_request_authentication(
     options: &K8sTranslationOptions,
     object: &K8sObject,
 ) -> MeshRequestAuthentication {
+    MeshRequestAuthentication {
+        refused: true,
+        name: object.metadata.name.clone(),
+        namespace: object.metadata.namespace.clone(),
+        scope: refused_policy_scope(options, object),
+        jwt_rules: Vec::new(),
+    }
+}
+
+/// Scope a refused security resource's fail-closed marker.
+///
+/// The resource's own `selector` scope when it declares no `targetRef(s)`.
+/// A refused resource's attachment cannot be trusted to resolve (it may be the
+/// reason it was refused), so a `targetRef(s)` resource covers its namespace,
+/// or the mesh in the Istio root namespace: the narrowest scope that still
+/// contains every target it could name. A selector that does not parse also
+/// falls back to that scope.
+fn refused_policy_scope(options: &K8sTranslationOptions, object: &K8sObject) -> PolicyScope {
     let selector = if has_istio_target_refs(&object.spec) {
         None
     } else {
         object.spec.get("selector")
     };
-    MeshRequestAuthentication {
-        refused: true,
+    istio_policy_scope(options, object, selector)
+}
+
+/// Fail-closed stand-in for an AuthorizationPolicy that translation refused
+/// (GHSA-2r85-85hh-23mw).
+///
+/// A refused policy used to be dropped from the published configuration, which
+/// removes enforcement from every workload it selects: a refused DENY stops
+/// denying, a refused CUSTOM stops delegating to its external authorizer, and a
+/// refused ALLOW that was a workload's only ALLOW removes the implicit-deny
+/// floor, so every caller is allowed. Ferrum cannot enforce the resource
+/// faithfully, so it is published under its own name and scope
+/// ([`refused_policy_scope`]) with one rule that never grants more than the
+/// resource did:
+///
+/// * `ALLOW` (or an omitted action): Istio's allow-nothing rule. It keeps the
+///   implicit-deny floor and grants nothing, so the workload accepts only what
+///   its other ALLOW policies grant.
+/// * `DENY`, `CUSTOM`, or an action Ferrum cannot read: a DENY rule with no
+///   conditions, which denies every request and connection to the scope. For
+///   CUSTOM this matches the runtime rule that a delegation which cannot be
+///   executed denies.
+/// * `AUDIT` changes no decision, so it publishes nothing (`None`).
+///
+/// The skip map still carries the translation error, so status keeps reporting
+/// the resource as rejected.
+pub(crate) fn refused_authorization_policy(
+    options: &K8sTranslationOptions,
+    object: &K8sObject,
+) -> Option<MeshPolicy> {
+    let rule = match object.spec.get("action") {
+        None => allow_nothing_rule(),
+        Some(action) => match action.as_str() {
+            Some("ALLOW") => allow_nothing_rule(),
+            Some("AUDIT") => return None,
+            _ => deny_everything_rule(),
+        },
+    };
+    Some(MeshPolicy {
         name: object.metadata.name.clone(),
         namespace: object.metadata.namespace.clone(),
-        scope: istio_policy_scope(options, object, selector),
-        jwt_rules: Vec::new(),
+        scope: refused_policy_scope(options, object),
+        rules: vec![rule],
+    })
+}
+
+/// Fail-closed stand-in for a PeerAuthentication that translation refused
+/// (GHSA-2r85-85hh-23mw).
+///
+/// Dropping a refused PeerAuthentication lets the workloads it selects fall
+/// back to the next tier's mode (or Ferrum's `PERMISSIVE` default), so a
+/// refused workload-level `STRICT` would admit plaintext. The resource is
+/// published under its own name and selector scope at `STRICT` with no port
+/// overrides. Within one tier the most restrictive mode wins, so the marker
+/// can only tighten inbound mTLS for the workloads it selects.
+pub(crate) fn refused_peer_authentication(
+    options: &K8sTranslationOptions,
+    object: &K8sObject,
+) -> PeerAuthentication {
+    PeerAuthentication {
+        name: object.metadata.name.clone(),
+        namespace: object.metadata.namespace.clone(),
+        scope: istio_policy_scope(options, object, object.spec.get("selector")),
+        mtls_mode: MtlsMode::Strict,
+        port_overrides: HashMap::new(),
     }
 }
 
@@ -7529,11 +7673,11 @@ pub(crate) struct SidecarOutboundPolicy {
 ///     `mode: null` handling below): the operator declared no egress proxy, so
 ///     the declared `mode` is honored.
 ///
-/// The resource is never REJECTED over this field. A rejected Sidecar is dropped
-/// from the translation entirely (`translate_k8s_objects_collecting_skips` skips
-/// it and retries), which would also drop its `egress` narrowing and thereby
-/// WIDEN both the workload's slice service view and the `REGISTRY_ONLY` registry
-/// derived from it — the opposite of failing closed.
+/// The resource is never REJECTED over this field. A rejected Sidecar used to
+/// be dropped from the translation, which widened egress; it is now published
+/// as a fail-closed marker ([`refused_sidecar`], GHSA-2r85-85hh-23mw). Even so,
+/// `REGISTRY_ONLY` is already this field's exact fail-closed reading, so the
+/// resource stays accepted and reports the degradation in `deferred_fields`.
 pub(crate) fn classify_sidecar_outbound_traffic_policy(spec: &Value) -> SidecarOutboundPolicy {
     use crate::modes::mesh::config::OutboundTrafficPolicy;
 
