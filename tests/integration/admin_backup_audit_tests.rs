@@ -120,7 +120,7 @@ fn token(subject: &str, role: Option<&str>) -> String {
     encode(
         &Header::new(jsonwebtoken::Algorithm::HS256),
         &claims,
-        &EncodingKey::from_secret(JWT_SECRET.as_bytes()),
+        &EncodingKey::from_secret(JWT_SECRET.as_bytes()).unwrap(),
     )
     .unwrap()
 }
@@ -142,7 +142,7 @@ fn token_with_ns(subject: &str, ns: &str) -> String {
     encode(
         &Header::new(jsonwebtoken::Algorithm::HS256),
         &claims,
-        &EncodingKey::from_secret(JWT_SECRET.as_bytes()),
+        &EncodingKey::from_secret(JWT_SECRET.as_bytes()).unwrap(),
     )
     .unwrap()
 }

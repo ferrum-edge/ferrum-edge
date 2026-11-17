@@ -160,7 +160,7 @@ fn mint_with_exp(
     encode(
         &header,
         &claims,
-        &EncodingKey::from_secret(secret.as_bytes()),
+        &EncodingKey::from_secret(secret.as_bytes()).unwrap(),
     )
     .expect("test JWT must encode")
 }
@@ -191,7 +191,7 @@ fn mint_with_nbf(
     encode(
         &header,
         &claims,
-        &EncodingKey::from_secret(secret.as_bytes()),
+        &EncodingKey::from_secret(secret.as_bytes()).unwrap(),
     )
     .expect("test JWT must encode")
 }
@@ -2241,7 +2241,7 @@ async fn unauthenticated_failures_do_not_disclose_key_inventory() {
         encode(
             &header,
             &claims,
-            &EncodingKey::from_secret(TENANT_A_SECRET.as_bytes()),
+            &EncodingKey::from_secret(TENANT_A_SECRET.as_bytes()).unwrap(),
         )
         .expect("test JWT must encode")
     };

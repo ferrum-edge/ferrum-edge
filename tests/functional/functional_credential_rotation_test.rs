@@ -294,7 +294,7 @@ fn generate_consumer_jwt(consumer_username: &str, secret: &str, exp_offset_secs:
         "exp": (now + chrono::Duration::seconds(exp_offset_secs)).timestamp(),
     });
     let header = Header::new(jsonwebtoken::Algorithm::HS256);
-    let key = EncodingKey::from_secret(secret.as_bytes());
+    let key = EncodingKey::from_secret(secret.as_bytes()).unwrap();
     encode(&header, &claims, &key).expect("Failed to encode JWT")
 }
 

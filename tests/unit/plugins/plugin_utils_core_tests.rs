@@ -757,7 +757,7 @@ fn jwt_verifier_peeks_issuer_without_verifying_signature() {
     let token = encode(
         &Header::default(),
         &json!({"iss": "https://issuer", "exp": 9_999_999_999u64}),
-        &EncodingKey::from_secret(b"secret"),
+        &EncodingKey::from_secret(b"secret").unwrap(),
     )
     .expect("test token should encode");
 

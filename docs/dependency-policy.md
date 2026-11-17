@@ -1207,7 +1207,7 @@ Rules:
   feature pair. An inline selection would win on both profiles.
 - **`jsonwebtoken` is the one deliberate exception.** It selects `aws_lc_rs`
   inline, identically on both profiles, and `rust_crypto` is never enabled.
-  jsonwebtoken 11 picks its provider automatically only when exactly one
+  jsonwebtoken 12 picks its provider automatically only when exactly one
   backend is compiled, so one inline selection keeps that true for every
   feature combination. On a `fips` build, `aws-lc-rs/fips` unifies onto the
   same `aws-lc-rs`, so JWTs are signed and verified in the validated module.

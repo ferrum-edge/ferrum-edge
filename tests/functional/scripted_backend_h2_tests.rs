@@ -5612,7 +5612,7 @@ fn grpc_early_response_authorization() -> String {
     let token = jsonwebtoken::encode(
         &jsonwebtoken::Header::new(jsonwebtoken::Algorithm::HS256),
         &json!({"sub": "affinity-consumer", "iat": now, "exp": now + 600}),
-        &jsonwebtoken::EncodingKey::from_secret(GRPC_EARLY_RESPONSE_JWT_SECRET.as_bytes()),
+        &jsonwebtoken::EncodingKey::from_secret(GRPC_EARLY_RESPONSE_JWT_SECRET.as_bytes()).unwrap(),
     )
     .expect("consumer JWT with active authorization lifetime");
     format!("Bearer {token}")

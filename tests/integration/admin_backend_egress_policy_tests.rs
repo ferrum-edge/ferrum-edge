@@ -44,7 +44,7 @@ fn token(secret: &str, additional: Value) -> String {
     encode(
         &Header::new(Algorithm::HS256),
         &claims,
-        &EncodingKey::from_secret(secret.as_bytes()),
+        &EncodingKey::from_secret(secret.as_bytes()).unwrap(),
     )
     .unwrap()
 }

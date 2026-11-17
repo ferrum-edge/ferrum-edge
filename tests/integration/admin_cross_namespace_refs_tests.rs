@@ -86,7 +86,7 @@ fn make_token(config: &TestConfig) -> String {
     encode(
         &Header::new(jsonwebtoken::Algorithm::HS256),
         &claims,
-        &EncodingKey::from_secret(config.jwt_secret.as_bytes()),
+        &EncodingKey::from_secret(config.jwt_secret.as_bytes()).unwrap(),
     )
     .unwrap()
 }

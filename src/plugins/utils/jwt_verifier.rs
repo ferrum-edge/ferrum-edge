@@ -141,11 +141,16 @@ fn decode_with_validation(
 
 /// Re-check the registered `aud` claim at Ferrum's verified-claims boundary.
 ///
-/// `jsonwebtoken` rejects a parsed `aud` string or string array that does not
-/// match (or, with no audiences configured, any parsed `aud`), but it treats a
-/// malformed value — `null`, a number, an object, or an array with non-string
-/// members — as absent or unparsed and accepts the token. RFC 7519 §4.1.3
-/// defines `aud` as a `StringOrURI` or an array of them, so:
+/// With `validate_aud` on (the default, which every caller of this re-check
+/// keeps), `jsonwebtoken` 12 rejects a parsed `aud` string or string array
+/// that does not match (or, with no audiences configured, any parsed `aud`) as
+/// `InvalidAudience`, and a number, an object, or an array with a non-string
+/// member as `InvalidClaimFormat` (`MissingRequiredClaim` when `aud` is
+/// required). Only
+/// JSON `null` is read as absent, so with no audiences configured a token
+/// carrying `"aud": null` passes the library; this re-check is what refuses it,
+/// and it backs up the library for every other shape. RFC 7519 §4.1.3 defines
+/// `aud` as a `StringOrURI` or an array of them, so:
 ///
 /// - an absent `aud` is acceptable (presence is enforced through
 ///   `required_spec_claims` whenever audiences are configured);
