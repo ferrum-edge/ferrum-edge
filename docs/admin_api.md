@@ -2689,6 +2689,8 @@ The response is cached briefly (`FERRUM_METRICS_RUNTIME_CACHE_MS`, default `1000
 
 The `/charges` endpoint exposes per-consumer API usage charges tracked by the `api_chargeback` plugin. It requires the same admin JWT authentication as other sensitive admin endpoints.
 
+Only a **designated billing collector** acknowledges delivery: a token whose `scope` claim grants `charges:collect` (a space-delimited string such as `"scope": "charges:collect"`, or an array). Its delivered responses count toward the two-hand-off rule that lets idle rows past `stale_entry_ttl_seconds` be evicted (see [plugins.md](plugins.md#api_chargeback)). Every other authenticated read gets the same document without side effects, so a dashboard, an operator `curl`, or any `FERRUM_ADMIN_JWT_VIEWER_SECRET` token (whose scope claims grant nothing) cannot make rows the collector never received evictable (GHSA-jjvr-vvwv-8qmh). The `role` claim never implies the scope; a `viewer` token with `charges:collect` is a sufficient collector credential.
+
 Monetary samples convert the stored `u64` counter to IEEE-754 binary64 and
 multiply it by the configured binary64 unit price (accepted rates are finite
 and ≤ `1e288`). Counters above 2^53 follow normal binary64 rounding; Ferrum

@@ -2070,6 +2070,91 @@ async fn render_charges_off_worker(
     }
 }
 
+/// Whether a verified admin token is a designated `/charges` billing
+/// collector: its `scope` claim grants
+/// [`plugins::api_chargeback::CHARGES_COLLECT_SCOPE`]. Tier-aware through
+/// [`crate::admin::jwt_auth::VerifiedAdminToken::grants_scope`], so a token
+/// verified by `FERRUM_ADMIN_JWT_VIEWER_SECRET` is never a collector, and the
+/// `role` claim never implies the scope (GHSA-jjvr-vvwv-8qmh).
+fn charges_collection_granted(token: &crate::admin::jwt_auth::VerifiedAdminToken) -> bool {
+    token.grants_scope(plugins::api_chargeback::CHARGES_COLLECT_SCOPE)
+}
+
+/// `GET /charges`, after authentication and the namespace-bounded global-route
+/// gate.
+///
+/// Every authenticated caller receives the same document. Only a designated
+/// collector (`acknowledges_collection`, from [`charges_collection_granted`])
+/// also carries the delivery acknowledgement that counts toward the
+/// two-hand-off rule for idle-row eviction (issue #5276). Dashboards, drift
+/// tools, viewer-key tokens, and ad-hoc reads are side-effect free, so they
+/// cannot make rows the billing collector never saw evictable
+/// (GHSA-jjvr-vvwv-8qmh).
+async fn charges_response(
+    registry: Option<Arc<plugins::api_chargeback::ChargebackRegistry>>,
+    query: Option<&str>,
+    acknowledges_collection: bool,
+) -> Response<Full<Bytes>> {
+    let format = match parse_chargeback_format(query) {
+        Ok(format) => format,
+        Err(resp) => return *resp,
+    };
+    let rendered = match registry {
+        Some(registry) => render_charges_off_worker(registry, format).await,
+        None => {
+            let empty = match format {
+                ChargebackFormat::Json => crate::plugins::api_chargeback::empty_charges_json(),
+                ChargebackFormat::Prometheus => {
+                    crate::plugins::api_chargeback::empty_charges_prometheus()
+                }
+            };
+            empty.map(|output| (output, None))
+        }
+    };
+    match rendered {
+        Ok((output, delivery_ack)) => {
+            let content_type = match format {
+                ChargebackFormat::Json => "application/json",
+                ChargebackFormat::Prometheus => "text/plain; version=0.0.4; charset=utf-8",
+            };
+            match with_admin_security_headers(Response::builder())
+                .status(StatusCode::OK)
+                .header("Content-Type", content_type)
+                .body(Full::new(Bytes::from(output)))
+            {
+                Ok(mut resp) => {
+                    // Collection is acknowledged by the connection's body
+                    // wrapper once it has taken this document, never here at
+                    // render time (issue #5276), and only for a designated
+                    // collector (GHSA-jjvr-vvwv-8qmh).
+                    if acknowledges_collection && let Some(ack) = delivery_ack {
+                        resp.extensions_mut().insert(ack);
+                    }
+                    resp
+                }
+                Err(_) => admin_builder_failure_response(),
+            }
+        }
+        // Fail closed: never serialize non-finite monetary values as JSON
+        // null (serde_json's default for Inf/NaN) or publish non-finite
+        // Prometheus samples.
+        Err(err) => json_response(StatusCode::INTERNAL_SERVER_ERROR, &json!({"error": err})),
+    }
+}
+
+/// `GET /charges` as the dispatcher answers it for `authorization`, against an
+/// explicit registry instead of the process-global one. `None` when the token
+/// does not verify. Reached through `_test_support`.
+pub(crate) async fn charges_response_for_test(
+    jwt_manager: &JwtManager,
+    authorization: &str,
+    registry: Arc<plugins::api_chargeback::ChargebackRegistry>,
+    query: Option<&str>,
+) -> Option<Response<Full<Bytes>>> {
+    let token = jwt_manager.verify_request(Some(authorization)).ok()?;
+    Some(charges_response(Some(registry), query, charges_collection_granted(&token)).await)
+}
+
 fn parse_chargeback_format(
     query: Option<&str>,
 ) -> Result<ChargebackFormat, Box<Response<Full<Bytes>>>> {
@@ -4058,14 +4143,16 @@ async fn handle_admin_request_inner(
         return Ok(resp);
     }
 
-    // Authenticate. The `diagnostics:read` scope is read from the same verified
-    // claims, so the diagnostic reference lookup never re-verifies the token.
-    let (auth, diagnostics_read) = match state.jwt_manager.verify_request(auth_header.as_deref()) {
+    // Authenticate. The `diagnostics:read` and `charges:collect` scopes are
+    // read from the same verified claims, so neither route re-verifies the
+    // token.
+    let (auth, token_scopes) = match state.jwt_manager.verify_request(auth_header.as_deref()) {
         Ok(token_data) => match AuditActor::from_verified(&token_data) {
             Ok(actor) => {
                 // Tier-aware: a viewer-key token's `scope` claims grant nothing.
                 let diagnostics_read = token_data.grants_scope(DIAGNOSTICS_READ_SCOPE);
-                (actor, diagnostics_read)
+                let charges_collect = charges_collection_granted(&token_data);
+                (actor, (diagnostics_read, charges_collect))
             }
             Err(message) => {
                 return Ok(with_admin_challenge(
@@ -4116,6 +4203,7 @@ async fn handle_admin_request_inner(
             ));
         }
     };
+    let (diagnostics_read, charges_collect) = token_scopes;
 
     // Peer address + bounded request ID for security-sensitive audit events.
     // Built after authentication so unauthenticated probes never mint correlation
@@ -4143,61 +4231,7 @@ async fn handle_admin_request_inner(
     // or a later accepted generation cannot honor its configured pool shard count.
     if path == "/charges" && method == Method::GET {
         let registry = crate::plugins::api_chargeback::try_global_registry();
-        match parse_chargeback_format(req.uri().query()) {
-            Ok(format) => {
-                let rendered = match registry {
-                    Some(registry) => render_charges_off_worker(registry, format).await,
-                    None => {
-                        let empty = match format {
-                            ChargebackFormat::Json => {
-                                crate::plugins::api_chargeback::empty_charges_json()
-                            }
-                            ChargebackFormat::Prometheus => {
-                                crate::plugins::api_chargeback::empty_charges_prometheus()
-                            }
-                        };
-                        empty.map(|output| (output, None))
-                    }
-                };
-                match rendered {
-                    Ok((output, delivery_ack)) => {
-                        let content_type = match format {
-                            ChargebackFormat::Json => "application/json",
-                            ChargebackFormat::Prometheus => {
-                                "text/plain; version=0.0.4; charset=utf-8"
-                            }
-                        };
-                        let resp = match with_admin_security_headers(Response::builder())
-                            .status(StatusCode::OK)
-                            .header("Content-Type", content_type)
-                            .body(Full::new(Bytes::from(output)))
-                        {
-                            Ok(mut resp) => {
-                                // Collection is acknowledged by the connection's
-                                // body wrapper once it has taken this document,
-                                // never here at render time (issue #5276).
-                                if let Some(ack) = delivery_ack {
-                                    resp.extensions_mut().insert(ack);
-                                }
-                                resp
-                            }
-                            Err(_) => admin_builder_failure_response(),
-                        };
-                        return Ok(resp);
-                    }
-                    Err(err) => {
-                        // Fail closed: never serialize non-finite monetary values as
-                        // JSON null (serde_json's default for Inf/NaN) or publish
-                        // non-finite Prometheus samples.
-                        return Ok(json_response(
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                            &json!({"error": err}),
-                        ));
-                    }
-                }
-            }
-            Err(resp) => return Ok(*resp),
-        }
+        return Ok(charges_response(registry, query.as_deref(), charges_collect).await);
     }
 
     if path == "/charges/sink/status" && method == Method::GET {

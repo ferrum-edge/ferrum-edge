@@ -2229,6 +2229,17 @@ paths:
         `Authorization: Bearer <token>` credentials.
         Default format is Prometheus text exposition; use `?format=json` for JSON.
 
+        **Collector designation.** Every authenticated caller receives the same
+        document, but only a token whose `scope` claim grants
+        `charges:collect` (OAuth 2.0 space-delimited string or array; the
+        `role` never implies it) is a billing collector: its delivered response
+        counts toward the two-hand-off rule that lets an idle row past
+        `stale_entry_ttl_seconds` be evicted. Reads by any other token —
+        dashboards, drift tools, ad-hoc `curl`, and every token verified by
+        `FERRUM_ADMIN_JWT_VIEWER_SECRET`, whose scope claims grant nothing —
+        are side-effect free and never make an uncollected row evictable
+        (GHSA-jjvr-vvwv-8qmh).
+
         Monetary fields convert stored `u64` counters to IEEE-754 binary64 and
         multiply them by configured binary64 unit prices. Counters above 2^53
         follow normal binary64 rounding. Accepted unit prices are finite and at most
