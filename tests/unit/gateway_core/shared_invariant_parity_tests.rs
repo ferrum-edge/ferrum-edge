@@ -5753,8 +5753,15 @@ fn destination_rule_host_matching_has_one_implementation() {
         "\n}\n",
     );
     assert!(
-        !bind.contains("wildcard_destination_rule"),
-        "a wildcard rule is applied like an exact one, so the binding no longer \
-         refuses the destinations it covers"
+        !bind.contains("wildcard_covered") && !bind.contains("wildcard_destination_rule_refused"),
+        "a wildcard rule is applied to a split leg like an exact one, so the binding \
+         no longer refuses the splits it covers"
+    );
+    assert_eq!(
+        bind.matches("wildcard_destination_rule_names_direct_backend(")
+            .count(),
+        2,
+        "a wildcard naming a direct external backend (own or rule) refuses the route: no \
+         rule can apply to a direct backend (review round 2, sol F3)"
     );
 }

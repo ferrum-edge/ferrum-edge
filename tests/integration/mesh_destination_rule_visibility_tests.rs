@@ -2817,3 +2817,127 @@ fn an_identically_spelled_wildcard_rule_takes_no_upstream_namespace_fallback() {
         "the declaring ServiceEntry makes `beta` the owner of the wildcard host"
     );
 }
+
+// ── Review round 2 (sol F1, F2) ──────────────────────────────────────────
+
+/// sol F2 (Istio `getExportedDestinationRuleFromNamespace`): in the target
+/// service's namespace Istio picks the most specific host among the EXPORTED
+/// rules first and only then checks the client may see it; a hidden match
+/// falls through to the root namespace instead of retrying the broader
+/// wildcard. So `payments`' exact rule exported only to `other` hides
+/// `payments`' public wildcard from the gateway for that host and the root
+/// exact TLS rule applies. A namespace-private rule is not in the exported
+/// index and hides nothing.
+#[test]
+fn a_hidden_exported_exact_rule_shadows_its_namespaces_wildcard_like_istio() {
+    let rules = |hidden_export: &[&str]| {
+        let mut public_wildcard = rule(
+            EXTERNAL_HOST_OWNER,
+            "owner-wildcard",
+            EXTERNAL_WILDCARD,
+            4444,
+            &["*"],
+        );
+        public_wildcard.traffic_policy = Some(MeshTrafficPolicy {
+            connect_timeout_ms: Some(4444),
+            ..MeshTrafficPolicy::default()
+        });
+        let mut hidden_exact = tls_rule(
+            EXTERNAL_HOST_OWNER,
+            "owner-exact-hidden",
+            EXTERNAL_HOST,
+            MtlsMode::Disable,
+        );
+        hidden_exact.export_to = hidden_export.iter().map(|e| (*e).to_string()).collect();
+        vec![
+            public_wildcard,
+            hidden_exact,
+            tls_rule("istio-system", "mesh-tls", EXTERNAL_HOST, MtlsMode::Simple),
+        ]
+    };
+
+    let mesh = egress_gateway_mesh(EXTERNAL_HOST_OWNER, rules(&["other"]));
+    let slice = slice_for(&mesh, EGRESS_GATEWAY_NAMESPACE);
+    let stub = slice
+        .destination_rules
+        .iter()
+        .find(|rule| rule.name == "owner-exact-hidden")
+        .expect("the hidden exported rule rides the slice as a selection stub");
+    assert!(
+        stub.traffic_policy.is_none() && stub.port_level_settings.is_empty(),
+        "a stub never carries the hidden rule's policy"
+    );
+    assert_eq!(
+        egress_scheme_for_mesh(mesh, EXTERNAL_HOST),
+        BackendScheme::Https,
+        "the hidden exact match shadows the owner's wildcard; the root TLS rule applies"
+    );
+
+    let private = egress_gateway_mesh(EXTERNAL_HOST_OWNER, rules(&["."]));
+    assert!(
+        !slice_for(&private, EGRESS_GATEWAY_NAMESPACE)
+            .destination_rules
+            .iter()
+            .any(|rule| rule.name == "owner-exact-hidden"),
+        "a namespace-private rule never reaches another namespace, not even as a stub"
+    );
+    assert_eq!(
+        egress_scheme_for_mesh(private, EXTERNAL_HOST),
+        BackendScheme::Http,
+        "a private rule is not in the exported index: the owner's wildcard wins the service tier"
+    );
+}
+
+/// sol F1: a concrete external host belongs to the most specific registered
+/// wildcard ServiceEntry covering it, so the declaring namespace's wildcard
+/// rule reaches the service tier on an upstream dialing that concrete host
+/// (as a NodeWaypoint split residual does), ahead of a root default.
+#[test]
+fn a_concrete_host_under_a_wildcard_service_entry_takes_its_owners_rule() {
+    let concrete = "api.one.wild.example.com";
+    let entries = vec![external_service_entry(
+        "beta",
+        "wild-api",
+        "*.wild.example.com",
+    )];
+    let effective = |rules: Vec<MeshDestinationRule>| {
+        let mut upstream = http_upstream("ext-u", concrete, 443);
+        upstream.namespace = "alpha".to_string();
+        let mut proxy = http_proxy("ext-p", concrete, 443);
+        proxy.namespace = "alpha".to_string();
+        proxy.upstream_id = Some("ext-u".to_string());
+        let config = GatewayConfig {
+            proxies: vec![proxy],
+            upstreams: vec![upstream],
+            mesh: Some(Box::new(external_host_mesh(entries.clone(), rules))),
+            ..GatewayConfig::default()
+        };
+        let prepared = prepare_gateway_config_via_mesh_slice_with_fixtures(
+            config,
+            &alpha_subscriber_runtime(),
+        )
+        .expect("mesh preparation succeeds");
+        prepared
+            .proxies
+            .iter()
+            .find(|p| p.id == "ext-p")
+            .expect("operator proxy survives")
+            .backend_connect_timeout_ms
+    };
+    assert_eq!(
+        effective(vec![
+            rule("beta", "owner-wildcard", "*.wild.example.com", 2222, &["*"]),
+            rule("istio-system", "mesh-default", "*", 3333, &["*"]),
+        ]),
+        2222,
+        "the wildcard ServiceEntry's owner is the service tier for its concrete hosts"
+    );
+    assert_eq!(
+        effective(vec![
+            rule("evil", "hijack", "*.wild.example.com", 6666, &["*"]),
+            rule("istio-system", "mesh-default", "*", 3333, &["*"]),
+        ]),
+        3333,
+        "an unrelated namespace still owns nothing; the root default applies"
+    );
+}

@@ -4526,6 +4526,23 @@ fn destination_rules_naming_host<'a>(
     })
 }
 
+/// Whether a wildcard DestinationRule (`*`, `*.example.com`) names external
+/// `host`. A carried route dials a DIRECT external backend (its own, or a
+/// `mesh_route_dispatch` rule's) through no upstream, so no rule can apply
+/// to it; a wildcard covering such a backend therefore refuses the route
+/// (issue #7387, kept by #7395) rather than letting its connection pool,
+/// timeout, load balancer or outlier policy be silently bypassed. Exact rules
+/// keep their documented behaviour (only a TLS-originating one refuses).
+/// Over-matching only refuses more.
+fn wildcard_destination_rule_names_direct_backend(mesh_slice: &MeshSlice, host: &str) -> bool {
+    destination_rules_naming_host(mesh_slice, host).any(|rule| {
+        matches!(
+            destination_rule_host_specificity(&rule.host, &rule.namespace, host),
+            Some(DestinationRuleHostSpecificity::Wildcard(_))
+        )
+    })
+}
+
 /// Whether a visible DestinationRule for external `host` asks the client to
 /// originate TLS on `port` (its `portLevelSettings` entry's `tls`, else its
 /// top-level `tls`, is `SIMPLE`, `MUTUAL` or `ISTIO_MUTUAL`). A carried route
@@ -4588,10 +4605,12 @@ fn destination_rule_originates_tls_for_host(mesh_slice: &MeshSlice, host: &str, 
 /// (its own, or a dispatch rule's) whose DestinationRule asks to originate
 /// TLS on that port: no DestinationRule applies to a direct backend, and the
 /// carried route would dial it in plaintext. A wildcard DestinationRule
-/// (issue #7395) counts like an exact one throughout: a split leg it covers
-/// is dispatched on its own residual leg, where the winning rule (TLS
-/// origination included) applies, and a direct backend it covers whose rule
-/// originates TLS is refused. Other external hosts are left as they are.
+/// (issue #7395) counts like an exact one for split legs: a split leg it
+/// covers is dispatched on its own residual leg, where the winning rule (TLS
+/// origination included) applies. A direct external backend it covers is
+/// refused whatever the rule sets, since no rule can apply to a direct
+/// backend ([`wildcard_destination_rule_names_direct_backend`]). Other
+/// external hosts are left as they are.
 fn bind_carried_http_routes_to_node_waypoint_transport(
     config: &mut GatewayConfig,
     runtime: &MeshRuntimeConfig,
@@ -4797,6 +4816,9 @@ fn bind_carried_http_routes_to_node_waypoint_transport(
     let mut oversized_weighted_routes = 0usize;
     // Direct external backends a DestinationRule asks to dial over TLS.
     let mut tls_origination_refused = 0usize;
+    // Direct external backends a wildcard DestinationRule names (no rule
+    // can apply to a direct backend).
+    let mut wildcard_direct_backend_refused = 0usize;
     for index in 0..config.proxies.len() {
         let proxy = &config.proxies[index];
         if !config::is_virtual_service_http_route_proxy_id(&proxy.id) {
@@ -4836,7 +4858,11 @@ fn bind_carried_http_routes_to_node_waypoint_transport(
             None if !backend_host.is_empty() && backend_port != 0 => {
                 match hosts.classify(&namespace, &backend_host) {
                     CarriedRouteHost::External => {
-                        if destination_rule_originates_tls_for_host(
+                        if wildcard_destination_rule_names_direct_backend(mesh_slice, &backend_host)
+                        {
+                            wildcard_direct_backend_refused += 1;
+                            keep = false;
+                        } else if destination_rule_originates_tls_for_host(
                             mesh_slice,
                             &backend_host,
                             backend_port,
@@ -4920,7 +4946,10 @@ fn bind_carried_http_routes_to_node_waypoint_transport(
                 }
                 match hosts.classify(&namespace, host) {
                     CarriedRouteHost::External => {
-                        if destination_rule_originates_tls_for_host(mesh_slice, host, port) {
+                        if wildcard_destination_rule_names_direct_backend(mesh_slice, host) {
+                            wildcard_direct_backend_refused += 1;
+                            keep = false;
+                        } else if destination_rule_originates_tls_for_host(mesh_slice, host, port) {
                             tls_origination_refused += 1;
                             keep = false;
                         }
@@ -5071,11 +5100,13 @@ fn bind_carried_http_routes_to_node_waypoint_transport(
             unrepresentable_weighted_splits = unrepresentable_splits,
             oversized_weighted_routes,
             tls_origination_refused,
+            wildcard_direct_backend_refused,
             "NodeWaypoint VirtualService routes refused: a destination is an in-cluster Service \
              this waypoint cannot reach over its mesh transport, a weighted split that must \
-             be dispatched leg by leg cannot be represented, or a direct external backend's \
-             DestinationRule asks for TLS origination a direct backend cannot carry; their \
-             hosts use the materialized Service routes"
+             be dispatched leg by leg cannot be represented, a direct external backend's \
+             DestinationRule asks for TLS origination a direct backend cannot carry, or a \
+             wildcard DestinationRule names a direct external backend no rule can apply to; \
+             their hosts use the materialized Service routes"
         );
         config
             .proxies
@@ -12081,6 +12112,17 @@ pub(crate) fn apply_destination_rules_with_tenant_file_roots(
         .collect();
     let service_entry_hosts =
         index_service_entry_host_owners(visible_service_entries.iter().copied());
+    let hidden_exported_rules: Vec<&MeshDestinationRule> = mesh_slice
+        .destination_rules
+        .iter()
+        .filter(|dr| {
+            slice::destination_rule_shadows_from_hiding(
+                dr,
+                client_namespace,
+                &mesh_slice.istio_root_namespace,
+            )
+        })
+        .collect();
 
     // Istio resolves the DestinationRule for a destination HOST, so tier
     // arbitration is per destination host, not per upstream. Arbitrating per
@@ -12099,6 +12141,7 @@ pub(crate) fn apply_destination_rules_with_tenant_file_roots(
         cluster_domain: runtime.cluster_domain.trim_matches('.'),
         mesh_service_identities: &service_identities,
         service_entry_hosts: &service_entry_hosts,
+        hidden_exported_rules: &hidden_exported_rules,
     };
     // The pass ALSO decides representability. An `Upstream` is ONE object: every
     // field a winning rule projects — load balancer, hash keys, backend TLS,
@@ -12238,12 +12281,20 @@ pub(crate) fn apply_destination_rules_with_tenant_file_roots(
                     // rule from a lower-priority tier, or a less specific
                     // host in the winning tier, must not overwrite the
                     // winning rules' policy for THIS host.
+                    // The lookup-path refusal count ignores shadowing: a
+                    // shadowed rule is in the lookup path.
+                    if host.specificity(dr).is_some_and(|specificity| {
+                        tier_scope
+                            .eligible_tier(dr, upstream, host.host, specificity)
+                            .is_some()
+                    }) {
+                        eligible_any_host = true;
+                    }
                     let Some(candidate) =
                         destination_rule_winner_candidate(&tier_scope, dr, upstream, host)
                     else {
                         continue;
                     };
-                    eligible_any_host = true;
                     if winners.get(host_idx).copied().flatten() == Some(candidate) {
                         wins_a_host = true;
                     }
@@ -13223,9 +13274,43 @@ struct MaterializationTierScope<'a> {
     /// evidence an external host has — it pins no namespace syntactically, and
     /// the upstream carrying it need not live in the owning namespace.
     service_entry_hosts: &'a std::collections::BTreeMap<String, ServiceEntryHostOwner>,
+    /// Rules hidden from this subscriber that still take part in Istio's
+    /// exported-rule host selection of their namespace
+    /// (`slice::destination_rule_shadows_from_hiding`): the policy-free
+    /// selection stubs slice admission emits. Never applied; a service- or
+    /// root-tier rule they out-specify on a host yields nothing there
+    /// (issue #7395, [`MaterializationTierScope::shadowed_by_hidden_rule`]).
+    hidden_exported_rules: &'a [&'a MeshDestinationRule],
 }
 
 impl MaterializationTierScope<'_> {
+    /// Istio's exported-rule lookup picks the most specific host among a
+    /// service or root namespace's exported rules BEFORE checking the client
+    /// can see it, and falls through to the next tier when it cannot. So a
+    /// visible rule in that tier is discarded for a host on which a hidden
+    /// exported rule of the same namespace is strictly more specific.
+    fn shadowed_by_hidden_rule(
+        &self,
+        dr: &MeshDestinationRule,
+        tier: DestinationRuleLookupTier,
+        host: DestinationRuleMatchHost<'_>,
+        specificity: DestinationRuleHostSpecificity,
+    ) -> bool {
+        if !matches!(
+            tier,
+            DestinationRuleLookupTier::Service | DestinationRuleLookupTier::Root
+        ) {
+            return false;
+        }
+        let namespace = dr.namespace.trim();
+        self.hidden_exported_rules.iter().any(|hidden| {
+            hidden.namespace.trim() == namespace
+                && host
+                    .specificity(hidden)
+                    .is_some_and(|hidden_specificity| hidden_specificity > specificity)
+        })
+    }
+
     /// Istio lookup tier for a `(DestinationRule, Upstream, destination host)`
     /// triple, or `None` when the rule must be refused outright.
     ///
@@ -13602,6 +13687,9 @@ fn destination_rule_winner_candidate(
 ) -> Option<DestinationRuleWinner> {
     let specificity = host.specificity(dr)?;
     let tier = tier_scope.eligible_tier(dr, upstream, host.host, specificity)?;
+    if tier_scope.shadowed_by_hidden_rule(dr, tier, host, specificity) {
+        return None;
+    }
     Some(DestinationRuleWinner { tier, specificity })
 }
 

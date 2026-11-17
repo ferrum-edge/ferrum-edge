@@ -114,7 +114,8 @@ enrolled rows and required live assertion IDs; fixture detail is in the
   (exact or wildcard rule) is dispatched leg by leg, each leg through its own
   rule-bearing upstream and authorized on its own policy; an external leg whose
   rule originates TLS is dialed over TLS, and a direct external backend whose
-  rule originates TLS is refused (issues #7387, #7395).
+  rule originates TLS, or that any wildcard rule names, is refused (issues
+  #7387, #7395).
 
   | Topology | Mesh-bound VirtualService `http[]` routes |
   |---|---|

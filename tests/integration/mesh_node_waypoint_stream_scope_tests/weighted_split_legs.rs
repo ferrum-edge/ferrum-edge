@@ -2437,14 +2437,13 @@ async fn wildcard_destination_rules_govern_external_legs_and_their_tls() {
     assert_eq!(counts[&leg(2)], 20);
 }
 
-/// Issue #7395: a direct external backend (the route's own or a dispatch
-/// rule's) whose winning DestinationRule is a TLS-originating wildcard is
-/// refused, like an exact one (issue #7387 round three): no DestinationRule
-/// applies to a direct backend, so the carried route would dial it in
-/// plaintext. A wildcard that only sets other policy, or that does not cover
-/// the host, keeps the route.
+/// Issue #7395 (review round 2, sol F3): a direct external backend (the
+/// route's own or a dispatch rule's) that a wildcard DestinationRule names is
+/// refused whatever the rule sets: no DestinationRule can apply to a direct
+/// backend, so its TLS, connection pool or timeout policy would be silently
+/// bypassed. A wildcard that does not cover the host keeps the route.
 #[test]
-fn a_direct_external_backend_under_a_wildcard_tls_rule_is_refused() {
+fn a_direct_external_backend_a_wildcard_rule_names_is_refused() {
     let own_backend = k8s_object(
         "VirtualService",
         "direct",
@@ -2489,9 +2488,9 @@ fn a_direct_external_backend_under_a_wildcard_tls_rule_is_refused() {
                 tcp_destination_rule(
                     "wildcard",
                     "*.wild.example",
-                    json!({"connectTimeout": "3s"}),
+                    json!({"connectTimeout": "3s", "maxConnections": 1}),
                 ),
-                false,
+                true,
             ),
             (
                 traffic_policy_rule(
@@ -2510,5 +2509,96 @@ fn a_direct_external_backend_under_a_wildcard_tls_rule_is_refused() {
                 "{shape}: {host}"
             );
         }
+    }
+}
+
+/// Issue #7395 (review round 2, sol F1): a concrete external split leg
+/// (`api.one.example.com`) belongs to the most specific registered wildcard
+/// ServiceEntry covering it, so the declaring namespace's wildcard rule
+/// governs its residual leg from another namespace's NodeWaypoint: TLS
+/// origination and connection policy land on every external leg.
+#[test]
+fn a_wildcard_service_entry_owners_rule_governs_concrete_split_legs() {
+    let in_namespace = |mut object: K8sObject, namespace: &str| {
+        object.metadata.namespace = namespace.to_string();
+        object
+    };
+    let objects = vec![
+        split_virtual_service(
+            "split",
+            "reviews.default.svc.cluster.local",
+            &[
+                ("reviews.default.svc.cluster.local", 8080, 50),
+                ("api.one.wild.example", 443, 25),
+                ("api.two.wild.example", 443, 25),
+            ],
+        ),
+        in_namespace(
+            k8s_object(
+                "ServiceEntry",
+                "wild-api",
+                json!({
+                    "hosts": ["*.wild.example"],
+                    "location": "MESH_EXTERNAL",
+                    "resolution": "DNS",
+                    "ports": [{"number": 443, "name": "http", "protocol": "HTTP"}]
+                }),
+            ),
+            "beta",
+        ),
+        in_namespace(
+            traffic_policy_rule(
+                "wild-owner",
+                "*.wild.example",
+                json!({
+                    "tls": {"mode": "SIMPLE"},
+                    "connectionPool": {"tcp": {"connectTimeout": "3s"}}
+                }),
+            ),
+            "beta",
+        ),
+        k8s_object(
+            "Sidecar",
+            "default",
+            json!({"egress": [{"hosts": ["*/*"]}]}),
+        ),
+    ];
+    // The cross-namespace rule reaches the waypoint under an enforced,
+    // all-importing Sidecar scope.
+    let runtime = MeshRuntimeConfig {
+        sidecar_enforced: true,
+        ..node_waypoint_runtime()
+    };
+    let slice = MeshSlice::from_gateway_config(
+        &translated_config(&objects, Vec::new()),
+        runtime.mesh_slice_request(),
+    );
+    let prepared =
+        prepare_gateway_config_from_mesh_slice(&slice, &runtime).expect("slice materializes");
+    assert!(
+        slice
+            .destination_rules
+            .iter()
+            .any(|rule| rule.name == "wild-owner"),
+        "the owner's wildcard is admitted at the service tier for the subscriber"
+    );
+    let route = carried_split_route(&prepared);
+    let split_id = route.upstream_id.clone().expect("split id");
+    let leg = |index: usize| format!("{split_id}-external-{index}");
+    assert_eq!(
+        leg_origination(&prepared, &route, &split_id),
+        vec![
+            (REVIEWS_UPSTREAM.to_string(), false),
+            (leg(0), true),
+            (leg(1), true),
+        ],
+        "both concrete legs originate the owner's TLS"
+    );
+    for index in 0..2 {
+        assert_eq!(
+            projected_connect_timeout(&prepared, &leg(index), 443),
+            Some(3000),
+            "the owner's connection policy reaches external leg {index}"
+        );
     }
 }
