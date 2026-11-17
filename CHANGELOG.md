@@ -93,6 +93,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   identifier, and the checker requires the patch README and the
   dependency-policy inventory row to carry the same record. Ferrum builds were
   already protected by the vendored patch.
+- **libz-sys is updated from 1.1.31 to 1.1.33** (RUSTSEC-2026-0544, zlib
+  heap buffer overflow in `gz_vacate()` after a stalled non-blocking
+  `gzwrite()`). It comes in through `rdkafka-sys` (the `kafka_logging`
+  plugin's librdkafka) in the root, `fuzz/` and `tests/performance/mesh/`
+  lockfiles. `chrono` is now marked unmaintained (RUSTSEC-2026-0543, no known
+  vulnerability); it is a direct dependency and also comes in through sqlx,
+  the GCP SDK, mongodb and testcontainers, so `deny.toml` time-boxes it until
+  2026-12-31 while the move to `time` is tracked in #7419.
 
 ### Added
 - **`mesh_route_dispatch` `weighted_splits`** (#7387). A new config table
