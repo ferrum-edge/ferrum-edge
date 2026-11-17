@@ -23,7 +23,7 @@ fn connection_state_new_disconnected() {
 fn grpc_jwt_secret_stores_and_retrieves() {
     let secret = GrpcJwtSecret::new("my-secret-key".to_string());
     let token = secret.mint("node-1", None, None).unwrap();
-    let key = jsonwebtoken::DecodingKey::from_secret(b"my-secret-key");
+    let key = jsonwebtoken::DecodingKey::from_secret(b"my-secret-key").unwrap();
     let mut validation = jsonwebtoken::Validation::new(jsonwebtoken::Algorithm::HS256);
     validation.validate_exp = true;
     assert!(jsonwebtoken::decode::<serde_json::Value>(&token, &key, &validation).is_ok());
@@ -34,7 +34,7 @@ fn grpc_jwt_secret_clone() {
     let secret = GrpcJwtSecret::new("test".to_string());
     let cloned = secret.clone();
     let token = cloned.mint("node-1", None, None).unwrap();
-    let key = jsonwebtoken::DecodingKey::from_secret(b"test");
+    let key = jsonwebtoken::DecodingKey::from_secret(b"test").unwrap();
     let mut validation = jsonwebtoken::Validation::new(jsonwebtoken::Algorithm::HS256);
     validation.validate_exp = true;
     assert!(jsonwebtoken::decode::<serde_json::Value>(&token, &key, &validation).is_ok());
@@ -90,7 +90,7 @@ fn generate_dp_jwt_produces_valid_token() {
     assert!(!token.is_empty());
 
     // Verify the token can be decoded with the same secret
-    let key = jsonwebtoken::DecodingKey::from_secret(b"test-secret");
+    let key = jsonwebtoken::DecodingKey::from_secret(b"test-secret").unwrap();
     let mut validation = jsonwebtoken::Validation::new(jsonwebtoken::Algorithm::HS256);
     validation.validate_exp = true;
     let decoded = jsonwebtoken::decode::<serde_json::Value>(&token, &key, &validation).unwrap();
@@ -110,10 +110,24 @@ fn generate_dp_jwt_different_nodes_produce_different_tokens() {
 #[test]
 fn generate_dp_jwt_wrong_secret_fails_validation() {
     let token = generate_dp_jwt("correct-secret", "node-1").unwrap();
-    let key = jsonwebtoken::DecodingKey::from_secret(b"wrong-secret");
+    let key = jsonwebtoken::DecodingKey::from_secret(b"wrong-secret").unwrap();
     let validation = jsonwebtoken::Validation::new(jsonwebtoken::Algorithm::HS256);
     let result = jsonwebtoken::decode::<serde_json::Value>(&token, &key, &validation);
     assert!(result.is_err());
+}
+
+/// jsonwebtoken 12 refuses an empty HMAC key, so minting with an empty secret
+/// fails instead of signing a token with it, while a non-empty secret still
+/// mints. `GrpcJwtSecret::mint` goes through the same helper.
+#[test]
+fn generate_dp_jwt_refuses_an_empty_secret() {
+    assert!(generate_dp_jwt("", "node-1").is_err());
+    assert!(
+        GrpcJwtSecret::new(String::new())
+            .mint("node-1", None, None)
+            .is_err()
+    );
+    assert!(generate_dp_jwt("s", "node-1").is_ok());
 }
 
 /// Default-issuer minting must include the `iss` claim with the documented
@@ -123,7 +137,7 @@ fn generate_dp_jwt_wrong_secret_fails_validation() {
 #[test]
 fn generate_dp_jwt_includes_default_iss_claim() {
     let token = generate_dp_jwt("test-secret", "node-1").unwrap();
-    let key = jsonwebtoken::DecodingKey::from_secret(b"test-secret");
+    let key = jsonwebtoken::DecodingKey::from_secret(b"test-secret").unwrap();
     let mut validation = jsonwebtoken::Validation::new(jsonwebtoken::Algorithm::HS256);
     validation.validate_exp = true;
     // Allow any issuer for this decode — we only want to read the claim.
@@ -137,7 +151,7 @@ fn generate_dp_jwt_includes_default_iss_claim() {
 #[test]
 fn generate_dp_jwt_with_custom_issuer_propagates_iss() {
     let token = generate_dp_jwt_with_issuer("test-secret", "node-1", "custom-fleet.cp-dp").unwrap();
-    let key = jsonwebtoken::DecodingKey::from_secret(b"test-secret");
+    let key = jsonwebtoken::DecodingKey::from_secret(b"test-secret").unwrap();
     let mut validation = jsonwebtoken::Validation::new(jsonwebtoken::Algorithm::HS256);
     validation.validate_exp = true;
     validation.required_spec_claims = std::collections::HashSet::new();

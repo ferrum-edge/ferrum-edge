@@ -146,7 +146,7 @@ fn admin_token() -> String {
     encode(
         &Header::new(jsonwebtoken::Algorithm::HS256),
         &claims,
-        &EncodingKey::from_secret(b"test-secret-key-for-admin-api"),
+        &EncodingKey::from_secret(b"test-secret-key-for-admin-api").unwrap(),
     )
     .unwrap()
 }

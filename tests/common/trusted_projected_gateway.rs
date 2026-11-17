@@ -266,7 +266,7 @@ impl TrustedProjectedGateway {
             "jti": Uuid::new_v4().to_string(),
         });
         let header = Header::new(jsonwebtoken::Algorithm::HS256);
-        let key = EncodingKey::from_secret(self.jwt_secret.as_bytes());
+        let key = EncodingKey::from_secret(self.jwt_secret.as_bytes()).unwrap();
         encode(&header, &claims, &key).expect("encode admin JWT")
     }
 

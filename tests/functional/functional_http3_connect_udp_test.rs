@@ -1170,7 +1170,7 @@ fn mint_masque_token(ttl_secs: i64) -> String {
     encode(
         &Header::new(jsonwebtoken::Algorithm::HS256),
         &claims,
-        &EncodingKey::from_secret(AUTH_JWT_SECRET.as_bytes()),
+        &EncodingKey::from_secret(AUTH_JWT_SECRET.as_bytes()).unwrap(),
     )
     .expect("encode MASQUE consumer JWT")
 }

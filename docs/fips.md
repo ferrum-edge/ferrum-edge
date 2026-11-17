@@ -40,7 +40,7 @@ AWS-LC, which dimpl, rcgen, and x509-parser already compile in. The RustCrypto
 `rust_crypto` backend is never compiled: it signed ES256 JWT-SVIDs and
 ES256/ES384/RS* `private_key_jwt` assertions on `p256`/`p384` 0.13
 (`crypto-bigint` 0.5, RUSTSEC-2026-0387) and the RustCrypto `rsa`
-(RUSTSEC-2023-0071). jsonwebtoken 11 needs exactly one backend compiled to
+(RUSTSEC-2023-0071). jsonwebtoken 12 needs exactly one backend compiled to
 choose its provider, and one inline selection keeps that true for every
 feature combination. AWS-LC accepts RSA keys of 2048–8192 bits only, for
 verification as well as signing. The JWKS paths (`jwks_auth`, OIDC, mesh

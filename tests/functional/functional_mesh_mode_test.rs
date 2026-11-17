@@ -115,7 +115,7 @@ fn verify_mesh_grpc_auth(metadata: &tonic::metadata::MetadataMap) -> Result<(), 
         .and_then(|value| value.to_str().ok())
         .map(|value| value.strip_prefix("Bearer ").unwrap_or(value))
         .ok_or_else(|| Status::unauthenticated("missing authorization token"))?;
-    let key = DecodingKey::from_secret(GRPC_SECRET.as_bytes());
+    let key = DecodingKey::from_secret(GRPC_SECRET.as_bytes()).unwrap();
     let mut validation = Validation::new(Algorithm::HS256);
     validation.validate_exp = true;
     validation.required_spec_claims = ["exp", "iat", "sub", "iss"]

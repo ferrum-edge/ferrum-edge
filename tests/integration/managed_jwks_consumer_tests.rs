@@ -48,7 +48,7 @@ fn admin_token() -> String {
     encode(
         &Header::new(Algorithm::HS256),
         &claims,
-        &EncodingKey::from_secret(ADMIN_SECRET.as_bytes()),
+        &EncodingKey::from_secret(ADMIN_SECRET.as_bytes()).unwrap(),
     )
     .expect("admin token")
 }

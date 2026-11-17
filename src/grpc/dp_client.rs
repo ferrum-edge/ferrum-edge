@@ -963,11 +963,10 @@ pub fn generate_dp_jwt_full_with_key_id(
         .map(str::trim)
         .filter(|kid| !kid.is_empty())
         .map(str::to_string);
-    let token = encode(
-        &header,
-        &claims,
-        &EncodingKey::from_secret(secret.as_bytes()),
-    )?;
+    // jsonwebtoken 12 refuses an empty HMAC key, so an unset secret fails the
+    // mint here instead of producing a token no control plane would accept.
+    let key = EncodingKey::from_secret(secret.as_bytes())?;
+    let token = encode(&header, &claims, &key)?;
     Ok(token)
 }
 

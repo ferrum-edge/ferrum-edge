@@ -789,7 +789,7 @@ fn symmetric_proof_algorithm_is_rejected() {
     let proof = sign_proof_with(
         Algorithm::HS256,
         &jwk,
-        &EncodingKey::from_secret(b"a-shared-secret-of-sufficient-length"),
+        &EncodingKey::from_secret(b"a-shared-secret-of-sufficient-length").unwrap(),
         &proof_claims_for(token),
     );
     assert_eq!(

@@ -256,7 +256,7 @@ fn mesh_reset_operator_token(config: &MeshResetTestConfig) -> String {
         "jti": Uuid::new_v4().to_string(),
     });
     let header = Header::new(jsonwebtoken::Algorithm::HS256);
-    let key = EncodingKey::from_secret(config.jwt_secret.as_bytes());
+    let key = EncodingKey::from_secret(config.jwt_secret.as_bytes()).unwrap();
     encode(&header, &claims, &key).unwrap()
 }
 

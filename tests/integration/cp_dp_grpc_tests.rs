@@ -113,7 +113,7 @@ fn generate_near_expiry_jwt(node_id: &str, audience: Option<&str>) -> String {
     encode(
         &Header::new(Algorithm::HS256),
         &claims,
-        &EncodingKey::from_secret(TEST_JWT_SECRET.as_bytes()),
+        &EncodingKey::from_secret(TEST_JWT_SECRET.as_bytes()).unwrap(),
     )
     .expect("near-expiry test JWT should mint")
 }
@@ -1542,7 +1542,7 @@ async fn test_cp_rejects_token_missing_required_claims() {
     let token_no_sub = encode(
         &Header::new(Algorithm::HS256),
         &minimal_claims,
-        &EncodingKey::from_secret(TEST_JWT_SECRET.as_bytes()),
+        &EncodingKey::from_secret(TEST_JWT_SECRET.as_bytes()).unwrap(),
     )
     .unwrap();
 
@@ -1914,7 +1914,7 @@ async fn test_cp_rejects_token_with_no_issuer_claim() {
     let token = encode(
         &Header::new(Algorithm::HS256),
         &claims,
-        &EncodingKey::from_secret(TEST_JWT_SECRET.as_bytes()),
+        &EncodingKey::from_secret(TEST_JWT_SECRET.as_bytes()).unwrap(),
     )
     .unwrap();
 

@@ -538,7 +538,9 @@ impl JwtManager {
         secret: &str,
         algorithm: Algorithm,
     ) -> Result<TokenData<AdminClaims>, JwtEncodeError> {
-        let key = DecodingKey::from_secret(secret.as_bytes());
+        // jsonwebtoken 12 refuses an empty HMAC key; that error rejects the
+        // token like any other verification failure.
+        let key = DecodingKey::from_secret(secret.as_bytes())?;
 
         // Configure validation with required claims. `Validation::new` makes
         // `algorithm` the only accepted `alg`, so the header cannot select a
@@ -583,10 +585,12 @@ impl JwtManager {
         // Decode and validate
         let token_data = decode::<AdminClaims>(token, &key, &validation)?;
 
-        // jsonwebtoken treats a malformed `aud` (null, number, object, mixed
-        // array) as absent and accepts it; re-check the shape so the strict
-        // audience contract above holds for every JSON form. Applies to both
-        // the primary and the viewer key tier.
+        // jsonwebtoken 12 rejects a number, object, or mixed-array `aud`
+        // itself (`InvalidClaimFormat`, or `MissingRequiredClaim` when an
+        // audience is configured) but reads `"aud": null` as absent; re-check
+        // the shape so the strict audience contract above holds for every JSON
+        // form, `null` included. Applies to both the primary and the viewer
+        // key tier.
         if !crate::plugins::utils::jwt_verifier::audience_claim_is_acceptable(
             &token_data.claims.additional,
             self.config.audience.is_some(),

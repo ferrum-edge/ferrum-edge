@@ -66,7 +66,7 @@ fn generate_test_token(config: &TestConfig) -> String {
         "jti": uuid::Uuid::new_v4().to_string()
     });
     let header = Header::new(jsonwebtoken::Algorithm::HS256);
-    let key = EncodingKey::from_secret(config.jwt_secret.as_bytes());
+    let key = EncodingKey::from_secret(config.jwt_secret.as_bytes()).unwrap();
     encode(&header, &claims, &key).unwrap()
 }
 
@@ -82,7 +82,7 @@ fn generate_expired_test_token(config: &TestConfig) -> String {
         "jti": uuid::Uuid::new_v4().to_string()
     });
     let header = Header::new(jsonwebtoken::Algorithm::HS256);
-    let key = EncodingKey::from_secret(config.jwt_secret.as_bytes());
+    let key = EncodingKey::from_secret(config.jwt_secret.as_bytes()).unwrap();
     encode(&header, &claims, &key).unwrap()
 }
 
@@ -10840,7 +10840,7 @@ fn generate_test_token_with_role(config: &TestConfig, role: &str) -> String {
         "jti": uuid::Uuid::new_v4().to_string()
     });
     let header = Header::new(jsonwebtoken::Algorithm::HS256);
-    let key = EncodingKey::from_secret(config.jwt_secret.as_bytes());
+    let key = EncodingKey::from_secret(config.jwt_secret.as_bytes()).unwrap();
     encode(&header, &claims, &key).unwrap()
 }
 
