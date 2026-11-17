@@ -16720,7 +16720,7 @@ pub(crate) const WEBSOCKET_BACKEND_REFUSAL_MAX_BODY_BYTES: usize = 64 * 1024;
 /// RFC 8441 / RFC 9220 Extended CONNECT client would tell it the tunnel is open.
 /// It stays the `502` protocol failure, as do a missing/invalid
 /// `Sec-WebSocket-Accept` and a malformed response.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct WebSocketBackendRefusal {
     pub(crate) status: StatusCode,
     /// The backend's headers after the backend-response strip (hop-by-hop,
@@ -16731,6 +16731,21 @@ pub struct WebSocketBackendRefusal {
     /// The backend's complete refusal body, or empty when it was not complete
     /// in the handshake read (then the representation headers are dropped).
     pub(crate) body: Bytes,
+}
+
+/// Header names and the body length only: values (`Set-Cookie`,
+/// `WWW-Authenticate` parameters) and body bytes can carry credentials, and
+/// this type rides inside `HbonePoolError`, whose `Debug` may be formatted.
+impl std::fmt::Debug for WebSocketBackendRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut header_names: Vec<&str> = self.headers.keys().map(String::as_str).collect();
+        header_names.sort_unstable();
+        f.debug_struct("WebSocketBackendRefusal")
+            .field("status", &self.status)
+            .field("header_names", &header_names)
+            .field("body_len", &self.body.len())
+            .finish()
+    }
 }
 
 impl WebSocketBackendRefusal {

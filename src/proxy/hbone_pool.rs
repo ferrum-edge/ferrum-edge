@@ -5653,7 +5653,9 @@ mod tests {
         });
 
         let sender = h2_client_to(addr).await;
-        let error = open_h2_ws_connect_stream_within(
+        // `H2WsConnectTunnel` deliberately has no `Debug`, so match rather
+        // than `expect_err`.
+        let Err(error) = open_h2_ws_connect_stream_within(
             Duration::from_secs(10),
             sender,
             "orders.default.svc.cluster.local:8080",
@@ -5663,7 +5665,9 @@ mod tests {
             None,
         )
         .await
-        .expect_err("a 401 is not an open tunnel");
+        else {
+            panic!("a 401 is not an open tunnel");
+        };
         assert_eq!(error.public_status(), Some(401));
         assert_eq!(error.error_class(), ErrorClass::ProtocolError);
         let boxed: Box<dyn std::error::Error + Send + Sync> = Box::new(error);
@@ -5720,7 +5724,9 @@ mod tests {
         });
 
         let sender = h2_client_to(addr).await;
-        let error = open_h2_ws_connect_stream_within(
+        // `H2WsConnectTunnel` deliberately has no `Debug`, so match rather
+        // than `expect_err`.
+        let Err(error) = open_h2_ws_connect_stream_within(
             Duration::from_millis(250),
             sender,
             "orders.default.svc.cluster.local:8080",
@@ -5730,7 +5736,9 @@ mod tests {
             None,
         )
         .await
-        .expect_err("a 401 is not an open tunnel");
+        else {
+            panic!("a 401 is not an open tunnel");
+        };
         match error {
             HbonePoolError::WebSocketUpgradeRefused {
                 status, refusal, ..
