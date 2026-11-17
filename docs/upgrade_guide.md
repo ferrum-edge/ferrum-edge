@@ -61,7 +61,7 @@ headers, such as `Set-Cookie`. Use a response policy (for example
 `security_headers.remove`) to suppress any you do not want exposed.
 
 
-### `/charges` acknowledges collection only for a `charges:collect` token (GHSA-jjvr-vvwv-8qmh)
+### `/charges` acknowledges collection only for a `charges:collect` token (GHSA-jjvr-vvwv-8qmh, #7413)
 
 `api_chargeback` evicts an idle row past `stale_entry_ttl_seconds` only after
 two delivered `/charges` exports collected it. Only a request whose admin JWT
@@ -96,7 +96,7 @@ Tokens verified by `FERRUM_ADMIN_JWT_VIEWER_SECRET` also now receive
 resource GETs. Compare `active_generation` across replicas with a primary-key
 token (any role).
 
-### `mcp_gateway` OpenAPI bridge route confinement and endpoint overlap
+### `mcp_gateway` OpenAPI bridge route confinement and endpoint overlap (#7406, #7410)
 
 - **Bridge routes.** Bridged tool calls now reach only operation paths under
   the matched proxy's literal listen prefix, whether or not `strip_listen_path`
@@ -117,7 +117,7 @@ token (any role).
   merges.
 
 
-### Consumer-name policy no longer matches external identities (GHSA-rxwj-x6c6-f4j5)
+### Consumer-name policy no longer matches external identities (GHSA-rxwj-x6c6-f4j5, #7417)
 
 Lists configured as Consumer usernames now match only a request whose
 authentication plugin mapped a gateway Consumer: WAF
@@ -141,7 +141,7 @@ even when it spells a listed username.
   and from other realms. Existing counters for external principals restart once
   after upgrade, including Redis-backed ones.
 
-### Duplicate JSON member names are refused by more plugins (GHSA-49cr-v28q-9hgp)
+### Duplicate JSON member names are refused by more plugins (GHSA-49cr-v28q-9hgp, #7417)
 
 `ai_prompt_shield` (every scan mode), `ai_semantic_firewall` (request and
 buffered JSON response), `a2a_gateway` (JSON-RPC, under a deny-capable policy)
@@ -149,7 +149,7 @@ and `ai_rate_limiter` (with `model_limits`) now refuse request bodies whose
 JSON objects repeat a member name, compared after escape decoding and at any
 depth. Clients must send each member once.
 
-### ConfigSync revision 6
+### ConfigSync revision 6 (#7417)
 
 Plugin triggers gained the `external_identity` and
 `external_identity_authority` predicates, so the ConfigSync protocol revision
@@ -158,7 +158,7 @@ the build-identity gate and keeps its cached configuration until it is
 upgraded.
 
 
-### Refused Istio security resources now fail closed (GHSA-2r85-85hh-23mw)
+### Refused Istio security resources now fail closed (GHSA-2r85-85hh-23mw, #7415)
 
 A refused AuthorizationPolicy, PeerAuthentication or Sidecar
 (`FerrumAccepted=False`) used to be dropped from the published mesh

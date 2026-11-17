@@ -149,7 +149,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   only a token whose `scope` claim grants `charges:collect` acknowledges
   delivery. Other reads return the same document with no side effect.
   **Operator action:** add `"scope": "charges:collect"` to the billing
-  collector's admin JWT (a `viewer` role is enough).
+  collector's admin JWT (a `viewer` role is enough). (#7413)
 - **Database URL redaction decodes MongoDB `authMechanismProperties`**
   (GHSA-wqrm-jcch-972x). Percent-encoded separators
   (`AWS_SESSION_TOKEN%3A<token>`, `%2C`) or property names slipped past the
@@ -164,7 +164,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   exact (`=`) and regex (`~`) routes are always refused; serve the bridge from
   a literal-prefix or host-only route. `POST`/`PUT /api-specs` also rejects an
   embedded `x-ferrum-plugins` `mcp_gateway` whose `endpoint.path` differs from
-  the validated `x-ferrum-mcp` endpoint (GHSA-26x8-8jq5-f73p).
+  the validated `x-ferrum-mcp` endpoint (GHSA-26x8-8jq5-f73p). (#7410)
 - Fixed GHSA-49cr-v28q-9hgp: `a2a_gateway`, `ai_semantic_firewall`,
   `ai_prompt_shield` (all scan modes) and `ai_rate_limiter` now screen governed
   JSON bodies for duplicate object member names with the shared `json_dup_keys`
@@ -185,7 +185,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and connection; - PeerAuthentication becomes STRICT; - a Sidecar blocks each
   untranslatable block (`egress: []` with REGISTRY_ONLY, `ingress: []`). Status
   still reports `FerrumAccepted=False` and now states the consequence in
-  `status.ferrum.translation.enforcement`.
+  `status.ferrum.translation.enforcement`. (#7415)
 - The consumer credential endpoints (`PUT`/`POST`/`DELETE
   /consumers/{id}/credentials/{type}` and `DELETE
   /consumers/{id}/credentials/{type}/{index}`) now evaluate `If-Match` against
@@ -996,28 +996,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   different builds refuse each other at `Subscribe`.
 - **BREAKING:** `ai_prompt_shield` in `content` / `all` scan modes refuses
   (reject/redact, 400 `ambiguous_json`) or records (warn) request bodies with
-  duplicate JSON member names.
+  duplicate JSON member names. (#7417)
 - **BREAKING:** ConfigSync protocol revision is now 6 (new plugin-trigger
-  predicates); upgrade CPs and DPs together.
+  predicates); upgrade CPs and DPs together. (#7417)
 - **BREAKING:** `ai_semantic_firewall` treats request bodies, buffered JSON
   responses, and SSE / NDJSON stream frames with duplicate member names as
   uninspectable (`uninspectable_body=ambiguous_json`, routed through
-  `fail_on_uninspectable_body`).
+  `fail_on_uninspectable_body`). (#7417)
 - **BREAKING:** `a2a_gateway` refuses JSON-RPC bodies with duplicate member
   names under a policy that can deny (`-32001`,
   `a2a.error=request_body_uninspectable`) and leaves them unclassified
-  otherwise.
+  otherwise. (#7417)
 - **BREAKING:** `ai_rate_limiter` treats request bodies with duplicate member
-  names as unparseable (refused with 400 while `model_limits` is set).
+  names as unparseable (refused with 400 while `model_limits` is set). (#7417)
 - **BREAKING:** WAF `global_exemptions.consumers` and rule
   `conditions.consumers`, `openapi_validator` `bypass.consumers`,
   `rate_limiting` `scope: consumers`, `ai_rate_limiter` `consumer_limits`, and
-  the trigger `consumer` predicate match mapped Consumer usernames only.
+  the trigger `consumer` predicate match mapped Consumer usernames only. (#7417)
 - **BREAKING:** `limit_by: consumer` in `rate_limiting`, `ws_rate_limiting`,
   `graphql`, `grpc_method_router`, `ai_rate_limiter`, and
   `tcp_connection_throttle` keys unmapped external identities as
   `external:<mechanism>:<authority>:<identity>`; their existing counters (local
-  and Redis) restart.
+  and Redis) restart. (#7417)
 - **BREAKING:** **Wildcard DestinationRule hosts are applied with Istio
   semantics on every mesh topology** (#7395). A rule host of `*.example.com` or
   `*` was admitted and then ignored by the data plane, so its TLS origination,
