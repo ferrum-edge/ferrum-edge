@@ -4504,41 +4504,25 @@ fn service_has_destination_rule(
         "{name}.{namespace}.svc.{}",
         cluster_domain.trim_matches('.')
     );
-    // A wildcard rule is never applied on the data plane, but naming the
-    // Service only sends the split leg by leg, which applies the same policy.
     mesh_slice
         .destination_rules
         .iter()
         .any(|rule| destination_rule_host_specificity(&rule.host, &rule.namespace, &fqdn).is_some())
 }
 
-/// The visible DestinationRules that name `host` exactly or as a Service
-/// alias: the rules DestinationRule application applies to it
-/// ([`destination_rule_host_matches`]). Every such rule is returned, whatever
-/// its tier: over-matching only sends more splits leg by leg or refuses more
-/// routes.
+/// The visible DestinationRules that name `host` (exactly, as a Service
+/// alias, or by a wildcard), through the same
+/// [`destination_rule_host_specificity`] that DestinationRule application
+/// uses (issue #7395). Every naming rule is returned, whatever its tier or
+/// specificity: over-matching is the safe direction for every caller (it
+/// only sends more splits leg by leg or refuses more routes).
 fn destination_rules_naming_host<'a>(
     mesh_slice: &'a MeshSlice,
     host: &str,
 ) -> impl Iterator<Item = &'a MeshDestinationRule> + use<'a> {
     let host = host.to_string();
     mesh_slice.destination_rules.iter().filter(move |rule| {
-        destination_rule_host_specificity(&rule.host, &rule.namespace, &host)
-            == Some(DestinationRuleHostSpecificity::Exact)
-    })
-}
-
-/// Whether a visible wildcard DestinationRule (`*`, `*.example.com`) covers
-/// external `host`. The data plane does not apply wildcard rules (that is
-/// its own feature), so a carried route cannot honour one, TLS origination
-/// included: a split leg or direct backend it covers is refused instead, and
-/// the host keeps its Service route, rather than dialed in plaintext.
-fn wildcard_destination_rule_covers_host(mesh_slice: &MeshSlice, host: &str) -> bool {
-    mesh_slice.destination_rules.iter().any(|rule| {
-        matches!(
-            destination_rule_host_specificity(&rule.host, &rule.namespace, host),
-            Some(DestinationRuleHostSpecificity::Wildcard(_))
-        )
+        destination_rule_host_specificity(&rule.host, &rule.namespace, &host).is_some()
     })
 }
 
@@ -4603,11 +4587,11 @@ fn destination_rule_originates_tls_for_host(mesh_slice: &MeshSlice, host: &str, 
 /// upstream id already in use), and a route with a direct external backend
 /// (its own, or a dispatch rule's) whose DestinationRule asks to originate
 /// TLS on that port: no DestinationRule applies to a direct backend, and the
-/// carried route would dial it in plaintext. So is a route with an external
-/// destination (a split leg or a direct backend) that a wildcard
-/// DestinationRule covers: the data plane does not apply wildcard rules, so
-/// that rule (TLS origination included) could not be honoured. Other external
-/// hosts are left as they are.
+/// carried route would dial it in plaintext. A wildcard DestinationRule
+/// (issue #7395) counts like an exact one throughout: a split leg it covers
+/// is dispatched on its own residual leg, where the winning rule (TLS
+/// origination included) applies, and a direct backend it covers whose rule
+/// originates TLS is refused. Other external hosts are left as they are.
 fn bind_carried_http_routes_to_node_waypoint_transport(
     config: &mut GatewayConfig,
     runtime: &MeshRuntimeConfig,
@@ -4647,8 +4631,6 @@ fn bind_carried_http_routes_to_node_waypoint_transport(
     let mut leg_dispatched: HashMap<(String, String), WeightedSplitLegs> = HashMap::new();
     let mut residual_upstreams: Vec<Upstream> = Vec::new();
     let mut unrepresentable_splits = 0usize;
-    // Splits and direct backends a wildcard DestinationRule covers.
-    let mut wildcard_destination_rule_refused = 0usize;
     for (namespace, id) in split_ids {
         let Some(split) = config
             .upstreams
@@ -4669,19 +4651,12 @@ fn bind_carried_http_routes_to_node_waypoint_transport(
         let mut rebound = true;
         let mut governed_by_destination_rule = false;
         let mut cross_namespace_leg = false;
-        let mut wildcard_covered = false;
         for target in &split.targets {
             match hosts.classify(&namespace, &target.host) {
                 CarriedRouteHost::External => {
-                    // A wildcard rule covering the host cannot be applied,
-                    // so the split is refused rather than dialed in
-                    // plaintext past it.
-                    if wildcard_destination_rule_covers_host(mesh_slice, &target.host) {
-                        wildcard_covered = true;
-                    }
-                    // An external host's own DestinationRule (TLS
-                    // origination included) applies only to an upstream
-                    // holding that host alone: its residual leg.
+                    // An external host's own DestinationRule, exact or
+                    // wildcard (TLS origination included), applies only to
+                    // an upstream holding that host alone: its residual leg.
                     if destination_rules_naming_host(mesh_slice, &target.host)
                         .next()
                         .is_some()
@@ -4756,11 +4731,6 @@ fn bind_carried_http_routes_to_node_waypoint_transport(
             }
         }
         if !rebound || legs.is_empty() {
-            failed_splits.insert((namespace, id));
-            continue;
-        }
-        if wildcard_covered {
-            wildcard_destination_rule_refused += 1;
             failed_splits.insert((namespace, id));
             continue;
         }
@@ -4866,10 +4836,7 @@ fn bind_carried_http_routes_to_node_waypoint_transport(
             None if !backend_host.is_empty() && backend_port != 0 => {
                 match hosts.classify(&namespace, &backend_host) {
                     CarriedRouteHost::External => {
-                        if wildcard_destination_rule_covers_host(mesh_slice, &backend_host) {
-                            wildcard_destination_rule_refused += 1;
-                            keep = false;
-                        } else if destination_rule_originates_tls_for_host(
+                        if destination_rule_originates_tls_for_host(
                             mesh_slice,
                             &backend_host,
                             backend_port,
@@ -4953,10 +4920,7 @@ fn bind_carried_http_routes_to_node_waypoint_transport(
                 }
                 match hosts.classify(&namespace, host) {
                     CarriedRouteHost::External => {
-                        if wildcard_destination_rule_covers_host(mesh_slice, host) {
-                            wildcard_destination_rule_refused += 1;
-                            keep = false;
-                        } else if destination_rule_originates_tls_for_host(mesh_slice, host, port) {
+                        if destination_rule_originates_tls_for_host(mesh_slice, host, port) {
                             tls_origination_refused += 1;
                             keep = false;
                         }
@@ -5107,13 +5071,11 @@ fn bind_carried_http_routes_to_node_waypoint_transport(
             unrepresentable_weighted_splits = unrepresentable_splits,
             oversized_weighted_routes,
             tls_origination_refused,
-            wildcard_destination_rule_refused,
             "NodeWaypoint VirtualService routes refused: a destination is an in-cluster Service \
              this waypoint cannot reach over its mesh transport, a weighted split that must \
-             be dispatched leg by leg cannot be represented, a direct external backend's \
-             DestinationRule asks for TLS origination a direct backend cannot carry, or a \
-             wildcard DestinationRule (not applied on the data plane) covers an external \
-             destination; their hosts use the materialized Service routes"
+             be dispatched leg by leg cannot be represented, or a direct external backend's \
+             DestinationRule asks for TLS origination a direct backend cannot carry; their \
+             hosts use the materialized Service routes"
         );
         config
             .proxies
@@ -11812,7 +11774,8 @@ fn mesh_sd_selected_service_port(upstream: &Upstream, mesh_slice: &MeshSlice) ->
 /// so the policy attaches to the egress routes; application is HOST-LEVEL
 /// (materialized routes are host-routed `/`). Policy hosts resolve against
 /// each service's FQDN with DestinationRule host semantics
-/// (`destination_rule_host_matches`: bare name, `name.namespace`, FQDN).
+/// (`destination_rule_host_specificity`, exact matches only: bare name,
+/// `name.namespace`, FQDN; a wildcard VirtualService host attaches nothing).
 ///
 /// Determinism + conflict handling mirror `apply_destination_rules`: policies
 /// are sorted by `(namespace, name)` and the FIRST match per service wins
@@ -11838,9 +11801,9 @@ fn synthesize_mesh_outbound_cors_plugins(
     }
     // Normalize the host MATCH KEY here, not just in `MeshConfig::normalize()`:
     // a slice arriving over the native/xDS carriers never passes config-source
-    // normalization on this DP, and `destination_rule_host_matches` lowercases
-    // and strips trailing dots but does NOT trim whitespace — a padded carried
-    // host would silently match no service and synthesize no plugin.
+    // normalization on this DP; normalizing once here keeps the match key
+    // canonical for `destination_rule_host_specificity` and the policy's own
+    // recorded host alike.
     let client_namespace = mesh_slice.namespace.as_str();
     let mut sorted_policies: Vec<(String, &config::MeshVirtualServiceCorsPolicy)> = mesh_slice
         .virtual_service_cors_policies
@@ -11870,7 +11833,8 @@ fn synthesize_mesh_outbound_cors_plugins(
         let matching: Vec<&(String, &config::MeshVirtualServiceCorsPolicy)> = sorted_policies
             .iter()
             .filter(|(host, policy)| {
-                destination_rule_host_matches(host, &policy.namespace, &service_fqdn)
+                destination_rule_host_specificity(host, &policy.namespace, &service_fqdn)
+                    == Some(DestinationRuleHostSpecificity::Exact)
             })
             .collect();
         let Some((_, policy)) = matching.first() else {
@@ -12148,11 +12112,35 @@ pub(crate) fn apply_destination_rules_with_tenant_file_roots(
     // service because `beta` sorts later — so this refuses instead, before any
     // upstream is mutated. See `docs/mesh.md` "An upstream that spans two
     // destinations".
-    let mut winning_tier_by_upstream_host: Vec<Vec<Option<DestinationRuleLookupTier>>> =
+    //
+    // Within the winning tier, Istio's most-specific-host rule picks the rules
+    // (issue #7395, `destination_rule_host_specificity`): an exact host or
+    // Service alias beats any wildcard, and a longer wildcard suffix beats a
+    // shorter one. The winner per host is therefore `(tier, specificity)`.
+    //
+    // Materialized Service upstreams are arbitrated on their logical Service
+    // host alone (`upstream_destination_rule_match_hosts`).
+    let logical_service_upstreams: Vec<bool> = config
+        .upstreams
+        .iter()
+        .map(|upstream| {
+            outbound_upstream_owner_port.contains_key(&NamespacedResourceId::new(
+                upstream.namespace.as_str(),
+                upstream.id.as_str(),
+            ))
+        })
+        .collect();
+    let mut winning_tier_by_upstream_host: Vec<Vec<Option<DestinationRuleWinner>>> =
         Vec::with_capacity(config.upstreams.len());
-    for upstream in &config.upstreams {
-        let hosts = upstream_destination_rule_match_hosts(upstream);
-        let mut winners: Vec<Option<DestinationRuleLookupTier>> = Vec::with_capacity(hosts.len());
+    for (upstream_idx, upstream) in config.upstreams.iter().enumerate() {
+        let hosts = upstream_destination_rule_match_hosts(
+            upstream,
+            logical_service_upstreams
+                .get(upstream_idx)
+                .copied()
+                .unwrap_or(false),
+        );
+        let mut winners: Vec<Option<DestinationRuleWinner>> = Vec::with_capacity(hosts.len());
         // The winning rule SET (indexes into `sorted_destination_rules`, which
         // is deterministically ordered) for each host that resolved one. Hosts
         // with NO winner contribute nothing: a destination no visible rule
@@ -12161,28 +12149,27 @@ pub(crate) fn apply_destination_rules_with_tenant_file_roots(
         // shape that has always inherited the upstream-wide policy.
         let mut winning_rule_sets: Vec<Vec<usize>> = Vec::new();
         for host in hosts {
-            let mut winner: Option<DestinationRuleLookupTier> = None;
+            let mut winner: Option<DestinationRuleWinner> = None;
             for dr in sorted_destination_rules.iter().copied() {
-                if !destination_rule_host_matches(&dr.host, &dr.namespace, host) {
-                    continue;
-                }
-                let Some(tier) = tier_scope.eligible_tier(dr, upstream, host) else {
+                let Some(candidate) =
+                    destination_rule_winner_candidate(&tier_scope, dr, upstream, host)
+                else {
                     continue;
                 };
                 winner = Some(match winner {
-                    Some(current) => current.min(tier),
-                    None => tier,
+                    Some(current) if current.outranks_or_ties(candidate) => current,
+                    _ => candidate,
                 });
             }
-            if let Some(tier) = winner {
+            if let Some(winner) = winner {
                 winning_rule_sets.push(
                     sorted_destination_rules
                         .iter()
                         .copied()
                         .enumerate()
                         .filter(|&(_, dr)| {
-                            destination_rule_host_matches(&dr.host, &dr.namespace, host)
-                                && tier_scope.eligible_tier(dr, upstream, host) == Some(tier)
+                            destination_rule_winner_candidate(&tier_scope, dr, upstream, host)
+                                == Some(winner)
                         })
                         .map(|(idx, _)| idx)
                         .collect(),
@@ -12234,21 +12221,27 @@ pub(crate) fn apply_destination_rules_with_tenant_file_roots(
             .enumerate()
             .filter_map(|(idx, upstream)| {
                 let winners = winning_tier_by_upstream_host.get(idx)?;
-                let hosts = upstream_destination_rule_match_hosts(upstream);
+                let hosts = upstream_destination_rule_match_hosts(
+                    upstream,
+                    logical_service_upstreams.get(idx).copied().unwrap_or(false),
+                );
                 let mut wins_a_host = false;
                 for (host_idx, host) in hosts.into_iter().enumerate() {
-                    if !destination_rule_host_matches(&dr.host, &dr.namespace, host) {
+                    if destination_rule_host_specificity(&dr.host, &dr.namespace, host).is_none() {
                         continue;
                     }
                     matched_any_host = true;
                     // A rule outside the lookup path is refused outright; a
-                    // rule from a lower-priority tier must not overwrite the
-                    // winning tier's policy for THIS host.
-                    let Some(tier) = tier_scope.eligible_tier(dr, upstream, host) else {
+                    // rule from a lower-priority tier, or a less specific
+                    // host in the winning tier, must not overwrite the
+                    // winning rules' policy for THIS host.
+                    let Some(candidate) =
+                        destination_rule_winner_candidate(&tier_scope, dr, upstream, host)
+                    else {
                         continue;
                     };
                     eligible_any_host = true;
-                    if winners.get(host_idx).copied().flatten() == Some(tier) {
+                    if winners.get(host_idx).copied().flatten() == Some(candidate) {
                         wins_a_host = true;
                     }
                 }
@@ -13276,11 +13269,18 @@ impl MaterializationTierScope<'_> {
     /// so a reverse-translated xDS carrier — which never passes
     /// `admit_destination_rules` — cannot land an arbitrary namespace's rule
     /// on this workload's routes.
+    ///
+    /// A WILDCARD rule (issue #7395) reaches the service tier exactly for the
+    /// matched destinations its own namespace owns by that resolved evidence,
+    /// as at admission (`slice::admit_destination_rules`): the upstream-
+    /// namespace fallback in (2) never applies to it, so a wildcard can never
+    /// claim the service tier for a host whose owner is unknown.
     fn eligible_tier(
         &self,
         dr: &MeshDestinationRule,
         upstream: &Upstream,
         matched_host: &str,
+        specificity: DestinationRuleHostSpecificity,
     ) -> Option<DestinationRuleLookupTier> {
         let host_owner = destination_host_owner(
             matched_host,
@@ -13290,13 +13290,14 @@ impl MaterializationTierScope<'_> {
         );
         let service_namespace = match host_owner.as_ref() {
             Some(owner) => Some(owner.namespace()),
-            None => {
+            None if specificity == DestinationRuleHostSpecificity::Exact => {
                 let upstream_namespace = upstream.namespace.trim();
                 (!upstream_namespace.is_empty()).then_some(upstream_namespace)
             }
+            None => None,
         };
         let tier = destination_rule_lookup_tier(
-            &dr.namespace,
+            dr,
             self.client_namespace,
             service_namespace,
             self.root_namespace,
@@ -13309,13 +13310,28 @@ impl MaterializationTierScope<'_> {
 /// on, in a STABLE order: target hosts first, then the upstream `name`, then
 /// the upstream `id`.
 ///
+/// A materialized Service upstream (`logical_service_upstream`: one the
+/// slice's Service inventory forward-derives, named with the Service FQDN) is
+/// arbitrated on its LOGICAL Service host alone, as Istio looks a
+/// DestinationRule up by Service hostname (issue #7395): its targets are
+/// workload addresses, east-west gateway endpoints, or opaque cross-cluster
+/// transport identities, none of which is a destination host a rule names.
+/// Matching them would let a wildcard win a gateway endpoint while an exact
+/// rule wins the Service name, and refuse the upstream as spanning two
+/// destinations.
+///
 /// A DR matches the upstream iff it matches at least one of these. Order is
 /// load-bearing — `apply_destination_rules` indexes its precomputed per-host
 /// winning tiers against this list, and calls this helper again during
 /// application, so the two must enumerate identically.
-fn upstream_destination_rule_match_hosts(upstream: &Upstream) -> Vec<&str> {
+fn upstream_destination_rule_match_hosts(
+    upstream: &Upstream,
+    logical_service_upstream: bool,
+) -> Vec<&str> {
     let mut hosts: Vec<&str> = Vec::with_capacity(upstream.targets.len() + 2);
-    hosts.extend(upstream.targets.iter().map(|target| target.host.as_str()));
+    if !logical_service_upstream {
+        hosts.extend(upstream.targets.iter().map(|target| target.host.as_str()));
+    }
     if let Some(name) = upstream.name.as_deref() {
         hosts.push(name);
     }
@@ -13364,26 +13380,56 @@ fn upstream_uses_mesh_transport(upstream: &Upstream) -> bool {
     }
 }
 
-/// How a DestinationRule `host` names a destination host.
+/// How specifically a DestinationRule `host` names a destination host, for
+/// Istio's most-specific-host precedence (issue #7395): an exact host or one
+/// of its Service aliases beats every wildcard, and a longer wildcard suffix
+/// beats a shorter one (`*.svc.cluster.local` beats `*.cluster.local` beats
+/// `*`). Derived `Ord` follows that ranking.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum DestinationRuleHostSpecificity {
-    /// `*` (suffix length 0) or `*.<suffix>`, by suffix length in bytes. The
-    /// data plane does not apply wildcard rules; a NodeWaypoint carried route
-    /// refuses an external destination one covers.
+    /// `*` (suffix length 0) or `*.<suffix>`, by suffix length in bytes.
     Wildcard(usize),
     /// The exact host, or a Service alias of it (short name, `<svc>.<ns>`,
-    /// `<svc>.<ns>.svc[.<domain>]`): what [`destination_rule_host_matches`],
-    /// and therefore DestinationRule application, matches.
+    /// `<svc>.<ns>.svc[.<domain>]`).
     Exact,
 }
 
-/// Whether, and how, DestinationRule `rule_host` (declared in `namespace`)
-/// names destination host `candidate`. The exact arm is
-/// [`destination_rule_host_matches`] itself, so it agrees with
-/// DestinationRule application by construction; the wildcard arm only
-/// DETECTS coverage (Istio semantics: `*.example.com` names
-/// `api.example.com` and `a.b.example.com`, never `example.com`; `*` names
-/// every DNS host name; never an IP literal or a dotless id).
+/// Whether `candidate` (already trimmed and lowercased) is a DNS host name a
+/// wildcard DestinationRule host may name: dotted, every label non-empty and
+/// made of letters, digits, `-` or `_`, and not an IP literal. A wildcard
+/// ServiceEntry host (`*.example.com`) qualifies too, as in Istio (a broader
+/// wildcard rule such as `*` or `*.com` names it). That excludes IP-literal
+/// targets, dotless upstream ids, and opaque transport identities such as the
+/// cross-cluster HBONE synthetic host (`mesh-xc-hbone|<gateway>|<port>|<pod>`),
+/// which no Istio host lookup sees.
+fn is_wildcard_matchable_host(candidate: &str) -> bool {
+    let candidate = candidate.strip_prefix("*.").unwrap_or(candidate);
+    candidate.contains('.')
+        && candidate.split('.').all(|label| {
+            !label.is_empty()
+                && label
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+        })
+        && candidate.parse::<std::net::IpAddr>().is_err()
+}
+
+/// Whether, and how specifically, DestinationRule `rule_host` (declared in
+/// `namespace`) names destination host `candidate`. The ONE DestinationRule
+/// host matcher (issue #7395): rule application (`apply_destination_rules`),
+/// the NodeWaypoint carried-route binding (`destination_rules_naming_host`)
+/// and the ServiceWaypoint slice narrowing
+/// (`slice::destination_rule_matches_admitted_service`) all select through
+/// it, so they agree by construction.
+///
+/// Exact arm: the host itself, or, for a short host, a Service alias resolved
+/// in the RULE's namespace (`reviews` ⇒ `reviews.<ns>`,
+/// `reviews.<ns>.svc.<domain>`), a two-label `<svc>.<ns>` or `<svc>.<ns>.svc`
+/// host ⇒ its `.svc.<domain>` form.
+///
+/// Wildcard arm (Istio semantics): `*.example.com` names `api.example.com` and
+/// `a.b.example.com`, never `example.com`; `*` names every host. A wildcard
+/// names DNS host names only ([`is_wildcard_matchable_host`]).
 pub(crate) fn destination_rule_host_specificity(
     rule_host: &str,
     namespace: &str,
@@ -13391,14 +13437,16 @@ pub(crate) fn destination_rule_host_specificity(
 ) -> Option<DestinationRuleHostSpecificity> {
     let rule_host = rule_host.trim().trim_end_matches('.').to_ascii_lowercase();
     let candidate = candidate.trim().trim_end_matches('.').to_ascii_lowercase();
+    if candidate.is_empty() {
+        return None;
+    }
     if let Some(suffix) = rule_host.strip_prefix('*') {
-        let is_dns_name = candidate.contains('.')
-            && candidate
-                .trim_start_matches('[')
-                .trim_end_matches(']')
-                .parse::<std::net::IpAddr>()
-                .is_err();
-        if !is_dns_name {
+        // A wildcard ServiceEntry host the rule spells identically is an
+        // exact match, as Istio's exact-host lookup finds it first.
+        if candidate == rule_host {
+            return Some(DestinationRuleHostSpecificity::Exact);
+        }
+        if !is_wildcard_matchable_host(&candidate) {
             return None;
         }
         if suffix.is_empty() {
@@ -13411,31 +13459,51 @@ pub(crate) fn destination_rule_host_specificity(
         return (candidate.len() > suffix.len() && candidate.ends_with(suffix))
             .then_some(DestinationRuleHostSpecificity::Wildcard(suffix.len()));
     }
-    destination_rule_host_matches(&rule_host, namespace, &candidate)
-        .then_some(DestinationRuleHostSpecificity::Exact)
+    let exact = if candidate == rule_host {
+        true
+    } else if !rule_host.contains('.') {
+        let namespaced = format!("{rule_host}.{}", namespace.trim());
+        candidate == namespaced || candidate.starts_with(&format!("{namespaced}.svc."))
+    } else if rule_host.bytes().filter(|byte| *byte == b'.').count() == 1 {
+        candidate.starts_with(&format!("{rule_host}.svc."))
+    } else if rule_host.ends_with(".svc") {
+        candidate.starts_with(&format!("{rule_host}."))
+    } else {
+        false
+    };
+    exact.then_some(DestinationRuleHostSpecificity::Exact)
 }
 
-fn destination_rule_host_matches(rule_host: &str, namespace: &str, candidate: &str) -> bool {
-    let rule_host = rule_host.trim_end_matches('.').to_ascii_lowercase();
-    let candidate = candidate.trim_end_matches('.').to_ascii_lowercase();
-    if candidate == rule_host {
-        return true;
-    }
+/// The rules that win one destination host (issue #7395): the most specific
+/// lookup tier first (client, then target service, then root namespace, see
+/// [`destination_rule_lookup_tier`]), then, within that tier, the most
+/// specific host match. Rules tied on both apply together, in the sorted
+/// application order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DestinationRuleWinner {
+    tier: DestinationRuleLookupTier,
+    specificity: DestinationRuleHostSpecificity,
+}
 
-    if !rule_host.contains('.') {
-        let namespaced = format!("{rule_host}.{namespace}");
-        return candidate == namespaced || candidate.starts_with(&format!("{namespaced}.svc."));
+impl DestinationRuleWinner {
+    /// True when `self` wins over, or ties with, `other`.
+    fn outranks_or_ties(self, other: Self) -> bool {
+        self.tier < other.tier || (self.tier == other.tier && self.specificity >= other.specificity)
     }
+}
 
-    let dot_count = rule_host.bytes().filter(|byte| *byte == b'.').count();
-    if dot_count == 1 {
-        return candidate.starts_with(&format!("{rule_host}.svc."));
-    }
-    if rule_host.ends_with(".svc") {
-        return candidate.starts_with(&format!("{rule_host}."));
-    }
-
-    false
+/// `dr`'s claim on destination host `host` of `upstream`: its lookup tier and
+/// host specificity, or `None` when it does not name the host or is outside
+/// the lookup path.
+fn destination_rule_winner_candidate(
+    tier_scope: &MaterializationTierScope<'_>,
+    dr: &MeshDestinationRule,
+    upstream: &Upstream,
+    host: &str,
+) -> Option<DestinationRuleWinner> {
+    let specificity = destination_rule_host_specificity(&dr.host, &dr.namespace, host)?;
+    let tier = tier_scope.eligible_tier(dr, upstream, host, specificity)?;
+    Some(DestinationRuleWinner { tier, specificity })
 }
 
 /// Apply a `MeshTrafficPolicy` onto a Ferrum `Upstream`.

@@ -5668,63 +5668,81 @@ fn allowed_ws_origins_grandfathering_warning_never_precedes_an_admission_refusal
     );
 }
 
-/// Issue #7387 review rounds 4-5: DestinationRule host matching has ONE exact
-/// implementation, and wildcard coverage is DETECTED, never applied, on the
-/// data plane. `destination_rule_host_matches` (exact hosts and Service
-/// aliases) decides rule application; `destination_rule_host_specificity`
-/// reuses it for its exact arm and adds only wildcard detection, which the
-/// NodeWaypoint carried-route binding uses to refuse a wildcard-covered
-/// external leg or direct backend (it would otherwise be dialed in plaintext
-/// past an unapplied rule). Applying wildcard rules is a separate feature;
-/// this pins that it is not half-enabled here.
+/// Issue #7395 (from the #7387 round-four design): DestinationRule host
+/// matching has ONE implementation, with Istio wildcard semantics.
+/// DestinationRule application (`apply_destination_rules`, through its
+/// `(tier, specificity)` winner), the NodeWaypoint carried-route binding
+/// (which decides that an external host's rule needs its own residual leg)
+/// and the ServiceWaypoint slice narrowing all select rules through
+/// `destination_rule_host_specificity`; a second, exact-only matcher dropped
+/// every wildcard rule (ServiceWaypoint) or isolated a wildcard-governed leg
+/// that never received its rule. No hand-rolled wildcard test and no
+/// wildcard refusal may reappear beside them.
 #[test]
 fn destination_rule_host_matching_has_one_implementation() {
     let mesh = source("src/modes/mesh/mod.rs");
-    for (signature, needle) in [
+    let slice = source("src/modes/mesh/slice.rs");
+    for (text, signature, needle) in [
         (
-            "pub(crate) fn destination_rule_host_specificity(",
-            "destination_rule_host_matches(",
-        ),
-        (
+            &mesh,
             "fn destination_rules_naming_host<'a>(",
-            "DestinationRuleHostSpecificity::Exact",
+            "destination_rule_host_specificity(",
         ),
         (
-            "fn wildcard_destination_rule_covers_host(",
-            "DestinationRuleHostSpecificity::Wildcard(_)",
+            &mesh,
+            "fn destination_rule_winner_candidate(",
+            "destination_rule_host_specificity(",
         ),
         (
+            &mesh,
             "pub(crate) fn apply_destination_rules_with_tenant_file_roots(",
-            "destination_rule_host_matches(",
+            "destination_rule_winner_candidate(",
+        ),
+        (
+            &mesh,
+            "pub(crate) fn apply_destination_rules_with_tenant_file_roots(",
+            "destination_rule_host_specificity(",
+        ),
+        (
+            &slice,
+            "fn destination_rule_matches_admitted_service(",
+            "super::destination_rule_host_specificity(",
+        ),
+        (
+            &slice,
+            "fn wildcard_destination_rule_names_owned_destination<F>(",
+            "super::destination_rule_host_specificity(",
         ),
     ] {
-        let body = item_body(&mesh, signature, "\n}\n");
-        assert!(body.contains(needle), "`{signature}` must reach `{needle}`");
+        let body = item_body(text, signature, "\n}\n");
+        assert!(
+            body.contains(needle),
+            "`{signature}` must select DestinationRules through `{needle}`"
+        );
+        assert!(
+            !body.contains("strip_prefix('*')")
+                && !body.contains("destination_rule_host_matches(")
+                && !body.contains("host_matches_admitted_service("),
+            "`{signature}` must not carry its own DestinationRule host matcher"
+        );
     }
-    let apply = item_body(
-        &mesh,
-        "pub(crate) fn apply_destination_rules_with_tenant_file_roots(",
-        "\n}\n",
-    );
     assert!(
-        !apply.contains("destination_rule_host_specificity(")
-            && !apply.contains("strip_prefix('*')"),
-        "DestinationRule application must not apply wildcard rules"
+        !mesh.contains("fn destination_rule_host_matches("),
+        "the exact-only matcher is gone; every caller uses the specificity matcher"
+    );
+    assert_eq!(
+        mesh.matches("rule_host.strip_prefix('*')").count(),
+        1,
+        "the one wildcard rule lives in `destination_rule_host_specificity`"
     );
     let bind = item_body(
         &mesh,
         "fn bind_carried_http_routes_to_node_waypoint_transport(",
         "\n}\n",
     );
-    assert_eq!(
-        bind.matches("wildcard_destination_rule_covers_host(")
-            .count(),
-        3,
-        "the binding refuses a wildcard-covered split leg, own backend and rule backend"
-    );
-    assert_eq!(
-        mesh.matches("strip_prefix('*')").count(),
-        1,
-        "the one wildcard rule lives in `destination_rule_host_specificity`"
+    assert!(
+        !bind.contains("wildcard_destination_rule"),
+        "a wildcard rule is applied like an exact one, so the binding no longer \
+         refuses the destinations it covers"
     );
 }

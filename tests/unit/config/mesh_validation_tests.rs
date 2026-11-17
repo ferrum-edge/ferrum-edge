@@ -3454,7 +3454,7 @@ mod virtual_service_cors {
     #[test]
     fn normalize_trims_and_lowercases_carried_host() {
         // Synthesis matches `policy.host` against service FQDNs with
-        // `destination_rule_host_matches` (no trimming there); a padded or
+        // `destination_rule_host_specificity`; a padded or
         // mixed-case native/file host must be normalized like DR hosts or the
         // policy silently attaches no plugin.
         let mut config = MeshConfig {

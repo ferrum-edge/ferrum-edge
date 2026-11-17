@@ -2621,16 +2621,15 @@ fn narrow_for_service_waypoint(
         .destination_rules
         .into_iter()
         .filter(|dr| {
-            // DR is admitted only when its host is one of the admitted
-            // Service's canonical Kubernetes DNS aliases. Broad prefix
-            // matches can accidentally admit unrelated external hosts.
+            // DR is admitted only when it names an admitted Service, through
+            // the one DestinationRule host matcher (exact alias or wildcard,
+            // issue #7395), from a namespace on that Service's lookup path.
             destination_rule_matches_admitted_service(
                 dr,
                 waypoint_namespace,
                 root_namespace,
                 cluster_domain,
                 &admitted_services,
-                &admitted_hosts,
             )
         })
         .collect();
@@ -2716,62 +2715,43 @@ fn admitted_service_hosts(services: &[MeshService], cluster_domain: &str) -> BTr
     hosts
 }
 
+/// Whether a DestinationRule governs a Service this service waypoint is bound
+/// to: it names one of the Service's dotted aliases (`<svc>.<ns>`,
+/// `<svc>.<ns>.svc`, the FQDN) through the ONE DestinationRule host matcher,
+/// [`super::destination_rule_host_specificity`] (exact, Service alias, or
+/// wildcard, issue #7395), AND its namespace is on that Service's Istio
+/// lookup path from the waypoint's client position, re-derived from the
+/// MATCHED Service: the waypoint's own namespace (client tier), the matched
+/// Service's namespace (service tier), or the configured
+/// `istio_root_namespace` (root tier, issue #2469 — omitting it dropped the
+/// mesh-wide default entirely). A short host resolves in the rule's own
+/// namespace, so it can only name a Service there. Export visibility and
+/// cross-tier precedence have already been resolved by
+/// `admit_destination_rules` and are re-applied per destination host by
+/// `apply_destination_rules`; this pass only re-checks ownership against the
+/// waypoint's narrowed service set.
 fn destination_rule_matches_admitted_service(
     dr: &MeshDestinationRule,
     waypoint_namespace: &str,
     root_namespace: &str,
     cluster_domain: &str,
     admitted_services: &[MeshService],
-    admitted_hosts: &BTreeSet<String>,
 ) -> bool {
-    let host = dr.host.trim_end_matches('.');
-    host_matches_admitted_service(host, admitted_hosts)
-        && destination_rule_namespace_allowed_for_admitted_service(
-            dr,
-            waypoint_namespace,
-            root_namespace,
-            cluster_domain,
-            admitted_services,
-            host,
-        )
-        || admitted_services
-            .iter()
-            .any(|service| host == service.name && dr.namespace == service.namespace)
-}
-
-/// Which namespaces may own a DestinationRule for a service-waypoint-admitted
-/// service.
-///
-/// This mirrors Istio's lookup path for the waypoint's client position: the
-/// waypoint's own namespace (client tier), the target Service's namespace
-/// (service tier), and the configured `istio_root_namespace` (root tier,
-/// issue #2469 — omitting it dropped the mesh-wide default entirely). Export
-/// visibility and cross-tier precedence have already been resolved by
-/// `admit_destination_rules`; this pass only re-checks ownership against the
-/// waypoint's narrowed service set.
-fn destination_rule_namespace_allowed_for_admitted_service(
-    dr: &MeshDestinationRule,
-    waypoint_namespace: &str,
-    root_namespace: &str,
-    cluster_domain: &str,
-    admitted_services: &[MeshService],
-    host: &str,
-) -> bool {
-    let cluster_domain = cluster_domain.trim().trim_end_matches('.');
     let root_namespace = root_namespace.trim();
+    let rule_namespace = dr.namespace.trim();
     admitted_services.iter().any(|service| {
-        let host_matches = host == format!("{}.{}", service.name, service.namespace)
-            || host == format!("{}.{}.svc", service.name, service.namespace)
-            || (!cluster_domain.is_empty()
-                && host
-                    == format!(
-                        "{}.{}.svc.{}",
-                        service.name, service.namespace, cluster_domain
-                    ));
-        host_matches
-            && (dr.namespace == service.namespace
-                || dr.namespace == waypoint_namespace
-                || (!root_namespace.is_empty() && dr.namespace.trim() == root_namespace))
+        let names_service = service_host_aliases(&service.name, &service.namespace, cluster_domain)
+            .iter()
+            // The dotless short alias would match a short host declared in
+            // ANY namespace; the dotted aliases carry the namespace.
+            .filter(|alias| alias.contains('.'))
+            .any(|alias| {
+                super::destination_rule_host_specificity(&dr.host, &dr.namespace, alias).is_some()
+            });
+        names_service
+            && (rule_namespace == service.namespace.trim()
+                || rule_namespace == waypoint_namespace.trim()
+                || (!root_namespace.is_empty() && rule_namespace == root_namespace))
     })
 }
 
@@ -3693,7 +3673,10 @@ type DestinationRuleGroupKey = (Option<String>, String);
 /// from the ownership claim tiering reads.
 ///
 /// The service tier is granted only on EVIDENCE of ownership (see
-/// `policy_target_service_ref`). A host whose owner cannot be established —
+/// `policy_target_service_ref`). A wildcard host owns nothing itself: it is
+/// admitted at the service tier only when it names a registry destination its
+/// own namespace owns (`wildcard_destination_rule_names_owned_destination`,
+/// issue #7395). A host whose owner cannot be established —
 /// an external host with no visible ServiceEntry, one claimed by ServiceEntries
 /// in two different namespaces, or an unqualified two-label host absent from
 /// the service inventory — has NO service tier, so only the client namespace
@@ -3734,12 +3717,33 @@ where
             scope.service_entry_hosts,
         );
         let tier = destination_rule_lookup_tier(
-            &rule.namespace,
+            rule,
             scope.client_namespace,
             host_scope.service_namespace.as_deref(),
             scope.root_namespace,
         );
+        let group_host = host_scope
+            .host_candidates
+            .first()
+            .cloned()
+            .unwrap_or_default();
         if !tier.is_in_lookup_path() {
+            // Issue #7395: a wildcard host names no single destination, so
+            // it has no owner of its own and its service tier is decided per
+            // destination it matches: the rule is admitted at the service
+            // tier when it names a registry destination its OWN namespace
+            // owns and the caller's scope admits. The data plane
+            // (`MaterializationTierScope::eligible_tier`) then grants it the
+            // service tier for exactly those destinations.
+            if is_wildcard_destination_rule_host(&rule.host)
+                && wildcard_destination_rule_names_owned_destination(rule, scope, &mut extra_admits)
+            {
+                visible.push((
+                    (Some(rule.namespace.trim().to_string()), group_host),
+                    DestinationRuleLookupTier::Service,
+                    rule,
+                ));
+            }
             continue;
         }
         if !extra_admits(
@@ -3749,11 +3753,6 @@ where
         ) {
             continue;
         }
-        let group_host = host_scope
-            .host_candidates
-            .first()
-            .cloned()
-            .unwrap_or_default();
         visible.push(((host_scope.service_namespace, group_host), tier, rule));
     }
 
@@ -3790,6 +3789,75 @@ where
         );
     }
     admitted
+}
+
+/// Whether a DestinationRule host is a wildcard (`*`, `*.example.com`).
+fn is_wildcard_destination_rule_host(host: &str) -> bool {
+    host.trim().starts_with('*')
+}
+
+/// Whether wildcard DestinationRule `rule` names a registry destination that
+/// its own namespace owns and that the caller's scope admits (issue #7395).
+///
+/// Ownership comes from the same evidence, in the same order, as every other
+/// service-tier decision ([`destination_host_owner`]): an in-cluster Service
+/// is owned by its namespace, an external host by the single namespace whose
+/// visible ServiceEntry declares it. It is NEVER inferred from the rule's
+/// declaring namespace alone: a wildcard that names no destination its
+/// namespace owns is refused here, as on the data plane. Each matched
+/// destination is offered to the caller's gate (`extra_admits`) as that
+/// destination, so the Sidecar egress scope judges the concrete host.
+fn wildcard_destination_rule_names_owned_destination<F>(
+    rule: &MeshDestinationRule,
+    scope: &DestinationRuleScope<'_>,
+    extra_admits: &mut F,
+) -> bool
+where
+    F: FnMut(&MeshDestinationRule, &str, &[String]) -> bool,
+{
+    let rule_namespace = rule.namespace.trim();
+    if rule_namespace.is_empty() {
+        return false;
+    }
+    let cluster_domain = scope.cluster_domain.trim().trim_end_matches('.');
+    for (namespace, name) in scope.mesh_service_identities {
+        if namespace != rule_namespace {
+            continue;
+        }
+        let fqdn = if cluster_domain.is_empty() {
+            format!("{name}.{namespace}.svc")
+        } else {
+            format!("{name}.{namespace}.svc.{cluster_domain}")
+        };
+        if super::destination_rule_host_specificity(&rule.host, &rule.namespace, &fqdn).is_some()
+            && extra_admits(
+                rule,
+                namespace.as_str(),
+                &service_host_aliases(name, namespace, cluster_domain),
+            )
+        {
+            return true;
+        }
+    }
+    for host in scope.service_entry_hosts.keys() {
+        let Some(owner) = destination_host_owner(
+            host,
+            scope.cluster_domain,
+            scope.mesh_service_identities,
+            scope.service_entry_hosts,
+        ) else {
+            continue;
+        };
+        if owner.namespace() != rule_namespace {
+            continue;
+        }
+        if super::destination_rule_host_specificity(&rule.host, &rule.namespace, host).is_some()
+            && extra_admits(rule, rule_namespace, std::slice::from_ref(host))
+        {
+            return true;
+        }
+    }
+    false
 }
 
 /// Ambiguous-destination counts ALREADY REPORTED for each client namespace, as

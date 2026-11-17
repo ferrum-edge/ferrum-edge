@@ -28,7 +28,7 @@
 //!   service tier for its external host; an unrelated namespace cannot become
 //!   one by publishing a rule; contested ownership disables the tier instead
 //!   of guessing an owner; and the admission resolver never disagrees with
-//!   `destination_rule_host_matches` in a direction that invents a tier.
+//!   `destination_rule_host_specificity` in a direction that invents a tier.
 //! * CP/DP agreement on that ownership for a MACHINE-SYNTHESIZED upstream: an
 //!   EgressGateway upstream is stamped with the gateway's own namespace, so the
 //!   materialization tier pass must resolve the external host's owner from the
@@ -1484,7 +1484,7 @@ fn an_invisible_service_entry_grants_no_service_tier() {
 
 // ── Qualified Kubernetes shorthand vs. the materialization host matcher ──
 
-/// `destination_rule_host_matches` treats a two-label rule host as Kubernetes
+/// `destination_rule_host_specificity` treats a two-label rule host as Kubernetes
 /// shorthand and matches it against `reviews.beta.svc.*` upstreams. The
 /// admission resolver must not disagree by resolving that same host to the
 /// RULE's namespace, or an unrelated namespace becomes an invented service
@@ -1609,8 +1609,9 @@ fn a_svc_qualified_host_is_owned_by_the_namespace_in_the_host_not_by_a_claimant(
     );
 }
 
-/// A wildcard host has no resolvable owner, so only the client and root tiers
-/// may write policy for it.
+/// A wildcard host owns nothing itself (issue #7395): it reaches the service
+/// tier only for destinations its namespace owns, and `evil` owns none here,
+/// so only the client's own wildcard stands.
 #[test]
 fn a_wildcard_host_grants_no_service_tier() {
     let rules = vec![
@@ -2246,4 +2247,347 @@ fn a_static_service_entry_without_a_rule_stays_plaintext_and_a_claimant_cannot_c
         "matching the ServiceEntry host must not let a non-owner's rule reach it"
     );
     assert_eq!(upstream.backend_tls_sni, None);
+}
+
+// ── Wildcard hosts: Istio semantics on every topology (issue #7395) ──────
+//
+// A wildcard rule host (`*.example.com`, `*`) is applied like an exact one.
+// Per destination host the winner is the most specific lookup tier first, then
+// the most specific host within it (exact or Service alias over any wildcard,
+// a longer wildcard suffix over a shorter one). A wildcard owns nothing itself:
+// it reaches the service tier only for destinations its own namespace owns.
+
+const EXTERNAL_WILDCARD: &str = "*.example.com";
+
+/// Client tier beats service tier beats root tier even when the more
+/// privileged tier only has a wildcard; within one tier, exact beats wildcard
+/// and the longer wildcard suffix beats the shorter one.
+#[test]
+fn wildcard_rules_resolve_by_tier_then_host_specificity() {
+    let entries = vec![external_service_entry(
+        "beta",
+        "external-api",
+        EXTERNAL_HOST,
+    )];
+    let effective = |rules: Vec<MeshDestinationRule>| {
+        materialized_external_connect_timeout(
+            external_host_mesh(entries.clone(), rules),
+            "alpha",
+            "beta",
+        )
+        .0
+    };
+    let owner_exact = rule("beta", "owner-exact", EXTERNAL_HOST, 2222, &["*"]);
+
+    assert_eq!(
+        effective(vec![
+            owner_exact.clone(),
+            rule("alpha", "client-wildcard", EXTERNAL_WILDCARD, 1111, &["*"]),
+        ]),
+        1111,
+        "the client tier wins outright, even with only a wildcard"
+    );
+    assert_eq!(
+        effective(vec![
+            owner_exact.clone(),
+            rule(
+                "istio-system",
+                "root-wildcard",
+                EXTERNAL_WILDCARD,
+                3333,
+                &["*"]
+            ),
+        ]),
+        2222,
+        "the owner's exact rule beats the root namespace's wildcard default"
+    );
+    assert_eq!(
+        effective(vec![rule(
+            "istio-system",
+            "root-wildcard",
+            EXTERNAL_WILDCARD,
+            3333,
+            &["*"]
+        )]),
+        3333,
+        "a root wildcard alone governs the host (it used to be ignored)"
+    );
+    assert_eq!(
+        effective(vec![
+            rule("alpha", "client-wildcard", EXTERNAL_WILDCARD, 4444, &["*"]),
+            rule("alpha", "client-exact", EXTERNAL_HOST, 1111, &["*"]),
+        ]),
+        1111,
+        "within the client tier the exact host beats the wildcard"
+    );
+    assert_eq!(
+        effective(vec![
+            rule("alpha", "client-catch-all", "*", 5555, &["*"]),
+            rule("alpha", "client-tld", "*.com", 6666, &["*"]),
+            rule("alpha", "client-wildcard", EXTERNAL_WILDCARD, 4444, &["*"]),
+        ]),
+        4444,
+        "within the client tier the longest wildcard suffix wins"
+    );
+}
+
+/// The service tier for a wildcard is per destination (issue #7395): a
+/// wildcard declared by the namespace whose ServiceEntry owns a matching host
+/// is admitted and applied there; the same wildcard from an unrelated
+/// namespace owns nothing and is refused at admission and on the data plane.
+#[test]
+fn a_wildcard_reaches_the_service_tier_only_for_destinations_its_namespace_owns() {
+    let entries = vec![external_service_entry(
+        "beta",
+        "external-api",
+        EXTERNAL_HOST,
+    )];
+    let mesh = external_host_mesh(
+        entries.clone(),
+        vec![
+            rule("beta", "owner-wildcard", EXTERNAL_WILDCARD, 2222, &["*"]),
+            rule("evil", "hijack-wildcard", EXTERNAL_WILDCARD, 6666, &["*"]),
+        ],
+    );
+    assert_eq!(
+        admitted_rule_names(&mesh, "alpha"),
+        vec!["owner-wildcard".to_string()],
+        "the ServiceEntry owner's wildcard is a service-tier rule for the host it owns"
+    );
+    let (effective, _) = materialized_external_connect_timeout(mesh, "alpha", "beta");
+    assert_eq!(
+        effective, 2222,
+        "and it governs that host on the data plane"
+    );
+
+    // A wildcard naming no destination its namespace owns is refused, whatever
+    // the upstream's own namespace says.
+    let (effective, baseline) = materialized_external_connect_timeout(
+        external_host_mesh(
+            Vec::new(),
+            vec![rule(
+                "evil",
+                "hijack-wildcard",
+                EXTERNAL_WILDCARD,
+                6666,
+                &["*"],
+            )],
+        ),
+        "alpha",
+        "evil",
+    );
+    assert_eq!(
+        effective, baseline,
+        "ownership of a wildcard is never inferred from a namespace alone"
+    );
+}
+
+/// Requirement 2's shape through slice construction AND TLS-scheme
+/// projection: a ServiceEntry owner in another namespace than the
+/// EgressGateway authors a wildcard that originates TLS; the gateway dials the
+/// owned host over TLS. An unrelated namespace's identical wildcard leaves it
+/// plaintext.
+#[test]
+fn a_cross_namespace_service_entry_owners_wildcard_originates_tls_on_the_egress_gateway() {
+    let wildcard_tls = |namespace: &str| {
+        let mut dr = external_tls_mode_rule(MtlsMode::Simple);
+        dr.namespace = namespace.to_string();
+        dr.host = EXTERNAL_WILDCARD.to_string();
+        dr
+    };
+    assert_eq!(
+        egress_scheme_for(AppProtocol::Http, vec![wildcard_tls(EXTERNAL_HOST_OWNER)]),
+        BackendScheme::Https,
+        "the owner's wildcard tls.mode SIMPLE originates TLS to its external host"
+    );
+    assert_eq!(
+        egress_scheme_for(AppProtocol::Http, vec![wildcard_tls("evil")]),
+        BackendScheme::Http,
+        "an unrelated namespace's wildcard owns nothing and changes nothing"
+    );
+}
+
+/// The backend scheme an EgressGateway running in `gateway_namespace` dials
+/// [`EXTERNAL_HOST`] with (HTTP ServiceEntry port), under `rules`.
+fn egress_scheme_in_namespace(
+    gateway_namespace: &str,
+    rules: Vec<MeshDestinationRule>,
+) -> BackendScheme {
+    let mut mesh = egress_gateway_mesh(EXTERNAL_HOST_OWNER, rules);
+    mesh.workloads = vec![workload_in(gateway_namespace, "egress-gateway")];
+    mesh.sidecars = vec![permissive_sidecar(gateway_namespace)];
+    let runtime = MeshRuntimeConfig {
+        namespace: gateway_namespace.to_string(),
+        topology: MeshTopology::EgressGateway,
+        sidecar_enforced: true,
+        ..default_mesh_runtime()
+    };
+    let config = GatewayConfig {
+        mesh: Some(Box::new(mesh)),
+        ..GatewayConfig::default()
+    };
+    let prepared = prepare_gateway_config_via_mesh_slice_with_fixtures(config, &runtime)
+        .expect("mesh preparation succeeds");
+    let upstream = prepared
+        .upstreams
+        .iter()
+        .find(|u| u.targets.iter().any(|t| t.host == EXTERNAL_HOST))
+        .expect("the egress gateway materializes an upstream for the ServiceEntry host");
+    prepared
+        .proxies
+        .iter()
+        .find(|p| p.upstream_id.as_deref() == Some(upstream.id.as_str()))
+        .expect("the materialized egress upstream has a referencing proxy")
+        .backend_scheme
+        .expect("an HTTP-family egress proxy carries a backend scheme")
+}
+
+/// Istio's root-namespace exception (issue #7395 requirement 1): for a client
+/// that itself runs in the root namespace, only the root namespace's PRIVATE
+/// rules are its client tier; its exported rules stay the mesh-wide default
+/// behind the destination owner's rules. Otherwise an exported root wildcard
+/// `DISABLE` would override the owner's exact TLS rule for every gateway in
+/// `istio-system`.
+#[test]
+fn a_root_namespace_egress_gateway_keeps_exported_root_rules_behind_the_owner() {
+    let owner_tls = external_tls_mode_rule(MtlsMode::Simple);
+    let root_disable = |name: &str, host: &str, export_to: &[&str]| {
+        let mut dr = external_tls_mode_rule(MtlsMode::Disable);
+        dr.namespace = "istio-system".to_string();
+        dr.name = name.to_string();
+        dr.host = host.to_string();
+        dr.export_to = export_to.iter().map(|e| (*e).to_string()).collect();
+        dr
+    };
+
+    assert_eq!(
+        egress_scheme_in_namespace(
+            "istio-system",
+            vec![
+                owner_tls.clone(),
+                root_disable("mesh-default", EXTERNAL_WILDCARD, &["*"]),
+            ],
+        ),
+        BackendScheme::Https,
+        "an exported root wildcard is the root tier, behind the owner's exact rule"
+    );
+    assert_eq!(
+        egress_scheme_in_namespace(
+            "istio-system",
+            vec![
+                owner_tls.clone(),
+                root_disable("mesh-default", EXTERNAL_HOST, &["*"]),
+            ],
+        ),
+        BackendScheme::Https,
+        "so is an exported root exact rule"
+    );
+    assert_eq!(
+        egress_scheme_in_namespace(
+            "istio-system",
+            vec![
+                owner_tls.clone(),
+                root_disable("gateway-local", EXTERNAL_WILDCARD, &["."]),
+            ],
+        ),
+        BackendScheme::Http,
+        "a root-namespace PRIVATE rule is the root-namespace client's own tier"
+    );
+    assert_eq!(
+        egress_scheme_in_namespace(
+            EGRESS_GATEWAY_NAMESPACE,
+            vec![
+                owner_tls,
+                root_disable("gateway-local", EXTERNAL_WILDCARD, &["."]),
+            ],
+        ),
+        BackendScheme::Https,
+        "outside the root namespace a private root rule is invisible"
+    );
+}
+
+/// A materialized Service upstream is arbitrated on its LOGICAL Service host
+/// (issue #7395 requirement 3). Its targets are east-west gateway endpoints and
+/// opaque cross-cluster HBONE transport identities; a catch-all rule must not
+/// win one of those while the exact rule wins the Service name, which would
+/// refuse the whole slice. The genuine multi-destination refusal stays: an
+/// operator upstream that really dials both hosts is still refused.
+#[test]
+fn a_materialized_service_upstream_is_arbitrated_on_its_logical_service_host() {
+    use ferrum_edge::_test_support::apply_destination_rules_with_tenant_roots_for_test as apply;
+
+    const SERVICE_FQDN: &str = "reviews.beta.svc.cluster.local";
+    let slice = |rules: Vec<MeshDestinationRule>| MeshSlice {
+        namespace: "alpha".to_string(),
+        istio_root_namespace: "istio-system".to_string(),
+        services: vec![service_in("beta", "reviews")],
+        destination_rules: rules,
+        ..MeshSlice::default()
+    };
+    let upstream_with_remote_targets = |id: &str| {
+        let mut upstream = http_upstream(id, "10.1.0.3", 8080);
+        upstream.namespace = "beta".to_string();
+        upstream.name = Some(SERVICE_FQDN.to_string());
+        for host in [
+            "mesh-xc-hbone|eastwest.remote.example.com|15443|10.1.0.4",
+            "eastwest.remote.example.com",
+        ] {
+            upstream.targets.push(UpstreamTarget {
+                host: host.to_string(),
+                port: 15443,
+                service_port_policy_key: None,
+                weight: 1,
+                tags: HashMap::new(),
+                locality: None,
+                path: None,
+            });
+        }
+        upstream
+    };
+    let exact = || {
+        let mut dr = rule("beta", "owner-exact", SERVICE_FQDN, 2222, &["*"]);
+        dr.traffic_policy = Some(MeshTrafficPolicy {
+            load_balancer: Some(MeshLoadBalancer::Simple(MeshSimpleLb::LeastRequest)),
+            ..MeshTrafficPolicy::default()
+        });
+        dr
+    };
+    let catch_all = || {
+        let mut dr = rule("istio-system", "mesh-default", "*", 3333, &["*"]);
+        dr.traffic_policy = Some(MeshTrafficPolicy {
+            load_balancer: Some(MeshLoadBalancer::Simple(MeshSimpleLb::Random)),
+            ..MeshTrafficPolicy::default()
+        });
+        dr
+    };
+    let runtime = alpha_subscriber_runtime();
+    let applied = |id: &str, rules: Vec<MeshDestinationRule>| {
+        let mut config = GatewayConfig {
+            upstreams: vec![upstream_with_remote_targets(id)],
+            ..GatewayConfig::default()
+        };
+        apply(&mut config, &runtime, &slice(rules), &[]).map(|()| config.upstreams[0].clone())
+    };
+
+    let materialized = "__mesh-out-upstream-beta-reviews-8080";
+    let exact_only = applied(materialized, vec![exact()]).expect("the exact rule applies");
+    let catch_all_only =
+        applied(materialized, vec![catch_all()]).expect("the catch-all applies alone");
+    assert_ne!(
+        exact_only.algorithm, catch_all_only.algorithm,
+        "the premise: the two rules project different load balancers"
+    );
+    let both = applied(materialized, vec![exact(), catch_all()])
+        .expect("a materialized Service upstream has one logical destination");
+    assert_eq!(
+        both.algorithm, exact_only.algorithm,
+        "the exact owner rule wins the logical Service host over the root catch-all"
+    );
+
+    let error = applied("operator-u", vec![exact(), catch_all()])
+        .expect_err("an operator upstream really dialing two hosts with different winners");
+    assert!(
+        error.to_string().contains("cannot be represented"),
+        "the genuine multi-destination refusal is kept: {error}"
+    );
 }
