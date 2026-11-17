@@ -6278,7 +6278,7 @@ async fn test_only_collector_scoped_charges_reads_acknowledge_delivery() {
         let token = jsonwebtoken::encode(
             &jsonwebtoken::Header::new(jsonwebtoken::Algorithm::HS256),
             &claims,
-            &jsonwebtoken::EncodingKey::from_secret(secret.as_bytes()),
+            &jsonwebtoken::EncodingKey::from_secret(secret.as_bytes()).unwrap(),
         )
         .unwrap();
         format!("Bearer {token}")
