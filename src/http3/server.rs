@@ -4100,6 +4100,7 @@ async fn handle_h3_request(
                     grpc_web_response_content_type,
                     StatusCode::NOT_FOUND,
                 ),
+                grpc_web_response_content_type.is_some(),
             );
             record_h3_flavor_aware_reject(&state, http_flavor, 404);
             let sent = if let Some(correlation_plugins) =
@@ -4254,6 +4255,18 @@ async fn handle_h3_request(
             initial_response_header_policy_plugins.as_ref(),
         );
         crate::proxy::restore_authoritative_allow_header(&mut headers, &allow_header);
+        record_h3_pre_send_rejection(
+            &mut ctx,
+            http_flavor,
+            grpc_web_response_content_type,
+            "allowed_methods",
+            StatusCode::METHOD_NOT_ALLOWED,
+            h3_grpc_reject_signal(
+                StatusCode::METHOD_NOT_ALLOWED,
+                br#"{"error":"Method Not Allowed"}"#,
+                &headers,
+            ),
+        );
         // Empty plugin list on the response path: do not run after_proxy /
         // request hooks merely to shape the 405. Logging uses a separate
         // immutable cache view below.
@@ -4373,6 +4386,17 @@ async fn handle_h3_request(
             "Rejected HTTP/3 request: route admission policy does not run on the requested protocol"
         );
         record_h3_flavor_aware_reject(&state, http_flavor, 403);
+        record_h3_pre_send_rejection(
+            &mut ctx,
+            http_flavor,
+            grpc_web_response_content_type,
+            crate::diagnostic_ref::ROUTE_PROTOCOL_ADMISSION_PHASE,
+            StatusCode::FORBIDDEN,
+            (
+                crate::proxy::grpc_proxy::grpc_status::PERMISSION_DENIED,
+                std::borrow::Cow::Borrowed("Request protocol not permitted on this route"),
+            ),
+        );
         send_h3_error_flavor_aware_with_policy(
             &mut stream,
             http_flavor,
@@ -21217,6 +21241,36 @@ fn record_request(state: &ProxyState, status: u16) {
 
 /// HTTP status of the head [`send_h3_error_flavor_aware`] writes: a gRPC or
 /// gRPC-Web error answers `200` carrying its `grpc-status`.
+/// Record a pre-plugin H3 refusal in the request's diagnostic slot before its
+/// head is sent (the stamp runs on the head), with the status that head
+/// carries. A gRPC-Web refusal first writes its gRPC status metadata, which is
+/// what lets the diagnostic reference recognize the `200` trailer-frame head
+/// as this refusal (issue #7407), and that the transaction log carries, as on
+/// every other gRPC-Web refusal. The log that follows the send still records
+/// the admission status; the diagnostic slot keeps this first record.
+fn record_h3_pre_send_rejection(
+    ctx: &mut RequestContext,
+    flavor: HttpFlavor,
+    grpc_web_response_content_type: Option<&str>,
+    phase: &str,
+    http_status: StatusCode,
+    grpc_signal: (u32, std::borrow::Cow<'static, str>),
+) {
+    if grpc_web_response_content_type.is_some() {
+        let (grpc_status, grpc_message) = grpc_signal;
+        crate::proxy::insert_grpc_error_metadata(
+            &mut ctx.metadata,
+            grpc_status,
+            grpc_message.as_ref(),
+        );
+    }
+    crate::diagnostic_ref::record_rejection(
+        ctx,
+        phase,
+        h3_error_head_status(flavor, grpc_web_response_content_type, http_status),
+    );
+}
+
 fn h3_error_head_status(
     flavor: HttpFlavor,
     grpc_web_response_content_type: Option<&str>,

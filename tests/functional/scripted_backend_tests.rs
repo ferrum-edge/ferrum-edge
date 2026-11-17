@@ -3417,22 +3417,35 @@ async fn diagnostic_refs_all_mode_marks_plugin_and_routing_rejections() {
     drop(backend);
 }
 
-/// A gRPC-Web route behind `key_auth`, whose backend is never reached.
+/// gRPC-Web routes whose backend is never reached: one behind `key_auth`,
+/// one whose `allowed_methods` admits only `GET`.
 fn diagnostic_grpc_web_yaml(refused_port: u16) -> String {
     to_file_mode_yaml(&json!({
         "version": "1",
-        "proxies": [{
-            "id": "diag-grpc-web",
-            "listen_path": "/grpcweb",
-            "backend_scheme": "http",
-            "backend_host": "127.0.0.1",
-            "backend_port": refused_port,
-            "strip_listen_path": true,
-            "plugins": [
-                {"plugin_config_id": "diag-grpc-web"},
-                {"plugin_config_id": "diag-grpc-web-key-auth"},
-            ],
-        }],
+        "proxies": [
+            {
+                "id": "diag-grpc-web",
+                "listen_path": "/grpcweb",
+                "backend_scheme": "http",
+                "backend_host": "127.0.0.1",
+                "backend_port": refused_port,
+                "strip_listen_path": true,
+                "plugins": [
+                    {"plugin_config_id": "diag-grpc-web"},
+                    {"plugin_config_id": "diag-grpc-web-key-auth"},
+                ],
+            },
+            {
+                "id": "diag-grpc-web-get",
+                "listen_path": "/grpcweb-get",
+                "backend_scheme": "http",
+                "backend_host": "127.0.0.1",
+                "backend_port": refused_port,
+                "strip_listen_path": true,
+                "allowed_methods": ["GET"],
+                "plugins": [{"plugin_config_id": "diag-grpc-web-get"}],
+            },
+        ],
         "consumers": [],
         "upstreams": [],
         "plugin_configs": [
@@ -3452,6 +3465,14 @@ fn diagnostic_grpc_web_yaml(refused_port: u16) -> String {
                 "enabled": true,
                 "config": {"key_location": "header:X-Api-Key"},
             },
+            {
+                "id": "diag-grpc-web-get",
+                "plugin_name": "grpc_web",
+                "scope": "proxy",
+                "proxy_id": "diag-grpc-web-get",
+                "enabled": true,
+                "config": {},
+            },
         ],
     }))
 }
@@ -3465,15 +3486,37 @@ fn grpc_message_frame(payload: &[u8]) -> Vec<u8> {
     framed
 }
 
-/// Check a gateway gRPC-Web rejection head and body: HTTP `200`, the
-/// terminal `grpc-status: 16` only in the body trailer frame, and the one
-/// reference exposed to browser callers. Returns the reference.
+/// The `grpc-status` of a gRPC-Web trailer frame. The gateway's encoder
+/// writes one `name: value` line per field (`grpc-status: 16\r\n`).
+fn grpc_web_trailer_status(frame: &[u8]) -> u32 {
+    assert_eq!(frame.first(), Some(&0x80), "a trailer frame: {frame:?}");
+    assert!(frame.len() >= 5, "a complete frame header: {frame:?}");
+    let declared = u32::from_be_bytes([frame[1], frame[2], frame[3], frame[4]]) as usize;
+    assert_eq!(
+        frame.len(),
+        5 + declared,
+        "one whole trailer frame: {frame:?}"
+    );
+    let trailers = String::from_utf8_lossy(&frame[5..]).into_owned();
+    let statuses: Vec<u32> = trailers
+        .split("\r\n")
+        .filter_map(|line| line.split_once(':'))
+        .filter(|(name, _)| name.trim().eq_ignore_ascii_case("grpc-status"))
+        .map(|(_, value)| value.trim().parse().expect("numeric grpc-status"))
+        .collect();
+    assert_eq!(statuses.len(), 1, "one grpc-status trailer: {trailers:?}");
+    statuses[0]
+}
+
+/// Check a gateway gRPC-Web rejection head and body: HTTP `200`, a non-zero
+/// `grpc-status` only in the body trailer frame, and the one reference
+/// exposed to browser callers. Returns the reference and the gRPC status.
 fn grpc_web_rejection_reference(
     status: u16,
     headers: &http::HeaderMap,
     body: &[u8],
     content_type: &str,
-) -> String {
+) -> (String, u32) {
     use base64::Engine;
     assert_eq!(status, 200, "gRPC-Web answers 200: {headers:?}");
     assert!(
@@ -3494,9 +3537,8 @@ fn grpc_web_rejection_reference(
     } else {
         body.to_vec()
     };
-    assert_eq!(frame.first(), Some(&0x80), "a trailer frame: {frame:?}");
-    let trailers = String::from_utf8_lossy(&frame[5..]).to_ascii_lowercase();
-    assert!(trailers.contains("grpc-status:16"), "{trailers}");
+    let grpc_status = grpc_web_trailer_status(&frame);
+    assert_ne!(grpc_status, 0, "a rejection is not OK: {headers:?}");
     let reference = rejection_reference(headers);
     let exposed: Vec<String> = headers
         .get_all("access-control-expose-headers")
@@ -3512,19 +3554,116 @@ fn grpc_web_rejection_reference(
             "{name} exposed once: {headers:?}"
         );
     }
-    reference
+    (reference, grpc_status)
 }
 
-// Issue #7407: with `FERRUM_DIAGNOSTIC_REFS=all`, a tokenless `key_auth`
+/// One client-visible response.
+struct ObservedResponse {
+    protocol: &'static str,
+    status: u16,
+    headers: http::HeaderMap,
+    body: Vec<u8>,
+}
+
+/// POST one gRPC-Web request with `content_type` to `path` over HTTP/1.1,
+/// HTTP/2 (h2c) and HTTP/3.
+async fn post_grpc_web_on_every_protocol(
+    gateway: &TestGateway,
+    https_port: u16,
+    path: &str,
+    content_type: &str,
+) -> Vec<ObservedResponse> {
+    use base64::Engine;
+    let body = if content_type.ends_with("-text") {
+        base64::engine::general_purpose::STANDARD
+            .encode(grpc_message_frame(b"ping"))
+            .into_bytes()
+    } else {
+        grpc_message_frame(b"ping")
+    };
+    let mut observed = Vec::new();
+    for (protocol, version) in [
+        ("http1", reqwest::Version::HTTP_11),
+        ("http2", reqwest::Version::HTTP_2),
+    ] {
+        let builder = reqwest::Client::builder().timeout(Duration::from_secs(10));
+        let client = if version == reqwest::Version::HTTP_2 {
+            builder.http2_prior_knowledge()
+        } else {
+            builder.http1_only()
+        }
+        .build()
+        .expect("client");
+        let response = client
+            .post(gateway.proxy_url(path))
+            .header("content-type", content_type)
+            .header("x-grpc-web", "1")
+            .header("X-Api-Key", DIAGNOSTIC_API_KEY)
+            .body(body.clone())
+            .send()
+            .await
+            .expect("gRPC-Web response");
+        assert_eq!(response.version(), version);
+        let status = response.status().as_u16();
+        let headers = response.headers().clone();
+        let bytes = response.bytes().await.expect("gRPC-Web body");
+        observed.push(ObservedResponse {
+            protocol,
+            status,
+            headers,
+            body: bytes.to_vec(),
+        });
+    }
+
+    // Retry only until the QUIC listener answers at all; the first response
+    // is the one asserted.
+    let h3 = Http3Client::insecure().expect("h3 client");
+    let h3_url = format!("https://localhost:{https_port}{path}");
+    let options = crate::scaffolding::clients::GetOptions::default()
+        .method(http::Method::POST)
+        .header("content-type", content_type)
+        .header("x-grpc-web", "1")
+        .header("x-api-key", DIAGNOSTIC_API_KEY)
+        .body(bytes::Bytes::from(body));
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let h3_response = loop {
+        match h3.get_with_options(&h3_url, options.clone()).await {
+            Ok(response) => break response,
+            Err(_) if Instant::now() < deadline => {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            Err(err) => panic!("H3 gRPC-Web POST did not complete: {err}"),
+        }
+    };
+    observed.push(ObservedResponse {
+        protocol: "http3",
+        status: h3_response.status.as_u16(),
+        headers: h3_response.headers,
+        body: h3_response.body_bytes.to_vec(),
+    });
+    observed
+}
+
+/// What a referenced gRPC-Web rejection must resolve to.
+struct ExpectedRejection {
+    path: &'static str,
+    grpc_status: Option<u32>,
+    proxy_id: Option<&'static str>,
+    source: &'static str,
+    phase: &'static str,
+    plugin: Option<&'static str>,
+}
+
+// Issue #7407: with `FERRUM_DIAGNOSTIC_REFS=all`, every tokenless gateway
 // rejection that reaches the client as a gRPC-Web trailer-frame error (HTTP
 // `200`, `grpc-status` in the body) carries a reference on HTTP/1.1, HTTP/2
 // and HTTP/3, binary and text, exposed to browser callers, that resolves to
-// `status: 200` and the rejecting plugin. A native gRPC Trailers-Only
+// `status: 200` and the rejecting phase: a `key_auth` plugin rejection, a
+// route miss, and an `allowed_methods` refusal. A native gRPC Trailers-Only
 // rejection on the same route keeps its reference.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore]
 async fn diagnostic_refs_all_mode_marks_grpc_web_rejections_on_every_protocol() {
-    const PATH: &str = "/grpcweb/diag.Echo/Call";
     let refused = reserve_refused_tcp_port().expect("reserve refused backend port");
     let gateway = TestGateway::builder()
         .mode_file(diagnostic_grpc_web_yaml(refused.port))
@@ -3543,81 +3682,99 @@ async fn diagnostic_refs_all_mode_marks_grpc_web_rejections_on_every_protocol() 
     let https_port = gateway
         .env_port("FERRUM_PROXY_HTTPS_PORT")
         .expect("harness-allocated HTTPS port");
-    let url = gateway.proxy_url(PATH);
-    let h1 = reqwest::Client::builder()
-        .http1_only()
+    let admin = reqwest::Client::builder()
         .timeout(Duration::from_secs(10))
         .build()
-        .expect("h1 client");
+        .expect("admin client");
+    let reader = diagnostic_token(json!({"scope": "diagnostics:read", "ns": ["ferrum"]}));
+
+    let cases = [
+        ExpectedRejection {
+            path: "/grpcweb/diag.Echo/Call",
+            grpc_status: Some(16),
+            proxy_id: Some("diag-grpc-web"),
+            source: "plugin",
+            phase: "authenticate",
+            plugin: Some("key_auth"),
+        },
+        ExpectedRejection {
+            path: "/no-such-grpc-route/diag.Echo/Call",
+            grpc_status: None,
+            proxy_id: None,
+            source: "routing",
+            phase: "route_not_found",
+            plugin: None,
+        },
+        ExpectedRejection {
+            path: "/grpcweb-get/diag.Echo/Call",
+            grpc_status: None,
+            proxy_id: Some("diag-grpc-web-get"),
+            source: "gateway",
+            phase: "allowed_methods",
+            plugin: None,
+        },
+    ];
+    let mut seen = std::collections::HashSet::new();
+    for case in &cases {
+        for content_type in ["application/grpc-web+proto", "application/grpc-web-text"] {
+            let observed =
+                post_grpc_web_on_every_protocol(&gateway, https_port, case.path, content_type)
+                    .await;
+            for response in observed {
+                let context = format!("{} {content_type} {}", case.path, response.protocol);
+                let (reference, grpc_status) = grpc_web_rejection_reference(
+                    response.status,
+                    &response.headers,
+                    &response.body,
+                    content_type,
+                );
+                if let Some(expected) = case.grpc_status {
+                    assert_eq!(grpc_status, expected, "{context}");
+                }
+                assert!(
+                    seen.insert(reference.clone()),
+                    "{context}: a fresh reference"
+                );
+                let lookup_url = gateway.admin_url(&format!("/diagnostics/v1/refs/{reference}"));
+                let body = resolve_detail(&admin, &lookup_url, &reader).await;
+                assert_eq!(body["protocol"], response.protocol, "{context}: {body}");
+                assert_eq!(
+                    body["status"], 200,
+                    "{context}: bound to the wire head: {body}"
+                );
+                assert!(body["gateway_error"].is_null(), "{context}: {body}");
+                let detail = &body["detail"];
+                match case.proxy_id {
+                    Some(proxy_id) => assert_eq!(detail["proxy_id"], proxy_id, "{context}: {body}"),
+                    None => assert!(detail["proxy_id"].is_null(), "{context}: {body}"),
+                }
+                assert_eq!(
+                    detail["backend_dispatch"], "not_dispatched",
+                    "{context}: {body}"
+                );
+                let rejection = &detail["rejection"];
+                assert_eq!(rejection["source"], case.source, "{context}: {body}");
+                assert_eq!(rejection["phase"], case.phase, "{context}: {body}");
+                match case.plugin {
+                    Some(plugin) => assert_eq!(rejection["plugin"], plugin, "{context}: {body}"),
+                    None => assert!(rejection.get("plugin").is_none(), "{context}: {body}"),
+                }
+                assert!(
+                    !body.to_string().contains(DIAGNOSTIC_API_KEY),
+                    "{context}: {body}"
+                );
+            }
+        }
+    }
+
+    // Native gRPC: a Trailers-Only head reports `grpc-status` itself.
     let h2 = reqwest::Client::builder()
         .http2_prior_knowledge()
         .timeout(Duration::from_secs(10))
         .build()
         .expect("h2c client");
-
-    let mut references = Vec::new();
-    for content_type in ["application/grpc-web+proto", "application/grpc-web-text"] {
-        let body = if content_type.ends_with("-text") {
-            use base64::Engine;
-            base64::engine::general_purpose::STANDARD
-                .encode(grpc_message_frame(b"ping"))
-                .into_bytes()
-        } else {
-            grpc_message_frame(b"ping")
-        };
-        for (client, version, protocol) in [
-            (&h1, reqwest::Version::HTTP_11, "http1"),
-            (&h2, reqwest::Version::HTTP_2, "http2"),
-        ] {
-            let response = client
-                .post(&url)
-                .header("content-type", content_type)
-                .header("x-grpc-web", "1")
-                .header("X-Api-Key", DIAGNOSTIC_API_KEY)
-                .body(body.clone())
-                .send()
-                .await
-                .expect("gRPC-Web response");
-            assert_eq!(response.version(), version);
-            let status = response.status().as_u16();
-            let headers = response.headers().clone();
-            let bytes = response.bytes().await.expect("gRPC-Web body");
-            let reference = grpc_web_rejection_reference(status, &headers, &bytes, content_type);
-            references.push((reference, protocol));
-        }
-
-        // Retry only until the QUIC listener answers at all; the first
-        // response is the one asserted.
-        let h3 = Http3Client::insecure().expect("h3 client");
-        let h3_url = format!("https://localhost:{https_port}{PATH}");
-        let options = crate::scaffolding::clients::GetOptions::default()
-            .method(http::Method::POST)
-            .header("content-type", content_type)
-            .header("x-grpc-web", "1")
-            .header("x-api-key", DIAGNOSTIC_API_KEY)
-            .body(bytes::Bytes::from(body.clone()));
-        let deadline = Instant::now() + Duration::from_secs(10);
-        let h3_response = loop {
-            match h3.get_with_options(&h3_url, options.clone()).await {
-                Ok(response) => break response,
-                Err(_) if Instant::now() < deadline => {
-                    tokio::time::sleep(Duration::from_millis(100)).await;
-                }
-                Err(err) => panic!("H3 gRPC-Web POST did not complete: {err}"),
-            }
-        };
-        let reference = grpc_web_rejection_reference(
-            h3_response.status.as_u16(),
-            &h3_response.headers,
-            &h3_response.body_bytes,
-            content_type,
-        );
-        references.push((reference, "http3"));
-    }
-
-    // Native gRPC: a Trailers-Only head reports `grpc-status` itself.
     let native = h2
-        .post(&url)
+        .post(gateway.proxy_url("/grpcweb/diag.Echo/Call"))
         .header("content-type", "application/grpc")
         .header("te", "trailers")
         .header("X-Api-Key", DIAGNOSTIC_API_KEY)
@@ -3635,34 +3792,12 @@ async fn diagnostic_refs_all_mode_marks_grpc_web_rejections_on_every_protocol() 
         "{:?}",
         native.headers()
     );
-    references.push((rejection_reference(native.headers()), "http2"));
-
-    let distinct: std::collections::HashSet<&String> =
-        references.iter().map(|(reference, _)| reference).collect();
-    assert_eq!(
-        distinct.len(),
-        references.len(),
-        "one reference per response"
-    );
-
-    let admin = reqwest::Client::builder()
-        .timeout(Duration::from_secs(10))
-        .build()
-        .expect("admin client");
-    let reader = diagnostic_token(json!({"scope": "diagnostics:read", "ns": ["ferrum"]}));
-    for (reference, protocol) in &references {
-        let lookup_url = gateway.admin_url(&format!("/diagnostics/v1/refs/{reference}"));
-        let body = resolve_detail(&admin, &lookup_url, &reader).await;
-        assert_eq!(body["protocol"], *protocol, "{body}");
-        assert_eq!(body["status"], 200, "bound to the wire head: {body}");
-        assert!(body["gateway_error"].is_null(), "{body}");
-        let detail = &body["detail"];
-        assert_eq!(detail["proxy_id"], "diag-grpc-web", "{body}");
-        assert_eq!(detail["backend_dispatch"], "not_dispatched", "{body}");
-        assert_eq!(detail["rejection"]["phase"], "authenticate", "{body}");
-        assert_eq!(detail["rejection"]["plugin"], "key_auth", "{body}");
-        assert!(!body.to_string().contains(DIAGNOSTIC_API_KEY), "{body}");
-    }
+    let reference = rejection_reference(native.headers());
+    assert!(seen.insert(reference.clone()), "a fresh reference");
+    let lookup_url = gateway.admin_url(&format!("/diagnostics/v1/refs/{reference}"));
+    let body = resolve_detail(&admin, &lookup_url, &reader).await;
+    assert_eq!(body["status"], 200, "{body}");
+    assert_eq!(body["detail"]["rejection"]["plugin"], "key_auth", "{body}");
 }
 
 // `errors` keeps its #5767 contract: a plugin rejection and a routing miss

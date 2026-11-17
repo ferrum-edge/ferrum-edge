@@ -622,10 +622,16 @@ token:
 gRPC Trailers-Only rejections (HTTP `200` with a non-zero `grpc-status`) count
 as error responses. So do gRPC-Web rejections (issue #7407), whose
 `grpc-status` is carried only in the body's trailer frame under an HTTP `200`
-head: the head cannot show the error, so the rejection funnel records, for a
-request that keeps its gRPC-Web representation, that the rejection's gRPC
-status is not `OK`, and the stamp accepts the `200` gRPC-Web head
+head: the head cannot show the error, so each recording site says so when it
+records the rejection, and the stamp accepts the `200` gRPC-Web head
 (`application/grpc-web`, `application/grpc-web-text`) as the one it authored.
+The plugin and policy rejection funnel marks a request that keeps its gRPC-Web
+representation when the rejection's gRPC status is not `OK` (plugin
+rejections, `allowed_methods`, route protocol admission, and the query
+trigger refusal); routing misses and mesh
+`REGISTRY_ONLY` misses mark it from the request's gRPC-Web classification,
+which is made before routing. HTTP/3 records its `allowed_methods` and route
+protocol admission refusals before their heads are sent.
 The reference resolves with `status: 200`, the status the client saw. A
 gRPC-Web rejection without that record (no gRPC status, or `OK`) carries no
 reference: it can be under-marked, but it never gets a false reference. A

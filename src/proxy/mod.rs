@@ -37340,6 +37340,7 @@ async fn handle_proxy_request_inner(
                             crate::diagnostic_ref::MESH_REGISTRY_ONLY_PHASE,
                             start_time,
                             response.status().as_u16(),
+                            grpc_web_response_content_type.is_some(),
                         );
                         record_status(&state, response.status().as_u16());
                         return Ok(response);
@@ -37376,6 +37377,7 @@ async fn handle_proxy_request_inner(
                         crate::diagnostic_ref::ROUTE_NOT_FOUND_PHASE,
                         start_time,
                         response.status().as_u16(),
+                        grpc_web_response_content_type.is_some(),
                     );
                     record_status(&state, response.status().as_u16());
                     // Global access logs still record the miss (scanner and
@@ -37603,7 +37605,10 @@ async fn handle_proxy_request_inner(
         );
         // gRPC-Web carries the status in a body trailer frame, never as
         // response header fields (issue #7155), exactly like the
-        // `allowed_methods` refusal below.
+        // `allowed_methods` refusal below. The gRPC status metadata is what
+        // tells the diagnostic reference that the `200` gRPC-Web head is
+        // this refusal (issue #7407).
+        apply_grpc_reject_metadata(&mut ctx, &reject);
         let grpc_web_response =
             build_grpc_web_reject_response(&[], &mut ctx, grpc_web_response_content_type, &reject)
                 .await;
@@ -37648,6 +37653,10 @@ async fn handle_proxy_request_inner(
             initial_response_header_policy_plugins.as_ref(),
         );
         restore_authoritative_allow_header(&mut reject.headers, &allow_header);
+        // Same gRPC reject metadata as a plugin rejection, so the diagnostic
+        // reference recognizes the `200` gRPC-Web head as this refusal
+        // (issue #7407).
+        apply_grpc_reject_metadata(&mut ctx, &reject);
         // Empty plugin list: do not run after_proxy / request hooks merely to
         // shape the response. Logging uses a separate immutable cache view.
         let grpc_web_response =

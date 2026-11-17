@@ -2143,16 +2143,26 @@ fn unrouted_rejection_slot(slot: Option<&Arc<DiagnosticSlot>>) -> Option<&Arc<Di
 /// `ferrum_unmatched_requests_total` regardless of whether diagnostic
 /// references are enabled: these requests never reach a plugin, so no other
 /// Prometheus family sees them.
+///
+/// `grpc_web_error` says the miss is answered as a gRPC-Web trailer-frame
+/// error (the request kept a gRPC-Web representation, so the `404` / registry
+/// refusal reaches the client as an HTTP `200` with a non-zero `grpc-status`
+/// in the body), which the head alone cannot show (issue #7407).
 pub(crate) fn record_route_miss(
     slot: Option<&Arc<DiagnosticSlot>>,
     phase: &'static str,
     started: Instant,
     status: u16,
+    grpc_web_error: bool,
 ) {
     crate::plugins::prometheus_metrics::global_registry().record_unmatched_request(phase, status);
     if let Some(slot) = unrouted_rejection_slot(slot) {
         let latency_ms = started.elapsed().as_secs_f64() * 1000.0;
-        slot.record_rejection(DiagnosticRejection::routing(phase, status));
+        let mut rejection = DiagnosticRejection::routing(phase, status);
+        if grpc_web_error {
+            rejection = rejection.with_grpc_web_error();
+        }
+        slot.record_rejection(rejection);
         slot.record_detail(DiagnosticDetail::unrouted(latency_ms));
     }
 }
