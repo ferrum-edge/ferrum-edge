@@ -3034,3 +3034,31 @@ fn an_exclusion_never_suppresses_a_same_named_sibling_rule() {
         "the same-named exact TLS rule is not excluded and wins the host"
     );
 }
+
+// ── Review round 4 (sol F2) ──────────────────────────────────────────────
+
+/// sol F2 (Istio `pkg/config/host/name.go`: `*` matches `*.com`): a catch-all
+/// root rule governs an EgressGateway upstream for a single-label wildcard
+/// ServiceEntry (`*.internal`), both under a permissive Sidecar and under one
+/// that imports only the ServiceEntry's namespace.
+#[test]
+fn a_catch_all_governs_a_single_label_wildcard_service_entry() {
+    let wildcard = "*.internal";
+    for sidecar_hosts in [
+        vec!["*/*".to_string()],
+        vec![format!("{EXTERNAL_HOST_OWNER}/*")],
+    ] {
+        let mut mesh = egress_gateway_mesh(
+            EXTERNAL_HOST_OWNER,
+            vec![tls_rule("istio-system", "mesh-tls", "*", MtlsMode::Simple)],
+        );
+        mesh.service_entries[0].hosts = vec![wildcard.to_string()];
+        let hosts: Vec<&str> = sidecar_hosts.iter().map(String::as_str).collect();
+        mesh.sidecars = vec![sidecar_admitting(EGRESS_GATEWAY_NAMESPACE, &hosts)];
+        assert_eq!(
+            egress_scheme_for_mesh(mesh, wildcard),
+            BackendScheme::Https,
+            "the root `*` names `*.internal` and originates TLS (Sidecar hosts {sidecar_hosts:?})"
+        );
+    }
+}

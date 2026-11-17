@@ -13560,8 +13560,14 @@ pub(crate) enum DestinationRuleHostSpecificity {
 /// cross-cluster HBONE synthetic host (`mesh-xc-hbone|<gateway>|<port>|<pod>`),
 /// which no Istio host lookup sees.
 fn is_wildcard_matchable_host(candidate: &str) -> bool {
-    let candidate = candidate.strip_prefix("*.").unwrap_or(candidate);
-    candidate.contains('.')
+    // A wildcard ServiceEntry declaration is a DNS name even when its suffix
+    // is a single label (`*.internal`, `*.com`; Istio's `*` names them); only a
+    // concrete name must be dotted, which keeps dotless upstream ids out.
+    let (wildcard_declaration, candidate) = match candidate.strip_prefix("*.") {
+        Some(suffix) => (true, suffix),
+        None => (false, candidate),
+    };
+    (wildcard_declaration || candidate.contains('.'))
         && candidate.split('.').all(|label| {
             !label.is_empty()
                 && label

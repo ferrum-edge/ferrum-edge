@@ -2122,12 +2122,15 @@ impl MeshSlice {
         // service → root lookup tiers (#2469), then this path's own scope gate,
         // then per-destination tier resolution. The root namespace is resolved
         // HERE, at slice build, so the data plane never has to know it.
+        let carried_destination_hosts =
+            carried_route_destination_hosts(&http_routes, &virtual_service_l4_upstreams);
         let destination_rule_scope = DestinationRuleScope {
             client_namespace: effective_namespace,
             root_namespace: mesh.istio_root_namespace.as_str(),
             cluster_domain: &cluster_domain,
             mesh_service_identities: &mesh_service_identities,
             service_entry_hosts: &service_entry_hosts,
+            carried_destination_hosts: &carried_destination_hosts,
         };
         let destination_rules: Vec<MeshDestinationRule> = admit_destination_rules(
             mesh.destination_rules.iter(),
@@ -2492,23 +2495,10 @@ fn destination_rule_host_exclusions(
     // Carried VirtualService HTTP route and L4 (`tcp[]` / `tls[]`) upstream
     // targets are destinations too: they reach DestinationRule selection on
     // the data plane like any other upstream.
-    for upstream in slice
-        .http_routes
-        .upstreams
-        .iter()
-        .chain(&slice.virtual_service_l4_upstreams)
-    {
-        for target in upstream
-            .get("targets")
-            .and_then(serde_json::Value::as_array)
-            .into_iter()
-            .flatten()
-        {
-            if let Some(host) = target.get("host").and_then(serde_json::Value::as_str) {
-                hosts.insert(canonical_destination_rule_host(host));
-            }
-        }
-    }
+    hosts.extend(carried_route_destination_hosts(
+        &slice.http_routes,
+        &slice.virtual_service_l4_upstreams,
+    ));
     let mut exclusions = BTreeSet::new();
     for rule in &slice.destination_rules {
         if !is_wildcard_destination_rule_host(&rule.host)
@@ -3238,6 +3228,9 @@ fn build_sidecar_egress_scope_snapshot(
                 cluster_domain,
                 mesh_service_identities,
                 service_entry_hosts,
+                // The operator egress-scope snapshot narrows registry
+                // destinations only; it carries no route upstreams.
+                carried_destination_hosts: &[],
             };
             let destination_rules: Vec<MeshDestinationRule> = admit_destination_rules(
                 mesh.destination_rules.iter(),
@@ -3807,6 +3800,12 @@ pub(crate) struct DestinationRuleScope<'a> {
     pub cluster_domain: &'a str,
     pub mesh_service_identities: &'a BTreeSet<(String, String)>,
     pub service_entry_hosts: &'a BTreeMap<String, ServiceEntryHostOwner>,
+    /// Concrete destination hosts of the carried VirtualService HTTP and L4
+    /// route upstreams (issue #7395). They reach DestinationRule selection on
+    /// the data plane like registry destinations, so wildcard admission
+    /// considers them too (a concrete host under a wildcard ServiceEntry is
+    /// owned by that ServiceEntry's namespace, `destination_host_owner`).
+    pub carried_destination_hosts: &'a [String],
 }
 
 /// Groups admitted DestinationRules by the destination they RESOLVE to, not by
@@ -4065,7 +4064,59 @@ where
             return true;
         }
     }
+    // Concrete destinations of carried routes: `api.one.example.com` under a
+    // `*.example.com` ServiceEntry belongs to its declaring namespace, so that
+    // namespace's narrower `*.one.example.com` rule is the most specific match
+    // for it (Istio `MostSpecificHostMatch` with the destination host as the
+    // needle), exactly as the data plane decides.
+    for host in scope.carried_destination_hosts {
+        let Some(host_owner) = destination_host_owner(
+            host,
+            scope.cluster_domain,
+            scope.mesh_service_identities,
+            scope.service_entry_hosts,
+        ) else {
+            continue;
+        };
+        let host_owner = host_owner.namespace();
+        if owner.is_some_and(|owner| host_owner != owner) {
+            continue;
+        }
+        if super::destination_rule_host_specificity(&rule.host, &rule.namespace, host).is_some()
+            && extra_admits(rule, host_owner, std::slice::from_ref(host))
+        {
+            return true;
+        }
+    }
     false
+}
+
+/// The canonical target hosts of carried VirtualService HTTP route and L4
+/// route upstreams (`targets[].host`), deduplicated and sorted. Shared by
+/// wildcard admission and host-exclusion resolution so both see the same
+/// destination inventory.
+fn carried_route_destination_hosts(
+    http_routes: &MeshHttpRouteSet,
+    virtual_service_l4_upstreams: &[serde_json::Value],
+) -> Vec<String> {
+    let mut hosts: BTreeSet<String> = BTreeSet::new();
+    for upstream in http_routes
+        .upstreams
+        .iter()
+        .chain(virtual_service_l4_upstreams)
+    {
+        for target in upstream
+            .get("targets")
+            .and_then(serde_json::Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            if let Some(host) = target.get("host").and_then(serde_json::Value::as_str) {
+                hosts.insert(canonical_destination_rule_host(host));
+            }
+        }
+    }
+    hosts.into_iter().collect()
 }
 
 /// Ambiguous-destination counts ALREADY REPORTED for each client namespace, as

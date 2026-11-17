@@ -158,9 +158,13 @@ fn translated_config(objects: &[K8sObject], policies: Vec<MeshPolicy>) -> Gatewa
             DEFAULT_NAMESPACE.to_string(),
             TrustDomain::new("cluster.local").expect("trust domain"),
         )
-        // `beta` hosts the cross-namespace ServiceEntry / DestinationRule
-        // fixtures (issue #7395); nothing else lives there.
-        .with_source_namespaces(vec![DEFAULT_NAMESPACE.to_string(), "beta".to_string()]),
+        // `beta` and `istio-system` host the cross-namespace ServiceEntry /
+        // DestinationRule fixtures (issue #7395); nothing else lives there.
+        .with_source_namespaces(vec![
+            DEFAULT_NAMESPACE.to_string(),
+            "beta".to_string(),
+            "istio-system".to_string(),
+        ]),
     )
     .expect("resources translate");
     let mut config = translated.config;
@@ -2233,6 +2237,18 @@ fn destination_rule_binding_and_application_agree_on_host_matching() {
             Some(Some(".example".len())),
         ),
         ("*.api.wild.example", "default", "*.wild.example", None),
+        // A single-label wildcard declaration is still a DNS name (round 4,
+        // sol F2): `*` names `*.internal`, and the identical host is exact. A
+        // concrete dotless name (an upstream id) stays out.
+        ("*", "default", "*.internal", Some(Some(0))),
+        ("*.internal", "default", "*.internal", Some(None)),
+        (
+            "*.internal",
+            "default",
+            "api.internal",
+            Some(Some(".internal".len())),
+        ),
+        ("*", "default", "internal", None),
         // A wildcard never names an IP literal, a dotless upstream id, or an
         // opaque transport identity (the cross-cluster HBONE synthetic host).
         ("*", "default", "10.0.0.11", None),
@@ -2604,4 +2620,96 @@ fn a_wildcard_service_entry_owners_rule_governs_concrete_split_legs() {
             "the owner's connection policy reaches external leg {index}"
         );
     }
+}
+
+/// Issue #7395 review round 4 (sol F1, Istio `MostSpecificHostMatch` with the
+/// destination host as the needle): the ServiceEntry owner's NARROWER
+/// wildcard (`*.one.wild.example` under a `*.wild.example` ServiceEntry) is
+/// the most specific rule for the concrete leg `api.one.wild.example`. Slice
+/// admission must keep it (the concrete host is a carried route destination
+/// owned by the ServiceEntry's namespace) so the residual leg gets its TLS
+/// and connect timeout, ahead of the root `*` default.
+#[test]
+fn an_owners_narrower_wildcard_governs_a_concrete_split_leg() {
+    let in_namespace = |mut object: K8sObject, namespace: &str| {
+        object.metadata.namespace = namespace.to_string();
+        object
+    };
+    let objects = vec![
+        split_virtual_service(
+            "split",
+            "reviews.default.svc.cluster.local",
+            &[
+                ("reviews.default.svc.cluster.local", 8080, 50),
+                ("api.one.wild.example", 443, 50),
+            ],
+        ),
+        in_namespace(
+            k8s_object(
+                "ServiceEntry",
+                "wild-api",
+                json!({
+                    "hosts": ["*.wild.example"],
+                    "location": "MESH_EXTERNAL",
+                    "resolution": "DNS",
+                    "ports": [{"number": 443, "name": "http", "protocol": "HTTP"}]
+                }),
+            ),
+            "beta",
+        ),
+        in_namespace(
+            traffic_policy_rule(
+                "narrow-owner",
+                "*.one.wild.example",
+                json!({
+                    "tls": {"mode": "SIMPLE"},
+                    "connectionPool": {"tcp": {"connectTimeout": "3s"}}
+                }),
+            ),
+            "beta",
+        ),
+        in_namespace(
+            traffic_policy_rule(
+                "mesh-default",
+                "*",
+                json!({"connectionPool": {"tcp": {"connectTimeout": "7s"}}}),
+            ),
+            "istio-system",
+        ),
+        k8s_object(
+            "Sidecar",
+            "default",
+            json!({"egress": [{"hosts": ["*/*"]}]}),
+        ),
+    ];
+    let runtime = MeshRuntimeConfig {
+        sidecar_enforced: true,
+        ..node_waypoint_runtime()
+    };
+    let slice = MeshSlice::from_gateway_config(
+        &translated_config(&objects, Vec::new()),
+        runtime.mesh_slice_request(),
+    );
+    assert!(
+        slice
+            .destination_rules
+            .iter()
+            .any(|rule| rule.name == "narrow-owner"),
+        "the owner's narrower wildcard is admitted for the concrete carried destination"
+    );
+    let prepared =
+        prepare_gateway_config_from_mesh_slice(&slice, &runtime).expect("slice materializes");
+    let route = carried_split_route(&prepared);
+    let split_id = route.upstream_id.clone().expect("split id");
+    let leg = format!("{split_id}-external-0");
+    assert_eq!(
+        leg_origination(&prepared, &route, &split_id),
+        vec![(REVIEWS_UPSTREAM.to_string(), false), (leg.clone(), true),],
+        "the narrower owner wildcard's TLS reaches the concrete leg"
+    );
+    assert_eq!(
+        projected_connect_timeout(&prepared, &leg, 443),
+        Some(3000),
+        "the most specific rule (the owner's narrower wildcard) beats the root `*`"
+    );
 }
