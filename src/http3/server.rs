@@ -4322,6 +4322,17 @@ async fn handle_h3_request(
     if matches!(http_flavor, HttpFlavor::Grpc) && method != "POST" {
         warn!(method = %method, "Rejected HTTP/3 gRPC request: method must be POST");
         record_h3_flavor_aware_reject(&state, http_flavor, 400);
+        record_h3_pre_send_rejection(
+            &mut ctx,
+            http_flavor,
+            grpc_web_response_content_type,
+            crate::diagnostic_ref::GRPC_POST_REQUIRED_PHASE,
+            StatusCode::BAD_REQUEST,
+            (
+                crate::proxy::grpc_proxy::grpc_status::INVALID_ARGUMENT,
+                std::borrow::Cow::Borrowed("gRPC requires POST method"),
+            ),
+        );
         send_h3_error_flavor_aware_with_policy(
             &mut stream,
             http_flavor,
@@ -4333,6 +4344,32 @@ async fn handle_h3_request(
             initial_response_header_policy_plugins.as_ref(),
         )
         .await?;
+        // Same funnel as the H1/H2 refusal: a transaction log with the status
+        // the wire carries. Boxed so the logging future stays off
+        // `handle_h3_request`'s fixed frame.
+        let logging_view = if grpc_web_response_content_type.is_some() {
+            epoch
+                .plugin_cache
+                .grpc_web_request_view(&proxy.namespace, &proxy.id)
+        } else {
+            epoch
+                .plugin_cache
+                .request_view(&proxy.namespace, &proxy.id, request_protocol)
+        };
+        let logging_plugins = logging_view.plugins();
+        Box::pin(log_pre_backend_rejected_request(
+            &logging_plugins,
+            &ctx,
+            h3_error_head_status(
+                http_flavor,
+                grpc_web_response_content_type,
+                StatusCode::BAD_REQUEST,
+            ),
+            start_time,
+            crate::diagnostic_ref::GRPC_POST_REQUIRED_PHASE,
+            0,
+        ))
+        .await;
         return Ok(());
     }
 
@@ -21256,7 +21293,7 @@ fn record_h3_pre_send_rejection(
     http_status: StatusCode,
     grpc_signal: (u32, std::borrow::Cow<'static, str>),
 ) {
-    if grpc_web_response_content_type.is_some() {
+    if grpc_web_response_content_type.is_some() || matches!(flavor, HttpFlavor::Grpc) {
         let (grpc_status, grpc_message) = grpc_signal;
         crate::proxy::insert_grpc_error_metadata(
             &mut ctx.metadata,

@@ -32715,6 +32715,19 @@ fn build_grpc_web_error_response_from_parts(
         .unwrap_or_else(|_| grpc_proxy::build_grpc_error_response(status, message))
 }
 
+/// The HTTP status of the head a pre-plugin refusal writes: `200` when it is
+/// answered as a gRPC-Web trailer-frame error, otherwise the normalized
+/// rejection's own status (`200` for a native gRPC Trailers-Only error).
+fn reject_wire_status(
+    grpc_web_response: Option<&Response<ProxyBody>>,
+    reject: &NormalizedRejectResponse,
+) -> u16 {
+    grpc_web_response.map_or_else(
+        || reject.http_status.as_u16(),
+        |response| response.status().as_u16(),
+    )
+}
+
 fn build_pre_plugin_reject_response(
     status: StatusCode,
     body: &[u8],
@@ -37612,6 +37625,14 @@ async fn handle_proxy_request_inner(
         let grpc_web_response =
             build_grpc_web_reject_response(&[], &mut ctx, grpc_web_response_content_type, &reject)
                 .await;
+        // The log keeps the admission status (403); the diagnostic slot
+        // records the head the client gets (`200` for native gRPC
+        // Trailers-Only and gRPC-Web), first, so the reference binds to it.
+        crate::diagnostic_ref::record_rejection(
+            &ctx,
+            crate::diagnostic_ref::ROUTE_PROTOCOL_ADMISSION_PHASE,
+            reject_wire_status(grpc_web_response.as_ref(), &reject),
+        );
         record_status(&state, StatusCode::FORBIDDEN.as_u16());
         let logging_plugins = plugin_cache_view.plugins();
         log_pre_backend_rejected_request(
@@ -37664,7 +37685,13 @@ async fn handle_proxy_request_inner(
                 .await;
         // Metrics and transaction logs keep the admission status (405) even when
         // native gRPC reshapes the client-visible HTTP status to trailers-only
-        // 200 + grpc-status.
+        // 200 + grpc-status. The diagnostic slot records that client-visible
+        // head first, so the reference binds to it.
+        crate::diagnostic_ref::record_rejection(
+            &ctx,
+            "allowed_methods",
+            reject_wire_status(grpc_web_response.as_ref(), &reject),
+        );
         record_status(&state, StatusCode::METHOD_NOT_ALLOWED.as_u16());
         let logging_plugins = plugin_cache_view.plugins();
         log_pre_backend_rejected_request(
@@ -37706,9 +37733,25 @@ async fn handle_proxy_request_inner(
             request_protocol,
             initial_response_header_policy_plugins.as_ref(),
         );
+        apply_grpc_reject_metadata(&mut ctx, &reject);
         let grpc_web_response =
             build_grpc_web_reject_response(&[], &mut ctx, grpc_web_response_content_type, &reject)
                 .await;
+        // Recorded through the rejection funnel like every other pre-plugin
+        // refusal, with the status the wire carries (`200` for both gRPC
+        // shapes), so it has a transaction log and, in `all` mode, a
+        // diagnostic reference (issue #7407).
+        let wire_status = reject_wire_status(grpc_web_response.as_ref(), &reject);
+        let logging_plugins = plugin_cache_view.plugins();
+        log_pre_backend_rejected_request(
+            &logging_plugins,
+            &ctx,
+            wire_status,
+            start_time,
+            crate::diagnostic_ref::GRPC_POST_REQUIRED_PHASE,
+            0,
+        )
+        .await;
         record_status(&state, reject.http_status.as_u16());
         if let Some(response) = grpc_web_response {
             return Ok(response);

@@ -203,6 +203,10 @@ pub const ROUTE_PROTOCOL_ADMISSION_PHASE: &str = "route_protocol_admission";
 /// chain with a query-reading plugin execution trigger (issue #6655).
 pub const QUERY_TRIGGER_ADMISSION_PHASE: &str = "query_trigger_admission";
 
+/// Rejection phase of a native gRPC or gRPC-Web request refused because its
+/// method is not `POST` (the gRPC protocol requires it), before any plugin.
+pub const GRPC_POST_REQUIRED_PHASE: &str = "grpc_post_required";
+
 /// Rejection phase of a gateway `500` whose backend-effective path could not
 /// be built from the matched route and target (issue #7156).
 pub const INVALID_BACKEND_PATH_PHASE: &str = "invalid_backend_path";
@@ -238,6 +242,7 @@ const GATEWAY_REJECTION_PHASES: &[&str] = &[
     RETIRED_GATEWAY_LISTENER_PHASE,
     ROUTE_PROTOCOL_ADMISSION_PHASE,
     QUERY_TRIGGER_ADMISSION_PHASE,
+    GRPC_POST_REQUIRED_PHASE,
     BACKEND_ADMISSION_PHASE,
     INVALID_BACKEND_PATH_PHASE,
     WEBSOCKET_UPGRADE_UNAVAILABLE_PHASE,

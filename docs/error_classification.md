@@ -613,7 +613,8 @@ token:
 - plugin rejections (for example a `key_auth` `401`, an `access_control`
   `403`, a `rate_limiting` `429`, a request-validation `400`), in every plugin
   phase;
-- gateway policy fences (allowed methods, WebSocket connection limits,
+- gateway policy fences (allowed methods, route protocol admission, the gRPC
+  non-`POST` refusal, WebSocket connection limits,
   backend connection limits, and the HTTP/1.1 and HTTP/2 frontend admission
   fences: unverifiable HTTP/1 framing, withdrawn client-certificate trust,
   overload, stale configuration);
@@ -627,11 +628,14 @@ records the rejection, and the stamp accepts the `200` gRPC-Web head
 (`application/grpc-web`, `application/grpc-web-text`) as the one it authored.
 The plugin and policy rejection funnel marks a request that keeps its gRPC-Web
 representation when the rejection's gRPC status is not `OK` (plugin
-rejections, `allowed_methods`, route protocol admission, and the query
-trigger refusal); routing misses and mesh
+rejections, `allowed_methods`, route protocol admission, the query trigger
+refusal, and the gRPC non-`POST` refusal, `grpc_post_required`); routing misses and mesh
 `REGISTRY_ONLY` misses mark it from the request's gRPC-Web classification,
-which is made before routing. HTTP/3 records its `allowed_methods` and route
-protocol admission refusals before their heads are sent.
+which is made before routing. The pre-plugin `allowed_methods` and route
+protocol admission refusals record the head the client gets (`200` for native
+gRPC Trailers-Only and gRPC-Web) even though their transaction log keeps the
+admission status (`405` / `403`), and HTTP/3 records them, and its gRPC
+non-`POST` refusal, before their heads are sent.
 The reference resolves with `status: 200`, the status the client saw. A
 gRPC-Web rejection without that record (no gRPC status, or `OK`) carries no
 reference: it can be under-marked, but it never gets a false reference. A
