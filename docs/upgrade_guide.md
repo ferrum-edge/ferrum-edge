@@ -28,6 +28,213 @@ applied by editing the file (see [File Mode](#file-mode-ferrum_modefile)).
 
 ## Upgrading to the next release (unreleased)
 
+### A backend's WebSocket upgrade refusal is relayed to the client (GHSA-7x2j-3389-2h35)
+
+When a backend answers the gateway's WebSocket upgrade with its own `3xx`,
+`4xx` or `5xx`, clients now receive that status, the backend's headers (after
+the backend-response strip and response policy) and its body when it arrived
+complete. Previously they received `502 {"error":"Backend WebSocket connection
+failed"}` with `X-Gateway-Error: backend_error`. The transaction log records
+the backend status with no `error_class` or `rejection_phase`. The circuit
+breaker and backend admission count the status exactly as on the HTTP path, so
+a `4xx` refusal no longer counts as a backend failure.
+
+**Operator action:** alerts or dashboards that counted WebSocket `502`s or
+`rejection_phase="websocket_backend_error"` as backend refusals should key on
+the relayed status instead. Dead or unreachable backends, timeouts, and
+protocol faults still produce the gateway `502`/`504`.
+
+### `preserve_host_header` now applies to WebSocket backends (#7392)
+
+With `preserve_host_header: true`, direct `ws://`/`wss://` backend handshakes
+now carry the client's Host instead of the selected target's authority. TLS SNI
+and certificate verification are unchanged.
+
+**Operator action:** a WebSocket backend behind a proxy with
+`preserve_host_header: true` must accept the client-facing virtual host on
+upgrades, as it already must for HTTP.
+
+### Backend WebSocket handshake headers reach the client (#7391)
+
+Successful upgrade responses now include the backend's end-to-end handshake
+headers, such as `Set-Cookie`. Use a response policy (for example
+`security_headers.remove`) to suppress any you do not want exposed.
+
+
+### `/charges` acknowledges collection only for a `charges:collect` token (GHSA-jjvr-vvwv-8qmh, #7413)
+
+`api_chargeback` evicts an idle row past `stale_entry_ttl_seconds` only after
+two delivered `/charges` exports collected it. Only a request whose admin JWT
+`scope` claim grants `charges:collect` now counts as a delivery. The claim can
+be a space-delimited string (`"scope": "charges:collect"`) or an array. The
+`role` never implies it, and tokens verified by
+`FERRUM_ADMIN_JWT_VIEWER_SECRET` never grant it. Other authenticated reads
+return the same document without acknowledging anything.
+
+Before upgrading, re-mint the billing collector's token (for example the
+Prometheus `bearer_token_file`) with `"scope": "charges:collect"`; a `viewer`
+role is sufficient. Give dashboards and other scrapers tokens without the
+scope. If the collector keeps a token without the scope, nothing is lost: idle
+rows are retained and counted in
+`ferrum_api_chargeback_uncollected_retained_entries` until the registry budgets
+fold new rows into the overflow row.
+
+### `/config/export` fingerprints are keyed from `FERRUM_ADMIN_CONFIG_EXPORT_FINGERPRINT_SECRET` (GHSA-crqx-mp2f-v8c8)
+
+Export fingerprints and `redaction.fingerprint_key_id` are no longer derived
+from `FERRUM_ADMIN_JWT_SECRET`, so every value changes on upgrade. Set
+`FERRUM_ADMIN_CONFIG_EXPORT_FINGERPRINT_SECRET` to the same value on every
+replica whose exports you compare. It must be at least 32 characters and differ
+from `FERRUM_ADMIN_JWT_SECRET`, `FERRUM_ADMIN_JWT_VIEWER_SECRET` and
+`FERRUM_CP_DP_GRPC_JWT_SECRET`; reused or short values fail startup and
+`validate`. Then re-baseline drift tooling once. Without the setting, each
+process uses a random key, so the key id changes on every restart and differs
+between replicas.
+
+Tokens verified by `FERRUM_ADMIN_JWT_VIEWER_SECRET` also now receive
+`cp_dp_trust.active_generation: null` on `/health`/`/status` and no `ETag` on
+resource GETs. Compare `active_generation` across replicas with a primary-key
+token (any role).
+
+### `mcp_gateway` OpenAPI bridge route confinement and endpoint overlap (#7406, #7410)
+
+- **Bridge routes.** Bridged tool calls now reach only operation paths under
+  the matched proxy's literal listen prefix, whether or not `strip_listen_path`
+  is set. Any other path gets JSON-RPC `-32603`. Serve an OpenAPI bridge from a
+  literal-prefix or host-only route; on exact (`=`) and regex (`~`) routes
+  every bridged call is refused.
+- **Endpoint overlap.** The MCP endpoint reserves its whole subtree, ASCII
+  case-insensitively, on the canonical request path. A spec import
+  (`x-ferrum-mcp`) or an `mcp_gateway` config is now rejected when any
+  operation path can land there. That includes a path parameter that can spell
+  an endpoint segment (`/{name}/status` beside `/mcp`) and operations served
+  under a second server base. Move `endpoint.path`
+  (`x-ferrum-mcp.endpoint.path`) to a path no operation can produce, for
+  example one segment deeper than every templated path.
+- **Embedded endpoint.** An embedded `x-ferrum-plugins` `mcp_gateway` may no
+  longer override the generated `endpoint.path`. Set
+  `x-ferrum-mcp.endpoint.path` instead. `endpoint.protocol_versions` still
+  merges.
+
+
+### Consumer-name policy no longer matches external identities (GHSA-rxwj-x6c6-f4j5, #7417)
+
+Lists configured as Consumer usernames now match only a request whose
+authentication plugin mapped a gateway Consumer: WAF
+`global_exemptions.consumers` and custom-rule `conditions.consumers`,
+`openapi_validator` `bypass.consumers`, `rate_limiting` `scope: consumers`
+rules, `ai_rate_limiter` `consumer_limits`, and the plugin-trigger `consumer`
+predicate. An unmapped external identity (`jwks_auth`, `oidc_relying_party`,
+`oauth2_introspection`, `ldap_auth`, `soap_ws_security`) never matches them,
+even when it spells a listed username.
+
+- To exempt or select an external principal, use the new trigger predicates
+  `external_identity` and `external_identity_authority`, the latter set to the
+  provider's realm authority digest (`opa` reports it as
+  `input.consumer.realm.authority`), for example `when: {not: {all: [{match:
+  {external_identity: {value: {exact: [svc-user]}}}}, {match:
+  {external_identity_authority: ["<64-hex digest>"]}}]}}` on the plugin
+  instance to skip. `auth_method` alone does not distinguish two providers of
+  one `jwks_auth` / `oauth2_introspection` instance.
+- With `limit_by: consumer`, external principals are counted under
+  `external:<mechanism>:<authority>:<identity>` keys, separate from Consumers
+  and from other realms. Existing counters for external principals restart once
+  after upgrade, including Redis-backed ones.
+
+### Duplicate JSON member names are refused by more plugins (GHSA-49cr-v28q-9hgp, #7417)
+
+`ai_prompt_shield` (every scan mode), `ai_semantic_firewall` (request and
+buffered JSON response), `a2a_gateway` (JSON-RPC, under a deny-capable policy)
+and `ai_rate_limiter` (with `model_limits`) now refuse request bodies whose
+JSON objects repeat a member name, compared after escape decoding and at any
+depth. Clients must send each member once.
+
+### ConfigSync revision 6 (#7417)
+
+Plugin triggers gained the `external_identity` and
+`external_identity_authority` predicates, so the ConfigSync protocol revision
+is now 6: upgrade CPs and DPs together. A DP from an older build is refused at
+the build-identity gate and keeps its cached configuration until it is
+upgraded.
+
+
+### Refused Istio security resources now fail closed (GHSA-2r85-85hh-23mw, #7415)
+
+A refused AuthorizationPolicy, PeerAuthentication or Sidecar
+(`FerrumAccepted=False`) used to be dropped from the published mesh
+configuration. It is now enforced fail-closed until it is fixed or deleted:
+
+- AuthorizationPolicy ALLOW: allow-nothing.
+- AuthorizationPolicy DENY, CUSTOM, or an unreadable action: deny every request
+  and connection to its scope.
+- AuthorizationPolicy AUDIT: nothing.
+- PeerAuthentication: STRICT.
+- Sidecar: an untranslatable `egress` becomes `egress: []` with REGISTRY_ONLY,
+  and an untranslatable `ingress` becomes `ingress: []`.
+
+A `targetRef(s)` AuthorizationPolicy's marker covers its namespace, or the
+whole mesh in the Istio root namespace. Before upgrading, run `kubectl get
+authorizationpolicies,peerauthentications,sidecars -A` and fix or delete every
+resource whose `FerrumAccepted` condition is `False`. The Istio status detail
+for a rejected Sidecar now reports `outbound_traffic_policy_enforced` under the
+rollout gate, plus `enforcement`, `egress_blocked` and `ingress_blocked`.
+
+### Wildcard DestinationRules now apply on the data plane (#7395)
+
+DestinationRules whose `host` is a wildcard (`*.example.com`, `*`) used to be
+accepted and ignored by every mesh data plane. They now apply with Istio
+semantics, so they start governing destinations they used to leave untouched:
+
+- Review every wildcard DestinationRule, especially a mesh-wide `*` or
+  `*.local` rule in the root namespace. Its `trafficPolicy` (TLS origination,
+  load balancer, outlier detection, connection pool, timeouts) now reaches
+  every matching destination that has no more specific rule in a
+  higher-precedence namespace. Within one namespace an exact host still beats a
+  wildcard. A client-namespace wildcard beats the destination owner's exact
+  rule, as in Istio.
+- An upstream whose destinations now resolve to different winning rule sets
+  (for example an operator upstream that dials a host a wildcard covers next to
+  a Service an exact rule governs) is refused, and the data plane keeps its
+  last good config. Split the upstream or give its destinations one common
+  winning rule.
+- A wildcard declared in a namespace other than the client's or the root
+  namespace applies only to destinations that namespace owns (its own Services,
+  or external hosts — wildcard ServiceEntry hosts included — only its
+  ServiceEntries declare). A Sidecar egress scope judges a wildcard rule by the
+  destinations it covers.
+- Mesh-generated upstreams are matched on their logical host only: a Service
+  upstream on its FQDN, an EgressGateway ServiceEntry upstream on its
+  ServiceEntry host (never its STATIC endpoint addresses). EastWestGateway
+  SNI-passthrough Service upstreams remain ungoverned by DestinationRules.
+- Gateways running in the root namespace (`istio-system`): only the root
+  namespace's private rules (`exportTo: ["."]`) take precedence over a
+  destination owner's rules. Exported root rules are now the mesh-wide default
+  behind the owner's rules. Mark gateway-only overrides `exportTo: ["."]`.
+- NodeWaypoint: VirtualService weighted-split legs covered by a wildcard rule
+  are served again with that rule (they were refused). A direct external
+  backend a wildcard names is still refused; the warning field is now
+  `wildcard_direct_backend_refused`.
+- A DestinationRule exported to some namespaces but not to a subscriber, and
+  more specific than a visible wildcard rule of the same namespace, now hides
+  that wildcard for its hosts (Istio's lookup order). The control plane
+  resolves this and sends only the outcome
+  (`destination_rule_host_exclusions`). Upgrade control planes and data planes
+  together.
+
+
+### Managed TLS and ACME deletes check every namespace (#7394)
+
+On database and control-plane nodes, `DELETE
+/admin/tls/{certificates,ca-bundles,crls,ocsp-responses,jwks}/{id}` and `DELETE
+/admin/tls/acme/certificates/{id}` now refuse with `409` when a proxy, upstream
+or enabled plugin config in *any* namespace of the configuration store
+references the record. Before, only the namespaces the node serves were
+checked. Each `used_by` entry found in the store carries a `namespace`. Remove
+or disable those references first. The delete returns `503` (retry) when the
+store or the namespace admission leases cannot be read or held, and every
+configuration write in the store waits for the duration of the delete.
+File-mode and data-plane nodes check only their own configuration.
+
 ### `request_mirror` refuses cleartext to a non-loopback host without `allow_plaintext` (GHSA-gcwp-xp94-4pcv, #6659)
 
 `request_mirror` now follows the plugin-egress rule of #6659: `mirror_protocol:

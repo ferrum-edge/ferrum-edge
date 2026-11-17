@@ -101,6 +101,106 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   vulnerability); it is a direct dependency and also comes in through sqlx,
   the GCP SDK, mongodb and testcontainers, so `deny.toml` time-boxes it until
   2026-12-31 while the move to `time` is tracked in #7419.
+- **A backend's WebSocket upgrade refusal no longer trips the route's circuit
+  breaker** (GHSA-7x2j-3389-2h35). A backend that answered the gateway's
+  upgrade request with its own `401`/`403`/`404`/`429` became a gateway `502`
+  that was charged to the circuit breaker and backend admission as a 5xx
+  failure. A few unauthenticated upgrades could therefore open the route's
+  breaker and block plain HTTP on the same proxy and target. On H1, H2 Extended
+  CONNECT and H3 Extended CONNECT, the backend's `3xx`-`5xx` answer is now
+  relayed (for a direct, Unix-socket, Ambient HBONE or Sidecar mesh-mTLS
+  backend): its status, its headers after the backend-response strip and
+  response policy (`WWW-Authenticate`, `Retry-After`, `Location`), and its body
+  when it arrived complete with the head (up to 64 KiB). It carries no
+  `X-Gateway-Error` and is logged without an `error_class`. The breaker and
+  backend admission are charged with the backend's status exactly as on the
+  HTTP path, so a `4xx` is never a failure. A `2xx` other than `101`, an
+  invalid `Sec-WebSocket-Accept`, and a malformed response remain a `502`.
+- **Backend response headers with UTF-8 obs-text are forwarded instead of
+  dropped** (GHSA-j26x-88q2-wq5m). Every backend-response collector (HTTP/1.1
+  and HTTP/2 through reqwest or the direct pools, native gRPC headers and
+  trailers, native HTTP/3, the HTTP/3 bridge, and `serverless_function`
+  terminate-mode responses) dropped any value with a byte above `0x7F`. A UTF-8
+  `Content-Disposition` filename or `Set-Cookie` therefore vanished, which
+  removed `Content-Disposition: attachment` protection for uploads with
+  non-ASCII names. Valid UTF-8 values are now forwarded byte for byte. A value
+  that is not valid UTF-8 is still dropped, but is counted and reported by a
+  rate-limited warning that names the field.
+- **Viewer-key admin tokens no longer receive values keyed by
+  `FERRUM_ADMIN_JWT_SECRET`** (GHSA-crqx-mp2f-v8c8). Tokens verified by
+  `FERRUM_ADMIN_JWT_VIEWER_SECRET` received `cp_dp_trust.active_generation` on
+  `/health`/`/status`, `GET /config/export` fingerprints and
+  `redaction.fingerprint_key_id`, and resource `ETag`s. Each is an HMAC under
+  the primary admin secret over input the reader can know, which gave an
+  offline way to test guesses of the secret that mints `admin` tokens.
+  `active_generation` is now `null` and the `ETag` is omitted for viewer-key
+  tokens; every primary-key role keeps both. Export fingerprints are now keyed
+  from the new `FERRUM_ADMIN_CONFIG_EXPORT_FINGERPRINT_SECRET`, which must be
+  at least 32 characters and distinct from every JWT secret. When it is unset,
+  each process uses a random key. **Operator action:** set
+  `FERRUM_ADMIN_CONFIG_EXPORT_FINGERPRINT_SECRET` to the same value on every
+  replica whose exports a drift tool compares, and re-baseline once, because
+  fingerprints and `fingerprint_key_id` change.
+- **BREAKING: only a `charges:collect`-scoped token acknowledges `/charges`
+  delivery** (issue #7413) (GHSA-jjvr-vvwv-8qmh). Any authenticated `GET /charges`, including
+  viewer-role and viewer-key reads, counted toward the two-delivery rule that
+  lets idle `api_chargeback` rows be evicted. Two dashboard reads during a
+  collector outage could therefore drop rows the collector never received. Now
+  only a token whose `scope` claim grants `charges:collect` acknowledges
+  delivery. Other reads return the same document with no side effect.
+  **Operator action:** add `"scope": "charges:collect"` to the billing
+  collector's admin JWT (a `viewer` role is enough). (#7413)
+- **Database URL redaction decodes MongoDB `authMechanismProperties`**
+  (GHSA-wqrm-jcch-972x). Percent-encoded separators
+  (`AWS_SESSION_TOKEN%3A<token>`, `%2C`) or property names slipped past the
+  scrubber, which leaked MONGODB-AWS session tokens and OIDC credentials into
+  logs and diagnostics. The value is now decoded before it is split. An entry
+  without a decoded `:`, or with a name that is still encoded, is redacted
+  whole.
+- **BREAKING:** (issue #7410) `mcp_gateway` OpenAPI bridge calls are confined to the matched
+  proxy's listen prefix whether or not `strip_listen_path` is set. Before, a
+  non-stripping prefix proxy forwarded any `openapi.operations[].path` to its
+  backend. Calls outside the route now get JSON-RPC `-32603`. Bridged calls on
+  exact (`=`) and regex (`~`) routes are always refused; serve the bridge from
+  a literal-prefix or host-only route. `POST`/`PUT /api-specs` also rejects an
+  embedded `x-ferrum-plugins` `mcp_gateway` whose `endpoint.path` differs from
+  the validated `x-ferrum-mcp` endpoint (GHSA-26x8-8jq5-f73p). (#7410)
+- Fixed GHSA-49cr-v28q-9hgp: `a2a_gateway`, `ai_semantic_firewall`,
+  `ai_prompt_shield` (all scan modes) and `ai_rate_limiter` now screen governed
+  JSON bodies for duplicate object member names with the shared `json_dup_keys`
+  scanner before evaluating policy, so a first-key-wins backend can no longer
+  act on a member the gateway never judged.
+- Fixed GHSA-rxwj-x6c6-f4j5: Consumer-username lists and per-caller rate-limit
+  state no longer match or share state with an unmapped external identity
+  (`jwks_auth`, `ldap_auth`, `oauth2_introspection`, `oidc_relying_party`,
+  `soap_ws_security`) that spells the same string, and external principals from
+  different realms no longer share a bucket.
+- **BREAKING:** (issue #7415) A Kubernetes AuthorizationPolicy, PeerAuthentication or Sidecar
+  that Ferrum refuses is no longer dropped from enforcement
+  (GHSA-2r85-85hh-23mw). Dropping it silently removed DENY rules, CUSTOM
+  external-authorization delegation, the ALLOW implicit-deny floor, workload
+  STRICT mTLS and Sidecar egress narrowing. The refused resource is now
+  published as a fail-closed marker under its own scope: - ALLOW becomes
+  allow-nothing; - DENY, CUSTOM or an unreadable action denies every request
+  and connection; - PeerAuthentication becomes STRICT; - a Sidecar blocks each
+  untranslatable block (`egress: []` with REGISTRY_ONLY, `ingress: []`). Status
+  still reports `FerrumAccepted=False` and now states the consequence in
+  `status.ferrum.translation.enforcement`. (#7415)
+- The consumer credential endpoints (`PUT`/`POST`/`DELETE
+  /consumers/{id}/credentials/{type}` and `DELETE
+  /consumers/{id}/credentials/{type}/{index}`) now evaluate `If-Match` against
+  the Consumer's `ETag` from `GET /consumers/{id}` and refuse a stale tag with
+  `412`, writing nothing. An indexed delete conditioned on the read it was
+  chosen from can no longer remove a different credential after a concurrent
+  append or removal (#7393).
+- **BREAKING:** (issue #7394) `DELETE` of managed TLS records
+  (`/admin/tls/{certificates,ca-bundles,crls,ocsp-responses,jwks}/{id}`) and
+  ACME certificates (`/admin/tls/acme/certificates/{id}`) now checks references
+  in every namespace of the configuration store, not only the namespaces the
+  node serves. It returns `409` (with `used_by[].namespace`) for a reference
+  anywhere, holds the namespace-registry lease and every namespace's admission
+  lease from the scan through the delete, and returns `503` when the store or
+  the leases are unavailable (#7394).
 
 ### Added
 - **`mesh_route_dispatch` `weighted_splits`** (#7387). A new config table
@@ -166,6 +266,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   workflow** (#7207). The Criterion bench (`tests/performance/mesh`) measures
   the per-request plugin-cache view cost, and the dispatchable workflow
   compares a commit against a baseline on one runner.
+- `FERRUM_ADMIN_CONFIG_EXPORT_FINGERPRINT_SECRET`: optional key root for `GET
+  /config/export` credential fingerprints (GHSA-crqx-mp2f-v8c8).
+- `charges:collect` admin JWT scope that designates the `/charges` billing
+  collector (GHSA-jjvr-vvwv-8qmh).
+- Plugin execution triggers accept `external_identity` (an unmapped external
+  principal) and `external_identity_authority` (the 64-hex realm authority
+  digest that verified it, as `opa` reports in
+  `input.consumer.realm.authority`) predicates.
 
 ### Removed
 - **Plugin readers for metadata and record shapes no built-in writes**
@@ -886,6 +994,71 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `virtual_service_http_routes` and `MeshSlice` gained `http_routes`, so the
   ConfigSync build identity moves to `configsync.r5`; a CP and DP from
   different builds refuse each other at `Subscribe`.
+- **BREAKING:** (issue #7417) `ai_prompt_shield` in `content` / `all` scan modes refuses
+  (reject/redact, 400 `ambiguous_json`) or records (warn) request bodies with
+  duplicate JSON member names. (#7417)
+- **BREAKING:** (issue #7417) ConfigSync protocol revision is now 6 (new plugin-trigger
+  predicates); upgrade CPs and DPs together. (#7417)
+- **BREAKING:** (issue #7417) `ai_semantic_firewall` treats request bodies, buffered JSON
+  responses, and SSE / NDJSON stream frames with duplicate member names as
+  uninspectable (`uninspectable_body=ambiguous_json`, routed through
+  `fail_on_uninspectable_body`). (#7417)
+- **BREAKING:** (issue #7417) `a2a_gateway` refuses JSON-RPC bodies with duplicate member
+  names under a policy that can deny (`-32001`,
+  `a2a.error=request_body_uninspectable`) and leaves them unclassified
+  otherwise. (#7417)
+- **BREAKING:** (issue #7417) `ai_rate_limiter` treats request bodies with duplicate member
+  names as unparseable (refused with 400 while `model_limits` is set). (#7417)
+- **BREAKING:** (issue #7417) WAF `global_exemptions.consumers` and rule
+  `conditions.consumers`, `openapi_validator` `bypass.consumers`,
+  `rate_limiting` `scope: consumers`, `ai_rate_limiter` `consumer_limits`, and
+  the trigger `consumer` predicate match mapped Consumer usernames only. (#7417)
+- **BREAKING:** (issue #7417) `limit_by: consumer` in `rate_limiting`, `ws_rate_limiting`,
+  `graphql`, `grpc_method_router`, `ai_rate_limiter`, and
+  `tcp_connection_throttle` keys unmapped external identities as
+  `external:<mechanism>:<authority>:<identity>`; their existing counters (local
+  and Redis) restart. (#7417)
+- **BREAKING:** (issue #7395) **Wildcard DestinationRule hosts are applied with Istio
+  semantics on every mesh topology** (#7395). A rule host of `*.example.com` or
+  `*` was admitted and then ignored by the data plane, so its TLS origination,
+  connection pool, load balancer, outlier detection and timeouts never applied,
+  and an external host a wildcard rule asked to dial over TLS went out in
+  plaintext. Wildcards now apply on Sidecar, Ambient, ServiceWaypoint,
+  NodeWaypoint and EgressGateway upstreams (EastWestGateway SNI-passthrough
+  Service upstreams stay ungoverned by any DestinationRule, as before). Per
+  destination host the winner is the most specific lookup tier (client, then
+  target service, then root namespace), then the most specific host (an exact
+  host or Service alias beats any wildcard, a longer suffix beats a shorter
+  one). A wildcard names DNS host names only (never IP-literal targets,
+  upstream ids or cross-cluster transport identities), names a wildcard
+  ServiceEntry host it covers, is judged by a Sidecar egress scope against the
+  destinations it covers, and reaches the target-service tier only for
+  destinations its own namespace owns (a wildcard ServiceEntry host is owned by
+  its declaring namespace). Mesh-generated upstreams are matched on their
+  logical host only (a Service upstream on its FQDN, an EgressGateway
+  ServiceEntry upstream on its ServiceEntry host, never on STATIC endpoint or
+  gateway addresses). A client in the root namespace (for example an
+  EgressGateway in `istio-system`) now takes only the root namespace's private
+  rules as its own tier; exported root rules stay the mesh-wide default behind
+  the destination owner's rules. NodeWaypoint carried routes no longer refuse
+  an external split leg a wildcard covers; the leg follows the applied rule,
+  TLS origination included. A direct external backend a wildcard names stays
+  refused (`wildcard_direct_backend_refused`). A concrete external host with no
+  exact ServiceEntry belongs to the most specific covering wildcard
+  ServiceEntry. As in Istio, a service- or root-namespace rule hidden from the
+  client by `exportTo` but more specific than that namespace's visible wildcard
+  makes the lookup fall through to the next namespace; the control plane
+  resolves this and sends only the outcome on the new
+  `MeshSlice.destination_rule_host_exclusions` field (xDS
+  `DestinationRuleHostExclusionsCarrier`); nothing about the hidden rule leaves
+  the control plane. Upgrade CP and DPs together.
+- **The Kubernetes status of a mesh-bound VirtualService reports where its
+  `http[]` routes apply** (#7390): `status.ferrum.translation.mesh_http_routes:
+  node_waypoint_only` plus a `FerrumAccepted` message note. Mesh data planes
+  apply VirtualService `http[]` routes only on NodeWaypoint; Sidecar, Ambient
+  and ServiceWaypoint keep routing to the destination Service. The sidecar GA
+  headline, README, FEATURES and `docs/mesh_supported_matrix.md` no longer
+  imply otherwise.
 
 ### Fixed
 - CI: restore the gateway config that the daily `performance-regression.yml`
@@ -2529,6 +2702,50 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   config built from a mesh slice dropped the slice's `ext_authz_providers`, so
   mesh validation refused every slice with a CUSTOM policy and the data plane
   kept its previous generation (#7233).
+- **WebSocket upgrades forward the backend's handshake response headers**
+  (#7391). Backend `Set-Cookie` and other end-to-end headers on the `101` (or a
+  mesh peer's Extended CONNECT `200`) now reach the client on H1, H2 and H3.
+  They pass through the backend-response strip first, then response policy. The
+  gateway still owns `Upgrade`, `Connection`, `Sec-WebSocket-*`,
+  `Content-Length` and its sticky cookie.
+- **`preserve_host_header` applies to direct WebSocket backend handshakes**
+  (#7392). The backend now sees the client's validated Host on H1, H2 and H3
+  upgrades, as on the HTTP path. The dial address, TLS SNI and certificate
+  verification still use the selected target, and an invalid client Host falls
+  back to the target authority.
+- **BREAKING:** (issue #7406) The `mcp_gateway` endpoint-scope overlap check now matches the
+  runtime claim: canonical path, ASCII case-insensitive, and path template
+  parameters treated as any value. `POST`/`PUT /api-specs` with `x-ferrum-mcp`
+  rejects a document where any operation path (bridged or not, under any
+  effective server base) can fall inside the endpoint scope, for example
+  `/MCP/status`, `/%6d%63p` or `/{name}/status` beside `/mcp`. It also rejects
+  a document whose operations × server bases exceed 65,536 paths or 16 MiB of
+  path text. `mcp_gateway` load rejects such `openapi.operations[].path`
+  entries (#7406).
+- Kubernetes controller: a demand-driven revision-evidence refresh no longer
+  blinds a watch scope while its replacement lists. The live watch keeps
+  delivering, so a `Delete` arriving during a refresh is observed immediately
+  instead of after up to two idle-relist windows (#7399). Added
+  `ferrum_k8s_controller_watch_evidence_refresh_relists_total`.
+- `FERRUM_DIAGNOSTIC_REFS=all` now references gateway rejections answered as
+  gRPC-Web trailer-frame errors (HTTP `200` with a non-zero `grpc-status` in
+  the body), on HTTP/1.1, HTTP/2 and HTTP/3. The reference resolves with
+  `status: 200`. The same applies to gRPC-Web route misses, `allowed_methods`
+  and route protocol admission refusals, and the gRPC non-`POST` refusal.
+  Native gRPC `allowed_methods` and route protocol admission refusals now
+  resolve against their `200` Trailers-Only head. Stamped gRPC-Web responses
+  also list `x-ferrum-diagnostic-ref` in `Access-Control-Expose-Headers`, so
+  browser callers can read it (#7407).
+- The gRPC non-`POST` refusal (native gRPC and gRPC-Web, on HTTP/1.1, HTTP/2
+  and HTTP/3) is now written to the transaction log once, with
+  `rejection_phase: "grpc_post_required"` and status `200`; it was not logged
+  before (#7407).
+- The `gateways-protocol-benchmark` dispatch inputs `skip_protocols`,
+  `skip_payload_sizes` and `skip_gateways` now match whole names, so skipping
+  `udp-dtls` no longer also skips `udp` (#7405).
+- `openapi.yaml` spells its 14 chargeback price `maximum` bounds as `1.0e+288`.
+  YAML 1.1 resolvers (libyaml/Psych, PyYAML) read the signless `1.0e288` as a
+  string (#7408).
 
 ### Performance
 - **The TLS record layer now uses AWS-LC's AES-GCM on the CPUs where it is
