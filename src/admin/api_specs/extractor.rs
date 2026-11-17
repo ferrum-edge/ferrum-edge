@@ -720,8 +720,10 @@ pub fn extract_with_external_refs(
         let operations = extract_mcp_bridge_operations(
             &root,
             &version,
-            listen_prefix,
-            endpoint_path.trim_end_matches('/'),
+            McpBridgeRoute {
+                listen_prefix,
+                endpoint_scope: endpoint_path.trim_end_matches('/'),
+            },
             proxy.allowed_methods.as_deref(),
             &effective.document_base,
             &external_docs,
@@ -1611,6 +1613,15 @@ fn mcp_bridge_endpoint_path(
     Ok(endpoint_path)
 }
 
+/// Where the generated gateway is served: the proxy's literal listen prefix
+/// (empty for none) and the MCP endpoint scope (`endpoint.path` without a
+/// trailing slash).
+#[derive(Clone, Copy)]
+struct McpBridgeRoute<'a> {
+    listen_prefix: &'a str,
+    endpoint_scope: &'a str,
+}
+
 /// Generate one `mcp_gateway` bridge operation per selected OpenAPI 3.x
 /// operation, and refuse the document when the MCP endpoint scope can claim
 /// the public path of ANY of its operations, under any effective server base.
@@ -1621,13 +1632,16 @@ fn mcp_bridge_endpoint_path(
 fn extract_mcp_bridge_operations(
     root: &Value,
     version: &str,
-    listen_prefix: &str,
-    endpoint_scope: &str,
+    route: McpBridgeRoute<'_>,
     allowed_methods: Option<&[String]>,
     document_base: &Url,
     externals: &HashMap<String, LoadedExternalDocument>,
     extension: &McpBridgeExtension,
 ) -> Result<Vec<Value>, ExtractError> {
+    let McpBridgeRoute {
+        listen_prefix,
+        endpoint_scope,
+    } = route;
     if version == "2.0" {
         return Err(mcp_extension_error(
             "`x-ferrum-mcp` requires an OpenAPI 3.x document; Swagger 2.0 is not supported"
