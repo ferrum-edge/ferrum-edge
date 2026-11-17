@@ -2833,6 +2833,19 @@ pub mod _test_support {
         crate::admin::collect_guarded_admin_response_for_test(response).await
     }
 
+    /// `GET /charges` exactly as the admin dispatcher answers it for
+    /// `authorization` (collector-scope decision included), rendered from
+    /// `registry` instead of the process-global one. `None` when the token
+    /// does not verify.
+    pub async fn charges_response_for_test(
+        jwt_manager: &crate::admin::jwt_auth::JwtManager,
+        authorization: &str,
+        registry: std::sync::Arc<crate::plugins::api_chargeback::ChargebackRegistry>,
+        query: Option<&str>,
+    ) -> Option<hyper::Response<http_body_util::Full<bytes::Bytes>>> {
+        crate::admin::charges_response_for_test(jwt_manager, authorization, registry, query).await
+    }
+
     /// Wrap an admin response as the admin listener does, then drop it
     /// without writing its body (`/charges` delivery acknowledgement tests).
     pub fn drop_guarded_admin_response_unpolled_for_test(

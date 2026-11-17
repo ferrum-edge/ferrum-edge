@@ -15,6 +15,7 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use chrono::{Duration, Utc};
 use ferrum_edge::admin::audit::{AuditActor, NamespaceCeilingDecision};
 use ferrum_edge::admin::jwt_auth::{
+    ADMIN_CONFIG_EXPORT_FINGERPRINT_SECRET_REUSED_ERROR,
     ADMIN_JWT_VIEWER_SECRET_EQUALS_PRIMARY_ERROR, AdminKeyTier, AdminRole, JwtConfig, JwtError,
     JwtManager, MAX_VIEWER_KEY_SUBJECT_BYTES, ViewerNamespaceCeiling, create_jwt_manager_from_env,
     random_read_only_jwt_manager,
@@ -325,6 +326,89 @@ fn identical_and_short_viewer_secrets_are_refused_without_echoing_them() {
     assert!(message.contains("FERRUM_ADMIN_JWT_VIEWER_SECRET"));
     assert!(message.contains("at least"));
     assert!(!message.contains(short));
+}
+
+const FINGERPRINT_SECRET: &str = "export-fingerprint-secret-0123456789abcdef";
+
+/// GHSA-crqx-mp2f-v8c8: the `GET /config/export` fingerprint secret may not
+/// reuse either admin signing secret, in whichever order they are attached,
+/// and refusals never echo a value.
+#[test]
+fn config_export_fingerprint_secret_must_not_reuse_a_signing_secret() {
+    let reuse_primary = JwtManager::new(jwt_config(PRIMARY_SECRET, ISSUER))
+        .with_config_export_fingerprint_secret(PRIMARY_SECRET.to_string());
+    let Err(JwtError::VerificationFailed(message)) = reuse_primary else {
+        panic!("a fingerprint secret equal to the primary secret must be refused");
+    };
+    assert_eq!(message, ADMIN_CONFIG_EXPORT_FINGERPRINT_SECRET_REUSED_ERROR);
+    assert!(!message.contains(PRIMARY_SECRET));
+
+    let reuse_viewer = manager_with_viewer_secret()
+        .with_config_export_fingerprint_secret(VIEWER_SECRET.to_string());
+    let Err(JwtError::VerificationFailed(message)) = reuse_viewer else {
+        panic!("a fingerprint secret equal to the viewer secret must be refused");
+    };
+    assert_eq!(message, ADMIN_CONFIG_EXPORT_FINGERPRINT_SECRET_REUSED_ERROR);
+
+    let viewer_after_fingerprint = JwtManager::new(jwt_config(PRIMARY_SECRET, ISSUER))
+        .with_config_export_fingerprint_secret(FINGERPRINT_SECRET.to_string())
+        .expect("a distinct fingerprint secret is accepted")
+        .with_viewer_secret(FINGERPRINT_SECRET.to_string());
+    let Err(JwtError::VerificationFailed(message)) = viewer_after_fingerprint else {
+        panic!("a viewer secret equal to the fingerprint secret must be refused");
+    };
+    assert_eq!(message, ADMIN_CONFIG_EXPORT_FINGERPRINT_SECRET_REUSED_ERROR);
+
+    let short = "short-fingerprint-secret";
+    let refused = JwtManager::new(jwt_config(PRIMARY_SECRET, ISSUER))
+        .with_config_export_fingerprint_secret(short.to_string());
+    let Err(JwtError::VerificationFailed(message)) = refused else {
+        panic!("a fingerprint secret under 32 characters must be refused");
+    };
+    assert!(message.contains("FERRUM_ADMIN_CONFIG_EXPORT_FINGERPRINT_SECRET"));
+    assert!(message.contains("at least"));
+    assert!(!message.contains(short));
+
+    let accepted = manager_with_viewer_secret()
+        .with_config_export_fingerprint_secret(FINGERPRINT_SECRET.to_string())
+        .expect("a fingerprint secret distinct from both signing secrets is accepted");
+    assert!(accepted.has_config_export_fingerprint_secret());
+    assert!(!manager_with_viewer_secret().has_config_export_fingerprint_secret());
+}
+
+#[test]
+fn jwt_manager_from_env_reads_the_config_export_fingerprint_secret() {
+    let env = EnvGuard::new(&[]);
+    env.unset("FERRUM_ADMIN_JWT_ISSUER");
+    env.unset("FERRUM_ADMIN_JWT_AUDIENCE");
+    env.unset("FERRUM_ADMIN_JWT_MAX_TTL");
+    env.unset("FERRUM_ADMIN_JWT_VIEWER_SECRET");
+    env.set("FERRUM_ADMIN_JWT_SECRET", PRIMARY_SECRET);
+
+    env.unset("FERRUM_ADMIN_CONFIG_EXPORT_FINGERPRINT_SECRET");
+    let manager = create_jwt_manager_from_env().expect("the fingerprint secret is optional");
+    assert!(!manager.has_config_export_fingerprint_secret());
+
+    env.set(
+        "FERRUM_ADMIN_CONFIG_EXPORT_FINGERPRINT_SECRET",
+        PRIMARY_SECRET,
+    );
+    let Err(reused) = create_jwt_manager_from_env() else {
+        panic!("a fingerprint secret reusing the admin secret must fail startup");
+    };
+    assert!(!reused.to_string().contains(PRIMARY_SECRET));
+
+    env.set(
+        "FERRUM_ADMIN_CONFIG_EXPORT_FINGERPRINT_SECRET",
+        FINGERPRINT_SECRET,
+    );
+    let manager = create_jwt_manager_from_env().expect("a distinct fingerprint secret is valid");
+    assert!(manager.has_config_export_fingerprint_secret());
+
+    // The read-only random-primary fallback honours it as well.
+    env.unset("FERRUM_ADMIN_JWT_SECRET");
+    let manager = random_read_only_jwt_manager().expect("fallback builds");
+    assert!(manager.has_config_export_fingerprint_secret());
 }
 
 #[test]

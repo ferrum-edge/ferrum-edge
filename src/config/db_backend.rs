@@ -21,7 +21,7 @@ use crate::plugins::PluginHttpClient;
 use arc_swap::ArcSwap;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use percent_encoding::percent_decode_str;
+use percent_encoding::{AsciiSet, CONTROLS, percent_decode_str, utf8_percent_encode};
 use std::collections::{BTreeSet, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -3892,14 +3892,52 @@ fn redact_query_option(option: &str) -> String {
     format!("{key}={value}")
 }
 
+/// Characters re-encoded when a decoded `authMechanismProperties` entry is
+/// echoed into a redacted URL, so the output keeps one property per `,`, one
+/// name/value split per `:`, and cannot start a new query option.
+const MECHANISM_PROPERTY_ENCODE_SET: &AsciiSet = &CONTROLS
+    .add(b' ')
+    .add(b'"')
+    .add(b'#')
+    .add(b'%')
+    .add(b'&')
+    .add(b'\'')
+    .add(b'+')
+    .add(b',')
+    .add(b':')
+    .add(b';')
+    .add(b'<')
+    .add(b'=')
+    .add(b'>')
+    .add(b'?');
+
 /// Redact credential-bearing properties inside a MongoDB
 /// `authMechanismProperties` value (`NAME:VALUE` pairs separated by `,`).
+///
+/// Drivers percent-decode the value before splitting it, so URI builders that
+/// encode the separators (`AWS_SESSION_TOKEN%3A<token>`, `%2C`) or the
+/// property name (`AWS_SESSION_TOK%45N`) are matched on the decoded form.
+/// Fails closed: a non-empty entry with no decoded `:` delimiter is replaced
+/// by `***` whole, and a name that still contains `%` after one decode (a
+/// doubly encoded name the matcher cannot read) is treated as sensitive.
 fn redact_mechanism_properties(value: &str) -> String {
-    value
+    let encode = |text: &str| utf8_percent_encode(text, MECHANISM_PROPERTY_ENCODE_SET).to_string();
+    let decoded = percent_decode_str(value).decode_utf8_lossy();
+    decoded
         .split(',')
-        .map(|property| match property.split_once(':') {
-            Some((name, _)) if is_sensitive_url_query_key(name) => format!("{name}:***"),
-            _ => property.to_string(),
+        .map(|property| {
+            if property.is_empty() {
+                return String::new();
+            }
+            match property.split_once(':') {
+                Some((name, _)) if name.contains('%') || is_sensitive_url_query_key(name) => {
+                    format!("{}:***", encode(name))
+                }
+                Some((name, property_value)) => {
+                    format!("{}:{}", encode(name), encode(property_value))
+                }
+                None => "***".to_string(),
+            }
         })
         .collect::<Vec<_>>()
         .join(",")

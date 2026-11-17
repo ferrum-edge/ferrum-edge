@@ -1253,9 +1253,18 @@ pub struct CollectionReceipt {
     walk_started_nanos: u64,
 }
 
+/// Admin JWT `scope` that designates a `/charges` billing collector
+/// (GHSA-jjvr-vvwv-8qmh). Only a `GET /charges` whose token grants it attaches
+/// a [`ChargesDeliveryAck`]; every other authenticated read is side-effect
+/// free, so a dashboard or ad-hoc reader cannot make idle rows the collector
+/// never received evictable. Tokens verified by
+/// `FERRUM_ADMIN_JWT_VIEWER_SECRET` never grant a scope.
+pub const CHARGES_COLLECT_SCOPE: &str = "charges:collect";
+
 /// Response extension carrying a `/charges` [`CollectionReceipt`] to the admin
 /// connection's body wrapper, which calls [`Self::acknowledge`] once hyper has
-/// taken the complete document.
+/// taken the complete document. Attached only for a token granting
+/// [`CHARGES_COLLECT_SCOPE`].
 #[derive(Clone)]
 pub struct ChargesDeliveryAck {
     registry: Arc<ChargebackRegistry>,
@@ -3121,7 +3130,7 @@ impl ChargebackRegistry {
             self.dropped_charges_total.load(Ordering::Relaxed)
         ));
         output.push_str(
-            "# HELP ferrum_api_chargeback_uncollected_retained_entries Billing rows the last eviction pass kept past stale_entry_ttl_seconds because no completed /charges export has collected their current counters.\n",
+            "# HELP ferrum_api_chargeback_uncollected_retained_entries Billing rows the last eviction pass kept past stale_entry_ttl_seconds because no /charges delivery to a charges:collect-scoped collector has collected their current counters.\n",
         );
         output.push_str("# TYPE ferrum_api_chargeback_uncollected_retained_entries gauge\n");
         output.push_str(&format!(

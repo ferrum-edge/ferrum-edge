@@ -322,8 +322,11 @@ pub struct CpDpTrustReloadSnapshot {
     /// Replica-stable HMAC-SHA-256 identifier of the accepted trust generation
     /// (`HMAC-SHA-256(status_hmac_key, domain || fingerprint)` as 64 lowercase
     /// hex). `None` when no bundle is watched or the HMAC key was refused.
-    /// Admin-JWT-authenticated `/health`/`/status` only; metrics bearer tokens
-    /// and metrics-allowlisted source addresses receive `None`.
+    /// `None` unless `/health`/`/status` was authenticated by a fleet-wide
+    /// token that `FERRUM_ADMIN_JWT_SECRET` verified:
+    /// `FERRUM_ADMIN_JWT_VIEWER_SECRET` tokens, metrics bearer tokens, and
+    /// metrics-allowlisted source addresses receive `None`
+    /// (GHSA-crqx-mp2f-v8c8; `admin_secret_keyed_detail_allowed`).
     pub active_generation: Option<String>,
     /// Attempts that produced a usable generation (replaced or confirmed).
     pub acceptances_total: u64,
