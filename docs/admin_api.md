@@ -1596,7 +1596,9 @@ reference) with the change, or have an `admin` make it.
 Because a `PUT` is a full replace, a client that submits an editor opened
 before someone else's accepted change does not merely omit that change — it
 reverts it. `GET /proxies/{id}`, `/upstreams/{id}`, `/consumers/{id}`, and
-`/plugins/config/{id}` return a strong `ETag`; send it back as `If-Match` on
+`/plugins/config/{id}` return a strong `ETag` (except to a token verified by
+`FERRUM_ADMIN_JWT_VIEWER_SECRET`, which cannot write and must never hold a MAC
+keyed by `FERRUM_ADMIN_JWT_SECRET`; GHSA-crqx-mp2f-v8c8); send it back as `If-Match` on
 `PUT` or `DELETE` of the same resource and the write is refused with
 `412 Precondition Failed` — writing nothing — unless the stored resource still
 has the state validated by that tag. The validator covers complete stored
@@ -2120,10 +2122,18 @@ curl -H "Authorization: Bearer $VIEWER_TOKEN" \
   It is present even when a consumer has none, so it shows that hidden
   credentials changed without revealing whether any exist.
 - **Fingerprint format.** `hmac-sha256:<64 lowercase hex>`, computed as
-  HMAC-SHA-256 under a subkey derived from `FERRUM_ADMIN_JWT_SECRET`
+  HMAC-SHA-256 under a subkey derived from
+  `FERRUM_ADMIN_CONFIG_EXPORT_FINGERPRINT_SECRET`
   (`HMAC-SHA-256(secret, "ferrum-edge/admin-config-export-fingerprint/v1")`).
-  The subkey is never derived from the viewer secret, so the reader cannot
-  compute or dictionary-test a fingerprint.
+  - The subkey is never derived from the viewer secret, so the reader cannot
+    compute or dictionary-test a fingerprint.
+  - It is never derived from `FERRUM_ADMIN_JWT_SECRET` either
+    (GHSA-crqx-mp2f-v8c8). `fingerprint_key_id` and the fingerprint of an
+    empty hidden-credential map are MACs over inputs every reader knows; keyed
+    by the primary secret they would let a viewer-key holder test offline
+    guesses of the secret that mints `admin` tokens. The fingerprint secret
+    must be at least 32 characters and differ from `FERRUM_ADMIN_JWT_SECRET`,
+    `FERRUM_ADMIN_JWT_VIEWER_SECRET`, and `FERRUM_CP_DP_GRPC_JWT_SECRET`.
   - The MAC input binds the resource kind, namespace, id, and the field's JSON
     pointer (for example `/credentials/keyauth/0/key` or
     `/config/headers/x-api-key`) to a key-sorted canonical JSON of the stored
@@ -2138,11 +2148,14 @@ curl -H "Authorization: Bearer $VIEWER_TOKEN" \
     its pointer uses index `0` (for example `/credentials/keyauth/0/key`), so
     the pointer always names the emitted position.
 - **Stable.** An unchanged credential fingerprints identically across calls and
-  across replicas that share `FERRUM_ADMIN_JWT_SECRET`. Rotating that secret
-  changes every fingerprint and `redaction.fingerprint_key_id`. Two caveats:
-  - In `file`/`mesh`/`node_agent` mode without `FERRUM_ADMIN_JWT_SECRET`, the
-    key is random per process, so fingerprints change on every restart.
-  - A CP and a DP (or any two replicas) whose admin secrets differ never
+  across replicas that share `FERRUM_ADMIN_CONFIG_EXPORT_FINGERPRINT_SECRET`.
+  Rotating that secret changes every fingerprint and
+  `redaction.fingerprint_key_id`. Two caveats:
+  - Without `FERRUM_ADMIN_CONFIG_EXPORT_FINGERPRINT_SECRET`, in any mode, the
+    key is random per process, so fingerprints change on every restart and
+    differ between replicas. Set it on every replica whose exports a drift
+    tool compares.
+  - A CP and a DP (or any two replicas) whose fingerprint secrets differ never
     produce comparable fingerprints.
 - **Residual oracle.** A principal that can *write* a field (an operator for
   plugin configs, upstreams, and proxies; an admin for consumers) can confirm
@@ -2675,6 +2688,8 @@ The response is cached briefly (`FERRUM_METRICS_RUNTIME_CACHE_MS`, default `1000
 ## Charges
 
 The `/charges` endpoint exposes per-consumer API usage charges tracked by the `api_chargeback` plugin. It requires the same admin JWT authentication as other sensitive admin endpoints.
+
+Only a **designated billing collector** acknowledges delivery: a token whose `scope` claim grants `charges:collect` (a space-delimited string such as `"scope": "charges:collect"`, or an array). Its delivered responses count toward the two-hand-off rule that lets idle rows past `stale_entry_ttl_seconds` be evicted (see [plugins.md](plugins.md#api_chargeback)). Every other authenticated read gets the same document without side effects, so a dashboard, an operator `curl`, or any `FERRUM_ADMIN_JWT_VIEWER_SECRET` token (whose scope claims grant nothing) cannot make rows the collector never received evictable (GHSA-jjvr-vvwv-8qmh). The `role` claim never implies the scope; a `viewer` token with `charges:collect` is a sufficient collector credential.
 
 Monetary samples convert the stored `u64` counter to IEEE-754 binary64 and
 multiply it by the configured binary64 unit price (accepted rates are finite

@@ -2833,6 +2833,19 @@ pub mod _test_support {
         crate::admin::collect_guarded_admin_response_for_test(response).await
     }
 
+    /// `GET /charges` exactly as the admin dispatcher answers it for
+    /// `authorization` (collector-scope decision included), rendered from
+    /// `registry` instead of the process-global one. `None` when the token
+    /// does not verify.
+    pub async fn charges_response_for_test(
+        jwt_manager: &crate::admin::jwt_auth::JwtManager,
+        authorization: &str,
+        registry: std::sync::Arc<crate::plugins::api_chargeback::ChargebackRegistry>,
+        query: Option<&str>,
+    ) -> Option<hyper::Response<http_body_util::Full<bytes::Bytes>>> {
+        crate::admin::charges_response_for_test(jwt_manager, authorization, registry, query).await
+    }
+
     /// Wrap an admin response as the admin listener does, then drop it
     /// without writing its body (`/charges` delivery acknowledgement tests).
     pub fn drop_guarded_admin_response_unpolled_for_test(
@@ -19090,6 +19103,17 @@ pub mod _test_support {
         /// increment this long-standing metric.
         pub fn watch_idle_relists(&self) -> u64 {
             self.metrics.snapshot().watch_idle_relists
+        }
+
+        /// Reflector rebuilds a demand-driven revision-evidence refresh started
+        /// (issue #7399), counted apart from idle relists.
+        pub fn watch_evidence_refresh_relists(&self) -> u64 {
+            self.metrics.snapshot().watch_evidence_refresh_relists
+        }
+
+        /// Watch `Delete` events the production watcher observed (issue #4491).
+        pub fn watch_deletes(&self) -> u64 {
+            self.metrics.snapshot().watch_deletes
         }
 
         /// Watch stream errors the production watcher counted (issue #4491),

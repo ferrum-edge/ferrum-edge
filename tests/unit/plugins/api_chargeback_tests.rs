@@ -4631,18 +4631,29 @@ fn test_admin_charges_path_is_non_owning_when_unconfigured() {
         charges_block.contains("try_global_registry"),
         "GET /charges must use try_global_registry"
     );
+    // The route hands the optional registry to `charges_response`, which renders
+    // the empty shapes when no plugin has configured the registry.
+    let renderer_idx = admin
+        .find("async fn charges_response(")
+        .expect("charges_response renderer");
+    let renderer_end = admin[renderer_idx..]
+        .find("\n}\n")
+        .map(|offset| renderer_idx + offset)
+        .expect("charges_response body end");
+    let renderer = &admin[renderer_idx..renderer_end];
     assert!(
-        charges_block.contains("empty_charges_json")
-            && charges_block.contains("empty_charges_prometheus"),
+        renderer.contains("empty_charges_json") && renderer.contains("empty_charges_prometheus"),
         "GET /charges must render empty shapes without claiming the registry"
     );
     // `try_global_registry()` contains the substring `global_registry()`; strip
     // the non-owning helper so this assertion only catches owning calls.
-    let without_try = charges_block.replace("try_global_registry()", "");
-    assert!(
-        !without_try.contains("global_registry()"),
-        "GET /charges must not call owning global_registry()"
-    );
+    for (label, block) in [("route", charges_block), ("renderer", renderer)] {
+        let without_try = block.replace("try_global_registry()", "");
+        assert!(
+            !without_try.contains("global_registry()"),
+            "GET /charges {label} must not call owning global_registry()"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -6236,6 +6247,119 @@ async fn test_charges_delivery_ack_fires_only_once_the_body_is_taken() {
         1,
         "two delivered documents confirm collection"
     );
+}
+
+/// GHSA-jjvr-vvwv-8qmh: only a designated collector's `GET /charges`
+/// acknowledges delivery. A `viewer` token without the `charges:collect` scope
+/// and a `FERRUM_ADMIN_JWT_VIEWER_SECRET` token (whose scope claims grant
+/// nothing) read the same document without moving the collection watermark,
+/// so an idle row nobody collected stays retained and counted.
+#[tokio::test]
+async fn test_only_collector_scoped_charges_reads_acknowledge_delivery() {
+    use ferrum_edge::admin::jwt_auth::{JwtConfig, JwtManager};
+    use ferrum_edge::plugins::api_chargeback::CHARGES_COLLECT_SCOPE;
+
+    const PRIMARY: &str = "charges-collector-primary-secret-0123456789";
+    const VIEWER_KEY: &str = "charges-collector-viewer-secret-0123456789";
+    const ISSUER: &str = "charges-collector-test";
+
+    let manager = JwtManager::new(JwtConfig {
+        secret: PRIMARY.to_string(),
+        issuer: ISSUER.to_string(),
+        audience: None,
+        max_ttl_seconds: 3600,
+        algorithm: jsonwebtoken::Algorithm::HS256,
+    })
+    .with_viewer_secret(VIEWER_KEY.to_string())
+    .expect("distinct viewer secret");
+    let bearer = |secret: &str, role: &str, scope: Option<&str>| {
+        let now = chrono::Utc::now();
+        let mut claims = json!({
+            "iss": ISSUER,
+            "sub": "billing",
+            "role": role,
+            "iat": now.timestamp(),
+            "nbf": now.timestamp(),
+            "exp": (now + chrono::Duration::seconds(600)).timestamp(),
+            "jti": uuid::Uuid::new_v4().to_string(),
+        });
+        if let Some(scope) = scope {
+            claims["scope"] = json!(scope);
+        }
+        let token = jsonwebtoken::encode(
+            &jsonwebtoken::Header::new(jsonwebtoken::Algorithm::HS256),
+            &claims,
+            &jsonwebtoken::EncodingKey::from_secret(secret.as_bytes()).unwrap(),
+        )
+        .unwrap();
+        format!("Bearer {token}")
+    };
+
+    let registry = Arc::new(ChargebackRegistry::new());
+    // No render cache and a zero idle TTL: every read walks the registry, and
+    // every row is idle, so only collection decides eviction.
+    registry.configure(0, 0, 0, TEST_MAX_ENTRIES, TEST_MAX_BYTES);
+    record_identity(&registry, "user-a");
+
+    let read = |authorization: String| {
+        let manager = manager.clone();
+        let registry = Arc::clone(&registry);
+        async move {
+            let response = ferrum_edge::_test_support::charges_response_for_test(
+                &manager,
+                &authorization,
+                registry,
+                Some("format=json"),
+            )
+            .await
+            .expect("token verifies");
+            assert_eq!(response.status(), hyper::StatusCode::OK);
+            let body =
+                ferrum_edge::_test_support::collect_guarded_admin_response_for_test(response).await;
+            serde_json::from_slice::<serde_json::Value>(&body).unwrap()
+        }
+    };
+
+    for (label, authorization) in [
+        (
+            "viewer without the collector scope",
+            bearer(PRIMARY, "viewer", None),
+        ),
+        (
+            "admin without the collector scope",
+            bearer(PRIMARY, "admin", None),
+        ),
+        (
+            "viewer-key token claiming the collector scope",
+            bearer(VIEWER_KEY, "viewer", Some(CHARGES_COLLECT_SCOPE)),
+        ),
+    ] {
+        for _ in 0..2 {
+            let document = read(authorization.clone()).await;
+            assert_eq!(
+                document["consumers"]["user-a"]["proxies"]["proxy-a"]["total_calls"], 1,
+                "{label}: the reader still receives the billing data"
+            );
+        }
+        assert_eq!(
+            registry.evict_stale(0),
+            0,
+            "{label}: two reads must not make an uncollected row evictable"
+        );
+        let document = read(authorization).await;
+        assert_eq!(
+            document["registry"]["uncollected_retained_entries"], 1,
+            "{label}: the idle row is retained and counted as uncollected"
+        );
+    }
+
+    // The designated collector: one hand-off is still insufficient, the second
+    // confirms collection (issue #5276).
+    let collector = bearer(PRIMARY, "viewer", Some(CHARGES_COLLECT_SCOPE));
+    read(collector.clone()).await;
+    assert_eq!(registry.evict_stale(0), 0, "one collector delivery");
+    read(collector).await;
+    assert_eq!(registry.evict_stale(0), 1, "two collector deliveries");
 }
 
 /// api_chargeback-CLAUDE-4: a reload that invalidates every walk cannot keep

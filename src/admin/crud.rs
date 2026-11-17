@@ -15,7 +15,7 @@ use uuid::Uuid;
 
 use crate::admin::AdminState;
 use crate::admin::audit::{self, AuditActor, AuditEvent};
-use crate::admin::jwt_auth::AdminRole;
+use crate::admin::jwt_auth::{AdminKeyTier, AdminRole};
 use crate::admin::plugin_config_projection::PlaceholderSiteRecorder;
 use crate::admin::preconditions::{self, IfMatch};
 use crate::config::db_backend::{
@@ -3177,10 +3177,18 @@ pub(crate) async fn handle_list_filtered<R: AdminResource>(
     }
 }
 
+/// `GET /<resource>/{id}`.
+///
+/// `key_tier` is the tier of the key that verified the caller's token. The
+/// strong `ETag` is a MAC keyed by `FERRUM_ADMIN_JWT_SECRET` over the stored
+/// representation, which for a resource without withheld fields is input the
+/// reader can reconstruct; a viewer-key token (which can never write, so has
+/// no use for `If-Match`) therefore gets no tag (GHSA-crqx-mp2f-v8c8).
 pub(crate) async fn handle_get<R: AdminResource>(
     state: &AdminState,
     id: &str,
     role: AdminRole,
+    key_tier: AdminKeyTier,
     namespace: &str,
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
     if let Err(message) = validate_resource_id(id) {
@@ -3202,8 +3210,10 @@ pub(crate) async fn handle_get<R: AdminResource>(
                 // Tags are issued only for a read from the store. The cached
                 // fallback below may lag the store, and a tag for a
                 // representation the store no longer holds would only ever
-                // produce a 412, so it gets none.
+                // produce a 412, so it gets none. Nor does a viewer-key
+                // caller: the tag is keyed by the primary admin secret.
                 if R::SUPPORTS_IF_MATCH
+                    && key_tier == AdminKeyTier::Primary
                     && let Some(tag) = current_etag(state, &resource)
                     && let Ok(value) =
                         hyper::header::HeaderValue::from_str(&preconditions::quoted(&tag))

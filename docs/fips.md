@@ -272,6 +272,7 @@ reload, which rebuilds through the same constructor.
   profile selects exposes no P-521 JWS path at all, so admitting it would be an
   allow-list entry that fails at first use rather than at admission.
 - `FERRUM_ADMIN_JWT_SECRET`, `FERRUM_ADMIN_JWT_VIEWER_SECRET`,
+  `FERRUM_ADMIN_CONFIG_EXPORT_FINGERPRINT_SECRET`,
   `FERRUM_CP_DP_GRPC_JWT_SECRET`, `FERRUM_BASIC_AUTH_HMAC_SECRET`, and
   `FERRUM_DATAGRAM_PROXY_PROTOCOL_SECRET` must be at least 32 bytes (SP 800-107 HMAC key strength). A shorter
   `FERRUM_DATAGRAM_PROXY_PROTOCOL_SECRET` fails `ferrum-edge validate` and

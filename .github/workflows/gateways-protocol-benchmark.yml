@@ -125,13 +125,18 @@ jobs:
       - name: Skip protocol?
         id: skip_check
         run: |
+          # Whole space-delimited tokens only (#7405): `grep -w` treats `-` as
+          # a word boundary, so skipping `udp-dtls` also skipped `udp`.
           skip_list="${{ inputs.skip_protocols }}"
-          if echo " $skip_list " | grep -qw "${{ matrix.protocol }}"; then
-            echo "skip=true" >> "$GITHUB_OUTPUT"
-            echo "Protocol ${{ matrix.protocol }} is in skip list — ending job."
-          else
-            echo "skip=false" >> "$GITHUB_OUTPUT"
-          fi
+          case " $skip_list " in
+            *" ${{ matrix.protocol }} "*)
+              echo "skip=true" >> "$GITHUB_OUTPUT"
+              echo "Protocol ${{ matrix.protocol }} is in skip list — ending job."
+              ;;
+            *)
+              echo "skip=false" >> "$GITHUB_OUTPUT"
+              ;;
+          esac
 
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -200,9 +205,10 @@ jobs:
             *)
               sizes=""
               for s in $all_sizes; do
-                if ! echo " $skip " | grep -qw "$s"; then
-                  sizes="$sizes $s"
-                fi
+                case " $skip " in
+                  *" $s "*) ;;
+                  *) sizes="$sizes $s" ;;
+                esac
               done
               ;;
           esac
@@ -243,9 +249,10 @@ jobs:
           skip="${{ inputs.skip_gateways }}"
           gws=""
           for g in $all; do
-            if ! echo " $skip " | grep -qw "$g"; then
-              gws="$gws $g"
-            fi
+            case " $skip " in
+              *" $g "*) ;;
+              *) gws="$gws $g" ;;
+            esac
           done
           gws=$(echo "$gws" | xargs)
           echo "list=$gws" >> "$GITHUB_OUTPUT"
@@ -284,10 +291,10 @@ jobs:
           # must match run_gateway_protocol_bench.sh. Bump deliberately.
           gws="${{ steps.gateways.outputs.list }}"
           images=""
-          echo " $gws " | grep -qw envoy && images="$images envoyproxy/envoy:v1.39.1"
-          echo " $gws " | grep -qw kong && images="$images kong/kong-gateway:3.16.0.0"
-          echo " $gws " | grep -qw tyk && images="$images tykio/tyk-gateway:v5.15.0 redis:8.4.7-alpine"
-          echo " $gws " | grep -qw krakend && images="$images krakend:2.13.11"
+          case " $gws " in *" envoy "*) images="$images envoyproxy/envoy:v1.39.1" ;; esac
+          case " $gws " in *" kong "*) images="$images kong/kong-gateway:3.16.0.0" ;; esac
+          case " $gws " in *" tyk "*) images="$images tykio/tyk-gateway:v5.15.0 redis:8.4.7-alpine" ;; esac
+          case " $gws " in *" krakend "*) images="$images krakend:2.13.11" ;; esac
           for img in $images; do
             echo "pulling $img..."
             docker pull "$img" &

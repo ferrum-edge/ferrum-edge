@@ -41,6 +41,7 @@ mod hbone_perf_fixture_contract_tests;
 mod istio_authz_custom_action_tests;
 mod istio_docs_capability_parity_tests;
 mod istio_duration_admission_tests;
+mod istio_refused_security_resource_tests;
 mod istio_request_auth_output_claims_tests;
 mod istio_virtual_service_id_collision_tests;
 mod jwt_secret_separation_tests;

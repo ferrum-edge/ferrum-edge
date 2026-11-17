@@ -12500,6 +12500,11 @@ WORKFLOW_DIRECTORY_JOB_GENERATION_TRANSITIONS: tuple[
 ] = (
     # Empty: no workflow-directory job generation transition is admitted.
     #
+    # Issue #7405's `gateways-protocol-benchmark.yml` `benchmark` pair (#7411:
+    # whole-token `case` matching of the dispatch skip inputs instead of
+    # `grep -qw`) is retired: its pin-normalized destination 2e12a83b... is
+    # main's live job, so the admission is permanently unreachable.
+    #
     # PR #7400's `gateways-protocol-benchmark.yml` `benchmark` pair (dropping
     # the BuildKit `type=gha,mode=max` layer cache that filled the Actions
     # cache) is retired: its pin-normalized destination 70b612bb... is main's

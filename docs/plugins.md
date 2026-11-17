@@ -1348,7 +1348,8 @@ latency fields remain `-1.0`; a configured target in such a record is not proof
 that Ferrum contacted it. `metadata.rejection_phase` identifies the plugin
 phase or gateway admission gate that rejected the request. Possible values
 include `authenticate`, `authorize`, `before_proxy`, `allowed_methods`,
-`route_protocol_admission`, `query_trigger_admission`, `route_not_found`,
+`route_protocol_admission`, `query_trigger_admission`, `grpc_post_required`,
+`route_not_found`,
 `grpc_backend_error`, and `websocket_backend_error`. Gateway-internal failures
 have their own phases: `invalid_backend_path` (a `500` when the matched route and
 target cannot form a backend path), `websocket_upgrade_unavailable` (a `500`
@@ -1377,7 +1378,7 @@ Terminal transaction logging is independent of ordinary request hooks:
 | Matched proxy, method absent from `allowed_methods` | 405 (+ authoritative `Allow`) | Emitted once with `rejection_phase: "allowed_methods"`, matched proxy/namespace, method/path, and client identity available at that phase | Not run |
 | Matched proxy whose native-gRPC or WebSocket plugin view omits an HTTP-only authentication or admission plugin, a plain HTTP or WebSocket request (other than a bodiless CORS preflight that the route's `cors` plugin answers) to a gRPC-intended route whose own chain carries a gRPC-only admission plugin such as `grpc_method_router`, or a gRPC-Web request whose composed view cannot run a gRPC-only admission plugin (see [Protocol Support](plugin_execution_order.md#protocol-support)) | 403 (native gRPC: trailers-only `PERMISSION_DENIED`) | Emitted once with `rejection_phase: "route_protocol_admission"` | Not run |
 | Matched proxy whose plugin chain carries an execution trigger that reads `query`, and whose raw query contains an unencoded `;` (`%3B` is accepted) | 400 (native gRPC: trailers-only `INVALID_ARGUMENT`) | Emitted once with `rejection_phase: "query_trigger_admission"` | Not run |
-| Matched native gRPC with non-`POST` method | protocol reject (typically 400 / gRPC `INVALID_ARGUMENT`) | Not emitted by the method-admission gate today | Not run |
+| Matched native gRPC or gRPC-Web request with a non-`POST` method | 200 trailers-only gRPC `INVALID_ARGUMENT` (gRPC-Web: the same status in its body trailer frame) | Emitted once with `rejection_phase: "grpc_post_required"` and `response_status_code` `200` | Not run |
 
 H1, H2, and H3 share this contract. The matched-proxy 405 path selects protocol-appropriate terminal logging/mirror hooks from one immutable plugin-cache generation and does not double-count with a later success path.
 
@@ -2006,9 +2007,16 @@ copy of those call and byte counters, and the optional `api_chargeback_sink`
 plugin keeps its own independent accumulator rather than draining this one.
 `stale_entry_ttl_seconds` therefore marks a row *eligible* for eviction; it does
 not by itself delete one. A row is removed only once **two delivered `/charges`
-exports have already collected its current counters**. Each of those exports
-started its registry walk after the row's last update, and the admin
-connection then took the complete document for writing to the collector.
+exports to a designated collector have already collected its current
+counters**. Each of those exports started its registry walk after the row's
+last update, and the admin connection then took the complete document for
+writing to the collector. A designated collector is a request whose admin JWT
+`scope` claim grants `charges:collect`; the `role` never implies it, and
+tokens verified by `FERRUM_ADMIN_JWT_VIEWER_SECRET` never grant a scope.
+Every other authenticated `GET /charges` returns the same document but
+acknowledges nothing, so a dashboard, a second scraper, or an operator
+`curl` during a collector outage cannot make uncollected rows evictable
+(GHSA-jjvr-vvwv-8qmh).
 Rendering alone acknowledges nothing: a failed render (a non-finite monetary
 value) leaves every row uncollected, and so does a scrape cancelled or reset
 before the gateway hands over the response body (for example a collector that
@@ -2137,7 +2145,7 @@ Successful H1, H2, and H3 WebSocket handshakes all use the `101` call-pricing ti
 | `stream_connection_pricing` | Object | _(optional)_ | Per-connection pricing for stream proxies (TCP/TCP+TLS/UDP/DTLS) |
 | `stream_connection_pricing.price_per_connection` | Number | _(required when block is set)_ | Per-session charge applied at stream disconnect. Finite, non-negative, ≤ `1e288` |
 | `render_cache_ttl_seconds` | Integer (u64) | `5` | How long the cached `/charges` response is served before rebuilding. Process-global: every enabled instance must use the same value |
-| `stale_entry_ttl_seconds` | Integer (u64) | `3600` | How long a chargeback entry may sit idle before it becomes *eligible* for eviction. Eligibility is not deletion: an unpinned idle entry also requires two `/charges` body hand-offs containing its current counters (a heuristic, not proof of receipt; see above). Current aggregate rows stay pinned while their cache generation exists. Process-global: every enabled instance must use the same value |
+| `stale_entry_ttl_seconds` | Integer (u64) | `3600` | How long a chargeback entry may sit idle before it becomes *eligible* for eviction. Eligibility is not deletion: an unpinned idle entry also requires two `/charges` body hand-offs to a `charges:collect`-scoped collector containing its current counters (a heuristic, not proof of receipt; see above). Current aggregate rows stay pinned while their cache generation exists. Process-global: every enabled instance must use the same value |
 | `cache_invalidation_min_age_ms` | Integer (u64) | `500` | Minimum age (ms) of a render cache before `record()` will invalidate it. Evaluated **per format** against that document's own timestamp, so a JSON-only collector gets the same protection as a Prometheus one and neither format's cache lifetime depends on whether the other is being scraped. An already-empty cache is left alone rather than restamped. Process-global: every enabled instance must use the same value |
 | `cleanup_interval_seconds` | Integer (u64) | `300` | How often (seconds) a background task evicts entries that are idle longer than `stale_entry_ttl_seconds` **and** already collected. Set to `0` to disable the periodic cleanup task. At most `31536000` (one year); larger values are rejected because the task's sleep deadline would overflow. Process-global: every enabled instance must use the same value. Reloading updates, disables, or re-enables the singleton task without retaining the prior interval |
 | `max_entries` | Integer (u64) | `100000` | Hard ceiling on retained billing rows (complete registry entry keys) in the shared registry. One principal can occupy many slots because keys also include proxy, status, protocol family, currency, namespace, and prices. A new row beyond the ceiling is folded into the internal `__cardinality_overflow__~sha256:ferrum-edge/api-chargeback/overflow/v1` aggregate row when its prepared fallback exists (per-identity attribution lost; recorded totals preserved). Charges outside the prepared matrix can be dropped if a new aggregate cannot reserve bytes; inspect `dropped_charges_total`. Must be `> 0` — there is no unlimited mode. Process-global: every enabled instance must use the same value |
@@ -2148,7 +2156,11 @@ Successful H1, H2, and H3 WebSocket handshakes all use the `101` call-pricing ti
 **Admin endpoint:** `GET /charges` requires a valid admin JWT in
 `Authorization: Bearer <token>`. Chargeback output can contain customer and
 billing data; `/metrics` is likewise protected by the observability-detail
-authentication policy.
+authentication policy. Give the billing collector a token with
+`"scope": "charges:collect"` (a `viewer` role is enough); without that scope
+its scrapes never confirm collection, and idle rows are retained (and counted
+in `uncollected_retained_entries`) until the registry budgets fold new rows
+into the overflow row.
 
 | Query Parameter | Description |
 |---|---|
@@ -2209,7 +2221,9 @@ scrape_configs:
 ```
 
 Prometheus scrapes of `/charges` must send admin JWT credentials, for example with `bearer_token_file`, `authorization.credentials_file`,
-or an auth proxy that injects the `Authorization: Bearer <token>` header.
+or an auth proxy that injects the `Authorization: Bearer <token>` header. The billing collector's token must carry
+`"scope": "charges:collect"`; other scrapers (dashboards, Grafana) should use tokens without it so their reads never
+count as collection.
 
 ### `api_chargeback_sink`
 
