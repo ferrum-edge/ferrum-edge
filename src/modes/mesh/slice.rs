@@ -2479,7 +2479,7 @@ fn destination_rule_host_exclusions(
             entry
                 .hosts
                 .iter()
-                .map(|host| canonical_destination_rule_host(host)),
+                .map(|host| canonical_destination_rule_host(host.as_str())),
         );
     }
     for upstream in &slice.http_routes.upstreams {
