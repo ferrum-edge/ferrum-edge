@@ -23,10 +23,28 @@ EXPRESSION = re.compile(r"\$\{\{\s*([^}]+?)\s*\}\}")
 
 
 def step_script(name):
-    """Return the dedented `run: |` body of the benchmark step called `name`."""
+    """Return the dedented `run: |` body of the benchmark step called `name`.
+
+    A renamed, re-indented or reshaped step fails here with the step's name,
+    not with an opaque `ValueError` / `StopIteration`, so drift in the workflow
+    is reported as drift.
+    """
     lines = WORKFLOW.read_text().splitlines()
-    start = lines.index(f"      - name: {name}")
-    run = next(i for i in range(start + 1, len(lines)) if lines[i] == "        run: |")
+    header = f"      - name: {name}"
+    if header not in lines:
+        raise AssertionError(
+            f"{WORKFLOW.name}: no step {name!r} at the benchmark job's step indentation"
+        )
+    start = lines.index(header)
+    run = None
+    for index in range(start + 1, len(lines)):
+        if lines[index].startswith("      - "):
+            break
+        if lines[index] == "        run: |":
+            run = index
+            break
+    if run is None:
+        raise AssertionError(f"{WORKFLOW.name}: step {name!r} has no `run: |` block script")
     body = []
     for line in lines[run + 1:]:
         if line.strip() and not line.startswith(" " * 10):
@@ -57,6 +75,12 @@ def run_step(name, expressions, path_prefix=None):
             raise AssertionError(f"step {name!r} failed: {result.stderr}")
         outputs = dict(line.split("=", 1) for line in output.read_text().splitlines() if line)
         return outputs, result.stdout
+
+
+class StepLookupTests(unittest.TestCase):
+    def test_a_missing_step_is_reported_by_name(self):
+        with self.assertRaisesRegex(AssertionError, "no step 'No such step'"):
+            step_script("No such step")
 
 
 class SkipProtocolTests(unittest.TestCase):
