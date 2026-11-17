@@ -1780,6 +1780,7 @@ impl McpGateway {
         let real_ip_header = http_client.real_ip_header().map(str::to_ascii_lowercase);
         validate_bridge_servers(
             mode,
+            &endpoint_path,
             &servers,
             &sessions,
             &validation,
@@ -1942,7 +1943,7 @@ impl McpGateway {
         // Case variants and encoded suffixes are reserved only for rejection,
         // never for endpoint matching. The HTTP frontend already refuses
         // encoded separators; keep direct plugin dispatch fail-closed too.
-        ctx.path.eq_ignore_ascii_case(scope) || endpoint_scope_contains(scope, &ctx.path)
+        endpoint_scope_reserves(scope, &ctx.path)
     }
 
     /// Claim this request for this instance. Called once, from the same
@@ -2295,6 +2296,25 @@ impl McpGateway {
                     return json_rpc_error(envelope.id.clone(), -32602, error.message(), None);
                 }
             };
+        // Admission already refuses an operation template that can spell a
+        // path inside the endpoint scope; re-check the substituted path so a
+        // bridged call can never reach a backend path that a direct client of
+        // this route is refused (defense in depth, #7406).
+        if endpoint_scope_reserves(
+            self.endpoint_path.trim_end_matches('/'),
+            &request.public_path,
+        ) {
+            if self.observability.emit_metadata {
+                ctx.metadata
+                    .insert("mcp.route_decision".to_string(), "deny".to_string());
+            }
+            return json_rpc_error(
+                envelope.id.clone(),
+                -32602,
+                "OpenAPI bridge path arguments resolve inside the MCP endpoint scope",
+                None,
+            );
+        }
         let Some(backend_path) = bridge_backend_path(ctx, &request.public_path) else {
             if self.observability.emit_metadata {
                 ctx.metadata
@@ -11834,32 +11854,54 @@ fn bridge_method_is_allowed(allowed_methods: Option<&[String]>, method: &str) ->
 /// the proxy dispatches for a direct request to that same public path.
 ///
 /// The router matched this MCP request's own path, so its strip offset names
-/// the proxy's literal listen prefix. With `strip_listen_path` an operation
-/// path under that prefix loses it exactly as a direct request would, and the
-/// proxy then joins the remainder onto its `backend_path` as usual (a
-/// non-absolute route override). `None` when the operation path is not under
-/// the prefix: a direct request to it could never reach this proxy, so the
-/// bridge refuses rather than inventing a route.
+/// the proxy's listen prefix whether or not the proxy strips it. An operation
+/// path must sit under that prefix on a segment boundary: otherwise a direct
+/// request to it could never reach this proxy, so the bridge refuses (`None`)
+/// rather than inventing a route. That containment is decided BEFORE
+/// `strip_listen_path` is consulted (GHSA-26x8-8jq5-f73p): a non-stripping
+/// proxy forwards the full public path, so skipping the check there let an
+/// operation reach any backend path outside the route. With
+/// `strip_listen_path` the operation path then loses the prefix exactly as a
+/// direct request would, and the proxy joins the remainder onto its
+/// `backend_path` as usual (a non-absolute route override). A host-only route
+/// (offset 0) has no path boundary to enforce.
+///
+/// The offset is a listen PREFIX only on a literal-prefix route. An exact
+/// (`=`) route serves only its own path, which is this MCP endpoint, and a
+/// regex (`~`) route is anchored to the whole request path, so its offset is
+/// the endpoint's full length too; neither route can serve another public
+/// path that this gateway may bridge, and deciding regex reachability would
+/// need the router's compiled matcher. Both refuse every bridged call.
 fn bridge_backend_path(ctx: &RequestContext, public_path: &str) -> Option<String> {
+    if ctx
+        .matched_proxy
+        .as_deref()
+        .and_then(|proxy| proxy.listen_path.as_deref())
+        .is_some_and(|listen_path| listen_path.starts_with(['=', '~']))
+    {
+        return None;
+    }
     let strip_len = ctx.matched_path_strip_len();
-    let strips = strip_len > 0
-        && ctx
-            .matched_proxy
-            .as_deref()
-            .is_some_and(|proxy| proxy.strip_listen_path);
-    if !strips {
+    if strip_len == 0 {
         return Some(public_path.to_string());
     }
     let prefix = ctx.path.get(..strip_len)?;
     let rest = public_path.strip_prefix(prefix)?;
-    if rest.is_empty() {
+    if !(rest.is_empty() || rest.starts_with('/') || prefix.ends_with('/')) {
+        return None;
+    }
+    let strips = ctx
+        .matched_proxy
+        .as_deref()
+        .is_some_and(|proxy| proxy.strip_listen_path);
+    if !strips {
+        Some(public_path.to_string())
+    } else if rest.is_empty() {
         Some("/".to_string())
     } else if rest.starts_with('/') {
         Some(rest.to_string())
-    } else if prefix.ends_with('/') {
-        Some(format!("/{rest}"))
     } else {
-        None
+        Some(format!("/{rest}"))
     }
 }
 
@@ -11898,11 +11940,13 @@ fn reject_bridge_server_fields(object: &Map<String, Value>, server_id: &str) -> 
 /// cannot decide on its own.
 fn validate_bridge_servers(
     mode: McpGatewayMode,
+    endpoint_path: &str,
     servers: &HashMap<String, McpServerConfig>,
     sessions: &McpSessionConfig,
     validation: &McpValidationConfig,
     real_ip_header: Option<&str>,
 ) -> Result<(), String> {
+    let endpoint_scope = endpoint_path.trim_end_matches('/');
     for server in servers.values() {
         let Some(bridge) = server.bridge() else {
             continue;
@@ -11911,6 +11955,18 @@ fn validate_bridge_servers(
         if mode != McpGatewayMode::AggregateRouter {
             return Err(format!(
                 "mcp_gateway: server {server_id:?} `openapi` requires mode `aggregate_router` because `transparent_proxy` forwards MCP JSON-RPC to one MCP upstream"
+            ));
+        }
+        // The endpoint claims its whole subtree (case variants and encoded
+        // suffixes included) and answers 404 there, so an operation that can
+        // land inside it, through a literal or a path parameter value, is
+        // unreachable to direct clients of the same route (#7406).
+        if bridge
+            .operation_path_templates()
+            .any(|path| path_template_may_enter_endpoint_scope(endpoint_scope, path))
+        {
+            return Err(format!(
+                "mcp_gateway: server {server_id:?} `openapi.operations` declares a `path` that can fall inside the `endpoint.path` scope (a literal match or a path parameter that can spell it); the MCP endpoint reserves its whole path subtree ASCII case-insensitively, so move `endpoint.path` to a path no operation can produce"
             ));
         }
         if bridge.tool_count() > validation.max_catalog_items_per_list {
@@ -12005,6 +12061,162 @@ fn authority_for_host_port(
     match explicit_port {
         Some(port) if port != default_port => format!("{rendered_host}:{port}"),
         _ => rendered_host,
+    }
+}
+
+/// Whether a request path falls inside the subtree an MCP endpoint scope
+/// (`endpoint.path` with trailing slashes trimmed) reserves at runtime: the
+/// scope itself and every descendant or `%`-encoded suffix, all compared
+/// ASCII case-insensitively. This is exactly the predicate the gateway uses to
+/// claim (and 404) requests, so admission checks that must agree with the
+/// runtime claim (`openapi.operations[].path`, the `/api-specs`
+/// `x-ferrum-mcp` generator) share it rather than re-deriving it (#7406).
+pub(crate) fn endpoint_scope_reserves(scope: &str, path: &str) -> bool {
+    path.eq_ignore_ascii_case(scope) || endpoint_scope_contains(scope, path)
+}
+
+/// Whether ANY request path an operation path template can produce is
+/// claimed by an MCP endpoint scope at runtime ([`endpoint_scope_reserves`]
+/// over the canonical request path).
+///
+/// The runtime claim is evaluated on `ctx.path`, the canonical policy path,
+/// so each literal run of the template has its escapes decoded the same way
+/// first (`/%6d%63p` is `/mcp`), independently of its neighbours: a run that
+/// cannot be decoded (an encoded separator, say) is compared as written and
+/// does not stop the others from being decoded. Segments then compare ASCII
+/// case-insensitively:
+///
+/// - a whole-segment `{name}` stands for any non-empty value (a value can
+///   never be empty, add a separator, or add an escape), and every repeat of
+///   the same name must take the same value, so `/{id}/{id}` cannot spell
+///   `/one/two`;
+/// - an expression inside a segment (`v{n}`, `mcp{suffix}`) is treated as
+///   able to match any text, INCLUDING none, because a direct client of an
+///   unbridged operation can send such a segment with an empty value. This
+///   is deliberately conservative: `/mcp{suffix}` overlaps `/mcp`.
+///
+/// When a run had to be compared as written, the claim's `%`-suffix rule is
+/// also applied to the raw template. Admission-time only (allocates).
+pub(crate) fn path_template_may_enter_endpoint_scope(scope: &str, template: &str) -> bool {
+    let mut any_raw = false;
+    let segments: Vec<TemplateSegmentPattern> = template
+        .split('/')
+        .map(|segment| template_segment_pattern(segment, &mut any_raw))
+        .collect();
+    let scope_segments: Vec<&str> = scope.split('/').collect();
+    let mut bindings: Vec<(&str, String)> = Vec::new();
+    let segment_overlap = segments.len() >= scope_segments.len()
+        && scope_segments
+            .iter()
+            .zip(&segments)
+            .all(|(scope_segment, pattern)| pattern.matches(scope_segment, &mut bindings));
+    segment_overlap || (any_raw && endpoint_scope_reserves(scope, template))
+}
+
+/// One path segment of an operation template.
+struct TemplateSegmentPattern<'a> {
+    /// `Some(name)` when the whole segment is one `{name}` expression.
+    whole_parameter: Option<&'a str>,
+    /// Otherwise: decoded, lower-cased literal runs, separated by template
+    /// expressions that match any text.
+    literals: Vec<String>,
+}
+
+impl<'a> TemplateSegmentPattern<'a> {
+    fn matches(&self, segment: &str, bindings: &mut Vec<(&'a str, String)>) -> bool {
+        let segment = segment.to_ascii_lowercase();
+        if let Some(name) = self.whole_parameter {
+            if segment.is_empty() {
+                return false;
+            }
+            if let Some((_, bound)) = bindings.iter().find(|(bound_name, _)| *bound_name == name) {
+                return *bound == segment;
+            }
+            bindings.push((name, segment));
+            return true;
+        }
+        // Glob match: the first and last literal runs anchor the ends (empty
+        // when the segment starts or ends with an expression), and the inner
+        // runs must appear in order between them.
+        let Some((first, rest)) = self.literals.split_first() else {
+            return segment.is_empty();
+        };
+        let Some(mut remaining) = segment.strip_prefix(first.as_str()) else {
+            return false;
+        };
+        let Some((last, inner)) = rest.split_last() else {
+            // No expression in this segment: an exact literal.
+            return remaining.is_empty();
+        };
+        for literal in inner {
+            let Some(index) = remaining.find(literal.as_str()) else {
+                return false;
+            };
+            remaining = &remaining[index + literal.len()..];
+        }
+        remaining.len() >= last.len() && remaining.ends_with(last.as_str())
+    }
+}
+
+/// Split one template segment on its `{...}` expressions and decode each
+/// literal run; sets `any_raw` when a run had to be kept as written.
+fn template_segment_pattern<'a>(
+    segment: &'a str,
+    any_raw: &mut bool,
+) -> TemplateSegmentPattern<'a> {
+    if let Some(name) = segment
+        .strip_prefix('{')
+        .and_then(|rest| rest.strip_suffix('}'))
+        .filter(|name| !name.contains(['{', '}']))
+    {
+        return TemplateSegmentPattern {
+            whole_parameter: Some(name),
+            literals: Vec::new(),
+        };
+    }
+    let mut literals = Vec::new();
+    let mut rest = segment;
+    loop {
+        match rest.find('{') {
+            Some(open) => {
+                literals.push(decoded_literal_run(&rest[..open], any_raw));
+                rest = match rest[open..].find('}') {
+                    Some(close) => &rest[open + close + 1..],
+                    None => "",
+                };
+            }
+            None => {
+                literals.push(decoded_literal_run(rest, any_raw));
+                return TemplateSegmentPattern {
+                    whole_parameter: None,
+                    literals,
+                };
+            }
+        }
+    }
+}
+
+/// Decode one literal run's escapes exactly as request-path canonicalization
+/// would, lower-cased. The run is decoded behind a fixed `/x` prefix so that a
+/// fragment such as `.` (from `{name}.{ext}`) is not judged as a whole dot
+/// segment; a run that does not decode is kept as written.
+fn decoded_literal_run(run: &str, any_raw: &mut bool) -> String {
+    if run.is_empty() {
+        return String::new();
+    }
+    let rooted = format!("/x{run}");
+    match crate::policy_path::canonicalize_policy_path(&rooted) {
+        Ok(canonical) => match canonical.strip_prefix("/x") {
+            Some(decoded) => decoded.to_ascii_lowercase(),
+            None => {
+                *any_raw = true;
+                run.to_ascii_lowercase()
+            }
+        },
+        Err(_) => {
+            *any_raw = true;
+            run.to_ascii_lowercase()
+        }
     }
 }
 
