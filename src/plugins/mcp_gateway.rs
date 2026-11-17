@@ -11865,7 +11865,22 @@ fn bridge_method_is_allowed(allowed_methods: Option<&[String]>, method: &str) ->
 /// direct request would, and the proxy joins the remainder onto its
 /// `backend_path` as usual (a non-absolute route override). A host-only route
 /// (offset 0) has no path boundary to enforce.
+///
+/// The offset is a listen PREFIX only on a literal-prefix route. An exact
+/// (`=`) route serves only its own path, which is this MCP endpoint, and a
+/// regex (`~`) route is anchored to the whole request path, so its offset is
+/// the endpoint's full length too; neither route can serve another public
+/// path that this gateway may bridge, and deciding regex reachability would
+/// need the router's compiled matcher. Both refuse every bridged call.
 fn bridge_backend_path(ctx: &RequestContext, public_path: &str) -> Option<String> {
+    if ctx
+        .matched_proxy
+        .as_deref()
+        .and_then(|proxy| proxy.listen_path.as_deref())
+        .is_some_and(|listen_path| listen_path.starts_with(['=', '~']))
+    {
+        return None;
+    }
     let strip_len = ctx.matched_path_strip_len();
     if strip_len == 0 {
         return Some(public_path.to_string());

@@ -41619,8 +41619,12 @@ components:
             sit under the matched proxy's listen path on a segment boundary
             whether or not strip_listen_path is set; a call whose path does
             not is refused with JSON-RPC -32603 and nothing is dispatched.
-            It must not fall inside endpoint.path's reserved subtree (ASCII
-            case-insensitive, like the runtime claim); load rejects it. Path
+            On an exact (`=`) or regex (`~`) route every bridged call is
+            refused the same way. It must not be able to fall inside
+            endpoint.path's reserved subtree (ASCII case-insensitive, like the
+            runtime claim; a `{name}` segment matches any endpoint segment);
+            load rejects it, and a substituted path inside the scope is
+            refused with JSON-RPC -32602 before dispatch. Path
             arguments are percent-encoded per segment and the result must be a
             canonical policy path, so an argument can never add `/`, a dot
             segment, `?`, or `#`.

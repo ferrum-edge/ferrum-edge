@@ -16921,12 +16921,31 @@ async fn bridge_get_on_petstore_route(
     strip_listen_path: bool,
     request_id: i64,
 ) -> (PluginResult, ferrum_edge::plugins::RequestContext) {
+    bridge_get_on_route(
+        "/petstore",
+        "/petstore".len(),
+        operation_path,
+        strip_listen_path,
+        request_id,
+    )
+    .await
+}
+
+/// Call `pets.getPet` through a gateway at `/petstore/mcp` on a proxy with
+/// `listen_path`, whose router match left `strip_len` as the matched offset.
+async fn bridge_get_on_route(
+    listen_path: &str,
+    strip_len: usize,
+    operation_path: &str,
+    strip_listen_path: bool,
+    request_id: i64,
+) -> (PluginResult, ferrum_edge::plugins::RequestContext) {
     let plugin = bridge_plugin_with(|config| {
         config["endpoint"]["path"] = json!("/petstore/mcp");
         bridge_operation(config, 0)["path"] = json!(operation_path);
     });
     let mut proxy = super::plugin_utils::create_test_proxy();
-    proxy.listen_path = Some("/petstore".to_string());
+    proxy.listen_path = Some(listen_path.to_string());
     proxy.strip_listen_path = strip_listen_path;
     let proxy = Arc::new(proxy);
     let session = {
@@ -16940,10 +16959,36 @@ async fn bridge_get_on_petstore_route(
     let (mut ctx, mut headers) = mcp_ctx(request);
     ctx.path = "/petstore/mcp".to_string();
     ctx.matched_proxy = Some(Arc::clone(&proxy));
-    ctx.set_matched_path_strip_len("/petstore".len());
+    ctx.set_matched_path_strip_len(strip_len);
     headers.insert("mcp-session-id".to_string(), session);
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     (result, ctx)
+}
+
+#[tokio::test]
+async fn openapi_bridge_refuses_every_call_on_exact_and_regex_routes() {
+    // The router's matched offset is a listen PREFIX only on a literal-prefix
+    // route. An exact route serves only the endpoint itself, and a regex
+    // route is anchored to the whole request path, so neither can reach
+    // another public path: every bridged call is refused, whatever
+    // `strip_listen_path` says, rather than forwarded unchecked.
+    for listen_path in ["=/petstore/mcp", "~/petstore/.*"] {
+        for strip in [false, true] {
+            let (result, ctx) = bridge_get_on_route(
+                listen_path,
+                "/petstore/mcp".len(),
+                "/petstore/pets/{petId}",
+                strip,
+                99,
+            )
+            .await;
+            let (status, body, _) = reject_json(result);
+            assert_eq!(status, 200, "{listen_path} strip={strip}");
+            assert_eq!(body["error"]["code"], json!(-32603), "{body}");
+            assert!(ctx.route_override_path.is_none(), "{listen_path}");
+            assert!(!mcp_bridge_is_claimed_for_test(&ctx));
+        }
+    }
 }
 
 #[tokio::test]
