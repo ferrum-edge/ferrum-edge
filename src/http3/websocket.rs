@@ -1564,14 +1564,19 @@ pub(crate) async fn handle_h3_websocket(
                 }
 
                 if let Some(refusal) = ws_backend_refusal {
-                    // Boxed: this future is polled inside `handle_h3_request`'s
-                    // stack budget, so the relay writer must not add an inline
-                    // slot beside the existing failure writer.
-                    Box::pin(send_h3_backend_refusal(
-                        &mut stream,
-                        refusal,
-                        &initial_response_header_policy_plugins,
-                    ))
+                    // Boxed trampoline: this future is polled inside
+                    // `handle_h3_request`'s stack budget, so the writer's
+                    // future must be built inside the heap-allocated block
+                    // rather than as a stack temporary of this frame
+                    // (`Box::pin(writer(..))` would still materialize it here).
+                    Box::pin(async {
+                        send_h3_backend_refusal(
+                            &mut stream,
+                            refusal,
+                            &initial_response_header_policy_plugins,
+                        )
+                        .await;
+                    })
                     .await;
                     drop(ws_connection_permit);
                     return Ok(());
