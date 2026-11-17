@@ -831,7 +831,21 @@ therefore covers this node's environment and served configuration and, on a
 node with a configuration store (database and CP modes), every namespace in
 that store; `used_by[].namespace` names the namespace of a reference found
 there. Disabled plugin configs do not hold a reference. If the store cannot
-be read, the delete is refused with `503` rather than guessed. Nodes without
+be read, the delete is refused with `503` rather than guessed.
+
+The scan and the delete are fenced against concurrent configuration writes:
+the delete takes the namespace-registry admission lease and every listed
+namespace's config admission lease (the same leases every admin writer takes
+before it validates a reference and holds until it commits), reads only
+proxies, upstreams and plugin configs under them, re-reads the namespace list,
+and deletes the record before releasing them. A write that would add a
+reference in a fenced namespace waits and then fails admission because the
+record is gone. A namespace that appears during the scan restarts it (up to
+three times, then `503`). One window remains: a first write into a namespace
+that still has no rows when the list is re-read can commit before the record
+is deleted, because no lease covers a name that does not exist yet. While
+the fence is held, every configuration write in the store waits, so a managed
+TLS delete briefly pauses admin writes fleet-wide. Nodes without
 a store (file and data-plane modes) check only their own configuration, and
 no node can see another process's environment, so a record named only by
 another gateway's `FERRUM_*` TLS settings is not protected by this check.

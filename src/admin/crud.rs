@@ -1083,6 +1083,14 @@ impl NamespaceRegistryAdmission {
             .collect()
     }
 
+    /// Whether every lease this admission holds (the registry key and each
+    /// namespace) is still valid by this process's local liveness view.
+    pub(crate) fn ensure_all_held(&self) -> Result<(), anyhow::Error> {
+        self.guards
+            .iter()
+            .try_for_each(NamespaceConfigAdmissionGuard::ensure_held)
+    }
+
     /// Observe the global registry lease across a persistence future that is
     /// not cancellation-safe. The per-name leases are verified at the commit
     /// boundary by the backend; this is the local liveness view.

@@ -690,3 +690,207 @@ async fn delete_refuses_a_managed_jwks_record_referenced_from_another_namespace(
         "an unreferenced record deletes: {body}"
     );
 }
+
+type ScanHook = Arc<
+    dyn Fn(&str) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> + Send + Sync,
+>;
+
+/// Clears the process-global scan hook even when the test panics.
+struct ScanHookGuard;
+
+impl Drop for ScanHookGuard {
+    fn drop(&mut self) {
+        ferrum_edge::admin::set_tls_reference_scan_hook_for_tests(None);
+    }
+}
+
+/// Pause the first delete of `record_id` between its reference scan and its
+/// namespace re-check; every other id passes straight through.
+fn pause_first_scan_of(
+    record_id: &str,
+) -> (
+    ScanHookGuard,
+    Arc<tokio::sync::Notify>,
+    Arc<tokio::sync::Notify>,
+) {
+    let scanned = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let paused = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let target = record_id.to_string();
+    let (hook_scanned, hook_release) = (scanned.clone(), release.clone());
+    let hook: ScanHook = Arc::new(
+        move |id: &str| -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
+            let pause = id == target && !paused.swap(true, std::sync::atomic::Ordering::SeqCst);
+            let (scanned, release) = (hook_scanned.clone(), hook_release.clone());
+            Box::pin(async move {
+                if pause {
+                    scanned.notify_one();
+                    release.notified().await;
+                }
+            })
+        },
+    );
+    ferrum_edge::admin::set_tls_reference_scan_hook_for_tests(Some(hook));
+    (ScanHookGuard, scanned, release)
+}
+
+async fn database_admin_with_record(
+    dir: &tempfile::TempDir,
+) -> (Arc<AdminHarness>, String, String) {
+    let mut state = admin_state(Arc::new(ArcSwap::from_pointee(GatewayConfig::default())));
+    state.db = Some(Arc::new(sqlite_store(dir).await));
+    state.mode = "database".to_string();
+    let admin = Arc::new(AdminHarness::start(state).await);
+    let record_id = format!("idp-{}", uuid::Uuid::new_v4().simple());
+    let source = format!("managed://jwks/{record_id}#jwks");
+    let key = signing_key("fenced");
+    let (status, body) = admin
+        .send(
+            reqwest::Method::POST,
+            "/admin/tls/jwks",
+            Some(json!({ "id": record_id, "name": "IdP keys", "jwks_json": jwks_json(&[&key]) })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    (admin, record_id, source)
+}
+
+/// Review sol F1 on #7412: a reference committed in an already-scanned
+/// namespace while the delete is between its scan and the store delete must
+/// not leave a stored reference to a deleted record. The delete holds every
+/// scanned namespace's admission lease until the record is gone, so the
+/// plugin write waits, then fails admission because the record no longer
+/// exists. Both requests never succeed together.
+#[tokio::test(flavor = "multi_thread")]
+async fn delete_fences_reference_writes_into_scanned_namespaces() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (admin, record_id, source) = database_admin_with_record(&dir).await;
+    let tenant = "tenant-b";
+    // tenant-b exists before the delete starts, so the scan fences it.
+    let (status, body) = admin
+        .send_ns(
+            reqwest::Method::POST,
+            "/consumers",
+            Some(json!({"id": "tenant-b-consumer", "username": "tenant-b-consumer"})),
+            tenant,
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+
+    let (_hook, scanned, release) = pause_first_scan_of(&record_id);
+    let delete_path = format!("/admin/tls/jwks/{record_id}");
+    let deleting = {
+        let admin = admin.clone();
+        let path = delete_path.clone();
+        tokio::spawn(async move { admin.send(reqwest::Method::DELETE, &path, None).await })
+    };
+    scanned.notified().await;
+
+    // The scan found no reference. A reference write into tenant-b now.
+    let mut writing = {
+        let admin = admin.clone();
+        let source = source.clone();
+        tokio::spawn(async move {
+            admin
+                .send_ns(
+                    reqwest::Method::POST,
+                    "/plugins/config",
+                    Some(jwks_auth_plugin_body("late-auth", &source, true)),
+                    tenant,
+                )
+                .await
+        })
+    };
+    // It cannot commit while the delete holds tenant-b's admission lease.
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(500), &mut writing)
+            .await
+            .is_err(),
+        "a reference write into a fenced namespace must wait for the delete"
+    );
+    release.notify_one();
+
+    let (delete_status, delete_body) = deleting.await.expect("delete task");
+    let (write_status, write_body) = writing.await.expect("write task");
+    assert_eq!(delete_status, StatusCode::OK, "{delete_body}");
+    assert_eq!(
+        write_status,
+        StatusCode::BAD_REQUEST,
+        "the late reference must fail admission: {write_body}"
+    );
+    let (status, body) = admin
+        .send_ns(
+            reqwest::Method::GET,
+            "/plugins/config/late-auth",
+            None,
+            tenant,
+        )
+        .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "no stored reference: {body}");
+}
+
+/// The same race into a namespace that had no rows when the scan started:
+/// its lease is not held, so the write may commit during the pause. The
+/// namespace re-check then sees it and rescans, so the delete answers `409`;
+/// or the write was held by a shared process lock and fails admission after
+/// the delete. Either way the two never both succeed.
+#[tokio::test(flavor = "multi_thread")]
+async fn delete_rescans_a_namespace_created_during_the_scan() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (admin, record_id, source) = database_admin_with_record(&dir).await;
+    let tenant = "tenant-new";
+
+    let (_hook, scanned, release) = pause_first_scan_of(&record_id);
+    let delete_path = format!("/admin/tls/jwks/{record_id}");
+    let deleting = {
+        let admin = admin.clone();
+        let path = delete_path.clone();
+        tokio::spawn(async move { admin.send(reqwest::Method::DELETE, &path, None).await })
+    };
+    scanned.notified().await;
+
+    let mut writing = {
+        let admin = admin.clone();
+        let source = source.clone();
+        tokio::spawn(async move {
+            admin
+                .send_ns(
+                    reqwest::Method::POST,
+                    "/plugins/config",
+                    Some(jwks_auth_plugin_body("new-tenant-auth", &source, true)),
+                    tenant,
+                )
+                .await
+        })
+    };
+    // Let the write commit if nothing holds it; a held write resolves later.
+    let early = tokio::time::timeout(std::time::Duration::from_secs(5), &mut writing).await;
+    release.notify_one();
+    let (delete_status, delete_body) = deleting.await.expect("delete task");
+    let (write_status, write_body) = match early {
+        Ok(joined) => joined.expect("write task"),
+        Err(_) => writing.await.expect("write task"),
+    };
+
+    match write_status {
+        StatusCode::CREATED => {
+            assert_eq!(
+                delete_status,
+                StatusCode::CONFLICT,
+                "a committed reference must refuse the delete: {delete_body}"
+            );
+            assert!(
+                delete_body["used_by"]
+                    .as_array()
+                    .is_some_and(|used_by| used_by
+                        .iter()
+                        .any(|usage| usage["namespace"] == tenant)),
+                "the rescan names the new namespace: {delete_body}"
+            );
+        }
+        StatusCode::BAD_REQUEST => {
+            assert_eq!(delete_status, StatusCode::OK, "{delete_body}");
+        }
+        other => panic!("unexpected write status {other}: {write_body}"),
+    }
+}

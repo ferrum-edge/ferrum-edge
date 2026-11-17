@@ -21,6 +21,9 @@ pub(crate) mod preconditions;
 pub mod provisioning;
 pub mod spec_codec;
 mod tls_management;
+#[cfg(feature = "test-support")]
+#[doc(hidden)]
+pub use tls_management::set_tls_reference_scan_hook_for_tests;
 
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
