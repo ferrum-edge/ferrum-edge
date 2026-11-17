@@ -1027,7 +1027,10 @@ pub(super) async fn handle_delete_acme_certificate(
     if let Err(response) = state.admit_non_config_db_write().await {
         return Ok(response);
     }
-    let usage = acme_certificate_usage(state, id);
+    let usage = match tls_record_usage(state, "acme", id).await {
+        Ok(usage) => usage,
+        Err(response) => return Ok(*response),
+    };
     if !usage.is_empty() {
         return Ok(super::json_response(
             StatusCode::CONFLICT,
@@ -1228,7 +1231,10 @@ pub(super) async fn handle_delete_managed(
     if let Err(response) = state.admit_non_config_db_write().await {
         return Ok(response);
     }
-    let usage = managed_record_usage(state, id);
+    let usage = match tls_record_usage(state, "managed", id).await {
+        Ok(usage) => usage,
+        Err(response) => return Ok(*response),
+    };
     if !usage.is_empty() {
         return Ok(super::json_response(
             StatusCode::CONFLICT,
@@ -2720,34 +2726,117 @@ fn source_identifier_names_record(identifier: &str, id: &str) -> bool {
     record == id
 }
 
-fn managed_record_usage(
-    state: &AdminState,
-    id: &str,
-) -> Vec<crate::tls::inventory::TlsInventoryUsage> {
-    collect_inventory(state)
-        .entries
-        .into_iter()
-        .filter(|entry| {
-            entry.source.kind == "managed"
-                && source_identifier_names_record(&entry.source.identifier, id)
-        })
-        .flat_map(|entry| entry.used_by)
-        .collect()
+/// One resource that references a managed TLS or ACME record, as reported in
+/// the `used_by` of a refused delete.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, serde::Serialize)]
+struct TlsRecordUsage {
+    #[serde(flatten)]
+    usage: crate::tls::inventory::TlsInventoryUsage,
+    /// Namespace of the referencing resource when it was found in the
+    /// configuration store. Absent for this process's environment and for
+    /// a reference seen only in the configuration it serves.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    namespace: Option<String>,
 }
 
-fn acme_certificate_usage(
+/// Every resource that references the `scheme://` record `id` (issue #7394).
+///
+/// Every gateway that shares the managed TLS / ACME store reads the record,
+/// but a node serves only its own namespace(s) (`FERRUM_NAMESPACE` in
+/// database mode, `FERRUM_CP_NAMESPACES` on a control plane) while its Admin
+/// API writes any namespace through `X-Ferrum-Namespace`. The configuration
+/// this process serves is therefore not enough to decide that a record is
+/// unused. When a configuration store is attached (database and CP modes),
+/// every namespace it holds is scanned too; a store that cannot be read
+/// refuses the delete with `503` rather than guessing. Only references are
+/// read: no TLS material is loaded on this request path.
+async fn tls_record_usage(
     state: &AdminState,
+    scheme: &str,
     id: &str,
-) -> Vec<crate::tls::inventory::TlsInventoryUsage> {
-    collect_inventory(state)
-        .entries
-        .into_iter()
-        .filter(|entry| {
-            entry.source.kind == "acme"
-                && source_identifier_names_record(&entry.source.identifier, id)
-        })
-        .flat_map(|entry| entry.used_by)
-        .collect()
+) -> Result<Vec<TlsRecordUsage>, Box<Response<Full<Bytes>>>> {
+    use crate::tls::inventory::{
+        TlsSourceReference, env_source_references, gateway_source_references,
+    };
+
+    let names_record = |reference: &TlsSourceReference| {
+        reference.source_kind == scheme && source_identifier_names_record(&reference.identifier, id)
+    };
+    let mut usages = std::collections::BTreeSet::new();
+    if let Some(db) = state.db.as_ref() {
+        let namespaces = match db.list_namespaces_authoritative().await {
+            Ok(namespaces) => namespaces,
+            Err(_error) => {
+                super::warn_persistence_failure_redacted("tls_record_usage_namespaces");
+                return Err(Box::new(tls_record_usage_unavailable_response()));
+            }
+        };
+        for namespace in namespaces {
+            let config = match db.load_namespace_snapshot(&namespace).await {
+                Ok(config) => config,
+                Err(_error) => {
+                    super::warn_persistence_failure_redacted("tls_record_usage_namespace_load");
+                    return Err(Box::new(tls_record_usage_unavailable_response()));
+                }
+            };
+            for reference in gateway_source_references(&config) {
+                if names_record(&reference) {
+                    usages.insert(TlsRecordUsage {
+                        usage: reference.usage,
+                        namespace: Some(namespace.clone()),
+                    });
+                }
+            }
+        }
+    }
+
+    // This process's environment, and the configuration it serves: the only
+    // view in file and DP modes, and in database mode a reference the
+    // running gateway still holds after it was removed from the store.
+    let mut local = Vec::new();
+    if let Some(env_config) = state
+        .proxy_state
+        .as_ref()
+        .map(|proxy| proxy.env_config.as_ref())
+    {
+        local.extend(env_source_references(env_config));
+    }
+    let served = state
+        .proxy_state
+        .as_ref()
+        .map(|proxy| proxy.config.load_full())
+        .or_else(|| {
+            state
+                .cached_config
+                .as_ref()
+                .map(|cached| cached.load_full())
+        });
+    if let Some(served) = served {
+        local.extend(gateway_source_references(&served));
+    }
+    for reference in local {
+        if names_record(&reference)
+            && !usages
+                .iter()
+                .any(|known: &TlsRecordUsage| known.usage == reference.usage)
+        {
+            usages.insert(TlsRecordUsage {
+                usage: reference.usage,
+                namespace: None,
+            });
+        }
+    }
+    Ok(usages.into_iter().collect())
+}
+
+fn tls_record_usage_unavailable_response() -> Response<Full<Bytes>> {
+    super::json_response(
+        StatusCode::SERVICE_UNAVAILABLE,
+        &json!({
+            "error": "cannot verify that no namespace still references the record; \
+                      the configuration store is unavailable"
+        }),
+    )
 }
 
 #[cfg(test)]

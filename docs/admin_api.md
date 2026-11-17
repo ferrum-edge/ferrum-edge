@@ -676,7 +676,7 @@ curl -X POST -H "Authorization: Bearer $TOKEN" \
   http://localhost:9000/admin/tls/acme/certificates
 ```
 
-Responses return non-secret certificate metadata, source URI, issuer, SANs, validity, fingerprint, ACME directory/account/order metadata, and timestamps. Private keys are persisted but never returned. Create, update, and delete operations ask active TLS source watchers to re-pull immediately; `DELETE` returns `409 Conflict` when the current runtime/config inventory still references the record. SAN strings use the same canonical representation as [TLS Inventory](#tls-inventory).
+Responses return non-secret certificate metadata, source URI, issuer, SANs, validity, fingerprint, ACME directory/account/order metadata, and timestamps. Private keys are persisted but never returned. Create, update, and delete operations ask active TLS source watchers to re-pull immediately; `DELETE` returns `409 Conflict` when any configuration still references the record (see [Managed record deletion](#managed-record-deletion)). SAN strings use the same canonical representation as [TLS Inventory](#tls-inventory).
 
 Import, update, and order finalization return `413 Payload Too Large` when the certificate, private key, or combined certificate chain exceeds `FERRUM_TLS_MAX_MATERIAL_SIZE_BYTES`; the error never echoes material or source identifiers.
 
@@ -816,7 +816,25 @@ config:
 - **Trust.** A present record with usable keys is `fresh` (no interval-based grace). A deleted, wrong-kind, oversized, malformed, or keyless record withdraws every key and the consumer refuses tokens, exactly like an expired remote set (`expired` in `jwks_trust`, readiness `unavailable`). A store that cannot be read keeps the last-read keys in `grace` for at most `jwks_max_stale_seconds`.
 - **Control plane / data plane.** The record never travels on ConfigSync: the plugin config carries only the reference, and each node resolves it from its own `FERRUM_TLS_MANAGED_STORE_PATH`, like every other `managed://` source. Point the CP and every DP at one shared store volume (see [Managed TLS And ACME Across Multiple Replicas](frontend_tls.md#managed-tls-and-acme-across-multiple-replicas)); a DP without the record refuses the provider's tokens.
 
-`DELETE` returns `409 Conflict` when the current runtime/config inventory still references the record.
+`DELETE` returns `409 Conflict` when any configuration still references the record (see [Managed record deletion](#managed-record-deletion)).
+
+### Managed record deletion
+
+`DELETE` on a managed certificate, CA bundle, CRL, OCSP response, or JWKS
+record, and on an ACME certificate, returns `409 Conflict` while any
+configuration still names the record, with the referencing resources in
+`used_by`. Every gateway that shares `FERRUM_TLS_MANAGED_STORE_PATH` reads the
+record whatever namespace it serves, while a database-mode node serves only
+`FERRUM_NAMESPACE` (and a control plane only `FERRUM_CP_NAMESPACES`) and its
+Admin API writes any namespace through `X-Ferrum-Namespace`. The check
+therefore covers this node's environment and served configuration and, on a
+node with a configuration store (database and CP modes), every namespace in
+that store; `used_by[].namespace` names the namespace of a reference found
+there. Disabled plugin configs do not hold a reference. If the store cannot
+be read, the delete is refused with `503` rather than guessed. Nodes without
+a store (file and data-plane modes) check only their own configuration, and
+no node can see another process's environment, so a record named only by
+another gateway's `FERRUM_*` TLS settings is not protected by this check.
 
 ## Cached-config read fallback
 

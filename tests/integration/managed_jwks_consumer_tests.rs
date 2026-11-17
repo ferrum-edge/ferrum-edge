@@ -147,10 +147,33 @@ impl AdminHarness {
         path: &str,
         body: Option<Value>,
     ) -> (StatusCode, Value) {
+        self.send_in(method, path, body, None).await
+    }
+
+    async fn send_ns(
+        &self,
+        method: reqwest::Method,
+        path: &str,
+        body: Option<Value>,
+        namespace: &str,
+    ) -> (StatusCode, Value) {
+        self.send_in(method, path, body, Some(namespace)).await
+    }
+
+    async fn send_in(
+        &self,
+        method: reqwest::Method,
+        path: &str,
+        body: Option<Value>,
+        namespace: Option<&str>,
+    ) -> (StatusCode, Value) {
         let mut request = self
             .client
             .request(method, format!("{}{path}", self.base))
             .bearer_auth(&self.token);
+        if let Some(namespace) = namespace {
+            request = request.header("X-Ferrum-Namespace", namespace);
+        }
         if let Some(body) = body {
             request = request.json(&body);
         }
@@ -586,5 +609,84 @@ async fn admin_writes_refuse_a_managed_jwks_source_without_a_usable_record() {
     assert_eq!(
         body["config"]["providers"][0]["jwks_source"], source,
         "a refused replacement must not be persisted: {body}"
+    );
+}
+
+/// A database-mode node serves one namespace, but its Admin API writes any
+/// namespace and every gateway sharing the managed store reads the record. A
+/// JWKS record that an enabled `jwks_auth` in another namespace references
+/// must not be deleted from a node whose served configuration has no
+/// reference (issue #7394): the guard scans every namespace in the store.
+#[tokio::test(flavor = "multi_thread")]
+async fn delete_refuses_a_managed_jwks_record_referenced_from_another_namespace() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    // The served configuration (namespace `ferrum`) holds no reference.
+    let mut state = admin_state(Arc::new(ArcSwap::from_pointee(GatewayConfig::default())));
+    state.db = Some(Arc::new(sqlite_store(&dir).await));
+    state.mode = "database".to_string();
+    let admin = AdminHarness::start(state).await;
+
+    let record_id = format!("idp-{}", uuid::Uuid::new_v4().simple());
+    let source = format!("managed://jwks/{record_id}#jwks");
+    let key = signing_key("cross-namespace");
+    let (status, body) = admin
+        .send(
+            reqwest::Method::POST,
+            "/admin/tls/jwks",
+            Some(json!({ "id": record_id, "name": "IdP keys", "jwks_json": jwks_json(&[&key]) })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+
+    let tenant = "tenant-b";
+    let (status, body) = admin
+        .send_ns(
+            reqwest::Method::POST,
+            "/plugins/config",
+            Some(jwks_auth_plugin_body("tenant-b-auth", &source, true)),
+            tenant,
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+
+    let delete_path = format!("/admin/tls/jwks/{record_id}");
+    let (status, body) = admin
+        .send(reqwest::Method::DELETE, &delete_path, None)
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::CONFLICT,
+        "a record another namespace references must not be deleted: {body}"
+    );
+    assert!(
+        body["used_by"].as_array().is_some_and(|used_by| {
+            used_by.iter().any(|usage| {
+                usage["namespace"] == tenant
+                    && usage["resource_type"] == "plugin_config"
+                    && usage["resource_id"] == "tenant-b-auth#provider[0]"
+            })
+        }),
+        "the refusal names the referencing namespace and plugin: {body}"
+    );
+    let (status, body) = admin.send(reqwest::Method::GET, &delete_path, None).await;
+    assert_eq!(status, StatusCode::OK, "the record survives: {body}");
+
+    // A disabled consumer reads nothing, so it no longer holds the record.
+    let (status, body) = admin
+        .send_ns(
+            reqwest::Method::PUT,
+            "/plugins/config/tenant-b-auth?expected_proxy_ids=",
+            Some(jwks_auth_plugin_body("tenant-b-auth", &source, false)),
+            tenant,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) = admin
+        .send(reqwest::Method::DELETE, &delete_path, None)
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "an unreferenced record deletes: {body}"
     );
 }

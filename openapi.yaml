@@ -731,6 +731,15 @@ paths:
     delete:
       operationId: deleteAcmeCertificate
       summary: Delete an unreferenced ACME-issued TLS certificate
+      description: |
+        Returns `409 Conflict`, with the referencing resources in `used_by`,
+        while any configuration still names the record. The check covers this
+        node's environment and served configuration and, on a node with a
+        configuration store (database and CP modes), every namespace in that
+        store, because every gateway sharing the store reads the record
+        whatever namespace it serves; `used_by[].namespace` names the
+        namespace of a reference found in the store. If the store cannot be
+        read the delete is refused with `503` rather than guessed.
       tags: [TLS]
       parameters:
         - $ref: "#/components/parameters/ResourceId"
@@ -1218,6 +1227,15 @@ paths:
     delete:
       operationId: deleteManagedTlsCertificate
       summary: Delete an unreferenced admin-managed TLS certificate
+      description: |
+        Returns `409 Conflict`, with the referencing resources in `used_by`,
+        while any configuration still names the record. The check covers this
+        node's environment and served configuration and, on a node with a
+        configuration store (database and CP modes), every namespace in that
+        store, because every gateway sharing the store reads the record
+        whatever namespace it serves; `used_by[].namespace` names the
+        namespace of a reference found in the store. If the store cannot be
+        read the delete is refused with `503` rather than guessed.
       tags: [TLS]
       parameters:
         - $ref: "#/components/parameters/ResourceId"
@@ -1380,6 +1398,15 @@ paths:
     delete:
       operationId: deleteManagedTlsCaBundle
       summary: Delete an unreferenced admin-managed TLS CA bundle
+      description: |
+        Returns `409 Conflict`, with the referencing resources in `used_by`,
+        while any configuration still names the record. The check covers this
+        node's environment and served configuration and, on a node with a
+        configuration store (database and CP modes), every namespace in that
+        store, because every gateway sharing the store reads the record
+        whatever namespace it serves; `used_by[].namespace` names the
+        namespace of a reference found in the store. If the store cannot be
+        read the delete is refused with `503` rather than guessed.
       tags: [TLS]
       parameters:
         - $ref: "#/components/parameters/ResourceId"
@@ -1538,6 +1565,15 @@ paths:
     delete:
       operationId: deleteManagedTlsCrl
       summary: Delete an unreferenced admin-managed TLS CRL bundle
+      description: |
+        Returns `409 Conflict`, with the referencing resources in `used_by`,
+        while any configuration still names the record. The check covers this
+        node's environment and served configuration and, on a node with a
+        configuration store (database and CP modes), every namespace in that
+        store, because every gateway sharing the store reads the record
+        whatever namespace it serves; `used_by[].namespace` names the
+        namespace of a reference found in the store. If the store cannot be
+        read the delete is refused with `503` rather than guessed.
       tags: [TLS]
       parameters:
         - $ref: "#/components/parameters/ResourceId"
@@ -1696,6 +1732,15 @@ paths:
     delete:
       operationId: deleteManagedTlsOcspResponse
       summary: Delete an unreferenced admin-managed OCSP response
+      description: |
+        Returns `409 Conflict`, with the referencing resources in `used_by`,
+        while any configuration still names the record. The check covers this
+        node's environment and served configuration and, on a node with a
+        configuration store (database and CP modes), every namespace in that
+        store, because every gateway sharing the store reads the record
+        whatever namespace it serves; `used_by[].namespace` names the
+        namespace of a reference found in the store. If the store cannot be
+        read the delete is refused with `503` rather than guessed.
       tags: [TLS]
       parameters:
         - $ref: "#/components/parameters/ResourceId"
@@ -1864,11 +1909,17 @@ paths:
       operationId: deleteManagedTlsJwks
       summary: Delete an unreferenced admin-managed JWKS document
       description: |
-        Returns `409 Conflict` while an enabled `jwks_auth` or
-        `oidc_relying_party` config (or any other inventory reference) still
-        names the record. A record removed anyway (another node sharing the
-        store, or an out-of-band edit) withdraws every key from its consumers,
-        which then refuse tokens until it is restored.
+        Returns `409 Conflict`, with the referencing resources in `used_by`,
+        while an enabled `jwks_auth` or `oidc_relying_party` config (or any
+        other inventory reference) still names the record. The check covers
+        this node's environment and served configuration and, on a node with
+        a configuration store (database and CP modes), every namespace in that
+        store: a node serving one namespace still refuses to delete a record
+        another namespace's consumer reads. `used_by[].namespace` names the
+        namespace of a reference found in the store. If the store cannot be
+        read the delete is refused with `503`. A record removed anyway (an
+        out-of-band edit of the shared store) withdraws every key from its
+        consumers, which then refuse tokens until it is restored.
       tags: [TLS]
       parameters:
         - $ref: "#/components/parameters/ResourceId"
