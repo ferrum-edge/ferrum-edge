@@ -363,6 +363,21 @@ pub enum HbonePoolError {
     ConnectStream { authority: String, message: String },
     #[error("HBONE CONNECT rejected for {authority} with status {status}")]
     ConnectRejected { authority: String, status: u16 },
+    /// The peer answered a Sidecar mesh-mTLS WebSocket Extended CONNECT
+    /// (RFC 8441) with a `3xx`-`5xx` application answer: the destination
+    /// gateway relayed its backend's refusal of the upgrade (its own
+    /// authentication, an Origin check, `404`, `429`, ...). The WebSocket
+    /// bridges relay the carried refusal to the client and charge the breaker
+    /// with its status exactly as the HTTP path does (GHSA-7x2j-3389-2h35),
+    /// rather than turning it into a breaker-tripping `502`. A bare HBONE
+    /// CONNECT rejection is the mesh transport's own admission decision and
+    /// stays [`Self::ConnectRejected`], as on the HTTP HBONE path.
+    #[error("WebSocket Extended CONNECT refused for {authority} with status {status}")]
+    WebSocketUpgradeRefused {
+        authority: String,
+        status: u16,
+        refusal: Box<super::WebSocketBackendRefusal>,
+    },
     /// A gateway trust authority was withdrawn while this transport was being
     /// established, or the transport it would have reused has since been
     /// retired (issue #3859). Fail closed: the connection is dropped rather
@@ -472,6 +487,7 @@ impl HbonePoolError {
             Self::InvalidConnectRequest { .. }
             | Self::ConnectStream { .. }
             | Self::ConnectRejected { .. }
+            | Self::WebSocketUpgradeRefused { .. }
             | Self::ExtendedConnectUnsupported { .. } => ErrorClass::ProtocolError,
             // Pre-wire, gateway-side ceiling refusal: no socket was opened, so
             // `retry_on_connect_failure` may rotate to another LB target with
@@ -533,6 +549,7 @@ impl HbonePoolError {
                 "tunnel setup failed"
             }
             Self::ConnectRejected { .. } => "tunnel rejected by peer",
+            Self::WebSocketUpgradeRefused { .. } => "WebSocket upgrade refused by peer",
             Self::TrustWithdrawn => "gateway trust authority withdrawn",
             Self::MaxConnectionsExceeded { .. } => "backend connection limit reached",
             Self::ExtendedConnectUnsupported { .. } => "peer does not support WebSocket tunneling",
@@ -543,8 +560,9 @@ impl HbonePoolError {
     }
 
     /// The peer's own CONNECT admission status, when the public body may carry
-    /// it. Only [`Self::ConnectRejected`] has one; every other variant returns
-    /// `None`, so no other failure can grow a numeric suffix.
+    /// it. Only [`Self::ConnectRejected`] and the WebSocket Extended CONNECT
+    /// refusal ([`Self::WebSocketUpgradeRefused`]) have one; every other
+    /// variant returns `None`, so no other failure can grow a numeric suffix.
     ///
     /// A three-digit HTTP status is the coarse outcome of the PEER's admission
     /// decision — not an address, an identity, a certificate subject, or
@@ -557,7 +575,9 @@ impl HbonePoolError {
     /// reason would silently coarsen that security check.
     pub fn public_status(&self) -> Option<u16> {
         match self {
-            Self::ConnectRejected { status, .. } => Some(*status),
+            Self::ConnectRejected { status, .. } | Self::WebSocketUpgradeRefused { status, .. } => {
+                Some(*status)
+            }
             _ => None,
         }
     }
@@ -632,6 +652,15 @@ impl HbonePoolError {
             Self::ConnectRejected { authority, status } => Self::ConnectRejected {
                 authority: authority.clone(),
                 status: *status,
+            },
+            Self::WebSocketUpgradeRefused {
+                authority,
+                status,
+                refusal,
+            } => Self::WebSocketUpgradeRefused {
+                authority: authority.clone(),
+                status: *status,
+                refusal: refusal.clone(),
             },
             Self::TrustWithdrawn => Self::TrustWithdrawn,
             Self::MaxConnectionsExceeded {
@@ -766,8 +795,8 @@ impl MeshTransportLabel {
     /// transport.
     ///
     /// Fields are closed-cardinality: `error_kind`, `error_phase` (from
-    /// [`HbonePoolError::public_reason`]), and `peer_status` only for
-    /// [`HbonePoolError::ConnectRejected`]. Never interpolates `Display`, so
+    /// [`HbonePoolError::public_reason`]), and `peer_status` only where
+    /// [`HbonePoolError::public_status`] has one. Never interpolates `Display`, so
     /// a host, address, CONNECT authority, tag value, SPIFFE ID, certificate
     /// subject/SAN/issuer/serial/fingerprint, trust root, key id, file path,
     /// verifier message, or peer-controlled string cannot ride this record.
@@ -3389,10 +3418,28 @@ pub(crate) async fn open_h2_ws_connect_stream(
             message: e.to_string(),
         })?;
     load.record_peer_max_streams(&sender);
-    if response.status() != StatusCode::OK {
+    let status = response.status();
+    if status != StatusCode::OK {
+        // A `3xx`-`5xx` is the destination's application answer to the
+        // upgrade (GHSA-7x2j-3389-2h35): carry it so the bridge relays it.
+        if (300..=599).contains(&status.as_u16()) {
+            let (parts, body) = response.into_parts();
+            let complete_body = read_ws_upgrade_refusal_body(body).await;
+            if let Some(refusal) = super::WebSocketBackendRefusal::from_response_parts(
+                status,
+                &parts.headers,
+                complete_body,
+            ) {
+                return Err(HbonePoolError::WebSocketUpgradeRefused {
+                    authority,
+                    status: status.as_u16(),
+                    refusal: Box::new(refusal),
+                });
+            }
+        }
         return Err(HbonePoolError::ConnectRejected {
             authority,
-            status: response.status().as_u16(),
+            status: status.as_u16(),
         });
     }
     let negotiated_subprotocol = response
@@ -3420,6 +3467,39 @@ pub(crate) async fn open_h2_ws_connect_stream(
         backend_extensions,
         backend_response_headers,
     })
+}
+
+/// How long a Sidecar mesh-mTLS WebSocket refusal may wait for its body after
+/// the refusal head arrived. A peer gateway writes the head and its small body
+/// together, so this only absorbs frame-processing skew; it is kept far below
+/// any connect budget so a stalled body never turns the refusal into a
+/// connect-timeout `502`.
+const WS_UPGRADE_REFUSAL_BODY_WAIT: Duration = Duration::from_millis(100);
+
+/// The complete body of a refused Extended CONNECT, or `None` when it did not
+/// end within [`WS_UPGRADE_REFUSAL_BODY_WAIT`], failed, or exceeded the relay
+/// cap ([`super::WEBSOCKET_BACKEND_REFUSAL_MAX_BODY_BYTES`]). `None` makes the
+/// relay carry an empty body without the representation headers.
+async fn read_ws_upgrade_refusal_body(mut body: RecvStream) -> Option<Bytes> {
+    if body.is_end_stream() {
+        return Some(Bytes::new());
+    }
+    let collect = async {
+        let mut collected = bytes::BytesMut::new();
+        while let Some(chunk) = body.data().await {
+            let chunk = chunk.ok()?;
+            let _ = body.flow_control().release_capacity(chunk.len());
+            if collected.len() + chunk.len() > super::WEBSOCKET_BACKEND_REFUSAL_MAX_BODY_BYTES {
+                return None;
+            }
+            collected.extend_from_slice(&chunk);
+        }
+        Some(collected.freeze())
+    };
+    tokio::time::timeout(WS_UPGRADE_REFUSAL_BODY_WAIT, collect)
+        .await
+        .ok()
+        .flatten()
 }
 
 pub fn target_hbone_enabled(target: &UpstreamTarget) -> bool {
@@ -5449,6 +5529,72 @@ mod tests {
             Err(other) => panic!("expected ExtendedConnectUnsupported, got error {other:?}"),
             Ok(_) => panic!("expected ExtendedConnectUnsupported, got an open tunnel"),
         }
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn ws_extended_connect_refusal_is_carried_for_the_relay() {
+        // GHSA-7x2j-3389-2h35: the destination gateway relays its backend's
+        // 401 on the Extended CONNECT response. The opener must carry that
+        // answer (status, stripped headers, complete body) for the WebSocket
+        // relay, not collapse it into a breaker-tripping ConnectRejected.
+        let body = r#"{"error":"backend-auth"}"#;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind h2 server");
+        let addr = listener.local_addr().expect("server addr");
+        let server = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.expect("server accept");
+            let mut builder = h2::server::Builder::new();
+            builder.enable_connect_protocol();
+            let mut conn = builder
+                .handshake::<_, Bytes>(tcp)
+                .await
+                .expect("server handshake");
+            let (_request, mut respond) = conn
+                .accept()
+                .await
+                .expect("server has a stream")
+                .expect("accepted request");
+            let response = http::Response::builder()
+                .status(StatusCode::UNAUTHORIZED)
+                .header("www-authenticate", "Bearer realm=\"ws\"")
+                .header("content-type", "application/json")
+                .header("x-gateway-error", "forged")
+                .body(())
+                .expect("build response");
+            let mut send = respond
+                .send_response(response, false)
+                .expect("send response");
+            send.send_data(Bytes::from_static(body.as_bytes()), true)
+                .expect("send body");
+            // Keep driving the connection so the frames are flushed.
+            while conn.accept().await.is_some() {}
+        });
+
+        let sender = h2_client_to(addr).await;
+        let error = open_h2_ws_connect_stream(
+            sender,
+            "orders.default.svc.cluster.local:8080",
+            "/ws",
+            &[],
+            None,
+            None,
+        )
+        .await
+        .expect_err("a 401 is not an open tunnel");
+        assert_eq!(error.public_status(), Some(401));
+        assert_eq!(error.error_class(), ErrorClass::ProtocolError);
+        let boxed: Box<dyn std::error::Error + Send + Sync> = Box::new(error);
+        let refusal = crate::proxy::websocket_backend_refusal(boxed.as_ref())
+            .expect("the shared relay must find the mesh refusal");
+        assert_eq!(refusal.status, StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            refusal.headers.get("www-authenticate").map(String::as_str),
+            Some("Bearer realm=\"ws\"")
+        );
+        assert!(!refusal.headers.contains_key("x-gateway-error"));
+        assert_eq!(refusal.body.as_ref(), body.as_bytes());
         server.abort();
     }
 

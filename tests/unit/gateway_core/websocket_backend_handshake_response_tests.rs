@@ -422,3 +422,81 @@ fn backend_response_collectors_keep_utf8_obs_text_and_count_drops() {
         "every non-UTF-8 drop must be counted"
     );
 }
+
+/// Strip all whitespace so source-shape checks survive rustfmt reflows.
+fn squeeze(source: &str) -> String {
+    source.chars().filter(|ch| !ch.is_whitespace()).collect()
+}
+
+/// Every WebSocket backend transport that can carry a backend's refusal of the
+/// upgrade must feed the ONE shared relay (GHSA-7x2j-3389-2h35): the H1 upgrade
+/// transports (direct TCP/TLS, Unix socket, inner HBONE handshake) through
+/// tungstenite's `Error::Http`, and the Sidecar mesh-mTLS Extended CONNECT
+/// through `HbonePoolError::WebSocketUpgradeRefused`. Both frontends' failure
+/// tails must consult that relay and charge the breaker by the backend status.
+#[test]
+fn every_websocket_transport_refusal_feeds_the_shared_relay() {
+    let proxy = squeeze(include_str!("../../../src/proxy/mod.rs"));
+    let relay = proxy
+        .find("pub(crate)fnwebsocket_backend_refusal(")
+        .expect("shared refusal extractor");
+    let relay_body = &proxy[relay..relay + 1200];
+    assert!(
+        relay_body.contains("tokio_tungstenite::tungstenite::Error::Http(response)"),
+        "the H1 upgrade transports' refusal must reach the relay"
+    );
+    assert!(
+        relay_body.contains("HbonePoolError::WebSocketUpgradeRefused{refusal,..}"),
+        "the Sidecar mesh-mTLS Extended CONNECT refusal must reach the relay"
+    );
+
+    let hbone = squeeze(include_str!("../../../src/proxy/hbone_pool.rs"));
+    let opener = hbone
+        .find("pub(crate)asyncfnopen_h2_ws_connect_stream(")
+        .expect("Sidecar WebSocket Extended CONNECT opener");
+    let opener_body = &hbone[opener..];
+    let refused = opener_body
+        .find("returnErr(HbonePoolError::WebSocketUpgradeRefused{")
+        .expect("the opener must carry a 3xx-5xx refusal");
+    let rejected = opener_body
+        .find("returnErr(HbonePoolError::ConnectRejected{")
+        .expect("other non-200 answers stay ConnectRejected");
+    assert!(
+        refused < rejected,
+        "the refusal must be carried before the ConnectRejected fallback"
+    );
+    assert!(opener_body[..refused].contains("WebSocketBackendRefusal::from_response_parts("));
+
+    let h3 = squeeze(include_str!("../../../src/http3/websocket.rs"));
+    for (label, source, extractor) in [
+        (
+            "H1/H2",
+            proxy.as_str(),
+            "websocket_backend_refusal(e.as_ref())",
+        ),
+        (
+            "H3",
+            h3.as_str(),
+            "crate::proxy::websocket_backend_refusal(e.as_ref())",
+        ),
+    ] {
+        let at = source
+            .find(extractor)
+            .unwrap_or_else(|| panic!("{label}: failure tail must consult the shared relay"));
+        let tail = &source[at..];
+        let settle = tail
+            .find("apply_circuit_breaker_outcome(&cb,ws_failure_status.as_u16(),false,None,")
+            .unwrap_or_else(|| panic!("{label}: a refusal must settle the breaker by its status"));
+        assert!(
+            tail[..settle].contains("ifws_backend_refusal.is_some(){"),
+            "{label}: the status-based settlement must be the refusal arm"
+        );
+    }
+
+    // The H3 refusal writer is polled inside `handle_h3_request`'s stack
+    // budget: box a trampoline so its future is built in the heap block.
+    assert!(
+        h3.contains("Box::pin(async{send_h3_backend_refusal("),
+        "H3: box the refusal writer through a trampoline, not Box::pin(writer(..))"
+    );
+}

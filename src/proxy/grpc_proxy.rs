@@ -5081,6 +5081,7 @@ fn mesh_mtls_pool_error_to_grpc(error: HbonePoolError) -> GrpcProxyError {
         E::InvalidConnectRequest { .. }
         | E::ConnectStream { .. }
         | E::ConnectRejected { .. }
+        | E::WebSocketUpgradeRefused { .. }
         | E::ExtendedConnectUnsupported { .. } => GrpcProxyError::backend_unavailable_with_source(
             GrpcBackendUnavailableKind::Connect,
             message,

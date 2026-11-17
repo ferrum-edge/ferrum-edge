@@ -75,7 +75,10 @@ plugins then govern them, and the gateway still owns the transport fields: `Upgr
 `Sec-WebSocket-Extensions`, and its sticky-session cookie.
 
 When the backend declines the upgrade with its own `3xx`, `4xx` or `5xx` (its own authentication,
-an Origin check, `404`, `429`, a redirect), the gateway relays that status, the backend's headers
+an Origin check, `404`, `429`, a redirect), the gateway relays that status on every backend
+transport: a direct or Unix-socket upgrade, the inner handshake through an Ambient HBONE tunnel, and
+a Sidecar mesh-mTLS peer's answer to the Extended CONNECT. A bare HBONE CONNECT rejection is the mesh
+transport's own admission decision and stays a gateway `502`, as on the HTTP HBONE path. It relays the backend's headers
 under the same strip and response policy (`WWW-Authenticate`, `Retry-After`, `Location`), and the
 backend's body when it arrived complete with the response head (up to 64 KiB; otherwise an empty
 body without `Content-Type`). The relayed answer carries no `X-Gateway-Error`, has no

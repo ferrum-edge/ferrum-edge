@@ -16704,10 +16704,11 @@ pub(crate) fn websocket_backend_failure_status_and_body(
 /// Largest backend refusal body the gateway relays to the client. The body is
 /// what the backend coalesced with its refusal head, so it is already bounded by
 /// the handshake read; this cap keeps the relay small regardless.
-const WEBSOCKET_BACKEND_REFUSAL_MAX_BODY_BYTES: usize = 64 * 1024;
+pub(crate) const WEBSOCKET_BACKEND_REFUSAL_MAX_BODY_BYTES: usize = 64 * 1024;
 
-/// A backend's own `3xx`-`5xx` answer to the gateway's RFC 6455 upgrade
-/// request (GHSA-7x2j-3389-2h35).
+/// A backend's own `3xx`-`5xx` answer to the gateway's WebSocket upgrade
+/// request (GHSA-7x2j-3389-2h35): an RFC 6455 non-`101` response, or a non-`2xx`
+/// response to a Sidecar mesh-mTLS RFC 8441 Extended CONNECT.
 ///
 /// The backend is healthy and declined the upgrade (its own authentication, an
 /// Origin check, `404`, `429`, a redirect, ...). The gateway relays that answer
@@ -16719,7 +16720,7 @@ const WEBSOCKET_BACKEND_REFUSAL_MAX_BODY_BYTES: usize = 64 * 1024;
 /// RFC 8441 / RFC 9220 Extended CONNECT client would tell it the tunnel is open.
 /// It stays the `502` protocol failure, as do a missing/invalid
 /// `Sec-WebSocket-Accept` and a malformed response.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) struct WebSocketBackendRefusal {
     pub(crate) status: StatusCode,
     /// The backend's headers after the backend-response strip (hop-by-hop,
@@ -16732,49 +16733,68 @@ pub(crate) struct WebSocketBackendRefusal {
     pub(crate) body: Bytes,
 }
 
+impl WebSocketBackendRefusal {
+    /// The refusal for a backend answer with `status` and `headers`, or `None`
+    /// when the status is not a relayable `3xx`-`5xx`. `complete_body` is the
+    /// backend's whole body when the transport read all of it (at most
+    /// [`WEBSOCKET_BACKEND_REFUSAL_MAX_BODY_BYTES`]); `None` relays an empty body
+    /// and drops the fields describing the representation the client will not
+    /// receive. Shared by every WebSocket transport that can carry a refusal.
+    pub(crate) fn from_response_parts(
+        status: StatusCode,
+        headers: &hyper::HeaderMap,
+        complete_body: Option<Bytes>,
+    ) -> Option<Self> {
+        if !(300..=599).contains(&status.as_u16()) {
+            return None;
+        }
+        let mut collected = HashMap::new();
+        collect_hyper_response_headers(headers, &mut collected);
+        let body = match complete_body {
+            Some(body) => body,
+            None => {
+                collected.retain(|name, _| {
+                    !name.eq_ignore_ascii_case("content-type")
+                        && !name.eq_ignore_ascii_case("content-encoding")
+                        && !name.eq_ignore_ascii_case("content-range")
+                });
+                Bytes::new()
+            }
+        };
+        Some(Self {
+            status,
+            headers: collected,
+            body,
+        })
+    }
+}
+
 /// The backend refusal carried by a failed WebSocket dial, if the backend
 /// answered the upgrade with a relayable status. Walks the error chain for
 /// tungstenite's `Error::Http`, which every H1 upgrade transport (direct
 /// TCP/TLS, admitted Unix socket, and the inner HBONE handshake) returns for a
-/// non-`101` answer.
+/// non-`101` answer, and for the Sidecar mesh-mTLS Extended CONNECT refusal
+/// ([`HbonePoolError::WebSocketUpgradeRefused`]).
 pub(crate) fn websocket_backend_refusal(
     error: &(dyn std::error::Error + 'static),
 ) -> Option<WebSocketBackendRefusal> {
     let mut current = Some(error);
-    let response = loop {
-        let err = current?;
+    while let Some(err) = current {
         if let Some(tokio_tungstenite::tungstenite::Error::Http(response)) =
             err.downcast_ref::<tokio_tungstenite::tungstenite::Error>()
         {
-            break response;
+            let status = response.status();
+            let body = websocket_backend_refusal_body(status, response.headers(), response.body());
+            return WebSocketBackendRefusal::from_response_parts(status, response.headers(), body);
+        }
+        if let Some(HbonePoolError::WebSocketUpgradeRefused { refusal, .. }) =
+            err.downcast_ref::<HbonePoolError>()
+        {
+            return Some(refusal.as_ref().clone());
         }
         current = err.source();
-    };
-    let status = response.status();
-    if !(300..=599).contains(&status.as_u16()) {
-        return None;
     }
-    let mut headers = HashMap::new();
-    collect_hyper_response_headers(response.headers(), &mut headers);
-    let body = match websocket_backend_refusal_body(status, response.headers(), response.body()) {
-        Some(body) => body,
-        None => {
-            // The declared body was not complete in the handshake read: relay
-            // the status and headers with an empty body, and drop the fields
-            // that describe a representation the client will not receive.
-            headers.retain(|name, _| {
-                !name.eq_ignore_ascii_case("content-type")
-                    && !name.eq_ignore_ascii_case("content-encoding")
-                    && !name.eq_ignore_ascii_case("content-range")
-            });
-            Bytes::new()
-        }
-    };
-    Some(WebSocketBackendRefusal {
-        status,
-        headers,
-        body,
-    })
+    None
 }
 
 /// The complete body of a backend refusal, or `None` when the bytes
