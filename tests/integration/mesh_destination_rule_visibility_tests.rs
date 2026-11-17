@@ -2591,3 +2591,229 @@ fn a_materialized_service_upstream_is_arbitrated_on_its_logical_service_host() {
         "the genuine multi-destination refusal is kept: {error}"
     );
 }
+
+// ── Review round (sol F1–F4, dsf F2) ─────────────────────────────────────
+
+/// The scheme and the materialized egress upstream for the first upstream
+/// whose target host or name is `host`, on an EgressGateway in
+/// [`EGRESS_GATEWAY_NAMESPACE`] built from `mesh`.
+fn egress_scheme_for_mesh(mesh: MeshConfig, host: &str) -> BackendScheme {
+    let prepared = prepare_egress_gateway(mesh);
+    let upstream = prepared
+        .upstreams
+        .iter()
+        .find(|u| u.name.as_deref() == Some(host) || u.targets.iter().any(|t| t.host == host))
+        .expect("the egress gateway materializes an upstream for the ServiceEntry host");
+    prepared
+        .proxies
+        .iter()
+        .find(|p| p.upstream_id.as_deref() == Some(upstream.id.as_str()))
+        .expect("the materialized egress upstream has a referencing proxy")
+        .backend_scheme
+        .expect("an HTTP-family egress proxy carries a backend scheme")
+}
+
+/// A `tls.mode` DestinationRule in `namespace` for `host`.
+fn tls_rule(namespace: &str, name: &str, host: &str, mode: MtlsMode) -> MeshDestinationRule {
+    let mut dr = rule(namespace, name, host, 2222, &["*"]);
+    dr.traffic_policy = Some(MeshTrafficPolicy {
+        tls: Some(MeshTrafficPolicyTls {
+            mode,
+            ..MeshTrafficPolicyTls::default()
+        }),
+        ..MeshTrafficPolicy::default()
+    });
+    dr
+}
+
+/// sol F1: a client- or root-tier wildcard is judged by the Sidecar egress
+/// scope against the destinations it covers, not against its own namespace
+/// and literal host. A gateway importing only `payments/*` keeps a root
+/// `*.example.com` TLS rule for `payments`' ServiceEntry host.
+#[test]
+fn a_root_wildcard_survives_a_sidecar_scope_that_imports_only_the_destination_namespace() {
+    let mut mesh = egress_gateway_mesh(
+        EXTERNAL_HOST_OWNER,
+        vec![tls_rule(
+            "istio-system",
+            "mesh-default",
+            EXTERNAL_WILDCARD,
+            MtlsMode::Simple,
+        )],
+    );
+    mesh.sidecars = vec![sidecar_admitting(
+        EGRESS_GATEWAY_NAMESPACE,
+        &[format!("{EXTERNAL_HOST_OWNER}/*").as_str()],
+    )];
+    assert_eq!(
+        egress_scheme_for_mesh(mesh.clone(), EXTERNAL_HOST),
+        BackendScheme::Https,
+        "the root wildcard covers an imported destination, so the scope admits it"
+    );
+
+    // A scope that imports nothing the wildcard covers still drops it.
+    mesh.sidecars = vec![sidecar_admitting(
+        EGRESS_GATEWAY_NAMESPACE,
+        &[
+            format!("{EXTERNAL_HOST_OWNER}/{EXTERNAL_HOST}").as_str(),
+            "other/*",
+        ],
+    )];
+    mesh.destination_rules = vec![tls_rule(
+        "istio-system",
+        "mesh-default",
+        "*.unrelated.example",
+        MtlsMode::Simple,
+    )];
+    assert_eq!(
+        egress_scheme_for_mesh(mesh, EXTERNAL_HOST),
+        BackendScheme::Http,
+        "a wildcard covering no admitted destination changes nothing"
+    );
+}
+
+/// sol F2: a wildcard ServiceEntry host is owned by the single namespace
+/// that declares it, at admission and on the data plane, so the owner's rule
+/// for the identical host, or for a broader wildcard, governs it from another
+/// namespace's EgressGateway; an unrelated namespace's rule does not.
+#[test]
+fn a_wildcard_service_entry_host_is_governed_by_its_owners_rules() {
+    let wildcard_host = "*.wild.example.com";
+    let mesh_with = |rules: Vec<MeshDestinationRule>| {
+        let mut mesh = egress_gateway_mesh(EXTERNAL_HOST_OWNER, rules);
+        mesh.service_entries[0].hosts = vec![wildcard_host.to_string()];
+        mesh
+    };
+    for host in [wildcard_host, "*.example.com", "*"] {
+        assert_eq!(
+            egress_scheme_for_mesh(
+                mesh_with(vec![tls_rule(
+                    EXTERNAL_HOST_OWNER,
+                    "owner-tls",
+                    host,
+                    MtlsMode::Simple
+                )]),
+                wildcard_host,
+            ),
+            BackendScheme::Https,
+            "the owner's {host} rule governs its wildcard ServiceEntry host"
+        );
+        assert_eq!(
+            egress_scheme_for_mesh(
+                mesh_with(vec![tls_rule("evil", "hijack", host, MtlsMode::Simple)]),
+                wildcard_host,
+            ),
+            BackendScheme::Http,
+            "an unrelated namespace's {host} rule owns nothing"
+        );
+    }
+}
+
+/// sol F3: a STATIC ServiceEntry's DNS endpoint is a transport endpoint of
+/// the one logical destination, not a second destination. A root `*` default
+/// and the owner's exact rule do not make the EgressGateway upstream
+/// unrepresentable; the owner's rule wins the ServiceEntry host.
+#[test]
+fn a_static_service_entrys_dns_endpoint_does_not_enter_rule_arbitration() {
+    let mut mesh = egress_gateway_mesh(
+        EXTERNAL_HOST_OWNER,
+        vec![
+            tls_rule(
+                EXTERNAL_HOST_OWNER,
+                "owner-tls",
+                EXTERNAL_HOST,
+                MtlsMode::Simple,
+            ),
+            tls_rule("istio-system", "mesh-default", "*", MtlsMode::Disable),
+        ],
+    );
+    let entry = &mut mesh.service_entries[0];
+    entry.resolution = Resolution::Static;
+    entry.endpoints = vec![MeshEndpoint {
+        address: "backend.vendor.net".to_string(),
+        ports: HashMap::from([("https".to_string(), 8443)]),
+        labels: HashMap::new(),
+        network: None,
+    }];
+    assert_eq!(
+        egress_scheme_for_mesh(mesh, "backend.vendor.net"),
+        BackendScheme::Https,
+        "the ServiceEntry host is the one destination; its owner's exact rule wins"
+    );
+}
+
+/// sol F4 (narrowed): an upstream id, or a name that only repeats it, is never
+/// a wildcard candidate, so a catch-all cannot latch onto a synthetic dotted
+/// identifier such as an east-west Service upstream's; an exact rule still
+/// matches an id as before.
+#[test]
+fn a_wildcard_never_names_an_upstream_id() {
+    use ferrum_edge::_test_support::apply_destination_rules_with_tenant_roots_for_test as apply;
+
+    const SYNTHETIC: &str = "__mesh-ew-upstream-beta-reviews.p8080";
+    let slice = MeshSlice {
+        namespace: "alpha".to_string(),
+        istio_root_namespace: "istio-system".to_string(),
+        destination_rules: vec![rule("alpha", "catch-all", "*", 3333, &["*"])],
+        ..MeshSlice::default()
+    };
+    let mut upstream = http_upstream(SYNTHETIC, "10.1.0.3", 8080);
+    upstream.namespace = "alpha".to_string();
+    upstream.name = Some(SYNTHETIC.to_string());
+    let mut proxy = http_proxy("ew-p", "10.1.0.3", 8080);
+    proxy.namespace = "alpha".to_string();
+    proxy.upstream_id = Some(SYNTHETIC.to_string());
+    let baseline = proxy.backend_connect_timeout_ms;
+    let mut config = GatewayConfig {
+        proxies: vec![proxy],
+        upstreams: vec![upstream],
+        ..GatewayConfig::default()
+    };
+    apply(&mut config, &alpha_subscriber_runtime(), &slice, &[]).expect("applies");
+    assert_eq!(
+        config.proxies[0].backend_connect_timeout_ms, baseline,
+        "the catch-all must not match a synthetic id"
+    );
+}
+
+/// dsf F2: a rule spelled exactly like a wildcard destination host is an
+/// exact match for ranking, but without a ServiceEntry owner it never borrows
+/// the upstream's namespace for the service tier (admission refuses it the
+/// same way); with the owner's ServiceEntry visible it applies.
+#[test]
+fn an_identically_spelled_wildcard_rule_takes_no_upstream_namespace_fallback() {
+    use ferrum_edge::_test_support::apply_destination_rules_with_tenant_roots_for_test as apply;
+
+    const WILD: &str = "*.api.external.com";
+    let applied = |service_entries: Vec<ServiceEntry>| {
+        let slice = MeshSlice {
+            namespace: "alpha".to_string(),
+            istio_root_namespace: "istio-system".to_string(),
+            service_entries,
+            destination_rules: vec![rule("beta", "beta-wild", WILD, 4444, &["*"])],
+            ..MeshSlice::default()
+        };
+        let mut upstream = http_upstream("beta-u", WILD, 443);
+        upstream.namespace = "beta".to_string();
+        let mut proxy = http_proxy("beta-p", WILD, 443);
+        proxy.namespace = "beta".to_string();
+        proxy.upstream_id = Some("beta-u".to_string());
+        let mut config = GatewayConfig {
+            proxies: vec![proxy],
+            upstreams: vec![upstream],
+            ..GatewayConfig::default()
+        };
+        apply(&mut config, &alpha_subscriber_runtime(), &slice, &[]).expect("applies");
+        config.proxies[0].backend_connect_timeout_ms
+    };
+    assert_ne!(
+        applied(Vec::new()),
+        4444,
+        "no owner: the wildcard rule must not take the service tier from the upstream"
+    );
+    assert_eq!(
+        applied(vec![external_service_entry("beta", "wild", WILD)]),
+        4444,
+        "the declaring ServiceEntry makes `beta` the owner of the wildcard host"
+    );
+}

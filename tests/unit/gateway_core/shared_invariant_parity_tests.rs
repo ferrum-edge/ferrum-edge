@@ -5701,6 +5701,11 @@ fn destination_rule_host_matching_has_one_implementation() {
         (
             &mesh,
             "pub(crate) fn apply_destination_rules_with_tenant_file_roots(",
+            "host.specificity(dr)",
+        ),
+        (
+            &mesh,
+            "impl DestinationRuleMatchHost<'_> {",
             "destination_rule_host_specificity(",
         ),
         (
@@ -5710,7 +5715,7 @@ fn destination_rule_host_matching_has_one_implementation() {
         ),
         (
             &slice,
-            "fn wildcard_destination_rule_names_owned_destination<F>(",
+            "fn wildcard_destination_rule_admitted_destination<F>(",
             "super::destination_rule_host_specificity(",
         ),
     ] {
@@ -5734,6 +5739,13 @@ fn destination_rule_host_matching_has_one_implementation() {
         mesh.matches("rule_host.strip_prefix('*')").count(),
         1,
         "the one wildcard rule lives in `destination_rule_host_specificity`"
+    );
+    // An upstream id is never a wildcard candidate (review F4): a catch-all
+    // must not latch onto a synthetic dotted identifier.
+    let match_hosts = item_body(&mesh, "fn upstream_destination_rule_match_hosts(", "\n}\n");
+    assert!(
+        match_hosts.contains("host: upstream.id.as_str(),\n        wildcard_eligible: false,"),
+        "the upstream id must stay an exact-only DestinationRule candidate"
     );
     let bind = item_body(
         &mesh,

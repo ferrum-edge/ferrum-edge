@@ -12118,17 +12118,13 @@ pub(crate) fn apply_destination_rules_with_tenant_file_roots(
     // Service alias beats any wildcard, and a longer wildcard suffix beats a
     // shorter one. The winner per host is therefore `(tier, specificity)`.
     //
-    // Materialized Service upstreams are arbitrated on their logical Service
-    // host alone (`upstream_destination_rule_match_hosts`).
+    // Materialized Service upstreams and other mesh-generated upstreams named
+    // with a destination host are arbitrated on that logical host alone
+    // (`is_logical_destination_upstream`, `upstream_destination_rule_match_hosts`).
     let logical_service_upstreams: Vec<bool> = config
         .upstreams
         .iter()
-        .map(|upstream| {
-            outbound_upstream_owner_port.contains_key(&NamespacedResourceId::new(
-                upstream.namespace.as_str(),
-                upstream.id.as_str(),
-            ))
-        })
+        .map(|upstream| is_logical_destination_upstream(upstream, &outbound_upstream_owner_port))
         .collect();
     let mut winning_tier_by_upstream_host: Vec<Vec<Option<DestinationRuleWinner>>> =
         Vec::with_capacity(config.upstreams.len());
@@ -12227,7 +12223,7 @@ pub(crate) fn apply_destination_rules_with_tenant_file_roots(
                 );
                 let mut wins_a_host = false;
                 for (host_idx, host) in hosts.into_iter().enumerate() {
-                    if destination_rule_host_specificity(&dr.host, &dr.namespace, host).is_none() {
+                    if host.specificity(dr).is_none() {
                         continue;
                     }
                     matched_any_host = true;
@@ -13290,7 +13286,14 @@ impl MaterializationTierScope<'_> {
         );
         let service_namespace = match host_owner.as_ref() {
             Some(owner) => Some(owner.namespace()),
-            None if specificity == DestinationRuleHostSpecificity::Exact => {
+            // Only a concrete exact host may borrow the upstream's
+            // namespace: a rule spelled like a wildcard ServiceEntry host
+            // is an `Exact` match too, but owns nothing without the
+            // ServiceEntry index (admission refuses it the same way).
+            None if specificity == DestinationRuleHostSpecificity::Exact
+                && !matched_host.contains('*')
+                && !dr.host.contains('*') =>
+            {
                 let upstream_namespace = upstream.namespace.trim();
                 (!upstream_namespace.is_empty()).then_some(upstream_namespace)
             }
@@ -13327,16 +13330,84 @@ impl MaterializationTierScope<'_> {
 fn upstream_destination_rule_match_hosts(
     upstream: &Upstream,
     logical_service_upstream: bool,
-) -> Vec<&str> {
-    let mut hosts: Vec<&str> = Vec::with_capacity(upstream.targets.len() + 2);
+) -> Vec<DestinationRuleMatchHost<'_>> {
+    let mut hosts: Vec<DestinationRuleMatchHost<'_>> =
+        Vec::with_capacity(upstream.targets.len() + 2);
     if !logical_service_upstream {
-        hosts.extend(upstream.targets.iter().map(|target| target.host.as_str()));
+        hosts.extend(
+            upstream
+                .targets
+                .iter()
+                .map(|target| DestinationRuleMatchHost {
+                    host: target.host.as_str(),
+                    wildcard_eligible: true,
+                }),
+        );
     }
     if let Some(name) = upstream.name.as_deref() {
-        hosts.push(name);
+        hosts.push(DestinationRuleMatchHost {
+            host: name,
+            // A name that merely repeats the id is a synthetic identifier
+            // (east-west Service upstreams, UDP listener upstreams), not a
+            // destination host.
+            wildcard_eligible: name != upstream.id,
+        });
     }
-    hosts.push(upstream.id.as_str());
+    hosts.push(DestinationRuleMatchHost {
+        host: upstream.id.as_str(),
+        wildcard_eligible: false,
+    });
     hosts
+}
+
+/// One candidate destination host of an upstream for DestinationRule
+/// matching (issue #7395). Every candidate matches an exact rule host or
+/// Service alias as before; only `wildcard_eligible` ones (destination hosts,
+/// never an upstream id or a name that repeats it) can be named by a wildcard,
+/// so a catch-all `*` never latches onto a synthetic dotted identifier.
+#[derive(Debug, Clone, Copy)]
+struct DestinationRuleMatchHost<'a> {
+    host: &'a str,
+    wildcard_eligible: bool,
+}
+
+impl DestinationRuleMatchHost<'_> {
+    /// How specifically `dr` names this candidate, honouring
+    /// `wildcard_eligible`.
+    fn specificity(&self, dr: &MeshDestinationRule) -> Option<DestinationRuleHostSpecificity> {
+        destination_rule_host_specificity(&dr.host, &dr.namespace, self.host).filter(
+            |specificity| {
+                self.wildcard_eligible || *specificity == DestinationRuleHostSpecificity::Exact
+            },
+        )
+    }
+}
+
+/// Whether an upstream is arbitrated on its logical destination host alone
+/// (see [`upstream_destination_rule_match_hosts`]): a materialized per-port
+/// Service upstream (`outbound_upstream_owner_port`), or any other
+/// mesh-generated upstream (reserved `__mesh` id, the same provenance
+/// [`TrustedMeshGeneratedResourceIds`] trusts) that is named with a destination
+/// host distinct from its id: an EgressGateway upstream named with its
+/// ServiceEntry host, or a source-side external UDP upstream named with its
+/// ServiceEntry host. Their targets are transport endpoints (workload or
+/// STATIC endpoint addresses, DNS endpoints, gateway endpoints, cross-cluster
+/// transport identities), never independent destinations a rule names.
+fn is_logical_destination_upstream(
+    upstream: &Upstream,
+    outbound_upstream_owner_port: &HashMap<NamespacedResourceId, u16>,
+) -> bool {
+    if outbound_upstream_owner_port.contains_key(&NamespacedResourceId::new(
+        upstream.namespace.as_str(),
+        upstream.id.as_str(),
+    )) {
+        return true;
+    }
+    upstream.id.starts_with("__mesh")
+        && upstream.name.as_deref().is_some_and(|name| {
+            let name = name.trim().trim_end_matches('.').to_ascii_lowercase();
+            name != upstream.id && is_wildcard_matchable_host(&name)
+        })
 }
 
 /// True when EVERY target of this upstream dispatches through an SVID-backed
@@ -13499,10 +13570,10 @@ fn destination_rule_winner_candidate(
     tier_scope: &MaterializationTierScope<'_>,
     dr: &MeshDestinationRule,
     upstream: &Upstream,
-    host: &str,
+    host: DestinationRuleMatchHost<'_>,
 ) -> Option<DestinationRuleWinner> {
-    let specificity = destination_rule_host_specificity(&dr.host, &dr.namespace, host)?;
-    let tier = tier_scope.eligible_tier(dr, upstream, host, specificity)?;
+    let specificity = host.specificity(dr)?;
+    let tier = tier_scope.eligible_tier(dr, upstream, host.host, specificity)?;
     Some(DestinationRuleWinner { tier, specificity })
 }
 

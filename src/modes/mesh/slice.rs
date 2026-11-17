@@ -3675,7 +3675,7 @@ type DestinationRuleGroupKey = (Option<String>, String);
 /// The service tier is granted only on EVIDENCE of ownership (see
 /// `policy_target_service_ref`). A wildcard host owns nothing itself: it is
 /// admitted at the service tier only when it names a registry destination its
-/// own namespace owns (`wildcard_destination_rule_names_owned_destination`,
+/// own namespace owns (`wildcard_destination_rule_admitted_destination`,
 /// issue #7395). A host whose owner cannot be established —
 /// an external host with no visible ServiceEntry, one claimed by ServiceEntries
 /// in two different namespaces, or an unqualified two-label host absent from
@@ -3727,6 +3727,7 @@ where
             .first()
             .cloned()
             .unwrap_or_default();
+        let wildcard = is_wildcard_destination_rule_host(&rule.host);
         if !tier.is_in_lookup_path() {
             // Issue #7395: a wildcard host names no single destination, so
             // it has no owner of its own and its service tier is decided per
@@ -3735,22 +3736,41 @@ where
             // owns and the caller's scope admits. The data plane
             // (`MaterializationTierScope::eligible_tier`) then grants it the
             // service tier for exactly those destinations.
-            if is_wildcard_destination_rule_host(&rule.host)
-                && wildcard_destination_rule_names_owned_destination(rule, scope, &mut extra_admits)
+            let rule_namespace = rule.namespace.trim();
+            if wildcard
+                && !rule_namespace.is_empty()
+                && wildcard_destination_rule_admitted_destination(
+                    rule,
+                    scope,
+                    Some(rule_namespace),
+                    &mut extra_admits,
+                )
             {
                 visible.push((
-                    (Some(rule.namespace.trim().to_string()), group_host),
+                    (Some(rule_namespace.to_string()), group_host),
                     DestinationRuleLookupTier::Service,
                     rule,
                 ));
             }
             continue;
         }
-        if !extra_admits(
+        // A client- or root-tier wildcard is judged by the caller's scope
+        // against the destinations it covers too (issue #7395): its literal
+        // host and declaring namespace are not a destination, so a Sidecar
+        // egress scope importing only `payments/*` must still admit a root
+        // `*.example.com` rule for `payments`' ServiceEntry host.
+        let scope_admits = extra_admits(
             rule,
             &host_scope.scope_namespace,
             &host_scope.host_candidates,
-        ) {
+        ) || (wildcard
+            && wildcard_destination_rule_admitted_destination(
+                rule,
+                scope,
+                None,
+                &mut extra_admits,
+            ));
+        if !scope_admits {
             continue;
         }
         visible.push(((host_scope.service_namespace, group_host), tier, rule));
@@ -3796,32 +3816,32 @@ fn is_wildcard_destination_rule_host(host: &str) -> bool {
     host.trim().starts_with('*')
 }
 
-/// Whether wildcard DestinationRule `rule` names a registry destination that
-/// its own namespace owns and that the caller's scope admits (issue #7395).
+/// Whether wildcard DestinationRule `rule` names a registry destination the
+/// caller's scope admits (issue #7395), restricted to destinations owned by
+/// `owner` when it is `Some` (the service-tier question: does the rule's own
+/// namespace own something it covers?).
 ///
-/// Ownership comes from the same evidence, in the same order, as every other
-/// service-tier decision ([`destination_host_owner`]): an in-cluster Service
-/// is owned by its namespace, an external host by the single namespace whose
-/// visible ServiceEntry declares it. It is NEVER inferred from the rule's
-/// declaring namespace alone: a wildcard that names no destination its
-/// namespace owns is refused here, as on the data plane. Each matched
-/// destination is offered to the caller's gate (`extra_admits`) as that
-/// destination, so the Sidecar egress scope judges the concrete host.
-fn wildcard_destination_rule_names_owned_destination<F>(
+/// Destinations are the in-cluster Services and the ServiceEntry hosts with a
+/// single owner, wildcard ServiceEntry hosts included. Ownership comes from
+/// the same evidence, in the same order, as every other service-tier decision
+/// ([`destination_host_owner`]): an in-cluster Service is owned by its
+/// namespace, an external host by the single namespace whose visible
+/// ServiceEntry declares it. It is NEVER inferred from the rule's declaring
+/// namespace alone. Each matched destination is offered to the caller's gate
+/// (`extra_admits`) as that destination (its owning namespace and host
+/// aliases), so the Sidecar egress scope judges the concrete host.
+fn wildcard_destination_rule_admitted_destination<F>(
     rule: &MeshDestinationRule,
     scope: &DestinationRuleScope<'_>,
+    owner: Option<&str>,
     extra_admits: &mut F,
 ) -> bool
 where
     F: FnMut(&MeshDestinationRule, &str, &[String]) -> bool,
 {
-    let rule_namespace = rule.namespace.trim();
-    if rule_namespace.is_empty() {
-        return false;
-    }
     let cluster_domain = scope.cluster_domain.trim().trim_end_matches('.');
     for (namespace, name) in scope.mesh_service_identities {
-        if namespace != rule_namespace {
+        if owner.is_some_and(|owner| namespace != owner) {
             continue;
         }
         let fqdn = if cluster_domain.is_empty() {
@@ -3840,7 +3860,7 @@ where
         }
     }
     for host in scope.service_entry_hosts.keys() {
-        let Some(owner) = destination_host_owner(
+        let Some(host_owner) = destination_host_owner(
             host,
             scope.cluster_domain,
             scope.mesh_service_identities,
@@ -3848,11 +3868,12 @@ where
         ) else {
             continue;
         };
-        if owner.namespace() != rule_namespace {
+        let host_owner = host_owner.namespace();
+        if owner.is_some_and(|owner| host_owner != owner) {
             continue;
         }
         if super::destination_rule_host_specificity(&rule.host, &rule.namespace, host).is_some()
-            && extra_admits(rule, rule_namespace, std::slice::from_ref(host))
+            && extra_admits(rule, host_owner, std::slice::from_ref(host))
         {
             return true;
         }
@@ -4175,8 +4196,25 @@ pub(crate) fn destination_host_owner(
         .trim()
         .trim_end_matches('.')
         .to_ascii_lowercase();
-    if host.is_empty() || host.contains('*') {
+    if host.is_empty() {
         return None;
+    }
+    // A wildcard host is never a Kubernetes Service; the only destination it
+    // can name is a registered wildcard ServiceEntry host (`*.example.com`),
+    // owned like any external host by the single namespace that declares it
+    // (issue #7395). Checked before the syntax arms, which would otherwise
+    // read `*.beta.svc` as a Service named `*`.
+    if host.contains('*') {
+        let is_wildcard_service_entry_host = host
+            .strip_prefix("*.")
+            .is_some_and(|suffix| !suffix.is_empty() && !suffix.contains('*'));
+        if !is_wildcard_service_entry_host {
+            return None;
+        }
+        let declared_owner = service_entry_host_owner(service_entry_hosts, &host)?;
+        return Some(DestinationHostOwner::ExternalHost {
+            namespace: declared_owner.to_string(),
+        });
     }
 
     if let Some((name, namespace)) = host
