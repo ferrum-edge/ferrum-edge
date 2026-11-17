@@ -21,6 +21,7 @@ use super::{
     PluginResult, RequestContext, ResponseStreamAction, ResponseStreamInspector,
     allocate_response_stream_handoff_id,
 };
+use crate::util::json_dup_keys;
 use crate::util::unknown_keys::reject_unknown_keys;
 
 /// Domain separator and schema version for [`A2aGateway`] replay provenance.
@@ -800,6 +801,22 @@ impl A2aGateway {
             }
             return None;
         }
+        // Duplicate member names make the classified envelope and the
+        // forwarded bytes two different documents: `serde_json` keeps the LAST
+        // `method` while a first-key-wins A2A server executes the FIRST, so
+        // `{"method":"tasks/cancel","method":"message/send"}` would be policed
+        // as `message/send` (GHSA-c78j-5w9p-cpq6, GHSA-49cr-v28q-9hgp). Such a
+        // body, a singleton or a batch, cannot be classified: under a policy
+        // that can deny it fails closed exactly like an oversized body,
+        // otherwise it is left unclassified. Malformed JSON is not ambiguous
+        // and keeps its own handling below.
+        if json_dup_keys::slice_ambiguity(body).is_some() {
+            warn_sampled!(
+                body_size = body.len(),
+                "A2A JSON-RPC request body has duplicate member names and cannot be classified"
+            );
+            return self.jsonrpc_inspection_failed_detection(false);
+        }
         let value: Value = serde_json::from_slice(body).ok()?;
         if let Some(batch) = value.as_array() {
             return self.detect_jsonrpc_batch(ctx, batch, headers);
@@ -1542,7 +1559,12 @@ impl A2aGateway {
         }
         // Bounded by the detection ceiling just checked; parses without
         // building a tree.
-        if serde_json::from_slice::<serde::de::IgnoredAny>(body).is_err() {
+        // A duplicate-member body was left unclassified by
+        // `detect_jsonrpc_body`; which class a first-key-wins server sees is
+        // unknowable, so it is unreadable here too.
+        if serde_json::from_slice::<serde::de::IgnoredAny>(body).is_err()
+            || json_dup_keys::slice_ambiguity(body).is_some()
+        {
             return Some(FinalClassUnprovable::Unreadable);
         }
         let is_array = body
