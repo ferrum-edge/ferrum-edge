@@ -12356,6 +12356,8 @@ fn make_raw_post_ctx(body: &str) -> RequestContext {
     ctx
 }
 
+/// Both directions carry rules, so the uninspectable marker is
+/// direction-scoped (`ai_semantic_firewall.<direction>.uninspectable_body`).
 fn ambiguous_firewall(on_error: &str) -> AiSemanticFirewall {
     plugin(&json!({
         "inspect": {"request": true, "response": true},
@@ -12388,7 +12390,7 @@ async fn duplicate_member_request_bodies_fail_closed() {
         );
         assert_eq!(
             ctx.metadata
-                .get("ai_semantic_firewall.uninspectable_body")
+                .get("ai_semantic_firewall.request.uninspectable_body")
                 .map(String::as_str),
             Some("ambiguous_json"),
             "{body}"
@@ -12408,7 +12410,7 @@ async fn duplicate_member_request_bodies_fail_closed() {
         );
         assert_eq!(
             ctx.metadata
-                .get("ai_semantic_firewall.uninspectable_body")
+                .get("ai_semantic_firewall.request.uninspectable_body")
                 .map(String::as_str),
             Some("ambiguous_json"),
             "final: {body}"
@@ -12421,7 +12423,7 @@ async fn duplicate_member_request_bodies_fail_closed() {
     assert_continue(warn.before_proxy(&mut ctx, &mut json_headers()).await);
     assert_eq!(
         ctx.metadata
-            .get("ai_semantic_firewall.uninspectable_body")
+            .get("ai_semantic_firewall.request.uninspectable_body")
             .map(String::as_str),
         Some("ambiguous_json")
     );
@@ -12443,7 +12445,7 @@ async fn duplicate_member_response_body_fails_closed() {
     );
     assert_eq!(
         ctx.metadata
-            .get("ai_semantic_firewall.uninspectable_body")
+            .get("ai_semantic_firewall.response.uninspectable_body")
             .map(String::as_str),
         Some("ambiguous_json")
     );
