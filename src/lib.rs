@@ -6024,6 +6024,7 @@ pub mod _test_support {
             4_096,
             None,
             None,
+            None,
         )
         .await?;
         Ok(handshake.stream)
@@ -6443,6 +6444,7 @@ pub mod _test_support {
             65_536,
             262_144,
             4_096,
+            None,
             None,
             None,
         )

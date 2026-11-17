@@ -1200,6 +1200,10 @@ pub(crate) async fn handle_h3_websocket(
                     state.websocket_write_buffer_size,
                     ws_idle_tracker.clone(),
                     Some(&state.dns_cache),
+                    crate::proxy::websocket_preserved_backend_host(
+                        proxy.preserve_host_header,
+                        ws_client_host.as_deref(),
+                    ),
                 )
                 .await
                 .map(|handshake| crate::proxy::WsBackendHandshake::Direct(Box::new(handshake))),

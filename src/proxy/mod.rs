@@ -17447,6 +17447,10 @@ async fn handle_websocket_request_authenticated(
                         state.websocket_write_buffer_size,
                         ws_idle_tracker.clone(),
                         Some(&state.dns_cache),
+                        websocket_preserved_backend_host(
+                            proxy.preserve_host_header,
+                            ws_client_host.as_deref(),
+                        ),
                     )
                     .await
                     .map(|handshake| WsBackendHandshake::Direct(Box::new(handshake))),
@@ -19752,6 +19756,12 @@ pub(crate) async fn connect_websocket_backend(
     // safe) and that exact IP is dialed. `None` (test helpers only) keeps OS
     // resolution. Literal-IP backends are screened explicitly regardless.
     dns_cache: Option<&crate::dns::DnsCache>,
+    // The `Host` the upgrade request carries instead of the backend URL
+    // authority: the validated client Host under `preserve_host_header`
+    // ([`websocket_preserved_backend_host`], issue #7392). The dial address,
+    // request-target, TLS SNI and certificate verification still come from
+    // `backend_url`.
+    preserved_host: Option<&str>,
 ) -> Result<BackendWsHandshake, Box<dyn std::error::Error + Send + Sync>> {
     let mut ws_config = WebSocketConfig::default();
     ws_config.max_frame_size = Some(max_websocket_frame_size_bytes);
@@ -19762,6 +19772,15 @@ pub(crate) async fn connect_websocket_backend(
     ws_config.auto_pong = false;
 
     let mut ws_request = backend_url.into_client_request()?;
+    // tungstenite writes the request's `Host` header verbatim and derives the
+    // TLS server name from the request URI, never from `Host`, so replacing
+    // the header changes only the virtual host the backend sees.
+    if let Some(host) = preserved_host {
+        ws_request.headers_mut().insert(
+            hyper::header::HOST,
+            hyper::header::HeaderValue::from_str(host)?,
+        );
+    }
     for (name, value) in client_headers {
         if let (Ok(header_name), Ok(header_value)) = (
             hyper::header::HeaderName::from_bytes(name.as_bytes()),
@@ -19914,6 +19933,25 @@ pub(crate) async fn connect_websocket_backend(
         backend_extensions,
         backend_response_headers,
     })
+}
+
+/// The `Host` a direct TCP/TLS WebSocket backend handshake sends in place of
+/// the backend URL authority (issue #7392).
+///
+/// With `preserve_host_header` on, the backend sees the client's Host, exactly
+/// as on the HTTP, gRPC, direct-H2 and H3 paths of the same proxy. The value
+/// passes the same `validated_outbound_host` screen those paths use; a missing
+/// or invalid client Host (userinfo, bad authority, unbracketed IPv6) returns
+/// `None`, so the handshake falls back to the backend authority. Shared by the
+/// H1/H2 and H3 WebSocket bridges.
+pub(crate) fn websocket_preserved_backend_host(
+    preserve_host_header: bool,
+    client_host: Option<&str>,
+) -> Option<&str> {
+    if !preserve_host_header {
+        return None;
+    }
+    client_host.and_then(validated_outbound_host)
 }
 
 /// Open an RFC 6455 WebSocket to a sidecar-ingress Unix-domain backend
