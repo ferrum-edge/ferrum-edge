@@ -1581,20 +1581,20 @@ impl A2aGateway {
         }
         // Bounded by the detection ceiling just checked; parses without
         // building a tree.
-        // A duplicate-member body was left unclassified by
-        // `detect_jsonrpc_body`; which class a first-key-wins server sees is
-        // unknowable, so it is unreadable here too.
-        if serde_json::from_slice::<serde::de::IgnoredAny>(body).is_err()
-            || json_dup_keys::slice_ambiguity(body).is_some()
-        {
+        if serde_json::from_slice::<serde::de::IgnoredAny>(body).is_err() {
             return Some(FinalClassUnprovable::Unreadable);
         }
+        // A duplicate-member body was left unclassified by
+        // `detect_jsonrpc_body`; which class a first-key-wins server sees is
+        // unknowable, so it is refused too. Only member names are ambiguous,
+        // not the array shape, so a batch is still answered as a batch below.
+        let ambiguous = json_dup_keys::slice_ambiguity(body).is_some();
         let is_array = body
             .iter()
             .find(|byte| !byte.is_ascii_whitespace())
             .is_some_and(|byte| *byte == b'[');
         if !is_array {
-            return None;
+            return ambiguous.then_some(FinalClassUnprovable::Unreadable);
         }
         // Only reached for a changed, unclassifiable batch; the tree is bounded
         // by the same ceiling and is needed to answer every request member.
