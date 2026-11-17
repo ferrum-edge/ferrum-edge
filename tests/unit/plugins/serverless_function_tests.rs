@@ -3657,6 +3657,7 @@ async fn test_terminate_forwards_safe_headers_and_preserves_repeated_cookies() {
                 .insert_header("x-function-internal", "must-strip")
                 .insert_header("x-amz-request-id", "provider-control")
                 .insert_header("x-api-key", "response-secret")
+                .insert_header("content-disposition", "attachment; filename=\"résumé.pdf\"")
                 .append_header("set-cookie", "a=1; Path=/")
                 .append_header("set-cookie", "b=2; Path=/"),
         )
@@ -3690,6 +3691,11 @@ async fn test_terminate_forwards_safe_headers_and_preserves_repeated_cookies() {
             assert_eq!(
                 headers.get("set-cookie").map(String::as_str),
                 Some("a=1; Path=/\nb=2; Path=/")
+            );
+            // GHSA-j26x-88q2-wq5m: a UTF-8 filename survives byte for byte.
+            assert_eq!(
+                headers.get("content-disposition").map(String::as_str),
+                Some("attachment; filename=\"résumé.pdf\"")
             );
             for stripped in [
                 "connection",
