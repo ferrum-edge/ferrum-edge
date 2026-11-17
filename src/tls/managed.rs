@@ -409,32 +409,37 @@ impl ManagedTlsStore {
         })
     }
 
-    /// [`Self::delete`] that first asks `still_authorized`, under the store's
-    /// exclusive lock, whether the caller may still remove the record.
+    /// Delete `id` only while `still_authorized` holds (issue #7394).
     ///
-    /// The admin delete guard passes its admission-lease fence here (issue
-    /// #7394), so the fence is re-validated after every lock wait and
-    /// immediately before the record is removed. `Ok(None)` means the check
-    /// refused and nothing changed or was republished.
+    /// The check runs under the store's exclusive lock immediately before the
+    /// record is removed, and again after the removal has been persisted. If
+    /// it fails before, nothing changes; if it fails after (the caller's lease
+    /// lapsed while persistence I/O stalled), the record is restored before
+    /// the lock is released. Either way the result is `Ok(None)`, so a delete
+    /// made without authority is never left in place or reported as done.
     pub fn delete_if_authorized(
         &self,
         id: &str,
-        still_authorized: impl FnOnce() -> bool,
+        still_authorized: impl Fn() -> bool,
     ) -> Result<Option<ManagedTlsRecord>, ManagedTlsError> {
         validate_managed_id(id)?;
         let id = id.to_string();
-        self.file.mutate_if(move |document| {
-            if !document.records.contains_key(&id) {
-                return Err(ManagedTlsError::NotFound(id));
-            }
-            if !still_authorized() {
-                return Ok((false, None));
-            }
-            match document.records.remove(&id) {
-                Some(record) => Ok((true, Some(record))),
-                None => Err(ManagedTlsError::NotFound(id)),
-            }
-        })
+        let outcome = self.file.mutate_if_confirmed(
+            |document| {
+                if !document.records.contains_key(&id) {
+                    return Err(ManagedTlsError::NotFound(id.clone()));
+                }
+                if !still_authorized() {
+                    return Ok((false, None));
+                }
+                match document.records.remove(&id) {
+                    Some(record) => Ok((true, Some(record))),
+                    None => Err(ManagedTlsError::NotFound(id.clone())),
+                }
+            },
+            &still_authorized,
+        )?;
+        Ok(outcome.flatten())
     }
 
     pub fn material(

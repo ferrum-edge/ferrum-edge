@@ -1049,8 +1049,9 @@ pub(super) async fn handle_delete_acme_certificate(
     };
     let id = id.to_string();
     let deleted = match offload_store_write("acme_certificate_delete", move || {
+        tls_store_delete_hook(&id);
         let deleted =
-            store.delete_certificate_if_authorized(&id, || tls_reference_fence_held(&fence));
+            store.delete_certificate_if_authorized(&id, tls_reference_fence_check(&fence));
         drop(fence);
         deleted
     })
@@ -1275,8 +1276,9 @@ pub(super) async fn handle_delete_managed(
         Ok(_) => {
             let owned_id = id.to_string();
             let deleted = match offload_store_write("managed_tls_delete", move || {
+                tls_store_delete_hook(&owned_id);
                 let deleted =
-                    store.delete_if_authorized(&owned_id, || tls_reference_fence_held(&fence));
+                    store.delete_if_authorized(&owned_id, tls_reference_fence_check(&fence));
                 drop(fence);
                 deleted
             })
@@ -2779,6 +2781,10 @@ struct TlsReferenceFence {
     admission: super::crud::NamespaceRegistryAdmission,
     db: Arc<dyn crate::config::db_backend::DatabaseBackend>,
     topology: crate::config::db_backend::DbWriteTopologyPermit,
+    /// Test-only: invalidate the leases once the store has persisted the
+    /// removal, as a renewal that lapsed during persistence I/O would.
+    #[cfg(feature = "test-support")]
+    lose_after_persist: bool,
 }
 
 impl TlsReferenceFence {
@@ -2877,7 +2883,7 @@ async fn tls_record_usage(
                     }
                 }
             }
-            run_tls_reference_scan_hook(id, &admission).await;
+            let lose_after_persist = run_tls_reference_scan_hook(id, &admission).await;
             let current = match db.list_namespaces_authoritative().await {
                 Ok(current) => current,
                 Err(_error) => {
@@ -2889,10 +2895,14 @@ async fn tls_record_usage(
                 .iter()
                 .all(|name| namespaces.binary_search(name).is_ok())
             {
+                #[cfg(not(feature = "test-support"))]
+                let _ = lose_after_persist;
                 fence = Some(TlsReferenceFence {
                     admission,
                     db: db.clone(),
                     topology,
+                    #[cfg(feature = "test-support")]
+                    lose_after_persist,
                 });
                 break;
             }
@@ -2954,6 +2964,30 @@ fn tls_reference_fence_held(fence: &Option<TlsReferenceFence>) -> bool {
     }
 }
 
+/// The check the TLS store runs before removing the record and again after
+/// persisting the removal (review round 3, sol F1).
+fn tls_reference_fence_check(fence: &Option<TlsReferenceFence>) -> impl Fn() -> bool + '_ {
+    let checks = std::cell::Cell::new(0_u32);
+    move || {
+        checks.set(checks.get().saturating_add(1));
+        apply_test_fence_loss_after_persist(fence, checks.get());
+        tls_reference_fence_held(fence)
+    }
+}
+
+#[cfg(feature = "test-support")]
+fn apply_test_fence_loss_after_persist(fence: &Option<TlsReferenceFence>, check: u32) {
+    if check > 1
+        && let Some(fence) = fence
+        && fence.lose_after_persist
+    {
+        fence.admission.force_lose_for_test();
+    }
+}
+
+#[cfg(not(feature = "test-support"))]
+fn apply_test_fence_loss_after_persist(_fence: &Option<TlsReferenceFence>, _check: u32) {}
+
 /// The store refused the delete because the fence lapsed after the scan: its
 /// answer may no longer hold, so nothing was removed.
 fn tls_reference_fence_lost_response() -> Response<Full<Bytes>> {
@@ -2970,6 +3004,9 @@ pub enum TlsReferenceScanHookAction {
     Continue,
     /// Invalidate the fence's leases, as a lapsed renewal would.
     LoseFence,
+    /// Keep the fence through the pre-removal check, then invalidate it once
+    /// the store has persisted the removal.
+    LoseFenceAfterPersist,
 }
 
 /// Test hook awaited between the reference scan and the namespace re-check.
@@ -3012,14 +3049,20 @@ pub fn set_tls_reference_scan_hook_for_tests(
     }
 }
 
-/// Await this record's test hook, if any, and apply what it asks.
+/// Await this record's test hook, if any, and apply what it asks. Returns
+/// whether the fence should lapse after the store persists the removal.
 #[cfg(feature = "test-support")]
 async fn run_tls_reference_scan_hook(
     id: &str,
     admission: &super::crud::NamespaceRegistryAdmission,
-) {
-    if tls_reference_scan_hook(id).await == TlsReferenceScanHookAction::LoseFence {
-        admission.force_lose_for_test();
+) -> bool {
+    match tls_reference_scan_hook(id).await {
+        TlsReferenceScanHookAction::Continue => false,
+        TlsReferenceScanHookAction::LoseFence => {
+            admission.force_lose_for_test();
+            false
+        }
+        TlsReferenceScanHookAction::LoseFenceAfterPersist => true,
     }
 }
 
@@ -3028,8 +3071,58 @@ async fn run_tls_reference_scan_hook(
 async fn run_tls_reference_scan_hook(
     _id: &str,
     _admission: &super::crud::NamespaceRegistryAdmission,
-) {
+) -> bool {
+    false
 }
+
+/// Test hook run on the blocking thread at the start of the store delete,
+/// with the fence already moved there. Keyed by record id.
+#[cfg(feature = "test-support")]
+type TlsStoreDeleteHookForTests = std::sync::Arc<dyn Fn() + Send + Sync>;
+
+#[cfg(feature = "test-support")]
+fn tls_store_delete_hook_slot()
+-> &'static std::sync::Mutex<std::collections::HashMap<String, TlsStoreDeleteHookForTests>> {
+    static HOOKS: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<String, TlsStoreDeleteHookForTests>>,
+    > = std::sync::OnceLock::new();
+    HOOKS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// Install (`Some`) or remove (`None`) the hook the blocking store delete of
+/// `record_id` runs before it touches the store. A hook may block (it runs on
+/// a blocking thread) to hold the delete while the test cancels the request.
+#[cfg(feature = "test-support")]
+#[doc(hidden)]
+pub fn set_tls_store_delete_hook_for_tests(
+    record_id: &str,
+    hook: Option<TlsStoreDeleteHookForTests>,
+) {
+    if let Ok(mut hooks) = tls_store_delete_hook_slot().lock() {
+        match hook {
+            Some(hook) => {
+                hooks.insert(record_id.to_string(), hook);
+            }
+            None => {
+                hooks.remove(record_id);
+            }
+        }
+    }
+}
+
+#[cfg(feature = "test-support")]
+fn tls_store_delete_hook(id: &str) {
+    let hook = tls_store_delete_hook_slot()
+        .lock()
+        .ok()
+        .and_then(|hooks| hooks.get(id).cloned());
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
+#[cfg(not(feature = "test-support"))]
+fn tls_store_delete_hook(_id: &str) {}
 
 #[cfg(feature = "test-support")]
 async fn tls_reference_scan_hook(id: &str) -> TlsReferenceScanHookAction {

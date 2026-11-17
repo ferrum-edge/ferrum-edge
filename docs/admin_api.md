@@ -839,9 +839,12 @@ namespace-registry admission lease and every listed namespace's config
 admission lease (the same leases every admin writer holds from validation to
 commit), reads only proxies, upstreams and plugin configs under them,
 re-reads the namespace list, and removes the record only after the TLS store
-has re-validated the fence under its own exclusive lock. The fence stays held
-until that store write concludes, even if the request is cancelled; if it
-lapsed or the topology changed, nothing is removed and the answer is `503`.
+has re-validated the fence under its own exclusive lock. The store checks the
+fence again once the removal is persisted, still under that lock, and restores
+the record if the fence lapsed while the write was being persisted. The fence
+stays held until that store write concludes, even if the request is
+cancelled; if it lapsed or the topology changed, the record is left (or put
+back) in place and the answer is `503`.
 A namespace that appears during the scan restarts it (up to three times,
 then `503`).
 

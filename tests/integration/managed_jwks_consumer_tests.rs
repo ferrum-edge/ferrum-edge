@@ -1055,3 +1055,136 @@ async fn reconnect_waits_for_the_delete_fence() {
     assert_eq!(status, StatusCode::OK, "{body}");
     reconnecting.abort();
 }
+
+/// Review round 3 (sol F1 / dsf F1) on #7412: the store checks the fence
+/// again after it has persisted the removal. A fence that lapsed while the
+/// write was being persisted restores the record before the store lock is
+/// released, and the delete answers `503`, never `200`.
+#[tokio::test(flavor = "multi_thread")]
+async fn delete_restores_the_record_when_the_fence_lapses_during_persistence() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (admin, record_id, _source, _store) = database_admin_with_record(&dir).await;
+    let (_hook, scanned, release) = pause_first_scan_of(
+        &record_id,
+        TlsReferenceScanHookAction::LoseFenceAfterPersist,
+    );
+    let path = format!("/admin/tls/jwks/{record_id}");
+    let deleting = {
+        let admin = admin.clone();
+        let path = path.clone();
+        tokio::spawn(async move { admin.send(reqwest::Method::DELETE, &path, None).await })
+    };
+    within("the reference scan", scanned.notified()).await;
+    release.notify_one();
+    let (status, body) = within("the delete", deleting).await.expect("delete task");
+    assert_eq!(
+        status,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "a fence lost during persistence must not report a delete: {body}"
+    );
+    let (status, body) = admin.send(reqwest::Method::GET, &path, None).await;
+    assert_eq!(status, StatusCode::OK, "the record was restored: {body}");
+}
+
+/// Removes this test's store-delete hook even when the test panics.
+struct StoreDeleteHookGuard(String);
+
+impl Drop for StoreDeleteHookGuard {
+    fn drop(&mut self) {
+        ferrum_edge::admin::set_tls_store_delete_hook_for_tests(&self.0, None);
+    }
+}
+
+/// Review round 3 (dsf F3) on #7412, the round-2 sol F1 fix: the fence moves
+/// into the blocking store delete. Cancelling the request (an HTTP/2 stream
+/// reset) while that delete is held must not release the namespace leases: a
+/// reference write into a scanned namespace still waits, and once the delete
+/// completes it fails admission because the record is gone.
+#[tokio::test(flavor = "multi_thread")]
+async fn cancelled_delete_keeps_the_fence_until_the_store_delete_ends() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (admin, record_id, source, _store) = database_admin_with_record(&dir).await;
+    let tenant = "tenant-b";
+    let (status, body) = admin
+        .send_ns(
+            reqwest::Method::POST,
+            "/consumers",
+            Some(json!({"id": "tenant-b-consumer", "username": "tenant-b-consumer"})),
+            tenant,
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+
+    // Hold the blocking store delete, with the fence already moved into it.
+    let (entered_tx, entered_rx) = tokio::sync::oneshot::channel::<()>();
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    let entered_tx = std::sync::Mutex::new(Some(entered_tx));
+    let release_rx = std::sync::Mutex::new(release_rx);
+    ferrum_edge::admin::set_tls_store_delete_hook_for_tests(
+        &record_id,
+        Some(Arc::new(move || {
+            if let Some(tx) = entered_tx.lock().expect("entered lock").take() {
+                let _ = tx.send(());
+            }
+            let _ = release_rx
+                .lock()
+                .expect("release lock")
+                .recv_timeout(std::time::Duration::from_secs(60));
+        })),
+    );
+    let _store_hook = StoreDeleteHookGuard(record_id.clone());
+
+    // An HTTP/2 client, so aborting the request resets its stream and the
+    // server drops the handler future.
+    let h2 = reqwest::Client::builder()
+        .http2_prior_knowledge()
+        .timeout(std::time::Duration::from_secs(60))
+        .build()
+        .expect("h2 client");
+    let deleting = {
+        let url = format!("{}/admin/tls/jwks/{record_id}", admin.base);
+        let token = admin.token.clone();
+        tokio::spawn(async move { h2.delete(url).bearer_auth(token).send().await })
+    };
+    within("the store delete", entered_rx)
+        .await
+        .expect("store delete hook");
+    deleting.abort();
+    let _ = deleting.await;
+
+    let mut writing = {
+        let admin = admin.clone();
+        let source = source.clone();
+        tokio::spawn(async move {
+            admin
+                .send_ns(
+                    reqwest::Method::POST,
+                    "/plugins/config",
+                    Some(jwks_auth_plugin_body("cancelled-race-auth", &source, true)),
+                    tenant,
+                )
+                .await
+        })
+    };
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(500), &mut writing)
+            .await
+            .is_err(),
+        "the cancelled delete's fence must still hold tenant-b's lease"
+    );
+    release_tx.send(()).expect("release the store delete");
+
+    let (status, body) = within("the write", writing).await.expect("write task");
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "the late reference fails admission once the record is gone: {body}"
+    );
+    let path = format!("/admin/tls/jwks/{record_id}");
+    let (status, body) = admin.send(reqwest::Method::GET, &path, None).await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "the delete completed: {body}"
+    );
+}

@@ -744,7 +744,8 @@ paths:
         namespace-registry lease and every namespace's config admission lease
         until the record is removed, so no write in a scanned namespace commits
         in between; the TLS store re-checks that fence before removing the
-        record and answers `503` if it lapsed. A first write into a namespace
+        record and after persisting the removal (restoring the record if it
+        lapsed meanwhile), and answers `503` if it lapsed. A first write into a namespace
         with no rows can still race the delete. See docs/admin_api.md
         "Managed record deletion".
       tags: [TLS]
@@ -1247,7 +1248,8 @@ paths:
         namespace-registry lease and every namespace's config admission lease
         until the record is removed, so no write in a scanned namespace commits
         in between; the TLS store re-checks that fence before removing the
-        record and answers `503` if it lapsed. A first write into a namespace
+        record and after persisting the removal (restoring the record if it
+        lapsed meanwhile), and answers `503` if it lapsed. A first write into a namespace
         with no rows can still race the delete. See docs/admin_api.md
         "Managed record deletion".
       tags: [TLS]
@@ -1425,7 +1427,8 @@ paths:
         namespace-registry lease and every namespace's config admission lease
         until the record is removed, so no write in a scanned namespace commits
         in between; the TLS store re-checks that fence before removing the
-        record and answers `503` if it lapsed. A first write into a namespace
+        record and after persisting the removal (restoring the record if it
+        lapsed meanwhile), and answers `503` if it lapsed. A first write into a namespace
         with no rows can still race the delete. See docs/admin_api.md
         "Managed record deletion".
       tags: [TLS]
@@ -1599,7 +1602,8 @@ paths:
         namespace-registry lease and every namespace's config admission lease
         until the record is removed, so no write in a scanned namespace commits
         in between; the TLS store re-checks that fence before removing the
-        record and answers `503` if it lapsed. A first write into a namespace
+        record and after persisting the removal (restoring the record if it
+        lapsed meanwhile), and answers `503` if it lapsed. A first write into a namespace
         with no rows can still race the delete. See docs/admin_api.md
         "Managed record deletion".
       tags: [TLS]
@@ -1773,7 +1777,8 @@ paths:
         namespace-registry lease and every namespace's config admission lease
         until the record is removed, so no write in a scanned namespace commits
         in between; the TLS store re-checks that fence before removing the
-        record and answers `503` if it lapsed. A first write into a namespace
+        record and after persisting the removal (restoring the record if it
+        lapsed meanwhile), and answers `503` if it lapsed. A first write into a namespace
         with no rows can still race the delete. See docs/admin_api.md
         "Managed record deletion".
       tags: [TLS]
@@ -1959,7 +1964,8 @@ paths:
         namespace-registry lease and every namespace's config admission lease
         until the record is removed, so no write in a scanned namespace commits
         in between; the TLS store re-checks that fence before removing the
-        record and answers `503` if it lapsed. A first write into a namespace
+        record and after persisting the removal (restoring the record if it
+        lapsed meanwhile), and answers `503` if it lapsed. A first write into a namespace
         with no rows can still race the delete. See docs/admin_api.md
         "Managed record deletion".
       tags: [TLS]
