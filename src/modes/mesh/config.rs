@@ -3500,9 +3500,9 @@ pub struct MeshSidecar {
     /// non-object block, or an `egressProxy` Ferrum cannot route through —
     /// resolves fail-closed to [`OutboundTrafficPolicy::RegistryOnly`] and is
     /// surfaced in the resource's `deferred_fields` status. The Sidecar itself
-    /// is never REJECTED over this field: dropping it would also drop its egress
-    /// narrowing and thereby WIDEN both the slice's service view and the derived
-    /// outbound registry.
+    /// is never REJECTED over this field: `REGISTRY_ONLY` is already its exact
+    /// fail-closed reading. (A Sidecar rejected for another reason is published
+    /// as a fail-closed marker rather than dropped, GHSA-2r85-85hh-23mw.)
     ///
     /// Applied only under `FERRUM_MESH_SIDECAR_ENFORCED && !…_DRY_RUN` (the same
     /// effective gate as `ingress[]` materialization) — see

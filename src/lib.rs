@@ -19092,6 +19092,17 @@ pub mod _test_support {
             self.metrics.snapshot().watch_idle_relists
         }
 
+        /// Reflector rebuilds a demand-driven revision-evidence refresh started
+        /// (issue #7399), counted apart from idle relists.
+        pub fn watch_evidence_refresh_relists(&self) -> u64 {
+            self.metrics.snapshot().watch_evidence_refresh_relists
+        }
+
+        /// Watch `Delete` events the production watcher observed (issue #4491).
+        pub fn watch_deletes(&self) -> u64 {
+            self.metrics.snapshot().watch_deletes
+        }
+
         /// Watch stream errors the production watcher counted (issue #4491),
         /// one per attempt whatever the logging decision was.
         pub fn watch_errors(&self) -> u64 {

@@ -807,3 +807,55 @@ async fn an_ordinary_watch_error_is_counted_but_not_held() {
     let _ = shutdown_tx.send(true);
     watcher.await.expect("watcher task");
 }
+
+/// Issue #7399 review: while a revision-evidence refresh replacement lists,
+/// the scope's live watch keeps being polled. An item it delivers is a
+/// delivered item like any other, so it must end the failure streak (issue
+/// #4491): recovery is logged, and the next fault is announced at error level
+/// as a new streak instead of being demoted to a debug-level repeat.
+#[tokio::test(start_paused = true)]
+async fn a_live_watch_delivery_during_a_refresh_ends_the_failure_streak() {
+    let (logs, _guard) = capture_logs();
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    // Only generation 0 is scripted, so the refresh replacement never lists.
+    let (harness, task) = scope(1, 0, shutdown_rx);
+    let watcher = tokio::spawn(task);
+    let transport_failure =
+        || watcher::Error::WatchFailed(kube::Error::LinesCodecMaxLineLengthExceeded);
+
+    list(&harness, 0, &["blackbox-tcp-main"]);
+    harness.emit_error(0, transport_failure());
+    tokio::time::sleep(SETTLE).await;
+    assert_eq!(logs.matching("ERROR", "class=\"other\"").len(), 1);
+
+    // Past the refresh spacing floor, then ask for evidence.
+    tokio::time::sleep(Duration::from_secs(10)).await;
+    harness.request_evidence_refresh();
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert_eq!(harness.watch_evidence_refresh_relists(), 1);
+
+    // The live watch delivers while the replacement is still listing.
+    apply(&harness, 0, "blackbox-tcp-new");
+    tokio::time::sleep(SETTLE).await;
+    assert_eq!(
+        harness.visible_names().await,
+        vec!["blackbox-tcp-main", "blackbox-tcp-new"]
+    );
+    let recovered = logs.matching("INFO", "recovered");
+    assert_eq!(recovered.len(), 1, "{:?}", logs.lines());
+    assert!(recovered[0].contains("failed_attempts=1"), "{recovered:?}");
+
+    // A later fault on the resumed watch starts a fresh streak.
+    harness.emit_error(0, transport_failure());
+    tokio::time::sleep(SETTLE).await;
+    assert_eq!(
+        logs.matching("ERROR", "class=\"other\"").len(),
+        2,
+        "the second fault is a new streak, announced at error level: {:?}",
+        logs.lines()
+    );
+    assert!(logs.matching("DEBUG", "watch error repeated").is_empty());
+
+    let _ = shutdown_tx.send(true);
+    watcher.await.expect("watcher task");
+}

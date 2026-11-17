@@ -12498,7 +12498,19 @@ CI_JOB_GENERATION_TRANSITIONS: tuple[tuple[str, str, str], ...] = (
 WORKFLOW_DIRECTORY_JOB_GENERATION_TRANSITIONS: tuple[
     tuple[str, str, str, str], ...
 ] = (
-    # Empty: no workflow-directory job generation transition is admitted.
+    # Issue #7405: `gateways-protocol-benchmark.yml` `benchmark` matches the
+    # `skip_protocols`, `skip_payload_sizes` and `skip_gateways` dispatch
+    # inputs (and the image pre-pull list) as whole space-delimited tokens with
+    # `case` instead of `grep -qw`, which treated `-` as a word boundary so
+    # skipping `udp-dtls` also skipped `udp`. Only those shell matches change;
+    # the job's Cross-sensitive command lines are unchanged. Retire this tuple
+    # once the destination is on `main`.
+    (
+        "gateways-protocol-benchmark.yml",
+        "benchmark",
+        "70b612bb967eda2827bcc5708133a30c27508be6ffd581e82150d8be5bde3ec8",
+        "2e12a83bd3541987b20799a4bca524a336021790f38781c4ab5dee8bd65bbc67",
+    ),
     #
     # PR #7400's `gateways-protocol-benchmark.yml` `benchmark` pair (dropping
     # the BuildKit `type=gha,mode=max` layer cache that filled the Actions

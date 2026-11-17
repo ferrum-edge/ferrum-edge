@@ -1160,6 +1160,7 @@ fn representative_metrics_exposition_matches_contract() {
         "ferrum_k8s_controller_istio_status_retries_total",
         "ferrum_k8s_controller_reconciliations_total",
         "ferrum_k8s_controller_watch_idle_relists_total",
+        "ferrum_k8s_controller_watch_evidence_refresh_relists_total",
         "ferrum_k8s_controller_watch_deletes_total",
         "ferrum_k8s_controller_watch_errors_total",
         "ferrum_k8s_controller_watch_relist_missed_deletes_total",
