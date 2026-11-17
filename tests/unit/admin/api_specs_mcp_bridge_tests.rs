@@ -673,3 +673,34 @@ fn x_ferrum_mcp_endpoint_overlap_checks_every_server_base() {
         "/pets-api/v1/pets/{petId}"
     );
 }
+
+#[test]
+fn x_ferrum_mcp_endpoint_overlap_work_is_bounded() {
+    // Every operation is checked under every effective server base, so a
+    // small document can ask for a large product of paths. Past a fixed
+    // budget the import is refused instead of doing unbounded work.
+    let servers: Vec<Value> = (0..300)
+        .map(|index| json!({ "url": format!("https://pets.example.com/b{index}") }))
+        .collect();
+    let mut paths = pet_paths();
+    for index in 0..220 {
+        paths[format!("/unselected{index}").as_str()] = plain_get(&format!("op{index}"), false);
+    }
+    let mut document = spec(json!({ "namespace": "pets" }), paths);
+    document["servers"] = Value::Array(servers);
+    let error = extract_error(&document);
+    assert!(error.contains("exceeds that budget"), "{error}");
+
+    // The same shape well inside the budget imports.
+    let servers: Vec<Value> = (0..20)
+        .map(|index| json!({ "url": format!("https://pets.example.com/b{index}") }))
+        .collect();
+    let mut paths = pet_paths();
+    for index in 0..20 {
+        paths[format!("/unselected{index}").as_str()] = plain_get(&format!("op{index}"), false);
+    }
+    let mut document = spec(json!({ "namespace": "pets" }), paths);
+    document["servers"] = Value::Array(servers);
+    let config = generated_gateway(&document);
+    assert_eq!(config["endpoint"]["path"], "/pets-api/mcp");
+}
