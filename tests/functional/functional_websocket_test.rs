@@ -4950,3 +4950,358 @@ async fn test_h3_websocket_ping_responsive_backend_yields_exactly_one_pong() {
     gateway.shutdown();
     echo_handle.abort();
 }
+
+// ============================================================================
+// Backend handshake responses: forwarded 101 headers (issue #7391), preserved
+// Host on direct dials (issue #7392) and relayed backend refusals
+// (GHSA-7x2j-3389-2h35) on H1, H2 Extended CONNECT and H3 Extended CONNECT.
+// ============================================================================
+
+/// Raw backend for the handshake-response tests. Every request head is read and
+/// its `(path, Host)` recorded. A path containing `deny` answers `401` with a
+/// challenge and a JSON body; any other WebSocket upgrade answers a valid `101`
+/// carrying two `Set-Cookie` lines, an end-to-end header, a header the route's
+/// policy removes and a forged gateway diagnostic header, then holds the socket;
+/// everything else (plain HTTP, the capability probe) answers `200 plain-ok`.
+async fn start_handshake_response_backend(
+    listener: TcpListener,
+    seen: Arc<std::sync::Mutex<Vec<(String, String)>>>,
+) {
+    loop {
+        let Ok((mut stream, _)) = listener.accept().await else {
+            continue;
+        };
+        let seen = seen.clone();
+        tokio::spawn(async move {
+            let mut head = Vec::new();
+            let mut buf = [0u8; 4096];
+            while !head.windows(4).any(|window| window == b"\r\n\r\n") {
+                match stream.read(&mut buf).await {
+                    Ok(0) | Err(_) => return,
+                    Ok(read) => head.extend_from_slice(&buf[..read]),
+                }
+            }
+            let head = String::from_utf8_lossy(&head).into_owned();
+            let path = head
+                .lines()
+                .next()
+                .and_then(|line| line.split_whitespace().nth(1))
+                .unwrap_or("")
+                .to_string();
+            let header = |name: &str| {
+                head.lines().find_map(|line| {
+                    let (field, value) = line.split_once(':')?;
+                    field
+                        .trim()
+                        .eq_ignore_ascii_case(name)
+                        .then(|| value.trim().to_string())
+                })
+            };
+            let is_upgrade =
+                header("upgrade").is_some_and(|value| value.eq_ignore_ascii_case("websocket"));
+            if is_upgrade {
+                seen.lock()
+                    .expect("seen lock")
+                    .push((path.clone(), header("host").unwrap_or_default()));
+            }
+            let response = if path.contains("deny") {
+                let body = r#"{"error":"backend-auth"}"#;
+                format!(
+                    "HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Bearer realm=\"ws\"\r\n\
+                     Content-Type: application/json\r\nContent-Length: {}\r\n\
+                     X-Gateway-Error: forged\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+            } else if is_upgrade {
+                let accept = tokio_tungstenite::tungstenite::handshake::derive_accept_key(
+                    header("sec-websocket-key").unwrap_or_default().as_bytes(),
+                );
+                format!(
+                    "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n\
+                     Connection: Upgrade\r\nSec-WebSocket-Accept: {accept}\r\n\
+                     Set-Cookie: sid=abc; Path=/\r\nSet-Cookie: theme=dark\r\n\
+                     X-Backend-Upgrade: yes\r\nX-Backend-Remove: secret\r\n\
+                     X-Gateway-Error: forged\r\n\r\n"
+                )
+            } else {
+                "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 8\r\n\
+                 Connection: close\r\n\r\nplain-ok"
+                    .to_string()
+            };
+            if stream.write_all(response.as_bytes()).await.is_err() {
+                return;
+            }
+            // Hold an upgraded session open until the gateway closes it.
+            while let Ok(read) = stream.read(&mut buf).await {
+                if read == 0 {
+                    break;
+                }
+            }
+        });
+    }
+}
+
+fn write_ws_handshake_response_config(config_path: &std::path::Path, backend_port: u16) {
+    let config = format!(
+        r#"
+version: "1"
+proxies:
+  - id: "ws-handshake-response-proxy"
+    listen_path: "/ws-hdr"
+    backend_scheme: http
+    backend_host: "127.0.0.1"
+    backend_port: {backend_port}
+    strip_listen_path: true
+    preserve_host_header: true
+    circuit_breaker:
+      failure_threshold: 1
+      success_threshold: 1
+      timeout_seconds: 60
+      failure_status_codes: [500, 502, 503, 504]
+      trip_on_connection_errors: true
+
+consumers: []
+plugin_configs:
+  - id: "plugin-security-headers-ws-handshake-response"
+    plugin_name: "security_headers"
+    config:
+      hsts: true
+      set:
+        X-WS-Security: "gateway-enforced"
+      remove: ["x-backend-remove"]
+    scope: global
+    enabled: true
+"#
+    );
+    let mut file = std::fs::File::create(config_path).expect("Failed to create config file");
+    file.write_all(config.as_bytes())
+        .expect("Failed to write config");
+}
+
+/// The forwarded backend `101` headers on a successful client handshake.
+fn assert_forwarded_backend_handshake_headers(headers: &http::HeaderMap, frontend: &str) {
+    let cookies: Vec<&str> = headers
+        .get_all("set-cookie")
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .collect();
+    assert_eq!(
+        cookies,
+        ["sid=abc; Path=/", "theme=dark"],
+        "{frontend}: every backend Set-Cookie on the 101 must reach the client"
+    );
+    assert_eq!(
+        headers
+            .get("x-backend-upgrade")
+            .and_then(|value| value.to_str().ok()),
+        Some("yes"),
+        "{frontend}: end-to-end backend handshake headers must be forwarded"
+    );
+    assert!(
+        headers.get("x-backend-remove").is_none(),
+        "{frontend}: response policy must still govern forwarded backend headers"
+    );
+    assert!(
+        headers.get("x-gateway-error").is_none(),
+        "{frontend}: a backend copy of a gateway-owned header must not be forwarded"
+    );
+    assert_eq!(
+        headers
+            .get("x-ws-security")
+            .and_then(|value| value.to_str().ok()),
+        Some("gateway-enforced")
+    );
+}
+
+/// The relayed backend `401` refusal on a failed client handshake.
+fn assert_relayed_backend_refusal(status: StatusCode, headers: &http::HeaderMap, frontend: &str) {
+    assert_eq!(
+        status,
+        StatusCode::UNAUTHORIZED,
+        "{frontend}: the backend's refusal must be relayed, not turned into a 502"
+    );
+    assert_eq!(
+        headers
+            .get("www-authenticate")
+            .and_then(|value| value.to_str().ok()),
+        Some("Bearer realm=\"ws\""),
+        "{frontend}: the backend challenge must reach the client"
+    );
+    assert!(
+        headers.get("x-gateway-error").is_none(),
+        "{frontend}: a relayed backend answer carries no gateway error token"
+    );
+}
+
+#[ignore]
+#[tokio::test]
+async fn test_websocket_backend_handshake_response_headers_host_and_refusal_h1_h2_h3() {
+    use bytes::Bytes;
+    use http::{Method, Version};
+    use http_body_util::{BodyExt, Empty};
+    use hyper::client::conn::http2;
+    use hyper_util::rt::{TokioExecutor, TokioIo};
+
+    let listener = TcpListener::bind_test("127.0.0.1:0")
+        .await
+        .expect("bind handshake-response backend");
+    let backend_port = listener.local_addr().expect("backend addr").port();
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let backend = tokio::spawn(start_handshake_response_backend(listener, seen.clone()));
+
+    let temp_dir = TempDir::new().expect("Failed to create temp dir");
+    let config_path = temp_dir.path().join("config.yaml");
+    write_ws_handshake_response_config(&config_path, backend_port);
+    build_gateway().expect("Failed to build gateway");
+    let (mut gateway, gateway_http_port, gateway_https_port) = start_gateway_tls_with_retry(
+        config_path.to_str().unwrap(),
+        "tests/certs/server.crt",
+        "tests/certs/server.key",
+    )
+    .await;
+
+    let backend_host_for = |path: &str| {
+        seen.lock()
+            .expect("seen lock")
+            .iter()
+            .find(|(seen_path, _)| seen_path == path)
+            .map(|(_, host)| host.clone())
+    };
+
+    // ── HTTP/1.1 Upgrade ────────────────────────────────────────────────
+    let mut h1_request = format!("ws://127.0.0.1:{gateway_http_port}/ws-hdr/up-h1")
+        .into_client_request()
+        .expect("H1 WebSocket request");
+    h1_request.headers_mut().insert(
+        http::header::HOST,
+        http::HeaderValue::from_static("tenant-h1.example.test"),
+    );
+    let (mut h1_ws, h1_response) = tokio_tungstenite::connect_async(h1_request)
+        .await
+        .expect("H1 WebSocket upgrade through the gateway");
+    assert_forwarded_backend_handshake_headers(h1_response.headers(), "H1");
+    assert_eq!(
+        backend_host_for("/up-h1").as_deref(),
+        Some("tenant-h1.example.test"),
+        "H1: preserve_host_header must reach the direct WebSocket backend"
+    );
+    let _ = h1_ws.close(None).await;
+
+    let h1_deny = reqwest::Client::builder()
+        .http1_only()
+        .build()
+        .expect("H1 client")
+        .get(format!(
+            "http://127.0.0.1:{gateway_http_port}/ws-hdr/deny-h1"
+        ))
+        .header("connection", "Upgrade")
+        .header("upgrade", "websocket")
+        .header("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ==")
+        .header("sec-websocket-version", "13")
+        .send()
+        .await
+        .expect("H1 refused upgrade");
+    assert_relayed_backend_refusal(h1_deny.status(), h1_deny.headers(), "H1");
+    assert_eq!(
+        h1_deny.text().await.expect("H1 refusal body"),
+        r#"{"error":"backend-auth"}"#
+    );
+
+    // ── HTTP/2 Extended CONNECT (RFC 8441) ──────────────────────────────
+    let h2_stream = tokio::net::TcpStream::connect(format!("127.0.0.1:{gateway_http_port}"))
+        .await
+        .expect("connect to gateway H2 port");
+    let (mut h2_sender, h2_connection) =
+        http2::handshake(TokioExecutor::new(), TokioIo::new(h2_stream))
+            .await
+            .expect("H2 handshake");
+    let h2_connection_task = tokio::spawn(async move {
+        let _ = h2_connection.await;
+    });
+    let h2_request = |path: &str| {
+        http::Request::builder()
+            .method(Method::CONNECT)
+            .uri(format!("http://tenant-h2.example.test/ws-hdr/{path}"))
+            .version(Version::HTTP_2)
+            .header(http::header::SEC_WEBSOCKET_VERSION, "13")
+            .extension(hyper::ext::Protocol::from_static("websocket"))
+            .body(Empty::<Bytes>::new())
+            .expect("build H2 WebSocket request")
+    };
+    let h2_up = h2_sender
+        .send_request(h2_request("up-h2"))
+        .await
+        .expect("H2 Extended CONNECT through the gateway");
+    assert_eq!(h2_up.status(), StatusCode::OK);
+    assert_forwarded_backend_handshake_headers(h2_up.headers(), "H2");
+    assert_eq!(
+        backend_host_for("/up-h2").as_deref(),
+        Some("tenant-h2.example.test"),
+        "H2: preserve_host_header must reach the direct WebSocket backend"
+    );
+    drop(h2_up);
+
+    let h2_deny = h2_sender
+        .send_request(h2_request("deny-h2"))
+        .await
+        .expect("H2 refused Extended CONNECT");
+    let (h2_deny_parts, h2_deny_body) = h2_deny.into_parts();
+    assert_relayed_backend_refusal(h2_deny_parts.status, &h2_deny_parts.headers, "H2");
+    let h2_deny_body = h2_deny_body
+        .collect()
+        .await
+        .expect("H2 refusal body")
+        .to_bytes();
+    assert_eq!(h2_deny_body.as_ref(), br#"{"error":"backend-auth"}"#);
+    h2_connection_task.abort();
+
+    // ── HTTP/3 Extended CONNECT (RFC 9220) ──────────────────────────────
+    let h3_client = Http3Client::insecure().expect("H3 client");
+    let h3_up = h3_client
+        .websocket(
+            &format!("https://localhost:{gateway_https_port}/ws-hdr/up-h3"),
+            WebSocketOptions::default(),
+        )
+        .await
+        .expect("H3 Extended CONNECT through the gateway");
+    assert_eq!(h3_up.status, StatusCode::OK);
+    assert_forwarded_backend_handshake_headers(&h3_up.headers, "H3");
+    assert_eq!(
+        backend_host_for("/up-h3"),
+        Some(format!("localhost:{gateway_https_port}")),
+        "H3: preserve_host_header must reach the direct WebSocket backend"
+    );
+    drop(h3_up);
+
+    let h3_deny_client = Http3Client::insecure().expect("H3 refusal client");
+    let mut h3_deny = h3_deny_client
+        .websocket(
+            &format!("https://localhost:{gateway_https_port}/ws-hdr/deny-h3"),
+            WebSocketOptions::default(),
+        )
+        .await
+        .expect("H3 refused Extended CONNECT");
+    assert_relayed_backend_refusal(h3_deny.status, &h3_deny.headers, "H3");
+    assert_eq!(
+        h3_deny.recv_body_text().await.expect("H3 refusal body"),
+        r#"{"error":"backend-auth"}"#
+    );
+
+    // Three backend 401 refusals against a `failure_threshold: 1` breaker:
+    // none may count as a backend failure, so plain HTTP on the same proxy and
+    // target still reaches the backend instead of the open breaker's 503.
+    let plain = reqwest::Client::new()
+        .get(format!("http://127.0.0.1:{gateway_http_port}/ws-hdr/plain"))
+        .send()
+        .await
+        .expect("plain HTTP after refused upgrades");
+    assert_eq!(
+        plain.status(),
+        StatusCode::OK,
+        "a backend 4xx upgrade refusal must not open the route's circuit breaker"
+    );
+    assert_eq!(plain.text().await.expect("plain body"), "plain-ok");
+
+    gateway.shutdown();
+    backend.abort();
+}
