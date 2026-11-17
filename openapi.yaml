@@ -17357,13 +17357,16 @@ components:
         replicas that share the same accepted trust bundle and the same HMAC
         key, changes when the accepted bundle changes semantically, and stays
         identical across an unchanged revalidation. Replicas that do not share
-        the HMAC key are incomparable. An admin JWT authorizes seeing this
-        value; it does not reveal the HMAC key. The private fingerprint, an
-        unkeyed digest of it, bundle paths, key material, JWTs, `kid`s, and
-        namespace inventories are never published. Prometheus, logs, error
-        messages, metrics bearer/CIDR-authorized health responses, and
-        unauthenticated `/health`/`/status` never carry a non-null
-        `active_generation`.
+        the HMAC key are incomparable. A fleet-wide admin JWT verified by
+        `FERRUM_ADMIN_JWT_SECRET` (any role) authorizes seeing this value; it
+        does not reveal the HMAC key. The private fingerprint, an unkeyed
+        digest of it, bundle paths, key material, JWTs, `kid`s, and namespace
+        inventories are never published. Prometheus, logs, error messages,
+        tokens verified by `FERRUM_ADMIN_JWT_VIEWER_SECRET`, metrics
+        bearer/CIDR-authorized health responses, and unauthenticated
+        `/health`/`/status` never carry a non-null `active_generation`: a
+        caller that holds no MAC under the primary secret must not receive one
+        to test guesses of it against (GHSA-crqx-mp2f-v8c8).
 
         Ages are measured on a monotonic clock, so a wall-clock/NTP step can
         neither extend nor shorten the window. Only an accepted reload resets
@@ -17515,9 +17518,11 @@ components:
             "ferrum-cp-dp-trust-status-id-v1\0" || private fingerprint).
             Identical across replicas that share the accepted bundle and HMAC
             key; incomparable if HMAC keys differ. Null when no bundle is
-            watched. Admin-JWT-authenticated `/health`/`/status` only — metrics
-            bearer tokens and metrics-allowlisted source addresses receive
-            null, as do unauthenticated callers. Never emitted to Prometheus,
+            watched. `/health`/`/status` authenticated by a fleet-wide
+            primary-key admin JWT only — tokens verified by
+            `FERRUM_ADMIN_JWT_VIEWER_SECRET`, metrics bearer tokens, and
+            metrics-allowlisted source addresses receive null, as do
+            unauthenticated callers. Never emitted to Prometheus,
             logs, or errors. Does not reveal the HMAC key.
 
     ServiceDiscoveryHealthSnapshot:

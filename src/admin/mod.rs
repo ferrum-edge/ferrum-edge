@@ -2963,11 +2963,27 @@ fn observability_detail_allowed_with(
 
 /// Whether the caller presented a valid Admin API JWT that is not
 /// namespace-bounded ([`AuditActor::is_namespace_bounded`]): the detail tier
-/// describes the whole process, not one tenant. Some detailed health fields are
-/// derived using the Admin API signing secret and must not be exposed through
-/// the broader metrics-token/CIDR observability tier.
+/// describes the whole process, not one tenant. Values keyed by the Admin API
+/// signing secret are gated separately by [`admin_secret_keyed_detail_allowed`].
 fn admin_jwt_detail_allowed(state: &AdminState, auth_header: Option<&str>) -> bool {
     verified_admin_actor(state, auth_header).is_some_and(|actor| !actor.is_namespace_bounded())
+}
+
+/// Whether a detail-tier caller may also see values keyed by
+/// `FERRUM_ADMIN_JWT_SECRET` (`cp_dp_trust.active_generation`): only a
+/// fleet-wide token that the primary key itself verified
+/// (GHSA-crqx-mp2f-v8c8).
+///
+/// Such a token is already an HMAC under that secret, so one more keyed value
+/// gives its holder no new offline verifier for guesses of the secret. A
+/// `FERRUM_ADMIN_JWT_VIEWER_SECRET` token, a metrics bearer token, and a
+/// metrics-allowlisted source hold no such MAC, and for them a keyed value
+/// over known input would be exactly that verifier.
+fn admin_secret_keyed_detail_allowed(actor: Option<&AuditActor>) -> bool {
+    actor.is_some_and(|actor| {
+        actor.key_tier == crate::admin::jwt_auth::AdminKeyTier::Primary
+            && !actor.is_namespace_bounded()
+    })
 }
 
 /// The actor of a valid Admin API JWT in `auth_header`, or `None` when none was
@@ -3265,6 +3281,7 @@ async fn handle_admin_request_inner(
         let admin_jwt_detail = admin_actor
             .as_ref()
             .is_some_and(|actor| !actor.is_namespace_bounded());
+        let admin_secret_keyed_detail = admin_secret_keyed_detail_allowed(admin_actor.as_ref());
         let detailed = observability_detail_allowed_with(
             &state,
             admin_jwt_detail,
@@ -3521,10 +3538,11 @@ async fn handle_admin_request_inner(
             // identifier. Authenticated detail only — never the coarse probe.
             if let Some(mut trust) = crate::grpc::cp_trust_health::snapshot() {
                 // This identifier is an HMAC under FERRUM_ADMIN_JWT_SECRET.
-                // Metrics-only credentials and CIDR allowlists authorize the
-                // operational counters above, but never an offline verifier
-                // for guesses of the Admin API signing secret.
-                if !admin_jwt_detail {
+                // Viewer-key tokens, metrics-only credentials, and CIDR
+                // allowlists authorize the operational counters above, but
+                // never an offline verifier for guesses of the Admin API
+                // signing secret (GHSA-crqx-mp2f-v8c8).
+                if !admin_secret_keyed_detail {
                     trust.active_generation = None;
                 }
                 // Booleans, seconds, counters, a closed-set reason, and the
