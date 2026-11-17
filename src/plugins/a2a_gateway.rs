@@ -807,15 +807,37 @@ impl A2aGateway {
         // `{"method":"tasks/cancel","method":"message/send"}` would be policed
         // as `message/send` (GHSA-c78j-5w9p-cpq6, GHSA-49cr-v28q-9hgp). Such a
         // body, a singleton or a batch, cannot be classified: under a policy
-        // that can deny it fails closed exactly like an oversized body,
-        // otherwise it is left unclassified. Malformed JSON is not ambiguous
-        // and keeps its own handling below.
+        // that can deny it fails closed, otherwise it is left unclassified.
+        // A batch refusal is still a batch answering every request member
+        // (JSON-RPC 2.0 section 6), like the unclassifiable-batch path below.
+        // Malformed JSON is not ambiguous and keeps its own handling below.
         if json_dup_keys::slice_ambiguity(body).is_some() {
             warn_sampled!(
                 body_size = body.len(),
                 "A2A JSON-RPC request body has duplicate member names and cannot be classified"
             );
-            return self.jsonrpc_inspection_failed_detection(false);
+            let is_batch = body
+                .iter()
+                .find(|byte| !byte.is_ascii_whitespace())
+                .is_some_and(|byte| *byte == b'[');
+            if !is_batch {
+                return self.jsonrpc_inspection_failed_detection(false);
+            }
+            let mut detection = self.jsonrpc_inspection_failed_detection(true)?;
+            // Only member names were ambiguous, not the array shape, so the
+            // ids every member is owed are still readable.
+            detection.jsonrpc_batch_ids = Some(
+                serde_json::from_slice::<Value>(body)
+                    .ok()
+                    .and_then(|value| {
+                        value
+                            .as_array()
+                            .map(Vec::as_slice)
+                            .map(collect_batch_response_ids)
+                    })
+                    .unwrap_or(BatchResponseIds::NoneAnswerable),
+            );
+            return Some(detection);
         }
         let value: Value = serde_json::from_slice(body).ok()?;
         if let Some(batch) = value.as_array() {

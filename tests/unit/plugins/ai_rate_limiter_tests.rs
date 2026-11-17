@@ -10372,7 +10372,7 @@ async fn a_duplicated_model_member_cannot_select_a_model_budget() {
         // Charged to the default window as `cheap`, served as `o1`.
         r#"{"model":"o1","model":"cheap","messages":[{"role":"user","content":"hi"}],"max_tokens":10}"#,
         // An escaped spelling of the same member name.
-        r#"{"model":"o1","model":"cheap","messages":[{"role":"user","content":"hi"}],"max_tokens":10}"#,
+        r#"{"model":"o1","mod\u0065l":"cheap","messages":[{"role":"user","content":"hi"}],"max_tokens":10}"#,
         // A nested duplicate changes the prompt estimate.
         r#"{"model":"o1","messages":[{"role":"user","content":"a long prompt","content":"hi"}],"max_tokens":10}"#,
     ];

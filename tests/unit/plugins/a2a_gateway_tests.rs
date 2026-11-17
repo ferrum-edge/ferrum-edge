@@ -7340,11 +7340,9 @@ async fn duplicate_member_jsonrpc_body_fails_closed_under_deny_policy() {
         // denied `tasks/cancel` by a first-key-wins server.
         r#"{"jsonrpc":"2.0","id":1,"method":"tasks/cancel","method":"tasks/get","params":{"id":"t"}}"#,
         // An escaped spelling of the same member name.
-        r#"{"jsonrpc":"2.0","id":1,"method":"tasks/cancel","method":"tasks/get","params":{"id":"t"}}"#,
+        r#"{"jsonrpc":"2.0","id":1,"method":"tasks/cancel","m\u0065thod":"tasks/get","params":{"id":"t"}}"#,
         // A nested duplicate decides which task the call acts on.
         r#"{"jsonrpc":"2.0","id":1,"method":"tasks/get","params":{"id":"t1","id":"t2"}}"#,
-        // A batch whose second member duplicates `method`.
-        r#"[{"jsonrpc":"2.0","id":1,"method":"tasks/get","params":{"id":"t"}},{"jsonrpc":"2.0","id":2,"method":"tasks/cancel","method":"tasks/get","params":{"id":"t"}}]"#,
     ];
     for raw in bodies {
         let (mut ctx, mut headers) = jsonrpc_ctx_with_raw_body(raw.to_string());
@@ -7369,6 +7367,32 @@ async fn duplicate_member_jsonrpc_body_fails_closed_under_deny_policy() {
             "{raw}"
         );
     }
+
+    // A batch whose second member duplicates `method` (DSF F2): the refusal
+    // is a batch answering every request member.
+    let (mut ctx, mut headers) = jsonrpc_ctx_with_raw_body(
+        r#"[{"jsonrpc":"2.0","id":1,"method":"tasks/get","params":{"id":"t"}},{"jsonrpc":"2.0","id":2,"method":"tasks/cancel","method":"tasks/get","params":{"id":"t"}}]"#
+            .to_string(),
+    );
+    let PluginResult::Reject {
+        status_code, body, ..
+    } = gateway.before_proxy(&mut ctx, &mut headers).await
+    else {
+        panic!("a duplicate-member batch must be refused under a deny policy");
+    };
+    assert_eq!(status_code, 200);
+    let body: Value = serde_json::from_str(&body).expect("refusal is JSON");
+    let responses = body.as_array().expect("a batch refusal is a batch");
+    assert_eq!(responses.len(), 2);
+    assert_eq!(responses[0]["id"], 1);
+    assert_eq!(responses[1]["id"], 2);
+    for response in responses {
+        assert_eq!(response["error"]["code"], -32001);
+    }
+    assert_eq!(
+        ctx.metadata.get("a2a.error").map(String::as_str),
+        Some("request_body_uninspectable")
+    );
 
     // The same envelope without the duplicate is still classified normally.
     let (mut ctx, mut headers) = jsonrpc_ctx_with_raw_body(

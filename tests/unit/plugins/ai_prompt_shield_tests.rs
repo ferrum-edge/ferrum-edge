@@ -6024,7 +6024,7 @@ async fn content_and_all_modes_refuse_duplicate_member_names() {
         // The advisory reproduction: a nested duplicate inside messages[].
         r#"{"model":"m","messages":[{"role":"user","content":"SSN 123-45-6789","content":"hi"}]}"#,
         // An escaped spelling of the same member name.
-        r#"{"model":"m","messages":[{"role":"user","content":"SSN 123-45-6789","content":"hi"}]}"#,
+        r#"{"model":"m","messages":[{"role":"user","content":"SSN 123-45-6789","\u0063ontent":"hi"}]}"#,
         // A top-level duplicate.
         r#"{"model":"m","messages":[{"role":"user","content":"SSN 123-45-6789"}],"messages":[{"role":"user","content":"hi"}]}"#,
     ];
