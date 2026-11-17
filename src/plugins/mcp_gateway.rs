@@ -1780,6 +1780,7 @@ impl McpGateway {
         let real_ip_header = http_client.real_ip_header().map(str::to_ascii_lowercase);
         validate_bridge_servers(
             mode,
+            &endpoint_path,
             &servers,
             &sessions,
             &validation,
@@ -1942,7 +1943,7 @@ impl McpGateway {
         // Case variants and encoded suffixes are reserved only for rejection,
         // never for endpoint matching. The HTTP frontend already refuses
         // encoded separators; keep direct plugin dispatch fail-closed too.
-        ctx.path.eq_ignore_ascii_case(scope) || endpoint_scope_contains(scope, &ctx.path)
+        endpoint_scope_reserves(scope, &ctx.path)
     }
 
     /// Claim this request for this instance. Called once, from the same
@@ -11905,11 +11906,13 @@ fn reject_bridge_server_fields(object: &Map<String, Value>, server_id: &str) -> 
 /// cannot decide on its own.
 fn validate_bridge_servers(
     mode: McpGatewayMode,
+    endpoint_path: &str,
     servers: &HashMap<String, McpServerConfig>,
     sessions: &McpSessionConfig,
     validation: &McpValidationConfig,
     real_ip_header: Option<&str>,
 ) -> Result<(), String> {
+    let endpoint_scope = endpoint_path.trim_end_matches('/');
     for server in servers.values() {
         let Some(bridge) = server.bridge() else {
             continue;
@@ -11918,6 +11921,17 @@ fn validate_bridge_servers(
         if mode != McpGatewayMode::AggregateRouter {
             return Err(format!(
                 "mcp_gateway: server {server_id:?} `openapi` requires mode `aggregate_router` because `transparent_proxy` forwards MCP JSON-RPC to one MCP upstream"
+            ));
+        }
+        // The endpoint claims its whole subtree (case variants and encoded
+        // suffixes included) and answers 404 there, so an operation inside it
+        // is unreachable to direct clients of the same route (#7406).
+        if bridge
+            .operation_path_templates()
+            .any(|path| endpoint_scope_reserves(endpoint_scope, path))
+        {
+            return Err(format!(
+                "mcp_gateway: server {server_id:?} `openapi.operations` declares a `path` inside the `endpoint.path` scope; the MCP endpoint reserves its whole path subtree (ASCII case-insensitively, including `%`-encoded suffixes)"
             ));
         }
         if bridge.tool_count() > validation.max_catalog_items_per_list {
@@ -12013,6 +12027,17 @@ fn authority_for_host_port(
         Some(port) if port != default_port => format!("{rendered_host}:{port}"),
         _ => rendered_host,
     }
+}
+
+/// Whether a request path falls inside the subtree an MCP endpoint scope
+/// (`endpoint.path` with trailing slashes trimmed) reserves at runtime: the
+/// scope itself and every descendant or `%`-encoded suffix, all compared
+/// ASCII case-insensitively. This is exactly the predicate the gateway uses to
+/// claim (and 404) requests, so admission checks that must agree with the
+/// runtime claim (`openapi.operations[].path`, the `/api-specs`
+/// `x-ferrum-mcp` generator) share it rather than re-deriving it (#7406).
+pub(crate) fn endpoint_scope_reserves(scope: &str, path: &str) -> bool {
+    path.eq_ignore_ascii_case(scope) || endpoint_scope_contains(scope, path)
 }
 
 /// Reserve descendants and ambiguous encoded suffixes, including case variants.

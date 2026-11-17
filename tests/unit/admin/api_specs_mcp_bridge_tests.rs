@@ -477,6 +477,52 @@ fn x_ferrum_mcp_forward_request_headers_reach_the_generated_bridge() {
     assert!(error.contains("forward_request_headers"), "{error}");
 }
 
+/// One GET operation, bridged or (with `x-ferrum-mcp: false`) left out of the
+/// generated catalog.
+fn plain_get(operation_id: &str, bridged: bool) -> Value {
+    json!({
+        "get": {
+            "operationId": operation_id,
+            "x-ferrum-mcp": bridged,
+            "responses": { "200": { "description": "ok" } }
+        }
+    })
+}
+
+#[test]
+fn x_ferrum_mcp_endpoint_scope_is_checked_like_the_runtime_claim() {
+    // Issue #7406: `mcp_gateway` claims its endpoint subtree ASCII
+    // case-insensitively and across `%`-encoded suffixes, and answers 404
+    // there, so every operation of the document (bridged or not) whose path
+    // falls inside that claim is refused at import.
+    let extension = json!({ "endpoint": { "path": "/pets-api/v1/mcp" } });
+    for (path, bridged) in [
+        ("/MCP", false),
+        ("/Mcp/status", false),
+        ("/mcp%2Fitems", false),
+        ("/mcp{suffix}", false),
+        ("/mcp/", false),
+        ("/MCP/status", true),
+    ] {
+        let mut paths = pet_paths();
+        paths[path] = plain_get("shadowed", bridged);
+        let error = extract_error(&spec(extension.clone(), paths));
+        assert!(
+            error.contains("overlaps an operation path"),
+            "{path}: {error}"
+        );
+    }
+
+    // Disjoint siblings and an operation above the endpoint stay importable.
+    for path in ["/mcpx", "/mcp-tools/items", "/"] {
+        let mut paths = pet_paths();
+        paths[path] = plain_get("sibling", false);
+        let config = generated_gateway(&spec(extension.clone(), paths));
+        assert_eq!(config["endpoint"]["path"], "/pets-api/v1/mcp", "{path}");
+        assert!(create_plugin("mcp_gateway", &config).unwrap().is_some());
+    }
+}
+
 #[test]
 fn x_ferrum_mcp_embedded_gateway_cannot_move_the_validated_endpoint() {
     // GHSA-26x8-8jq5-f73p: the generated `endpoint.path` was checked against

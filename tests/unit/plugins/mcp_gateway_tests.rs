@@ -16978,6 +16978,37 @@ async fn openapi_bridge_refuses_paths_outside_the_listen_prefix_without_strip_li
     assert!(!ctx.route_override_path_is_absolute);
 }
 
+#[test]
+fn openapi_bridge_operations_inside_the_endpoint_scope_are_refused() {
+    // Issue #7406: the endpoint reserves its subtree ASCII
+    // case-insensitively, so an operation there is unreachable to direct
+    // clients of the same route.
+    // Operation 0 declares a `petId` path parameter; operation 1 none.
+    for (index, path) in [
+        (1, "/mcp"),
+        (1, "/MCP"),
+        (1, "/Mcp/status"),
+        (0, "/Mcp/pets/{petId}"),
+        (0, "/mcp/{petId}"),
+    ] {
+        let error = bridge_config_error(|config| {
+            bridge_operation(config, index)["path"] = json!(path);
+        });
+        assert!(
+            error.contains("inside the `endpoint.path` scope"),
+            "{path}: {error}"
+        );
+    }
+    for path in ["/mcpx/{petId}", "/mcp-tools/{petId}"] {
+        let mut config = bridge_config();
+        bridge_operation(&mut config, 0)["path"] = json!(path);
+        assert!(
+            create_plugin("mcp_gateway", &config).unwrap().is_some(),
+            "{path}"
+        );
+    }
+}
+
 /// Admit one bridged `tools/call` like [`bridge_call`], after `prepare` has
 /// set up the request context and the client's request headers.
 async fn bridge_call_with(

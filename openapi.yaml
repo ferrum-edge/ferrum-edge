@@ -8202,10 +8202,17 @@ paths:
           X-Forwarded-*, MCP transport, Ferrum-internal), cookie / `content`
           / non-default-style / object parameters, and required non-JSON
           bodies are rejected with `400` naming the operation (exclude it to
-          proceed). An embedded `mcp_gateway` in `x-ferrum-plugins` is merged
-          over the generated config (the `openapi` server id is reserved).
-          Cannot be combined with `x-ferrum-validate` in one document, and
-          requires a literal-prefix `listen_path`.
+          proceed). The endpoint must sit under the literal `listen_path`
+          and reserves its whole subtree the way the running gateway claims
+          it (ASCII case-insensitively, including `%`-encoded suffixes), so
+          a document with ANY operation path inside it (bridged or not, for
+          example `/MCP/status` or `/mcp%2Fitems` beside `/mcp`) is rejected
+          with `400`. An embedded `mcp_gateway` in `x-ferrum-plugins` is
+          merged over the generated config (the `openapi` server id is
+          reserved; its `endpoint` merges key by key and an `endpoint.path`
+          other than the generated one is rejected with `400`). Cannot be
+          combined with `x-ferrum-validate` in one document, and requires a
+          literal-prefix `listen_path`.
         - **`x-ferrum-external-refs`** (optional) — `true` or an object
           (`enabled`, optional `document_base`, optional `allowed_origins`)
           to opt this document into external / cross-document `$ref`

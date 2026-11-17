@@ -1576,7 +1576,7 @@ fn mcp_tool_name_slug(text: &str) -> String {
 }
 
 /// Generate one `mcp_gateway` bridge operation per selected OpenAPI 3.x
-/// operation.
+/// operation, and collect the public path of every operation in the document.
 ///
 /// `$ref`s are resolved with the SAME resolver, depth limit, and
 /// document-scoped expansion budget the `x-ferrum-validate` generator uses,
@@ -1589,7 +1589,7 @@ fn extract_mcp_bridge_operations(
     document_base: &Url,
     externals: &HashMap<String, LoadedExternalDocument>,
     extension: &McpBridgeExtension,
-) -> Result<Vec<Value>, ExtractError> {
+) -> Result<McpBridgeOperations, ExtractError> {
     if version == "2.0" {
         return Err(mcp_extension_error(
             "`x-ferrum-mcp` requires an OpenAPI 3.x document; Swagger 2.0 is not supported"
@@ -1599,7 +1599,7 @@ fn extract_mcp_bridge_operations(
     let resolver = LocalSchemaResolver::build(root, version, document_base, externals)?;
     let root = resolver.primary_root();
     let Some(paths) = root.get("paths").and_then(Value::as_object) else {
-        return Ok(Vec::new());
+        return Ok(McpBridgeOperations::default());
     };
     let root_server_bases = match openapi_server_bases(root.get("servers"), "servers")? {
         None => vec![SERVER_BASE_ROOT.to_string()],
@@ -1607,6 +1607,7 @@ fn extract_mcp_bridge_operations(
     };
     let mut resolution_state = ResolutionState::new();
     let mut operations = Vec::new();
+    let mut document_paths = Vec::new();
     let mut tool_names = HashSet::new();
     for (path_template, path_item) in paths {
         let resolved_path_item = resolve_path_item(
@@ -1631,6 +1632,32 @@ fn extract_mcp_bridge_operations(
                 continue;
             };
             let location = format!("paths.{path_template}.{method}");
+            // Operation servers > Path Item servers > root servers, exactly
+            // as the validator resolves them. The first effective base is the
+            // one the bridge dispatches under.
+            let effective_bases = match openapi_server_bases(
+                operation.get("servers"),
+                &format!("{location}.servers"),
+            )? {
+                Some(bases) => bases,
+                None => path_item_bases
+                    .clone()
+                    .unwrap_or_else(|| root_server_bases.clone()),
+            };
+            let base = effective_bases
+                .first()
+                .map(String::as_str)
+                .unwrap_or(SERVER_BASE_ROOT);
+            let spec_path = join_server_base_and_path(base, path_template)?;
+            let public_path = if !listen_prefix.is_empty() && spec_path == "/" {
+                listen_prefix.to_string()
+            } else {
+                format!("{listen_prefix}{spec_path}")
+            };
+            // Every operation of the document is served on this proxy, so
+            // the MCP endpoint's reserved subtree must miss all of them, not
+            // only the bridged ones (#7406).
+            document_paths.push(public_path.clone());
             let operation_extension = parse_operation_mcp_extension(operation, &location)?;
             if !mcp_operation_selected(extension, operation, &operation_extension, method) {
                 continue;
@@ -1656,28 +1683,6 @@ fn extract_mcp_bridge_operations(
                     "`{location}` is selected as an MCP tool but its method is not in `x-ferrum-proxy.allowed_methods`; exclude the operation or allow the method"
                 )));
             }
-            // Operation servers > Path Item servers > root servers, exactly
-            // as the validator resolves them. The first effective base is the
-            // one the bridge dispatches under.
-            let effective_bases = match openapi_server_bases(
-                operation.get("servers"),
-                &format!("{location}.servers"),
-            )? {
-                Some(bases) => bases,
-                None => path_item_bases
-                    .clone()
-                    .unwrap_or_else(|| root_server_bases.clone()),
-            };
-            let base = effective_bases
-                .first()
-                .map(String::as_str)
-                .unwrap_or(SERVER_BASE_ROOT);
-            let spec_path = join_server_base_and_path(base, path_template)?;
-            let public_path = if !listen_prefix.is_empty() && spec_path == "/" {
-                listen_prefix.to_string()
-            } else {
-                format!("{listen_prefix}{spec_path}")
-            };
             let generated = generate_mcp_bridge_operation(
                 &resolver,
                 &mut resolution_state,
@@ -1711,7 +1716,20 @@ fn extract_mcp_bridge_operations(
             mcp_bridge::MAX_BRIDGE_OPERATIONS
         )));
     }
-    Ok(operations)
+    Ok(McpBridgeOperations {
+        operations,
+        document_paths,
+    })
+}
+
+/// The `x-ferrum-mcp` generator's view of a document's operations.
+#[derive(Default)]
+struct McpBridgeOperations {
+    /// Generated `openapi.operations` entries, one per selected operation.
+    operations: Vec<Value>,
+    /// Public request path template of EVERY operation in the document,
+    /// selected or not, for the endpoint-scope overlap check.
+    document_paths: Vec<String>,
 }
 
 /// One selected operation, as the bridge generator reads it.
@@ -2079,9 +2097,13 @@ fn auto_inject_mcp_gateway(
     proxy: &Proxy,
     namespace: &str,
     extension: McpBridgeExtension,
-    operations: Vec<Value>,
+    operations: McpBridgeOperations,
     listen_prefix: &str,
 ) -> Result<(), ExtractError> {
+    let McpBridgeOperations {
+        operations,
+        document_paths,
+    } = operations;
     if operations.is_empty() {
         return Err(mcp_extension_error(
             "`x-ferrum-mcp` selected no bridgeable operations; without `include` only GET operations are published, and POST, PUT, PATCH, and DELETE need `include` or `x-ferrum-mcp: true` on the operation"
@@ -2092,8 +2114,8 @@ fn auto_inject_mcp_gateway(
         .endpoint_path
         .unwrap_or_else(|| format!("{listen_prefix}/mcp"));
     // The endpoint is served by this proxy, so it must sit under the proxy's
-    // literal listen prefix, and it reserves its whole subtree, so no bridged
-    // operation may live there.
+    // literal listen prefix, and it reserves its whole subtree, so no
+    // operation of this document may live there.
     if !listen_prefix.is_empty()
         && endpoint_path != listen_prefix
         && !endpoint_path.starts_with(&format!("{listen_prefix}/"))
@@ -2103,14 +2125,14 @@ fn auto_inject_mcp_gateway(
         ));
     }
     let endpoint_scope = endpoint_path.trim_end_matches('/');
-    for operation in &operations {
-        let path = operation.get("path").and_then(Value::as_str).unwrap_or("");
-        if path == endpoint_scope || path.starts_with(&format!("{endpoint_scope}/")) {
-            return Err(mcp_extension_error(
-                "`x-ferrum-mcp.endpoint.path` overlaps a bridged operation path; the MCP endpoint reserves its whole path subtree"
-                    .to_string(),
-            ));
-        }
+    if document_paths
+        .iter()
+        .any(|path| mcp_endpoint_scope_reserves_operation(endpoint_scope, path))
+    {
+        return Err(mcp_extension_error(
+            "`x-ferrum-mcp.endpoint.path` overlaps an operation path of this document; the MCP endpoint reserves its whole path subtree, ASCII case-insensitively and including `%`-encoded suffixes"
+                .to_string(),
+        ));
     }
 
     let mut bridge = extension.limits;
@@ -2194,6 +2216,22 @@ fn auto_inject_mcp_gateway(
         updated_at: now,
     });
     Ok(())
+}
+
+/// Whether the runtime claim of an MCP endpoint scope covers requests to an
+/// OpenAPI operation path template: the gateway's own predicate
+/// ([`crate::plugins::mcp_gateway::endpoint_scope_reserves`]: the scope, its
+/// descendants, and `%`-encoded suffixes, ASCII case-insensitively), plus a
+/// template expression that directly follows the scope (`/mcp{x}`), whose
+/// encoded or empty values land inside it.
+fn mcp_endpoint_scope_reserves_operation(endpoint_scope: &str, path: &str) -> bool {
+    crate::plugins::mcp_gateway::endpoint_scope_reserves(endpoint_scope, path)
+        || (path
+            .get(..endpoint_scope.len())
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case(endpoint_scope))
+            && path
+                .get(endpoint_scope.len()..)
+                .is_some_and(|tail| tail.starts_with('{')))
 }
 
 /// Merge an operator-embedded `mcp_gateway` config over the generated one.
