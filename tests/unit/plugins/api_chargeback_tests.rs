@@ -4631,18 +4631,29 @@ fn test_admin_charges_path_is_non_owning_when_unconfigured() {
         charges_block.contains("try_global_registry"),
         "GET /charges must use try_global_registry"
     );
+    // The route hands the optional registry to `charges_response`, which renders
+    // the empty shapes when no plugin has configured the registry.
+    let renderer_idx = admin
+        .find("async fn charges_response(")
+        .expect("charges_response renderer");
+    let renderer_end = admin[renderer_idx..]
+        .find("\n}\n")
+        .map(|offset| renderer_idx + offset)
+        .expect("charges_response body end");
+    let renderer = &admin[renderer_idx..renderer_end];
     assert!(
-        charges_block.contains("empty_charges_json")
-            && charges_block.contains("empty_charges_prometheus"),
+        renderer.contains("empty_charges_json") && renderer.contains("empty_charges_prometheus"),
         "GET /charges must render empty shapes without claiming the registry"
     );
     // `try_global_registry()` contains the substring `global_registry()`; strip
     // the non-owning helper so this assertion only catches owning calls.
-    let without_try = charges_block.replace("try_global_registry()", "");
-    assert!(
-        !without_try.contains("global_registry()"),
-        "GET /charges must not call owning global_registry()"
-    );
+    for (label, block) in [("route", charges_block), ("renderer", renderer)] {
+        let without_try = block.replace("try_global_registry()", "");
+        assert!(
+            !without_try.contains("global_registry()"),
+            "GET /charges {label} must not call owning global_registry()"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
