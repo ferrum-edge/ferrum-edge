@@ -30,10 +30,10 @@
 //! # Fingerprints
 //!
 //! `hmac-sha256:<64 lowercase hex>` = HMAC-SHA-256 under a subkey derived from
-//! the primary admin JWT secret:
+//! the dedicated fingerprint secret:
 //!
 //! ```text
-//! subkey      = HMAC-SHA-256(FERRUM_ADMIN_JWT_SECRET,
+//! subkey      = HMAC-SHA-256(FERRUM_ADMIN_CONFIG_EXPORT_FINGERPRINT_SECRET,
 //!                            "ferrum-edge/admin-config-export-fingerprint/v1")
 //! fingerprint = HMAC-SHA-256(subkey, len64(kind) || kind || len64(namespace) || namespace
 //!                                    || len64(id) || id || len64(pointer) || pointer
@@ -46,16 +46,22 @@
 //!
 //! - **Keyed**, never a plain digest: many credentials (API keys, passwords)
 //!   are guessable, and an unkeyed digest would be an offline oracle for them.
-//! - **Not derivable by the reader**: the subkey comes from the primary secret,
-//!   never from `FERRUM_ADMIN_JWT_VIEWER_SECRET`, so the viewer-tier credential
-//!   the export exists for cannot compute or dictionary-test a fingerprint.
+//! - **Not derivable by the reader**: the subkey never comes from
+//!   `FERRUM_ADMIN_JWT_VIEWER_SECRET`, so the viewer-tier credential the export
+//!   exists for cannot compute or dictionary-test a fingerprint.
+//! - **Not an oracle for a signing secret** (GHSA-crqx-mp2f-v8c8): the subkey
+//!   never comes from `FERRUM_ADMIN_JWT_SECRET` either. `fingerprint_key_id`
+//!   and the fingerprint of an empty hidden-credential map are MACs over
+//!   inputs every reader knows; keyed by the primary secret they would let a
+//!   viewer-key holder test offline guesses of the secret that mints `admin`
+//!   tokens. The fingerprint secret must differ from every JWT signing secret.
 //! - **Stable**: the canonical JSON sorts object keys, so an unchanged stored
 //!   value fingerprints identically across calls and across replicas that
-//!   share `FERRUM_ADMIN_JWT_SECRET`. Rotating that secret changes every
-//!   fingerprint; `redaction.fingerprint_key_id` (a keyed label, not the key)
-//!   tells a consumer that two exports are not comparable. Without a
-//!   configured secret (`file`/`mesh`/`node_agent` fallback) the key is random
-//!   per process, and a CP and a DP whose secrets differ never agree.
+//!   share the fingerprint secret. Rotating it changes every fingerprint;
+//!   `redaction.fingerprint_key_id` (a keyed label, not the key) tells a
+//!   consumer that two exports are not comparable. Without a configured
+//!   fingerprint secret the key is random per process, and replicas or a CP
+//!   and a DP whose fingerprint secrets differ never agree.
 //! - **Bound to its field**: the resource kind, namespace, id, and field
 //!   pointer are MAC inputs, so equal secrets in two fields — or on two
 //!   resources — do not produce equal fingerprints, and a fingerprint cannot be
@@ -142,13 +148,14 @@ fn export_builds() -> &'static Semaphore {
     EXPORT_BUILDS.get_or_init(|| Semaphore::new(MAX_CONCURRENT_EXPORT_BUILDS))
 }
 
-/// Derive the fingerprint subkey from the primary admin JWT secret. `None`
-/// when no secret is configured.
-pub fn fingerprint_key(jwt_secret: &str) -> Option<HmacSha256Key> {
-    if jwt_secret.is_empty() {
+/// Derive the fingerprint subkey from the configuration-export fingerprint
+/// secret (`FERRUM_ADMIN_CONFIG_EXPORT_FINGERPRINT_SECRET`, or a random
+/// per-process value). `None` for an empty secret.
+pub fn fingerprint_key(fingerprint_secret: &str) -> Option<HmacSha256Key> {
+    if fingerprint_secret.is_empty() {
         return None;
     }
-    let mut derive = HmacSha256::new_from_slice(jwt_secret.as_bytes()).ok()?;
+    let mut derive = HmacSha256::new_from_slice(fingerprint_secret.as_bytes()).ok()?;
     derive.update(FINGERPRINT_SUBKEY_LABEL);
     HmacSha256Key::new_from_slice(derive.finalize().as_ref()).ok()
 }
@@ -404,7 +411,7 @@ pub(crate) async fn handle_config_export(
 ) -> Response<Full<Bytes>> {
     let Some(key) = state.jwt_manager.config_export_fingerprint_key() else {
         return config_export_unavailable_response(
-            "Configuration export unavailable: no admin JWT secret is configured",
+            "Configuration export unavailable: no fingerprint key is available",
         );
     };
     let permit = match tokio::time::timeout(EXPORT_PERMIT_WAIT, export_builds().acquire()).await {

@@ -402,6 +402,108 @@ async fn fingerprints_are_stable_and_change_when_the_credential_changes() {
     assert_eq!(first.body["upstreams"], rotated.body["upstreams"]);
 }
 
+const FINGERPRINT_SECRET: &str = "config-export-fingerprint-secret-0123456789";
+
+fn admin_state_with_manager(
+    cached: Arc<ArcSwap<GatewayConfig>>,
+    manager: JwtManager,
+) -> AdminState {
+    let mut state = admin_state(cached, false);
+    state.jwt_manager = manager;
+    state
+}
+
+/// GHSA-crqx-mp2f-v8c8: no export value is a MAC keyed by
+/// `FERRUM_ADMIN_JWT_SECRET`, so a viewer-key holder cannot test offline
+/// guesses of the secret that mints `admin` tokens. Replicas that share
+/// `FERRUM_ADMIN_CONFIG_EXPORT_FINGERPRINT_SECRET` still publish identical,
+/// comparable exports.
+#[tokio::test]
+async fn export_fingerprints_are_keyed_by_the_dedicated_secret_not_the_admin_secret() {
+    use ferrum_edge::admin::config_export::{
+        FingerprintRendering, fingerprint_key, fingerprint_key_id,
+    };
+
+    let primary_key = fingerprint_key(PRIMARY_SECRET).expect("non-empty secret");
+    let primary_key_id = fingerprint_key_id(&primary_key);
+    // Known inputs: the staging consumer stores no hidden credential type.
+    let primary_hidden =
+        FingerprintRendering::new(&primary_key, "consumer", "staging", "consumer-staging")
+            .fingerprint("/hidden_credentials", &json!({}));
+    let dedicated_key_id =
+        fingerprint_key_id(&fingerprint_key(FINGERPRINT_SECRET).expect("non-empty secret"));
+
+    let replica = || {
+        jwt_manager()
+            .with_config_export_fingerprint_secret(FINGERPRINT_SECRET.to_string())
+            .expect("a distinct fingerprint secret is accepted")
+    };
+    let (base_a, _sd_a) = start_admin(admin_state_with_manager(
+        cached(two_tenant_config(STAGING_KEY)),
+        replica(),
+    ))
+    .await;
+    let (base_b, _sd_b) = start_admin(admin_state_with_manager(
+        cached(two_tenant_config(STAGING_KEY)),
+        replica(),
+    ))
+    .await;
+    // Without the dedicated secret each process keys from a random value.
+    let (base_random, _sd_random) =
+        start_admin(admin_state(cached(two_tenant_config(STAGING_KEY)), false)).await;
+
+    let viewer_key = token(VIEWER_SECRET, Algorithm::HS256, "viewer", None);
+    let ns_bounded_viewer_key = token(
+        VIEWER_SECRET,
+        Algorithm::HS256,
+        "viewer",
+        Some(json!("staging")),
+    );
+    let primary_admin = token(PRIMARY_SECRET, Algorithm::HS256, "admin", None);
+
+    let mut replica_exports = Vec::new();
+    for (base, bearer, expected_key_id) in [
+        (&base_a, &viewer_key, Some(&dedicated_key_id)),
+        (&base_a, &ns_bounded_viewer_key, Some(&dedicated_key_id)),
+        (&base_a, &primary_admin, Some(&dedicated_key_id)),
+        (&base_b, &viewer_key, Some(&dedicated_key_id)),
+        (&base_random, &viewer_key, None),
+        (&base_random, &primary_admin, None),
+    ] {
+        let export = get(base, EXPORT, Some(bearer), Some("staging")).await;
+        assert_eq!(export.status, 200);
+        let key_id = export.body["redaction"]["fingerprint_key_id"]
+            .as_str()
+            .expect("key id is published")
+            .to_string();
+        assert_ne!(
+            key_id, primary_key_id,
+            "the published key id must not be keyed by the admin JWT secret"
+        );
+        let hidden = export
+            .body
+            .pointer("/consumers/0/hidden_credentials_fingerprint")
+            .and_then(Value::as_str)
+            .expect("every consumer carries the hidden-credentials fingerprint");
+        assert!(is_fingerprint(&json!(hidden)));
+        assert_ne!(
+            hidden, primary_hidden,
+            "a known-input fingerprint must not be keyed by the admin JWT secret"
+        );
+        match expected_key_id {
+            Some(expected) => {
+                assert_eq!(&key_id, expected);
+                replica_exports.push(export.text);
+            }
+            None => assert_ne!(key_id, dedicated_key_id),
+        }
+    }
+    assert!(
+        replica_exports.windows(2).all(|pair| pair[0] == pair[1]),
+        "replicas sharing the fingerprint secret publish identical exports to every reader"
+    );
+}
+
 #[tokio::test]
 async fn export_is_namespace_scoped_and_honours_ns_claims() {
     let config = cached(two_tenant_config(STAGING_KEY));
@@ -628,6 +730,66 @@ async fn database_export_is_labelled_and_falls_back_to_cached_on_database_error(
     assert_eq!(fallback.body["source"], "cached");
     assert_eq!(fallback.body["consumers"][0]["username"], "carol");
     assert!(!fallback.text.contains(cached_key));
+}
+
+/// GHSA-crqx-mp2f-v8c8: a resource `ETag` is a MAC keyed by
+/// `FERRUM_ADMIN_JWT_SECRET`. A viewer-key token cannot write, so it has no use
+/// for `If-Match`, and it must not hold a MAC under the primary secret; it gets
+/// the resource without a tag. Primary-key tokens of every role keep it.
+#[tokio::test]
+async fn viewer_key_reads_carry_no_primary_keyed_etag() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let db = sqlite_store(&dir).await;
+    db.create_consumer(&consumer_with_key(
+        "db-consumer",
+        "dora",
+        "database-api-key-must-not-leak",
+    ))
+    .await
+    .expect("seed consumer");
+    let mut state = admin_state(cached(GatewayConfig::default()), false);
+    state.db = Some(Arc::new(db));
+    state.mode = "database".to_string();
+    let (base, _sd) = start_admin(state).await;
+    let client = reqwest::Client::new();
+
+    for (label, bearer, expects_tag) in [
+        (
+            "viewer-key token",
+            token(VIEWER_SECRET, Algorithm::HS256, "viewer", None),
+            false,
+        ),
+        (
+            "viewer-key token claiming admin",
+            token(VIEWER_SECRET, Algorithm::HS256, "admin", None),
+            false,
+        ),
+        (
+            "primary-key viewer",
+            token(PRIMARY_SECRET, Algorithm::HS256, "viewer", None),
+            true,
+        ),
+        (
+            "primary-key admin",
+            token(PRIMARY_SECRET, Algorithm::HS256, "admin", None),
+            true,
+        ),
+    ] {
+        let resp = client
+            .get(format!("{base}/consumers/db-consumer"))
+            .bearer_auth(&bearer)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status().as_u16(), 200, "{label}");
+        assert_eq!(
+            resp.headers().get(reqwest::header::ETAG).is_some(),
+            expects_tag,
+            "{label}: unexpected ETag exposure"
+        );
+        let body: Value = resp.json().await.unwrap();
+        assert_eq!(body["username"], "dora", "{label}");
+    }
 }
 
 /// Userinfo is stripped only for `viewer` reads. `operator` and `admin` write

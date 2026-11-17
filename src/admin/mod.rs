@@ -2073,6 +2073,91 @@ async fn render_charges_off_worker(
     }
 }
 
+/// Whether a verified admin token is a designated `/charges` billing
+/// collector: its `scope` claim grants
+/// [`plugins::api_chargeback::CHARGES_COLLECT_SCOPE`]. Tier-aware through
+/// [`crate::admin::jwt_auth::VerifiedAdminToken::grants_scope`], so a token
+/// verified by `FERRUM_ADMIN_JWT_VIEWER_SECRET` is never a collector, and the
+/// `role` claim never implies the scope (GHSA-jjvr-vvwv-8qmh).
+fn charges_collection_granted(token: &crate::admin::jwt_auth::VerifiedAdminToken) -> bool {
+    token.grants_scope(plugins::api_chargeback::CHARGES_COLLECT_SCOPE)
+}
+
+/// `GET /charges`, after authentication and the namespace-bounded global-route
+/// gate.
+///
+/// Every authenticated caller receives the same document. Only a designated
+/// collector (`acknowledges_collection`, from [`charges_collection_granted`])
+/// also carries the delivery acknowledgement that counts toward the
+/// two-hand-off rule for idle-row eviction (issue #5276). Dashboards, drift
+/// tools, viewer-key tokens, and ad-hoc reads are side-effect free, so they
+/// cannot make rows the billing collector never saw evictable
+/// (GHSA-jjvr-vvwv-8qmh).
+async fn charges_response(
+    registry: Option<Arc<plugins::api_chargeback::ChargebackRegistry>>,
+    query: Option<&str>,
+    acknowledges_collection: bool,
+) -> Response<Full<Bytes>> {
+    let format = match parse_chargeback_format(query) {
+        Ok(format) => format,
+        Err(resp) => return *resp,
+    };
+    let rendered = match registry {
+        Some(registry) => render_charges_off_worker(registry, format).await,
+        None => {
+            let empty = match format {
+                ChargebackFormat::Json => crate::plugins::api_chargeback::empty_charges_json(),
+                ChargebackFormat::Prometheus => {
+                    crate::plugins::api_chargeback::empty_charges_prometheus()
+                }
+            };
+            empty.map(|output| (output, None))
+        }
+    };
+    match rendered {
+        Ok((output, delivery_ack)) => {
+            let content_type = match format {
+                ChargebackFormat::Json => "application/json",
+                ChargebackFormat::Prometheus => "text/plain; version=0.0.4; charset=utf-8",
+            };
+            match with_admin_security_headers(Response::builder())
+                .status(StatusCode::OK)
+                .header("Content-Type", content_type)
+                .body(Full::new(Bytes::from(output)))
+            {
+                Ok(mut resp) => {
+                    // Collection is acknowledged by the connection's body
+                    // wrapper once it has taken this document, never here at
+                    // render time (issue #5276), and only for a designated
+                    // collector (GHSA-jjvr-vvwv-8qmh).
+                    if acknowledges_collection && let Some(ack) = delivery_ack {
+                        resp.extensions_mut().insert(ack);
+                    }
+                    resp
+                }
+                Err(_) => admin_builder_failure_response(),
+            }
+        }
+        // Fail closed: never serialize non-finite monetary values as JSON
+        // null (serde_json's default for Inf/NaN) or publish non-finite
+        // Prometheus samples.
+        Err(err) => json_response(StatusCode::INTERNAL_SERVER_ERROR, &json!({"error": err})),
+    }
+}
+
+/// `GET /charges` as the dispatcher answers it for `authorization`, against an
+/// explicit registry instead of the process-global one. `None` when the token
+/// does not verify. Reached through `_test_support`.
+pub(crate) async fn charges_response_for_test(
+    jwt_manager: &JwtManager,
+    authorization: &str,
+    registry: Arc<plugins::api_chargeback::ChargebackRegistry>,
+    query: Option<&str>,
+) -> Option<Response<Full<Bytes>>> {
+    let token = jwt_manager.verify_request(Some(authorization)).ok()?;
+    Some(charges_response(Some(registry), query, charges_collection_granted(&token)).await)
+}
+
 fn parse_chargeback_format(
     query: Option<&str>,
 ) -> Result<ChargebackFormat, Box<Response<Full<Bytes>>>> {
@@ -2966,11 +3051,27 @@ fn observability_detail_allowed_with(
 
 /// Whether the caller presented a valid Admin API JWT that is not
 /// namespace-bounded ([`AuditActor::is_namespace_bounded`]): the detail tier
-/// describes the whole process, not one tenant. Some detailed health fields are
-/// derived using the Admin API signing secret and must not be exposed through
-/// the broader metrics-token/CIDR observability tier.
+/// describes the whole process, not one tenant. Values keyed by the Admin API
+/// signing secret are gated separately by [`admin_secret_keyed_detail_allowed`].
 fn admin_jwt_detail_allowed(state: &AdminState, auth_header: Option<&str>) -> bool {
     verified_admin_actor(state, auth_header).is_some_and(|actor| !actor.is_namespace_bounded())
+}
+
+/// Whether a detail-tier caller may also see values keyed by
+/// `FERRUM_ADMIN_JWT_SECRET` (`cp_dp_trust.active_generation`): only a
+/// fleet-wide token that the primary key itself verified
+/// (GHSA-crqx-mp2f-v8c8).
+///
+/// Such a token is already an HMAC under that secret, so one more keyed value
+/// gives its holder no new offline verifier for guesses of the secret. A
+/// `FERRUM_ADMIN_JWT_VIEWER_SECRET` token, a metrics bearer token, and a
+/// metrics-allowlisted source hold no such MAC, and for them a keyed value
+/// over known input would be exactly that verifier.
+fn admin_secret_keyed_detail_allowed(actor: Option<&AuditActor>) -> bool {
+    actor.is_some_and(|actor| {
+        actor.key_tier == crate::admin::jwt_auth::AdminKeyTier::Primary
+            && !actor.is_namespace_bounded()
+    })
 }
 
 /// The actor of a valid Admin API JWT in `auth_header`, or `None` when none was
@@ -3268,6 +3369,7 @@ async fn handle_admin_request_inner(
         let admin_jwt_detail = admin_actor
             .as_ref()
             .is_some_and(|actor| !actor.is_namespace_bounded());
+        let admin_secret_keyed_detail = admin_secret_keyed_detail_allowed(admin_actor.as_ref());
         let detailed = observability_detail_allowed_with(
             &state,
             admin_jwt_detail,
@@ -3524,10 +3626,11 @@ async fn handle_admin_request_inner(
             // identifier. Authenticated detail only — never the coarse probe.
             if let Some(mut trust) = crate::grpc::cp_trust_health::snapshot() {
                 // This identifier is an HMAC under FERRUM_ADMIN_JWT_SECRET.
-                // Metrics-only credentials and CIDR allowlists authorize the
-                // operational counters above, but never an offline verifier
-                // for guesses of the Admin API signing secret.
-                if !admin_jwt_detail {
+                // Viewer-key tokens, metrics-only credentials, and CIDR
+                // allowlists authorize the operational counters above, but
+                // never an offline verifier for guesses of the Admin API
+                // signing secret (GHSA-crqx-mp2f-v8c8).
+                if !admin_secret_keyed_detail {
                     trust.active_generation = None;
                 }
                 // Booleans, seconds, counters, a closed-set reason, and the
@@ -4043,14 +4146,16 @@ async fn handle_admin_request_inner(
         return Ok(resp);
     }
 
-    // Authenticate. The `diagnostics:read` scope is read from the same verified
-    // claims, so the diagnostic reference lookup never re-verifies the token.
-    let (auth, diagnostics_read) = match state.jwt_manager.verify_request(auth_header.as_deref()) {
+    // Authenticate. The `diagnostics:read` and `charges:collect` scopes are
+    // read from the same verified claims, so neither route re-verifies the
+    // token.
+    let (auth, token_scopes) = match state.jwt_manager.verify_request(auth_header.as_deref()) {
         Ok(token_data) => match AuditActor::from_verified(&token_data) {
             Ok(actor) => {
                 // Tier-aware: a viewer-key token's `scope` claims grant nothing.
                 let diagnostics_read = token_data.grants_scope(DIAGNOSTICS_READ_SCOPE);
-                (actor, diagnostics_read)
+                let charges_collect = charges_collection_granted(&token_data);
+                (actor, (diagnostics_read, charges_collect))
             }
             Err(message) => {
                 return Ok(with_admin_challenge(
@@ -4101,6 +4206,7 @@ async fn handle_admin_request_inner(
             ));
         }
     };
+    let (diagnostics_read, charges_collect) = token_scopes;
 
     // Peer address + bounded request ID for security-sensitive audit events.
     // Built after authentication so unauthenticated probes never mint correlation
@@ -4128,61 +4234,7 @@ async fn handle_admin_request_inner(
     // or a later accepted generation cannot honor its configured pool shard count.
     if path == "/charges" && method == Method::GET {
         let registry = crate::plugins::api_chargeback::try_global_registry();
-        match parse_chargeback_format(req.uri().query()) {
-            Ok(format) => {
-                let rendered = match registry {
-                    Some(registry) => render_charges_off_worker(registry, format).await,
-                    None => {
-                        let empty = match format {
-                            ChargebackFormat::Json => {
-                                crate::plugins::api_chargeback::empty_charges_json()
-                            }
-                            ChargebackFormat::Prometheus => {
-                                crate::plugins::api_chargeback::empty_charges_prometheus()
-                            }
-                        };
-                        empty.map(|output| (output, None))
-                    }
-                };
-                match rendered {
-                    Ok((output, delivery_ack)) => {
-                        let content_type = match format {
-                            ChargebackFormat::Json => "application/json",
-                            ChargebackFormat::Prometheus => {
-                                "text/plain; version=0.0.4; charset=utf-8"
-                            }
-                        };
-                        let resp = match with_admin_security_headers(Response::builder())
-                            .status(StatusCode::OK)
-                            .header("Content-Type", content_type)
-                            .body(Full::new(Bytes::from(output)))
-                        {
-                            Ok(mut resp) => {
-                                // Collection is acknowledged by the connection's
-                                // body wrapper once it has taken this document,
-                                // never here at render time (issue #5276).
-                                if let Some(ack) = delivery_ack {
-                                    resp.extensions_mut().insert(ack);
-                                }
-                                resp
-                            }
-                            Err(_) => admin_builder_failure_response(),
-                        };
-                        return Ok(resp);
-                    }
-                    Err(err) => {
-                        // Fail closed: never serialize non-finite monetary values as
-                        // JSON null (serde_json's default for Inf/NaN) or publish
-                        // non-finite Prometheus samples.
-                        return Ok(json_response(
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                            &json!({"error": err}),
-                        ));
-                    }
-                }
-            }
-            Err(resp) => return Ok(*resp),
-        }
+        return Ok(charges_response(registry, query.as_deref(), charges_collect).await);
     }
 
     if path == "/charges/sink/status" && method == Method::GET {
@@ -4675,7 +4727,7 @@ async fn handle_admin_request_inner(
             crud::handle_list::<Proxy>(&state, &pagination, auth.role, &namespace).await
         }
         (Method::GET, ["proxies", id]) => {
-            crud::handle_get::<Proxy>(&state, id, auth.role, &namespace).await
+            crud::handle_get::<Proxy>(&state, id, auth.role, auth.key_tier, &namespace).await
         }
         (Method::GET, ["proxies", id, "mcp", "tools"]) => {
             let pagination = route_pagination!();
@@ -4749,7 +4801,7 @@ async fn handle_admin_request_inner(
             .await
         }
         (Method::GET, ["consumers", id]) => {
-            crud::handle_get::<Consumer>(&state, id, auth.role, &namespace).await
+            crud::handle_get::<Consumer>(&state, id, auth.role, auth.key_tier, &namespace).await
         }
         (Method::GET, ["consumers", id, "verification"]) => {
             if let Some(resp) = require_admin_role(&auth, AdminRole::Admin) {
@@ -4899,7 +4951,7 @@ async fn handle_admin_request_inner(
             .await
         }
         (Method::GET, ["plugins", "config", id]) => {
-            crud::handle_get::<PluginConfig>(&state, id, auth.role, &namespace).await
+            crud::handle_get::<PluginConfig>(&state, id, auth.role, auth.key_tier, &namespace).await
         }
         (Method::PUT, ["plugins", "config", id]) => {
             if let Some(resp) = require_admin_role(&auth, AdminRole::Operator) {
@@ -4955,7 +5007,7 @@ async fn handle_admin_request_inner(
             .await
         }
         (Method::GET, ["upstreams", id]) => {
-            crud::handle_get::<Upstream>(&state, id, auth.role, &namespace).await
+            crud::handle_get::<Upstream>(&state, id, auth.role, auth.key_tier, &namespace).await
         }
         (Method::PUT, ["upstreams", id]) => {
             if let Some(resp) = require_admin_role(&auth, AdminRole::Operator) {
@@ -5038,7 +5090,14 @@ async fn handle_admin_request_inner(
             if let Some(resp) = require_admin_role(&auth, AdminRole::Operator) {
                 return Ok(resp);
             }
-            crud::handle_get::<GatewayTrustBundleRecord>(&state, id, auth.role, &namespace).await
+            crud::handle_get::<GatewayTrustBundleRecord>(
+                &state,
+                id,
+                auth.role,
+                auth.key_tier,
+                &namespace,
+            )
+            .await
         }
         (Method::PUT, ["gateway-trust-bundles", id]) => {
             if let Some(resp) = require_admin_role(&auth, AdminRole::Admin) {
