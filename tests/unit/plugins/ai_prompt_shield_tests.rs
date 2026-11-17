@@ -6013,3 +6013,111 @@ async fn bomless_wide_encoded_numeric_roots_are_json_candidates() {
         assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
     }
 }
+
+/// GHSA-49cr-v28q-9hgp: duplicate member names are refused in the ordinary
+/// `content` and `all` scan modes too, not only in `mcp_arguments`.
+/// `serde_json` keeps the LAST duplicate, so the advisory body is scanned as
+/// `hi` while a first-key-wins upstream receives the SSN.
+#[tokio::test]
+async fn content_and_all_modes_refuse_duplicate_member_names() {
+    let bodies = [
+        // The advisory reproduction: a nested duplicate inside messages[].
+        r#"{"model":"m","messages":[{"role":"user","content":"SSN 123-45-6789","content":"hi"}]}"#,
+        // An escaped spelling of the same member name.
+        r#"{"model":"m","messages":[{"role":"user","content":"SSN 123-45-6789","content":"hi"}]}"#,
+        // A top-level duplicate.
+        r#"{"model":"m","messages":[{"role":"user","content":"SSN 123-45-6789"}],"messages":[{"role":"user","content":"hi"}]}"#,
+    ];
+    for mode in ["content", "all"] {
+        for body in bodies {
+            for action in ["reject", "redact"] {
+                let plugin = AiPromptShield::new(&json!({
+                    "action": action,
+                    "scan_fields": mode,
+                    "patterns": ["ssn"]
+                }))
+                .unwrap();
+                let mut ctx = make_post_ctx_with_raw_body(body);
+                let mut headers = make_post_headers();
+                assert_reject(plugin.before_proxy(&mut ctx, &mut headers).await, Some(400));
+                assert_eq!(
+                    shield_metadata(&ctx, "ai_shield_rejected"),
+                    Some("ambiguous_json"),
+                    "{mode}/{action}: {body}"
+                );
+
+                // The final backend-visible body is screened as well.
+                let mut ctx = make_post_ctx_with_raw_body(body);
+                assert_reject(
+                    plugin
+                        .on_final_request_body_with_context(&mut ctx, &headers, body.as_bytes())
+                        .await,
+                    Some(400),
+                );
+                assert_eq!(
+                    shield_metadata(&ctx, "ai_shield_rejected"),
+                    Some("ambiguous_json"),
+                    "{mode}/{action} final: {body}"
+                );
+            }
+
+            let plugin = AiPromptShield::new(&json!({
+                "action": "warn",
+                "scan_fields": mode,
+                "patterns": ["ssn"]
+            }))
+            .unwrap();
+            let mut ctx = make_post_ctx_with_raw_body(body);
+            let mut headers = make_post_headers();
+            assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+            assert_eq!(
+                shield_metadata(&ctx, "ai_shield_warnings"),
+                Some("ambiguous_json"),
+                "{mode}/warn: {body}"
+            );
+        }
+
+        // The same request without the duplicate is scanned normally.
+        let plugin = AiPromptShield::new(&json!({
+            "action": "reject",
+            "scan_fields": mode,
+            "patterns": ["ssn"]
+        }))
+        .unwrap();
+        let clean = r#"{"model":"m","messages":[{"role":"user","content":"hi"}]}"#;
+        let mut ctx = make_post_ctx_with_raw_body(clean);
+        let mut headers = make_post_headers();
+        assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+    }
+}
+
+/// A deferred compressed body is first readable in the final hook, so the
+/// duplicate-member screen must run there for it too.
+#[tokio::test]
+async fn deferred_compressed_body_with_duplicate_members_is_refused() {
+    let plugin = AiPromptShield::new(&json!({
+        "action": "reject",
+        "patterns": ["ssn"]
+    }))
+    .unwrap();
+    let mut ctx = create_test_context();
+    ctx.method = "POST".to_string();
+    let mut headers = make_post_headers();
+    headers.insert("content-encoding".to_string(), "gzip".to_string());
+    ctx.headers = headers.clone();
+    assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+
+    headers.remove("content-encoding");
+    let body =
+        br#"{"model":"m","messages":[{"role":"user","content":"SSN 123-45-6789","content":"hi"}]}"#;
+    assert_reject(
+        plugin
+            .on_final_request_body_with_context(&mut ctx, &headers, body)
+            .await,
+        Some(400),
+    );
+    assert_eq!(
+        shield_metadata(&ctx, "ai_shield_rejected"),
+        Some("ambiguous_json")
+    );
+}
