@@ -1091,6 +1091,14 @@ impl NamespaceRegistryAdmission {
             .try_for_each(NamespaceConfigAdmissionGuard::ensure_held)
     }
 
+    /// Test-only: mark every lease invalid, as a lapsed renewal would.
+    #[cfg(feature = "test-support")]
+    pub(crate) fn force_lose_for_test(&self) {
+        for guard in &self.guards {
+            guard.force_lose_for_test();
+        }
+    }
+
     /// Observe the global registry lease across a persistence future that is
     /// not cancellation-safe. The per-name leases are verified at the commit
     /// boundary by the backend; this is the local liveness view.

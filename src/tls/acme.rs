@@ -888,6 +888,31 @@ impl AcmeCertificateStore {
         })
     }
 
+    /// [`Self::delete_certificate`] that first asks `still_authorized`, under
+    /// the store's exclusive lock, whether the caller may still remove the
+    /// record (issue #7394). `Ok(None)` means the check refused and nothing
+    /// changed or was republished.
+    pub fn delete_certificate_if_authorized(
+        &self,
+        id: &str,
+        still_authorized: impl FnOnce() -> bool,
+    ) -> Result<Option<AcmeCertificateRecord>, AcmeError> {
+        validate_acme_id(id)?;
+        let id = id.to_string();
+        self.file.mutate_if(move |document| {
+            if !document.certificates.contains_key(&id) {
+                return Err(AcmeError::NotFound(id));
+            }
+            if !still_authorized() {
+                return Ok((false, None));
+            }
+            match document.certificates.remove(&id) {
+                Some(record) => Ok((true, Some(record))),
+                None => Err(AcmeError::NotFound(id)),
+            }
+        })
+    }
+
     pub fn material(
         &self,
         identifier: &str,

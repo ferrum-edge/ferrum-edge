@@ -1027,7 +1027,8 @@ pub(super) async fn handle_delete_acme_certificate(
     if let Err(response) = state.admit_non_config_db_write().await {
         return Ok(response);
     }
-    // `fence` is held until this handler returns, after the store delete.
+    // `fence` moves into the blocking delete below, which owns it until the
+    // store mutation has concluded, even if this request is cancelled.
     let (usage, fence) = match tls_record_usage(state, "acme", id).await {
         Ok(found) => found,
         Err(response) => return Ok(*response),
@@ -1046,12 +1047,12 @@ pub(super) async fn handle_delete_acme_certificate(
         Ok(store) => store,
         Err(response) => return Ok(*response),
     };
-    if let Some(response) = tls_reference_fence_lost(fence.as_ref()) {
-        return Ok(response);
-    }
     let id = id.to_string();
     let deleted = match offload_store_write("acme_certificate_delete", move || {
-        store.delete_certificate(&id)
+        let deleted =
+            store.delete_certificate_if_authorized(&id, || tls_reference_fence_held(&fence));
+        drop(fence);
+        deleted
     })
     .await
     {
@@ -1059,7 +1060,8 @@ pub(super) async fn handle_delete_acme_certificate(
         Err(response) => return Ok(*response),
     };
     match deleted {
-        Ok(record) => {
+        Ok(None) => Ok(tls_reference_fence_lost_response()),
+        Ok(Some(record)) => {
             request_managed_source_reloads();
             Ok(super::json_response(
                 StatusCode::OK,
@@ -1235,7 +1237,8 @@ pub(super) async fn handle_delete_managed(
     if let Err(response) = state.admit_non_config_db_write().await {
         return Ok(response);
     }
-    // `fence` is held until this handler returns, after the store delete.
+    // `fence` moves into the blocking delete below, which owns it until the
+    // store mutation has concluded, even if this request is cancelled.
     let (usage, fence) = match tls_record_usage(state, "managed", id).await {
         Ok(found) => found,
         Err(response) => return Ok(*response),
@@ -1270,19 +1273,21 @@ pub(super) async fn handle_delete_managed(
             }),
         )),
         Ok(_) => {
-            if let Some(response) = tls_reference_fence_lost(fence.as_ref()) {
-                return Ok(response);
-            }
             let owned_id = id.to_string();
-            let deleted =
-                match offload_store_write("managed_tls_delete", move || store.delete(&owned_id))
-                    .await
-                {
-                    Ok(deleted) => deleted,
-                    Err(response) => return Ok(*response),
-                };
+            let deleted = match offload_store_write("managed_tls_delete", move || {
+                let deleted =
+                    store.delete_if_authorized(&owned_id, || tls_reference_fence_held(&fence));
+                drop(fence);
+                deleted
+            })
+            .await
+            {
+                Ok(deleted) => deleted,
+                Err(response) => return Ok(*response),
+            };
             match deleted {
-                Ok(record) => {
+                Ok(None) => Ok(tls_reference_fence_lost_response()),
+                Ok(Some(record)) => {
                     request_managed_source_reloads();
                     if kind == ManagedTlsMaterialKind::Jwks {
                         refresh_managed_jwks_consumers().await;
@@ -2752,16 +2757,35 @@ struct TlsRecordUsage {
 ///
 /// It is the global namespace-registry lease plus every namespace's config
 /// admission lease. Every admin writer that can add a reference (CRUD,
-/// `/batch`, `/restore`, API-spec import) takes its namespace's lease before
-/// it validates the reference and keeps it until the write commits, so while
-/// the fence is held no such write can commit in any namespace the scan
-/// covered, and no namespace can be created or renamed in the registry.
+/// `/batch`, `/restore`, API-spec import) holds its namespace's lease from
+/// validation to commit, so while the fence is held no such write can commit
+/// in any namespace the scan covered, and no namespace can be created or
+/// renamed in the registry. A write that waited then fails admission only if
+/// its admission resolves the record (managed JWKS references); backend TLS
+/// paths are not resolved at admission (review dsf F1, documented in
+/// `docs/admin_api.md`).
+///
+/// It also holds the config store's write-topology pin, taken before the
+/// leases (the order every config writer uses), so a reconnect cannot move
+/// the scan, the leases and their renewal onto a different database partway
+/// through (review sol F3). It does not apply the sticky failover-write
+/// policy: the record lives in the independent TLS store.
+///
+/// The fence moves into the blocking store delete, so a cancelled request
+/// cannot release it while that delete is still pending (review sol F1),
+/// and the store re-validates it under its exclusive lock, immediately before
+/// removing the record (review sol F2).
 struct TlsReferenceFence {
     admission: super::crud::NamespaceRegistryAdmission,
+    db: Arc<dyn crate::config::db_backend::DatabaseBackend>,
+    topology: crate::config::db_backend::DbWriteTopologyPermit,
 }
 
 impl TlsReferenceFence {
     fn ensure_held(&self) -> Result<(), anyhow::Error> {
+        if self.db.config_topology_epoch() != self.topology.topology_epoch() {
+            anyhow::bail!("config store topology changed under the TLS reference fence");
+        }
         self.admission.ensure_all_held()
     }
 }
@@ -2811,6 +2835,9 @@ async fn tls_record_usage(
     let mut usages = std::collections::BTreeSet::new();
     let mut fence = None;
     if let Some(db) = state.db.as_ref() {
+        // Pinned before any lease and before the first read, so every step
+        // below runs against one topology.
+        let topology = db.acquire_write_topology_permit().await;
         let mut namespaces = match db.list_namespaces_authoritative().await {
             Ok(namespaces) => namespaces,
             Err(_error) => {
@@ -2850,7 +2877,7 @@ async fn tls_record_usage(
                     }
                 }
             }
-            tls_reference_scan_hook(id).await;
+            run_tls_reference_scan_hook(id, &admission).await;
             let current = match db.list_namespaces_authoritative().await {
                 Ok(current) => current,
                 Err(_error) => {
@@ -2862,7 +2889,11 @@ async fn tls_record_usage(
                 .iter()
                 .all(|name| namespaces.binary_search(name).is_ok())
             {
-                fence = Some(TlsReferenceFence { admission });
+                fence = Some(TlsReferenceFence {
+                    admission,
+                    db: db.clone(),
+                    topology,
+                });
                 break;
             }
             drop(admission);
@@ -2913,57 +2944,104 @@ async fn tls_record_usage(
     Ok((usages.into_iter().collect(), fence))
 }
 
-/// Refuse the store delete if the fence's leases lapsed after the scan: the
-/// answer it gave may no longer hold.
-fn tls_reference_fence_lost(fence: Option<&TlsReferenceFence>) -> Option<Response<Full<Bytes>>> {
-    let fence = fence?;
-    if fence.ensure_held().is_ok() {
-        return None;
+/// Whether the delete may still proceed: true without a fence (no
+/// configuration store), else the fence's topology and leases must hold.
+/// Called by the store under its exclusive lock.
+fn tls_reference_fence_held(fence: &Option<TlsReferenceFence>) -> bool {
+    match fence {
+        None => true,
+        Some(fence) => fence.ensure_held().is_ok(),
     }
+}
+
+/// The store refused the delete because the fence lapsed after the scan: its
+/// answer may no longer hold, so nothing was removed.
+fn tls_reference_fence_lost_response() -> Response<Full<Bytes>> {
     super::warn_persistence_failure_redacted("tls_record_usage_fence_lost");
-    Some(tls_record_usage_unavailable_response())
+    tls_record_usage_unavailable_response()
 }
 
-/// Test hook awaited between the reference scan and the namespace re-check,
-/// with the record id. The slot is process-global: a hook must return
-/// immediately for every id other than its own test's.
-#[cfg(feature = "test-support")]
-type TlsReferenceScanHookForTests = std::sync::Arc<
-    dyn Fn(&str) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> + Send + Sync,
->;
-
-#[cfg(feature = "test-support")]
-fn tls_reference_scan_hook_slot() -> &'static std::sync::Mutex<Option<TlsReferenceScanHookForTests>>
-{
-    static HOOK: std::sync::OnceLock<std::sync::Mutex<Option<TlsReferenceScanHookForTests>>> =
-        std::sync::OnceLock::new();
-    HOOK.get_or_init(|| std::sync::Mutex::new(None))
-}
-
-/// Install or clear the hook a managed TLS / ACME delete awaits after its
-/// cross-namespace reference scan. Tests must clear it before finishing.
+/// What a test hook asks the delete to do after its reference scan.
 #[cfg(feature = "test-support")]
 #[doc(hidden)]
-pub fn set_tls_reference_scan_hook_for_tests(hook: Option<TlsReferenceScanHookForTests>) {
-    if let Ok(mut slot) = tls_reference_scan_hook_slot().lock() {
-        *slot = hook;
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TlsReferenceScanHookAction {
+    /// Carry on with the namespace re-check and the delete.
+    Continue,
+    /// Invalidate the fence's leases, as a lapsed renewal would.
+    LoseFence,
+}
+
+/// Test hook awaited between the reference scan and the namespace re-check.
+#[cfg(feature = "test-support")]
+type TlsReferenceScanHookForTests = std::sync::Arc<
+    dyn Fn() -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = TlsReferenceScanHookAction> + Send>,
+        > + Send
+        + Sync,
+>;
+
+/// Hooks keyed by record id, so concurrent tests never replace or clear each
+/// other's (review sol F4).
+#[cfg(feature = "test-support")]
+fn tls_reference_scan_hook_slot()
+-> &'static std::sync::Mutex<std::collections::HashMap<String, TlsReferenceScanHookForTests>> {
+    static HOOKS: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<String, TlsReferenceScanHookForTests>>,
+    > = std::sync::OnceLock::new();
+    HOOKS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// Install (`Some`) or remove (`None`) the hook a managed TLS / ACME delete
+/// of `record_id` awaits after its cross-namespace reference scan.
+#[cfg(feature = "test-support")]
+#[doc(hidden)]
+pub fn set_tls_reference_scan_hook_for_tests(
+    record_id: &str,
+    hook: Option<TlsReferenceScanHookForTests>,
+) {
+    if let Ok(mut hooks) = tls_reference_scan_hook_slot().lock() {
+        match hook {
+            Some(hook) => {
+                hooks.insert(record_id.to_string(), hook);
+            }
+            None => {
+                hooks.remove(record_id);
+            }
+        }
     }
 }
 
+/// Await this record's test hook, if any, and apply what it asks.
 #[cfg(feature = "test-support")]
-async fn tls_reference_scan_hook(id: &str) {
-    let hook = tls_reference_scan_hook_slot()
-        .lock()
-        .ok()
-        .and_then(|slot| slot.clone());
-    if let Some(hook) = hook {
-        hook(id).await;
+async fn run_tls_reference_scan_hook(
+    id: &str,
+    admission: &super::crud::NamespaceRegistryAdmission,
+) {
+    if tls_reference_scan_hook(id).await == TlsReferenceScanHookAction::LoseFence {
+        admission.force_lose_for_test();
     }
 }
 
 /// Without `test-support` no hook can be installed.
 #[cfg(not(feature = "test-support"))]
-async fn tls_reference_scan_hook(_id: &str) {}
+async fn run_tls_reference_scan_hook(
+    _id: &str,
+    _admission: &super::crud::NamespaceRegistryAdmission,
+) {
+}
+
+#[cfg(feature = "test-support")]
+async fn tls_reference_scan_hook(id: &str) -> TlsReferenceScanHookAction {
+    let hook = tls_reference_scan_hook_slot()
+        .lock()
+        .ok()
+        .and_then(|hooks| hooks.get(id).cloned());
+    match hook {
+        Some(hook) => hook().await,
+        None => TlsReferenceScanHookAction::Continue,
+    }
+}
 
 fn tls_record_usage_unavailable_response() -> Response<Full<Bytes>> {
     super::json_response(

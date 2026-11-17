@@ -115,7 +115,11 @@ paths:
   `try_write`s Admin topology then generation, both fail-fast, and publishes the
   connection and its topology in one store under those guards; issue #7061).
   Managed TLS/ACME handlers use the non-topology write gate only (read-only +
-  database-unavailable) and must not pin or inherit sticky DB failover policy.
+  database-unavailable) and must not inherit sticky DB failover policy. The
+  one exception to "no pin" is the managed TLS/ACME delete's cross-namespace
+  reference fence (issue #7394): it reads and leases the config store, so it
+  takes `acquire_write_topology_permit` (not `admit_write`) before its leases
+  and holds it until the TLS-store delete concludes.
   Observe-only `/health` uses the synchronous policy check;
   `admin_writes_enabled` reports config-database mutation admission.
 - Runtime config polling is authoritative and primary-consistent: startup full loads, incremental change-log reads, relationship reads, cursor advancement, and accepted association state must not use SQL read replicas or MongoDB secondary read preferences.

@@ -691,23 +691,34 @@ async fn delete_refuses_a_managed_jwks_record_referenced_from_another_namespace(
     );
 }
 
-type ScanHook = Arc<
-    dyn Fn(&str) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> + Send + Sync,
->;
+use ferrum_edge::admin::TlsReferenceScanHookAction;
 
-/// Clears the process-global scan hook even when the test panics.
-struct ScanHookGuard;
+type ScanHookFuture =
+    std::pin::Pin<Box<dyn std::future::Future<Output = TlsReferenceScanHookAction> + Send>>;
+type ScanHook = Arc<dyn Fn() -> ScanHookFuture + Send + Sync>;
+
+/// Removes this test's scan hook (keyed by its own record id) even when the
+/// test panics. Other tests' hooks are untouched.
+struct ScanHookGuard(String);
 
 impl Drop for ScanHookGuard {
     fn drop(&mut self) {
-        ferrum_edge::admin::set_tls_reference_scan_hook_for_tests(None);
+        ferrum_edge::admin::set_tls_reference_scan_hook_for_tests(&self.0, None);
     }
 }
 
+/// Bounded wait, so a hook that never fires fails the test instead of hanging.
+async fn within<T>(what: &str, future: impl std::future::Future<Output = T>) -> T {
+    tokio::time::timeout(std::time::Duration::from_secs(30), future)
+        .await
+        .unwrap_or_else(|_| panic!("timed out waiting for {what}"))
+}
+
 /// Pause the first delete of `record_id` between its reference scan and its
-/// namespace re-check; every other id passes straight through.
+/// namespace re-check, then answer `action`.
 fn pause_first_scan_of(
     record_id: &str,
+    action: TlsReferenceScanHookAction,
 ) -> (
     ScanHookGuard,
     Arc<tokio::sync::Notify>,
@@ -716,31 +727,46 @@ fn pause_first_scan_of(
     let scanned = Arc::new(tokio::sync::Notify::new());
     let release = Arc::new(tokio::sync::Notify::new());
     let paused = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let target = record_id.to_string();
     let (hook_scanned, hook_release) = (scanned.clone(), release.clone());
-    let hook: ScanHook = Arc::new(
-        move |id: &str| -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
-            let pause = id == target && !paused.swap(true, std::sync::atomic::Ordering::SeqCst);
-            let (scanned, release) = (hook_scanned.clone(), hook_release.clone());
-            Box::pin(async move {
-                if pause {
-                    scanned.notify_one();
-                    release.notified().await;
-                }
-            })
-        },
-    );
-    ferrum_edge::admin::set_tls_reference_scan_hook_for_tests(Some(hook));
-    (ScanHookGuard, scanned, release)
+    let hook: ScanHook = Arc::new(move || -> ScanHookFuture {
+        let pause = !paused.swap(true, std::sync::atomic::Ordering::SeqCst);
+        let (scanned, release) = (hook_scanned.clone(), hook_release.clone());
+        Box::pin(async move {
+            if pause {
+                scanned.notify_one();
+                release.notified().await;
+                action
+            } else {
+                TlsReferenceScanHookAction::Continue
+            }
+        })
+    });
+    ferrum_edge::admin::set_tls_reference_scan_hook_for_tests(record_id, Some(hook));
+    (ScanHookGuard(record_id.to_string()), scanned, release)
+}
+
+async fn database_admin(
+    dir: &tempfile::TempDir,
+) -> (
+    Arc<AdminHarness>,
+    Arc<ferrum_edge::config::db_loader::DatabaseStore>,
+) {
+    let mut state = admin_state(Arc::new(ArcSwap::from_pointee(GatewayConfig::default())));
+    let store = Arc::new(sqlite_store(dir).await);
+    state.db = Some(store.clone());
+    state.mode = "database".to_string();
+    (Arc::new(AdminHarness::start(state).await), store)
 }
 
 async fn database_admin_with_record(
     dir: &tempfile::TempDir,
-) -> (Arc<AdminHarness>, String, String) {
-    let mut state = admin_state(Arc::new(ArcSwap::from_pointee(GatewayConfig::default())));
-    state.db = Some(Arc::new(sqlite_store(dir).await));
-    state.mode = "database".to_string();
-    let admin = Arc::new(AdminHarness::start(state).await);
+) -> (
+    Arc<AdminHarness>,
+    String,
+    String,
+    Arc<ferrum_edge::config::db_loader::DatabaseStore>,
+) {
+    let (admin, store) = database_admin(dir).await;
     let record_id = format!("idp-{}", uuid::Uuid::new_v4().simple());
     let source = format!("managed://jwks/{record_id}#jwks");
     let key = signing_key("fenced");
@@ -752,7 +778,7 @@ async fn database_admin_with_record(
         )
         .await;
     assert_eq!(status, StatusCode::CREATED, "{body}");
-    (admin, record_id, source)
+    (admin, record_id, source, store)
 }
 
 /// Review sol F1 on #7412: a reference committed in an already-scanned
@@ -764,7 +790,7 @@ async fn database_admin_with_record(
 #[tokio::test(flavor = "multi_thread")]
 async fn delete_fences_reference_writes_into_scanned_namespaces() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let (admin, record_id, source) = database_admin_with_record(&dir).await;
+    let (admin, record_id, source, _store) = database_admin_with_record(&dir).await;
     let tenant = "tenant-b";
     // tenant-b exists before the delete starts, so the scan fences it.
     let (status, body) = admin
@@ -777,14 +803,15 @@ async fn delete_fences_reference_writes_into_scanned_namespaces() {
         .await;
     assert_eq!(status, StatusCode::CREATED, "{body}");
 
-    let (_hook, scanned, release) = pause_first_scan_of(&record_id);
+    let (_hook, scanned, release) =
+        pause_first_scan_of(&record_id, TlsReferenceScanHookAction::Continue);
     let delete_path = format!("/admin/tls/jwks/{record_id}");
     let deleting = {
         let admin = admin.clone();
         let path = delete_path.clone();
         tokio::spawn(async move { admin.send(reqwest::Method::DELETE, &path, None).await })
     };
-    scanned.notified().await;
+    within("the reference scan", scanned.notified()).await;
 
     // The scan found no reference. A reference write into tenant-b now.
     let mut writing = {
@@ -810,8 +837,8 @@ async fn delete_fences_reference_writes_into_scanned_namespaces() {
     );
     release.notify_one();
 
-    let (delete_status, delete_body) = deleting.await.expect("delete task");
-    let (write_status, write_body) = writing.await.expect("write task");
+    let (delete_status, delete_body) = within("the delete", deleting).await.expect("delete task");
+    let (write_status, write_body) = within("the write", writing).await.expect("write task");
     assert_eq!(delete_status, StatusCode::OK, "{delete_body}");
     assert_eq!(
         write_status,
@@ -837,17 +864,18 @@ async fn delete_fences_reference_writes_into_scanned_namespaces() {
 #[tokio::test(flavor = "multi_thread")]
 async fn delete_rescans_a_namespace_created_during_the_scan() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let (admin, record_id, source) = database_admin_with_record(&dir).await;
+    let (admin, record_id, source, _store) = database_admin_with_record(&dir).await;
     let tenant = "tenant-new";
 
-    let (_hook, scanned, release) = pause_first_scan_of(&record_id);
+    let (_hook, scanned, release) =
+        pause_first_scan_of(&record_id, TlsReferenceScanHookAction::Continue);
     let delete_path = format!("/admin/tls/jwks/{record_id}");
     let deleting = {
         let admin = admin.clone();
         let path = delete_path.clone();
         tokio::spawn(async move { admin.send(reqwest::Method::DELETE, &path, None).await })
     };
-    scanned.notified().await;
+    within("the reference scan", scanned.notified()).await;
 
     let mut writing = {
         let admin = admin.clone();
@@ -866,10 +894,10 @@ async fn delete_rescans_a_namespace_created_during_the_scan() {
     // Let the write commit if nothing holds it; a held write resolves later.
     let early = tokio::time::timeout(std::time::Duration::from_secs(5), &mut writing).await;
     release.notify_one();
-    let (delete_status, delete_body) = deleting.await.expect("delete task");
+    let (delete_status, delete_body) = within("the delete", deleting).await.expect("delete task");
     let (write_status, write_body) = match early {
         Ok(joined) => joined.expect("write task"),
-        Err(_) => writing.await.expect("write task"),
+        Err(_) => within("the write", writing).await.expect("write task"),
     };
 
     match write_status {
@@ -893,4 +921,137 @@ async fn delete_rescans_a_namespace_created_during_the_scan() {
         }
         other => panic!("unexpected write status {other}: {write_body}"),
     }
+}
+
+/// An ACME certificate record for `domain`, self-signed and imported through
+/// the Admin API.
+async fn create_acme_certificate(admin: &AdminHarness, id: &str, domain: &str) {
+    let key_pair = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).expect("P-256 key");
+    let params = rcgen::CertificateParams::new(vec![domain.to_string()]).expect("params");
+    let cert = params
+        .self_signed(&key_pair)
+        .expect("self-signed certificate");
+    let (status, body) = admin
+        .send(
+            reqwest::Method::POST,
+            "/admin/tls/acme/certificates",
+            Some(json!({
+                "id": id,
+                "domains": [domain],
+                "directory_url": "https://acme-v02.api.letsencrypt.org/directory",
+                "cert_pem": cert.pem(),
+                "key_pem": key_pair.serialize_pem(),
+            })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+}
+
+/// Review dsf F3 on #7412: the ACME delete runs the same cross-namespace
+/// guard. A proxy in another namespace that names the certificate refuses the
+/// delete with `409` naming that namespace.
+#[tokio::test(flavor = "multi_thread")]
+async fn acme_delete_refuses_a_certificate_referenced_from_another_namespace() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (admin, _store) = database_admin(&dir).await;
+    let id = format!("acme-{}", uuid::Uuid::new_v4().simple());
+    create_acme_certificate(&admin, &id, "acme-fence.example.com").await;
+    let tenant = "tenant-b";
+    let (status, body) = admin
+        .send_ns(
+            reqwest::Method::POST,
+            "/proxies",
+            Some(json!({
+                "id": "acme-proxy",
+                "listen_path": "/acme-proxy",
+                "backend_scheme": "https",
+                "backend_host": "backend.internal",
+                "backend_port": 443,
+                "backend_tls_client_cert_path": format!("acme://certificates/{id}#cert"),
+                "backend_tls_client_key_path": format!("acme://certificates/{id}#key"),
+            })),
+            tenant,
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+
+    let path = format!("/admin/tls/acme/certificates/{id}");
+    let (status, body) = admin.send(reqwest::Method::DELETE, &path, None).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert!(
+        body["used_by"].as_array().is_some_and(|used_by| used_by
+            .iter()
+            .any(|usage| { usage["namespace"] == tenant && usage["resource_id"] == "acme-proxy" })),
+        "the refusal names the referencing namespace and proxy: {body}"
+    );
+    let (status, body) = admin.send(reqwest::Method::GET, &path, None).await;
+    assert_eq!(status, StatusCode::OK, "the certificate survives: {body}");
+}
+
+/// Review sol F2 / dsf F3 on #7412: the TLS store re-validates the fence
+/// under its own lock right before removing the record. Leases that lapse
+/// after the scan refuse the delete with `503` and leave the record in place.
+#[tokio::test(flavor = "multi_thread")]
+async fn acme_delete_refuses_when_the_fence_lapses_after_the_scan() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (admin, _store) = database_admin(&dir).await;
+    let id = format!("acme-{}", uuid::Uuid::new_v4().simple());
+    create_acme_certificate(&admin, &id, "acme-lapse.example.com").await;
+
+    let (_hook, scanned, release) = pause_first_scan_of(&id, TlsReferenceScanHookAction::LoseFence);
+    let path = format!("/admin/tls/acme/certificates/{id}");
+    let deleting = {
+        let admin = admin.clone();
+        let path = path.clone();
+        tokio::spawn(async move { admin.send(reqwest::Method::DELETE, &path, None).await })
+    };
+    within("the reference scan", scanned.notified()).await;
+    release.notify_one();
+    let (status, body) = within("the delete", deleting).await.expect("delete task");
+    assert_eq!(
+        status,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "a lapsed fence must refuse the delete: {body}"
+    );
+    let (status, body) = admin.send(reqwest::Method::GET, &path, None).await;
+    assert_eq!(status, StatusCode::OK, "the certificate survives: {body}");
+}
+
+/// Review sol F3 on #7412: the fence pins the config store topology, so a
+/// reconnect cannot move the scan or the leases to another database while a
+/// delete is between its scan and the store delete.
+#[tokio::test(flavor = "multi_thread")]
+async fn reconnect_waits_for_the_delete_fence() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (admin, record_id, _source, store) = database_admin_with_record(&dir).await;
+    let (_hook, scanned, release) =
+        pause_first_scan_of(&record_id, TlsReferenceScanHookAction::Continue);
+    let path = format!("/admin/tls/jwks/{record_id}");
+    let deleting = {
+        let admin = admin.clone();
+        let path = path.clone();
+        tokio::spawn(async move { admin.send(reqwest::Method::DELETE, &path, None).await })
+    };
+    within("the reference scan", scanned.notified()).await;
+
+    let other = dir.path().join(format!(
+        "managed-jwks-other-{}.db",
+        uuid::Uuid::new_v4().simple()
+    ));
+    let other_url = format!("sqlite:{}?mode=rwc", other.to_string_lossy());
+    let mut reconnecting = {
+        let store = store.clone();
+        tokio::spawn(async move { store.reconnect(&other_url).await })
+    };
+    match tokio::time::timeout(std::time::Duration::from_millis(500), &mut reconnecting).await {
+        Err(_) => {}
+        Ok(joined) => assert!(
+            joined.expect("reconnect task").is_err(),
+            "a reconnect must not publish while the delete fence pins the topology"
+        ),
+    }
+    release.notify_one();
+    let (status, body) = within("the delete", deleting).await.expect("delete task");
+    assert_eq!(status, StatusCode::OK, "{body}");
+    reconnecting.abort();
 }

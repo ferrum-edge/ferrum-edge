@@ -740,11 +740,13 @@ paths:
         whatever namespace it serves; `used_by[].namespace` names the
         namespace of a reference found in the store. If the store cannot be
         read the delete is refused with `503` rather than guessed.
-        The scan holds the namespace-registry lease and every namespace's
-        config admission lease until the record is deleted, so a concurrent
-        write cannot add a reference in a scanned namespace; a first write
-        into a namespace with no rows can still race the delete. See
-        docs/admin_api.md "Managed record deletion".
+        The scan pins the config store topology and holds the
+        namespace-registry lease and every namespace's config admission lease
+        until the record is removed, so no write in a scanned namespace commits
+        in between; the TLS store re-checks that fence before removing the
+        record and answers `503` if it lapsed. A first write into a namespace
+        with no rows can still race the delete. See docs/admin_api.md
+        "Managed record deletion".
       tags: [TLS]
       parameters:
         - $ref: "#/components/parameters/ResourceId"
@@ -1241,11 +1243,13 @@ paths:
         whatever namespace it serves; `used_by[].namespace` names the
         namespace of a reference found in the store. If the store cannot be
         read the delete is refused with `503` rather than guessed.
-        The scan holds the namespace-registry lease and every namespace's
-        config admission lease until the record is deleted, so a concurrent
-        write cannot add a reference in a scanned namespace; a first write
-        into a namespace with no rows can still race the delete. See
-        docs/admin_api.md "Managed record deletion".
+        The scan pins the config store topology and holds the
+        namespace-registry lease and every namespace's config admission lease
+        until the record is removed, so no write in a scanned namespace commits
+        in between; the TLS store re-checks that fence before removing the
+        record and answers `503` if it lapsed. A first write into a namespace
+        with no rows can still race the delete. See docs/admin_api.md
+        "Managed record deletion".
       tags: [TLS]
       parameters:
         - $ref: "#/components/parameters/ResourceId"
@@ -1417,11 +1421,13 @@ paths:
         whatever namespace it serves; `used_by[].namespace` names the
         namespace of a reference found in the store. If the store cannot be
         read the delete is refused with `503` rather than guessed.
-        The scan holds the namespace-registry lease and every namespace's
-        config admission lease until the record is deleted, so a concurrent
-        write cannot add a reference in a scanned namespace; a first write
-        into a namespace with no rows can still race the delete. See
-        docs/admin_api.md "Managed record deletion".
+        The scan pins the config store topology and holds the
+        namespace-registry lease and every namespace's config admission lease
+        until the record is removed, so no write in a scanned namespace commits
+        in between; the TLS store re-checks that fence before removing the
+        record and answers `503` if it lapsed. A first write into a namespace
+        with no rows can still race the delete. See docs/admin_api.md
+        "Managed record deletion".
       tags: [TLS]
       parameters:
         - $ref: "#/components/parameters/ResourceId"
@@ -1589,11 +1595,13 @@ paths:
         whatever namespace it serves; `used_by[].namespace` names the
         namespace of a reference found in the store. If the store cannot be
         read the delete is refused with `503` rather than guessed.
-        The scan holds the namespace-registry lease and every namespace's
-        config admission lease until the record is deleted, so a concurrent
-        write cannot add a reference in a scanned namespace; a first write
-        into a namespace with no rows can still race the delete. See
-        docs/admin_api.md "Managed record deletion".
+        The scan pins the config store topology and holds the
+        namespace-registry lease and every namespace's config admission lease
+        until the record is removed, so no write in a scanned namespace commits
+        in between; the TLS store re-checks that fence before removing the
+        record and answers `503` if it lapsed. A first write into a namespace
+        with no rows can still race the delete. See docs/admin_api.md
+        "Managed record deletion".
       tags: [TLS]
       parameters:
         - $ref: "#/components/parameters/ResourceId"
@@ -1761,11 +1769,13 @@ paths:
         whatever namespace it serves; `used_by[].namespace` names the
         namespace of a reference found in the store. If the store cannot be
         read the delete is refused with `503` rather than guessed.
-        The scan holds the namespace-registry lease and every namespace's
-        config admission lease until the record is deleted, so a concurrent
-        write cannot add a reference in a scanned namespace; a first write
-        into a namespace with no rows can still race the delete. See
-        docs/admin_api.md "Managed record deletion".
+        The scan pins the config store topology and holds the
+        namespace-registry lease and every namespace's config admission lease
+        until the record is removed, so no write in a scanned namespace commits
+        in between; the TLS store re-checks that fence before removing the
+        record and answers `503` if it lapsed. A first write into a namespace
+        with no rows can still race the delete. See docs/admin_api.md
+        "Managed record deletion".
       tags: [TLS]
       parameters:
         - $ref: "#/components/parameters/ResourceId"
@@ -1945,11 +1955,13 @@ paths:
         read the delete is refused with `503`. A record removed anyway (an
         out-of-band edit of the shared store) withdraws every key from its
         consumers, which then refuse tokens until it is restored.
-        The scan holds the namespace-registry lease and every namespace's
-        config admission lease until the record is deleted, so a concurrent
-        write cannot add a reference in a scanned namespace; a first write
-        into a namespace with no rows can still race the delete. See
-        docs/admin_api.md "Managed record deletion".
+        The scan pins the config store topology and holds the
+        namespace-registry lease and every namespace's config admission lease
+        until the record is removed, so no write in a scanned namespace commits
+        in between; the TLS store re-checks that fence before removing the
+        record and answers `503` if it lapsed. A first write into a namespace
+        with no rows can still race the delete. See docs/admin_api.md
+        "Managed record deletion".
       tags: [TLS]
       parameters:
         - $ref: "#/components/parameters/ResourceId"
