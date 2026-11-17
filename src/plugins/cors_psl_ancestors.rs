@@ -1,4 +1,4 @@
-//! Generated from the Public Suffix List bundled with `psl` 2.1.248
+//! Generated from the Public Suffix List bundled with `psl` 2.1.255
 //! (`data/rules.txt`). Do not edit by hand: regenerate with
 //! `python3 scripts/generate_cors_psl_ancestors.py`.
 //!
@@ -26,6 +26,7 @@ pub(crate) const PSL_SUFFIX_ANCESTORS: &[&str] = &[
     "amazoncognito.com",
     "amazonwebservices.com.cn",
     "amazonwebservices.eu",
+    "amba.host",
     "ap-east-1.amazonaws.com",
     "ap-east-1.amazoncognito.com",
     "ap-east-1.on.aws",

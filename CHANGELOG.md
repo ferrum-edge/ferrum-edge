@@ -377,6 +377,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `test-support` feature.
 
 ### Changed
+- Refresh bundled public trust data (#7402): `webpki-roots` 1.0.12 drops the
+  Buypass Class 2 and Class 3, DigiCert Trusted Root G4, QuoVadis Root CA 1 G3
+  and 3 G3, and Certigna roots from the default outbound trust store, following
+  Mozilla. A backend or health-check target whose chain ends at one of them now
+  needs `backend_tls_server_ca_cert_path` or `FERRUM_TLS_CA_BUNDLE_PATH`; a
+  control plane that a data plane or mesh node dials needs
+  `FERRUM_DP_GRPC_TLS_CA_CERT_PATH`. The Public Suffix List moves to `psl` 2.1.255
+  (see the upgrade guide for its CORS effect).
 - JWT verification uses jsonwebtoken 12 (#7404). Every JWT verifier (admin API,
   `jwt_auth`, `jwks_auth`/OIDC, DPoP proofs, CP/DP gRPC and JWT-SVID) now
   rejects a token whose header declares a `crit` extension other than `b64`, or
