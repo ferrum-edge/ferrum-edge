@@ -57,6 +57,9 @@ pub(crate) use istio::{
 // fail-closed REGISTRY_ONLY degradation is never enforced without being reported
 // (nor reported without being enforced).
 pub(crate) use istio::{SidecarOutboundPolicy, classify_sidecar_outbound_traffic_policy};
+// The status writer reports a rejected Sidecar's fail-closed marker from the
+// same constructor the translation publishes (GHSA-2r85-85hh-23mw).
+pub(crate) use istio::refused_sidecar;
 // Shared with the Istio status writer the same way: the ServiceEntry UDP-port
 // classification used by translation/materialization (a `protocol: UDP` port is
 // classified `AppProtocol::Udp`; external UDP egress materializes only on the
@@ -2451,12 +2454,7 @@ pub fn translate_k8s_objects_collecting_skips(
 
         match translation {
             Ok(mut translation) => {
-                carry_refused_request_authentications(
-                    &mut translation,
-                    objects,
-                    &options,
-                    &skipped,
-                );
+                carry_refused_security_resources(&mut translation, objects, &options, &skipped);
                 return Some((translation, skipped));
             }
             Err(error) => {
@@ -2498,20 +2496,35 @@ pub fn translate_k8s_objects_collecting_skips(
     }
 }
 
-/// Publish every refused RequestAuthentication as a fail-closed marker
-/// instead of dropping it (issue #6656). Dropping it would remove JWT
-/// validation from the workloads it selects; see
-/// [`istio::refused_request_authentication`]. The skip map still carries the
-/// translation error, so status keeps reporting the resource as rejected.
-fn carry_refused_request_authentications(
+/// Publish every refused Istio security resource as a fail-closed marker
+/// instead of dropping it.
+///
+/// Dropping a refused security resource removes enforcement from the
+/// workloads it selects. RequestAuthentication (issue #6656) would stop
+/// validating JWTs; AuthorizationPolicy, PeerAuthentication and Sidecar
+/// (GHSA-2r85-85hh-23mw) would stop denying, stop delegating to an external
+/// authorizer, lose the ALLOW implicit-deny floor, fall back from `STRICT`
+/// mTLS, or widen egress. Each kind's marker never grants more than the
+/// refused resource did; see [`istio::refused_request_authentication`],
+/// [`istio::refused_authorization_policy`],
+/// [`istio::refused_peer_authentication`] and [`istio::refused_sidecar`]. The
+/// skip map still carries the translation error, so status keeps reporting
+/// the resource as rejected.
+fn carry_refused_security_resources(
     translation: &mut K8sTranslation,
     objects: &[K8sObject],
     options: &K8sTranslationOptions,
     skipped: &std::collections::HashMap<K8sResourceKey, K8sTranslateError>,
 ) {
-    let mut refused = Vec::new();
+    let mut request_authentications = Vec::new();
+    let mut mesh_policies = Vec::new();
+    let mut peer_authentications = Vec::new();
+    let mut sidecars = Vec::new();
     for key in skipped.keys() {
-        if key.kind != "RequestAuthentication" {
+        if !matches!(
+            key.kind.as_str(),
+            "RequestAuthentication" | "AuthorizationPolicy" | "PeerAuthentication" | "Sidecar"
+        ) {
             continue;
         }
         let Some(object) = objects.iter().find(|object| {
@@ -2522,27 +2535,49 @@ fn carry_refused_request_authentications(
         }) else {
             continue;
         };
-        refused.push(istio::refused_request_authentication(options, object));
+        // Translation dispatches these kinds to the Istio translator by kind
+        // alone, so the marker follows the same rule.
+        match key.kind.as_str() {
+            "RequestAuthentication" => {
+                request_authentications.push(istio::refused_request_authentication(options, object))
+            }
+            "AuthorizationPolicy" => {
+                mesh_policies.extend(istio::refused_authorization_policy(options, object));
+            }
+            "PeerAuthentication" => {
+                peer_authentications.push(istio::refused_peer_authentication(options, object));
+            }
+            _ => sidecars.push(istio::refused_sidecar(object)),
+        }
     }
-    if refused.is_empty() {
+    if request_authentications.is_empty()
+        && mesh_policies.is_empty()
+        && peer_authentications.is_empty()
+        && sidecars.is_empty()
+    {
         return;
     }
     // Deterministic order regardless of HashMap iteration.
-    refused
+    request_authentications
         .sort_by(|left, right| (&left.namespace, &left.name).cmp(&(&right.namespace, &right.name)));
-    translation
-        .config
-        .mesh
-        .get_or_insert_with(|| {
-            // Every mesh-producing object was skipped: keep the configured
-            // Istio root namespace so a mesh-wide marker stays owned by it.
-            Box::new(MeshConfig {
-                istio_root_namespace: options.istio_root_namespace.clone(),
-                ..MeshConfig::default()
-            })
+    mesh_policies
+        .sort_by(|left, right| (&left.namespace, &left.name).cmp(&(&right.namespace, &right.name)));
+    peer_authentications
+        .sort_by(|left, right| (&left.namespace, &left.name).cmp(&(&right.namespace, &right.name)));
+    sidecars
+        .sort_by(|left, right| (&left.namespace, &left.name).cmp(&(&right.namespace, &right.name)));
+    let mesh = translation.config.mesh.get_or_insert_with(|| {
+        // Every mesh-producing object was skipped: keep the configured
+        // Istio root namespace so a mesh-wide marker stays owned by it.
+        Box::new(MeshConfig {
+            istio_root_namespace: options.istio_root_namespace.clone(),
+            ..MeshConfig::default()
         })
-        .request_authentications
-        .extend(refused);
+    });
+    mesh.request_authentications.extend(request_authentications);
+    mesh.mesh_policies.extend(mesh_policies);
+    mesh.peer_authentications.extend(peer_authentications);
+    mesh.sidecars.extend(sidecars);
 }
 
 fn includes_object_namespace(options: &K8sTranslationOptions, object: &K8sObject) -> bool {
