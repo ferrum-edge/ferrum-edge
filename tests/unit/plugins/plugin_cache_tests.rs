@@ -11103,11 +11103,22 @@ fn test_request_conditional_unbounded_trailer_policy_follows_waf_exemptions() {
     // Consumer identity is established by the authentication phase, so this case
     // only resolves correctly because the request paths defer the decision to the
     // finalized request context instead of reading it at intake.
+    let mut partner = super::plugin_utils::create_test_consumer();
+    partner.username = "trusted-partner".to_string();
     let mut by_consumer = trailer_policy_ctx("GET", "/api/orders");
-    by_consumer.authenticated_identity = Some("trusted-partner".to_string());
+    by_consumer.identified_consumer = Some(Arc::new(partner));
     assert!(
         !view.unbounded_response_trailer_policy_applies(&by_consumer),
         "a consumer-exempt request must preserve its backend trailers"
+    );
+
+    // An unmapped external identity spelling the Consumer name is not exempt
+    // (GHSA-rxwj-x6c6-f4j5).
+    let mut external = trailer_policy_ctx("GET", "/api/orders");
+    external.authenticated_identity = Some("trusted-partner".to_string());
+    assert!(
+        view.unbounded_response_trailer_policy_applies(&external),
+        "an external identity must not inherit a Consumer exemption"
     );
 }
 

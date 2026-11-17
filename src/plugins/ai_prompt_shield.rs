@@ -85,9 +85,9 @@
 //! a batch — and nothing else in the envelope (issue #5908). Recognition is
 //! shared with `mcp_gateway` (`utils::mcp_jsonrpc`), so the shield accepts the
 //! same request media types the gateway does, including a request with no
-//! `Content-Type`, and a body with duplicate member names is refused by
-//! enforcing actions instead of being read one way here and another way by the
-//! server that executes the call. `+json` gRPC-Web media types are accepted
+//! `Content-Type`. In every scan mode, a body with duplicate member names is
+//! refused by enforcing actions (and recorded by `warn`) instead of being read
+//! one way here and another way by the upstream that consumes it. `+json` gRPC-Web media types are accepted
 //! only for bare JSON bodies (`mcp_gateway` refuses framed payloads).
 //!
 //! A body the whole-document JSON parse refuses passes uninspected only when it
@@ -1592,10 +1592,17 @@ impl AiPromptShield {
         self.reject_uninspectable_body(ctx, reason)
     }
 
-    /// Refuse (or, in warn mode, record) an MCP body whose member names are
-    /// duplicated: which `params.arguments` a server executes would then depend
-    /// on its JSON parser.
-    fn handle_ambiguous_mcp_body(&self, ctx: &mut RequestContext) -> PluginResult {
+    /// Refuse (or, in warn mode, record) a body whose member names are
+    /// duplicated, in every scan mode. `serde_json` keeps the LAST duplicate
+    /// while many upstream parsers keep the FIRST, so the shield would scan one
+    /// document and forward another: `{"content":"<PII>","content":"hi"}` is
+    /// scanned as `hi` and delivered as the PII (GHSA-c78j-5w9p-cpq6,
+    /// GHSA-49cr-v28q-9hgp). In `mcp_arguments` mode it decides which
+    /// `params.arguments` a server executes. Reject and redact refuse rather
+    /// than canonicalize: reject forwards the original bytes, and a redact
+    /// rewrite that collapsed the duplicates would silently change the
+    /// request.
+    fn handle_ambiguous_body(&self, ctx: &mut RequestContext) -> PluginResult {
         if self.action == ShieldAction::Warn {
             ctx.metadata.insert(
                 "ai_shield_warnings".to_string(),
@@ -1611,7 +1618,11 @@ impl AiPromptShield {
             status_code: 400,
             body: serde_json::json!({
                 "error": "Request body could not be inspected",
-                "message": "Request blocked because the MCP request body has duplicate member names."
+                "message": if self.scan_mode == ScanMode::McpArguments {
+                    "Request blocked because the MCP request body has duplicate member names."
+                } else {
+                    "Request blocked because the JSON request body has duplicate member names."
+                }
             })
             .to_string(),
             headers: HashMap::new(),
@@ -2441,12 +2452,12 @@ impl Plugin for AiPromptShield {
             return self.handle_oversize_body(ctx, body_size);
         }
 
-        // An MCP body whose member names are duplicated is read one way here
-        // and possibly another way by the server that executes the call.
-        if self.scan_mode == ScanMode::McpArguments
-            && crate::util::json_dup_keys::slice_ambiguity(body.as_bytes()).is_some()
-        {
-            return self.handle_ambiguous_mcp_body(ctx);
+        // A body whose member names are duplicated is read one way here and
+        // possibly another way by the upstream that consumes it, in every scan
+        // mode (see `handle_ambiguous_body`). Screen the exact bytes before any
+        // parse; ordinary malformed JSON keeps its own disposition below.
+        if ctx.json_scan_memo.ambiguity_str(body).is_some() {
+            return self.handle_ambiguous_body(ctx);
         }
 
         // Detect PII and capture streaming intent from the same parsed JSON.
@@ -2866,6 +2877,12 @@ impl Plugin for AiPromptShield {
             }
             return self.handle_uninspectable_body(ctx, "non_utf8_body");
         };
+        // The backend receives exactly these bytes, so they must be one
+        // unambiguous document (see the matching screen in `before_proxy`).
+        // This is also the first screen a deferred compressed body gets.
+        if ctx.json_scan_memo.ambiguity_str(body_text).is_some() {
+            return self.handle_ambiguous_body(ctx);
+        }
         let json = match serde_json::from_str::<Value>(body_text) {
             Ok(json) => json,
             Err(_) => {

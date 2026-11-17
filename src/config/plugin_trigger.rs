@@ -152,13 +152,34 @@ pub struct PluginTriggerMatch {
     /// Frontend listener port that accepted the request/connection.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub listen_port: Option<Vec<u16>>,
-    /// Authenticated consumer username / external identity.
+    /// Username of the mapped gateway Consumer. Never matches an unmapped
+    /// external identity, even one that spells the same string
+    /// (GHSA-rxwj-x6c6-f4j5); use [`Self::external_identity`] for those.
     ///
     /// Only authoritative after the authentication boundary — see the module
     /// docs and `docs/plugin_execution_order.md`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[serde(deserialize_with = "crate::util::json_object::deserialize_optional_object")]
     pub consumer: Option<PluginTriggerIdentityMatch>,
+    /// Unmapped external identity (a `jwks_auth`, `oidc_relying_party`,
+    /// `oauth2_introspection`, `ldap_auth`, or `soap_ws_security` principal),
+    /// present only when no gateway Consumer is mapped. Combine it with
+    /// [`Self::external_identity_authority`] under `all` to scope it to one
+    /// verifying authority (two providers of one mechanism can issue the same
+    /// subject). Same post-authentication rules as `consumer`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(deserialize_with = "crate::util::json_object::deserialize_optional_object")]
+    pub external_identity: Option<PluginTriggerIdentityMatch>,
+    /// Verifying authority of the unmapped external identity: the opaque
+    /// 64-character hex realm digest the authentication boundary committed
+    /// with it (the value `opa` exposes as `input.consumer.realm.authority`).
+    /// Two providers of one mechanism (two `jwks_auth` issuers, say) have
+    /// different digests, so an `external_identity` exemption combined with
+    /// this predicate cannot be claimed by an equal subject from another
+    /// authority. The list is an OR; a principal with no committed authority
+    /// never matches. Same post-authentication rules as `consumer`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub external_identity_authority: Option<Vec<String>>,
     /// Successful authentication mechanism name (e.g. `jwt_auth`). Compared
     /// ASCII-case-insensitively; the list is an OR. Post-authentication only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -313,6 +334,9 @@ enum CompiledMatch {
     ProxyId(Vec<Box<str>>),
     ListenPort(Vec<u16>),
     Consumer(CompiledIdentityMatch),
+    ExternalIdentity(CompiledIdentityMatch),
+    /// Decoded realm authority digests.
+    ExternalIdentityAuthority(Vec<[u8; 32]>),
     /// Lowercased mechanism names.
     AuthMethod(Vec<Box<str>>),
     SpiffeId(CompiledIdentityMatch),
@@ -379,7 +403,12 @@ pub trait TriggerFacts {
     fn namespace(&self) -> Option<&str>;
     fn proxy_id(&self) -> Option<&str>;
     fn listen_port(&self) -> Option<u16>;
+    /// Username of the mapped gateway Consumer only.
     fn consumer_identity(&self) -> Option<&str>;
+    /// Unmapped external identity, only when no Consumer is mapped.
+    fn external_identity(&self) -> Option<&str>;
+    /// Committed verifying-authority digest of [`Self::external_identity`].
+    fn external_identity_authority(&self) -> Option<[u8; 32]>;
     fn auth_method(&self) -> Option<&str>;
     fn spiffe_id(&self) -> Option<&str>;
     /// Visit every value of the named header (name already ASCII-lowercased).
@@ -432,7 +461,8 @@ impl CompiledPluginTrigger {
     }
 
     /// Whether any leaf reads authenticated identity (`consumer`,
-    /// `auth_method`, `spiffe_id`). Such a trigger must not gate a hook that
+    /// `external_identity`, `external_identity_authority`, `auth_method`,
+    /// `spiffe_id`). Such a trigger must not gate a hook that
     /// runs at or before the authentication boundary.
     pub fn reads_authenticated_identity(&self) -> bool {
         self.reads_authenticated_identity
@@ -563,6 +593,8 @@ fn compile_match(
         + usize::from(leaf.proxy_id.is_some())
         + usize::from(leaf.listen_port.is_some())
         + usize::from(leaf.consumer.is_some())
+        + usize::from(leaf.external_identity.is_some())
+        + usize::from(leaf.external_identity_authority.is_some())
         + usize::from(leaf.auth_method.is_some())
         + usize::from(leaf.spiffe_id.is_some());
     if set != 1 {
@@ -680,6 +712,19 @@ fn compile_match(
             identity, "consumer",
         )?));
     }
+    if let Some(identity) = &leaf.external_identity {
+        budget.reads_authenticated_identity = true;
+        return Ok(CompiledMatch::ExternalIdentity(compile_identity_match(
+            identity,
+            "external_identity",
+        )?));
+    }
+    if let Some(values) = &leaf.external_identity_authority {
+        budget.reads_authenticated_identity = true;
+        return Ok(CompiledMatch::ExternalIdentityAuthority(
+            compile_authority_digests(values)?,
+        ));
+    }
     if let Some(values) = &leaf.auth_method {
         budget.reads_authenticated_identity = true;
         return Ok(CompiledMatch::AuthMethod(compile_token_list(
@@ -719,6 +764,32 @@ fn is_http_token_byte(byte: u8) -> bool {
                 | b'|'
                 | b'~'
         )
+}
+
+/// Decode `external_identity_authority` entries: each is exactly 64 hex
+/// characters (case-insensitive). The entries are never echoed.
+fn compile_authority_digests(values: &[String]) -> Result<Vec<[u8; 32]>, String> {
+    const LABEL: &str = "external_identity_authority";
+    if values.is_empty() {
+        return Err(format!("trigger: `{LABEL}` must list at least one value"));
+    }
+    if values.len() > MAX_TRIGGER_LIST_LEN {
+        return Err(format!(
+            "trigger: `{LABEL}` has {} entries, over the {MAX_TRIGGER_LIST_LEN} limit",
+            values.len()
+        ));
+    }
+    let mut out = Vec::with_capacity(values.len());
+    for (index, value) in values.iter().enumerate() {
+        let mut digest = [0u8; 32];
+        if value.len() != 64 || hex::decode_to_slice(value, &mut digest).is_err() {
+            return Err(format!(
+                "trigger: `{LABEL}[{index}]` must be a 64-character hex realm authority digest"
+            ));
+        }
+        out.push(digest);
+    }
+    Ok(out)
 }
 
 fn compile_token_list(
@@ -1115,6 +1186,12 @@ fn eval_match(leaf: &CompiledMatch, facts: &dyn TriggerFacts) -> bool {
             .listen_port()
             .is_some_and(|port| ports.contains(&port)),
         CompiledMatch::Consumer(identity) => matches_identity(identity, facts.consumer_identity()),
+        CompiledMatch::ExternalIdentity(identity) => {
+            matches_identity(identity, facts.external_identity())
+        }
+        CompiledMatch::ExternalIdentityAuthority(digests) => facts
+            .external_identity_authority()
+            .is_some_and(|authority| digests.contains(&authority)),
         CompiledMatch::AuthMethod(values) => facts
             .auth_method()
             .is_some_and(|value| values.iter().any(|entry| entry.eq_ignore_ascii_case(value))),

@@ -8,6 +8,7 @@ use super::config_values::{
     optional_string, optional_string_vec, optional_u8, optional_u32, parse_severity,
 };
 use crate::plugins::RequestContext;
+use crate::plugins::utils::principal;
 use crate::util::unknown_keys::reject_unknown_keys;
 
 /// Fixed-shape custom-rule object keys.
@@ -272,7 +273,9 @@ impl CompiledConditions {
             return false;
         }
         if !self.consumers.is_empty() {
-            let identity = ctx.effective_identity();
+            // Mapped Consumers only, never an unmapped external identity that
+            // spells the same string (GHSA-rxwj-x6c6-f4j5).
+            let identity = principal::consumer_username(ctx);
             if !self
                 .consumers
                 .iter()

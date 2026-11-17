@@ -937,3 +937,34 @@ async fn stream_runner_names_the_refusing_plugin() {
     holder.release_admission_permits();
     assert_eq!(throttle.tracked_keys_count(), Some(0));
 }
+
+/// GHSA-rxwj-x6c6-f4j5: an unmapped external stream identity that spells a
+/// Consumer's username never shares that Consumer's live-connection budget.
+#[tokio::test]
+async fn test_tcp_connection_throttle_keeps_external_identity_off_a_consumer_budget() {
+    let plugin = make_plugin(&json!({"max_connections_per_key": 1})).unwrap();
+
+    let mut consumer = make_ctx("tcp-proxy", "10.0.0.1", Some("alice"));
+    assert!(matches!(
+        plugin.on_stream_connect(&mut consumer).await,
+        PluginResult::Continue
+    ));
+
+    let mut external = make_ctx("tcp-proxy", "10.0.0.2", None);
+    external.authenticated_identity = Some("alice".to_string());
+    assert!(matches!(
+        plugin.on_stream_connect(&mut external).await,
+        PluginResult::Continue
+    ));
+    assert_eq!(plugin.tracked_keys_count(), Some(2));
+
+    let mut external_again = make_ctx("tcp-proxy", "10.0.0.3", None);
+    external_again.authenticated_identity = Some("alice".to_string());
+    assert!(matches!(
+        plugin.on_stream_connect(&mut external_again).await,
+        PluginResult::Reject {
+            status_code: 429,
+            ..
+        }
+    ));
+}

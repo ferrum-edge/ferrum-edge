@@ -107,6 +107,50 @@ pub struct SseParse {
     pub fully_parsed: bool,
 }
 
+/// Whether one SSE event's joined `data:` payload is a JSON document with
+/// duplicate object members. Mirrors `parse_sse_data_frames_checked`: lines
+/// joined with `\n`, trimmed, empty and `[DONE]` payloads skipped.
+pub fn sse_event_data_is_ambiguous(data: &[&str]) -> bool {
+    if data.is_empty() {
+        return false;
+    }
+    let joined = data.join("\n");
+    let trimmed = joined.trim();
+    !trimmed.is_empty()
+        && trimmed != "[DONE]"
+        && crate::util::json_dup_keys::str_ambiguity(trimmed).is_some()
+}
+
+/// Whether any `data:` payload of a buffered SSE body is a duplicate-member
+/// JSON document (GHSA-c78j-5w9p-cpq6, GHSA-49cr-v28q-9hgp): the frame parser
+/// keeps the LAST duplicate while a first-key-wins client reads the FIRST.
+/// Events and fields are split exactly as
+/// `parse_sse_data_frames_checked` splits them (leading BOMs ignored, CRLF /
+/// LF / CR line ends, `:` comments, one optional space after the colon).
+pub fn sse_data_payloads_are_ambiguous(body: &str) -> bool {
+    let mut data: Vec<&str> = Vec::new();
+    for line in sse_lines(strip_sse_boms(body)) {
+        if line.is_empty() {
+            if sse_event_data_is_ambiguous(&data) {
+                return true;
+            }
+            data.clear();
+            continue;
+        }
+        if line.starts_with(':') {
+            continue;
+        }
+        let (field, value) = match line.split_once(':') {
+            Some((field, value)) => (field, value.strip_prefix(' ').unwrap_or(value)),
+            None => (line, ""),
+        };
+        if field == "data" {
+            data.push(value);
+        }
+    }
+    sse_event_data_is_ambiguous(&data)
+}
+
 /// Parse SSE `data:` frames from a buffered SSE response body into JSON values.
 ///
 /// Consumes leading UTF-8 BOMs, splits lines on CRLF, LF, or CR, skips

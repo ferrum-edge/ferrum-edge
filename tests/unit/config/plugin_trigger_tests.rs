@@ -29,6 +29,8 @@ struct Facts {
     proxy_id: Option<String>,
     listen_port: Option<u16>,
     consumer: Option<String>,
+    external_identity: Option<String>,
+    external_identity_authority: Option<[u8; 32]>,
     auth_method: Option<String>,
     spiffe_id: Option<String>,
     headers: Vec<(String, String)>,
@@ -115,6 +117,12 @@ impl TriggerFacts for Facts {
     }
     fn consumer_identity(&self) -> Option<&str> {
         self.consumer.as_deref()
+    }
+    fn external_identity(&self) -> Option<&str> {
+        self.external_identity.as_deref()
+    }
+    fn external_identity_authority(&self) -> Option<[u8; 32]> {
+        self.external_identity_authority
     }
     fn auth_method(&self) -> Option<&str> {
         self.auth_method.as_deref()
@@ -772,6 +780,7 @@ fn identity_predicates_read_consumer_auth_method_and_spiffe_id() {
 fn identity_predicates_are_flagged_for_phase_safety() {
     for predicate in [
         serde_json::json!({"consumer": {}}),
+        serde_json::json!({"external_identity": {}}),
         serde_json::json!({"auth_method": ["jwt_auth"]}),
         serde_json::json!({"spiffe_id": {}}),
     ] {
@@ -898,4 +907,67 @@ fn trigger_round_trips_through_json_without_emitting_absent_fields() {
     assert!(!encoded.contains("case_insensitive"), "{encoded}");
     let decoded: PluginTrigger = serde_json::from_str(&encoded).expect("round trip");
     assert_eq!(decoded, trigger);
+}
+
+/// `external_identity` reads only the unmapped external principal, so it can
+/// be scoped to one mechanism with `auth_method` (GHSA-rxwj-x6c6-f4j5).
+#[test]
+fn external_identity_predicate_reads_only_the_external_identity() {
+    let trigger = compile(serde_json::json!({
+        "when": {"all": [
+            {"match": {"external_identity": {"value": {"exact": ["alice"]}}}},
+            {"match": {"auth_method": ["jwks_auth"]}}
+        ]}
+    }));
+    let mut facts = Facts::http();
+    facts.consumer = Some("alice".to_string());
+    facts.auth_method = Some("jwks_auth".to_string());
+    assert!(
+        !trigger.evaluate(&facts),
+        "a mapped Consumer named alice is not the external identity alice"
+    );
+
+    facts.consumer = None;
+    facts.external_identity = Some("alice".to_string());
+    assert!(trigger.evaluate(&facts));
+
+    facts.auth_method = Some("ldap_auth".to_string());
+    assert!(!trigger.evaluate(&facts));
+}
+
+/// `external_identity_authority` compares the committed realm digest, so two
+/// authorities of one mechanism are told apart; a principal with no authority
+/// never matches, and malformed digests are refused without being echoed.
+#[test]
+fn external_identity_authority_predicate_compares_the_committed_digest() {
+    let trusted = [0xab_u8; 32];
+    let trigger = compile(serde_json::json!({
+        "when": {"match": {"external_identity_authority": [hex::encode_upper(trusted)]}}
+    }));
+    assert!(trigger.reads_authenticated_identity());
+    let mut facts = Facts::http();
+    facts.external_identity = Some("alice".to_string());
+    assert!(
+        !trigger.evaluate(&facts),
+        "no committed authority never matches"
+    );
+    facts.external_identity_authority = Some([0xcd; 32]);
+    assert!(!trigger.evaluate(&facts));
+    facts.external_identity_authority = Some(trusted);
+    assert!(trigger.evaluate(&facts));
+
+    for bad in [
+        serde_json::json!([]),
+        serde_json::json!(["abcd"]),
+        serde_json::json!(["zz".repeat(32)]),
+    ] {
+        let error = compile_error(serde_json::json!({
+            "when": {"match": {"external_identity_authority": bad}}
+        }));
+        assert!(error.contains("external_identity_authority"), "{error}");
+        assert!(
+            !error.contains("zzzz"),
+            "the entry must not be echoed: {error}"
+        );
+    }
 }

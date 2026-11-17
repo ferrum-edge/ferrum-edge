@@ -3151,6 +3151,7 @@ const EXPECTED_OBJECT_ADMISSION_FIELDS: &[&str] = &[
     "src/config/plugin_trigger.rs:PluginTriggerIdentityMatch.value",
     "src/config/plugin_trigger.rs:PluginTriggerMatch.consumer",
     "src/config/plugin_trigger.rs:PluginTriggerMatch.cookie",
+    "src/config/plugin_trigger.rs:PluginTriggerMatch.external_identity",
     "src/config/plugin_trigger.rs:PluginTriggerMatch.header",
     "src/config/plugin_trigger.rs:PluginTriggerMatch.host",
     "src/config/plugin_trigger.rs:PluginTriggerMatch.path",

@@ -13,6 +13,7 @@ use tokio_tungstenite::tungstenite::protocol::frame::CloseFrame;
 use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
 use uuid::Uuid;
 
+use super::utils::principal::Principal;
 use super::utils::rate_limit::{
     LocalStateSemantics, RATE_LIMIT_REDIS_CONFIG_KEYS, RateLimitBackend,
     STANDALONE_RATE_LIMIT_CONFIG_ID, WsFrameRateAlgorithm, WsRateLimitKey, WsRateLimitOp,
@@ -387,8 +388,10 @@ impl WsRateLimiting {
     fn aggregate_scope(&self, ctx: &RequestContext) -> Option<Arc<str>> {
         let (prefix, value) = match self.limit_by {
             WsLimitBy::Connection => return None,
-            WsLimitBy::Consumer => match ctx.effective_identity() {
-                Some(identity) => ("consumer:", identity),
+            // A mapped Consumer and an unmapped external principal (keyed with
+            // its realm) never share a bucket (GHSA-rxwj-x6c6-f4j5).
+            WsLimitBy::Consumer => match Principal::of_request(ctx) {
+                Some(principal) => return Some(Arc::from(principal.key())),
                 None => ("ip:", ctx.client_ip.as_str()),
             },
             WsLimitBy::Ip => ("ip:", ctx.client_ip.as_str()),

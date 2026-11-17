@@ -7324,3 +7324,178 @@ async fn changed_final_batch_hiding_a_card_behind_an_unknown_member_is_refused()
         assert_eq!(response["error"]["code"], -32001);
     }
 }
+
+/// GHSA-49cr-v28q-9hgp: `serde_json` keeps the LAST of duplicate members while
+/// a first-key-wins A2A server executes the FIRST, so a duplicated `method`
+/// must never be policed as its last spelling. Under a policy that can deny,
+/// every duplicate-member body (singleton, escaped name, nested member, batch
+/// member) is refused as uninspectable before any method is classified.
+#[tokio::test]
+async fn duplicate_member_jsonrpc_body_fails_closed_under_deny_policy() {
+    let gateway = plugin(json!({
+        "policy": {"methods": {"tasks/cancel": {"action": "deny"}}}
+    }));
+    let bodies = [
+        // The advisory reproduction: judged as `tasks/get`, executed as the
+        // denied `tasks/cancel` by a first-key-wins server.
+        r#"{"jsonrpc":"2.0","id":1,"method":"tasks/cancel","method":"tasks/get","params":{"id":"t"}}"#,
+        // An escaped spelling of the same member name.
+        r#"{"jsonrpc":"2.0","id":1,"method":"tasks/cancel","m\u0065thod":"tasks/get","params":{"id":"t"}}"#,
+        // A nested duplicate decides which task the call acts on.
+        r#"{"jsonrpc":"2.0","id":1,"method":"tasks/get","params":{"id":"t1","id":"t2"}}"#,
+    ];
+    for raw in bodies {
+        let (mut ctx, mut headers) = jsonrpc_ctx_with_raw_body(raw.to_string());
+        let PluginResult::Reject {
+            status_code, body, ..
+        } = gateway.before_proxy(&mut ctx, &mut headers).await
+        else {
+            panic!("duplicate-member body must be refused under a deny policy: {raw}");
+        };
+        assert_eq!(status_code, 200, "{raw}");
+        let body: Value = serde_json::from_str(&body).expect("refusal is JSON");
+        assert_eq!(body["error"]["code"], -32001, "{raw}");
+        assert_eq!(body["error"]["data"]["method"], "unknown", "{raw}");
+        assert_eq!(
+            ctx.metadata.get("a2a.error").map(String::as_str),
+            Some("request_body_uninspectable"),
+            "{raw}"
+        );
+        assert_eq!(
+            ctx.metadata.get("a2a.policy_decision").map(String::as_str),
+            Some("deny"),
+            "{raw}"
+        );
+    }
+
+    // A batch whose second member duplicates `method` (DSF F2): the refusal
+    // is a batch answering every request member.
+    let (mut ctx, mut headers) = jsonrpc_ctx_with_raw_body(
+        r#"[{"jsonrpc":"2.0","id":1,"method":"tasks/get","params":{"id":"t"}},{"jsonrpc":"2.0","id":2,"method":"tasks/cancel","method":"tasks/get","params":{"id":"t"}}]"#
+            .to_string(),
+    );
+    let PluginResult::Reject {
+        status_code, body, ..
+    } = gateway.before_proxy(&mut ctx, &mut headers).await
+    else {
+        panic!("a duplicate-member batch must be refused under a deny policy");
+    };
+    assert_eq!(status_code, 200);
+    let body: Value = serde_json::from_str(&body).expect("refusal is JSON");
+    let responses = body.as_array().expect("a batch refusal is a batch");
+    assert_eq!(responses.len(), 2);
+    assert_eq!(responses[0]["id"], 1);
+    assert_eq!(responses[1]["id"], 2);
+    for response in responses {
+        assert_eq!(response["error"]["code"], -32001);
+    }
+    assert_eq!(
+        ctx.metadata.get("a2a.error").map(String::as_str),
+        Some("request_body_uninspectable")
+    );
+
+    // The same envelope without the duplicate is still classified normally.
+    let (mut ctx, mut headers) = jsonrpc_ctx_with_raw_body(
+        r#"{"jsonrpc":"2.0","id":1,"method":"tasks/get","params":{"id":"t"}}"#.to_string(),
+    );
+    assert!(matches!(
+        gateway.before_proxy(&mut ctx, &mut headers).await,
+        PluginResult::Continue
+    ));
+    assert_eq!(
+        ctx.metadata.get("a2a.method").map(String::as_str),
+        Some("tasks/get")
+    );
+}
+
+/// A transform that introduces a duplicate member after admission is refused
+/// on the final backend-visible body, under a deny policy and (as an
+/// unprovable operation class) without one.
+#[tokio::test]
+async fn duplicate_member_final_jsonrpc_body_is_refused() {
+    let dispatched = r#"{"jsonrpc":"2.0","id":"req-1","method":"tasks/cancel","method":"tasks/get","params":{"id":"t"}}"#;
+    for (config, expected_error) in [
+        (
+            json!({"policy": {"methods": {"tasks/cancel": {"action": "deny"}}}}),
+            "request_body_uninspectable",
+        ),
+        (json!({}), "operation_class_unprovable"),
+    ] {
+        let gateway = plugin(config);
+        let (mut ctx, mut headers) = jsonrpc_ctx(json!({
+            "jsonrpc": "2.0",
+            "id": "req-1",
+            "method": "tasks/get",
+            "params": {"id": "t"}
+        }));
+        assert!(matches!(
+            gateway.before_proxy(&mut ctx, &mut headers).await,
+            PluginResult::Continue
+        ));
+        let PluginResult::Reject { body, .. } = gateway
+            .on_final_request_body_with_context(&mut ctx, &headers, dispatched.as_bytes())
+            .await
+        else {
+            panic!("a duplicate-member final body must be refused ({expected_error})");
+        };
+        let body: Value = serde_json::from_str(&body).expect("refusal is JSON");
+        assert_eq!(body["error"]["code"], -32001);
+        assert_eq!(
+            ctx.metadata.get("a2a.error").map(String::as_str),
+            Some(expected_error)
+        );
+    }
+}
+
+/// sol F1 / dsf F3 (round 2): an admitted batch whose final body gains a
+/// duplicate member is refused with a batch answering every request member,
+/// with and without a policy that can deny.
+#[tokio::test]
+async fn duplicate_member_final_jsonrpc_batch_is_refused_as_a_batch() {
+    let dispatched = r#"[{"jsonrpc":"2.0","id":1,"method":"tasks/get","params":{"id":"t"}},{"jsonrpc":"2.0","id":2,"method":"tasks/get","method":"tasks/cancel","params":{"id":"t"}}]"#;
+    for config in [
+        json!({"policy": {"methods": {"tasks/cancel": {"action": "deny"}}}}),
+        json!({}),
+    ] {
+        let gateway = plugin(config);
+        let (mut ctx, mut headers) = jsonrpc_ctx(json!([
+            {"jsonrpc": "2.0", "id": 1, "method": "tasks/get", "params": {"id": "t"}},
+            {"jsonrpc": "2.0", "id": 2, "method": "tasks/get", "params": {"id": "t"}}
+        ]));
+        assert!(matches!(
+            gateway.before_proxy(&mut ctx, &mut headers).await,
+            PluginResult::Continue
+        ));
+        let PluginResult::Reject { body, .. } = gateway
+            .on_final_request_body_with_context(&mut ctx, &headers, dispatched.as_bytes())
+            .await
+        else {
+            panic!("a duplicate-member final batch must be refused");
+        };
+        let body: Value = serde_json::from_str(&body).expect("refusal is JSON");
+        let responses = body.as_array().expect("a batch refusal is a batch");
+        assert_eq!(responses.len(), 2);
+        assert_eq!(responses[0]["id"], 1);
+        assert_eq!(responses[1]["id"], 2);
+        for response in responses {
+            assert_eq!(response["error"]["code"], -32001);
+        }
+    }
+}
+
+/// Without a policy that can deny, a duplicate-member body is left
+/// unclassified (as an oversized one is) rather than classified as its last
+/// `method`.
+#[tokio::test]
+async fn duplicate_member_jsonrpc_body_is_unclassified_without_deny_policy() {
+    let gateway = plugin(json!({}));
+    let (mut ctx, mut headers) = jsonrpc_ctx_with_raw_body(
+        r#"{"jsonrpc":"2.0","id":1,"method":"tasks/cancel","method":"tasks/get","params":{"id":"t"}}"#
+            .to_string(),
+    );
+    assert!(matches!(
+        gateway.before_proxy(&mut ctx, &mut headers).await,
+        PluginResult::Continue
+    ));
+    assert!(!ctx.metadata.contains_key("a2a.method"));
+}

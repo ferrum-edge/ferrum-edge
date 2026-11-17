@@ -51,8 +51,8 @@ use super::utils::json_escape::escape_json_string;
 use super::utils::sse::{
     AnthropicEvent, MAX_OPENAI_STREAM_ACCUMULATORS, SseEventName, SseReassembler, SseTextKind,
     is_text_event_stream_media_type, is_tgi_stream_frame, original_response_is_event_stream,
-    parse_sse_data_frames_checked, split_sse_line_terminator, sse_lines, sse_lines_inclusive,
-    strip_sse_boms,
+    parse_sse_data_frames_checked, split_sse_line_terminator, sse_data_payloads_are_ambiguous,
+    sse_lines_inclusive, strip_sse_boms,
 };
 use super::utils::synthetic_response::{
     request_method_omits_response_body, synthetic_response_omits_body,
@@ -6447,48 +6447,6 @@ fn argument_documents_are_ambiguous(json: &Value) -> bool {
         ambiguous = ambiguous || crate::util::json_dup_keys::str_ambiguity(arguments).is_some();
     });
     ambiguous
-}
-
-/// Whether one SSE event's joined `data:` payload is a JSON document with
-/// duplicate object members. Mirrors `parse_sse_data_frames_checked`: lines
-/// joined with `\n`, trimmed, empty and `[DONE]` payloads skipped.
-fn sse_event_data_is_ambiguous(data: &[&str]) -> bool {
-    if data.is_empty() {
-        return false;
-    }
-    let joined = data.join("\n");
-    let trimmed = joined.trim();
-    !trimmed.is_empty()
-        && trimmed != "[DONE]"
-        && crate::util::json_dup_keys::str_ambiguity(trimmed).is_some()
-}
-
-/// Whether any `data:` payload of a buffered SSE body is a duplicate-member
-/// JSON document. Events and fields are split exactly as
-/// `parse_sse_data_frames_checked` splits them (leading BOMs ignored, CRLF /
-/// LF / CR line ends, `:` comments, one optional space after the colon).
-fn sse_data_payloads_are_ambiguous(body: &str) -> bool {
-    let mut data: Vec<&str> = Vec::new();
-    for line in sse_lines(strip_sse_boms(body)) {
-        if line.is_empty() {
-            if sse_event_data_is_ambiguous(&data) {
-                return true;
-            }
-            data.clear();
-            continue;
-        }
-        if line.starts_with(':') {
-            continue;
-        }
-        let (field, value) = match line.split_once(':') {
-            Some((field, value)) => (field, value.strip_prefix(' ').unwrap_or(value)),
-            None => (line, ""),
-        };
-        if field == "data" {
-            data.push(value);
-        }
-    }
-    sse_event_data_is_ambiguous(&data)
 }
 
 fn collect_function_value<'a>(value: Option<&'a Value>, texts: &mut Vec<Cow<'a, str>>) {

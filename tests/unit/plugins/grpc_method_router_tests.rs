@@ -1673,3 +1673,38 @@ async fn documented_rejection_headers_match_the_runtime_contract() {
         other => panic!("expected 429, got {other:?}"),
     }
 }
+
+/// GHSA-rxwj-x6c6-f4j5: a mapped Consumer and an unmapped external identity
+/// with the same name never share a method budget, and neither do two realms.
+#[tokio::test]
+async fn test_rate_limiting_keeps_external_identity_off_a_consumer_budget() {
+    let config = json!({
+        "method_rate_limits": {
+            "/pkg.Svc/Create": { "max_requests": 1, "window_seconds": 60 }
+        },
+        "limit_by": "consumer"
+    });
+    let plugin = create_plugin("grpc_method_router", &config)
+        .unwrap()
+        .unwrap();
+
+    // The mapped Consumer `testuser` spends its budget.
+    let mut ctx = create_grpc_context("/pkg.Svc/Create");
+    let _ = plugin.on_request_received(&mut ctx).await;
+    assert_continue(enforce_effective_path(plugin.as_ref(), &mut ctx).await);
+
+    for mechanism in ["jwks_auth", "ldap_auth"] {
+        let mut ctx = create_grpc_context("/pkg.Svc/Create");
+        super::plugin_utils::commit_external_identity(&mut ctx, "testuser", mechanism);
+        let _ = plugin.on_request_received(&mut ctx).await;
+        assert_continue(enforce_effective_path(plugin.as_ref(), &mut ctx).await);
+    }
+
+    let mut ctx = create_grpc_context("/pkg.Svc/Create");
+    super::plugin_utils::commit_external_identity(&mut ctx, "testuser", "jwks_auth");
+    let _ = plugin.on_request_received(&mut ctx).await;
+    assert_reject(
+        enforce_effective_path(plugin.as_ref(), &mut ctx).await,
+        Some(429),
+    );
+}

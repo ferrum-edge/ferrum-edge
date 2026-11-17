@@ -142,6 +142,62 @@ pub fn create_test_context() -> RequestContext {
     ctx
 }
 
+/// Replace `ctx`'s principal with an unmapped external identity committed
+/// through the shared authentication boundary by `mechanism`, so it carries
+/// that verified realm — what `jwks_auth`, `ldap_auth`, and the other external
+/// mechanisms leave behind (GHSA-rxwj-x6c6-f4j5).
+pub fn commit_external_identity(ctx: &mut RequestContext, identity: &str, mechanism: &'static str) {
+    commit_external_identity_with_authority(ctx, identity, mechanism, None);
+}
+
+/// [`commit_external_identity`] with a staged verifying-authority digest, the
+/// way a multi-provider `jwks_auth` / `oauth2_introspection` commits one per
+/// accepted issuer.
+pub fn commit_external_identity_with_authority(
+    ctx: &mut RequestContext,
+    identity: &str,
+    mechanism: &'static str,
+    authority: Option<[u8; 32]>,
+) {
+    use ferrum_edge::plugins::utils::auth_attempt::AuthenticationAttempt;
+    use ferrum_edge::plugins::utils::auth_flow::{VerifyOutcome, commit_authentication_attempt};
+
+    ctx.identified_consumer = None;
+    let mut attempt = AuthenticationAttempt::new();
+    if let Some(authority) = authority {
+        attempt.stage_identity_realm_authority(authority);
+    }
+    let committed = commit_authentication_attempt(
+        ctx,
+        attempt,
+        VerifyOutcome::success(None, Some(identity.to_string()), None),
+        mechanism,
+        true,
+    )
+    .expect("external identity commits");
+    assert!(committed, "the external identity must be committed");
+}
+
+/// [`create_test_context`] with its Consumer replaced by a committed external
+/// identity (see [`commit_external_identity`]).
+pub fn committed_external_identity_context(
+    identity: &str,
+    mechanism: &'static str,
+) -> RequestContext {
+    let mut ctx = create_test_context();
+    commit_external_identity(&mut ctx, identity, mechanism);
+    ctx
+}
+
+/// A request whose mapped gateway Consumer has `username`.
+pub fn consumer_context(username: &str) -> RequestContext {
+    let mut consumer = create_test_consumer();
+    consumer.username = username.to_string();
+    let mut ctx = create_test_context();
+    ctx.identified_consumer = Some(Arc::new(consumer));
+    ctx
+}
+
 /// Build a request context whose raw header map contains `value`, then run
 /// `materialize_headers()`.
 ///
