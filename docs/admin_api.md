@@ -1596,7 +1596,9 @@ reference) with the change, or have an `admin` make it.
 Because a `PUT` is a full replace, a client that submits an editor opened
 before someone else's accepted change does not merely omit that change — it
 reverts it. `GET /proxies/{id}`, `/upstreams/{id}`, `/consumers/{id}`, and
-`/plugins/config/{id}` return a strong `ETag`; send it back as `If-Match` on
+`/plugins/config/{id}` return a strong `ETag` (except to a token verified by
+`FERRUM_ADMIN_JWT_VIEWER_SECRET`, which cannot write and must never hold a MAC
+keyed by `FERRUM_ADMIN_JWT_SECRET`; GHSA-crqx-mp2f-v8c8); send it back as `If-Match` on
 `PUT` or `DELETE` of the same resource and the write is refused with
 `412 Precondition Failed` — writing nothing — unless the stored resource still
 has the state validated by that tag. The validator covers complete stored

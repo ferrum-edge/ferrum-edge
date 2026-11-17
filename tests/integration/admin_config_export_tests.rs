@@ -732,6 +732,66 @@ async fn database_export_is_labelled_and_falls_back_to_cached_on_database_error(
     assert!(!fallback.text.contains(cached_key));
 }
 
+/// GHSA-crqx-mp2f-v8c8: a resource `ETag` is a MAC keyed by
+/// `FERRUM_ADMIN_JWT_SECRET`. A viewer-key token cannot write, so it has no use
+/// for `If-Match`, and it must not hold a MAC under the primary secret; it gets
+/// the resource without a tag. Primary-key tokens of every role keep it.
+#[tokio::test]
+async fn viewer_key_reads_carry_no_primary_keyed_etag() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let db = sqlite_store(&dir).await;
+    db.create_consumer(&consumer_with_key(
+        "db-consumer",
+        "dora",
+        "database-api-key-must-not-leak",
+    ))
+    .await
+    .expect("seed consumer");
+    let mut state = admin_state(cached(GatewayConfig::default()), false);
+    state.db = Some(Arc::new(db));
+    state.mode = "database".to_string();
+    let (base, _sd) = start_admin(state).await;
+    let client = reqwest::Client::new();
+
+    for (label, bearer, expects_tag) in [
+        (
+            "viewer-key token",
+            token(VIEWER_SECRET, Algorithm::HS256, "viewer", None),
+            false,
+        ),
+        (
+            "viewer-key token claiming admin",
+            token(VIEWER_SECRET, Algorithm::HS256, "admin", None),
+            false,
+        ),
+        (
+            "primary-key viewer",
+            token(PRIMARY_SECRET, Algorithm::HS256, "viewer", None),
+            true,
+        ),
+        (
+            "primary-key admin",
+            token(PRIMARY_SECRET, Algorithm::HS256, "admin", None),
+            true,
+        ),
+    ] {
+        let resp = client
+            .get(format!("{base}/consumers/db-consumer"))
+            .bearer_auth(&bearer)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status().as_u16(), 200, "{label}");
+        assert_eq!(
+            resp.headers().get(reqwest::header::ETAG).is_some(),
+            expects_tag,
+            "{label}: unexpected ETag exposure"
+        );
+        let body: Value = resp.json().await.unwrap();
+        assert_eq!(body["username"], "dora", "{label}");
+    }
+}
+
 /// Userinfo is stripped only for `viewer` reads. `operator` and `admin` write
 /// proxies and upstreams, so their reads must round-trip through `PUT`
 /// unchanged, including username-only URLs such as `ssh://git@host`.

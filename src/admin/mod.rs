@@ -4690,7 +4690,7 @@ async fn handle_admin_request_inner(
             crud::handle_list::<Proxy>(&state, &pagination, auth.role, &namespace).await
         }
         (Method::GET, ["proxies", id]) => {
-            crud::handle_get::<Proxy>(&state, id, auth.role, &namespace).await
+            crud::handle_get::<Proxy>(&state, id, auth.role, auth.key_tier, &namespace).await
         }
         (Method::GET, ["proxies", id, "mcp", "tools"]) => {
             let pagination = route_pagination!();
@@ -4764,7 +4764,7 @@ async fn handle_admin_request_inner(
             .await
         }
         (Method::GET, ["consumers", id]) => {
-            crud::handle_get::<Consumer>(&state, id, auth.role, &namespace).await
+            crud::handle_get::<Consumer>(&state, id, auth.role, auth.key_tier, &namespace).await
         }
         (Method::GET, ["consumers", id, "verification"]) => {
             if let Some(resp) = require_admin_role(&auth, AdminRole::Admin) {
@@ -4906,7 +4906,7 @@ async fn handle_admin_request_inner(
             .await
         }
         (Method::GET, ["plugins", "config", id]) => {
-            crud::handle_get::<PluginConfig>(&state, id, auth.role, &namespace).await
+            crud::handle_get::<PluginConfig>(&state, id, auth.role, auth.key_tier, &namespace).await
         }
         (Method::PUT, ["plugins", "config", id]) => {
             if let Some(resp) = require_admin_role(&auth, AdminRole::Operator) {
@@ -4962,7 +4962,7 @@ async fn handle_admin_request_inner(
             .await
         }
         (Method::GET, ["upstreams", id]) => {
-            crud::handle_get::<Upstream>(&state, id, auth.role, &namespace).await
+            crud::handle_get::<Upstream>(&state, id, auth.role, auth.key_tier, &namespace).await
         }
         (Method::PUT, ["upstreams", id]) => {
             if let Some(resp) = require_admin_role(&auth, AdminRole::Operator) {
@@ -5045,7 +5045,14 @@ async fn handle_admin_request_inner(
             if let Some(resp) = require_admin_role(&auth, AdminRole::Operator) {
                 return Ok(resp);
             }
-            crud::handle_get::<GatewayTrustBundleRecord>(&state, id, auth.role, &namespace).await
+            crud::handle_get::<GatewayTrustBundleRecord>(
+                &state,
+                id,
+                auth.role,
+                auth.key_tier,
+                &namespace,
+            )
+            .await
         }
         (Method::PUT, ["gateway-trust-bundles", id]) => {
             if let Some(resp) = require_admin_role(&auth, AdminRole::Admin) {

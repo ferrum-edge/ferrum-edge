@@ -9174,7 +9174,10 @@ components:
       description: |
         Strong entity-tag for the stored resource, for use in `If-Match`.
         Present only when the resource was read from the database (absent on a
-        `X-Data-Source: cached` fallback). Opaque: it is a keyed MAC over the
+        `X-Data-Source: cached` fallback) and the caller's token was verified
+        by `FERRUM_ADMIN_JWT_SECRET`: a token verified by
+        `FERRUM_ADMIN_JWT_VIEWER_SECRET` cannot write and never receives a MAC
+        keyed by the primary secret (GHSA-crqx-mp2f-v8c8). Opaque: it is a keyed MAC over the
         full stored representation, bound to the resource kind, namespace, and
         id, and it changes whenever any stored field changes — including
         fields redacted from this caller's view. Replicas configured with the
