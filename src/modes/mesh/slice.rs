@@ -563,6 +563,17 @@ pub struct MeshSlice {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     #[serde(deserialize_with = "crate::util::json_object::deserialize_object_vec")]
     pub destination_rules: Vec<MeshDestinationRule>,
+    /// Control-plane-resolved outcomes of Istio's exported-rule host
+    /// selection (issue #7395): a visible wildcard rule in `destination_rules`
+    /// that does NOT apply to one destination host of this slice, because a
+    /// rule of the same namespace that is hidden from this subscriber is more
+    /// specific for that host and Istio then falls through to the next tier.
+    /// Names only the visible rule and the destination host; nothing about
+    /// the hidden rule (name, host pattern, `exportTo`, policy) leaves the
+    /// control plane. See [`destination_rule_host_exclusions`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(deserialize_with = "crate::util::json_object::deserialize_object_vec")]
+    pub destination_rule_host_exclusions: Vec<DestinationRuleHostExclusion>,
     /// VirtualService-derived host-level CORS policies (issue #1973),
     /// narrowed like `destination_rules`. The DP synthesizes per-route `cors`
     /// plugin instances onto materialized outbound routes from these.
@@ -1025,6 +1036,7 @@ impl MeshSlice {
             && self.http_routes == other.http_routes
             && self.workloads == other.workloads
             && self.ambient_udp_source_workloads == other.ambient_udp_source_workloads
+            && self.destination_rule_host_exclusions == other.destination_rule_host_exclusions
             && self.node_waypoint_assertors == other.node_waypoint_assertors
             // The NodeWaypoint capture inventory changes independently of
             // `workloads` / `peer_authentications` (a pod in ANOTHER namespace
@@ -2321,7 +2333,7 @@ impl MeshSlice {
             request.waypoint_name.as_deref(),
             &request_namespace,
         );
-        Self {
+        let mut slice = Self {
             node_id: request.node_id,
             namespace: request_namespace.clone(),
             // Issue #2469: the DP needs the mesh root namespace to distinguish
@@ -2360,6 +2372,7 @@ impl MeshSlice {
             request_authentications,
             telemetry_resources,
             destination_rules,
+            destination_rule_host_exclusions: Vec::new(),
             virtual_service_cors_policies,
             proxy_configs,
             trust_bundles: mesh.trust_bundles.clone(),
@@ -2378,8 +2391,142 @@ impl MeshSlice {
             // xDS reverse translation populates this field directly; native
             // MeshSubscribe configs leave it empty.
             runtime_overlay: MeshRuntimeOverlay::default(),
+        };
+        slice.destination_rule_host_exclusions = destination_rule_host_exclusions(
+            &mesh.destination_rules,
+            &slice,
+            effective_namespace,
+            mesh.istio_root_namespace.as_str(),
+            &cluster_domain,
+        );
+        slice
+    }
+}
+
+/// One control-plane-resolved exclusion: the visible DestinationRule
+/// `namespace`/`name` (a wildcard) does not apply to destination `host`
+/// (issue #7395, [`MeshSlice::destination_rule_host_exclusions`]).
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DestinationRuleHostExclusion {
+    pub namespace: String,
+    pub name: String,
+    pub host: String,
+}
+
+impl DestinationRuleHostExclusion {
+    /// Whether this excludes `rule` for destination `host` (hosts compared in
+    /// canonical form: trimmed, no trailing dot, ASCII-lowercase).
+    pub(crate) fn excludes(&self, rule: &MeshDestinationRule, host: &str) -> bool {
+        self.namespace == rule.namespace.trim()
+            && self.name == rule.name
+            && self.host == canonical_destination_rule_host(host)
+    }
+}
+
+fn canonical_destination_rule_host(host: &str) -> String {
+    host.trim().trim_end_matches('.').to_ascii_lowercase()
+}
+
+/// Resolve, on the control plane, Istio's exported-rule host selection for
+/// the destination hosts this slice can reach (issue #7395; Istio
+/// `pilot/pkg/model/push_context.go`, `SetDestinationRules` and
+/// `getExportedDestinationRuleFromNamespace`).
+///
+/// In the target service's namespace and the root namespace Istio picks the
+/// most specific host among that namespace's EXPORTED rules (every rule that
+/// is not namespace-private) BEFORE checking that the chosen rule is exported
+/// to the client; when it is not, the lookup falls through to the next tier
+/// rather than retrying a broader visible wildcard of the same namespace. A
+/// namespace-private rule (`exportTo: ["."]` or only its own namespace) is not
+/// in that exported index, so it shadows nothing for other namespaces.
+///
+/// For every admitted, non-client-tier wildcard rule and every destination
+/// host the slice carries (Service FQDNs, ServiceEntry hosts, and the hosts
+/// of carried VirtualService route upstreams) that it names, this records an
+/// exclusion when a hidden exported rule of the same namespace names that host
+/// strictly more specifically. Only the outcome rides the slice.
+fn destination_rule_host_exclusions(
+    all_rules: &[MeshDestinationRule],
+    slice: &MeshSlice,
+    client_namespace: &str,
+    root_namespace: &str,
+    cluster_domain: &str,
+) -> Vec<DestinationRuleHostExclusion> {
+    let hidden: Vec<&MeshDestinationRule> = all_rules
+        .iter()
+        .filter(|rule| destination_rule_shadows_from_hiding(rule, client_namespace, root_namespace))
+        .collect();
+    if hidden.is_empty() {
+        return Vec::new();
+    }
+    let cluster_domain = cluster_domain.trim().trim_end_matches('.');
+    let mut hosts: BTreeSet<String> = BTreeSet::new();
+    for service in &slice.services {
+        hosts.insert(canonical_destination_rule_host(
+            &if cluster_domain.is_empty() {
+                format!("{}.{}.svc", service.name, service.namespace)
+            } else {
+                format!(
+                    "{}.{}.svc.{cluster_domain}",
+                    service.name, service.namespace
+                )
+            },
+        ));
+    }
+    for entry in &slice.service_entries {
+        hosts.extend(
+            entry
+                .hosts
+                .iter()
+                .map(|host| canonical_destination_rule_host(host)),
+        );
+    }
+    for upstream in &slice.http_routes.upstreams {
+        for target in upstream
+            .get("targets")
+            .and_then(serde_json::Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            if let Some(host) = target.get("host").and_then(serde_json::Value::as_str) {
+                hosts.insert(canonical_destination_rule_host(host));
+            }
         }
     }
+    let mut exclusions = BTreeSet::new();
+    for rule in &slice.destination_rules {
+        if !is_wildcard_destination_rule_host(&rule.host)
+            || destination_rule_lookup_tier(rule, client_namespace, None, root_namespace)
+                == DestinationRuleLookupTier::Client
+        {
+            continue;
+        }
+        for host in &hosts {
+            let Some(specificity) =
+                super::destination_rule_host_specificity(&rule.host, &rule.namespace, host)
+            else {
+                continue;
+            };
+            let shadowed = hidden.iter().any(|hidden| {
+                hidden.namespace.trim() == rule.namespace.trim()
+                    && super::destination_rule_host_specificity(
+                        &hidden.host,
+                        &hidden.namespace,
+                        host,
+                    )
+                    .is_some_and(|hidden_specificity| hidden_specificity > specificity)
+            });
+            if shadowed {
+                exclusions.insert(DestinationRuleHostExclusion {
+                    namespace: rule.namespace.trim().to_string(),
+                    name: rule.name.clone(),
+                    host: host.clone(),
+                });
+            }
+        }
+    }
+    exclusions.into_iter().collect()
 }
 
 struct ServiceWaypointNarrowingResources {
@@ -3707,8 +3854,7 @@ where
         DestinationRuleLookupTier,
         &MeshDestinationRule,
     )> = Vec::new();
-    let candidates: Vec<&MeshDestinationRule> = candidates.collect();
-    for &rule in &candidates {
+    for rule in candidates {
         if !destination_rule_exported_to_namespace(rule, scope.client_namespace) {
             continue;
         }
@@ -3810,77 +3956,7 @@ where
              they merge in deterministic (namespace, name, normalized host) order"
         );
     }
-    let stubs = hidden_exported_selection_stubs(&candidates, &admitted, scope);
-    admitted.extend(stubs);
     admitted
-}
-
-/// Policy-free selection stubs for rules hidden from this subscriber that
-/// shadow an admitted wildcard (issue #7395, Istio host-selection order).
-///
-/// Istio looks a destination up in the target service's (or the root)
-/// namespace by first choosing the most specific host among that namespace's
-/// EXPORTED rules, and only then checks that the chosen host's rules are
-/// exported to the client; when they are not, the lookup falls through to the
-/// next namespace instead of retrying a broader wildcard in the same one
-/// (`PushContext.getExportedDestinationRuleFromNamespace`). So an exact
-/// `api.example.com` rule exported only to `other` hides `beta`'s public
-/// `*.example.com` rule from `alpha` for that host, and the root namespace's
-/// rule applies.
-///
-/// The data plane can reproduce that only if it knows the hidden rule's host.
-/// For each rule that is exported (not namespace-private), not exported to
-/// this subscriber, and strictly more specific, on a host it names, than an
-/// admitted wildcard of the same namespace, this emits a stub carrying only
-/// its name, namespace, host and `exportTo`, never its policy. The data plane
-/// never applies a stub (it fails the `exportTo` re-check) and uses it only to
-/// discard the shadowed wildcard for those hosts (`apply_destination_rules`).
-fn hidden_exported_selection_stubs(
-    candidates: &[&MeshDestinationRule],
-    admitted: &[MeshDestinationRule],
-    scope: &DestinationRuleScope<'_>,
-) -> Vec<MeshDestinationRule> {
-    let admitted_wildcards: Vec<&MeshDestinationRule> = admitted
-        .iter()
-        .filter(|rule| is_wildcard_destination_rule_host(&rule.host))
-        .collect();
-    if admitted_wildcards.is_empty() {
-        return Vec::new();
-    }
-    let cluster_domain = scope.cluster_domain.trim().trim_end_matches('.');
-    let mut stubs = Vec::new();
-    for &rule in candidates {
-        if !destination_rule_shadows_from_hiding(rule, scope.client_namespace, scope.root_namespace)
-        {
-            continue;
-        }
-        let Some((own_host, own_specificity)) =
-            destination_rule_selection_host(rule, cluster_domain)
-        else {
-            continue;
-        };
-        let shadows = admitted_wildcards.iter().any(|wildcard| {
-            wildcard.namespace.trim() == rule.namespace.trim()
-                && super::destination_rule_host_specificity(
-                    &wildcard.host,
-                    &wildcard.namespace,
-                    &own_host,
-                )
-                .is_some_and(|wildcard_specificity| own_specificity > wildcard_specificity)
-        });
-        if shadows {
-            stubs.push(MeshDestinationRule {
-                name: rule.name.clone(),
-                namespace: rule.namespace.clone(),
-                host: rule.host.clone(),
-                traffic_policy: None,
-                port_level_settings: HashMap::new(),
-                subsets: Vec::new(),
-                export_to: rule.export_to.clone(),
-            });
-        }
-    }
-    stubs
 }
 
 /// Whether `rule` takes part in Istio's exported-rule host selection for
@@ -3888,9 +3964,9 @@ fn hidden_exported_selection_stubs(
 /// namespace-private), not exported to the client, and declared outside the
 /// client's own namespace (the client tier is that namespace's own index),
 /// except that a root-namespace client still looks the root namespace's
-/// exported rules up through the exported index. Shared by slice admission
-/// (stub emission) and the data plane (shadowing), so they agree.
-pub(crate) fn destination_rule_shadows_from_hiding(
+/// exported rules up through the exported index. Read only by the control
+/// plane ([`destination_rule_host_exclusions`]); hidden rules never leave it.
+fn destination_rule_shadows_from_hiding(
     rule: &MeshDestinationRule,
     client_namespace: &str,
     root_namespace: &str,
@@ -3904,41 +3980,6 @@ pub(crate) fn destination_rule_shadows_from_hiding(
     }
     !destination_rule_exported_to_namespace(rule, client_namespace)
         && !destination_rule_is_namespace_private(rule)
-}
-
-/// A rule host as the destination host it selects, with its own
-/// specificity: a wildcard is itself (`Wildcard(suffix length)`); an exact
-/// host is its canonical FQDN (a short name or `<svc>.<ns>[.svc]` completed
-/// with the cluster domain, the short name in the rule's own namespace).
-fn destination_rule_selection_host(
-    rule: &MeshDestinationRule,
-    cluster_domain: &str,
-) -> Option<(String, super::DestinationRuleHostSpecificity)> {
-    let host = rule.host.trim().trim_end_matches('.').to_ascii_lowercase();
-    if host.is_empty() {
-        return None;
-    }
-    if let Some(suffix) = host.strip_prefix('*') {
-        return Some((
-            host.clone(),
-            super::DestinationRuleHostSpecificity::Wildcard(suffix.len()),
-        ));
-    }
-    let svc_suffix = if cluster_domain.is_empty() {
-        ".svc".to_string()
-    } else {
-        format!(".svc.{cluster_domain}")
-    };
-    let canonical = if !host.contains('.') {
-        format!("{host}.{}{svc_suffix}", rule.namespace.trim())
-    } else if host.matches('.').count() == 1 {
-        format!("{host}{svc_suffix}")
-    } else if host.ends_with(".svc") && !cluster_domain.is_empty() {
-        format!("{host}.{cluster_domain}")
-    } else {
-        host
-    };
-    Some((canonical, super::DestinationRuleHostSpecificity::Exact))
 }
 
 /// Whether a DestinationRule host is a wildcard (`*`, `*.example.com`).
@@ -6182,6 +6223,7 @@ mod tests {
             peer_authentications: vec![make_peer_auth("pa1", "ns", None)],
             service_entries: vec![make_service_entry("se1", "ns", vec!["*".into()])],
             destination_rules: Vec::new(),
+            destination_rule_host_exclusions: Vec::new(),
             virtual_service_cors_policies: Vec::new(),
             virtual_service_l4_proxies: Vec::new(),
             virtual_service_l4_upstreams: Vec::new(),

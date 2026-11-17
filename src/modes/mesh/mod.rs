@@ -12112,17 +12112,6 @@ pub(crate) fn apply_destination_rules_with_tenant_file_roots(
         .collect();
     let service_entry_hosts =
         index_service_entry_host_owners(visible_service_entries.iter().copied());
-    let hidden_exported_rules: Vec<&MeshDestinationRule> = mesh_slice
-        .destination_rules
-        .iter()
-        .filter(|dr| {
-            slice::destination_rule_shadows_from_hiding(
-                dr,
-                client_namespace,
-                &mesh_slice.istio_root_namespace,
-            )
-        })
-        .collect();
 
     // Istio resolves the DestinationRule for a destination HOST, so tier
     // arbitration is per destination host, not per upstream. Arbitrating per
@@ -12141,7 +12130,7 @@ pub(crate) fn apply_destination_rules_with_tenant_file_roots(
         cluster_domain: runtime.cluster_domain.trim_matches('.'),
         mesh_service_identities: &service_identities,
         service_entry_hosts: &service_entry_hosts,
-        hidden_exported_rules: &hidden_exported_rules,
+        host_exclusions: &mesh_slice.destination_rule_host_exclusions,
     };
     // The pass ALSO decides representability. An `Upstream` is ONE object: every
     // field a winning rule projects — load balancer, hash keys, backend TLS,
@@ -13274,41 +13263,25 @@ struct MaterializationTierScope<'a> {
     /// evidence an external host has — it pins no namespace syntactically, and
     /// the upstream carrying it need not live in the owning namespace.
     service_entry_hosts: &'a std::collections::BTreeMap<String, ServiceEntryHostOwner>,
-    /// Rules hidden from this subscriber that still take part in Istio's
-    /// exported-rule host selection of their namespace
-    /// (`slice::destination_rule_shadows_from_hiding`): the policy-free
-    /// selection stubs slice admission emits. Never applied; a service- or
-    /// root-tier rule they out-specify on a host yields nothing there
-    /// (issue #7395, [`MaterializationTierScope::shadowed_by_hidden_rule`]).
-    hidden_exported_rules: &'a [&'a MeshDestinationRule],
+    /// Control-plane-resolved host exclusions (issue #7395,
+    /// `MeshSlice::destination_rule_host_exclusions`): a visible wildcard rule
+    /// that Istio's exported-rule host selection does not apply to a host
+    /// because a rule hidden from this subscriber is more specific there.
+    host_exclusions: &'a [slice::DestinationRuleHostExclusion],
 }
 
 impl MaterializationTierScope<'_> {
-    /// Istio's exported-rule lookup picks the most specific host among a
-    /// service or root namespace's exported rules BEFORE checking the client
-    /// can see it, and falls through to the next tier when it cannot. So a
-    /// visible rule in that tier is discarded for a host on which a hidden
-    /// exported rule of the same namespace is strictly more specific.
-    fn shadowed_by_hidden_rule(
+    /// Whether the control plane resolved that `dr` does not apply to this
+    /// destination host (Istio falls through to the next tier there; see
+    /// `slice::destination_rule_host_exclusions`).
+    fn excluded_for_host(
         &self,
         dr: &MeshDestinationRule,
-        tier: DestinationRuleLookupTier,
         host: DestinationRuleMatchHost<'_>,
-        specificity: DestinationRuleHostSpecificity,
     ) -> bool {
-        if !matches!(
-            tier,
-            DestinationRuleLookupTier::Service | DestinationRuleLookupTier::Root
-        ) {
-            return false;
-        }
-        let namespace = dr.namespace.trim();
-        self.hidden_exported_rules.iter().any(|hidden| {
-            hidden.namespace.trim() == namespace
-                && host
-                    .specificity(hidden)
-                    .is_some_and(|hidden_specificity| hidden_specificity > specificity)
-        })
+        self.host_exclusions
+            .iter()
+            .any(|exclusion| exclusion.excludes(dr, host.host))
     }
 
     /// Istio lookup tier for a `(DestinationRule, Upstream, destination host)`
@@ -13687,7 +13660,7 @@ fn destination_rule_winner_candidate(
 ) -> Option<DestinationRuleWinner> {
     let specificity = host.specificity(dr)?;
     let tier = tier_scope.eligible_tier(dr, upstream, host.host, specificity)?;
-    if tier_scope.shadowed_by_hidden_rule(dr, tier, host, specificity) {
+    if tier_scope.excluded_for_host(dr, host) {
         return None;
     }
     Some(DestinationRuleWinner { tier, specificity })
@@ -33615,6 +33588,7 @@ mod tests {
                 },
             ],
             destination_rules: Vec::new(),
+            destination_rule_host_exclusions: Vec::new(),
             virtual_service_cors_policies: Vec::new(),
             proxy_configs: Vec::new(),
             trust_bundles: None,

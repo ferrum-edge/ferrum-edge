@@ -2820,17 +2820,23 @@ fn an_identically_spelled_wildcard_rule_takes_no_upstream_namespace_fallback() {
 
 // ── Review round 2 (sol F1, F2) ──────────────────────────────────────────
 
-/// sol F2 (Istio `getExportedDestinationRuleFromNamespace`): in the target
-/// service's namespace Istio picks the most specific host among the EXPORTED
-/// rules first and only then checks the client may see it; a hidden match
-/// falls through to the root namespace instead of retrying the broader
-/// wildcard. So `payments`' exact rule exported only to `other` hides
-/// `payments`' public wildcard from the gateway for that host and the root
-/// exact TLS rule applies. A namespace-private rule is not in the exported
-/// index and hides nothing.
+/// sol F2 (Istio `pilot/pkg/model/push_context.go`,
+/// `getExportedDestinationRuleFromNamespace`): in the target service's
+/// namespace Istio picks the most specific host among the EXPORTED rules first
+/// and only then checks the client may see it; a hidden match falls through to
+/// the root namespace instead of retrying the broader wildcard. So `payments`'
+/// exact rule exported only to another namespace hides `payments`' public
+/// wildcard from the gateway for that host and the root exact TLS rule
+/// applies. The control plane resolves this and sends only the outcome.
+///
+/// A namespace-private rule (`exportTo: ["."]`) is not in Istio's exported
+/// index (`SetDestinationRules` adds only non-private rules to
+/// `exportedDestRulesByNamespace`), so it shadows nothing for other
+/// namespaces and the owner's wildcard wins the service tier.
 #[test]
 fn a_hidden_exported_exact_rule_shadows_its_namespaces_wildcard_like_istio() {
-    let rules = |hidden_export: &[&str]| {
+    const HIDDEN_EXPORT: &str = "hidden-tenant-ns";
+    let rules = |hidden_export: &str| {
         let mut public_wildcard = rule(
             EXTERNAL_HOST_OWNER,
             "owner-wildcard",
@@ -2848,43 +2854,68 @@ fn a_hidden_exported_exact_rule_shadows_its_namespaces_wildcard_like_istio() {
             EXTERNAL_HOST,
             MtlsMode::Disable,
         );
-        hidden_exact.export_to = hidden_export.iter().map(|e| (*e).to_string()).collect();
+        hidden_exact.export_to = vec![hidden_export.to_string()];
+        let mut hidden_unrelated = rule(
+            EXTERNAL_HOST_OWNER,
+            "owner-unrelated-hidden",
+            "*.payments-internal.example.com",
+            5555,
+            &[],
+        );
+        hidden_unrelated.export_to = vec![hidden_export.to_string()];
         vec![
             public_wildcard,
             hidden_exact,
+            hidden_unrelated,
             tls_rule("istio-system", "mesh-tls", EXTERNAL_HOST, MtlsMode::Simple),
         ]
     };
 
-    let mesh = egress_gateway_mesh(EXTERNAL_HOST_OWNER, rules(&["other"]));
+    let mesh = egress_gateway_mesh(EXTERNAL_HOST_OWNER, rules(HIDDEN_EXPORT));
     let slice = slice_for(&mesh, EGRESS_GATEWAY_NAMESPACE);
-    let stub = slice
-        .destination_rules
-        .iter()
-        .find(|rule| rule.name == "owner-exact-hidden")
-        .expect("the hidden exported rule rides the slice as a selection stub");
-    assert!(
-        stub.traffic_policy.is_none() && stub.port_level_settings.is_empty(),
-        "a stub never carries the hidden rule's policy"
+    assert_eq!(
+        slice
+            .destination_rule_host_exclusions
+            .iter()
+            .map(|exclusion| (
+                exclusion.namespace.as_str(),
+                exclusion.name.as_str(),
+                exclusion.host.as_str()
+            ))
+            .collect::<Vec<_>>(),
+        vec![(EXTERNAL_HOST_OWNER, "owner-wildcard", EXTERNAL_HOST)],
+        "only the outcome rides the slice: the visible wildcard does not apply to that host"
     );
+    // Nothing about a rule outside its export scope reaches the subscriber.
+    let wire = serde_json::to_string(&slice).expect("slice serializes");
+    for hidden in [
+        "owner-exact-hidden",
+        "owner-unrelated-hidden",
+        "payments-internal",
+        HIDDEN_EXPORT,
+    ] {
+        assert!(
+            !wire.contains(hidden),
+            "hidden-rule metadata {hidden:?} must not appear in another namespace's slice"
+        );
+    }
     assert_eq!(
         egress_scheme_for_mesh(mesh, EXTERNAL_HOST),
         BackendScheme::Https,
         "the hidden exact match shadows the owner's wildcard; the root TLS rule applies"
     );
 
-    let private = egress_gateway_mesh(EXTERNAL_HOST_OWNER, rules(&["."]));
+    let private = egress_gateway_mesh(EXTERNAL_HOST_OWNER, rules("."));
     assert!(
-        !slice_for(&private, EGRESS_GATEWAY_NAMESPACE)
-            .destination_rules
-            .iter()
-            .any(|rule| rule.name == "owner-exact-hidden"),
-        "a namespace-private rule never reaches another namespace, not even as a stub"
+        slice_for(&private, EGRESS_GATEWAY_NAMESPACE)
+            .destination_rule_host_exclusions
+            .is_empty(),
+        "a namespace-private rule is not in the exported index and excludes nothing"
     );
     assert_eq!(
         egress_scheme_for_mesh(private, EXTERNAL_HOST),
         BackendScheme::Http,
-        "a private rule is not in the exported index: the owner's wildcard wins the service tier"
+        "the owner's wildcard wins the service tier over the root TLS rule"
     );
 }
 
