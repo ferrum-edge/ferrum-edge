@@ -862,6 +862,14 @@ async fn indexed_credential_delete_with_a_stale_tag_removes_nothing() {
 /// The comparison and the removal run under the namespace admission lease, so
 /// two indexed deletes holding one tag cannot both commit (each would
 /// otherwise remove a different entry from the same read).
+///
+/// Competing credential writes can also be refused before admission with the
+/// documented namespace-fence `503` (`Retry-After: 1`, "Namespace mutation is
+/// temporarily unavailable; retry later"): the mTLS DNS admission guard is
+/// claimed fail-fast and a writer that reaches it while the previous one is
+/// still releasing it is told to retry. That answer writes nothing, so each
+/// writer retries it, as a client would, and the test still requires exactly
+/// one commit across every final answer. Any other `503` fails the test.
 #[tokio::test]
 async fn concurrent_indexed_deletes_holding_one_tag_commit_exactly_once() {
     let dir = TempDir::new().expect("tempdir");
@@ -883,25 +891,34 @@ async fn concurrent_indexed_deletes_holding_one_tag_commit_exactly_once() {
             let start = start.clone();
             tokio::spawn(async move {
                 start.wait().await;
-                send(
-                    Method::DELETE,
-                    &base,
-                    "/consumers/rotating/credentials/keyauth/0",
-                    &admin_token(),
-                    Some(&tag),
-                    None,
-                )
-                .await
-                .status
+                let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+                loop {
+                    let reply = send(
+                        Method::DELETE,
+                        &base,
+                        "/consumers/rotating/credentials/keyauth/0",
+                        &admin_token(),
+                        Some(&tag),
+                        None,
+                    )
+                    .await;
+                    let fence_contention = reply.status == 503
+                        && reply.body["error"]
+                            == crate::common::scheduled_scaling::NAMESPACE_FENCE_RETRY_MESSAGE;
+                    if !fence_contention || tokio::time::Instant::now() >= deadline {
+                        return (reply.status, reply.body);
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                }
             })
         })
         .collect();
     let mut accepted = 0;
     for writer in writers {
         match writer.await.expect("writer task") {
-            200 => accepted += 1,
-            412 => {}
-            other => panic!("unexpected status {other}"),
+            (200, _) => accepted += 1,
+            (412, _) => {}
+            (other, body) => panic!("unexpected status {other}: {body}"),
         }
     }
     assert_eq!(accepted, 1, "exactly one conditioned delete commits");
