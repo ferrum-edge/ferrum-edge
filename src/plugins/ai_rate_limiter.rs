@@ -32,6 +32,7 @@
 //! rather than being charged zero tokens against a budget.
 
 use crate::plugins::utils::log_sampling::warn_sampled;
+use crate::util::json_dup_keys;
 
 use async_trait::async_trait;
 use serde_json::Value;
@@ -2357,8 +2358,21 @@ fn is_cohere_v1_chat_path(path: &str) -> bool {
 
 /// Parse one request document, ignoring a leading UTF-8 byte-order mark that
 /// lenient upstream parsers skip but `serde_json` rejects.
+///
+/// A document with duplicate object member names does not parse here.
+/// `serde_json` keeps the LAST duplicate while many provider SDKs and
+/// upstreams keep the FIRST, so `{"model":"gpt-4o","model":"gpt-4o-mini"}`
+/// would be charged to the `gpt-4o-mini` budget and served as `gpt-4o`, and a
+/// duplicated `max_tokens` or `messages` would shrink the reservation
+/// (GHSA-c78j-5w9p-cpq6, GHSA-49cr-v28q-9hgp). Every caller already treats an
+/// object-shaped body that does not parse as an uninspectable AI call: refused
+/// when `model_limits` is configured (its budget cannot be established),
+/// otherwise admitted unmetered under `on_unmetered_response`.
 fn parse_request_json(text: &str) -> Option<Value> {
     let text = text.strip_prefix('\u{feff}').unwrap_or(text);
+    if json_dup_keys::str_ambiguity(text).is_some() {
+        return None;
+    }
     serde_json::from_str::<Value>(text).ok()
 }
 

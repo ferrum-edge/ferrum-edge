@@ -10357,3 +10357,54 @@ async fn a_body_bearing_get_never_consults_the_budget() {
     );
     assert!(!has_scoped_meta(&get, "ai_ratelimit_request"));
 }
+
+// ─── GHSA-49cr-v28q-9hgp: duplicate JSON members ─────────────────────────
+
+/// Duplicate member names make the budgeted document and the forwarded bytes
+/// two different documents: `serde_json` keeps the LAST `model`, while a
+/// first-key-wins upstream serves the FIRST. Such a body cannot name its model
+/// budget, so with `model_limits` it is refused like any other unreadable
+/// candidate, at arrival and on the final backend-visible body.
+#[tokio::test]
+async fn a_duplicated_model_member_cannot_select_a_model_budget() {
+    let plugin = model_budget_limiter();
+    let ambiguous = [
+        // Charged to the default window as `cheap`, served as `o1`.
+        r#"{"model":"o1","model":"cheap","messages":[{"role":"user","content":"hi"}],"max_tokens":10}"#,
+        // An escaped spelling of the same member name.
+        r#"{"model":"o1","model":"cheap","messages":[{"role":"user","content":"hi"}],"max_tokens":10}"#,
+        // A nested duplicate changes the prompt estimate.
+        r#"{"model":"o1","messages":[{"role":"user","content":"a long prompt","content":"hi"}],"max_tokens":10}"#,
+    ];
+    for body in ambiguous {
+        let mut ctx = post_ctx_with_body(body);
+        assert_reject(
+            plugin.before_proxy(&mut ctx, &mut json_headers()).await,
+            Some(400),
+        );
+        assert!(
+            !has_scoped_meta(&ctx, "ai_ratelimit_budget_model"),
+            "{body}"
+        );
+        assert!(!has_scoped_meta(&ctx, "ai_ratelimit_request"), "{body}");
+    }
+
+    // An admitted call a transform rewrites into a duplicate-member body is
+    // refused on the final body instead of being re-attributed.
+    let mut ctx = post_ctx_with_body(&chat_body("cheap"));
+    assert_continue(plugin.before_proxy(&mut ctx, &mut json_headers()).await);
+    assert_reject(
+        plugin
+            .on_final_request_body_with_context(&mut ctx, &json_headers(), ambiguous[0].as_bytes())
+            .await,
+        Some(400),
+    );
+
+    // Without model budgets the same body is an uninspectable AI candidate:
+    // admitted with no estimate taken from the ambiguous document.
+    let plain = local_limiter(10_000, "total_tokens", "ip");
+    let mut ctx = post_ctx_with_body(ambiguous[0]);
+    assert_continue(plain.before_proxy(&mut ctx, &mut json_headers()).await);
+    assert!(has_scoped_meta(&ctx, "ai_ratelimit_request"));
+    assert!(has_scoped_meta(&ctx, "ai_ratelimit_compressed_ai_request"));
+}
