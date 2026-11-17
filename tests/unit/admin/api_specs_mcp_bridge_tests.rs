@@ -503,6 +503,12 @@ fn x_ferrum_mcp_endpoint_scope_is_checked_like_the_runtime_claim() {
         ("/mcp{suffix}", false),
         ("/mcp/", false),
         ("/MCP/status", true),
+        // The runtime claim reads the canonical request path.
+        ("/%6d%63p", false),
+        ("/mc%70/items", false),
+        // A path parameter can spell the endpoint segment.
+        ("/{name}/status", false),
+        ("/m{rest}", false),
     ] {
         let mut paths = pet_paths();
         paths[path] = plain_get("shadowed", bridged);
@@ -513,8 +519,26 @@ fn x_ferrum_mcp_endpoint_scope_is_checked_like_the_runtime_claim() {
         );
     }
 
+    // A bridged operation whose path parameter can spell the endpoint: the
+    // tool call `{"name": "MCP"}` would reach a path direct clients get 404 on.
+    let mut paths = pet_paths();
+    paths["/{name}/status"] = json!({
+        "get": {
+            "operationId": "status",
+            "parameters": [{
+                "name": "name",
+                "in": "path",
+                "required": true,
+                "schema": { "type": "string" }
+            }],
+            "responses": { "200": { "description": "ok" } }
+        }
+    });
+    let error = extract_error(&spec(extension.clone(), paths));
+    assert!(error.contains("overlaps an operation path"), "{error}");
+
     // Disjoint siblings and an operation above the endpoint stay importable.
-    for path in ["/mcpx", "/mcp-tools/items", "/"] {
+    for path in ["/mcpx", "/mcp-tools/items", "/", "/v{n}", "/%41bc"] {
         let mut paths = pet_paths();
         paths[path] = plain_get("sibling", false);
         let config = generated_gateway(&spec(extension.clone(), paths));

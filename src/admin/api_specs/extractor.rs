@@ -2127,10 +2127,17 @@ fn auto_inject_mcp_gateway(
     let endpoint_scope = endpoint_path.trim_end_matches('/');
     if document_paths
         .iter()
-        .any(|path| mcp_endpoint_scope_reserves_operation(endpoint_scope, path))
+        // Shared with `mcp_gateway`'s own load check, so import, plugin
+        // admission, and the runtime claim agree.
+        .any(|path| {
+            crate::plugins::mcp_gateway::path_template_may_enter_endpoint_scope(
+                endpoint_scope,
+                path,
+            )
+        })
     {
         return Err(mcp_extension_error(
-            "`x-ferrum-mcp.endpoint.path` overlaps an operation path of this document; the MCP endpoint reserves its whole path subtree, ASCII case-insensitively and including `%`-encoded suffixes"
+            "`x-ferrum-mcp.endpoint.path` overlaps an operation path of this document (a literal match, or a path parameter that can spell it); the MCP endpoint reserves its whole path subtree ASCII case-insensitively, so move it to a path no operation can produce"
                 .to_string(),
         ));
     }
@@ -2216,22 +2223,6 @@ fn auto_inject_mcp_gateway(
         updated_at: now,
     });
     Ok(())
-}
-
-/// Whether the runtime claim of an MCP endpoint scope covers requests to an
-/// OpenAPI operation path template: the gateway's own predicate
-/// ([`crate::plugins::mcp_gateway::endpoint_scope_reserves`]: the scope, its
-/// descendants, and `%`-encoded suffixes, ASCII case-insensitively), plus a
-/// template expression that directly follows the scope (`/mcp{x}`), whose
-/// encoded or empty values land inside it.
-fn mcp_endpoint_scope_reserves_operation(endpoint_scope: &str, path: &str) -> bool {
-    crate::plugins::mcp_gateway::endpoint_scope_reserves(endpoint_scope, path)
-        || (path
-            .get(..endpoint_scope.len())
-            .is_some_and(|prefix| prefix.eq_ignore_ascii_case(endpoint_scope))
-            && path
-                .get(endpoint_scope.len()..)
-                .is_some_and(|tail| tail.starts_with('{')))
 }
 
 /// Merge an operator-embedded `mcp_gateway` config over the generated one.

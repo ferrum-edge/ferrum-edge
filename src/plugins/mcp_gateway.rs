@@ -2296,6 +2296,25 @@ impl McpGateway {
                     return json_rpc_error(envelope.id.clone(), -32602, error.message(), None);
                 }
             };
+        // Admission already refuses an operation template that can spell a
+        // path inside the endpoint scope; re-check the substituted path so a
+        // bridged call can never reach a backend path that a direct client of
+        // this route is refused (defense in depth, #7406).
+        if endpoint_scope_reserves(
+            self.endpoint_path.trim_end_matches('/'),
+            &request.public_path,
+        ) {
+            if self.observability.emit_metadata {
+                ctx.metadata
+                    .insert("mcp.route_decision".to_string(), "deny".to_string());
+            }
+            return json_rpc_error(
+                envelope.id.clone(),
+                -32602,
+                "OpenAPI bridge path arguments resolve inside the MCP endpoint scope",
+                None,
+            );
+        }
         let Some(backend_path) = bridge_backend_path(ctx, &request.public_path) else {
             if self.observability.emit_metadata {
                 ctx.metadata
@@ -11924,14 +11943,15 @@ fn validate_bridge_servers(
             ));
         }
         // The endpoint claims its whole subtree (case variants and encoded
-        // suffixes included) and answers 404 there, so an operation inside it
-        // is unreachable to direct clients of the same route (#7406).
+        // suffixes included) and answers 404 there, so an operation that can
+        // land inside it, through a literal or a path parameter value, is
+        // unreachable to direct clients of the same route (#7406).
         if bridge
             .operation_path_templates()
-            .any(|path| endpoint_scope_reserves(endpoint_scope, path))
+            .any(|path| path_template_may_enter_endpoint_scope(endpoint_scope, path))
         {
             return Err(format!(
-                "mcp_gateway: server {server_id:?} `openapi.operations` declares a `path` inside the `endpoint.path` scope; the MCP endpoint reserves its whole path subtree (ASCII case-insensitively, including `%`-encoded suffixes)"
+                "mcp_gateway: server {server_id:?} `openapi.operations` declares a `path` that can fall inside the `endpoint.path` scope (a literal match or a path parameter that can spell it); the MCP endpoint reserves its whole path subtree ASCII case-insensitively, so move `endpoint.path` to a path no operation can produce"
             ));
         }
         if bridge.tool_count() > validation.max_catalog_items_per_list {
@@ -12038,6 +12058,112 @@ fn authority_for_host_port(
 /// `x-ferrum-mcp` generator) share it rather than re-deriving it (#7406).
 pub(crate) fn endpoint_scope_reserves(scope: &str, path: &str) -> bool {
     path.eq_ignore_ascii_case(scope) || endpoint_scope_contains(scope, path)
+}
+
+/// Whether ANY request path an operation path template can produce is
+/// claimed by an MCP endpoint scope at runtime ([`endpoint_scope_reserves`]
+/// over the canonical request path).
+///
+/// The runtime claim is evaluated on `ctx.path`, the canonical policy path,
+/// so each literal run of the template is canonicalized the same way first
+/// (`/%6d%63p` is `/mcp`). A `{name}` template expression stands for any
+/// value, so a segment such as `{name}` or `v{n}` matches every scope
+/// segment its pattern can spell, ASCII case-insensitively: `/{name}/status`
+/// overlaps `/mcp` because `name = "MCP"` lands inside the claim. A template
+/// whose literal runs do not canonicalize is compared as written instead,
+/// including the claim's `%`-suffix rule. Admission-time only (allocates).
+pub(crate) fn path_template_may_enter_endpoint_scope(scope: &str, template: &str) -> bool {
+    let (segments, canonical) = match canonical_path_template_segments(template) {
+        Some(segments) => (segments, true),
+        None => (
+            template.split('/').map(template_segment_pattern).collect(),
+            false,
+        ),
+    };
+    let scope_segments: Vec<&str> = scope.split('/').collect();
+    let segment_overlap = segments.len() >= scope_segments.len()
+        && scope_segments
+            .iter()
+            .zip(&segments)
+            .all(|(scope_segment, pattern)| pattern.matches(scope_segment));
+    segment_overlap || (!canonical && endpoint_scope_reserves(scope, template))
+}
+
+/// One path segment of an operation template: literal runs (lower-cased)
+/// separated by template expressions that match any text.
+struct TemplateSegmentPattern {
+    literals: Vec<String>,
+}
+
+impl TemplateSegmentPattern {
+    /// Glob match: the first and last literal runs anchor the ends (empty
+    /// when the segment starts or ends with an expression), and the inner
+    /// runs must appear in order between them.
+    fn matches(&self, segment: &str) -> bool {
+        let segment = segment.to_ascii_lowercase();
+        let Some((first, rest)) = self.literals.split_first() else {
+            return segment.is_empty();
+        };
+        let Some(mut remaining) = segment.strip_prefix(first.as_str()) else {
+            return false;
+        };
+        let Some((last, inner)) = rest.split_last() else {
+            // No expression in this segment: an exact literal.
+            return remaining.is_empty();
+        };
+        for literal in inner {
+            let Some(index) = remaining.find(literal.as_str()) else {
+                return false;
+            };
+            remaining = &remaining[index + literal.len()..];
+        }
+        remaining.len() >= last.len() && remaining.ends_with(last.as_str())
+    }
+}
+
+/// Split one raw template segment on its `{...}` expressions.
+fn template_segment_pattern(segment: &str) -> TemplateSegmentPattern {
+    let mut literals = Vec::new();
+    let mut rest = segment;
+    loop {
+        match rest.find('{') {
+            Some(open) => {
+                literals.push(rest[..open].to_ascii_lowercase());
+                rest = match rest[open..].find('}') {
+                    Some(close) => &rest[open + close + 1..],
+                    None => "",
+                };
+            }
+            None => {
+                literals.push(rest.to_ascii_lowercase());
+                return TemplateSegmentPattern { literals };
+            }
+        }
+    }
+}
+
+/// The template's segments with every literal run canonicalized as a policy
+/// path, or `None` when one does not canonicalize.
+fn canonical_path_template_segments(template: &str) -> Option<Vec<TemplateSegmentPattern>> {
+    template
+        .split('/')
+        .map(|segment| {
+            let raw = template_segment_pattern(segment);
+            let literals = raw
+                .literals
+                .into_iter()
+                .map(|literal| {
+                    if literal.is_empty() {
+                        return Some(literal);
+                    }
+                    let rooted = format!("/{literal}");
+                    let canonical = crate::policy_path::canonicalize_policy_path(&rooted).ok()?;
+                    Some(canonical.strip_prefix('/')?.to_ascii_lowercase())
+                })
+                .collect::<Option<Vec<_>>>()?;
+            Some(TemplateSegmentPattern { literals })
+        })
+        .collect()
 }
 
 /// Reserve descendants and ambiguous encoded suffixes, including case variants.

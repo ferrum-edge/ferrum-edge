@@ -17007,6 +17007,41 @@ fn openapi_bridge_operations_inside_the_endpoint_scope_are_refused() {
             "{path}"
         );
     }
+
+    // A whole-segment path parameter stands for any value, so it can spell
+    // the endpoint: `{"petId": "MCP"}` would reach `/MCP/status`, which a
+    // direct client of this route is refused with 404.
+    for (endpoint, path) in [
+        ("/mcp", "/{petId}/status"),
+        ("/mcp", "/{petId}"),
+        ("/api/mcp", "/api/{petId}/status"),
+        ("/api/mcp", "/{petId}/mcp"),
+        ("/api/mcp", "/api/{petId}"),
+    ] {
+        let error = bridge_config_error(|config| {
+            config["endpoint"]["path"] = json!(endpoint);
+            bridge_operation(config, 0)["path"] = json!(path);
+        });
+        assert!(
+            error.contains("inside the `endpoint.path` scope"),
+            "{endpoint} {path}: {error}"
+        );
+    }
+    // A parameter path that is too short to reach the scope, or whose literal
+    // segments differ, is not inside it.
+    for (endpoint, path) in [
+        ("/mcp/v1", "/{petId}"),
+        ("/api/mcp", "/{petId}"),
+        ("/api/mcp", "/other/{petId}/status"),
+    ] {
+        let mut config = bridge_config();
+        config["endpoint"]["path"] = json!(endpoint);
+        bridge_operation(&mut config, 0)["path"] = json!(path);
+        assert!(
+            create_plugin("mcp_gateway", &config).unwrap().is_some(),
+            "{endpoint} {path}"
+        );
+    }
 }
 
 /// Admit one bridged `tools/call` like [`bridge_call`], after `prepare` has
