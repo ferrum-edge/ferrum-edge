@@ -423,9 +423,15 @@ fn backend_response_collectors_keep_utf8_obs_text_and_count_drops() {
     );
 }
 
-/// Strip all whitespace so source-shape checks survive rustfmt reflows.
+/// Drop full-line `//` comments and all whitespace so source-shape checks
+/// survive rustfmt reflows and explanatory comments inside a block.
 fn squeeze(source: &str) -> String {
-    source.chars().filter(|ch| !ch.is_whitespace()).collect()
+    source
+        .lines()
+        .filter(|line| !line.trim_start().starts_with("//"))
+        .flat_map(str::chars)
+        .filter(|ch| !ch.is_whitespace())
+        .collect()
 }
 
 /// Every WebSocket backend transport that can carry a backend's refusal of the
@@ -451,45 +457,82 @@ fn every_websocket_transport_refusal_feeds_the_shared_relay() {
     );
 
     let hbone = squeeze(include_str!("../../../src/proxy/hbone_pool.rs"));
-    let opener = hbone
-        .find("pub(crate)asyncfnopen_h2_ws_connect_stream(")
-        .expect("Sidecar WebSocket Extended CONNECT opener");
-    let opener_body = &hbone[opener..];
-    let refused = opener_body
-        .find("returnErr(HbonePoolError::WebSocketUpgradeRefused{")
-        .expect("the opener must carry a 3xx-5xx refusal");
-    let rejected = opener_body
+    let head = hbone
+        .find("asyncfnopen_h2_ws_connect_stream_head(")
+        .expect("Sidecar WebSocket Extended CONNECT head opener");
+    let head_body = &hbone[head..];
+    let refused = head_body
+        .find("returnOk(WsConnectHead::Refused{")
+        .expect("the opener must hand back a 3xx-5xx refusal head");
+    let rejected = head_body
         .find("returnErr(HbonePoolError::ConnectRejected{")
         .expect("other non-200 answers stay ConnectRejected");
     assert!(
         refused < rejected,
         "the refusal must be carried before the ConnectRejected fallback"
     );
-    assert!(opener_body[..refused].contains("WebSocketBackendRefusal::from_response_parts("));
+    let finish = hbone
+        .find("asyncfnfinish_ws_connect_head(")
+        .expect("refusal finisher");
+    let finish_body = &hbone[finish..finish + 1500];
+    assert!(finish_body.contains("WebSocketBackendRefusal::from_response_parts("));
+    assert!(finish_body.contains("Err(HbonePoolError::WebSocketUpgradeRefused{"));
+    // The production deadline bounds the response head only, so an in-time
+    // refusal head is never erased by its optional body read.
+    let within = hbone
+        .find("asyncfnopen_h2_ws_connect_stream_within(")
+        .expect("timed Extended CONNECT opener");
+    let within_body = &hbone[within..within + 1500];
+    let timed_head = within_body
+        .find("tokio::time::timeout(head_timeout,open_h2_ws_connect_stream_head(")
+        .expect("the head deadline wraps only the head opener");
+    let finished = within_body
+        .find("finish_ws_connect_head(head).await")
+        .expect("the refusal is finished after the head deadline");
+    assert!(timed_head < finished);
+    let mesh_mtls = squeeze(include_str!("../../../src/proxy/mesh_mtls_pool.rs"));
+    assert!(
+        mesh_mtls.contains("open_h2_ws_connect_stream_within(Duration::from_millis(proxy.backend_connect_timeout_ms),"),
+        "the Sidecar WebSocket dial must use the head-bounded opener"
+    );
 
     let h3 = squeeze(include_str!("../../../src/http3/websocket.rs"));
-    for (label, source, extractor) in [
+    for (label, source, extractor, breaker_path) in [
         (
             "H1/H2",
             proxy.as_str(),
             "websocket_backend_refusal(e.as_ref())",
+            "backend_dispatch::",
         ),
         (
             "H3",
             h3.as_str(),
             "crate::proxy::websocket_backend_refusal(e.as_ref())",
+            "crate::proxy::backend_dispatch::",
         ),
     ] {
         let at = source
             .find(extractor)
             .unwrap_or_else(|| panic!("{label}: failure tail must consult the shared relay"));
         let tail = &source[at..];
-        let settle = tail
-            .find("apply_circuit_breaker_outcome(&cb,ws_failure_status.as_u16(),false,None,")
-            .unwrap_or_else(|| panic!("{label}: a refusal must settle the breaker by its status"));
+        // The breaker block itself (not the earlier refusal log branch) must
+        // open with the refusal arm settling by the backend's status, ahead of
+        // the egress-denied and failure arms.
+        let breaker = tail
+            .find("if!cb_failure_already_recorded&&letSome(cb)=cb_probe.current_breaker(")
+            .unwrap_or_else(|| panic!("{label}: terminal breaker settlement block"));
+        let block = &tail[breaker..breaker + 1500];
+        let refusal_arm = block
+            .find(&format!(
+                "{{ifws_backend_refusal.is_some(){{{breaker_path}apply_circuit_breaker_outcome(&cb,ws_failure_status.as_u16(),false,None,"
+            ))
+            .unwrap_or_else(|| panic!("{label}: the breaker block must open with the refusal arm"));
+        let egress_arm = block
+            .find("}elseifws_egress_denied{")
+            .unwrap_or_else(|| panic!("{label}: egress-denied arm"));
         assert!(
-            tail[..settle].contains("ifws_backend_refusal.is_some(){"),
-            "{label}: the status-based settlement must be the refusal arm"
+            refusal_arm < egress_arm,
+            "{label}: a refusal must settle by status before any failure arm"
         );
     }
 
