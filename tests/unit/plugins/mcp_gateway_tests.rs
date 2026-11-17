@@ -17062,6 +17062,8 @@ fn openapi_bridge_operations_inside_the_endpoint_scope_are_refused() {
         ("/api/mcp", "/api/{petId}/status"),
         ("/api/mcp", "/{petId}/mcp"),
         ("/api/mcp", "/api/{petId}"),
+        // Both repeats of one parameter carry the same value.
+        ("/one/one", "/{petId}/{petId}"),
     ] {
         let error = bridge_config_error(|config| {
             config["endpoint"]["path"] = json!(endpoint);
@@ -17078,6 +17080,9 @@ fn openapi_bridge_operations_inside_the_endpoint_scope_are_refused() {
         ("/mcp/v1", "/{petId}"),
         ("/api/mcp", "/{petId}"),
         ("/api/mcp", "/other/{petId}/status"),
+        // `/{petId}/{petId}` repeats ONE value, so it can never spell two
+        // different endpoint segments.
+        ("/one/two", "/{petId}/{petId}"),
     ] {
         let mut config = bridge_config();
         config["endpoint"]["path"] = json!(endpoint);

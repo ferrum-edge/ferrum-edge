@@ -12080,42 +12080,64 @@ pub(crate) fn endpoint_scope_reserves(scope: &str, path: &str) -> bool {
 /// over the canonical request path).
 ///
 /// The runtime claim is evaluated on `ctx.path`, the canonical policy path,
-/// so each literal run of the template is canonicalized the same way first
-/// (`/%6d%63p` is `/mcp`). A `{name}` template expression stands for any
-/// value, so a segment such as `{name}` or `v{n}` matches every scope
-/// segment its pattern can spell, ASCII case-insensitively: `/{name}/status`
-/// overlaps `/mcp` because `name = "MCP"` lands inside the claim. A template
-/// whose literal runs do not canonicalize is compared as written instead,
-/// including the claim's `%`-suffix rule. Admission-time only (allocates).
+/// so each literal run of the template has its escapes decoded the same way
+/// first (`/%6d%63p` is `/mcp`), independently of its neighbours: a run that
+/// cannot be decoded (an encoded separator, say) is compared as written and
+/// does not stop the others from being decoded. Segments then compare ASCII
+/// case-insensitively:
+///
+/// - a whole-segment `{name}` stands for any non-empty value (a value can
+///   never be empty, add a separator, or add an escape), and every repeat of
+///   the same name must take the same value, so `/{id}/{id}` cannot spell
+///   `/one/two`;
+/// - an expression inside a segment (`v{n}`, `mcp{suffix}`) is treated as
+///   able to match any text, INCLUDING none, because a direct client of an
+///   unbridged operation can send such a segment with an empty value. This
+///   is deliberately conservative: `/mcp{suffix}` overlaps `/mcp`.
+///
+/// When a run had to be compared as written, the claim's `%`-suffix rule is
+/// also applied to the raw template. Admission-time only (allocates).
 pub(crate) fn path_template_may_enter_endpoint_scope(scope: &str, template: &str) -> bool {
-    let (segments, canonical) = match canonical_path_template_segments(template) {
-        Some(segments) => (segments, true),
-        None => (
-            template.split('/').map(template_segment_pattern).collect(),
-            false,
-        ),
-    };
+    let mut any_raw = false;
+    let segments: Vec<TemplateSegmentPattern> = template
+        .split('/')
+        .map(|segment| template_segment_pattern(segment, &mut any_raw))
+        .collect();
     let scope_segments: Vec<&str> = scope.split('/').collect();
+    let mut bindings: Vec<(&str, String)> = Vec::new();
     let segment_overlap = segments.len() >= scope_segments.len()
         && scope_segments
             .iter()
             .zip(&segments)
-            .all(|(scope_segment, pattern)| pattern.matches(scope_segment));
-    segment_overlap || (!canonical && endpoint_scope_reserves(scope, template))
+            .all(|(scope_segment, pattern)| pattern.matches(scope_segment, &mut bindings));
+    segment_overlap || (any_raw && endpoint_scope_reserves(scope, template))
 }
 
-/// One path segment of an operation template: literal runs (lower-cased)
-/// separated by template expressions that match any text.
-struct TemplateSegmentPattern {
+/// One path segment of an operation template.
+struct TemplateSegmentPattern<'a> {
+    /// `Some(name)` when the whole segment is one `{name}` expression.
+    whole_parameter: Option<&'a str>,
+    /// Otherwise: decoded, lower-cased literal runs, separated by template
+    /// expressions that match any text.
     literals: Vec<String>,
 }
 
-impl TemplateSegmentPattern {
-    /// Glob match: the first and last literal runs anchor the ends (empty
-    /// when the segment starts or ends with an expression), and the inner
-    /// runs must appear in order between them.
-    fn matches(&self, segment: &str) -> bool {
+impl<'a> TemplateSegmentPattern<'a> {
+    fn matches(&self, segment: &str, bindings: &mut Vec<(&'a str, String)>) -> bool {
         let segment = segment.to_ascii_lowercase();
+        if let Some(name) = self.whole_parameter {
+            if segment.is_empty() {
+                return false;
+            }
+            if let Some((_, bound)) = bindings.iter().find(|(bound_name, _)| *bound_name == name) {
+                return *bound == segment;
+            }
+            bindings.push((name, segment));
+            return true;
+        }
+        // Glob match: the first and last literal runs anchor the ends (empty
+        // when the segment starts or ends with an expression), and the inner
+        // runs must appear in order between them.
         let Some((first, rest)) = self.literals.split_first() else {
             return segment.is_empty();
         };
@@ -12136,49 +12158,66 @@ impl TemplateSegmentPattern {
     }
 }
 
-/// Split one raw template segment on its `{...}` expressions.
-fn template_segment_pattern(segment: &str) -> TemplateSegmentPattern {
+/// Split one template segment on its `{...}` expressions and decode each
+/// literal run; sets `any_raw` when a run had to be kept as written.
+fn template_segment_pattern<'a>(
+    segment: &'a str,
+    any_raw: &mut bool,
+) -> TemplateSegmentPattern<'a> {
+    if let Some(name) = segment
+        .strip_prefix('{')
+        .and_then(|rest| rest.strip_suffix('}'))
+        .filter(|name| !name.contains(['{', '}']))
+    {
+        return TemplateSegmentPattern {
+            whole_parameter: Some(name),
+            literals: Vec::new(),
+        };
+    }
     let mut literals = Vec::new();
     let mut rest = segment;
     loop {
         match rest.find('{') {
             Some(open) => {
-                literals.push(rest[..open].to_ascii_lowercase());
+                literals.push(decoded_literal_run(&rest[..open], any_raw));
                 rest = match rest[open..].find('}') {
                     Some(close) => &rest[open + close + 1..],
                     None => "",
                 };
             }
             None => {
-                literals.push(rest.to_ascii_lowercase());
-                return TemplateSegmentPattern { literals };
+                literals.push(decoded_literal_run(rest, any_raw));
+                return TemplateSegmentPattern {
+                    whole_parameter: None,
+                    literals,
+                };
             }
         }
     }
 }
 
-/// The template's segments with every literal run canonicalized as a policy
-/// path, or `None` when one does not canonicalize.
-fn canonical_path_template_segments(template: &str) -> Option<Vec<TemplateSegmentPattern>> {
-    template
-        .split('/')
-        .map(|segment| {
-            let raw = template_segment_pattern(segment);
-            let literals = raw
-                .literals
-                .into_iter()
-                .map(|literal| {
-                    if literal.is_empty() {
-                        return Some(literal);
-                    }
-                    let rooted = format!("/{literal}");
-                    let canonical = crate::policy_path::canonicalize_policy_path(&rooted).ok()?;
-                    Some(canonical.strip_prefix('/')?.to_ascii_lowercase())
-                })
-                .collect::<Option<Vec<_>>>()?;
-            Some(TemplateSegmentPattern { literals })
-        })
-        .collect()
+/// Decode one literal run's escapes exactly as request-path canonicalization
+/// would, lower-cased. The run is decoded behind a fixed `/x` prefix so that a
+/// fragment such as `.` (from `{name}.{ext}`) is not judged as a whole dot
+/// segment; a run that does not decode is kept as written.
+fn decoded_literal_run(run: &str, any_raw: &mut bool) -> String {
+    if run.is_empty() {
+        return String::new();
+    }
+    let rooted = format!("/x{run}");
+    match crate::policy_path::canonicalize_policy_path(&rooted) {
+        Ok(canonical) => match canonical.strip_prefix("/x") {
+            Some(decoded) => decoded.to_ascii_lowercase(),
+            None => {
+                *any_raw = true;
+                run.to_ascii_lowercase()
+            }
+        },
+        Err(_) => {
+            *any_raw = true;
+            run.to_ascii_lowercase()
+        }
+    }
 }
 
 /// Reserve descendants and ambiguous encoded suffixes, including case variants.

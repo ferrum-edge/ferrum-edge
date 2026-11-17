@@ -500,6 +500,8 @@ fn x_ferrum_mcp_endpoint_scope_is_checked_like_the_runtime_claim() {
         ("/MCP", false),
         ("/Mcp/status", false),
         ("/mcp%2Fitems", false),
+        // Conservative: an expression inside a segment may be empty for a
+        // direct client of an unbridged operation.
         ("/mcp{suffix}", false),
         ("/mcp/", false),
         ("/MCP/status", true),
@@ -509,6 +511,9 @@ fn x_ferrum_mcp_endpoint_scope_is_checked_like_the_runtime_claim() {
         // A path parameter can spell the endpoint segment.
         ("/{name}/status", false),
         ("/m{rest}", false),
+        // A literal run that is not a whole segment (the `.` here) does not
+        // stop the other runs from being decoded.
+        ("/mc%70/{name}.{ext}", false),
     ] {
         let mut paths = pet_paths();
         paths[path] = plain_get("shadowed", bridged);

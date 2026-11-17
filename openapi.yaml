@@ -8208,7 +8208,11 @@ paths:
           document with ANY operation path that can fall inside it, bridged
           or not and under any effective server base (for example
           `/MCP/status`, `/%6d%63p`, or `/{name}/status` beside `/mcp`; a
-          path parameter stands for any value), is rejected with `400`. An embedded `mcp_gateway` in `x-ferrum-plugins` is
+          whole-segment `{name}` stands for any non-empty value, repeats of
+          one name share it, and an expression inside a segment may be
+          empty), is rejected with `400`; so is a document whose operations
+          times effective server bases exceed 65,536 paths or 16 MiB of path
+          text. An embedded `mcp_gateway` in `x-ferrum-plugins` is
           merged over the generated config (the `openapi` server id is
           reserved; its `endpoint` merges key by key and an `endpoint.path`
           other than the generated one is rejected with `400`). Cannot be
@@ -41622,7 +41626,8 @@ components:
             On an exact (`=`) or regex (`~`) route every bridged call is
             refused the same way. It must not be able to fall inside
             endpoint.path's reserved subtree (ASCII case-insensitive, like the
-            runtime claim; a `{name}` segment matches any endpoint segment);
+            runtime claim; a `{name}` segment matches any endpoint segment,
+            and repeats of one name must match the same text);
             load rejects it, and a substituted path inside the scope is
             refused with JSON-RPC -32602 before dispatch. Path
             arguments are percent-encoded per segment and the result must be a
