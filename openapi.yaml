@@ -8215,10 +8215,22 @@ paths:
           X-Forwarded-*, MCP transport, Ferrum-internal), cookie / `content`
           / non-default-style / object parameters, and required non-JSON
           bodies are rejected with `400` naming the operation (exclude it to
-          proceed). An embedded `mcp_gateway` in `x-ferrum-plugins` is merged
-          over the generated config (the `openapi` server id is reserved).
-          Cannot be combined with `x-ferrum-validate` in one document, and
-          requires a literal-prefix `listen_path`.
+          proceed). The endpoint must sit under the literal `listen_path`
+          and reserves its whole subtree the way the running gateway claims
+          it (canonical request path, ASCII case-insensitively), so a
+          document with ANY operation path that can fall inside it, bridged
+          or not and under any effective server base (for example
+          `/MCP/status`, `/%6d%63p`, or `/{name}/status` beside `/mcp`; a
+          whole-segment `{name}` stands for any non-empty value, repeats of
+          one name share it, and an expression inside a segment may be
+          empty), is rejected with `400`; so is a document whose operations
+          times effective server bases exceed 65,536 paths or 16 MiB of path
+          text. An embedded `mcp_gateway` in `x-ferrum-plugins` is
+          merged over the generated config (the `openapi` server id is
+          reserved; its `endpoint` merges key by key and an `endpoint.path`
+          other than the generated one is rejected with `400`). Cannot be
+          combined with `x-ferrum-validate` in one document, and requires a
+          literal-prefix `listen_path`.
         - **`x-ferrum-external-refs`** (optional) — `true` or an object
           (`enabled`, optional `document_base`, optional `allowed_origins`)
           to opt this document into external / cross-document `$ref`
@@ -41674,7 +41686,17 @@ components:
             The operation's PUBLIC request path on this proxy (listen path
             included), with `{name}` path parameters each occupying a whole
             segment. It is mapped onto the backend exactly as a direct request
-            to that path would be (strip_listen_path, backend_path). Path
+            to that path would be (strip_listen_path, backend_path). It must
+            sit under the matched proxy's listen path on a segment boundary
+            whether or not strip_listen_path is set; a call whose path does
+            not is refused with JSON-RPC -32603 and nothing is dispatched.
+            On an exact (`=`) or regex (`~`) route every bridged call is
+            refused the same way. It must not be able to fall inside
+            endpoint.path's reserved subtree (ASCII case-insensitive, like the
+            runtime claim; a `{name}` segment matches any endpoint segment,
+            and repeats of one name must match the same text);
+            load rejects it, and a substituted path inside the scope is
+            refused with JSON-RPC -32602 before dispatch. Path
             arguments are percent-encoded per segment and the result must be a
             canonical policy path, so an argument can never add `/`, a dot
             segment, `?`, or `#`.

@@ -556,6 +556,12 @@ impl McpOpenApiBridge {
     pub fn max_request_body_bytes(&self) -> usize {
         self.max_request_body_bytes
     }
+
+    /// Every configured operation path template (`/pets/{petId}`), for the
+    /// configuration cross-check against the gateway's own endpoint scope.
+    pub fn operation_path_templates(&self) -> impl Iterator<Item = &str> {
+        self.operations.values().map(BridgeOperation::path_template)
+    }
 }
 
 impl BridgeOperation {
