@@ -165,15 +165,16 @@ fn openapi_info_version_matches_crate_version() {
     );
 }
 
-/// `openapi: 3.1.x` documents are YAML 1.2. Its Core Schema float form is
-/// `[-+]?(\.[0-9]+|[0-9]+(\.[0-9]*)?)([eE][-+][0-9]+)?`: the exponent needs an
-/// explicit sign. A YAML 1.1-style `1.0e288` parses as a number in
-/// `serde_yaml` but as the string `"1.0e288"` in strict YAML 1.2 loaders
-/// (libyaml/Psych), which turns a JSON Schema `maximum` into a string and
-/// breaks downstream validators (issue #7408). Scan the raw text, since
-/// `serde_yaml` cannot see the difference.
+/// Exponent floats must carry a sign so every YAML resolver reads them as
+/// numbers (issue #7408). The YAML 1.2 Core Schema accepts `1.0e288` (its
+/// exponent sign is optional), but the YAML 1.1 float type requires
+/// `[eE][-+][0-9]+`, and widely used loaders resolve with YAML 1.1 rules
+/// (libyaml/Psych, PyYAML). They read `maximum: 1.0e288` as the string
+/// `"1.0e288"`, which breaks JSON Schema validators downstream. `1.0e+288` is
+/// a float under both. Scan the raw text, since `serde_yaml` accepts both
+/// spellings.
 #[test]
-fn openapi_plain_scalars_use_yaml_1_2_exponent_syntax() {
+fn openapi_plain_scalars_avoid_yaml_1_1_only_exponent_syntax() {
     // A whole plain scalar after `key: ` or a `- ` sequence entry, with an
     // optional trailing comment, that is a signless-exponent float.
     let signless_exponent = Regex::new(
@@ -188,7 +189,7 @@ fn openapi_plain_scalars_use_yaml_1_2_exponent_syntax() {
         .collect();
     assert!(
         offenders.is_empty(),
-        "openapi.yaml has YAML 1.1-only signless exponent floats (write e.g. `1.0e+288`) on lines {offenders:?}"
+        "openapi.yaml has signless exponent floats, which YAML 1.1 resolvers read as strings (write e.g. `1.0e+288`), on lines {offenders:?}"
     );
 
     // The chargeback price bounds that #7408 found must still parse as the
@@ -1629,9 +1630,10 @@ fn row_if_match_operations_match_the_router_and_document_412() {
             if !has_if_match {
                 continue;
             }
-            assert_eq!(
-                operation["responses"]["412"]["$ref"],
-                json!("#/components/responses/PreconditionFailed"),
+            // Most operations reference the shared response; DELETE
+            // /proxies/{id} documents its deployment-profile 412 inline.
+            assert!(
+                operation["responses"]["412"].is_object(),
                 "{method} {path} takes If-Match and must document 412"
             );
             documented.insert(format!("{} {path}", method.to_uppercase()));
