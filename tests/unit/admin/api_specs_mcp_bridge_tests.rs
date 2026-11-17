@@ -621,3 +621,55 @@ fn x_ferrum_mcp_embedded_gateway_cannot_move_the_validated_endpoint() {
         .expect("merged gateway");
     assert_eq!(gateway.config["endpoint"]["path"], "/pets-api/mcp");
 }
+
+#[test]
+fn x_ferrum_mcp_endpoint_overlap_checks_every_server_base() {
+    // Every effective server base exposes the operation on this proxy, so an
+    // overlap under a non-first base is refused too (the bridge itself
+    // dispatches under the first base only), whichever level declares it.
+    let servers = json!([
+        { "url": "https://pets.example.com/v1" },
+        { "url": "https://pets.example.com/mcp" }
+    ]);
+    let extension = json!({ "endpoint": { "path": "/pets-api/mcp" } });
+
+    let mut document = spec(extension.clone(), pet_paths());
+    document["servers"] = servers.clone();
+    let error = extract_error(&document);
+    assert!(
+        error.contains("overlaps an operation path"),
+        "root: {error}"
+    );
+
+    let mut paths = pet_paths();
+    paths["/status"] = plain_get("status", false);
+    paths["/status"]["servers"] = servers.clone();
+    let error = extract_error(&spec(extension.clone(), paths));
+    assert!(
+        error.contains("overlaps an operation path"),
+        "path item: {error}"
+    );
+
+    let mut paths = pet_paths();
+    paths["/status"] = plain_get("status", false);
+    paths["/status"]["get"]["servers"] = servers.clone();
+    let error = extract_error(&spec(extension.clone(), paths));
+    assert!(
+        error.contains("overlaps an operation path"),
+        "operation: {error}"
+    );
+
+    // The same document with disjoint bases imports, and the bridge keeps
+    // dispatching under the first base.
+    let mut paths = pet_paths();
+    paths["/status"] = plain_get("status", false);
+    paths["/status"]["get"]["servers"] = json!([
+        { "url": "https://pets.example.com/v1" },
+        { "url": "https://pets.example.com/v2" }
+    ]);
+    let config = generated_gateway(&spec(extension, paths));
+    assert_eq!(
+        operation(&config, "getPet")["path"],
+        "/pets-api/v1/pets/{petId}"
+    );
+}

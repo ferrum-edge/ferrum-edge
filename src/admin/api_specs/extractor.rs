@@ -1644,19 +1644,26 @@ fn extract_mcp_bridge_operations(
                     .clone()
                     .unwrap_or_else(|| root_server_bases.clone()),
             };
+            let public_path_under = |base: &str| -> Result<String, ExtractError> {
+                let spec_path = join_server_base_and_path(base, path_template)?;
+                Ok(if !listen_prefix.is_empty() && spec_path == "/" {
+                    listen_prefix.to_string()
+                } else {
+                    format!("{listen_prefix}{spec_path}")
+                })
+            };
+            // Every operation of the document is served on this proxy under
+            // EVERY effective server base, so the MCP endpoint's reserved
+            // subtree must miss all of those paths, bridged or not (#7406).
+            // The bridge itself dispatches under the first base only.
+            for base in effective_bases.iter().skip(1) {
+                document_paths.push(public_path_under(base)?);
+            }
             let base = effective_bases
                 .first()
                 .map(String::as_str)
                 .unwrap_or(SERVER_BASE_ROOT);
-            let spec_path = join_server_base_and_path(base, path_template)?;
-            let public_path = if !listen_prefix.is_empty() && spec_path == "/" {
-                listen_prefix.to_string()
-            } else {
-                format!("{listen_prefix}{spec_path}")
-            };
-            // Every operation of the document is served on this proxy, so
-            // the MCP endpoint's reserved subtree must miss all of them, not
-            // only the bridged ones (#7406).
+            let public_path = public_path_under(base)?;
             document_paths.push(public_path.clone());
             let operation_extension = parse_operation_mcp_extension(operation, &location)?;
             if !mcp_operation_selected(extension, operation, &operation_extension, method) {
