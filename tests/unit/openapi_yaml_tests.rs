@@ -1605,6 +1605,58 @@ fn consumer_credential_surface_schemas_match_runtime_redaction() {
     );
 }
 
+/// The row `If-Match` contract is documented on exactly the operations the
+/// admin router evaluates it on (`if_match_route` in `src/admin/mod.rs`),
+/// each with its `412`. The consumer credential sub-routes joined that set in
+/// issue #7393; the integration suite (`admin_conditional_write_tests`)
+/// drives the runtime side.
+#[test]
+fn row_if_match_operations_match_the_router_and_document_412() {
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+    let paths = spec["paths"].as_object().expect("paths object");
+    let mut documented = BTreeSet::new();
+    for (path, item) in paths {
+        for method in OPENAPI_HTTP_METHODS {
+            let Some(operation) = item.get(*method) else {
+                continue;
+            };
+            let has_if_match = operation["parameters"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .any(|parameter| parameter["$ref"] == "#/components/parameters/IfMatch");
+            if !has_if_match {
+                continue;
+            }
+            assert_eq!(
+                operation["responses"]["412"]["$ref"],
+                json!("#/components/responses/PreconditionFailed"),
+                "{method} {path} takes If-Match and must document 412"
+            );
+            documented.insert(format!("{} {path}", method.to_uppercase()));
+        }
+    }
+    let expected: BTreeSet<String> = [
+        "PUT /proxies/{id}",
+        "DELETE /proxies/{id}",
+        "PUT /upstreams/{id}",
+        "DELETE /upstreams/{id}",
+        "PUT /consumers/{id}",
+        "DELETE /consumers/{id}",
+        "PUT /plugins/config/{id}",
+        "DELETE /plugins/config/{id}",
+        "PUT /consumers/{consumer_id}/credentials/{cred_type}",
+        "POST /consumers/{consumer_id}/credentials/{cred_type}",
+        "DELETE /consumers/{consumer_id}/credentials/{cred_type}",
+        "DELETE /consumers/{consumer_id}/credentials/{cred_type}/{index}",
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect();
+    assert_eq!(documented, expected);
+}
+
 #[test]
 fn proxy_create_schema_requires_upstream_or_direct_backend() {
     let spec: serde_json::Value =

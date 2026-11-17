@@ -1396,8 +1396,9 @@ curl -X POST -H "Authorization: Bearer $TOKEN" \
   -d '{"key": "rotated-api-key-0123456789"}' \
   http://localhost:9000/consumers/{consumer_id}/credentials/keyauth
 
-# Delete a specific credential by index (0-based)
-curl -X DELETE -H "Authorization: Bearer $TOKEN" \
+# Delete a specific credential by index (0-based), conditioned on the
+# Consumer's ETag from the GET the index was chosen from
+curl -X DELETE -H "Authorization: Bearer $TOKEN" -H "If-Match: $CONSUMER_ETAG" \
   http://localhost:9000/consumers/{consumer_id}/credentials/keyauth/0
 
 # Delete all credentials of a type
@@ -1431,7 +1432,21 @@ and the previous configuration is kept.
 Credential rotation workflow:
 1. `POST .../credentials/keyauth` with the new key — both old and new are now active
 2. Roll out the new key to all clients
-3. `DELETE .../credentials/keyauth/0` to remove the old key
+3. `GET /consumers/{consumer_id}`, then `DELETE .../credentials/keyauth/0` with
+   that response's `ETag` as `If-Match` to remove the old key
+
+The index is a position in the array as the caller last read it, and every
+entry reads back redacted, so an index alone cannot say which credential was
+meant once another writer (another admin, a second UI tab, automation) has
+appended or removed one: an unconditional indexed delete removes whatever
+entry now sits at that position. The credential endpoints (`PUT`, `POST` and
+`DELETE` on `/consumers/{id}/credentials/{cred_type}`, and the indexed
+`DELETE`) therefore evaluate `If-Match` against the Consumer's own `ETag` from
+`GET /consumers/{id}`. The comparison runs under the namespace admission lease
+the write commits under, so any change to the Consumer since that read is
+refused with `412 Precondition Failed` and nothing is written; re-read the
+Consumer and choose the entry again. Omitting `If-Match` keeps the write
+unconditional. See [Conditional writes](#conditional-writes-etag--if-match).
 
 Max credentials per type is controlled by `FERRUM_MAX_CREDENTIALS_PER_TYPE` (default: 2).
 
@@ -1636,7 +1651,10 @@ curl -X PUT -H "Authorization: Bearer $TOKEN" -H "If-Match: $ETAG" \
   Comparison is strong, so a weak `W/"…"` tag never matches. A comma-separated list
   matches if any member does. A malformed or empty `If-Match` is `400`, never
   treated as absent. Row preconditions apply only to `PUT`/`DELETE` on the
-  four resource routes above. `POST /restore` supports the separate namespace
+  four resource routes above and to the consumer credential endpoints
+  (`PUT`/`POST`/`DELETE /consumers/{id}/credentials/{cred_type}` and
+  `DELETE /consumers/{id}/credentials/{cred_type}/{index}`), which take the
+  Consumer's tag. `POST /restore` supports the separate namespace
   precondition described below. Opt-in deployment removal and spec replacement
   use the separate [deployment authority profile](deployment_mutations.md).
   `If-Match` on any other mutating route (including

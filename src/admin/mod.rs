@@ -4800,6 +4800,7 @@ async fn handle_admin_request_inner(
             if let Some(resp) = require_admin_role(&auth, AdminRole::Admin) {
                 return Ok(resp);
             }
+            let if_match = route_if_match!();
             handle_update_credentials(
                 &state,
                 &auth,
@@ -4808,6 +4809,7 @@ async fn handle_admin_request_inner(
                 &body_bytes,
                 &namespace,
                 route_live_apply_mode!(),
+                if_match,
             )
             .await
         }
@@ -4815,6 +4817,7 @@ async fn handle_admin_request_inner(
             if let Some(resp) = require_admin_role(&auth, AdminRole::Admin) {
                 return Ok(resp);
             }
+            let if_match = route_if_match!();
             handle_append_credential(
                 &state,
                 &auth,
@@ -4823,6 +4826,7 @@ async fn handle_admin_request_inner(
                 &body_bytes,
                 &namespace,
                 route_live_apply_mode!(),
+                if_match,
             )
             .await
         }
@@ -4830,6 +4834,7 @@ async fn handle_admin_request_inner(
             if let Some(resp) = require_admin_role(&auth, AdminRole::Admin) {
                 return Ok(resp);
             }
+            let if_match = route_if_match!();
             handle_delete_credential_by_index(
                 &state,
                 &auth,
@@ -4838,6 +4843,7 @@ async fn handle_admin_request_inner(
                 index,
                 &namespace,
                 route_live_apply_mode!(),
+                if_match,
             )
             .await
         }
@@ -4845,6 +4851,7 @@ async fn handle_admin_request_inner(
             if let Some(resp) = require_admin_role(&auth, AdminRole::Admin) {
                 return Ok(resp);
             }
+            let if_match = route_if_match!();
             handle_delete_credentials(
                 &state,
                 &auth,
@@ -4852,6 +4859,7 @@ async fn handle_admin_request_inner(
                 cred_type,
                 &namespace,
                 route_live_apply_mode!(),
+                if_match,
             )
             .await
         }
@@ -7384,14 +7392,25 @@ struct PersistCounts {
 
 const DATABASE_OPERATION_FAILED_MESSAGE: &str = "Database unavailable — operation failed";
 pub(crate) const IF_MATCH_UNSUPPORTED_MESSAGE: &str = "If-Match is only supported on PUT and \
-     DELETE of /proxies/{id}, /upstreams/{id}, /consumers/{id}, /plugins/config/{id}, \
-     and POST /restore";
+     DELETE of /proxies/{id}, /upstreams/{id}, /consumers/{id}, /plugins/config/{id}, on the \
+     /consumers/{id}/credentials/{type}[/{index}] mutations, and on POST /restore";
 
 /// Routes that evaluate `If-Match` (see `preconditions`). Every other mutating
 /// route refuses the header instead of ignoring it.
 fn if_match_route(method: &Method, segments: &[&str]) -> bool {
     if method == Method::POST && segments == ["restore"] {
         return true;
+    }
+    // The credential sub-routes rewrite the whole Consumer, so they are
+    // conditioned on the Consumer's own tag (issue #7393): an index or a
+    // per-type replacement chosen from a read is only meaningful while the
+    // Consumer still has the representation that read returned.
+    match segments {
+        ["consumers", _, "credentials", _] => {
+            return matches!(*method, Method::PUT | Method::POST | Method::DELETE);
+        }
+        ["consumers", _, "credentials", _, _] => return *method == Method::DELETE,
+        _ => {}
     }
     (method == Method::PUT || method == Method::DELETE)
         && matches!(
@@ -8421,6 +8440,7 @@ fn normalize_credential_set(cred_value: Value) -> Result<Value, Box<Response<Ful
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_update_credentials(
     state: &AdminState,
     actor: &AuditActor,
@@ -8429,6 +8449,7 @@ async fn handle_update_credentials(
     body: &[u8],
     namespace: &str,
     apply_mode: LiveApplyMode,
+    if_match: Option<&preconditions::IfMatch>,
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
     let _write_permit = match state.admit_write().await {
         Ok(permit) => permit,
@@ -8476,6 +8497,11 @@ async fn handle_update_credentials(
                 Ok(consumer) => consumer,
                 Err(resp) => return *resp,
             };
+        if let Some(refusal) =
+            crud::consumer_if_match_refusal(state, if_match, consumer_id, &consumer)
+        {
+            return refusal;
+        }
         let before = consumer.clone();
         consumer
             .credentials
@@ -8550,6 +8576,7 @@ async fn handle_delete_credentials(
     cred_type: &str,
     namespace: &str,
     apply_mode: LiveApplyMode,
+    if_match: Option<&preconditions::IfMatch>,
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
     let _write_permit = match state.admit_write().await {
         Ok(permit) => permit,
@@ -8582,6 +8609,11 @@ async fn handle_delete_credentials(
                 Ok(consumer) => consumer,
                 Err(resp) => return *resp,
             };
+        if let Some(refusal) =
+            crud::consumer_if_match_refusal(state, if_match, consumer_id, &consumer)
+        {
+            return refusal;
+        }
         // Whole-Consumer PUT preserves credential types the ordinary response
         // projection hides, so this route is the only way to remove them. It
         // therefore also accepts an unknown/custom type that the Consumer
@@ -8636,6 +8668,7 @@ async fn handle_delete_credentials(
 }
 
 /// POST /consumers/:id/credentials/:type — Append a credential entry for zero-downtime rotation.
+#[allow(clippy::too_many_arguments)]
 async fn handle_append_credential(
     state: &AdminState,
     actor: &AuditActor,
@@ -8644,6 +8677,7 @@ async fn handle_append_credential(
     body: &[u8],
     namespace: &str,
     apply_mode: LiveApplyMode,
+    if_match: Option<&preconditions::IfMatch>,
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
     let _write_permit = match state.admit_write().await {
         Ok(permit) => permit,
@@ -8693,6 +8727,11 @@ async fn handle_append_credential(
                 Ok(consumer) => consumer,
                 Err(resp) => return *resp,
             };
+        if let Some(refusal) =
+            crud::consumer_if_match_refusal(state, if_match, consumer_id, &consumer)
+        {
+            return refusal;
+        }
         let before = consumer.clone();
         let new_value = match consumer.credentials.get(cred_type) {
             Some(Value::Array(arr)) => {
@@ -8791,6 +8830,13 @@ async fn handle_append_credential(
 
 /// DELETE /consumers/:id/credentials/:type/:index — Remove a specific credential entry by index.
 ///
+/// The index is a position in the array the caller last read, and every entry
+/// reads back redacted, so an index alone cannot say which credential the
+/// caller meant once another writer has appended or removed one. `If-Match`
+/// with the Consumer's `ETag` from that read pins the array: it is compared
+/// under the namespace admission lease, so a changed Consumer is refused with
+/// `412` and nothing is removed (issue #7393).
+#[allow(clippy::too_many_arguments)]
 async fn handle_delete_credential_by_index(
     state: &AdminState,
     actor: &AuditActor,
@@ -8799,6 +8845,7 @@ async fn handle_delete_credential_by_index(
     index_str: &str,
     namespace: &str,
     apply_mode: LiveApplyMode,
+    if_match: Option<&preconditions::IfMatch>,
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
     let _write_permit = match state.admit_write().await {
         Ok(permit) => permit,
@@ -8847,6 +8894,11 @@ async fn handle_delete_credential_by_index(
                 Ok(consumer) => consumer,
                 Err(resp) => return *resp,
             };
+        if let Some(refusal) =
+            crud::consumer_if_match_refusal(state, if_match, consumer_id, &consumer)
+        {
+            return refusal;
+        }
         let before = consumer.clone();
         let cred_value = match consumer.credentials.get_mut(cred_type) {
             Some(value) => value,

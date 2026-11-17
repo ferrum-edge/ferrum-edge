@@ -6534,6 +6534,7 @@ paths:
             Built-in credential type to replace. Matches runtime
             `ALLOWED_CREDENTIAL_TYPES`; any other path segment returns `400`.
         - $ref: "#/components/parameters/LiveApplyMode"
+        - $ref: "#/components/parameters/IfMatch"
       requestBody:
         required: true
         content:
@@ -6571,6 +6572,8 @@ paths:
           $ref: "#/components/responses/ReadOnly"
         "404":
           $ref: "#/components/responses/NotFound"
+        "412":
+          $ref: "#/components/responses/PreconditionFailed"
         "408":
           $ref: "#/components/responses/RequestTimeout"
         "409":
@@ -6604,6 +6607,7 @@ paths:
             Built-in credential type to append to. Matches runtime
             `ALLOWED_CREDENTIAL_TYPES`; any other path segment returns `400`.
         - $ref: "#/components/parameters/LiveApplyMode"
+        - $ref: "#/components/parameters/IfMatch"
       requestBody:
         required: true
         content:
@@ -6632,6 +6636,8 @@ paths:
           $ref: "#/components/responses/ReadOnly"
         "404":
           $ref: "#/components/responses/NotFound"
+        "412":
+          $ref: "#/components/responses/PreconditionFailed"
         "408":
           $ref: "#/components/responses/RequestTimeout"
         "409":
@@ -6671,6 +6677,7 @@ paths:
             `POST` on this path advertise only `BuiltInCredentialType`; this
             `DELETE` parameter stays the broader `CredentialTypeName`.
         - $ref: "#/components/parameters/LiveApplyMode"
+        - $ref: "#/components/parameters/IfMatch"
       responses:
         "202":
           $ref: "#/components/responses/AcceptedDeferred"
@@ -6689,6 +6696,8 @@ paths:
           $ref: "#/components/responses/ReadOnly"
         "404":
           $ref: "#/components/responses/NotFound"
+        "412":
+          $ref: "#/components/responses/PreconditionFailed"
         "409":
           $ref: "#/components/responses/Conflict"
         "503":
@@ -6724,9 +6733,22 @@ paths:
       description: |
         Removes a single credential entry at the given index. When the array
         becomes empty after removal, the credential type is removed.
+
+        The index is a position in the array as the caller last read it, and
+        every entry reads back redacted, so the index alone cannot identify a
+        credential once another writer has appended or removed one: the entry
+        now at that position would be removed instead. Send `If-Match` with the
+        Consumer's `ETag` from the `GET /consumers/{id}` the index was chosen
+        from. The tag is compared with the stored Consumer under the namespace
+        admission lease the removal commits under, so any change to the
+        Consumer since that read (including another credential write) is
+        refused with `412` and nothing is removed; re-read the Consumer and
+        choose the entry again. Omitting `If-Match` keeps the removal
+        unconditional.
       tags: [Consumers]
       parameters:
         - $ref: "#/components/parameters/LiveApplyMode"
+        - $ref: "#/components/parameters/IfMatch"
       responses:
         "202":
           $ref: "#/components/responses/AcceptedDeferred"
@@ -6749,6 +6771,8 @@ paths:
           $ref: "#/components/responses/ReadOnly"
         "404":
           $ref: "#/components/responses/NotFound"
+        "412":
+          $ref: "#/components/responses/PreconditionFailed"
         "409":
           $ref: "#/components/responses/Conflict"
         "503":
@@ -8990,10 +9014,18 @@ components:
         because all of them serialize on the namespace config admission lease
         the comparison runs under.
 
+        The `/consumers/{consumer_id}/credentials/{cred_type}` mutations
+        (`PUT`, `POST`, `DELETE`) and the indexed
+        `DELETE /consumers/{consumer_id}/credentials/{cred_type}/{index}`
+        rewrite the whole Consumer, so they take the Consumer's own `ETag`
+        from `GET /consumers/{id}`: any change to the Consumer since that read
+        refuses them with `412`.
+
         Omitting the header keeps the write unconditional. A malformed or
         empty header is `400`, never treated as absent. `If-Match` is only
         evaluated on `PUT`/`DELETE` of `/proxies/{id}`, `/upstreams/{id}`,
-        `/consumers/{id}`, and `/plugins/config/{id}`. `POST /restore` uses
+        `/consumers/{id}`, and `/plugins/config/{id}`, and on the consumer
+        credential mutations above. `POST /restore` uses
         the separate NamespaceIfMatch contract; any other `POST`,
         `PUT`, `PATCH`, or `DELETE` carrying it is refused with `400` rather
         than applied unconditionally. As RFC 9110 §13.2.1 requires, a request

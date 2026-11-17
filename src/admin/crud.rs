@@ -3342,6 +3342,20 @@ fn if_match_refusal<R: AdminResource>(
     ))
 }
 
+/// `If-Match` for the `/consumers/{id}/credentials/...` mutations, evaluated
+/// against the Consumer the credential handler read under the namespace
+/// admission lease. The tag is the Consumer's own `ETag` from
+/// `GET /consumers/{id}`, so the same tag conditions a whole-Consumer write
+/// and a credential sub-route write (issue #7393).
+pub(crate) fn consumer_if_match_refusal(
+    state: &AdminState,
+    if_match: Option<&IfMatch>,
+    consumer_id: &str,
+    consumer: &Consumer,
+) -> Option<Response<Full<Bytes>>> {
+    if_match_refusal::<Consumer>(state, if_match, consumer_id, Some(consumer))
+}
+
 /// The caller-supplied set of proxies expected to reference a plugin
 /// config, from the required `expected_proxy_ids` query parameter on
 /// `PUT`/`DELETE /plugins/config/{id}` (forge-ops issue #569).
