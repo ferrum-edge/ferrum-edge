@@ -3130,7 +3130,7 @@ impl ChargebackRegistry {
             self.dropped_charges_total.load(Ordering::Relaxed)
         ));
         output.push_str(
-            "# HELP ferrum_api_chargeback_uncollected_retained_entries Billing rows the last eviction pass kept past stale_entry_ttl_seconds because no completed /charges export has collected their current counters.\n",
+            "# HELP ferrum_api_chargeback_uncollected_retained_entries Billing rows the last eviction pass kept past stale_entry_ttl_seconds because no /charges delivery to a charges:collect-scoped collector has collected their current counters.\n",
         );
         output.push_str("# TYPE ferrum_api_chargeback_uncollected_retained_entries gauge\n");
         output.push_str(&format!(

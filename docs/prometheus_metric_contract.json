@@ -1030,7 +1030,7 @@
   {
     "name": "ferrum_api_chargeback_uncollected_retained_entries",
     "type": "gauge",
-    "help": "Billing rows the last eviction pass kept past stale_entry_ttl_seconds because no completed /charges export has collected their current counters.",
+    "help": "Billing rows the last eviction pass kept past stale_entry_ttl_seconds because no /charges delivery to a charges:collect-scoped collector has collected their current counters.",
     "labels": [],
     "subsystem": "api_chargeback",
     "export_surface": "/charges",
