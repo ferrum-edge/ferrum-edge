@@ -19743,6 +19743,9 @@ pub(crate) struct BackendWsHandshake {
     pub stream: BackendWsStream,
     pub negotiated_subprotocol: Option<hyper::header::HeaderValue>,
     pub backend_extensions: Option<hyper::header::HeaderValue>,
+    /// The backend's end-to-end handshake response headers (issue #7391),
+    /// collected with the backend-response strip. See
+    /// [`WsBackendHandshake::take_backend_response_headers`].
     pub backend_response_headers: HashMap<String, String>,
 }
 
@@ -19758,9 +19761,6 @@ pub(crate) struct MeshBackendWsHandshake {
     pub stream: MeshBackendWsStream,
     pub negotiated_subprotocol: Option<hyper::header::HeaderValue>,
     pub backend_extensions: Option<hyper::header::HeaderValue>,
-    /// The backend's end-to-end handshake response headers (issue #7391),
-    /// collected with the backend-response strip. See
-    /// [`WsBackendHandshake::take_backend_response_headers`].
     pub backend_response_headers: HashMap<String, String>,
 }
 
