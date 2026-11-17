@@ -12832,7 +12832,7 @@ pub(crate) fn collect_reqwest_response_headers(
         if connection_listed.iter().any(|n| n == k) {
             continue;
         }
-        if let Ok(val) = v.to_str() {
+        if let Some(val) = crate::proxy::backend_response_field_value_str(k, v) {
             // `get_mut(name)` borrows the key as &str — no String alloc on
             // the multi-value case. Only the insert branch allocates the
             // owned key. Matches the H1/H2 path's pattern (see CLAUDE.md).

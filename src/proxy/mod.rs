@@ -56699,6 +56699,79 @@ pub(crate) fn record_request(state: &ProxyState, status: u16) {
     record_status(state, status);
 }
 
+/// Backend response header and trailer field values dropped because they are
+/// not valid UTF-8 (GHSA-j26x-88q2-wq5m), since process start.
+static BACKEND_RESPONSE_NON_UTF8_FIELD_DROPS: AtomicU64 = AtomicU64::new(0);
+/// Monotonic millisecond stamp of the last non-UTF-8 drop warning (`0` = none).
+static BACKEND_RESPONSE_NON_UTF8_LAST_WARN_MS: AtomicU64 = AtomicU64::new(0);
+/// At most one non-UTF-8 drop warning per window, across every backend.
+const BACKEND_RESPONSE_NON_UTF8_WARN_WINDOW_MS: u64 = 60_000;
+
+/// The text form of one backend response header or trailer value, as every
+/// backend-response collector (H1/H2 reqwest and direct hyper, native gRPC
+/// headers and trailers, native H3, and the H3 cross-protocol bridge) reads it.
+///
+/// RFC 9110 §5.5 allows obs-text (0x80-0xFF) in a field value and requires a
+/// recipient to treat it as opaque data. `HeaderValue::to_str` accepts only
+/// visible ASCII, so a raw UTF-8 `Content-Disposition` filename or a `Set-Cookie`
+/// with a UTF-8 byte used to vanish from the client response
+/// (GHSA-j26x-88q2-wq5m). Any valid UTF-8 value is kept byte for byte; the
+/// downstream `HeaderValue::from_str` builders accept obs-text, so the client
+/// receives the exact bytes the backend sent.
+///
+/// A value that is not valid UTF-8 (for example ISO-8859-1 bytes) cannot be
+/// carried by the `HashMap<String, String>` response representation. It is
+/// dropped, counted ([`backend_response_non_utf8_field_drops_total`]) and
+/// reported by a rate-limited warning that names the field, never its value.
+///
+/// Allocation-free: the ASCII fast path of `str::from_utf8` costs the same scan
+/// `to_str` performed.
+#[inline]
+pub(crate) fn backend_response_field_value_str<'a>(
+    name: &http::header::HeaderName,
+    value: &'a http::header::HeaderValue,
+) -> Option<&'a str> {
+    match std::str::from_utf8(value.as_bytes()) {
+        Ok(text) => Some(text),
+        Err(_) => {
+            note_dropped_non_utf8_backend_response_field(name);
+            None
+        }
+    }
+}
+
+#[cold]
+#[inline(never)]
+fn note_dropped_non_utf8_backend_response_field(name: &http::header::HeaderName) {
+    let total = BACKEND_RESPONSE_NON_UTF8_FIELD_DROPS
+        .fetch_add(1, Ordering::Relaxed)
+        .saturating_add(1);
+    let now = crate::socket_opts::monotonic_now_ms();
+    let last = BACKEND_RESPONSE_NON_UTF8_LAST_WARN_MS.load(Ordering::Relaxed);
+    if last != 0 && now.saturating_sub(last) < BACKEND_RESPONSE_NON_UTF8_WARN_WINDOW_MS {
+        return;
+    }
+    if BACKEND_RESPONSE_NON_UTF8_LAST_WARN_MS
+        .compare_exchange(last, now.max(1), Ordering::Relaxed, Ordering::Relaxed)
+        .is_err()
+    {
+        return;
+    }
+    warn!(
+        header = %name,
+        dropped_total = total,
+        "Dropped a backend response header value that is not valid UTF-8; the gateway \
+         forwards UTF-8 obs-text but cannot carry other non-ASCII bytes (further drops \
+         in the next 60s are counted, not logged)"
+    );
+}
+
+/// Backend response header and trailer values dropped since process start
+/// because they were not valid UTF-8 (see [`backend_response_field_value_str`]).
+pub fn backend_response_non_utf8_field_drops_total() -> u64 {
+    BACKEND_RESPONSE_NON_UTF8_FIELD_DROPS.load(Ordering::Relaxed)
+}
+
 /// Collect backend response headers into a HashMap.
 ///
 /// RFC 7230 Section 3.2.2 allows folding multi-valued headers with commas,
@@ -56732,7 +56805,7 @@ fn collect_response_headers_generic<'a, I>(
         if connection_listed_strip.iter().any(|n| n == k) {
             continue;
         }
-        if let Ok(vs) = v.to_str() {
+        if let Some(vs) = backend_response_field_value_str(k, v) {
             // Determine multi-value separator before allocating the key String.
             // HeaderName comparison is zero-cost (pointer/length check on
             // pre-interned names), saving a String allocation when the header
@@ -75272,17 +75345,28 @@ mod tests {
     }
 
     #[test]
-    fn collect_response_headers_skips_invalid_utf8_values() {
+    fn collect_response_headers_keeps_utf8_obs_text_and_skips_invalid_utf8_values() {
+        // GHSA-j26x-88q2-wq5m: UTF-8 obs-text is forwarded byte for byte; only
+        // a value the string representation cannot carry is dropped.
         let mut source = reqwest::header::HeaderMap::new();
         source.insert(
             "x-non-utf8",
             HeaderValue::from_bytes(&[0x80, 0x81]).expect("valid raw header value"),
+        );
+        source.insert(
+            "content-disposition",
+            HeaderValue::from_bytes("attachment; filename=\"résumé.pdf\"".as_bytes())
+                .expect("valid obs-text header value"),
         );
 
         let mut target = HashMap::new();
         collect_response_headers(&source, &mut target);
 
         assert!(!target.contains_key("x-non-utf8"));
+        assert_eq!(
+            target.get("content-disposition").map(String::as_str),
+            Some("attachment; filename=\"résumé.pdf\"")
+        );
     }
 
     #[test]

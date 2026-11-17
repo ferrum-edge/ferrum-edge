@@ -6931,7 +6931,7 @@ pub(crate) fn collect_buffered_grpc_trailers(
         if is_backend_response_strip_header(k.as_str()) {
             continue;
         }
-        if let Ok(vs) = v.to_str() {
+        if let Some(vs) = super::backend_response_field_value_str(k, v) {
             // Preserve gRPC duplicate metadata semantics: HeaderMap yields each
             // value separately, and the string-map representation joins them
             // with newlines (same convention as multi-value Set-Cookie) so the

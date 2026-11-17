@@ -488,6 +488,19 @@ framing.
 
 Request-direction header rules and synthetic responses add their own restrictions; each plugin's section lists them.
 
+### Non-ASCII backend response header values
+
+Response hooks see backend response headers and trailers as text. RFC 9110
+§5.5 allows obs-text (bytes `0x80`-`0xFF`) in a field value, and every backend
+response collector (HTTP/1.1 and HTTP/2 through reqwest or the direct pools,
+native gRPC headers and trailers, native HTTP/3, the HTTP/3 cross-protocol
+bridge, and the WebSocket handshake response) keeps any value that is valid
+UTF-8 byte for byte, so a UTF-8 `Content-Disposition` filename or `Set-Cookie`
+reaches HTTP/1.1, HTTP/2 and HTTP/3 clients unchanged (GHSA-j26x-88q2-wq5m). A
+value that is not valid UTF-8 (for example ISO-8859-1 bytes) cannot be carried
+and is dropped. Each drop is counted, and a rate-limited warning (at most one
+per minute) names the field and the running total, never the value.
+
 ## Plugin HTTP calls and the proxy hop limit
 
 An HTTP call a plugin makes on behalf of the current request carries the request's gateway hop count in `X-Ferrum-Hops` (`received + 1`, the same value the proxied request carries), so a plugin target that resolves back to a Ferrum gateway is refused with `508 Loop Detected` at the same `FERRUM_MAX_PROXY_HOPS` limit as a looping route (see [Proxy hop limit](routing.md#proxy-hop-limit)). Every such call goes through one shared helper, `proxy::hop_limit::stamp_plugin_call_proxy_hops`, which adds exactly one field line from a pre-built static value. With `FERRUM_MAX_PROXY_HOPS=0` nothing is stamped.
