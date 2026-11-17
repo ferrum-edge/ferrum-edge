@@ -882,7 +882,13 @@ An exemption with no `paths`/`methods`/`ips`/`consumers` exempts nothing.
   canonical (a percent escape, a `\`, a `.`/`..` segment, or `//`) is rejected
   at construction rather than silently exempting nothing; `~regex` entries are
   not checked this way.
-- `methods`, `consumers`, `ips` (CIDR)
+- `methods`, `consumers`, `ips` (CIDR). `consumers` lists **mapped Consumer
+  usernames**: an unmapped external identity (a `jwks_auth` subject, an LDAP
+  login, ...) never matches, even one that spells a listed username, so a
+  self-registered IdP user named like an exempted Consumer is still scanned.
+  To exempt an external principal, gate the WAF instance with an execution
+  trigger such as `not: {all: [{match: {external_identity: ...}}, {match:
+  {auth_method: [jwks_auth]}}]}`.
 - `header_present` — suppress every rule, and every disposition that would
   otherwise refuse (`fail_closed` and `block` for `on_body_too_large`,
   `on_unlisted_content_type`, `on_unlisted_response_content_type`, and
@@ -894,7 +900,7 @@ An exemption with no `paths`/`methods`/`ips`/`consumers` exempts nothing.
   gateway inject it (and strip any client copy), and rotate it like any other
   credential; the header is still forwarded to the backend. Ferrum's own
   `request_transformer` runs in `before_proxy`, after the WAF has decided, so
-  it cannot inject it. Exempting authenticated callers via `consumers` is
+  it cannot inject it. Exempting authenticated Consumers via `consumers` is
   usually the better tool. Per-rule `conditions.headers` keeps plain value
   matching, so scope rules on client-controlled headers with the same care.
 - `fp_capture_filters` — suppress any matched value matching these patterns
@@ -943,7 +949,7 @@ suppresses the hit while an ordinary `<script>…</script>` payload still blocks
 | `score` | integer | severity weight | Anomaly-score contribution when `scoring` is enabled. |
 | `fp_filters` | string[] | `[]` | Unanchored regex filters evaluated against the complete inspected target value after a rule match; if any filter matches anywhere in that value, the hit is suppressed. For `body_json_path`, this is the selected JSON scalar's string form, not only the matched substring. A body containing non-UTF-8 bytes is filtered against its lossy text view (invalid bytes become `U+FFFD`), so binary content is filtered on the same terms as text. |
 | `paranoia_min` | u8 | `1` | Minimum paranoia level required for this rule. |
-| `conditions` | object | `{}` | Optional request conditions: `paths`, `methods`, `headers`, and `consumers`. Path entries share exact-match and trailing-`*` prefix forms with `global_exemptions.paths`, but `~regex` anchoring differs: rule `conditions.paths` compile the text after `~` as an operator-authored, unanchored regex evaluated with Rust regex `is_match`, so they may match anywhere in the path unless the pattern itself is anchored (for example `~^/admin(?:/|$)`). A floating match such as `~api` therefore matches both `/api/users` and `/v1/api-keys`. Exact and prefix forms are unchanged and are not regex-anchored. |
+| `conditions` | object | `{}` | Optional request conditions: `paths`, `methods`, `headers`, and `consumers` (mapped Consumer usernames only; an unmapped external identity never matches). Path entries share exact-match and trailing-`*` prefix forms with `global_exemptions.paths`, but `~regex` anchoring differs: rule `conditions.paths` compile the text after `~` as an operator-authored, unanchored regex evaluated with Rust regex `is_match`, so they may match anywhere in the path unless the pattern itself is anchored (for example `~^/admin(?:/|$)`). A floating match such as `~api` therefore matches both `/api/users` and `/v1/api-keys`. Exact and prefix forms are unchanged and are not regex-anchored. |
 
 The `url_path` / `full_url` targets, `conditions.paths`, and
 `global_exemptions.paths` all evaluate the **canonical policy path**, derived

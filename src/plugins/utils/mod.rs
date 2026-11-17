@@ -42,6 +42,7 @@ pub mod oauth_client_auth;
 pub mod openai_error;
 pub mod plugin_secret_env;
 pub mod policy_digest;
+pub mod principal;
 pub mod query;
 pub mod rate_limit;
 pub mod redis_rate_limiter;

@@ -32,6 +32,7 @@
 //! rather than being charged zero tokens against a budget.
 
 use crate::plugins::utils::log_sampling::warn_sampled;
+use crate::plugins::utils::principal::{self, Principal};
 use crate::util::json_dup_keys;
 
 use async_trait::async_trait;
@@ -770,13 +771,13 @@ impl AiRateLimiter {
     }
 
     fn rate_key(&self, ctx: &RequestContext) -> String {
+        // A mapped Consumer (`consumer:`) and an unmapped external principal
+        // (`external:`, keyed with its realm) never share a token window
+        // (GHSA-rxwj-x6c6-f4j5).
         if self.limit_by == "consumer"
-            && let Some(identity) = ctx.effective_identity()
+            && let Some(principal) = Principal::of_request(ctx)
         {
-            let mut key = String::with_capacity(identity.len() + 9);
-            key.push_str("consumer:");
-            key.push_str(identity);
-            return key;
+            return principal.key();
         }
 
         let ip = crate::util::client_identity::rate_limit_client_ip_string(&ctx.client_ip, 64)
@@ -843,10 +844,11 @@ impl AiRateLimiter {
     /// The ceiling of this request's default (non-model) window: its
     /// consumer's `consumer_limits` override, else `token_limit`.
     fn default_limit(&self, ctx: &RequestContext) -> u64 {
+        // `consumer_limits` names mapped Consumers only.
         if self.limit_by == "consumer"
             && !self.consumer_limits.is_empty()
-            && let Some(identity) = ctx.effective_identity()
-            && let Some(limit) = self.consumer_limits.get(identity)
+            && let Some(username) = principal::consumer_username(ctx)
+            && let Some(limit) = self.consumer_limits.get(username)
         {
             return *limit;
         }

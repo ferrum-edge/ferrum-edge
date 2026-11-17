@@ -1371,7 +1371,8 @@ Available `match` predicates:
 | `source_cidr` | gateway-resolved client IP | exact address or CIDR; IPv4-mapped IPv6 normalized |
 | `namespace` / `proxy_id` | matched proxy identity | list is an OR |
 | `listen_port` | accepting frontend port | list is an OR |
-| `consumer` | authenticated consumer / external identity | **post-authentication only**; never gates a stream connection; refused on auth and stream-only plugins |
+| `consumer` | mapped gateway Consumer username only (never an unmapped external identity that spells the same string) | **post-authentication only**; never gates a stream connection; refused on auth and stream-only plugins |
+| `external_identity` | unmapped external identity, only when no Consumer is mapped (combine with `auth_method` under `all` to scope it to one mechanism) | same as `consumer` |
 | `auth_method` | successful mechanism name | **post-authentication only**; never gates a stream connection; refused on auth and stream-only plugins |
 | `spiffe_id` | peer SPIFFE ID | **post-authentication only**; no authoritative stream fact, so it never gates a stream connection; refused on auth and stream-only plugins |
 
@@ -1452,7 +1453,7 @@ phase of that instance reuses it. This is what makes a skip *symmetric*: a
 from "skipped its request hooks" to "runs its response hooks", which would leave
 half-initialized plugin state behind.
 
-Identity predicates (`consumer`, `auth_method`, `spiffe_id`) are not
+Identity predicates (`consumer`, `external_identity`, `auth_method`, `spiffe_id`) are not
 authoritative before the authentication boundary. A trigger that uses them
 therefore **does not gate** hooks at or before `authenticate` — the instance runs
 and no decision is memoized, so the first `authorize`-or-later hook makes the
@@ -1615,7 +1616,7 @@ a trigger, so a skipped instance would still see the override applied while its
 request-conditional trailer policy stood down; such a trigger is refused.
 
 An **authentication** plugin may not carry an identity predicate: `authenticate`
-is the phase that establishes `consumer` / `auth_method` / `spiffe_id`, so such a
+is the phase that establishes `consumer` / `external_identity` / `auth_method` / `spiffe_id`, so such a
 trigger could only read another mechanism's committed identity and would make the
 effective auth chain order-dependent. That composition is rejected at
 publication, as is an identity predicate on a **stream-only** plugin (see
@@ -1976,11 +1977,11 @@ After all plugin phases complete, the gateway injects `X-Consumer-Username` (and
 
 ### Rate limiting runs after auth (priority 2900)
 
-Rate limiting sits late in the Admission band (priority 2900) so it can enforce limits by **authenticated identity**, not just by IP address. When `limit_by: "consumer"`, the plugin uses the mapped Consumer username when available, otherwise external `ctx.authenticated_identity`; those values only exist after the authenticate phase. When `limit_by: "spiffe_identity"`, the plugin uses `ctx.peer_spiffe_id`, populated earlier by the `spiffe_identity` plugin.
+Rate limiting sits late in the Admission band (priority 2900) so it can enforce limits by **authenticated identity**, not just by IP address. When `limit_by: "consumer"`, the plugin keys a mapped Consumer by username and an unmapped external `ctx.authenticated_identity` by a separate realm-scoped key; those values only exist after the authenticate phase. When `limit_by: "spiffe_identity"`, the plugin uses `ctx.peer_spiffe_id`, populated earlier by the `spiffe_identity` plugin.
 
 **Dual-phase behavior:**
 - `limit_by: "ip"` — enforces IP-based limits in `on_request_received` (phase 1, before auth). This protects auth endpoints from brute-force attacks.
-- `limit_by: "consumer"` — enforces identity-based limits in `authorize` (phase 3, after auth). Uses mapped Consumer username first, then external `authenticated_identity`, and falls back to IP-based keying only when no authenticated identity exists. `limits` must include one `scope: "default"` rule for generic consumers/IP fallback, and may include `scope: "consumers"` rules that share a configured limit/window template across named identities. Each effective identity has its own counter; the configured window is not a pooled budget.
+- `limit_by: "consumer"` — enforces identity-based limits in `authorize` (phase 3, after auth). Keys a mapped Consumer as `consumer:<username>` and an unmapped external `authenticated_identity` as `external:<mechanism>:<authority>:<identity>` (the two never share a counter), and falls back to IP-based keying only when no authenticated identity exists. `scope: "consumers"` rules match mapped Consumer usernames only. `limits` must include one `scope: "default"` rule for generic consumers/IP fallback, and may include `scope: "consumers"` rules that share a configured limit/window template across named identities. Each effective identity has its own counter; the configured window is not a pooled budget.
 - `limit_by: "spiffe_identity"` — enforces SPIFFE-based limits in `authorize` (phase 3, after `spiffe_identity`). Uses the peer SPIFFE URI and falls back to IP-based keying when no SPIFFE identity exists. The shorter alias `spiffe` is accepted.
 
 **Header exposure** (`expose_headers: true`): When enabled, the plugin injects `x-ratelimit-limit`, `x-ratelimit-remaining`, and `x-ratelimit-window` headers on both upstream requests (`before_proxy`) and downstream responses (`after_proxy`). This lets backends and clients see current rate-limit state without additional lookups. Disabled by default so gateway admins control whether limit details are exposed. The limiter key/identity is deliberately never injected as a header: for `limit_by: "consumer"`/`"spiffe_identity"` it would disclose the gateway's internal notion of the caller identity (consumer username) or the peer workload SVID to the downstream client.

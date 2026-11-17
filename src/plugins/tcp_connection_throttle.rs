@@ -18,6 +18,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use super::utils::principal::Principal;
 use super::{Plugin, PluginResult, StreamAdmissionPermit, StreamConnectionContext};
 
 /// Default IPv6 grouping for anonymous (IP-keyed) budgets: one `/64` is the
@@ -164,15 +165,16 @@ impl TcpConnectionThrottle {
             ctx.proxy_namespace.as_str(),
             ctx.proxy_id.as_str(),
         );
-        match ctx.effective_identity() {
-            Some(identity) => {
-                let mut key = String::with_capacity(
-                    "proxy::consumer:".len() + proxy_key.len() + identity.len(),
-                );
+        // A mapped Consumer (`consumer:`) and an unmapped external principal
+        // (`external:`) never share a live-connection budget
+        // (GHSA-rxwj-x6c6-f4j5).
+        match Principal::of_stream(ctx) {
+            Some(principal) => {
+                let mut key = String::with_capacity("proxy::".len() + proxy_key.len() + 64);
                 key.push_str("proxy:");
                 key.push_str(&proxy_key);
-                key.push_str(":consumer:");
-                key.push_str(identity);
+                key.push(':');
+                principal.push_key(&mut key);
                 key
             }
             None => {

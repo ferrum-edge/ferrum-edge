@@ -4,6 +4,7 @@ use std::collections::{HashMap, HashSet};
 
 use crate::plugins::RequestContext;
 use crate::plugins::utils::auth_flow::constant_time_eq;
+use crate::plugins::utils::principal;
 use crate::util::unknown_keys::reject_unknown_keys;
 
 use super::config_values::optional_string_vec_in;
@@ -174,9 +175,12 @@ impl CompiledExemptions {
                 ctx.canonical_client_ip()
                     .is_some_and(|client_ip| self.ips.iter().any(|cidr| cidr.matches(client_ip)))
             }),
+            // Consumer usernames name mapped Consumers only: an unmapped
+            // external principal whose identity string equals a listed
+            // username is not that Consumer (GHSA-rxwj-x6c6-f4j5).
             (!self.consumers.is_empty()).then(|| {
-                ctx.effective_identity()
-                    .is_some_and(|identity| self.consumers.contains(identity))
+                principal::consumer_username(ctx)
+                    .is_some_and(|username| self.consumers.contains(username))
             }),
         ];
         let mut configured = criteria.into_iter().flatten();

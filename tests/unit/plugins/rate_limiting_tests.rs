@@ -3517,3 +3517,76 @@ async fn max_state_entries_bounds_distinct_local_keys() {
     }));
     assert!(RateLimiting::new(&config, PluginHttpClient::default()).is_ok());
 }
+
+/// GHSA-rxwj-x6c6-f4j5: with `limit_by: consumer`, an unmapped external
+/// identity that spells a Consumer's username neither inherits that
+/// Consumer's `scope: consumers` override nor spends its bucket, and two
+/// realms that issue the same subject keep separate buckets.
+#[tokio::test]
+async fn external_identity_never_shares_a_consumer_bucket_or_override() {
+    let plugin = make_rate_limiter(json!({
+        "limit_by": "consumer",
+        "limits": [
+            { "scope": "default", "window_seconds": 60, "max_requests": 1 },
+            { "scope": "consumers", "consumers": ["security-scanner"], "window_seconds": 60, "max_requests": 3 }
+        ]
+    }));
+
+    // The jwks_auth principal is held to the default rule, not the override.
+    let mut jwks =
+        super::plugin_utils::committed_external_identity_context("security-scanner", "jwks_auth");
+    assert_continue(plugin.authorize(&mut jwks).await);
+    let mut jwks_again =
+        super::plugin_utils::committed_external_identity_context("security-scanner", "jwks_auth");
+    assert_reject(plugin.authorize(&mut jwks_again).await, Some(429));
+
+    // The same subject from another realm has its own bucket.
+    let mut ldap =
+        super::plugin_utils::committed_external_identity_context("security-scanner", "ldap_auth");
+    assert_continue(plugin.authorize(&mut ldap).await);
+
+    // The mapped Consumer keeps its whole override budget: the external
+    // principals spent none of it.
+    for _ in 0..3 {
+        let mut scanner = super::plugin_utils::consumer_context("security-scanner");
+        assert_continue(plugin.authorize(&mut scanner).await);
+    }
+    let mut scanner_over = super::plugin_utils::consumer_context("security-scanner");
+    assert_reject(plugin.authorize(&mut scanner_over).await, Some(429));
+}
+
+/// The namespaced key layout behind the separation above.
+#[test]
+fn principal_keys_separate_consumers_external_identities_and_realms() {
+    use ferrum_edge::plugins::utils::principal::Principal;
+
+    let consumer = super::plugin_utils::consumer_context("alice");
+    let jwks = super::plugin_utils::committed_external_identity_context("alice", "jwks_auth");
+    let ldap = super::plugin_utils::committed_external_identity_context("alice", "ldap_auth");
+
+    let consumer_key = Principal::of_request(&consumer).expect("consumer").key();
+    let jwks_key = Principal::of_request(&jwks).expect("jwks").key();
+    let ldap_key = Principal::of_request(&ldap).expect("ldap").key();
+    assert_eq!(consumer_key, "consumer:alice");
+    assert!(jwks_key.starts_with("external:jwks_auth:"), "{jwks_key}");
+    assert!(jwks_key.ends_with(":alice"), "{jwks_key}");
+    assert_ne!(consumer_key, jwks_key);
+    assert_ne!(jwks_key, ldap_key);
+
+    // An unmapped identity without a committed realm is still never a
+    // Consumer key.
+    let mut bare = create_test_context();
+    bare.identified_consumer = None;
+    bare.authenticated_identity = Some("alice".to_string());
+    assert_eq!(
+        Principal::of_request(&bare).expect("bare").key(),
+        "external:-:-:alice"
+    );
+    // A Consumer always wins over a stale external identity.
+    let mut both = super::plugin_utils::consumer_context("bob");
+    both.authenticated_identity = Some("alice".to_string());
+    assert_eq!(
+        Principal::of_request(&both).expect("both").key(),
+        "consumer:bob"
+    );
+}

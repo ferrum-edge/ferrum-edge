@@ -10408,3 +10408,64 @@ async fn a_duplicated_model_member_cannot_select_a_model_budget() {
     assert!(has_scoped_meta(&ctx, "ai_ratelimit_request"));
     assert!(has_scoped_meta(&ctx, "ai_ratelimit_compressed_ai_request"));
 }
+
+// ─── GHSA-rxwj-x6c6-f4j5: Consumer vs external identity ─────────────────
+
+/// `consumer_limits` names mapped Consumers only, and `limit_by: consumer`
+/// keeps an external identity that spells a Consumer's username on its own
+/// window.
+#[tokio::test]
+async fn consumer_limits_and_windows_never_apply_to_an_external_identity() {
+    let plugin = AiRateLimiter::new(
+        &json!({
+            "token_limit": 1000,
+            "window_seconds": 60,
+            "limit_by": "consumer",
+            "consumer_limits": {"testuser": 50},
+            "expose_headers": true
+        }),
+        PluginHttpClient::default(),
+    )
+    .unwrap();
+
+    // The mapped Consumer `testuser` spends its 50-token override.
+    let mut consumer = ai_request_ctx(10, "hi");
+    assert_continue(
+        plugin
+            .before_proxy(&mut consumer, &mut HashMap::new())
+            .await,
+    );
+    assert_eq!(
+        scoped_meta(&consumer, "ai_ratelimit_limit").map(String::as_str),
+        Some("50")
+    );
+    assert_continue(
+        plugin
+            .on_response_body(
+                &mut consumer,
+                200,
+                &mut json_headers(),
+                &openai_response(30, 20),
+            )
+            .await,
+    );
+
+    // A jwks_auth principal named `testuser` gets neither the override nor the
+    // Consumer's exhausted window.
+    let mut external = ai_request_ctx(10, "hi");
+    super::plugin_utils::commit_external_identity(&mut external, "testuser", "jwks_auth");
+    assert_continue(
+        plugin
+            .before_proxy(&mut external, &mut HashMap::new())
+            .await,
+    );
+    assert_eq!(
+        scoped_meta(&external, "ai_ratelimit_limit").map(String::as_str),
+        Some("1000")
+    );
+    assert_eq!(
+        scoped_meta(&external, "ai_ratelimit_usage"),
+        scoped_meta(&external, "ai_ratelimit_reserved_tokens"),
+        "the external window holds only this call's reservation"
+    );
+}

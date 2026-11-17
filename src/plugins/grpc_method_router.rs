@@ -10,10 +10,10 @@
 //!   from that finalized method for downstream response phases
 
 use crate::plugins::utils::log_sampling::warn_sampled;
+use crate::plugins::utils::principal::Principal;
 
 use async_trait::async_trait;
 use serde_json::Value;
-use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -543,35 +543,32 @@ impl GrpcMethodRouter {
 
     /// Build the rate limit key based on `limit_by` config.
     ///
-    /// When `limit_by: "consumer"`, uses the identified consumer's username,
-    /// falling back to `authenticated_identity` (for external auth like JWKS
-    /// where no gateway Consumer exists), then to client IP.
-    ///
-    /// The identity is tagged `consumer:` or `ip:` (as in `rate_limiting`) so an
-    /// identity string that equals an IP never shares a budget with the
-    /// unauthenticated caller at that IP.
+    /// When `limit_by: "consumer"`, keys a mapped Consumer as
+    /// `consumer:<username>` and an unmapped external principal (JWKS and
+    /// other external auth) as `external:<realm>:<identity>`, so the two
+    /// namespaces and two realms never share a budget (GHSA-rxwj-x6c6-f4j5);
+    /// an anonymous caller falls back to `ip:`, so an identity string that
+    /// equals an IP never shares a budget with the unauthenticated caller at
+    /// that IP.
     ///
     /// `rule` is the matched rule's [`RateSpec::rule`], so an exact rule keeps
     /// its per-method key and service/default rules pool per caller.
     fn rate_key(&self, ctx: &RequestContext, rule: &str) -> String {
-        let (kind, identity) = match (self.limit_by == "consumer")
-            .then(|| ctx.effective_identity())
-            .flatten()
-        {
-            Some(identity) => ("consumer:", Cow::Borrowed(identity)),
-            None => (
-                "ip:",
-                Cow::Owned(
-                    crate::util::client_identity::rate_limit_client_ip_string(&ctx.client_ip, 64)
-                        .unwrap_or_else(|| ctx.client_ip.clone()),
-                ),
-            ),
-        };
-        let mut key =
-            String::with_capacity("grpc_method::".len() + kind.len() + identity.len() + rule.len());
+        let principal = (self.limit_by == "consumer")
+            .then(|| Principal::of_request(ctx))
+            .flatten();
+        let mut key = String::with_capacity("grpc_method::".len() + rule.len() + 64);
         key.push_str("grpc_method:");
-        key.push_str(kind);
-        key.push_str(&identity);
+        match principal {
+            Some(principal) => principal.push_key(&mut key),
+            None => {
+                key.push_str("ip:");
+                key.push_str(
+                    &crate::util::client_identity::rate_limit_client_ip_string(&ctx.client_ip, 64)
+                        .unwrap_or_else(|| ctx.client_ip.clone()),
+                );
+            }
+        }
         key.push(':');
         key.push_str(rule);
         key

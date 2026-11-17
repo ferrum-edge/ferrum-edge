@@ -10543,3 +10543,48 @@ async fn gateway_zstd_compression_output_passes_response_validation() {
             .await,
     );
 }
+
+/// GHSA-rxwj-x6c6-f4j5: `bypass.consumers` names mapped Consumers only. An
+/// external principal whose identity equals a bypassed Consumer's username is
+/// still validated.
+#[tokio::test]
+async fn bypass_consumers_match_mapped_consumers_only() {
+    let config = json!({
+        "schema_draft": "draft7",
+        "bypass": {"consumers": ["security-scanner"]},
+        "operations": [{
+            "method": "POST",
+            "path_template": "/items",
+            "path_regex": "^/items$",
+            "request_body": {"content": {"application/json": {"type": "object"}}}
+        }]
+    });
+    let plugin = OpenapiValidator::new(&config).unwrap();
+    let into_post = |mut ctx: RequestContext| {
+        ctx.method = "POST".to_string();
+        ctx.path = "/items".to_string();
+        ctx.headers = json_headers();
+        ctx
+    };
+
+    let external = into_post(super::plugin_utils::committed_external_identity_context(
+        "security-scanner",
+        "jwks_auth",
+    ));
+    assert!(
+        plugin.should_buffer_request_body(&external),
+        "an external identity must not inherit a Consumer bypass"
+    );
+
+    let mut consumer = into_post(super::plugin_utils::consumer_context("security-scanner"));
+    assert!(!plugin.should_buffer_request_body(&consumer));
+    let mut headers = consumer.headers.clone();
+    assert_continue(plugin.before_proxy(&mut consumer, &mut headers).await);
+    assert_eq!(
+        consumer
+            .metadata
+            .get("openapi_validator.skip_reason")
+            .map(String::as_str),
+        Some("bypass_consumer")
+    );
+}

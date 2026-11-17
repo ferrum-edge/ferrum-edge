@@ -22,8 +22,8 @@
 //!
 //! # Phase safety
 //!
-//! A trigger that reads authenticated identity (`consumer`, `auth_method`,
-//! `spiffe_id`) is not authoritative before the authentication boundary. Such a
+//! A trigger that reads authenticated identity (`consumer`, `external_identity`,
+//! `auth_method`, `spiffe_id`) is not authoritative before the authentication boundary. Such a
 //! trigger simply **does not gate** hooks at or before `authenticate`
 //! ([`TriggerPhase::PreAuth`]): the instance runs, and no decision is memoized,
 //! so the first `authorize`-or-later hook makes the real decision. Failing
@@ -87,6 +87,7 @@ use crate::config::plugin_trigger::{
     CompiledPluginTrigger, FieldVisitor, PluginTrigger, PluginTriggerProtocol, TriggerFacts,
 };
 use crate::config::types::{HttpFlavor, HttpWireTransport};
+use crate::plugins::utils::principal;
 use crate::plugins::{
     RequestContext, StreamConnectionContext, StreamFrontendTransport, StreamTransactionSummary,
     StreamTriggerDecisions, TransactionSummary,
@@ -509,12 +510,15 @@ impl TriggerFacts for HttpTriggerFacts<'_> {
         self.ctx.frontend_listen_port
     }
 
+    /// The mapped Consumer only: a `consumer` predicate never matches an
+    /// unmapped external identity that spells the same string
+    /// (GHSA-rxwj-x6c6-f4j5).
     fn consumer_identity(&self) -> Option<&str> {
-        self.ctx
-            .identified_consumer
-            .as_ref()
-            .map(|consumer| consumer.username.as_str())
-            .or(self.ctx.authenticated_identity.as_deref())
+        principal::consumer_username(self.ctx)
+    }
+
+    fn external_identity(&self) -> Option<&str> {
+        principal::external_identity(self.ctx)
     }
 
     fn auth_method(&self) -> Option<&str> {
@@ -759,7 +763,11 @@ impl TriggerFacts for StreamTriggerFacts<'_> {
     // rather than a second, divergent definition of stream identity.
 
     fn consumer_identity(&self) -> Option<&str> {
-        self.ctx.effective_identity()
+        principal::stream_consumer_username(self.ctx)
+    }
+
+    fn external_identity(&self) -> Option<&str> {
+        principal::stream_external_identity(self.ctx)
     }
 
     fn auth_method(&self) -> Option<&str> {

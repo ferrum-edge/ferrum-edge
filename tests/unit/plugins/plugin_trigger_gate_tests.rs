@@ -590,7 +590,7 @@ async fn an_identity_predicate_does_not_gate_hooks_before_authentication() {
             vec![make_proxy("api", "/api", vec!["stamp"])],
             vec![with_trigger(
                 header_stamper("stamp", PluginScope::Proxy, Some("api"), "x-stamp"),
-                json!({"when": {"match": {"consumer": {"value": {"exact": ["alice"]}}}}}),
+                json!({"when": {"match": {"external_identity": {"value": {"exact": ["alice"]}}}}}),
             )],
         ),
         "api",
@@ -2099,4 +2099,66 @@ async fn an_encoded_semicolon_is_accepted_and_read_as_a_literal() {
             .map(String::as_str),
         Some("1")
     );
+}
+
+// ---------------------------------------------------------------------------
+// Consumer vs external identity (GHSA-rxwj-x6c6-f4j5)
+// ---------------------------------------------------------------------------
+
+/// `consumer` matches only a mapped Consumer and `external_identity` only an
+/// unmapped external principal, so `not: {consumer: [x]}` on a guard is never
+/// skipped for an external principal that spells `x`.
+#[tokio::test]
+async fn consumer_and_external_identity_predicates_never_cross_namespaces() {
+    let consumer_gated = published(
+        &config(
+            vec![make_proxy("api", "/api", vec!["stamp"])],
+            vec![with_trigger(
+                header_stamper("stamp", PluginScope::Proxy, Some("api"), "x-stamp"),
+                json!({"when": {"not": {"match": {"consumer": {"value": {"exact": ["internal-scanner"]}}}}}}),
+            )],
+        ),
+        "api",
+    );
+    let external_gated = published(
+        &config(
+            vec![make_proxy("api", "/api", vec!["stamp"])],
+            vec![with_trigger(
+                header_stamper("stamp", PluginScope::Proxy, Some("api"), "x-stamp"),
+                json!({"when": {"match": {"external_identity": {"value": {"exact": ["internal-scanner"]}}}}}),
+            )],
+        ),
+        "api",
+    );
+
+    let mut scanner_consumer = super::plugin_utils::create_test_consumer();
+    scanner_consumer.username = "internal-scanner".to_string();
+    let with_consumer = || {
+        let mut ctx = request("GET", "/api");
+        ctx.identified_consumer = Some(Arc::new(scanner_consumer.clone()));
+        ctx
+    };
+    let with_external = || {
+        let mut ctx = request("GET", "/api");
+        ctx.authenticated_identity = Some("internal-scanner".to_string());
+        ctx
+    };
+
+    async fn stamped(plugins: &[Arc<dyn Plugin>], mut ctx: RequestContext) -> bool {
+        let mut headers = HashMap::new();
+        for plugin in plugins {
+            plugin.before_proxy(&mut ctx, &mut headers).await;
+        }
+        headers.contains_key("x-stamp")
+    }
+
+    // The Consumer exemption skips the mapped Consumer only.
+    assert!(!stamped(&consumer_gated, with_consumer()).await);
+    assert!(
+        stamped(&consumer_gated, with_external()).await,
+        "an external identity spelling the Consumer name must not be exempt"
+    );
+    // The external predicate selects the external principal only.
+    assert!(stamped(&external_gated, with_external()).await);
+    assert!(!stamped(&external_gated, with_consumer()).await);
 }

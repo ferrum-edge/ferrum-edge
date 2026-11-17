@@ -1312,7 +1312,7 @@ pub(crate) fn validate_plugin_security_composition(
 ///   the override applied while its request-conditional trailer policy
 ///   answered "not governed", forwarding a trailer a route `remove` targets.
 /// * **An identity-reading trigger on an authentication plugin.** `authenticate`
-///   is the phase that establishes `consumer` / `auth_method` / `spiffe_id`, so
+///   is the phase that establishes `consumer` / `external_identity` / `auth_method` / `spiffe_id`, so
 ///   such a trigger could only ever read another mechanism's committed identity,
 ///   which makes the effective auth chain order-dependent.
 /// * **An identity-reading trigger on a STREAM-ONLY plugin.** The stream
@@ -1371,12 +1371,12 @@ fn trigger_composition_error(
     }
     if gate.reads_authenticated_identity() && plugin.is_auth_plugin() {
         return Some(
-            "an authentication plugin cannot be gated on `consumer` / `auth_method` / `spiffe_id`, which its own phase establishes",
+            "an authentication plugin cannot be gated on `consumer` / `external_identity` / `auth_method` / `spiffe_id`, which its own phase establishes",
         );
     }
     if gate.reads_authenticated_identity() && is_stream_only_plugin(plugin) {
         return Some(
-            "a stream-only plugin cannot be gated on `consumer` / `auth_method` / `spiffe_id`: the only gated phase of a stream connection is `on_stream_connect`, which is also where stream authentication runs, so an identity predicate never gates one — and a stream connection carries no authoritative peer SPIFFE fact at all",
+            "a stream-only plugin cannot be gated on `consumer` / `external_identity` / `auth_method` / `spiffe_id`: the only gated phase of a stream connection is `on_stream_connect`, which is also where stream authentication runs, so an identity predicate never gates one — and a stream connection carries no authoritative peer SPIFFE fact at all",
         );
     }
     None

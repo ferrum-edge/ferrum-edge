@@ -17,6 +17,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use super::utils::mcp_jsonrpc::{self, RequestScan};
+use super::utils::principal::{self, Principal};
 use super::utils::rate_limit::{
     DynamicHttpRateLimitAlgorithm, DynamicRateLimitOp, ENFORCEMENT_UNAVAILABLE_BODY,
     ENFORCEMENT_UNAVAILABLE_STATUS, LocalStateSemantics, RATE_LIMIT_REDIS_CONFIG_KEYS,
@@ -263,7 +264,7 @@ impl LimitBy {
 
 /// The single key every caller of a `limit_by: service` policy charges.
 ///
-/// It cannot equal any per-caller key (`ip:` / `consumer:` / `spiffe:` /
+/// It cannot equal any per-caller key (`ip:` / `consumer:` / `external:` / `spiffe:` /
 /// `tool:<len>:` all carry a colon-terminated prefix this lacks), and the
 /// policy's own local state and default Redis prefix already isolate it from
 /// every other policy, so one constant is enough.
@@ -710,9 +711,12 @@ impl RateLimiting {
 
     fn request_key(&self, ctx: &RequestContext) -> String {
         match self.limit_by {
+            // A mapped Consumer and an unmapped external principal never share
+            // a bucket, and neither do two realms that issue the same subject
+            // (GHSA-rxwj-x6c6-f4j5).
             LimitBy::Consumer => {
-                if let Some(identity) = ctx.effective_identity() {
-                    return prefixed_key("consumer:", identity);
+                if let Some(principal) = Principal::of_request(ctx) {
+                    return principal.key();
                 }
             }
             LimitBy::SpiffeIdentity => {
@@ -728,9 +732,10 @@ impl RateLimiting {
     }
 
     fn request_limit_op(&self, ctx: &RequestContext) -> &DynamicRateLimitOp {
+        // `scope: consumers` overrides name mapped Consumers only.
         if self.limit_by == LimitBy::Consumer
-            && let Some(identity) = ctx.effective_identity()
-            && let Some(limit) = self.consumer_overrides.get(identity)
+            && let Some(username) = principal::consumer_username(ctx)
+            && let Some(limit) = self.consumer_overrides.get(username)
         {
             return limit;
         }
@@ -741,8 +746,8 @@ impl RateLimiting {
     fn stream_key(&self, ctx: &super::StreamConnectionContext) -> String {
         match self.limit_by {
             LimitBy::Consumer => {
-                if let Some(identity) = ctx.effective_identity() {
-                    return prefixed_key("consumer:", identity);
+                if let Some(principal) = Principal::of_stream(ctx) {
+                    return principal.key();
                 }
             }
             LimitBy::SpiffeIdentity => {
@@ -763,8 +768,8 @@ impl RateLimiting {
 
     fn stream_limit_op(&self, ctx: &super::StreamConnectionContext) -> &DynamicRateLimitOp {
         if self.limit_by == LimitBy::Consumer
-            && let Some(identity) = ctx.effective_identity()
-            && let Some(limit) = self.consumer_overrides.get(identity)
+            && let Some(username) = principal::stream_consumer_username(ctx)
+            && let Some(limit) = self.consumer_overrides.get(username)
         {
             return limit;
         }
@@ -1632,7 +1637,8 @@ fn mcp_request_body(ctx: &RequestContext) -> Option<&[u8]> {
 ///
 /// The tool name is length-prefixed, so no identity text can make one
 /// caller's per-tool key equal another caller's: every such key starts with
-/// `tool:<len>:`, which no `ip:` / `consumer:` / `spiffe:` key does.
+/// `tool:<len>:`, which no `ip:` / `consumer:` / `external:` / `spiffe:` key
+/// does.
 fn per_tool_key(tool: &str, base_key: &str) -> String {
     let length = tool.len().to_string();
     let mut key = String::with_capacity(7 + length.len() + tool.len() + base_key.len());
