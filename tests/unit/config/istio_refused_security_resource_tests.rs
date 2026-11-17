@@ -603,3 +603,144 @@ fn refused_sidecar_ingress_declares_no_inbound_listeners_and_keeps_valid_egress(
         .collect();
     assert_eq!(admitted, vec!["allowed"]);
 }
+
+// ── Scope: markers reach only the workloads they select ────────────────────
+//
+// `decide` above evaluates every published policy. These tests instead build
+// the per-workload slice (`MeshSlice::from_gateway_config`, which narrows
+// policies with `policy_scope_applies_to_workload`) so the markers' blast
+// radius is pinned end to end, not just by the `PolicyScope` value.
+
+fn workload_slice(translation: &K8sTranslation, namespace: &str, app: &str) -> MeshSlice {
+    let config = GatewayConfig {
+        mesh: translation.config.mesh.clone(),
+        ..GatewayConfig::default()
+    };
+    MeshSlice::from_gateway_config(
+        &config,
+        MeshSliceRequest {
+            node_id: format!("{namespace}-{app}"),
+            namespace: namespace.to_string(),
+            labels: std::collections::BTreeMap::from([("app".to_string(), app.to_string())]),
+            ..MeshSliceRequest::default()
+        },
+    )
+}
+
+fn decide_for(slice: &MeshSlice, request: &MeshAuthzRequest) -> MeshAuthzDecision {
+    evaluate_mesh_authorization_policies(slice.mesh_policies.iter(), request)
+}
+
+/// A refused selector-scoped ALLOW denies only the workloads it selects.
+#[test]
+fn refused_selector_allow_marker_reaches_only_selected_workloads() {
+    let refused = authorization_policy(
+        "allow-office",
+        json!({
+            "selector": {"matchLabels": {"app": "api"}},
+            "action": "ALLOW",
+            "rules": [{"from": [{"source": {"ipBlocks": ["10.0.0.0/40"]}}]}]
+        }),
+    );
+    let (translation, refused_names) = translate(&[refused]);
+    assert_eq!(refused_names, vec!["allow-office".to_string()]);
+
+    let api = workload_slice(&translation, "default", "api");
+    assert!(
+        is_deny(&decide_for(&api, &http("/anything"))),
+        "the selected workload keeps the implicit-deny floor"
+    );
+    for (namespace, app) in [("default", "web"), ("other", "api")] {
+        let slice = workload_slice(&translation, namespace, app);
+        assert!(
+            slice.mesh_policies.is_empty(),
+            "{namespace}/{app} is not selected: {:?}",
+            slice.mesh_policies
+        );
+        assert_eq!(
+            decide_for(&slice, &http("/anything")),
+            MeshAuthzDecision::Allow,
+            "{namespace}/{app} must not inherit the refused policy's floor"
+        );
+    }
+}
+
+/// A refused selector-less DENY covers its namespace and nothing else; the
+/// same policy in the Istio root namespace covers the mesh.
+#[test]
+fn refused_deny_marker_covers_its_namespace_or_the_mesh_from_the_root() {
+    let tenant = authorization_policy(
+        "deny-tenant",
+        json!({
+            "action": "DENY",
+            "rules": [{"from": [{"source": {"ipBlocks": ["10.0.0.0/40"]}}]}]
+        }),
+    );
+    let (translation, _) = translate(&[tenant]);
+    assert!(is_deny(&decide_for(
+        &workload_slice(&translation, "default", "web"),
+        &http("/")
+    )));
+    assert_eq!(
+        decide_for(&workload_slice(&translation, "other", "web"), &http("/")),
+        MeshAuthzDecision::Allow,
+        "a namespace-scoped marker must not reach another namespace"
+    );
+
+    let root = object(
+        "security.istio.io/v1",
+        "AuthorizationPolicy",
+        ROOT_NS,
+        "deny-root",
+        json!({
+            "action": "DENY",
+            "rules": [{"from": [{"source": {"ipBlocks": ["10.0.0.0/40"]}}]}]
+        }),
+    );
+    let (translation, refused_names) = translate(&[root]);
+    assert_eq!(refused_names, vec!["deny-root".to_string()]);
+    for namespace in ["default", "other"] {
+        assert!(
+            is_deny(&decide_for(
+                &workload_slice(&translation, namespace, "web"),
+                &l4()
+            )),
+            "a refused mesh-wide DENY denies {namespace} too"
+        );
+    }
+}
+
+/// A refused workload-scoped STRICT PeerAuthentication, resolved through each
+/// workload's own slice: the selected workload is STRICT, a sibling keeps the
+/// namespace's PERMISSIVE posture.
+#[test]
+fn refused_peer_authentication_marker_reaches_only_selected_workloads() {
+    let namespace_permissive = object(
+        "security.istio.io/v1",
+        "PeerAuthentication",
+        "default",
+        "namespace-permissive",
+        json!({ "mtls": {"mode": "PERMISSIVE"} }),
+    );
+    let refused = object(
+        "security.istio.io/v1",
+        "PeerAuthentication",
+        "default",
+        "api-strict",
+        json!({
+            "selector": {"matchLabels": {"app": "api"}},
+            "mtls": {"mode": "STRICT"},
+            "portLevelMtls": {"99999": {"mode": "PERMISSIVE"}}
+        }),
+    );
+    let (translation, refused_names) = translate(&[namespace_permissive, refused]);
+    assert_eq!(refused_names, vec!["api-strict".to_string()]);
+    assert_eq!(
+        workload_slice(&translation, "default", "api").resolve_inbound_mtls_mode_fail_closed(8080),
+        MtlsMode::Strict
+    );
+    assert_eq!(
+        workload_slice(&translation, "default", "web").resolve_inbound_mtls_mode_fail_closed(8080),
+        MtlsMode::Permissive
+    );
+}
