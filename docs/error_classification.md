@@ -613,21 +613,44 @@ token:
 - plugin rejections (for example a `key_auth` `401`, an `access_control`
   `403`, a `rate_limiting` `429`, a request-validation `400`), in every plugin
   phase;
-- gateway policy fences (allowed methods, WebSocket connection limits,
+- gateway policy fences (allowed methods, route protocol admission, the gRPC
+  non-`POST` refusal, WebSocket connection limits,
   backend connection limits, and the HTTP/1.1 and HTTP/2 frontend admission
   fences: unverifiable HTTP/1 framing, withdrawn client-certificate trust,
   overload, stale configuration);
 - routing `404`s (no route matched) and mesh `REGISTRY_ONLY` route misses.
 
 gRPC Trailers-Only rejections (HTTP `200` with a non-zero `grpc-status`) count
-as error responses. A gRPC-Web rejection whose `grpc-status` is carried only in
-the body's trailer frame (an HTTP `200` head without `grpc-status`) is not
-recognized as an error when the head is stamped, so it carries no reference:
-such a rejection can be under-marked, but it never gets a false reference. A
+as error responses. So do gRPC-Web rejections (issue #7407), whose
+`grpc-status` is carried only in the body's trailer frame under an HTTP `200`
+head: the head cannot show the error, so each recording site says so when it
+records the rejection, and the stamp accepts the `200` gRPC-Web head
+(`application/grpc-web`, `application/grpc-web-text`) as the one it authored.
+The plugin and policy rejection funnel marks a request that keeps its gRPC-Web
+representation when the rejection's gRPC status is not `OK` (plugin
+rejections, `allowed_methods`, route protocol admission, the query trigger
+refusal, and the gRPC non-`POST` refusal, `grpc_post_required`); routing misses and mesh
+`REGISTRY_ONLY` misses mark it from the request's gRPC-Web classification,
+which is made before routing. The pre-plugin `allowed_methods` and route
+protocol admission refusals record the head the client gets (`200` for native
+gRPC Trailers-Only and gRPC-Web) even though their transaction log keeps the
+admission status (`405` / `403`), and HTTP/3 records them, and its gRPC
+non-`POST` refusal, before their heads are sent.
+The reference resolves with `status: 200`, the status the client saw. A
+gRPC-Web rejection without that record (no gRPC status, or `OK`) carries no
+reference: it can be under-marked, but it never gets a false reference. A
 response is gateway-authored only when its rejection site recorded it in the
 request's diagnostic slot before the head was written, and
-only on a head whose status is the one that rejection recorded (a rejection a
-later phase replaced marks nothing). An ordinary relayed backend `5xx` receives
+only on a head whose status is the one that rejection recorded, or the `200`
+head of a recorded gRPC-Web rejection (a rejection a later phase replaced
+marks nothing).
+
+Every stamped gRPC-Web response, tokened or not, also lists
+`x-ferrum-diagnostic-ref` in its `Access-Control-Expose-Headers` (next to
+`grpc-status`, `grpc-message` and `grpc-status-details-bin`), so a
+cross-origin browser `fetch()` client can read the reference without
+configuring `expose_headers`. The name is appended once, only to a response
+that already carries that field. An ordinary relayed backend `5xx` receives
 a compiled gateway token (`backend_timeout` for a relayed `504`, `backend_error`
 for any other `5xx`) and may carry a diagnostic reference when diagnostics are
 enabled. Backend `4xx` responses do not receive a reference.

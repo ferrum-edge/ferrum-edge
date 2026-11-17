@@ -33007,6 +33007,19 @@ fn build_grpc_web_error_response_from_parts(
         .unwrap_or_else(|_| grpc_proxy::build_grpc_error_response(status, message))
 }
 
+/// The HTTP status of the head a pre-plugin refusal writes: `200` when it is
+/// answered as a gRPC-Web trailer-frame error, otherwise the normalized
+/// rejection's own status (`200` for a native gRPC Trailers-Only error).
+fn reject_wire_status(
+    grpc_web_response: Option<&Response<ProxyBody>>,
+    reject: &NormalizedRejectResponse,
+) -> u16 {
+    grpc_web_response.map_or_else(
+        || reject.http_status.as_u16(),
+        |response| response.status().as_u16(),
+    )
+}
+
 fn build_pre_plugin_reject_response(
     status: StatusCode,
     body: &[u8],
@@ -37632,6 +37645,7 @@ async fn handle_proxy_request_inner(
                             crate::diagnostic_ref::MESH_REGISTRY_ONLY_PHASE,
                             start_time,
                             response.status().as_u16(),
+                            grpc_web_response_content_type.is_some(),
                         );
                         record_status(&state, response.status().as_u16());
                         return Ok(response);
@@ -37668,6 +37682,7 @@ async fn handle_proxy_request_inner(
                         crate::diagnostic_ref::ROUTE_NOT_FOUND_PHASE,
                         start_time,
                         response.status().as_u16(),
+                        grpc_web_response_content_type.is_some(),
                     );
                     record_status(&state, response.status().as_u16());
                     // Global access logs still record the miss (scanner and
@@ -37895,10 +37910,21 @@ async fn handle_proxy_request_inner(
         );
         // gRPC-Web carries the status in a body trailer frame, never as
         // response header fields (issue #7155), exactly like the
-        // `allowed_methods` refusal below.
+        // `allowed_methods` refusal below. The gRPC status metadata is what
+        // tells the diagnostic reference that the `200` gRPC-Web head is
+        // this refusal (issue #7407).
+        apply_grpc_reject_metadata(&mut ctx, &reject);
         let grpc_web_response =
             build_grpc_web_reject_response(&[], &mut ctx, grpc_web_response_content_type, &reject)
                 .await;
+        // The log keeps the admission status (403); the diagnostic slot
+        // records the head the client gets (`200` for native gRPC
+        // Trailers-Only and gRPC-Web), first, so the reference binds to it.
+        crate::diagnostic_ref::record_rejection(
+            &ctx,
+            crate::diagnostic_ref::ROUTE_PROTOCOL_ADMISSION_PHASE,
+            reject_wire_status(grpc_web_response.as_ref(), &reject),
+        );
         record_status(&state, StatusCode::FORBIDDEN.as_u16());
         let logging_plugins = plugin_cache_view.plugins();
         log_pre_backend_rejected_request(
@@ -37940,6 +37966,10 @@ async fn handle_proxy_request_inner(
             initial_response_header_policy_plugins.as_ref(),
         );
         restore_authoritative_allow_header(&mut reject.headers, &allow_header);
+        // Same gRPC reject metadata as a plugin rejection, so the diagnostic
+        // reference recognizes the `200` gRPC-Web head as this refusal
+        // (issue #7407).
+        apply_grpc_reject_metadata(&mut ctx, &reject);
         // Empty plugin list: do not run after_proxy / request hooks merely to
         // shape the response. Logging uses a separate immutable cache view.
         let grpc_web_response =
@@ -37947,7 +37977,13 @@ async fn handle_proxy_request_inner(
                 .await;
         // Metrics and transaction logs keep the admission status (405) even when
         // native gRPC reshapes the client-visible HTTP status to trailers-only
-        // 200 + grpc-status.
+        // 200 + grpc-status. The diagnostic slot records that client-visible
+        // head first, so the reference binds to it.
+        crate::diagnostic_ref::record_rejection(
+            &ctx,
+            "allowed_methods",
+            reject_wire_status(grpc_web_response.as_ref(), &reject),
+        );
         record_status(&state, StatusCode::METHOD_NOT_ALLOWED.as_u16());
         let logging_plugins = plugin_cache_view.plugins();
         log_pre_backend_rejected_request(
@@ -37975,8 +38011,6 @@ async fn handle_proxy_request_inner(
     // gRPC spec mandates POST method. Reject non-POST gRPC requests with a proper
     // gRPC trailers-only error rather than forwarding an invalid request to the backend.
     if is_grpc_request && method != "POST" {
-        ctx.terminal_record.mark_counted();
-        state.request_count.fetch_add(1, Ordering::Relaxed);
         warn!(method = %method, path = %path, "Rejected gRPC request: method must be POST");
         let mut reject = normalize_reject_response(
             StatusCode::BAD_REQUEST,
@@ -37989,10 +38023,30 @@ async fn handle_proxy_request_inner(
             request_protocol,
             initial_response_header_policy_plugins.as_ref(),
         );
+        apply_grpc_reject_metadata(&mut ctx, &reject);
         let grpc_web_response =
             build_grpc_web_reject_response(&[], &mut ctx, grpc_web_response_content_type, &reject)
                 .await;
-        record_status(&state, reject.http_status.as_u16());
+        // Recorded through the rejection funnel like every other pre-plugin
+        // refusal, with the status the wire carries (`200` for both gRPC
+        // shapes), so it has a transaction log and, in `all` mode, a
+        // diagnostic reference (issue #7407).
+        let wire_status = reject_wire_status(grpc_web_response.as_ref(), &reject);
+        let logging_plugins = plugin_cache_view.plugins();
+        log_pre_backend_rejected_request(
+            &logging_plugins,
+            &ctx,
+            wire_status,
+            start_time,
+            crate::diagnostic_ref::GRPC_POST_REQUIRED_PHASE,
+            0,
+        )
+        .await;
+        // Counted after the log, like every other terminal: a client abort
+        // during that log is settled by the client-abort scope (issue #6768),
+        // which counts an uncounted request with the status it carried.
+        ctx.terminal_record.mark_counted();
+        record_request(&state, wire_status);
         if let Some(response) = grpc_web_response {
             return Ok(response);
         }
