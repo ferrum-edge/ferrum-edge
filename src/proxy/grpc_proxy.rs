@@ -7919,24 +7919,32 @@ mod tests {
     }
 
     #[test]
-    fn collect_buffered_grpc_trailers_skips_non_utf8_values() {
-        // `to_str()` fails on non-ASCII; the helper silently drops those
-        // entries without leaking them. A malicious backend could otherwise
-        // smuggle binary garbage into the response header map. Legitimate
-        // binary trailers (e.g. `grpc-status-details-bin`) are
-        // base64-encoded by gRPC convention, so they do round-trip through
-        // `to_str()` cleanly.
+    fn collect_buffered_grpc_trailers_keeps_utf8_and_skips_non_utf8_values() {
+        // GHSA-j26x-88q2-wq5m: values that are valid UTF-8, obs-text
+        // included, are preserved byte for byte
+        // (`backend_response_field_value_str`). `x-bin-trailer` here is
+        // invalid UTF-8, which the `HashMap<String, String>` representation
+        // cannot carry, so it is dropped, counted, and reported by a
+        // rate-limited warning that names the field and never the value.
+        // Legitimate binary trailers (e.g. `grpc-status-details-bin`) are
+        // base64-encoded by gRPC convention, so they are always ASCII.
         let mut trailer_map = hyper::HeaderMap::new();
         trailer_map.insert("grpc-status", "0".parse().unwrap());
         trailer_map.insert(
             "x-bin-trailer",
             http::HeaderValue::from_bytes(&[0x80, 0x81]).unwrap(),
         );
+        trailer_map.insert(
+            "x-detail",
+            http::HeaderValue::from_bytes("détail".as_bytes()).unwrap(),
+        );
 
         let mut out: HashMap<String, String> = HashMap::new();
         collect_buffered_grpc_trailers(&trailer_map, &mut out);
-        assert_eq!(out.len(), 1);
+        assert_eq!(out.len(), 2);
         assert_eq!(out.get("grpc-status").map(String::as_str), Some("0"));
+        assert_eq!(out.get("x-detail").map(String::as_str), Some("détail"));
+        assert!(!out.contains_key("x-bin-trailer"));
     }
 
     #[test]
