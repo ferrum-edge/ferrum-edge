@@ -888,7 +888,8 @@ fn hidden_rule_shadowing_covers_carried_l4_upstream_targets() {
                 serde_json::json!({"egress": [{"hosts": ["*/*"]}]}),
             ),
         ],
-        options(),
+        // The ServiceEntry and DestinationRules live in `beta`.
+        options().with_source_namespaces(vec!["default".to_string(), "beta".to_string()]),
     )
     .expect("translation succeeds");
     let slice = MeshSlice::from_gateway_config(

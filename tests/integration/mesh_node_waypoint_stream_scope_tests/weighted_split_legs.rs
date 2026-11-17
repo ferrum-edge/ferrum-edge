@@ -157,7 +157,10 @@ fn translated_config(objects: &[K8sObject], policies: Vec<MeshPolicy>) -> Gatewa
         K8sTranslationOptions::new(
             DEFAULT_NAMESPACE.to_string(),
             TrustDomain::new("cluster.local").expect("trust domain"),
-        ),
+        )
+        // `beta` hosts the cross-namespace ServiceEntry / DestinationRule
+        // fixtures (issue #7395); nothing else lives there.
+        .with_source_namespaces(vec![DEFAULT_NAMESPACE.to_string(), "beta".to_string()]),
     )
     .expect("resources translate");
     let mut config = translated.config;
