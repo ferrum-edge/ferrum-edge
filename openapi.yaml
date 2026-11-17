@@ -41850,13 +41850,13 @@ components:
                         price_per_byte_sent:
                           type: number
                           exclusiveMinimum: 0
-                          maximum: 1.0e288
+                          maximum: 1.0e+288
                     - required: [price_per_byte_received]
                       properties:
                         price_per_byte_received:
                           type: number
                           exclusiveMinimum: 0
-                          maximum: 1.0e288
+                          maximum: 1.0e+288
             - required: [stream_connection_pricing]
               properties:
                 stream_connection_pricing:
@@ -41866,7 +41866,7 @@ components:
                     price_per_connection:
                       type: number
                       exclusiveMinimum: 0
-                      maximum: 1.0e288
+                      maximum: 1.0e+288
         # `schema` and `schema_ref` are mutually exclusive projections.
         - not:
             required: [schema, schema_ref]
@@ -41901,7 +41901,7 @@ components:
               price_per_call:
                 type: number
                 minimum: 0
-                maximum: 1.0e288
+                maximum: 1.0e+288
                 description: |
                   Charge per HTTP API call (e.g. 0.00001). Must be finite,
                   non-negative, and at most 1e288 so `u64` counter × price stays
@@ -41931,7 +41931,7 @@ components:
             price_per_byte_sent:
               type: number
               minimum: 0
-              maximum: 1.0e288
+              maximum: 1.0e+288
               default: 0.0
               description: |
                 Per-byte charge for bytes flowed client->backend. Finite,
@@ -41940,7 +41940,7 @@ components:
             price_per_byte_received:
               type: number
               minimum: 0
-              maximum: 1.0e288
+              maximum: 1.0e+288
               default: 0.0
               description: |
                 Per-byte charge for bytes flowed backend->client. Finite,
@@ -41959,7 +41959,7 @@ components:
             price_per_connection:
               type: number
               minimum: 0
-              maximum: 1.0e288
+              maximum: 1.0e+288
               description: |
                 Per-session charge applied at stream disconnect. Finite,
                 non-negative, at most 1e288 (same binary64 counter×price bound
@@ -42216,13 +42216,13 @@ components:
                         price_per_byte_sent:
                           type: number
                           exclusiveMinimum: 0
-                          maximum: 1.0e288
+                          maximum: 1.0e+288
                     - required: [price_per_byte_received]
                       properties:
                         price_per_byte_received:
                           type: number
                           exclusiveMinimum: 0
-                          maximum: 1.0e288
+                          maximum: 1.0e+288
             - required: [stream_connection_pricing]
               properties:
                 stream_connection_pricing:
@@ -42232,7 +42232,7 @@ components:
                     price_per_connection:
                       type: number
                       exclusiveMinimum: 0
-                      maximum: 1.0e288
+                      maximum: 1.0e+288
         - if:
             required: [mode]
             properties:
@@ -42433,7 +42433,7 @@ components:
               price_per_call:
                 type: number
                 minimum: 0
-                maximum: 1.0e288
+                maximum: 1.0e+288
                 description: |
                   Finite non-negative per-call price at most 1e288 (shared
                   chargeback binary64 counter×price bound).
@@ -42445,12 +42445,12 @@ components:
             price_per_byte_sent:
               type: number
               minimum: 0
-              maximum: 1.0e288
+              maximum: 1.0e+288
               default: 0.0
             price_per_byte_received:
               type: number
               minimum: 0
-              maximum: 1.0e288
+              maximum: 1.0e+288
               default: 0.0
           description: Optional per-byte pricing for client->backend and backend->client bytes. When this is the only pricing dimension, at least one rate must be strictly greater than zero (has_any_pricing).
         stream_connection_pricing:
@@ -42461,7 +42461,7 @@ components:
             price_per_connection:
               type: number
               minimum: 0
-              maximum: 1.0e288
+              maximum: 1.0e+288
           description: Optional flat per-session charge for TCP/TCP+TLS/UDP/DTLS disconnects. When this is the only pricing dimension, price_per_connection must be strictly greater than zero (has_any_pricing).
         clickhouse:
           type: object

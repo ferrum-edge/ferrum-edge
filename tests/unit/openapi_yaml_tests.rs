@@ -165,6 +165,60 @@ fn openapi_info_version_matches_crate_version() {
     );
 }
 
+/// `openapi: 3.1.x` documents are YAML 1.2. Its Core Schema float form is
+/// `[-+]?(\.[0-9]+|[0-9]+(\.[0-9]*)?)([eE][-+][0-9]+)?`: the exponent needs an
+/// explicit sign. A YAML 1.1-style `1.0e288` parses as a number in
+/// `serde_yaml` but as the string `"1.0e288"` in strict YAML 1.2 loaders
+/// (libyaml/Psych), which turns a JSON Schema `maximum` into a string and
+/// breaks downstream validators (issue #7408). Scan the raw text, since
+/// `serde_yaml` cannot see the difference.
+#[test]
+fn openapi_plain_scalars_use_yaml_1_2_exponent_syntax() {
+    // A whole plain scalar after `key: ` or a `- ` sequence entry, with an
+    // optional trailing comment, that is a signless-exponent float.
+    let signless_exponent = Regex::new(
+        r"^\s*(?:-\s+)?(?:[^\s'#\x22][^:#]*:\s+|-\s+)?[-+]?(?:\.[0-9]+|[0-9]+(?:\.[0-9]*)?)[eE][0-9]+\s*(?:#.*)?$",
+    )
+    .expect("regex compiles");
+    let offenders: Vec<usize> = include_str!("../../openapi.yaml")
+        .lines()
+        .enumerate()
+        .filter(|(_, line)| signless_exponent.is_match(line))
+        .map(|(index, _)| index + 1)
+        .collect();
+    assert!(
+        offenders.is_empty(),
+        "openapi.yaml has YAML 1.1-only signless exponent floats (write e.g. `1.0e+288`) on lines {offenders:?}"
+    );
+
+    // The chargeback price bounds that #7408 found must still parse as the
+    // runtime ceiling.
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+    let mut bounds = 0;
+    let mut stack = vec![&spec];
+    while let Some(value) = stack.pop() {
+        match value {
+            serde_json::Value::Object(map) => {
+                for (key, child) in map {
+                    if key == "maximum" && child.as_f64().is_some_and(|max| max > 1.0e+200) {
+                        assert_eq!(
+                            child.as_f64(),
+                            Some(ferrum_edge::plugins::chargeback::pricing::MAX_UNIT_PRICE),
+                            "large numeric maximum must equal the chargeback unit-price ceiling"
+                        );
+                        bounds += 1;
+                    }
+                    stack.push(child);
+                }
+            }
+            serde_json::Value::Array(items) => stack.extend(items),
+            _ => {}
+        }
+    }
+    assert_eq!(bounds, 14, "expected the 14 chargeback price maximums");
+}
+
 /// Every runtime Redis key-prefix default is derived from `FERRUM_NAMESPACE`
 /// (and, for the limiters, the plugin-config id), which no static schema
 /// `default` can express. A client that fills in defaults would write the
