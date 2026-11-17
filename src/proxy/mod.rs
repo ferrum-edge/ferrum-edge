@@ -16701,6 +16701,139 @@ pub(crate) fn websocket_backend_failure_status_and_body(
     }
 }
 
+/// Largest backend refusal body the gateway relays to the client. The body is
+/// what the backend coalesced with its refusal head, so it is already bounded by
+/// the handshake read; this cap keeps the relay small regardless.
+const WEBSOCKET_BACKEND_REFUSAL_MAX_BODY_BYTES: usize = 64 * 1024;
+
+/// A backend's own `3xx`-`5xx` answer to the gateway's RFC 6455 upgrade
+/// request (GHSA-7x2j-3389-2h35).
+///
+/// The backend is healthy and declined the upgrade (its own authentication, an
+/// Origin check, `404`, `429`, a redirect, ...). The gateway relays that answer
+/// instead of a synthetic `502`, and charges the circuit breaker and backend
+/// admission with the backend's real status, exactly as the HTTP path does for
+/// the same status: a `4xx` is never a backend failure.
+///
+/// A `1xx`/`2xx` non-`101` answer is not a refusal: relaying a `2xx` to an
+/// RFC 8441 / RFC 9220 Extended CONNECT client would tell it the tunnel is open.
+/// It stays the `502` protocol failure, as do a missing/invalid
+/// `Sec-WebSocket-Accept` and a malformed response.
+#[derive(Debug)]
+pub(crate) struct WebSocketBackendRefusal {
+    pub(crate) status: StatusCode,
+    /// The backend's headers after the backend-response strip (hop-by-hop,
+    /// `Connection`-listed and gateway-owned diagnostic names). The response
+    /// builders still apply the initial response header policy and the
+    /// WebSocket transport strip, and derive the framing themselves.
+    pub(crate) headers: HashMap<String, String>,
+    /// The backend's complete refusal body, or empty when it was not complete
+    /// in the handshake read (then the representation headers are dropped).
+    pub(crate) body: Bytes,
+}
+
+/// The backend refusal carried by a failed WebSocket dial, if the backend
+/// answered the upgrade with a relayable status. Walks the error chain for
+/// tungstenite's `Error::Http`, which every H1 upgrade transport (direct
+/// TCP/TLS, admitted Unix socket, and the inner HBONE handshake) returns for a
+/// non-`101` answer.
+pub(crate) fn websocket_backend_refusal(
+    error: &(dyn std::error::Error + 'static),
+) -> Option<WebSocketBackendRefusal> {
+    let mut current = Some(error);
+    let response = loop {
+        let err = current?;
+        if let Some(tokio_tungstenite::tungstenite::Error::Http(response)) =
+            err.downcast_ref::<tokio_tungstenite::tungstenite::Error>()
+        {
+            break response;
+        }
+        current = err.source();
+    };
+    let status = response.status();
+    if !(300..=599).contains(&status.as_u16()) {
+        return None;
+    }
+    let mut headers = HashMap::new();
+    collect_hyper_response_headers(response.headers(), &mut headers);
+    let body = match websocket_backend_refusal_body(status, response.headers(), response.body()) {
+        Some(body) => body,
+        None => {
+            // The declared body was not complete in the handshake read: relay
+            // the status and headers with an empty body, and drop the fields
+            // that describe a representation the client will not receive.
+            headers.retain(|name, _| {
+                !name.eq_ignore_ascii_case("content-type")
+                    && !name.eq_ignore_ascii_case("content-encoding")
+                    && !name.eq_ignore_ascii_case("content-range")
+            });
+            Bytes::new()
+        }
+    };
+    Some(WebSocketBackendRefusal {
+        status,
+        headers,
+        body,
+    })
+}
+
+/// The complete body of a backend refusal, or `None` when the bytes
+/// tungstenite read with the head do not hold exactly the declared body.
+fn websocket_backend_refusal_body(
+    status: StatusCode,
+    headers: &hyper::HeaderMap,
+    tail: &Option<Vec<u8>>,
+) -> Option<Bytes> {
+    // Only `3xx`-`5xx` reach here, so `304` is the one bodiless status.
+    if status == StatusCode::NOT_MODIFIED {
+        return Some(Bytes::new());
+    }
+    if headers.contains_key(hyper::header::TRANSFER_ENCODING) {
+        return None;
+    }
+    let mut lengths = headers.get_all(hyper::header::CONTENT_LENGTH).iter();
+    let declared = lengths.next()?;
+    if lengths.next().is_some() {
+        return None;
+    }
+    let declared: usize = std::str::from_utf8(declared.as_bytes())
+        .ok()?
+        .trim()
+        .parse()
+        .ok()?;
+    if declared > WEBSOCKET_BACKEND_REFUSAL_MAX_BODY_BYTES {
+        return None;
+    }
+    let tail = tail.as_deref().unwrap_or_default();
+    (tail.len() >= declared).then(|| Bytes::copy_from_slice(&tail[..declared]))
+}
+
+/// The H1/H2 client response relaying a [`WebSocketBackendRefusal`]: the
+/// backend's status, its headers under the same initial response header policy
+/// and WebSocket transport strip as every other failed handshake, and an
+/// authoritative `Content-Length` for the relayed body.
+pub(crate) fn build_websocket_backend_refusal_response(
+    refusal: WebSocketBackendRefusal,
+    initial_response_header_policy_plugins: &[Arc<dyn Plugin>],
+) -> Response<ProxyBody> {
+    let WebSocketBackendRefusal {
+        status,
+        mut headers,
+        body,
+    } = refusal;
+    finalize_websocket_response_headers(initial_response_header_policy_plugins, &mut headers);
+    headers_mod::apply_sanitized_response_headers(
+        Response::builder().status(status),
+        &mut headers,
+        headers_mod::ClientResponseFraming::ExactBody {
+            status: status.as_u16(),
+            len: body.len() as u64,
+        },
+    )
+    .body(ProxyBody::full(body))
+    .unwrap_or_else(|_| build_websocket_error_fallback_response(StatusCode::BAD_GATEWAY))
+}
+
 fn build_websocket_error_fallback_response(status: StatusCode) -> Response<ProxyBody> {
     let mut response = Response::new(ProxyBody::from_string(
         r#"{"error":"Internal server error"}"#,
@@ -17503,6 +17636,17 @@ async fn handle_websocket_request_authenticated(
                 // else keeps the 502.
                 let (ws_failure_status, ws_failure_body) =
                     websocket_backend_failure_status_and_body(ws_error_class);
+                // A backend that answered the upgrade with its own 3xx-5xx
+                // (GHSA-7x2j-3389-2h35) is a healthy backend's answer, not a
+                // gateway failure: it is relayed to the client, and the breaker,
+                // backend admission, metrics and the transaction log all see the
+                // backend's real status with no error class, exactly as the HTTP
+                // path records the same status.
+                let ws_backend_refusal = websocket_backend_refusal(e.as_ref());
+                let ws_failure_status = ws_backend_refusal
+                    .as_ref()
+                    .map_or(ws_failure_status, |refusal| refusal.status);
+                let ws_outcome_error_class = ws_backend_refusal.is_none().then_some(ws_error_class);
                 // A gateway-side egress-policy rejection (denied literal-IP
                 // backend) never reached a backend: it must be non-retryable AND
                 // neutral to backend health — no circuit-breaker trip and no
@@ -17513,7 +17657,13 @@ async fn handle_websocket_request_authenticated(
                 // Every failed handshake ends its attempt, retried or not. A
                 // dial refused before its attempt began has none (issue #5875).
                 if ws_attempt_dispatched {
-                    ctx.record_backend_attempt(Some(ws_error_class), !ws_is_pre_wire, None);
+                    ctx.record_backend_attempt(
+                        ws_outcome_error_class,
+                        !ws_is_pre_wire,
+                        ws_backend_refusal
+                            .as_ref()
+                            .map(|refusal| refusal.status.as_u16()),
+                    );
                 }
 
                 // Retry only on PRE-WIRE failures (DNS / TCP refused / TLS
@@ -17751,14 +17901,23 @@ async fn handle_websocket_request_authenticated(
                 // rejected the upgrade will now log
                 // `error_kind=protocol_error` or `request_error` rather
                 // than the misleading hardcoded `connect_failure`.
-                error!(
-                    proxy_id = %proxy.id,
-                    backend_url = %strip_query_params(&current_backend_url),
-                    error_kind = retry::error_class_log_kind(ws_error_class),
-                    error_class = %ws_error_class,
-                    error = %e,
-                    "WebSocket backend connection failed"
-                );
+                if ws_backend_refusal.is_some() {
+                    debug!(
+                        proxy_id = %proxy.id,
+                        backend_url = %strip_query_params(&current_backend_url),
+                        status = ws_failure_status.as_u16(),
+                        "WebSocket backend refused the upgrade; relaying its response"
+                    );
+                } else {
+                    error!(
+                        proxy_id = %proxy.id,
+                        backend_url = %strip_query_params(&current_backend_url),
+                        error_kind = retry::error_class_log_kind(ws_error_class),
+                        error_class = %ws_error_class,
+                        error = %e,
+                        "WebSocket backend connection failed"
+                    );
+                }
                 // Record the failure so the breaker / passive health see it
                 // and a claimed HALF_OPEN probe slot is released. Previously
                 // only the retry branch recorded — with retries unconfigured
@@ -17773,7 +17932,19 @@ async fn handle_websocket_request_authenticated(
                         current_cb_target_key.as_deref(),
                     )
                 {
-                    if ws_egress_denied {
+                    if ws_backend_refusal.is_some() {
+                        // The backend answered: classify its status against
+                        // `failure_status_codes` exactly as the HTTP path does,
+                        // so a 401/403/404/429 refusal can never open the
+                        // breaker (GHSA-7x2j-3389-2h35).
+                        backend_dispatch::apply_circuit_breaker_outcome(
+                            &cb,
+                            ws_failure_status.as_u16(),
+                            false,
+                            None,
+                            cb_probe.take_slot(),
+                        );
+                    } else if ws_egress_denied {
                         // Gateway-side egress denial dialed no backend: release any
                         // admitted HALF_OPEN probe slot NEUTRALLY (no failure count)
                         // so the breaker can recover, rather than leaking it by
@@ -17796,7 +17967,7 @@ async fn handle_websocket_request_authenticated(
                     permits.record_backend_outcome(BackendAdmissionOutcome {
                         response_status: ws_failure_status.as_u16(),
                         connection_error: ws_is_pre_wire,
-                        error_class: Some(ws_error_class),
+                        error_class: ws_outcome_error_class,
                         backend_elapsed: backend_admission_start.elapsed(),
                     });
                 }
@@ -17819,10 +17990,14 @@ async fn handle_websocket_request_authenticated(
                         let ws_gateway_overhead_ms =
                             (ws_total_ms - ws_plugin_execution_ms).max(0.0);
                         let mut metadata = clone_log_metadata(&ctx);
-                        metadata.insert(
-                            "rejection_phase".to_string(),
-                            "websocket_backend_error".to_string(),
-                        );
+                        // A relayed backend refusal is the backend's answer,
+                        // not a gateway rejection.
+                        if ws_backend_refusal.is_none() {
+                            metadata.insert(
+                                "rejection_phase".to_string(),
+                                "websocket_backend_error".to_string(),
+                            );
+                        }
                         let ws_err_method = if is_h2_websocket { "CONNECT" } else { "GET" };
                         let summary = TransactionSummary {
                             namespace: proxy.namespace.clone(),
@@ -17850,7 +18025,7 @@ async fn handle_websocket_request_authenticated(
                             request_user_agent: ctx
                                 .effective_request_header("user-agent")
                                 .map(str::to_owned),
-                            error_class: Some(ws_error_class),
+                            error_class: ws_outcome_error_class,
                             metadata,
                             ai_usage_export: ctx.ai_usage_export.clone(),
                             proxy_lifecycle_generation: ctx.proxy_lifecycle_generation,
@@ -17861,11 +18036,17 @@ async fn handle_websocket_request_authenticated(
                         )
                         .await;
                     }
-                } else {
+                } else if let Some(error_class) = ws_outcome_error_class {
                     crate::runtime_metrics::global_ref()
-                        .record_http_error(Some(&proxy.id), ws_error_class);
+                        .record_http_error(Some(&proxy.id), error_class);
                 }
 
+                if let Some(refusal) = ws_backend_refusal {
+                    return Ok(build_websocket_backend_refusal_response(
+                        refusal,
+                        &initial_response_header_policy_plugins,
+                    ));
+                }
                 return Ok(build_websocket_backend_failure_response(
                     ws_failure_status,
                     ws_failure_body,
