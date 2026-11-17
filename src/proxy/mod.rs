@@ -16721,7 +16721,7 @@ pub(crate) const WEBSOCKET_BACKEND_REFUSAL_MAX_BODY_BYTES: usize = 64 * 1024;
 /// It stays the `502` protocol failure, as do a missing/invalid
 /// `Sec-WebSocket-Accept` and a malformed response.
 #[derive(Debug, Clone)]
-pub(crate) struct WebSocketBackendRefusal {
+pub struct WebSocketBackendRefusal {
     pub(crate) status: StatusCode,
     /// The backend's headers after the backend-response strip (hop-by-hop,
     /// `Connection`-listed and gateway-owned diagnostic names). The response
