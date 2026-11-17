@@ -2880,10 +2880,16 @@ fn a_hidden_exported_exact_rule_shadows_its_namespaces_wildcard_like_istio() {
             .map(|exclusion| (
                 exclusion.namespace.as_str(),
                 exclusion.name.as_str(),
+                exclusion.rule_host.as_str(),
                 exclusion.host.as_str()
             ))
             .collect::<Vec<_>>(),
-        vec![(EXTERNAL_HOST_OWNER, "owner-wildcard", EXTERNAL_HOST)],
+        vec![(
+            EXTERNAL_HOST_OWNER,
+            "owner-wildcard",
+            EXTERNAL_WILDCARD,
+            EXTERNAL_HOST
+        )],
         "only the outcome rides the slice: the visible wildcard does not apply to that host"
     );
     // Nothing about a rule outside its export scope reaches the subscriber.
@@ -2970,5 +2976,61 @@ fn a_concrete_host_under_a_wildcard_service_entry_takes_its_owners_rule() {
         ]),
         3333,
         "an unrelated namespace still owns nothing; the root default applies"
+    );
+}
+
+// ── Review round 3 (sol F1) ──────────────────────────────────────────────
+
+/// sol F1: an exclusion names the visible rule by namespace, name AND its own
+/// host pattern. Native/file configs may repeat one `(namespace, name)` for
+/// distinct hosts, so excluding by name alone would also suppress a sibling
+/// exact rule that outranks the hidden wildcard. Here `payments/shared`
+/// exists twice (a broad wildcard without TLS and an exact TLS rule); a hidden
+/// `*.one.example.com` shadows only the broad wildcard, and the exact TLS
+/// rule still wins, as in Istio (the exact host is the most specific exported
+/// match).
+#[test]
+fn an_exclusion_never_suppresses_a_same_named_sibling_rule() {
+    const CONCRETE: &str = "api.one.example.com";
+    let mut mesh = egress_gateway_mesh(
+        EXTERNAL_HOST_OWNER,
+        vec![
+            rule(
+                EXTERNAL_HOST_OWNER,
+                "shared",
+                EXTERNAL_WILDCARD,
+                4444,
+                &["*"],
+            ),
+            tls_rule(EXTERNAL_HOST_OWNER, "shared", CONCRETE, MtlsMode::Simple),
+            {
+                let mut hidden = rule(
+                    EXTERNAL_HOST_OWNER,
+                    "hidden-narrow",
+                    "*.one.example.com",
+                    5555,
+                    &[],
+                );
+                hidden.export_to = vec!["hidden-tenant-ns".to_string()];
+                hidden
+            },
+        ],
+    );
+    mesh.service_entries[0].hosts = vec![CONCRETE.to_string()];
+
+    let slice = slice_for(&mesh, EGRESS_GATEWAY_NAMESPACE);
+    assert_eq!(
+        slice
+            .destination_rule_host_exclusions
+            .iter()
+            .map(|exclusion| (exclusion.rule_host.as_str(), exclusion.host.as_str()))
+            .collect::<Vec<_>>(),
+        vec![(EXTERNAL_WILDCARD, CONCRETE)],
+        "only the shadowed broad wildcard is excluded, identified by its host pattern"
+    );
+    assert_eq!(
+        egress_scheme_for_mesh(mesh, CONCRETE),
+        BackendScheme::Https,
+        "the same-named exact TLS rule is not excluded and wins the host"
     );
 }

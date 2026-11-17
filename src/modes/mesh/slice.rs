@@ -2403,14 +2403,19 @@ impl MeshSlice {
     }
 }
 
-/// One control-plane-resolved exclusion: the visible DestinationRule
-/// `namespace`/`name` (a wildcard) does not apply to destination `host`
-/// (issue #7395, [`MeshSlice::destination_rule_host_exclusions`]).
+/// One control-plane-resolved exclusion: the visible wildcard
+/// DestinationRule identified by `namespace`, `name` and its own host pattern
+/// `rule_host` does not apply to destination `host` (issue #7395,
+/// [`MeshSlice::destination_rule_host_exclusions`]). The rule host is part of
+/// the identity because native/file configs may repeat one `(namespace,
+/// name)` for distinct hosts; it is the visible rule's own, already
+/// authorized metadata.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DestinationRuleHostExclusion {
     pub namespace: String,
     pub name: String,
+    pub rule_host: String,
     pub host: String,
 }
 
@@ -2420,6 +2425,7 @@ impl DestinationRuleHostExclusion {
     pub(crate) fn excludes(&self, rule: &MeshDestinationRule, host: &str) -> bool {
         self.namespace == rule.namespace.trim()
             && self.name == rule.name
+            && self.rule_host == canonical_destination_rule_host(&rule.host)
             && self.host == canonical_destination_rule_host(host)
     }
 }
@@ -2442,8 +2448,9 @@ fn canonical_destination_rule_host(host: &str) -> String {
 /// in that exported index, so it shadows nothing for other namespaces.
 ///
 /// For every admitted, non-client-tier wildcard rule and every destination
-/// host the slice carries (Service FQDNs, ServiceEntry hosts, and the hosts
-/// of carried VirtualService route upstreams) that it names, this records an
+/// host the slice carries (Service FQDNs, ServiceEntry hosts, and the target
+/// hosts of carried VirtualService HTTP and L4 route upstreams) that it
+/// names, this records an
 /// exclusion when a hidden exported rule of the same namespace names that host
 /// strictly more specifically. Only the outcome rides the slice.
 fn destination_rule_host_exclusions(
@@ -2482,7 +2489,15 @@ fn destination_rule_host_exclusions(
                 .map(|host| canonical_destination_rule_host(host.as_str())),
         );
     }
-    for upstream in &slice.http_routes.upstreams {
+    // Carried VirtualService HTTP route and L4 (`tcp[]` / `tls[]`) upstream
+    // targets are destinations too: they reach DestinationRule selection on
+    // the data plane like any other upstream.
+    for upstream in slice
+        .http_routes
+        .upstreams
+        .iter()
+        .chain(&slice.virtual_service_l4_upstreams)
+    {
         for target in upstream
             .get("targets")
             .and_then(serde_json::Value::as_array)
@@ -2521,6 +2536,7 @@ fn destination_rule_host_exclusions(
                 exclusions.insert(DestinationRuleHostExclusion {
                     namespace: rule.namespace.trim().to_string(),
                     name: rule.name.clone(),
+                    rule_host: canonical_destination_rule_host(&rule.host),
                     host: host.clone(),
                 });
             }

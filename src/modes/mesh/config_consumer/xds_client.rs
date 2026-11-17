@@ -6102,6 +6102,17 @@ mod tests {
             // round trip or the DP cannot tell an admitted root-tier
             // DestinationRule from an arbitrary-namespace one.
             istio_root_namespace: "istio-config".to_string(),
+            // Issue #7395: the control-plane-resolved wildcard host
+            // exclusions are the xDS data plane's only source of Istio's
+            // exported-rule host selection.
+            destination_rule_host_exclusions: vec![
+                crate::modes::mesh::slice::DestinationRuleHostExclusion {
+                    namespace: "beta".to_string(),
+                    name: "owner-wildcard".to_string(),
+                    rule_host: "*.example.com".to_string(),
+                    host: "api.example.com".to_string(),
+                },
+            ],
             ..MeshSlice::default()
         }
     }
@@ -6131,6 +6142,11 @@ mod tests {
         );
         assert_eq!(recovered.service_entries, native.service_entries);
         assert_eq!(recovered.destination_rules, native.destination_rules);
+        assert!(!native.destination_rule_host_exclusions.is_empty());
+        assert_eq!(
+            recovered.destination_rule_host_exclusions,
+            native.destination_rule_host_exclusions
+        );
         assert_eq!(
             recovered.istio_root_namespace, native.istio_root_namespace,
             "the mesh root namespace must round-trip so the DP can classify \

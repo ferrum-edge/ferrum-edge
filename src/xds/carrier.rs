@@ -1177,7 +1177,12 @@ mod tests {
             MeshSliceCarrier::ConfigRevision(MeshConfigRevision::new("db", 42)),
             MeshSliceCarrier::Workloads(Vec::new()),
             MeshSliceCarrier::AmbientUdpSourceWorkloads(Vec::new()),
-            MeshSliceCarrier::DestinationRuleHostExclusions(Vec::new()),
+            MeshSliceCarrier::DestinationRuleHostExclusions(vec![DestinationRuleHostExclusion {
+                namespace: "beta".to_string(),
+                name: "owner-wildcard".to_string(),
+                rule_host: "*.example.com".to_string(),
+                host: "api.example.com".to_string(),
+            }]),
             MeshSliceCarrier::NodeWaypointAssertors(vec![NodeWaypointAssertor {
                 spiffe_id: SpiffeId::new("spiffe://cluster.local/ns/ferrum/sa/node-waypoint")
                     .unwrap(),

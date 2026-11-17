@@ -45,7 +45,7 @@ impl Schema {
             (Self::Slice, "service_waypoint_bound_services") => Self::Fields("namespace name"),
             (Self::Slice, "node_waypoint_assertors") => Self::Fields("spiffe_id asserts"),
             (Self::Slice, "destination_rule_host_exclusions") => {
-                Self::Fields("namespace name host")
+                Self::Fields("namespace name rule_host host")
             }
             (Self::Slice, "extension_configs") => Self::Fields("name namespace type_url value"),
             (
