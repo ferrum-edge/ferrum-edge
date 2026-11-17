@@ -12,6 +12,13 @@ fn ctx(method: &str, path: &str) -> RequestContext {
     RequestContext::new("203.0.113.10".into(), method.into(), path.into())
 }
 
+/// A mapped gateway Consumer with the given username.
+fn consumer_named(username: &str) -> ferrum_edge::config::types::Consumer {
+    let mut consumer = super::plugin_utils::create_test_consumer();
+    consumer.username = username.to_string();
+    consumer
+}
+
 /// Build a WAF for the rule-semantics tests in this file.
 ///
 /// Pins `scan_budget_ms: 0` (unbounded) unless the config sets its own budget.
@@ -302,7 +309,7 @@ async fn waf_clears_preexisting_reserved_metadata_before_evaluation() {
 }
 
 #[tokio::test]
-async fn consumer_scoped_request_rule_uses_authenticated_identity() {
+async fn consumer_scoped_request_rule_uses_mapped_consumer_only() {
     let plugin = waf(json!({
         "include_default_rules": false,
         "custom_rules": [{
@@ -330,8 +337,24 @@ async fn consumer_scoped_request_rule_uses_authenticated_identity() {
             .is_some_and(|hits| hits.contains("CUSTOM-CONSUMER-QUERY"))
     );
 
+    // GHSA-rxwj-x6c6-f4j5: an unmapped external identity that spells the
+    // listed Consumer username is not that Consumer.
+    let mut external_ctx = ctx("GET", "/search");
+    external_ctx.authenticated_identity = Some("alice".into());
+    external_ctx.set_raw_query_string("q=needle".into());
+    assert!(matches!(
+        plugin.authorize(&mut external_ctx).await,
+        PluginResult::Continue
+    ));
+    assert!(
+        !external_ctx
+            .metadata
+            .get("waf.rule_hits")
+            .is_some_and(|hits| hits.contains("CUSTOM-CONSUMER-QUERY"))
+    );
+
     let mut authenticated_ctx = ctx("GET", "/search");
-    authenticated_ctx.authenticated_identity = Some("alice".into());
+    authenticated_ctx.identified_consumer = Some(std::sync::Arc::new(consumer_named("alice")));
     authenticated_ctx.set_raw_query_string("q=needle".into());
     let result = plugin.authorize(&mut authenticated_ctx).await;
 
@@ -2519,7 +2542,7 @@ fn request_exempt_from_waf_keeps_its_backend_trailers() {
     // Consumer identity only exists after authentication, which is exactly why
     // the resolution is deferred to the finalized request context.
     let mut by_consumer = ctx("GET", "/orders");
-    by_consumer.authenticated_identity = Some("trusted-partner".to_string());
+    by_consumer.identified_consumer = Some(std::sync::Arc::new(consumer_named("trusted-partner")));
 
     for exempt in [by_path, by_method, by_ip, by_consumer] {
         assert!(
@@ -11046,4 +11069,53 @@ fn on_scan_timeout_openapi_runtime_parity() {
         Waf::new(&json!({ "mode": "monitor", "on_scan_timeout": null })).is_ok(),
         "runtime must accept an explicit null as the documented default"
     );
+}
+
+/// GHSA-rxwj-x6c6-f4j5: `global_exemptions.consumers` names mapped Consumers.
+/// In a multi-auth route (`key_auth` for the internal scanner Consumer,
+/// `jwks_auth` / `ldap_auth` / ... for end users), an external principal who
+/// registers the scanner's username is still scanned.
+#[tokio::test]
+async fn global_consumer_exemption_does_not_exempt_external_identity_with_same_name() {
+    let plugin = waf(json!({
+        "include_default_rules": false,
+        "global_exemptions": { "consumers": ["security-scanner"] },
+        "custom_rules": [{
+            "id": "CUSTOM-SCANNER-QUERY",
+            "name": "query marker",
+            "category": "custom",
+            "severity": "high",
+            "target": "query_values",
+            "match_kind": "contains",
+            "pattern": "needle",
+            "action": "enforce"
+        }]
+    }))
+    .unwrap();
+
+    for mechanism in [
+        "jwks_auth",
+        "ldap_auth",
+        "oauth2_introspection",
+        "oidc_relying_party",
+        "soap_ws_security",
+    ] {
+        let mut external =
+            super::plugin_utils::committed_external_identity_context("security-scanner", mechanism);
+        external.set_raw_query_string("q=needle".into());
+        assert!(
+            matches!(
+                plugin.authorize(&mut external).await,
+                PluginResult::Reject { .. }
+            ),
+            "{mechanism}: an external identity must not inherit a Consumer exemption"
+        );
+    }
+
+    let mut scanner = super::plugin_utils::consumer_context("security-scanner");
+    scanner.set_raw_query_string("q=needle".into());
+    assert!(matches!(
+        plugin.authorize(&mut scanner).await,
+        PluginResult::Continue
+    ));
 }

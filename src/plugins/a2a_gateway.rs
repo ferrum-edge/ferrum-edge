@@ -21,6 +21,7 @@ use super::{
     PluginResult, RequestContext, ResponseStreamAction, ResponseStreamInspector,
     allocate_response_stream_handoff_id,
 };
+use crate::util::json_dup_keys;
 use crate::util::unknown_keys::reject_unknown_keys;
 
 /// Domain separator and schema version for [`A2aGateway`] replay provenance.
@@ -800,6 +801,44 @@ impl A2aGateway {
             }
             return None;
         }
+        // Duplicate member names make the classified envelope and the
+        // forwarded bytes two different documents: `serde_json` keeps the LAST
+        // `method` while a first-key-wins A2A server executes the FIRST, so
+        // `{"method":"tasks/cancel","method":"message/send"}` would be policed
+        // as `message/send` (GHSA-c78j-5w9p-cpq6, GHSA-49cr-v28q-9hgp). Such a
+        // body, a singleton or a batch, cannot be classified: under a policy
+        // that can deny it fails closed, otherwise it is left unclassified.
+        // A batch refusal is still a batch answering every request member
+        // (JSON-RPC 2.0 section 6), like the unclassifiable-batch path below.
+        // Malformed JSON is not ambiguous and keeps its own handling below.
+        if json_dup_keys::slice_ambiguity(body).is_some() {
+            warn_sampled!(
+                body_size = body.len(),
+                "A2A JSON-RPC request body has duplicate member names and cannot be classified"
+            );
+            let is_batch = body
+                .iter()
+                .find(|byte| !byte.is_ascii_whitespace())
+                .is_some_and(|byte| *byte == b'[');
+            if !is_batch {
+                return self.jsonrpc_inspection_failed_detection(false);
+            }
+            let mut detection = self.jsonrpc_inspection_failed_detection(true)?;
+            // Only member names were ambiguous, not the array shape, so the
+            // ids every member is owed are still readable.
+            detection.jsonrpc_batch_ids = Some(
+                serde_json::from_slice::<Value>(body)
+                    .ok()
+                    .and_then(|value| {
+                        value
+                            .as_array()
+                            .map(Vec::as_slice)
+                            .map(collect_batch_response_ids)
+                    })
+                    .unwrap_or(BatchResponseIds::NoneAnswerable),
+            );
+            return Some(detection);
+        }
         let value: Value = serde_json::from_slice(body).ok()?;
         if let Some(batch) = value.as_array() {
             return self.detect_jsonrpc_batch(ctx, batch, headers);
@@ -1545,12 +1584,17 @@ impl A2aGateway {
         if serde_json::from_slice::<serde::de::IgnoredAny>(body).is_err() {
             return Some(FinalClassUnprovable::Unreadable);
         }
+        // A duplicate-member body was left unclassified by
+        // `detect_jsonrpc_body`; which class a first-key-wins server sees is
+        // unknowable, so it is refused too. Only member names are ambiguous,
+        // not the array shape, so a batch is still answered as a batch below.
+        let ambiguous = json_dup_keys::slice_ambiguity(body).is_some();
         let is_array = body
             .iter()
             .find(|byte| !byte.is_ascii_whitespace())
             .is_some_and(|byte| *byte == b'[');
         if !is_array {
-            return None;
+            return ambiguous.then_some(FinalClassUnprovable::Unreadable);
         }
         // Only reached for a changed, unclassifiable batch; the tree is bounded
         // by the same ceiling and is needed to answer every request member.

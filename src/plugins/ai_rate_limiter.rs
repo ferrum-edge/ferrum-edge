@@ -32,6 +32,8 @@
 //! rather than being charged zero tokens against a budget.
 
 use crate::plugins::utils::log_sampling::warn_sampled;
+use crate::plugins::utils::principal::{self, Principal};
+use crate::util::json_dup_keys;
 
 use async_trait::async_trait;
 use serde_json::Value;
@@ -769,13 +771,13 @@ impl AiRateLimiter {
     }
 
     fn rate_key(&self, ctx: &RequestContext) -> String {
+        // A mapped Consumer (`consumer:`) and an unmapped external principal
+        // (`external:`, keyed with its realm) never share a token window
+        // (GHSA-rxwj-x6c6-f4j5).
         if self.limit_by == "consumer"
-            && let Some(identity) = ctx.effective_identity()
+            && let Some(principal) = Principal::of_request(ctx)
         {
-            let mut key = String::with_capacity(identity.len() + 9);
-            key.push_str("consumer:");
-            key.push_str(identity);
-            return key;
+            return principal.key();
         }
 
         let ip = crate::util::client_identity::rate_limit_client_ip_string(&ctx.client_ip, 64)
@@ -842,10 +844,11 @@ impl AiRateLimiter {
     /// The ceiling of this request's default (non-model) window: its
     /// consumer's `consumer_limits` override, else `token_limit`.
     fn default_limit(&self, ctx: &RequestContext) -> u64 {
+        // `consumer_limits` names mapped Consumers only.
         if self.limit_by == "consumer"
             && !self.consumer_limits.is_empty()
-            && let Some(identity) = ctx.effective_identity()
-            && let Some(limit) = self.consumer_limits.get(identity)
+            && let Some(username) = principal::consumer_username(ctx)
+            && let Some(limit) = self.consumer_limits.get(username)
         {
             return *limit;
         }
@@ -2357,8 +2360,21 @@ fn is_cohere_v1_chat_path(path: &str) -> bool {
 
 /// Parse one request document, ignoring a leading UTF-8 byte-order mark that
 /// lenient upstream parsers skip but `serde_json` rejects.
+///
+/// A document with duplicate object member names does not parse here.
+/// `serde_json` keeps the LAST duplicate while many provider SDKs and
+/// upstreams keep the FIRST, so `{"model":"gpt-4o","model":"gpt-4o-mini"}`
+/// would be charged to the `gpt-4o-mini` budget and served as `gpt-4o`, and a
+/// duplicated `max_tokens` or `messages` would shrink the reservation
+/// (GHSA-c78j-5w9p-cpq6, GHSA-49cr-v28q-9hgp). Every caller already treats an
+/// object-shaped body that does not parse as an uninspectable AI call: refused
+/// when `model_limits` is configured (its budget cannot be established),
+/// otherwise admitted unmetered under `on_unmetered_response`.
 fn parse_request_json(text: &str) -> Option<Value> {
     let text = text.strip_prefix('\u{feff}').unwrap_or(text);
+    if json_dup_keys::str_ambiguity(text).is_some() {
+        return None;
+    }
     serde_json::from_str::<Value>(text).ok()
 }
 

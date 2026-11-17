@@ -13054,14 +13054,44 @@ components:
             maximum: 65535
         consumer:
           description: >-
-            Authenticated consumer username, falling back to the external
-            authenticated identity. Only authoritative after the authentication
-            boundary — a trigger using it does not gate hooks at or before
+            Username of the mapped gateway Consumer. Never matches an unmapped
+            external identity, even one that spells the same string; use
+            `external_identity` for those. Only authoritative after the
+            authentication boundary — a trigger using it does not gate hooks at or before
             `authenticate`, never gates a stream connection at all (whose one
             gated phase, `on_stream_connect`, is also where stream
             authentication runs), and is rejected outright on an authentication
             plugin and on a stream-only plugin where it could gate nothing.
           $ref: "#/components/schemas/PluginTriggerIdentityMatch"
+        external_identity:
+          description: >-
+            Unmapped external identity (a `jwks_auth`, `oidc_relying_party`,
+            `oauth2_introspection`, `ldap_auth`, or `soap_ws_security`
+            principal), present only when no gateway Consumer is mapped. Combine
+            it with `external_identity_authority` (or, for a single-authority
+            mechanism, `auth_method`) under `all` to scope it to one verifying
+            authority.
+            Post-authentication only, with the same stream limitation and the
+            same refusals as `consumer`.
+          $ref: "#/components/schemas/PluginTriggerIdentityMatch"
+        external_identity_authority:
+          type: array
+          minItems: 1
+          maxItems: 64
+          description: >-
+            Verifying authority of the unmapped external identity: the opaque
+            64-character hex realm digest committed with it at the
+            authentication boundary (the value `opa` exposes as
+            `input.consumer.realm.authority`). Two providers of one mechanism
+            have different digests, so combining this with
+            `external_identity` keeps an equal subject from another authority
+            out of an exemption. The list is an OR, comparison is
+            case-insensitive, and a principal without a committed authority
+            never matches. Post-authentication only, with the same stream
+            limitation and the same refusals as `consumer`.
+          items:
+            type: string
+            pattern: "^[0-9A-Fa-f]{64}$"
         auth_method:
           type: array
           minItems: 1
@@ -14568,8 +14598,9 @@ components:
           description: >-
             Budget dimension. `connection` (default) gives every WebSocket
             session its own bucket. `consumer` shares one bucket across every
-            session of the authenticated identity (mapped Consumer username,
-            else the external authenticated identity); anonymous sessions share
+            session of the authenticated principal (a mapped Consumer, or an
+            unmapped external identity keyed together with its verifying realm,
+            so the two never share a bucket); anonymous sessions share
             their client IP's bucket. `ip` shares one bucket per resolved client
             IP. `service` shares one bucket per proxy. The identity is resolved
             once at upgrade admission. Aggregate budgets use the same 50,000-key
@@ -32671,7 +32702,7 @@ components:
           items:
             type: string
             minLength: 1
-          description: "Effective consumer identities for `scope: consumers` rules. Each listed identity gets an independent counter using this rule's windows. Matched against mapped Consumer username first, then external authenticated identity. A repeated identity is rejected here and across rules; JSON Schema can only express the within-rule half, so the cross-rule duplicate is refused by the plugin constructor alone."
+          description: "Effective consumer identities for `scope: consumers` rules. Each listed identity gets an independent counter using this rule's windows. Matched against the mapped Consumer username only; an unmapped external identity never matches, even one that spells a listed username, and is counted under its own realm-scoped key. A repeated identity is rejected here and across rules; JSON Schema can only express the within-rule half, so the cross-rule duplicate is refused by the plugin constructor alone."
         requests_per_second:
           type: integer
           format: uint64
@@ -33381,6 +33412,9 @@ components:
                       type: [string, "null"]
                   consumers:
                     type: [array, "null"]
+                    description: >-
+                      Mapped Consumer usernames. An unmapped external identity
+                      never matches, even one that spells a listed username.
                     items:
                       type: string
                       minLength: 1
@@ -33807,6 +33841,9 @@ components:
                 type: [string, "null"]
             consumers:
               type: [array, "null"]
+              description: >-
+                Mapped Consumer usernames. An unmapped external identity never
+                matches, even one that spells a listed username.
               items:
                 type: string
                 minLength: 1
@@ -33838,6 +33875,9 @@ components:
             minLength: 1
         consumers:
           type: [array, "null"]
+          description: >-
+            Mapped Consumer usernames. An unmapped external identity never
+            matches, even one that spells a listed username.
           items:
             type: string
             minLength: 1
@@ -34671,7 +34711,10 @@ components:
                 type: string
                 minLength: 1
               default: []
-              description: Consumer identities that skip validation.
+              description: >-
+                Mapped Consumer usernames that skip validation. An unmapped
+                external identity never matches, even one that spells a listed
+                username.
             header_present:
               type: object
               propertyNames:
@@ -39347,10 +39390,12 @@ components:
             minimum: 1
             maximum: 18446744073709551615
           description: >-
-            Per-consumer token ceilings, keyed by the exact authenticated
-            identity that limit_by=consumer keys on (requires limit_by
-            consumer). A listed consumer keeps its own window; only the ceiling
-            differs. Unlisted consumers and IP-keyed fallbacks use token_limit.
+            Per-consumer token ceilings, keyed by mapped Consumer username
+            (requires limit_by consumer). An unmapped external identity never
+            matches, even one that spells a listed username. A listed consumer
+            keeps its own window; only the ceiling differs. Unlisted
+            consumers, external identities, and IP-keyed fallbacks use
+            token_limit.
         model_limits:
           type: object
           maxProperties: 1024

@@ -951,7 +951,11 @@ pub fn check_peer_version_compatibility(
 /// revision: bump it on every change to the ConfigSync messages, frame
 /// semantics, or the snapshot/delta JSON contract, even when the crate
 /// version stays the same.
-pub const CONFIG_SYNC_PROTOCOL_REVISION: u32 = 5;
+///
+/// Revision 6: plugin triggers gained the `external_identity` and
+/// `external_identity_authority` leaf predicates (GHSA-rxwj-x6c6-f4j5), which
+/// a pre-change peer's closed `PluginTriggerMatch` refuses.
+pub const CONFIG_SYNC_PROTOCOL_REVISION: u32 = 6;
 
 /// Leading text of every ConfigSync build-mismatch refusal. The DP recognises
 /// the CP's `FAILED_PRECONDITION` Subscribe status by this prefix.

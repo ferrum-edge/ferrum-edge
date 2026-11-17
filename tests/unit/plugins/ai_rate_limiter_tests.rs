@@ -10357,3 +10357,115 @@ async fn a_body_bearing_get_never_consults_the_budget() {
     );
     assert!(!has_scoped_meta(&get, "ai_ratelimit_request"));
 }
+
+// ─── GHSA-49cr-v28q-9hgp: duplicate JSON members ─────────────────────────
+
+/// Duplicate member names make the budgeted document and the forwarded bytes
+/// two different documents: `serde_json` keeps the LAST `model`, while a
+/// first-key-wins upstream serves the FIRST. Such a body cannot name its model
+/// budget, so with `model_limits` it is refused like any other unreadable
+/// candidate, at arrival and on the final backend-visible body.
+#[tokio::test]
+async fn a_duplicated_model_member_cannot_select_a_model_budget() {
+    let plugin = model_budget_limiter();
+    let ambiguous = [
+        // Charged to the default window as `cheap`, served as `o1`.
+        r#"{"model":"o1","model":"cheap","messages":[{"role":"user","content":"hi"}],"max_tokens":10}"#,
+        // An escaped spelling of the same member name.
+        r#"{"model":"o1","mod\u0065l":"cheap","messages":[{"role":"user","content":"hi"}],"max_tokens":10}"#,
+        // A nested duplicate changes the prompt estimate.
+        r#"{"model":"o1","messages":[{"role":"user","content":"a long prompt","content":"hi"}],"max_tokens":10}"#,
+    ];
+    for body in ambiguous {
+        let mut ctx = post_ctx_with_body(body);
+        assert_reject(
+            plugin.before_proxy(&mut ctx, &mut json_headers()).await,
+            Some(400),
+        );
+        assert!(
+            !has_scoped_meta(&ctx, "ai_ratelimit_budget_model"),
+            "{body}"
+        );
+        assert!(!has_scoped_meta(&ctx, "ai_ratelimit_request"), "{body}");
+    }
+
+    // An admitted call a transform rewrites into a duplicate-member body is
+    // refused on the final body instead of being re-attributed.
+    let mut ctx = post_ctx_with_body(&chat_body("cheap"));
+    assert_continue(plugin.before_proxy(&mut ctx, &mut json_headers()).await);
+    assert_reject(
+        plugin
+            .on_final_request_body_with_context(&mut ctx, &json_headers(), ambiguous[0].as_bytes())
+            .await,
+        Some(400),
+    );
+
+    // Without model budgets the same body is an uninspectable AI candidate:
+    // admitted with no estimate taken from the ambiguous document.
+    let plain = local_limiter(10_000, "total_tokens", "ip");
+    let mut ctx = post_ctx_with_body(ambiguous[0]);
+    assert_continue(plain.before_proxy(&mut ctx, &mut json_headers()).await);
+    assert!(has_scoped_meta(&ctx, "ai_ratelimit_request"));
+    assert!(has_scoped_meta(&ctx, "ai_ratelimit_compressed_ai_request"));
+}
+
+// ─── GHSA-rxwj-x6c6-f4j5: Consumer vs external identity ─────────────────
+
+/// `consumer_limits` names mapped Consumers only, and `limit_by: consumer`
+/// keeps an external identity that spells a Consumer's username on its own
+/// window.
+#[tokio::test]
+async fn consumer_limits_and_windows_never_apply_to_an_external_identity() {
+    let plugin = AiRateLimiter::new(
+        &json!({
+            "token_limit": 1000,
+            "window_seconds": 60,
+            "limit_by": "consumer",
+            "consumer_limits": {"testuser": 50},
+            "expose_headers": true
+        }),
+        PluginHttpClient::default(),
+    )
+    .unwrap();
+
+    // The mapped Consumer `testuser` spends its 50-token override.
+    let mut consumer = ai_request_ctx(10, "hi");
+    assert_continue(
+        plugin
+            .before_proxy(&mut consumer, &mut HashMap::new())
+            .await,
+    );
+    assert_eq!(
+        scoped_meta(&consumer, "ai_ratelimit_limit").map(String::as_str),
+        Some("50")
+    );
+    assert_continue(
+        plugin
+            .on_response_body(
+                &mut consumer,
+                200,
+                &mut json_headers(),
+                &openai_response(30, 20),
+            )
+            .await,
+    );
+
+    // A jwks_auth principal named `testuser` gets neither the override nor the
+    // Consumer's exhausted window.
+    let mut external = ai_request_ctx(10, "hi");
+    super::plugin_utils::commit_external_identity(&mut external, "testuser", "jwks_auth");
+    assert_continue(
+        plugin
+            .before_proxy(&mut external, &mut HashMap::new())
+            .await,
+    );
+    assert_eq!(
+        scoped_meta(&external, "ai_ratelimit_limit").map(String::as_str),
+        Some("1000")
+    );
+    assert_eq!(
+        scoped_meta(&external, "ai_ratelimit_usage"),
+        scoped_meta(&external, "ai_ratelimit_reserved_tokens"),
+        "the external window holds only this call's reservation"
+    );
+}

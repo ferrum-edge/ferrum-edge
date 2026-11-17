@@ -48,6 +48,7 @@ use crate::util::unknown_keys::reject_unknown_keys;
 use super::charged_decode::{ChargedDecodeError, decode_one_chain_coding};
 use super::utils::auth_flow::constant_time_eq;
 use super::utils::content_encoding::parse_content_codings_including_zstd;
+use super::utils::principal;
 use super::utils::sse::{is_text_event_stream_media_type, original_response_is_event_stream};
 use super::utils::synthetic_response::{
     request_method_omits_response_body, synthetic_response_omits_body,
@@ -1137,8 +1138,11 @@ impl OpenapiValidator {
         {
             return Some("bypass_method");
         }
-        if let Some(identity) = ctx.effective_identity()
-            && self.bypass_consumers.contains(identity)
+        // `bypass.consumers` names mapped Consumers only; an unmapped external
+        // identity that spells a listed username is still validated
+        // (GHSA-rxwj-x6c6-f4j5).
+        if let Some(username) = principal::consumer_username(ctx)
+            && self.bypass_consumers.contains(username)
         {
             return Some("bypass_consumer");
         }

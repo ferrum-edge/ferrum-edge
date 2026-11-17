@@ -32,7 +32,6 @@ use crate::plugins::utils::log_sampling::warn_sampled;
 
 use async_trait::async_trait;
 use serde_json::Value;
-use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -40,6 +39,7 @@ use std::time::{Duration, Instant};
 use tracing::debug;
 
 use super::utils::body_transform::is_json_content_type;
+use super::utils::principal::Principal;
 use super::utils::rate_limit::{
     DynamicHttpRateLimitAlgorithm, DynamicRateLimitOp, ENFORCEMENT_UNAVAILABLE_BODY,
     ENFORCEMENT_UNAVAILABLE_STATUS, LocalStateSemantics, RATE_LIMIT_REDIS_CONFIG_KEYS,
@@ -490,29 +490,27 @@ impl GraphqlPlugin {
 
     /// Build the rate limit key based on `limit_by` config.
     ///
-    /// The identity is tagged `consumer:` or `ip:` (as in `rate_limiting`) so an
-    /// identity string that equals an IP never shares a budget with the
-    /// unauthenticated caller at that IP.
+    /// The caller is keyed as in `rate_limiting`: `consumer:<username>` for a
+    /// mapped Consumer, `external:<realm>:<identity>` for an unmapped external
+    /// principal (so neither namespace nor two realms share a budget,
+    /// GHSA-rxwj-x6c6-f4j5), else `ip:`, so an identity string that equals an
+    /// IP never shares a budget with the unauthenticated caller at that IP.
     fn rate_key(&self, ctx: &RequestContext, kind: &str, value: &str) -> String {
-        let (identity_kind, identity) = match (self.limit_by == "consumer")
-            .then(|| ctx.effective_identity())
-            .flatten()
-        {
-            Some(identity) => ("consumer:", Cow::Borrowed(identity)),
-            None => (
-                "ip:",
-                Cow::Owned(
-                    crate::util::client_identity::rate_limit_client_ip_string(&ctx.client_ip, 64)
-                        .unwrap_or_else(|| ctx.client_ip.clone()),
-                ),
-            ),
-        };
-        let mut key = String::with_capacity(
-            4 + identity_kind.len() + identity.len() + kind.len() + value.len() + 2,
-        );
+        let principal = (self.limit_by == "consumer")
+            .then(|| Principal::of_request(ctx))
+            .flatten();
+        let mut key = String::with_capacity(4 + kind.len() + value.len() + 2 + 64);
         key.push_str("gql:");
-        key.push_str(identity_kind);
-        key.push_str(&identity);
+        match principal {
+            Some(principal) => principal.push_key(&mut key),
+            None => {
+                key.push_str("ip:");
+                key.push_str(
+                    &crate::util::client_identity::rate_limit_client_ip_string(&ctx.client_ip, 64)
+                        .unwrap_or_else(|| ctx.client_ip.clone()),
+                );
+            }
+        }
         key.push(':');
         key.push_str(kind);
         key.push(':');
