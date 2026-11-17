@@ -873,22 +873,29 @@ async fn concurrent_indexed_deletes_holding_one_tag_commit_exactly_once() {
         .etag
         .expect("consumer GET issues an ETag");
 
-    let writers = (0..4).map(|_| {
-        let base = base.clone();
-        let tag = tag.clone();
-        tokio::spawn(async move {
-            send(
-                Method::DELETE,
-                &base,
-                "/consumers/rotating/credentials/keyauth/0",
-                &admin_token(),
-                Some(&tag),
-                None,
-            )
-            .await
-            .status
+    // Spawn every writer before awaiting any, and release them together, so
+    // the deletes really compete for the comparison (review sol F2).
+    let start = Arc::new(tokio::sync::Barrier::new(4));
+    let writers: Vec<_> = (0..4)
+        .map(|_| {
+            let base = base.clone();
+            let tag = tag.clone();
+            let start = start.clone();
+            tokio::spawn(async move {
+                start.wait().await;
+                send(
+                    Method::DELETE,
+                    &base,
+                    "/consumers/rotating/credentials/keyauth/0",
+                    &admin_token(),
+                    Some(&tag),
+                    None,
+                )
+                .await
+                .status
+            })
         })
-    });
+        .collect();
     let mut accepted = 0;
     for writer in writers {
         match writer.await.expect("writer task") {
