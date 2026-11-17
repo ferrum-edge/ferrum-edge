@@ -232,6 +232,51 @@ impl TlsInventory {
     }
 }
 
+/// One configured TLS source reference and the resource that makes it,
+/// without the material behind it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TlsSourceReference {
+    /// The configured source scheme (`managed`, `acme`, `file`, ...), the
+    /// same label an inventory entry reports before its material is loaded.
+    pub source_kind: String,
+    /// The configured source identifier, as in
+    /// [`TlsInventorySource::identifier`].
+    pub identifier: String,
+    pub usage: TlsInventoryUsage,
+}
+
+/// Every TLS source `gateway_config` references, with the referencing
+/// resource. Loads no material, so it is cheap enough for an admin request
+/// path. The managed-TLS and ACME delete guards run it over every namespace
+/// in the configuration store, not only the configuration this process
+/// serves (issue #7394).
+pub fn gateway_source_references(gateway_config: &GatewayConfig) -> Vec<TlsSourceReference> {
+    let mut sources = Vec::new();
+    collect_gateway_sources(gateway_config, &mut sources);
+    into_source_references(sources)
+}
+
+/// Every TLS source this process's environment references (`resource_type`
+/// `env`). Loads no material.
+pub fn env_source_references(env_config: &EnvConfig) -> Vec<TlsSourceReference> {
+    let mut sources = Vec::new();
+    collect_env_sources(env_config, &mut sources);
+    into_source_references(sources)
+}
+
+fn into_source_references(sources: Vec<InventorySourceRef>) -> Vec<TlsSourceReference> {
+    sources
+        .into_iter()
+        .map(|source_ref| TlsSourceReference {
+            source_kind: configured_source_kind(&source_ref.source)
+                .as_str()
+                .to_string(),
+            identifier: source_ref.source.source_id(),
+            usage: source_ref.usage,
+        })
+        .collect()
+}
+
 impl InventoryEntryBuilder {
     fn into_entry(self, scope: InventoryScope) -> TlsInventoryEntry {
         let source_kind = configured_source_kind(&self.source);

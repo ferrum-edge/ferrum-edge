@@ -15,6 +15,7 @@ mod frontend_live_reload_arming_tests;
 mod frontend_trust_binding_tests;
 mod inbound_crl_resumption_tests;
 mod inventory_public_metadata_tests;
+mod inventory_source_references_tests;
 mod managed_store_ha_tests;
 mod material_size_cap_tests;
 mod material_size_config_tests;

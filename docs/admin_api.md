@@ -676,7 +676,7 @@ curl -X POST -H "Authorization: Bearer $TOKEN" \
   http://localhost:9000/admin/tls/acme/certificates
 ```
 
-Responses return non-secret certificate metadata, source URI, issuer, SANs, validity, fingerprint, ACME directory/account/order metadata, and timestamps. Private keys are persisted but never returned. Create, update, and delete operations ask active TLS source watchers to re-pull immediately; `DELETE` returns `409 Conflict` when the current runtime/config inventory still references the record. SAN strings use the same canonical representation as [TLS Inventory](#tls-inventory).
+Responses return non-secret certificate metadata, source URI, issuer, SANs, validity, fingerprint, ACME directory/account/order metadata, and timestamps. Private keys are persisted but never returned. Create, update, and delete operations ask active TLS source watchers to re-pull immediately; `DELETE` returns `409 Conflict` when any configuration still references the record (see [Managed record deletion](#managed-record-deletion)). SAN strings use the same canonical representation as [TLS Inventory](#tls-inventory).
 
 Import, update, and order finalization return `413 Payload Too Large` when the certificate, private key, or combined certificate chain exceeds `FERRUM_TLS_MAX_MATERIAL_SIZE_BYTES`; the error never echoes material or source identifiers.
 
@@ -816,7 +816,58 @@ config:
 - **Trust.** A present record with usable keys is `fresh` (no interval-based grace). A deleted, wrong-kind, oversized, malformed, or keyless record withdraws every key and the consumer refuses tokens, exactly like an expired remote set (`expired` in `jwks_trust`, readiness `unavailable`). A store that cannot be read keeps the last-read keys in `grace` for at most `jwks_max_stale_seconds`.
 - **Control plane / data plane.** The record never travels on ConfigSync: the plugin config carries only the reference, and each node resolves it from its own `FERRUM_TLS_MANAGED_STORE_PATH`, like every other `managed://` source. Point the CP and every DP at one shared store volume (see [Managed TLS And ACME Across Multiple Replicas](frontend_tls.md#managed-tls-and-acme-across-multiple-replicas)); a DP without the record refuses the provider's tokens.
 
-`DELETE` returns `409 Conflict` when the current runtime/config inventory still references the record.
+`DELETE` returns `409 Conflict` when any configuration still references the record (see [Managed record deletion](#managed-record-deletion)).
+
+### Managed record deletion
+
+`DELETE` on a managed certificate, CA bundle, CRL, OCSP response, or JWKS
+record, and on an ACME certificate, returns `409 Conflict` while any
+configuration still names the record, with the referencing resources in
+`used_by`. Every gateway that shares `FERRUM_TLS_MANAGED_STORE_PATH` reads the
+record whatever namespace it serves, while a database-mode node serves only
+`FERRUM_NAMESPACE` (and a control plane only `FERRUM_CP_NAMESPACES`) and its
+Admin API writes any namespace through `X-Ferrum-Namespace`. The check
+therefore covers this node's environment and served configuration and, on a
+node with a configuration store (database and CP modes), every namespace in
+that store; `used_by[].namespace` names the namespace of a reference found
+there. Disabled plugin configs do not hold a reference. If the store cannot
+be read, the delete is refused with `503` rather than guessed.
+
+The scan and the delete are fenced against concurrent configuration writes.
+The delete pins the config store's write topology, takes the
+namespace-registry admission lease and every listed namespace's config
+admission lease (the same leases every admin writer holds from validation to
+commit), reads only proxies, upstreams and plugin configs under them,
+re-reads the namespace list, and removes the record only after the TLS store
+has re-validated the fence under its own exclusive lock. The store checks the
+fence again once the removal is persisted, still under that lock, and restores
+the record if the fence lapsed while the write was being persisted. The fence
+stays held until that store write concludes, even if the request is
+cancelled; if it lapsed or the topology changed, the record is left (or put
+back) in place and the answer is `503`.
+A namespace that appears during the scan restarts it (up to three times,
+then `503`).
+
+What the fence guarantees: no write in a scanned namespace commits between
+the scan and the delete, so the `409`/`200` answer reflects the stored
+configuration at the moment the record is removed. What happens to a write
+that was waiting depends on whether its admission resolves the record. A
+`managed://jwks/...` reference from `jwks_auth` or `oidc_relying_party` is
+checked against the store, so it then fails admission (`400`) because the
+record is gone. Backend TLS paths on proxies and upstreams
+(`backend_tls_*_path`) are not resolved at admission, so such a write then
+commits a reference to the deleted record, exactly as it could reference a
+record that never existed; the backend TLS connection fails until the record
+is restored.
+
+One window remains: a first write into a namespace that still has no rows
+when the list is re-read can commit before the record is removed, because no
+lease covers a name that does not exist yet. While the fence is held, every
+configuration write in the store waits, so a managed TLS delete briefly
+pauses admin writes fleet-wide. Nodes without
+a store (file and data-plane modes) check only their own configuration, and
+no node can see another process's environment, so a record named only by
+another gateway's `FERRUM_*` TLS settings is not protected by this check.
 
 ## Cached-config read fallback
 
@@ -1396,8 +1447,9 @@ curl -X POST -H "Authorization: Bearer $TOKEN" \
   -d '{"key": "rotated-api-key-0123456789"}' \
   http://localhost:9000/consumers/{consumer_id}/credentials/keyauth
 
-# Delete a specific credential by index (0-based)
-curl -X DELETE -H "Authorization: Bearer $TOKEN" \
+# Delete a specific credential by index (0-based), conditioned on the
+# Consumer's ETag from the GET the index was chosen from
+curl -X DELETE -H "Authorization: Bearer $TOKEN" -H "If-Match: $CONSUMER_ETAG" \
   http://localhost:9000/consumers/{consumer_id}/credentials/keyauth/0
 
 # Delete all credentials of a type
@@ -1431,7 +1483,21 @@ and the previous configuration is kept.
 Credential rotation workflow:
 1. `POST .../credentials/keyauth` with the new key — both old and new are now active
 2. Roll out the new key to all clients
-3. `DELETE .../credentials/keyauth/0` to remove the old key
+3. `GET /consumers/{consumer_id}`, then `DELETE .../credentials/keyauth/0` with
+   that response's `ETag` as `If-Match` to remove the old key
+
+The index is a position in the array as the caller last read it, and every
+entry reads back redacted, so an index alone cannot say which credential was
+meant once another writer (another admin, a second UI tab, automation) has
+appended or removed one: an unconditional indexed delete removes whatever
+entry now sits at that position. The credential endpoints (`PUT`, `POST` and
+`DELETE` on `/consumers/{id}/credentials/{cred_type}`, and the indexed
+`DELETE`) therefore evaluate `If-Match` against the Consumer's own `ETag` from
+`GET /consumers/{id}`. The comparison runs under the namespace admission lease
+the write commits under, so any change to the Consumer since that read is
+refused with `412 Precondition Failed` and nothing is written; re-read the
+Consumer and choose the entry again. Omitting `If-Match` keeps the write
+unconditional. See [Conditional writes](#conditional-writes-etag--if-match).
 
 Max credentials per type is controlled by `FERRUM_MAX_CREDENTIALS_PER_TYPE` (default: 2).
 
@@ -1638,7 +1704,10 @@ curl -X PUT -H "Authorization: Bearer $TOKEN" -H "If-Match: $ETAG" \
   Comparison is strong, so a weak `W/"…"` tag never matches. A comma-separated list
   matches if any member does. A malformed or empty `If-Match` is `400`, never
   treated as absent. Row preconditions apply only to `PUT`/`DELETE` on the
-  four resource routes above. `POST /restore` supports the separate namespace
+  four resource routes above and to the consumer credential endpoints
+  (`PUT`/`POST`/`DELETE /consumers/{id}/credentials/{cred_type}` and
+  `DELETE /consumers/{id}/credentials/{cred_type}/{index}`), which take the
+  Consumer's tag. `POST /restore` supports the separate namespace
   precondition described below. Opt-in deployment removal and spec replacement
   use the separate [deployment authority profile](deployment_mutations.md).
   `If-Match` on any other mutating route (including

@@ -888,6 +888,39 @@ impl AcmeCertificateStore {
         })
     }
 
+    /// Delete `id` only while `still_authorized` holds (issue #7394).
+    ///
+    /// The check runs under the store's exclusive lock immediately before the
+    /// record is removed, and again after the removal has been persisted. If
+    /// it fails before, nothing changes; if it fails after (the caller's lease
+    /// lapsed while persistence I/O stalled), the record is restored before
+    /// the lock is released. Either way the result is `Ok(None)`, so a delete
+    /// made without authority is never left in place or reported as done.
+    pub fn delete_certificate_if_authorized(
+        &self,
+        id: &str,
+        still_authorized: impl Fn() -> bool,
+    ) -> Result<Option<AcmeCertificateRecord>, AcmeError> {
+        validate_acme_id(id)?;
+        let id = id.to_string();
+        let outcome = self.file.mutate_if_confirmed(
+            |document| {
+                if !document.certificates.contains_key(&id) {
+                    return Err(AcmeError::NotFound(id.clone()));
+                }
+                if !still_authorized() {
+                    return Ok((false, None));
+                }
+                match document.certificates.remove(&id) {
+                    Some(record) => Ok((true, Some(record))),
+                    None => Err(AcmeError::NotFound(id.clone())),
+                }
+            },
+            &still_authorized,
+        )?;
+        Ok(outcome.flatten())
+    }
+
     pub fn material(
         &self,
         identifier: &str,

@@ -1083,6 +1083,22 @@ impl NamespaceRegistryAdmission {
             .collect()
     }
 
+    /// Whether every lease this admission holds (the registry key and each
+    /// namespace) is still valid by this process's local liveness view.
+    pub(crate) fn ensure_all_held(&self) -> Result<(), anyhow::Error> {
+        self.guards
+            .iter()
+            .try_for_each(NamespaceConfigAdmissionGuard::ensure_held)
+    }
+
+    /// Test-only: mark every lease invalid, as a lapsed renewal would.
+    #[cfg(feature = "test-support")]
+    pub(crate) fn force_lose_for_test(&self) {
+        for guard in &self.guards {
+            guard.force_lose_for_test();
+        }
+    }
+
     /// Observe the global registry lease across a persistence future that is
     /// not cancellation-safe. The per-name leases are verified at the commit
     /// boundary by the backend; this is the local liveness view.
@@ -3350,6 +3366,20 @@ fn if_match_refusal<R: AdminResource>(
             id
         )}),
     ))
+}
+
+/// `If-Match` for the `/consumers/{id}/credentials/...` mutations, evaluated
+/// against the Consumer the credential handler read under the namespace
+/// admission lease. The tag is the Consumer's own `ETag` from
+/// `GET /consumers/{id}`, so the same tag conditions a whole-Consumer write
+/// and a credential sub-route write (issue #7393).
+pub(crate) fn consumer_if_match_refusal(
+    state: &AdminState,
+    if_match: Option<&IfMatch>,
+    consumer_id: &str,
+    consumer: &Consumer,
+) -> Option<Response<Full<Bytes>>> {
+    if_match_refusal::<Consumer>(state, if_match, consumer_id, Some(consumer))
 }
 
 /// The caller-supplied set of proxies expected to reference a plugin

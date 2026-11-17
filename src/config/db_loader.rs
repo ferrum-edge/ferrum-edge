@@ -2941,6 +2941,38 @@ impl DatabaseStore {
         Ok(config)
     }
 
+    /// Load proxies, upstreams and plugin configs (the resources that can name
+    /// a TLS source) in one primary snapshot, for the managed TLS / ACME
+    /// delete guard (issue #7394). Consumers and trust bundles are not read.
+    pub async fn load_namespace_tls_reference_graph(
+        &self,
+        namespace: &str,
+    ) -> Result<GatewayConfig, anyhow::Error> {
+        let start = Instant::now();
+        let loaded_at = Utc::now();
+        let mut tx = self.pool().begin().await?;
+        self.configure_full_load_snapshot(&mut tx).await?;
+        let purpose = FullLoadPurpose::AdmissionValidation;
+        let proxies = self.load_proxies_tx(namespace, purpose, &mut tx).await?;
+        let plugin_configs = self
+            .load_plugin_configs_tx(namespace, purpose, &mut tx)
+            .await?;
+        let upstreams = self.load_upstreams_tx(namespace, purpose, &mut tx).await?;
+        tx.commit().await?;
+        let mut config = GatewayConfig {
+            version: crate::config::types::CURRENT_CONFIG_VERSION.to_string(),
+            proxies,
+            plugin_configs,
+            upstreams,
+            loaded_at,
+            known_namespaces: Vec::new(),
+            ..Default::default()
+        };
+        config.normalize_fields();
+        self.check_slow_query("load_namespace_tls_reference_graph", start);
+        Ok(config)
+    }
+
     /// Load the policy-graph neighborhood `scope` names with indexed point
     /// reads in one snapshot transaction, so plugin-graph admission costs what
     /// the write touches rather than the namespace (issue #6056). Equal to
@@ -12668,6 +12700,13 @@ impl DatabaseBackend for DatabaseStore {
         namespace: &str,
     ) -> Result<GatewayConfig, anyhow::Error> {
         DatabaseStore::load_namespace_policy_graph(self, namespace).await
+    }
+
+    async fn load_namespace_tls_reference_graph(
+        &self,
+        namespace: &str,
+    ) -> Result<GatewayConfig, anyhow::Error> {
+        DatabaseStore::load_namespace_tls_reference_graph(self, namespace).await
     }
 
     async fn load_namespace_policy_neighborhood(
