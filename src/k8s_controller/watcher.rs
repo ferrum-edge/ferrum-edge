@@ -1382,6 +1382,19 @@ pub(crate) async fn run_watcher_generations<S, F>(
                         // Proves nothing, exactly as on the generation stream.
                         Ok(Some(watcher::Event::Init)) => {}
                         Ok(Some(event)) => {
+                            // A delivered item ends a failure streak whichever
+                            // stream polled it (issue #4491), so a later fault
+                            // is announced as a new streak, not a repeat.
+                            if let Some(failed_attempts) = failure_streak.record_success() {
+                                info!(
+                                    kind = %target.kind,
+                                    api_version = %target.api_version,
+                                    scope = %target.scope,
+                                    failed_attempts,
+                                    "{} recovered; the watch is delivering again",
+                                    target.watcher_label
+                                );
+                            }
                             if matches!(event, watcher::Event::Delete(_)) {
                                 metrics
                                     .watch_deletes
