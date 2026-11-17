@@ -3158,17 +3158,30 @@ impl DestinationRuleLookupTier {
 /// authoritative side. An empty `client_namespace`, `service_namespace`, or
 /// `root_namespace` disables that tier rather than matching every rule whose
 /// own namespace also trims to empty.
+///
+/// **Root-namespace client exception** (issue #7395, Istio
+/// `PushContext.destinationRule`): when the CLIENT itself runs in the root
+/// namespace (an egress or ingress gateway in `istio-system`), only the root
+/// namespace's PRIVATE rules ([`destination_rule_is_namespace_private`]) are
+/// its client tier. Its exported rules are the mesh-wide defaults, so they
+/// stay at the root tier, behind the target service's own rules; otherwise an
+/// exported root wildcard such as `*.example.com` would override an exact
+/// owner rule for every gateway in the root namespace.
 pub fn destination_rule_lookup_tier(
-    rule_namespace: &str,
+    rule: &MeshDestinationRule,
     client_namespace: &str,
     service_namespace: Option<&str>,
     root_namespace: &str,
 ) -> DestinationRuleLookupTier {
-    let rule_namespace = rule_namespace.trim();
+    let rule_namespace = rule.namespace.trim();
     let client_namespace = client_namespace.trim();
     let service_namespace = service_namespace.map(str::trim).filter(|ns| !ns.is_empty());
     let root_namespace = root_namespace.trim();
-    if !client_namespace.is_empty() && rule_namespace == client_namespace {
+    let client_is_root = !root_namespace.is_empty() && client_namespace == root_namespace;
+    if !client_namespace.is_empty()
+        && rule_namespace == client_namespace
+        && (!client_is_root || destination_rule_is_namespace_private(rule))
+    {
         DestinationRuleLookupTier::Client
     } else if service_namespace == Some(rule_namespace) {
         DestinationRuleLookupTier::Service
@@ -3177,6 +3190,18 @@ pub fn destination_rule_lookup_tier(
     } else {
         DestinationRuleLookupTier::Unscoped
     }
+}
+
+/// Whether a DestinationRule is visible only inside its own namespace: an
+/// empty `exportTo` (namespace-local by Ferrum convention), or one whose every
+/// entry is `.` or the declaring namespace itself. Istio's
+/// root-namespace-local index holds exactly these rules; see
+/// [`destination_rule_lookup_tier`].
+pub fn destination_rule_is_namespace_private(rule: &MeshDestinationRule) -> bool {
+    let declaring_namespace = rule.namespace.trim();
+    rule.export_to
+        .iter()
+        .all(|target| target == "." || target == declaring_namespace)
 }
 
 /// Whether `entry` applies to a workload in `workload_namespace`: export
@@ -9369,9 +9394,10 @@ fn normalize_mesh_fields_internal(
         normalize_mesh_export_to(&mut dr.export_to);
     }
     // Same treatment as DestinationRule hosts: synthesis matches
-    // `policy.host` against service FQDNs via `destination_rule_host_matches`
-    // (no trimming/lowercasing there), so an un-normalized native/file host
-    // like `" Svc.Default "` would silently attach no CORS plugin.
+    // `policy.host` against service FQDNs via `destination_rule_host_specificity`
+    // (exact matches only), so the recorded host must be canonical too: an
+    // un-normalized native/file host like `" Svc.Default "` must not survive
+    // into the slice.
     for policy in virtual_service_cors_policies {
         policy.host = normalize_mesh_hostname_like(&policy.host);
         normalize_mesh_export_to(&mut policy.export_to);

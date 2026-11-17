@@ -83,7 +83,7 @@ Ferrum supports dynamic upstream target discovery through four providers, config
 ### Kubernetes Mesh Translation
 
 - **Gateway API route splits** — translates `HTTPRoute.backendRefs` and `GRPCRoute.backendRefs` into direct backends or generated weighted upstreams while preserving zero-weight rule capture semantics.
-- **Istio VirtualService route splits** — translates `VirtualService.http[].route` into direct backends or generated upstreams, including prefix, exact, and regex URI matches.
+- **Istio VirtualService route splits** — translates `VirtualService.http[].route` into direct backends or generated upstreams, including prefix, exact, and regex URI matches. Applied on gateway proxies and, for mesh-bound VirtualServices, on the NodeWaypoint data plane only: Sidecar, Ambient and ServiceWaypoint data planes do not apply `http[]` routes, and the VirtualService status reports `mesh_http_routes: node_waypoint_only` (see [docs/mesh_supported_matrix.md](docs/mesh_supported_matrix.md)).
 - **Istio AuthorizationPolicy** — translates ALLOW/DENY/AUDIT policies with Istio-compatible empty-rule semantics (ALLOW with no rules = allow-nothing)
 - **Kubernetes sidecar injector** — admission webhook with annotation-controlled opt-in, SPIFFE ID derivation from pod namespace/service account, iptables/eBPF capture init containers
 

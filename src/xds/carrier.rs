@@ -49,7 +49,9 @@ use crate::modes::mesh::config::{
     TrustBundleSet, Workload,
 };
 use crate::modes::mesh::revision::MeshConfigRevision;
-use crate::modes::mesh::slice::{MeshEgressScopeSnapshot, MeshHttpRouteSet, MeshSlice};
+use crate::modes::mesh::slice::{
+    DestinationRuleHostExclusion, MeshEgressScopeSnapshot, MeshHttpRouteSet, MeshSlice,
+};
 
 /// Common inner `type_url` prefix for every Ferrum mesh-slice carrier.
 pub const FERRUM_CARRIER_TYPE_URL_PREFIX: &str = "type.googleapis.com/ferrum.config.extension.v3.";
@@ -106,6 +108,10 @@ pub const FERRUM_ECDS_WORKLOADS_TYPE_URL: &str =
 /// Inner `type_url` for the Ambient UDP source-evidence workload inventory.
 pub const FERRUM_ECDS_AMBIENT_UDP_SOURCE_WORKLOADS_TYPE_URL: &str =
     "type.googleapis.com/ferrum.config.extension.v3.AmbientUdpSourceWorkloadsCarrier";
+/// Inner `type_url` for the control-plane-resolved DestinationRule host
+/// exclusions (`MeshSlice::destination_rule_host_exclusions`, issue #7395).
+pub const FERRUM_ECDS_DESTINATION_RULE_HOST_EXCLUSIONS_TYPE_URL: &str =
+    "type.googleapis.com/ferrum.config.extension.v3.DestinationRuleHostExclusionsCarrier";
 /// Inner `type_url` for the exact NodeWaypoint assertor SPIFFE inventory.
 pub const FERRUM_ECDS_NODE_WAYPOINT_ASSERTORS_TYPE_URL: &str =
     "type.googleapis.com/ferrum.config.extension.v3.NodeWaypointAssertorsCarrier";
@@ -279,6 +285,9 @@ pub enum MeshSliceCarrier {
     ConfigRevision(MeshConfigRevision),
     Workloads(Vec<Workload>),
     AmbientUdpSourceWorkloads(Vec<Workload>),
+    /// Control-plane-resolved DestinationRule host exclusions (issue #7395);
+    /// see [`FERRUM_ECDS_DESTINATION_RULE_HOST_EXCLUSIONS_TYPE_URL`].
+    DestinationRuleHostExclusions(Vec<DestinationRuleHostExclusion>),
     NodeWaypointAssertors(Vec<NodeWaypointAssertor>),
     /// Cross-namespace NodeWaypoint capture destination workloads (issue #3287);
     /// see [`FERRUM_ECDS_NODE_WAYPOINT_CAPTURE_DESTINATIONS_TYPE_URL`].
@@ -358,6 +367,9 @@ impl MeshSliceCarrier {
             MeshSliceCarrier::AmbientUdpSourceWorkloads(_) => {
                 FERRUM_ECDS_AMBIENT_UDP_SOURCE_WORKLOADS_TYPE_URL
             }
+            MeshSliceCarrier::DestinationRuleHostExclusions(_) => {
+                FERRUM_ECDS_DESTINATION_RULE_HOST_EXCLUSIONS_TYPE_URL
+            }
             MeshSliceCarrier::NodeWaypointAssertors(_) => {
                 FERRUM_ECDS_NODE_WAYPOINT_ASSERTORS_TYPE_URL
             }
@@ -414,6 +426,9 @@ impl MeshSliceCarrier {
             MeshSliceCarrier::ConfigRevision(_) => "config-revision",
             MeshSliceCarrier::Workloads(_) => "workloads",
             MeshSliceCarrier::AmbientUdpSourceWorkloads(_) => "ambient-udp-source-workloads",
+            MeshSliceCarrier::DestinationRuleHostExclusions(_) => {
+                "destination-rule-host-exclusions"
+            }
             MeshSliceCarrier::NodeWaypointAssertors(_) => "node-waypoint-assertors",
             MeshSliceCarrier::NodeWaypointCaptureDestinations(_) => {
                 "node-waypoint-capture-destinations"
@@ -461,6 +476,7 @@ impl MeshSliceCarrier {
             MeshSliceCarrier::ConfigRevision(value) => encode(value),
             MeshSliceCarrier::Workloads(value) => encode(value),
             MeshSliceCarrier::AmbientUdpSourceWorkloads(value) => encode(value),
+            MeshSliceCarrier::DestinationRuleHostExclusions(value) => encode(value),
             MeshSliceCarrier::NodeWaypointAssertors(value) => encode(value),
             MeshSliceCarrier::NodeWaypointCaptureDestinations(value) => encode(value),
             MeshSliceCarrier::NodeWaypointCapturePeerAuthentications(value) => encode(value),
@@ -534,6 +550,9 @@ impl MeshSliceCarrier {
             FERRUM_ECDS_WORKLOADS_TYPE_URL => MeshSliceCarrier::Workloads(decode_json(value)?),
             FERRUM_ECDS_AMBIENT_UDP_SOURCE_WORKLOADS_TYPE_URL => {
                 MeshSliceCarrier::AmbientUdpSourceWorkloads(decode_json(value)?)
+            }
+            FERRUM_ECDS_DESTINATION_RULE_HOST_EXCLUSIONS_TYPE_URL => {
+                MeshSliceCarrier::DestinationRuleHostExclusions(decode_json(value)?)
             }
             FERRUM_ECDS_NODE_WAYPOINT_ASSERTORS_TYPE_URL => {
                 MeshSliceCarrier::NodeWaypointAssertors(decode_json(value)?)
@@ -661,6 +680,9 @@ pub fn carrier_resource_name_for_type_url(type_url: &str) -> Option<&'static str
         FERRUM_ECDS_WORKLOADS_TYPE_URL => Some("ferrum-mesh-carrier/workloads"),
         FERRUM_ECDS_AMBIENT_UDP_SOURCE_WORKLOADS_TYPE_URL => {
             Some("ferrum-mesh-carrier/ambient-udp-source-workloads")
+        }
+        FERRUM_ECDS_DESTINATION_RULE_HOST_EXCLUSIONS_TYPE_URL => {
+            Some("ferrum-mesh-carrier/destination-rule-host-exclusions")
         }
         FERRUM_ECDS_NODE_WAYPOINT_ASSERTORS_TYPE_URL => {
             Some("ferrum-mesh-carrier/node-waypoint-assertors")
@@ -868,6 +890,11 @@ pub fn build_slice_carriers(slice: &MeshSlice) -> Vec<MeshSliceCarrier> {
     if !slice.ambient_udp_source_workloads.is_empty() {
         carriers.push(MeshSliceCarrier::AmbientUdpSourceWorkloads(
             slice.ambient_udp_source_workloads.clone(),
+        ));
+    }
+    if !slice.destination_rule_host_exclusions.is_empty() {
+        carriers.push(MeshSliceCarrier::DestinationRuleHostExclusions(
+            slice.destination_rule_host_exclusions.clone(),
         ));
     }
     if !slice.node_waypoint_assertors.is_empty() {
@@ -1150,6 +1177,12 @@ mod tests {
             MeshSliceCarrier::ConfigRevision(MeshConfigRevision::new("db", 42)),
             MeshSliceCarrier::Workloads(Vec::new()),
             MeshSliceCarrier::AmbientUdpSourceWorkloads(Vec::new()),
+            MeshSliceCarrier::DestinationRuleHostExclusions(vec![DestinationRuleHostExclusion {
+                namespace: "beta".to_string(),
+                name: "owner-wildcard".to_string(),
+                rule_host: "*.example.com".to_string(),
+                host: "api.example.com".to_string(),
+            }]),
             MeshSliceCarrier::NodeWaypointAssertors(vec![NodeWaypointAssertor {
                 spiffe_id: SpiffeId::new("spiffe://cluster.local/ns/ferrum/sa/node-waypoint")
                     .unwrap(),
@@ -1275,6 +1308,7 @@ mod tests {
             MeshSliceCarrier::ConfigRevision(MeshConfigRevision::new("db", 42)),
             MeshSliceCarrier::Workloads(Vec::new()),
             MeshSliceCarrier::AmbientUdpSourceWorkloads(Vec::new()),
+            MeshSliceCarrier::DestinationRuleHostExclusions(Vec::new()),
             MeshSliceCarrier::NodeWaypointAssertors(vec![NodeWaypointAssertor {
                 spiffe_id: SpiffeId::new("spiffe://cluster.local/ns/ferrum/sa/node-waypoint")
                     .unwrap(),

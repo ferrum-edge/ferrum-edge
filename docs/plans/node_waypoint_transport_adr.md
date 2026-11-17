@@ -143,7 +143,7 @@ one of the route's candidate destinations (issue #7387). A split whose external
 host a DestinationRule names is dispatched the same way; an external leg whose
 rule originates TLS is dialed over `https` with that rule's TLS, and a direct
 external backend whose rule originates TLS is refused, because carried routes
-dial plain HTTP and no rule applies to a direct backend. An external destination a wildcard DestinationRule covers is refused too, since the data plane does not apply wildcard rules. Sidecar, Ambient and
+dial plain HTTP and no rule applies to a direct backend. A wildcard DestinationRule counts like an exact one (#7395): a covered external split leg gets its own residual leg carrying the winning rule, TLS origination included, and a covered direct backend is refused whatever the rule sets, because no DestinationRule can apply to a direct backend (`wildcard_direct_backend_refused`). Sidecar, Ambient and
 ServiceWaypoint slices carry no HTTP routes. See `docs/mesh.md` ("Mesh data
 planes: NodeWaypoint route carriage").
 

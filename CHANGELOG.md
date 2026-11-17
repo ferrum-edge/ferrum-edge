@@ -422,14 +422,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     leg by leg too, so that rule applies to the host's leg alone.
   - Splits no DestinationRule names keep the workload rebinding. Sidecar and
     Ambient are unchanged.
-- **BREAKING — a NodeWaypoint carried route whose external destination a
-  wildcard DestinationRule covers is refused** (issue #7387). The data plane
-  does not apply wildcard DestinationRule hosts (`*`, `*.example.com`; see
-  #7395), so such a rule, TLS origination included, was bypassed and the host
-  dialed in plaintext. A carried route whose external split leg or direct
-  backend (its own or a `mesh_route_dispatch` rule's) a visible wildcard rule
-  covers is now refused, and the host keeps its Service route
-  (`wildcard_destination_rule_refused` in the refusal warning).
+- **BREAKING — a NodeWaypoint carried route whose direct external backend a
+  wildcard DestinationRule names is refused** (issues #7387, #7395). No
+  DestinationRule can apply to a direct backend (a carried route's own single
+  external destination or a `mesh_route_dispatch` rule's), so a wildcard rule's
+  TLS origination or connection policy would be bypassed and the host dialed
+  in plaintext. Such a route is refused, and the host keeps its Service route
+  (`wildcard_direct_backend_refused` in the refusal warning). An external
+  split leg a wildcard rule covers is dispatched on its own residual leg,
+  where the winning rule applies (#7395).
 - **BREAKING — a NodeWaypoint carried route whose direct external backend has a
   TLS-originating DestinationRule is refused** (issue #7387). Carried routes dial
   plain HTTP and no DestinationRule applies to a direct backend, so such a

@@ -1720,3 +1720,85 @@ fn service_entry_workload_selector_is_reported_deferred() {
         "an entry without workloadSelector must not report it"
     );
 }
+
+/// Issue #7390: a mesh-bound VirtualService's `http[]` routes are applied only
+/// by NodeWaypoint data planes, so its status must say so instead of reporting
+/// the route count alone. A VirtualService bound only to an ingress gateway,
+/// or one with no `http[]` routes, carries no such note.
+#[test]
+fn mesh_bound_virtual_service_status_reports_where_http_routes_apply() {
+    use ferrum_edge::k8s_controller::istio_status::{
+        VIRTUAL_SERVICE_MESH_HTTP_ROUTES_NOTE, VIRTUAL_SERVICE_MESH_HTTP_ROUTES_SCOPE,
+    };
+    let http = json!([{
+        "route": [{"destination": {
+            "host": "reviews.default.svc.cluster.local",
+            "port": {"number": 8080}
+        }}]
+    }]);
+    let report = |name: &str, spec: Value| -> (String, Value) {
+        let obj = object("networking.istio.io/v1", "VirtualService", name, spec);
+        let updates = plan_istio_status_updates(&[obj], options());
+        let update = update_for(&updates, "VirtualService", name);
+        let condition = find_condition(
+            update.status["conditions"].as_array().unwrap(),
+            "FerrumAccepted",
+        );
+        assert_eq!(condition["status"].as_str(), Some("True"), "{name}");
+        (
+            condition["message"].as_str().unwrap().to_string(),
+            update.ferrum_detail.as_ref().unwrap()["translation"]["mesh_http_routes"].clone(),
+        )
+    };
+
+    for (name, gateways) in [
+        ("omitted-gateways", None),
+        ("explicit-mesh", Some(json!(["mesh", "ingress-gw"]))),
+    ] {
+        let mut spec = json!({"hosts": ["reviews.default.svc.cluster.local"], "http": http});
+        if let Some(gateways) = gateways {
+            spec["gateways"] = gateways;
+        }
+        let (message, scope) = report(name, spec);
+        assert_eq!(
+            scope,
+            json!(VIRTUAL_SERVICE_MESH_HTTP_ROUTES_SCOPE),
+            "{name}: the status records that only NodeWaypoint applies the routes"
+        );
+        assert!(
+            message.contains(VIRTUAL_SERVICE_MESH_HTTP_ROUTES_NOTE),
+            "{name}: the condition message names the topologies that ignore them: {message}"
+        );
+    }
+
+    let (message, scope) = report(
+        "ingress-only",
+        json!({
+            "hosts": ["reviews.default.svc.cluster.local"],
+            "gateways": ["ingress-gw"],
+            "http": http
+        }),
+    );
+    assert_eq!(
+        scope,
+        Value::Null,
+        "an ingress-only VirtualService binds no mesh"
+    );
+    assert!(!message.contains(VIRTUAL_SERVICE_MESH_HTTP_ROUTES_NOTE));
+
+    let (message, scope) = report(
+        "tcp-only",
+        json!({
+            "hosts": ["reviews.default.svc.cluster.local"],
+            "tcp": [{
+                "match": [{"port": 9000}],
+                "route": [{"destination": {
+                    "host": "reviews.default.svc.cluster.local",
+                    "port": {"number": 9000}
+                }}]
+            }]
+        }),
+    );
+    assert_eq!(scope, Value::Null, "no http[] routes, nothing to qualify");
+    assert!(!message.contains(VIRTUAL_SERVICE_MESH_HTTP_ROUTES_NOTE));
+}

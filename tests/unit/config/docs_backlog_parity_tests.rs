@@ -90,6 +90,49 @@ fn mesh_supported_matrix_product_deferral_index_is_current() {
     );
 }
 
+/// Issue #7390: the sidecar GA headline must not claim VirtualService routing
+/// while Sidecar data planes do not apply mesh-bound `http[]` routes (only
+/// NodeWaypoint does), and FEATURES must qualify route splits by topology.
+#[test]
+fn virtual_service_http_routing_is_scoped_to_the_topologies_that_apply_it() {
+    let headline_start = MESH_SUPPORTED_MATRIX
+        .find("**GA track — Ferrum-native sidecar mesh.**")
+        .expect("matrix keeps the sidecar GA headline");
+    let headline_end = MESH_SUPPORTED_MATRIX[headline_start..]
+        .find("\n- **")
+        .map_or(MESH_SUPPORTED_MATRIX.len(), |end| headline_start + end);
+    let headline = &MESH_SUPPORTED_MATRIX[headline_start..headline_end];
+    assert!(
+        !headline.contains("`VirtualService` routing"),
+        "the sidecar GA headline must not claim VirtualService routing"
+    );
+    assert!(
+        headline.contains("is **not** part of the sidecar GA track"),
+        "the headline must say VirtualService http[] routing is outside the sidecar GA track"
+    );
+    for topology in [
+        "| Sidecar | **Not applied**",
+        "| ServiceWaypoint (GAMMA) | **Not applied**",
+        "| Ambient | **Not applied**",
+        "| NodeWaypoint | Applied",
+    ] {
+        assert!(
+            MESH_SUPPORTED_MATRIX.contains(topology),
+            "matrix must state the VirtualService http[] outcome per topology: {topology}"
+        );
+    }
+    assert!(
+        MESH_SUPPORTED_MATRIX.contains("mesh_http_routes: node_waypoint_only"),
+        "matrix must name the status field that reports the scope"
+    );
+    assert!(
+        FEATURES.contains(
+            "Sidecar, Ambient and ServiceWaypoint data planes do not apply `http[]` routes"
+        ),
+        "FEATURES must qualify VirtualService route splits by topology"
+    );
+}
+
 #[test]
 fn node_agent_udp_live_coverage_cites_closed_trackers_and_enrolled_destination_gate() {
     assert!(

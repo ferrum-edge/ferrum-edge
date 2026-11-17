@@ -44,6 +44,9 @@ impl Schema {
             (Self::Slice, "revision") => Self::Fields("authority sequence"),
             (Self::Slice, "service_waypoint_bound_services") => Self::Fields("namespace name"),
             (Self::Slice, "node_waypoint_assertors") => Self::Fields("spiffe_id asserts"),
+            (Self::Slice, "destination_rule_host_exclusions") => {
+                Self::Fields("namespace name rule_host host")
+            }
             (Self::Slice, "extension_configs") => Self::Fields("name namespace type_url value"),
             (
                 Self::Slice,
@@ -232,7 +235,7 @@ const SLICE: &str = "node_id namespace istio_root_namespace workload_spiffe_id w
     local_inbound_workloads local_ingress_listeners sidecar_ingress_declared \
     declared_ingress_http_ports mesh_policies ext_authz_providers peer_authentications \
     service_entries request_authentications telemetry_resources destination_rules \
-    virtual_service_cors_policies proxy_configs trust_bundles multi_cluster \
+    destination_rule_host_exclusions virtual_service_cors_policies proxy_configs trust_bundles multi_cluster \
     outbound_traffic_policy sidecar_outbound_traffic_policy sidecar_egress_scope extension_configs \
     runtime_overlay";
 const WORKLOAD: &str = "spiffe_id selector service_name service_namespace addresses ports \

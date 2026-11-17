@@ -1958,6 +1958,10 @@ fn reverse_translate(
         // still need `FERRUM_MESH_CONFIG_PROTOCOL=native` for full DR
         // semantics; see docs/mesh.md ("DestinationRule support matrix").
         destination_rules,
+        // Issue #7395: control-plane-resolved host exclusions for visible
+        // wildcard rules, so an xDS-built slice selects exactly like a
+        // native-built one.
+        destination_rule_host_exclusions: recovered.destination_rule_host_exclusions,
         // GAP-1a: ProxyConfig recovered from the ProxyConfigs carrier.
         proxy_configs: recovered.proxy_configs,
         // GAP-1a: SPIFFE trust bundles recovered from the TrustBundles
@@ -2130,6 +2134,7 @@ struct RecoveredSliceCarriers {
     config_revision: Option<crate::modes::mesh::revision::MeshConfigRevision>,
     workloads: Vec<crate::modes::mesh::config::Workload>,
     ambient_udp_source_workloads: Vec<crate::modes::mesh::config::Workload>,
+    destination_rule_host_exclusions: Vec<crate::modes::mesh::slice::DestinationRuleHostExclusion>,
     node_waypoint_assertors: Vec<crate::modes::mesh::config::NodeWaypointAssertor>,
     node_waypoint_capture_destinations: Vec<crate::modes::mesh::config::Workload>,
     node_waypoint_capture_peer_authentications: Vec<crate::modes::mesh::config::PeerAuthentication>,
@@ -2602,6 +2607,9 @@ fn apply_recovered_carrier(
         MeshSliceCarrier::Workloads(value) => recovered.workloads = value,
         MeshSliceCarrier::AmbientUdpSourceWorkloads(value) => {
             recovered.ambient_udp_source_workloads = value
+        }
+        MeshSliceCarrier::DestinationRuleHostExclusions(value) => {
+            recovered.destination_rule_host_exclusions = value
         }
         MeshSliceCarrier::NodeWaypointAssertors(value) => recovered.node_waypoint_assertors = value,
         MeshSliceCarrier::NodeWaypointCaptureDestinations(value) => {
@@ -6094,6 +6102,17 @@ mod tests {
             // round trip or the DP cannot tell an admitted root-tier
             // DestinationRule from an arbitrary-namespace one.
             istio_root_namespace: "istio-config".to_string(),
+            // Issue #7395: the control-plane-resolved wildcard host
+            // exclusions are the xDS data plane's only source of Istio's
+            // exported-rule host selection.
+            destination_rule_host_exclusions: vec![
+                crate::modes::mesh::slice::DestinationRuleHostExclusion {
+                    namespace: "beta".to_string(),
+                    name: "owner-wildcard".to_string(),
+                    rule_host: "*.example.com".to_string(),
+                    host: "api.example.com".to_string(),
+                },
+            ],
             ..MeshSlice::default()
         }
     }
@@ -6123,6 +6142,11 @@ mod tests {
         );
         assert_eq!(recovered.service_entries, native.service_entries);
         assert_eq!(recovered.destination_rules, native.destination_rules);
+        assert!(!native.destination_rule_host_exclusions.is_empty());
+        assert_eq!(
+            recovered.destination_rule_host_exclusions,
+            native.destination_rule_host_exclusions
+        );
         assert_eq!(
             recovered.istio_root_namespace, native.istio_root_namespace,
             "the mesh root namespace must round-trip so the DP can classify \

@@ -820,3 +820,116 @@ fn virtual_service_l4_exported_upstream_ids_preserve_source_boundaries() {
         );
     }
 }
+
+/// Issue #7395 review round 3 (sol F2): the control plane's DestinationRule
+/// host-exclusion resolution also covers carried VirtualService `tcp[]`
+/// upstream targets. `beta`'s public `*.example.com` rule is shadowed, for
+/// the two concrete L4 destinations under `beta`'s wildcard ServiceEntry, by
+/// `beta`'s `*.one.example.com` rule exported only elsewhere, so Istio falls
+/// through to the next tier for them; only that outcome rides the slice.
+#[test]
+fn hidden_rule_shadowing_covers_carried_l4_upstream_targets() {
+    let dr = |name: &str, spec: Value| {
+        object(
+            "DestinationRule",
+            name,
+            "beta",
+            "networking.istio.io/v1beta1",
+            spec,
+        )
+    };
+    let result = translate_k8s_objects(
+        &[
+            vs(
+                "ext-split",
+                serde_json::json!({
+                    "hosts": ["ext.one.example.com"],
+                    "tcp": [{
+                        "match": [{"port": 9000}],
+                        "route": [
+                            {"destination": {"host": "api.one.example.com", "port": {"number": 9000}}, "weight": 50},
+                            {"destination": {"host": "other.one.example.com", "port": {"number": 9000}}, "weight": 50}
+                        ]
+                    }]
+                }),
+            ),
+            object(
+                "ServiceEntry",
+                "wild",
+                "beta",
+                "networking.istio.io/v1beta1",
+                serde_json::json!({
+                    "hosts": ["*.example.com"],
+                    "location": "MESH_EXTERNAL",
+                    "resolution": "DNS",
+                    "ports": [{"number": 9000, "name": "http", "protocol": "HTTP"}]
+                }),
+            ),
+            dr(
+                "beta-wild",
+                serde_json::json!({
+                    "host": "*.example.com",
+                    "trafficPolicy": {"connectionPool": {"tcp": {"connectTimeout": "4s"}}}
+                }),
+            ),
+            dr(
+                "beta-hidden",
+                serde_json::json!({
+                    "host": "*.one.example.com",
+                    "exportTo": ["other"],
+                    "trafficPolicy": {"connectionPool": {"tcp": {"connectTimeout": "9s"}}}
+                }),
+            ),
+            object(
+                "Sidecar",
+                "default",
+                "default",
+                "networking.istio.io/v1beta1",
+                serde_json::json!({"egress": [{"hosts": ["*/*"]}]}),
+            ),
+        ],
+        // The ServiceEntry and DestinationRules live in `beta`.
+        options().with_source_namespaces(vec!["default".to_string(), "beta".to_string()]),
+    )
+    .expect("translation succeeds");
+    let slice = MeshSlice::from_gateway_config(
+        &result.config,
+        MeshSliceRequest {
+            node_id: "sidecar-a".to_string(),
+            namespace: "default".to_string(),
+            ..MeshSliceRequest::default()
+        }
+        .with_enforce_sidecar_egress(true),
+    );
+    assert_eq!(
+        slice.virtual_service_l4_upstreams.len(),
+        1,
+        "the weighted tcp[] upstream rides the slice"
+    );
+    assert!(
+        slice
+            .destination_rules
+            .iter()
+            .any(|rule| rule.name == "beta-wild"),
+        "the ServiceEntry owner's wildcard is admitted at the service tier"
+    );
+    let mut excluded: Vec<(&str, &str)> = slice
+        .destination_rule_host_exclusions
+        .iter()
+        .map(|exclusion| (exclusion.name.as_str(), exclusion.host.as_str()))
+        .collect();
+    excluded.sort_unstable();
+    assert_eq!(
+        excluded,
+        vec![
+            ("beta-wild", "api.one.example.com"),
+            ("beta-wild", "other.one.example.com"),
+        ],
+        "both concrete L4 destinations skip the shadowed wildcard"
+    );
+    let wire = serde_json::to_string(&slice).expect("slice serializes");
+    assert!(
+        !wire.contains("beta-hidden") && !wire.contains("*.one.example.com"),
+        "nothing about the hidden rule rides the slice"
+    );
+}

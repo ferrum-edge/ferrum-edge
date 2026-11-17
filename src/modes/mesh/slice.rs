@@ -13,9 +13,10 @@ use crate::modes::mesh::config::{
     MultiClusterConfig, NodeWaypointAssertor, OutboundTrafficPolicy, PeerAuthentication,
     PolicyScope, ResolvedIngressListener, ServiceEntry, SidecarHostPattern, TrustBundleSet,
     WaypointAttachment, Workload, WorkloadLabels, destination_rule_exported_to_namespace,
-    destination_rule_lookup_tier, is_false, is_zero_usize, policy_scope_applies_to_workload,
-    policy_scope_applies_with_waypoint, policy_target_attachment_applies_to_service,
-    proxy_config_applies_to_workload, scope_applies_to_workload, service_entry_applies_to_workload,
+    destination_rule_is_namespace_private, destination_rule_lookup_tier, is_false, is_zero_usize,
+    policy_scope_applies_to_workload, policy_scope_applies_with_waypoint,
+    policy_target_attachment_applies_to_service, proxy_config_applies_to_workload,
+    scope_applies_to_workload, service_entry_applies_to_workload,
     virtual_service_cors_policy_exported_to_namespace, workload_selector_matches,
 };
 use crate::modes::mesh::dns_proxy::DEFAULT_CLUSTER_DOMAIN;
@@ -562,6 +563,17 @@ pub struct MeshSlice {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     #[serde(deserialize_with = "crate::util::json_object::deserialize_object_vec")]
     pub destination_rules: Vec<MeshDestinationRule>,
+    /// Control-plane-resolved outcomes of Istio's exported-rule host
+    /// selection (issue #7395): a visible wildcard rule in `destination_rules`
+    /// that does NOT apply to one destination host of this slice, because a
+    /// rule of the same namespace that is hidden from this subscriber is more
+    /// specific for that host and Istio then falls through to the next tier.
+    /// Names only the visible rule and the destination host; nothing about
+    /// the hidden rule (name, host pattern, `exportTo`, policy) leaves the
+    /// control plane. See [`destination_rule_host_exclusions`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(deserialize_with = "crate::util::json_object::deserialize_object_vec")]
+    pub destination_rule_host_exclusions: Vec<DestinationRuleHostExclusion>,
     /// VirtualService-derived host-level CORS policies (issue #1973),
     /// narrowed like `destination_rules`. The DP synthesizes per-route `cors`
     /// plugin instances onto materialized outbound routes from these.
@@ -1024,6 +1036,7 @@ impl MeshSlice {
             && self.http_routes == other.http_routes
             && self.workloads == other.workloads
             && self.ambient_udp_source_workloads == other.ambient_udp_source_workloads
+            && self.destination_rule_host_exclusions == other.destination_rule_host_exclusions
             && self.node_waypoint_assertors == other.node_waypoint_assertors
             // The NodeWaypoint capture inventory changes independently of
             // `workloads` / `peer_authentications` (a pod in ANOTHER namespace
@@ -2109,12 +2122,15 @@ impl MeshSlice {
         // service → root lookup tiers (#2469), then this path's own scope gate,
         // then per-destination tier resolution. The root namespace is resolved
         // HERE, at slice build, so the data plane never has to know it.
+        let carried_destination_hosts =
+            carried_route_destination_hosts(&http_routes, &virtual_service_l4_upstreams);
         let destination_rule_scope = DestinationRuleScope {
             client_namespace: effective_namespace,
             root_namespace: mesh.istio_root_namespace.as_str(),
             cluster_domain: &cluster_domain,
             mesh_service_identities: &mesh_service_identities,
             service_entry_hosts: &service_entry_hosts,
+            carried_destination_hosts: &carried_destination_hosts,
         };
         let destination_rules: Vec<MeshDestinationRule> = admit_destination_rules(
             mesh.destination_rules.iter(),
@@ -2320,7 +2336,7 @@ impl MeshSlice {
             request.waypoint_name.as_deref(),
             &request_namespace,
         );
-        Self {
+        let mut slice = Self {
             node_id: request.node_id,
             namespace: request_namespace.clone(),
             // Issue #2469: the DP needs the mesh root namespace to distinguish
@@ -2359,6 +2375,7 @@ impl MeshSlice {
             request_authentications,
             telemetry_resources,
             destination_rules,
+            destination_rule_host_exclusions: Vec::new(),
             virtual_service_cors_policies,
             proxy_configs,
             trust_bundles: mesh.trust_bundles.clone(),
@@ -2377,8 +2394,145 @@ impl MeshSlice {
             // xDS reverse translation populates this field directly; native
             // MeshSubscribe configs leave it empty.
             runtime_overlay: MeshRuntimeOverlay::default(),
+        };
+        slice.destination_rule_host_exclusions = destination_rule_host_exclusions(
+            &mesh.destination_rules,
+            &slice,
+            effective_namespace,
+            mesh.istio_root_namespace.as_str(),
+            &cluster_domain,
+        );
+        slice
+    }
+}
+
+/// One control-plane-resolved exclusion: the visible wildcard
+/// DestinationRule identified by `namespace`, `name` and its own host pattern
+/// `rule_host` does not apply to destination `host` (issue #7395,
+/// [`MeshSlice::destination_rule_host_exclusions`]). The rule host is part of
+/// the identity because native/file configs may repeat one `(namespace,
+/// name)` for distinct hosts; it is the visible rule's own, already
+/// authorized metadata.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DestinationRuleHostExclusion {
+    pub namespace: String,
+    pub name: String,
+    pub rule_host: String,
+    pub host: String,
+}
+
+impl DestinationRuleHostExclusion {
+    /// Whether this excludes `rule` for destination `host` (hosts compared in
+    /// canonical form: trimmed, no trailing dot, ASCII-lowercase).
+    pub(crate) fn excludes(&self, rule: &MeshDestinationRule, host: &str) -> bool {
+        self.namespace == rule.namespace.trim()
+            && self.name == rule.name
+            && self.rule_host == canonical_destination_rule_host(&rule.host)
+            && self.host == canonical_destination_rule_host(host)
+    }
+}
+
+fn canonical_destination_rule_host(host: &str) -> String {
+    host.trim().trim_end_matches('.').to_ascii_lowercase()
+}
+
+/// Resolve, on the control plane, Istio's exported-rule host selection for
+/// the destination hosts this slice can reach (issue #7395; Istio
+/// `pilot/pkg/model/push_context.go`, `SetDestinationRules` and
+/// `getExportedDestinationRuleFromNamespace`).
+///
+/// In the target service's namespace and the root namespace Istio picks the
+/// most specific host among that namespace's EXPORTED rules (every rule that
+/// is not namespace-private) BEFORE checking that the chosen rule is exported
+/// to the client; when it is not, the lookup falls through to the next tier
+/// rather than retrying a broader visible wildcard of the same namespace. A
+/// namespace-private rule (`exportTo: ["."]` or only its own namespace) is not
+/// in that exported index, so it shadows nothing for other namespaces.
+///
+/// For every admitted, non-client-tier wildcard rule and every destination
+/// host the slice carries (Service FQDNs, ServiceEntry hosts, and the target
+/// hosts of carried VirtualService HTTP and L4 route upstreams) that it
+/// names, this records an
+/// exclusion when a hidden exported rule of the same namespace names that host
+/// strictly more specifically. Only the outcome rides the slice.
+fn destination_rule_host_exclusions(
+    all_rules: &[MeshDestinationRule],
+    slice: &MeshSlice,
+    client_namespace: &str,
+    root_namespace: &str,
+    cluster_domain: &str,
+) -> Vec<DestinationRuleHostExclusion> {
+    let hidden: Vec<&MeshDestinationRule> = all_rules
+        .iter()
+        .filter(|rule| destination_rule_shadows_from_hiding(rule, client_namespace, root_namespace))
+        .collect();
+    if hidden.is_empty() {
+        return Vec::new();
+    }
+    let cluster_domain = cluster_domain.trim().trim_end_matches('.');
+    let mut hosts: BTreeSet<String> = BTreeSet::new();
+    for service in &slice.services {
+        hosts.insert(canonical_destination_rule_host(
+            &if cluster_domain.is_empty() {
+                format!("{}.{}.svc", service.name, service.namespace)
+            } else {
+                format!(
+                    "{}.{}.svc.{cluster_domain}",
+                    service.name, service.namespace
+                )
+            },
+        ));
+    }
+    for entry in &slice.service_entries {
+        hosts.extend(
+            entry
+                .hosts
+                .iter()
+                .map(|host| canonical_destination_rule_host(host.as_str())),
+        );
+    }
+    // Carried VirtualService HTTP route and L4 (`tcp[]` / `tls[]`) upstream
+    // targets are destinations too: they reach DestinationRule selection on
+    // the data plane like any other upstream.
+    hosts.extend(carried_route_destination_hosts(
+        &slice.http_routes,
+        &slice.virtual_service_l4_upstreams,
+    ));
+    let mut exclusions = BTreeSet::new();
+    for rule in &slice.destination_rules {
+        if !is_wildcard_destination_rule_host(&rule.host)
+            || destination_rule_lookup_tier(rule, client_namespace, None, root_namespace)
+                == DestinationRuleLookupTier::Client
+        {
+            continue;
+        }
+        for host in &hosts {
+            let Some(specificity) =
+                super::destination_rule_host_specificity(&rule.host, &rule.namespace, host)
+            else {
+                continue;
+            };
+            let shadowed = hidden.iter().any(|hidden| {
+                hidden.namespace.trim() == rule.namespace.trim()
+                    && super::destination_rule_host_specificity(
+                        &hidden.host,
+                        &hidden.namespace,
+                        host,
+                    )
+                    .is_some_and(|hidden_specificity| hidden_specificity > specificity)
+            });
+            if shadowed {
+                exclusions.insert(DestinationRuleHostExclusion {
+                    namespace: rule.namespace.trim().to_string(),
+                    name: rule.name.clone(),
+                    rule_host: canonical_destination_rule_host(&rule.host),
+                    host: host.clone(),
+                });
+            }
         }
     }
+    exclusions.into_iter().collect()
 }
 
 struct ServiceWaypointNarrowingResources {
@@ -2621,16 +2775,15 @@ fn narrow_for_service_waypoint(
         .destination_rules
         .into_iter()
         .filter(|dr| {
-            // DR is admitted only when its host is one of the admitted
-            // Service's canonical Kubernetes DNS aliases. Broad prefix
-            // matches can accidentally admit unrelated external hosts.
+            // DR is admitted only when it names an admitted Service, through
+            // the one DestinationRule host matcher (exact alias or wildcard,
+            // issue #7395), from a namespace on that Service's lookup path.
             destination_rule_matches_admitted_service(
                 dr,
                 waypoint_namespace,
                 root_namespace,
                 cluster_domain,
                 &admitted_services,
-                &admitted_hosts,
             )
         })
         .collect();
@@ -2716,62 +2869,43 @@ fn admitted_service_hosts(services: &[MeshService], cluster_domain: &str) -> BTr
     hosts
 }
 
+/// Whether a DestinationRule governs a Service this service waypoint is bound
+/// to: it names one of the Service's dotted aliases (`<svc>.<ns>`,
+/// `<svc>.<ns>.svc`, the FQDN) through the ONE DestinationRule host matcher,
+/// [`super::destination_rule_host_specificity`] (exact, Service alias, or
+/// wildcard, issue #7395), AND its namespace is on that Service's Istio
+/// lookup path from the waypoint's client position, re-derived from the
+/// MATCHED Service: the waypoint's own namespace (client tier), the matched
+/// Service's namespace (service tier), or the configured
+/// `istio_root_namespace` (root tier, issue #2469 — omitting it dropped the
+/// mesh-wide default entirely). A short host resolves in the rule's own
+/// namespace, so it can only name a Service there. Export visibility and
+/// cross-tier precedence have already been resolved by
+/// `admit_destination_rules` and are re-applied per destination host by
+/// `apply_destination_rules`; this pass only re-checks ownership against the
+/// waypoint's narrowed service set.
 fn destination_rule_matches_admitted_service(
     dr: &MeshDestinationRule,
     waypoint_namespace: &str,
     root_namespace: &str,
     cluster_domain: &str,
     admitted_services: &[MeshService],
-    admitted_hosts: &BTreeSet<String>,
 ) -> bool {
-    let host = dr.host.trim_end_matches('.');
-    host_matches_admitted_service(host, admitted_hosts)
-        && destination_rule_namespace_allowed_for_admitted_service(
-            dr,
-            waypoint_namespace,
-            root_namespace,
-            cluster_domain,
-            admitted_services,
-            host,
-        )
-        || admitted_services
-            .iter()
-            .any(|service| host == service.name && dr.namespace == service.namespace)
-}
-
-/// Which namespaces may own a DestinationRule for a service-waypoint-admitted
-/// service.
-///
-/// This mirrors Istio's lookup path for the waypoint's client position: the
-/// waypoint's own namespace (client tier), the target Service's namespace
-/// (service tier), and the configured `istio_root_namespace` (root tier,
-/// issue #2469 — omitting it dropped the mesh-wide default entirely). Export
-/// visibility and cross-tier precedence have already been resolved by
-/// `admit_destination_rules`; this pass only re-checks ownership against the
-/// waypoint's narrowed service set.
-fn destination_rule_namespace_allowed_for_admitted_service(
-    dr: &MeshDestinationRule,
-    waypoint_namespace: &str,
-    root_namespace: &str,
-    cluster_domain: &str,
-    admitted_services: &[MeshService],
-    host: &str,
-) -> bool {
-    let cluster_domain = cluster_domain.trim().trim_end_matches('.');
     let root_namespace = root_namespace.trim();
+    let rule_namespace = dr.namespace.trim();
     admitted_services.iter().any(|service| {
-        let host_matches = host == format!("{}.{}", service.name, service.namespace)
-            || host == format!("{}.{}.svc", service.name, service.namespace)
-            || (!cluster_domain.is_empty()
-                && host
-                    == format!(
-                        "{}.{}.svc.{}",
-                        service.name, service.namespace, cluster_domain
-                    ));
-        host_matches
-            && (dr.namespace == service.namespace
-                || dr.namespace == waypoint_namespace
-                || (!root_namespace.is_empty() && dr.namespace.trim() == root_namespace))
+        let names_service = service_host_aliases(&service.name, &service.namespace, cluster_domain)
+            .iter()
+            // The dotless short alias would match a short host declared in
+            // ANY namespace; the dotted aliases carry the namespace.
+            .filter(|alias| alias.contains('.'))
+            .any(|alias| {
+                super::destination_rule_host_specificity(&dr.host, &dr.namespace, alias).is_some()
+            });
+        names_service
+            && (rule_namespace == service.namespace.trim()
+                || rule_namespace == waypoint_namespace.trim()
+                || (!root_namespace.is_empty() && rule_namespace == root_namespace))
     })
 }
 
@@ -3094,6 +3228,9 @@ fn build_sidecar_egress_scope_snapshot(
                 cluster_domain,
                 mesh_service_identities,
                 service_entry_hosts,
+                // The operator egress-scope snapshot narrows registry
+                // destinations only; it carries no route upstreams.
+                carried_destination_hosts: &[],
             };
             let destination_rules: Vec<MeshDestinationRule> = admit_destination_rules(
                 mesh.destination_rules.iter(),
@@ -3663,6 +3800,12 @@ pub(crate) struct DestinationRuleScope<'a> {
     pub cluster_domain: &'a str,
     pub mesh_service_identities: &'a BTreeSet<(String, String)>,
     pub service_entry_hosts: &'a BTreeMap<String, ServiceEntryHostOwner>,
+    /// Concrete destination hosts of the carried VirtualService HTTP and L4
+    /// route upstreams (issue #7395). They reach DestinationRule selection on
+    /// the data plane like registry destinations, so wildcard admission
+    /// considers them too (a concrete host under a wildcard ServiceEntry is
+    /// owned by that ServiceEntry's namespace, `destination_host_owner`).
+    pub carried_destination_hosts: &'a [String],
 }
 
 /// Groups admitted DestinationRules by the destination they RESOLVE to, not by
@@ -3693,7 +3836,10 @@ type DestinationRuleGroupKey = (Option<String>, String);
 /// from the ownership claim tiering reads.
 ///
 /// The service tier is granted only on EVIDENCE of ownership (see
-/// `policy_target_service_ref`). A host whose owner cannot be established —
+/// `policy_target_service_ref`). A wildcard host owns nothing itself: it is
+/// admitted at the service tier only when it names a registry destination its
+/// own namespace owns (`wildcard_destination_rule_admitted_destination`,
+/// issue #7395). A host whose owner cannot be established —
 /// an external host with no visible ServiceEntry, one claimed by ServiceEntries
 /// in two different namespaces, or an unqualified two-label host absent from
 /// the service inventory — has NO service tier, so only the client namespace
@@ -3734,26 +3880,62 @@ where
             scope.service_entry_hosts,
         );
         let tier = destination_rule_lookup_tier(
-            &rule.namespace,
+            rule,
             scope.client_namespace,
             host_scope.service_namespace.as_deref(),
             scope.root_namespace,
         );
-        if !tier.is_in_lookup_path() {
-            continue;
-        }
-        if !extra_admits(
-            rule,
-            &host_scope.scope_namespace,
-            &host_scope.host_candidates,
-        ) {
-            continue;
-        }
         let group_host = host_scope
             .host_candidates
             .first()
             .cloned()
             .unwrap_or_default();
+        let wildcard = is_wildcard_destination_rule_host(&rule.host);
+        if !tier.is_in_lookup_path() {
+            // Issue #7395: a wildcard host names no single destination, so
+            // it has no owner of its own and its service tier is decided per
+            // destination it matches: the rule is admitted at the service
+            // tier when it names a registry destination its OWN namespace
+            // owns and the caller's scope admits. The data plane
+            // (`MaterializationTierScope::eligible_tier`) then grants it the
+            // service tier for exactly those destinations.
+            let rule_namespace = rule.namespace.trim();
+            if wildcard
+                && !rule_namespace.is_empty()
+                && wildcard_destination_rule_admitted_destination(
+                    rule,
+                    scope,
+                    Some(rule_namespace),
+                    &mut extra_admits,
+                )
+            {
+                visible.push((
+                    (Some(rule_namespace.to_string()), group_host),
+                    DestinationRuleLookupTier::Service,
+                    rule,
+                ));
+            }
+            continue;
+        }
+        // A client- or root-tier wildcard is judged by the caller's scope
+        // against the destinations it covers too (issue #7395): its literal
+        // host and declaring namespace are not a destination, so a Sidecar
+        // egress scope importing only `payments/*` must still admit a root
+        // `*.example.com` rule for `payments`' ServiceEntry host.
+        let scope_admits = extra_admits(
+            rule,
+            &host_scope.scope_namespace,
+            &host_scope.host_candidates,
+        ) || (wildcard
+            && wildcard_destination_rule_admitted_destination(
+                rule,
+                scope,
+                None,
+                &mut extra_admits,
+            ));
+        if !scope_admits {
+            continue;
+        }
         visible.push(((host_scope.service_namespace, group_host), tier, rule));
     }
 
@@ -3790,6 +3972,151 @@ where
         );
     }
     admitted
+}
+
+/// Whether `rule` takes part in Istio's exported-rule host selection for
+/// `client_namespace` while being hidden from it: exported (not
+/// namespace-private), not exported to the client, and declared outside the
+/// client's own namespace (the client tier is that namespace's own index),
+/// except that a root-namespace client still looks the root namespace's
+/// exported rules up through the exported index. Read only by the control
+/// plane ([`destination_rule_host_exclusions`]); hidden rules never leave it.
+fn destination_rule_shadows_from_hiding(
+    rule: &MeshDestinationRule,
+    client_namespace: &str,
+    root_namespace: &str,
+) -> bool {
+    let namespace = rule.namespace.trim();
+    let client_namespace = client_namespace.trim();
+    let root_namespace = root_namespace.trim();
+    if namespace.is_empty() || (namespace == client_namespace && client_namespace != root_namespace)
+    {
+        return false;
+    }
+    !destination_rule_exported_to_namespace(rule, client_namespace)
+        && !destination_rule_is_namespace_private(rule)
+}
+
+/// Whether a DestinationRule host is a wildcard (`*`, `*.example.com`).
+fn is_wildcard_destination_rule_host(host: &str) -> bool {
+    host.trim().starts_with('*')
+}
+
+/// Whether wildcard DestinationRule `rule` names a registry destination the
+/// caller's scope admits (issue #7395), restricted to destinations owned by
+/// `owner` when it is `Some` (the service-tier question: does the rule's own
+/// namespace own something it covers?).
+///
+/// Destinations are the in-cluster Services and the ServiceEntry hosts with a
+/// single owner, wildcard ServiceEntry hosts included. Ownership comes from
+/// the same evidence, in the same order, as every other service-tier decision
+/// ([`destination_host_owner`]): an in-cluster Service is owned by its
+/// namespace, an external host by the single namespace whose visible
+/// ServiceEntry declares it. It is NEVER inferred from the rule's declaring
+/// namespace alone. Each matched destination is offered to the caller's gate
+/// (`extra_admits`) as that destination (its owning namespace and host
+/// aliases), so the Sidecar egress scope judges the concrete host.
+fn wildcard_destination_rule_admitted_destination<F>(
+    rule: &MeshDestinationRule,
+    scope: &DestinationRuleScope<'_>,
+    owner: Option<&str>,
+    extra_admits: &mut F,
+) -> bool
+where
+    F: FnMut(&MeshDestinationRule, &str, &[String]) -> bool,
+{
+    let cluster_domain = scope.cluster_domain.trim().trim_end_matches('.');
+    for (namespace, name) in scope.mesh_service_identities {
+        if owner.is_some_and(|owner| namespace != owner) {
+            continue;
+        }
+        let fqdn = if cluster_domain.is_empty() {
+            format!("{name}.{namespace}.svc")
+        } else {
+            format!("{name}.{namespace}.svc.{cluster_domain}")
+        };
+        if super::destination_rule_host_specificity(&rule.host, &rule.namespace, &fqdn).is_some()
+            && extra_admits(
+                rule,
+                namespace.as_str(),
+                &service_host_aliases(name, namespace, cluster_domain),
+            )
+        {
+            return true;
+        }
+    }
+    for host in scope.service_entry_hosts.keys() {
+        let Some(host_owner) = destination_host_owner(
+            host,
+            scope.cluster_domain,
+            scope.mesh_service_identities,
+            scope.service_entry_hosts,
+        ) else {
+            continue;
+        };
+        let host_owner = host_owner.namespace();
+        if owner.is_some_and(|owner| host_owner != owner) {
+            continue;
+        }
+        if super::destination_rule_host_specificity(&rule.host, &rule.namespace, host).is_some()
+            && extra_admits(rule, host_owner, std::slice::from_ref(host))
+        {
+            return true;
+        }
+    }
+    // Concrete destinations of carried routes: `api.one.example.com` under a
+    // `*.example.com` ServiceEntry belongs to its declaring namespace, so that
+    // namespace's narrower `*.one.example.com` rule is the most specific match
+    // for it (Istio `MostSpecificHostMatch` with the destination host as the
+    // needle), exactly as the data plane decides.
+    for host in scope.carried_destination_hosts {
+        let Some(host_owner) = destination_host_owner(
+            host,
+            scope.cluster_domain,
+            scope.mesh_service_identities,
+            scope.service_entry_hosts,
+        ) else {
+            continue;
+        };
+        let host_owner = host_owner.namespace();
+        if owner.is_some_and(|owner| host_owner != owner) {
+            continue;
+        }
+        if super::destination_rule_host_specificity(&rule.host, &rule.namespace, host).is_some()
+            && extra_admits(rule, host_owner, std::slice::from_ref(host))
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// The canonical target hosts of carried VirtualService HTTP route and L4
+/// route upstreams (`targets[].host`), deduplicated and sorted. Shared by
+/// wildcard admission and host-exclusion resolution so both see the same
+/// destination inventory.
+fn carried_route_destination_hosts(
+    http_routes: &MeshHttpRouteSet,
+    virtual_service_l4_upstreams: &[serde_json::Value],
+) -> Vec<String> {
+    let mut hosts: BTreeSet<String> = BTreeSet::new();
+    for upstream in http_routes
+        .upstreams
+        .iter()
+        .chain(virtual_service_l4_upstreams)
+    {
+        for target in upstream
+            .get("targets")
+            .and_then(serde_json::Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            if let Some(host) = target.get("host").and_then(serde_json::Value::as_str) {
+                hosts.insert(canonical_destination_rule_host(host));
+            }
+        }
+    }
+    hosts.into_iter().collect()
 }
 
 /// Ambiguous-destination counts ALREADY REPORTED for each client namespace, as
@@ -4107,8 +4434,25 @@ pub(crate) fn destination_host_owner(
         .trim()
         .trim_end_matches('.')
         .to_ascii_lowercase();
-    if host.is_empty() || host.contains('*') {
+    if host.is_empty() {
         return None;
+    }
+    // A wildcard host is never a Kubernetes Service; the only destination it
+    // can name is a registered wildcard ServiceEntry host (`*.example.com`),
+    // owned like any external host by the single namespace that declares it
+    // (issue #7395). Checked before the syntax arms, which would otherwise
+    // read `*.beta.svc` as a Service named `*`.
+    if host.contains('*') {
+        let is_wildcard_service_entry_host = host
+            .strip_prefix("*.")
+            .is_some_and(|suffix| !suffix.is_empty() && !suffix.contains('*'));
+        if !is_wildcard_service_entry_host {
+            return None;
+        }
+        let declared_owner = service_entry_host_owner(service_entry_hosts, &host)?;
+        return Some(DestinationHostOwner::ExternalHost {
+            namespace: declared_owner.to_string(),
+        });
     }
 
     if let Some((name, namespace)) = host
@@ -4140,10 +4484,49 @@ pub(crate) fn destination_host_owner(
         });
     }
 
-    let declared_owner = service_entry_host_owner(service_entry_hosts, &host)?;
+    // An exact ServiceEntry host decides (a contested one owns nothing).
+    // Otherwise the concrete host is a member of the most specific registered
+    // wildcard ServiceEntry host covering it (issue #7395): `api.one.example.com`
+    // under `*.example.com` belongs to the namespace that declares that
+    // wildcard, as Istio resolves the request to that ServiceEntry.
+    let declared_owner = if service_entry_hosts.contains_key(&host) {
+        service_entry_host_owner(service_entry_hosts, &host)?
+    } else {
+        wildcard_service_entry_host_owner(service_entry_hosts, &host)?
+    };
     Some(DestinationHostOwner::ExternalHost {
         namespace: declared_owner.to_string(),
     })
+}
+
+/// The owner of the most specific registered wildcard ServiceEntry host
+/// (`*.example.com`) covering concrete `host` (already canonical), or `None`
+/// when none covers it or the most specific one is contested. `*.example.com`
+/// covers `api.example.com` and `a.b.example.com`, never `example.com`.
+fn wildcard_service_entry_host_owner<'a>(
+    service_entry_hosts: &'a BTreeMap<String, ServiceEntryHostOwner>,
+    host: &str,
+) -> Option<&'a str> {
+    let mut best: Option<(usize, &'a ServiceEntryHostOwner)> = None;
+    for (registered, owner) in service_entry_hosts {
+        let Some(suffix) = registered.strip_prefix('*') else {
+            continue;
+        };
+        if !suffix.starts_with('.')
+            || suffix.contains('*')
+            || host.len() <= suffix.len()
+            || !host.ends_with(suffix)
+        {
+            continue;
+        }
+        if best.is_none_or(|(len, _)| suffix.len() > len) {
+            best = Some((suffix.len(), owner));
+        }
+    }
+    match best?.1 {
+        ServiceEntryHostOwner::Owned(namespace) => Some(namespace.as_str()),
+        ServiceEntryHostOwner::Ambiguous => None,
+    }
 }
 
 fn mesh_service_identity_exists(
@@ -5907,6 +6290,7 @@ mod tests {
             peer_authentications: vec![make_peer_auth("pa1", "ns", None)],
             service_entries: vec![make_service_entry("se1", "ns", vec!["*".into()])],
             destination_rules: Vec::new(),
+            destination_rule_host_exclusions: Vec::new(),
             virtual_service_cors_policies: Vec::new(),
             virtual_service_l4_proxies: Vec::new(),
             virtual_service_l4_upstreams: Vec::new(),
