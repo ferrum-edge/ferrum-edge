@@ -45,6 +45,9 @@ pub(crate) use istio::{telemetry_deferred_fields, virtual_service_retry_deferred
 pub(crate) use istio::{
     virtual_service_route_mirror_is_deferred, virtual_service_route_mirrors_are_deferred,
 };
+// Same for the mesh binding of a VirtualService's `http[]` routes (issue #7390):
+// the status writer reports where they apply from the predicate that decides it.
+pub(crate) use istio::virtual_service_binds_mesh;
 // Shared with the Istio status writer the same way: Sidecar `ingress[]`
 // classification used by resolution and deferred-field reporting is one
 // predicate, so modeled HTTP and stream listeners cannot be reported deferred.

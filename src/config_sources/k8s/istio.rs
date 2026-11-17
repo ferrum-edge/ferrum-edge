@@ -5133,15 +5133,23 @@ fn virtual_service_mesh_export_to(object: &K8sObject) -> Result<Vec<String>, K8s
 fn virtual_service_mesh_http_route_export_to(
     object: &K8sObject,
 ) -> Result<Option<Vec<String>>, K8sTranslateError> {
-    let binds_mesh = parse_l4_virtual_service_gateways(object).is_ok_and(|gateways| {
-        gateways
-            .iter()
-            .any(|gateway| gateway == crate::proxy::stream_match::MESH_GATEWAY_TOKEN)
-    });
-    if !binds_mesh {
+    if !virtual_service_binds_mesh(object) {
         return Ok(None);
     }
     virtual_service_mesh_export_to(object).map(Some)
+}
+
+/// Whether a VirtualService's `spec.gateways` binds the mesh: omitted, or a
+/// strictly parsed list naming `mesh` (issue #7233). Shared with the Istio
+/// status writer, which reports where a mesh-bound VirtualService's `http[]`
+/// routes are applied (issue #7390), so the binding the translator writes and
+/// the status it reports cannot diverge.
+pub(crate) fn virtual_service_binds_mesh(object: &K8sObject) -> bool {
+    parse_l4_virtual_service_gateways(object).is_ok_and(|gateways| {
+        gateways
+            .iter()
+            .any(|gateway| gateway == crate::proxy::stream_match::MESH_GATEWAY_TOKEN)
+    })
 }
 
 fn virtual_service_routes(

@@ -1366,6 +1366,17 @@ fn accepted_status(
     (status, detail)
 }
 
+/// `status.ferrum.translation.mesh_http_routes` for a mesh-bound
+/// VirtualService with `http[]` routes (issue #7390): mesh data planes apply
+/// those routes only on the NodeWaypoint topology.
+pub const VIRTUAL_SERVICE_MESH_HTTP_ROUTES_SCOPE: &str = "node_waypoint_only";
+
+/// The `FerrumAccepted` message note naming the topologies that do NOT apply a
+/// mesh-bound VirtualService's `http[]` routes (issue #7390).
+pub const VIRTUAL_SERVICE_MESH_HTTP_ROUTES_NOTE: &str = "mesh http[] routes are applied only by \
+     NodeWaypoint data planes; Sidecar, Ambient and ServiceWaypoint data planes ignore them and \
+     route to the destination Service";
+
 /// Status for `VirtualService`. The translator consumes `spec.http` routes
 /// (incl. `mirror` / `rewrite` / `redirect` / `corsPolicy`) and `spec.tcp` /
 /// `spec.tls` L4 route blocks (translated to stream proxies: port / SNI
@@ -1401,24 +1412,34 @@ fn virtual_service_status(
         Ok(_translation) => {
             let deferred = virtual_service_deferred_fields(&object.spec);
             let clamped = virtual_service_clamped_fields(&object.spec);
-            let message = if deferred.is_empty() && clamped.is_empty() {
+            // Issue #7390: a mesh-bound VirtualService's `http[]` routes reach
+            // only NodeWaypoint data planes (`MeshSlice.http_routes`); Sidecar,
+            // Ambient and ServiceWaypoint data planes keep routing to the plain
+            // Service. Say so instead of reporting the route count alone.
+            let mesh_http_routes = (http_route_count > 0
+                && crate::config_sources::k8s::virtual_service_binds_mesh(object))
+            .then_some(VIRTUAL_SERVICE_MESH_HTTP_ROUTES_SCOPE);
+            let mut notes = Vec::new();
+            if !deferred.is_empty() {
+                notes.push(format!("deferred fields: {}", deferred.join(", ")));
+            }
+            if !clamped.is_empty() {
+                notes.push(format!("clamped fields: {}", clamped.join(", ")));
+            }
+            if mesh_http_routes.is_some() {
+                notes.push(VIRTUAL_SERVICE_MESH_HTTP_ROUTES_NOTE.to_string());
+            }
+            let message = if notes.is_empty() {
                 format!(
                     "Ferrum accepted this VirtualService ({host_count} host(s), {http_route_count} HTTP route(s))"
                 )
             } else {
-                let mut notes = Vec::new();
-                if !deferred.is_empty() {
-                    notes.push(format!("deferred fields: {}", deferred.join(", ")));
-                }
-                if !clamped.is_empty() {
-                    notes.push(format!("clamped fields: {}", clamped.join(", ")));
-                }
                 format!(
                     "Ferrum accepted this VirtualService ({host_count} host(s), {http_route_count} HTTP route(s)); {}",
                     notes.join("; ")
                 )
             };
-            let detail = json!({
+            let mut detail = json!({
                 "translation": {
                     "hosts": host_count,
                     "http_routes_translated": http_route_count,
@@ -1426,6 +1447,9 @@ fn virtual_service_status(
                     "clamped_fields": clamped,
                 }
             });
+            if let Some(scope) = mesh_http_routes {
+                detail["translation"]["mesh_http_routes"] = json!(scope);
+            }
             accepted_status(object, true, "Accepted", &message, Some(detail))
         }
         Err(error) => {
