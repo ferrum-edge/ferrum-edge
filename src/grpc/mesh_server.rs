@@ -780,7 +780,8 @@ impl MeshConfigSync for MeshGrpcServer {
         .with_enforce_sidecar_identity_narrowing(self.sidecar_identity_narrowing);
         let slice_request = slice_request
             .with_ambient_udp_source_scoping(inner.ambient_udp_source_scoping)
-            .with_node_waypoint_capture_scoping(inner.node_waypoint_capture_scoping);
+            .with_node_waypoint_capture_scoping(inner.node_waypoint_capture_scoping)
+            .with_sidecar_http_routes(inner.sidecar_http_routes);
         // Register the receiver before loading the initial snapshot so a
         // concurrent CP broadcast is either captured by this stream or already
         // reflected in the loaded snapshot.

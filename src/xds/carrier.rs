@@ -1066,6 +1066,11 @@ pub struct XdsNodeMetadata {
     /// legacy DPs, which then receive no inventory and fail closed.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub node_waypoint_capture_scoping: bool,
+    /// This node is a Sidecar that serves mesh-bound VirtualService `http[]`
+    /// routes (issue #7423), so the CP carries them on its slice
+    /// (`HttpRoutesCarrier`). Absent on other topologies, which receive none.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub sidecar_http_routes: bool,
 }
 
 /// Per-node scoping flags the CP remembers for an ADS stream and replays into
@@ -1079,12 +1084,19 @@ pub struct XdsNodeMetadata {
 pub struct XdsNodeScoping {
     pub ambient_udp_source_scoping: bool,
     pub node_waypoint_capture_scoping: bool,
+    /// Sidecar VirtualService `http[]` route carriage (issue #7423). Not a
+    /// cross-namespace inventory: it only selects whether the slice carries
+    /// the routes already visible to the subscription namespace.
+    pub sidecar_http_routes: bool,
 }
 
 impl XdsNodeScoping {
-    /// `true` when the node requested no cross-namespace inventory at all.
+    /// `true` when the node requested no cross-namespace inventory and no
+    /// Sidecar route carriage.
     pub fn is_default(&self) -> bool {
-        !self.ambient_udp_source_scoping && !self.node_waypoint_capture_scoping
+        !self.ambient_udp_source_scoping
+            && !self.node_waypoint_capture_scoping
+            && !self.sidecar_http_routes
     }
 }
 
@@ -1093,6 +1105,7 @@ impl From<&XdsNodeMetadata> for XdsNodeScoping {
         Self {
             ambient_udp_source_scoping: metadata.ambient_udp_source_scoping,
             node_waypoint_capture_scoping: metadata.node_waypoint_capture_scoping,
+            sidecar_http_routes: metadata.sidecar_http_routes,
         }
     }
 }
@@ -1113,6 +1126,7 @@ pub fn encode_node_metadata_with_scoping(
             .map(ToString::to_string),
         ambient_udp_source_scoping: scoping.ambient_udp_source_scoping,
         node_waypoint_capture_scoping: scoping.node_waypoint_capture_scoping,
+        sidecar_http_routes: scoping.sidecar_http_routes,
     };
     if metadata.workload_spiffe_id.is_none()
         && metadata.waypoint_name.is_none()
@@ -1282,9 +1296,23 @@ mod tests {
             XdsNodeScoping {
                 ambient_udp_source_scoping: true,
                 node_waypoint_capture_scoping: false,
+                sidecar_http_routes: false,
             },
         ));
         assert!(udp_scope.ambient_udp_source_scoping);
+        assert!(!udp_scope.sidecar_http_routes);
+        // Issue #7423: the Sidecar route-carriage flag rides node metadata on
+        // its own, even with no identity, and reaches the CP's scoping.
+        let sidecar_routes = XdsNodeScoping {
+            ambient_udp_source_scoping: false,
+            node_waypoint_capture_scoping: false,
+            sidecar_http_routes: true,
+        };
+        let sidecar_bytes = encode_node_metadata_with_scoping(None, None, sidecar_routes);
+        assert!(!sidecar_bytes.is_empty());
+        let sidecar_metadata = decode_node_metadata(&sidecar_bytes);
+        assert!(sidecar_metadata.sidecar_http_routes);
+        assert_eq!(XdsNodeScoping::from(&sidecar_metadata), sidecar_routes);
         // Absent / empty identity encodes to empty bytes (prior no-metadata
         // wire shape) and decodes to no identity.
         assert!(encode_node_metadata_with_scoping(None, None, none).is_empty());

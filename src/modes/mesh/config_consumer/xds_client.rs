@@ -206,6 +206,10 @@ pub struct XdsClientConfig {
     /// listener (issue #3287); advertised in `Node.metadata` so the CP resolves
     /// the cross-namespace capture destination / PeerAuthentication inventory.
     pub node_waypoint_capture_scoping: bool,
+    /// This DP is a Sidecar that serves mesh-bound VirtualService `http[]`
+    /// routes (issue #7423); advertised in `Node.metadata` so the CP carries
+    /// them on the slice.
+    pub sidecar_http_routes: bool,
     pub stream_channel_capacity: usize,
     pub primary_retry_secs: u64,
     /// Client connection timeout. `0` disables tonic's explicit connect timeout.
@@ -1110,6 +1114,7 @@ async fn run_ads_stream_with_auth(
         crate::xds::carrier::XdsNodeScoping {
             ambient_udp_source_scoping: config.ambient_udp_source_scoping,
             node_waypoint_capture_scoping: config.node_waypoint_capture_scoping,
+            sidecar_http_routes: config.sidecar_http_routes,
         },
     ) {
         send_ads_request(&tx, request, timings.outbound).await?;
@@ -2951,6 +2956,7 @@ mod tests {
             waypoint_name: None,
             ambient_udp_source_scoping: false,
             node_waypoint_capture_scoping: false,
+            sidecar_http_routes: false,
             stream_channel_capacity: 32,
             primary_retry_secs: 300,
             connect_timeout_seconds: 10,

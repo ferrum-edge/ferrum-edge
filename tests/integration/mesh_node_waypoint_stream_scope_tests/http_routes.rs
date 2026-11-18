@@ -234,13 +234,21 @@ fn node_waypoint_slice_carries_bound_routes_their_plugins_and_upstreams() {
 fn http_routes_are_not_carried_to_other_topologies_or_namespaces() {
     let config = translated_config(&[virtual_service("split", split_spec(json!({})))]);
 
-    let sidecar = runtime_for_topology(MeshTopology::Sidecar);
-    let slice = MeshSlice::from_gateway_config(&config, sidecar.mesh_slice_request());
-    assert!(slice.http_routes.is_empty(), "Sidecar is not served yet");
+    // Issue #7423: Sidecar slices carry the routes too (see the Sidecar
+    // section below); Ambient (the L4 data plane) and ServiceWaypoint do not.
+    for topology in [MeshTopology::Ambient, MeshTopology::ServiceWaypoint] {
+        let runtime = runtime_for_topology(topology);
+        let slice = MeshSlice::from_gateway_config(&config, runtime.mesh_slice_request());
+        assert!(
+            slice.http_routes.is_empty(),
+            "{topology:?} is not served HTTP routes"
+        );
+    }
 
     let other_namespace = MeshSliceRequest {
         namespace: "other".to_string(),
         node_waypoint_capture_scoping: true,
+        sidecar_http_routes: false,
         ..node_waypoint_runtime().mesh_slice_request()
     };
     let slice = MeshSlice::from_gateway_config(&config, other_namespace);
@@ -383,12 +391,13 @@ fn data_plane_materializes_carried_routes_and_exposes_route_upstreams_to_authz()
 }
 
 #[test]
-fn data_plane_refuses_http_routes_outside_node_waypoint() {
+fn data_plane_refuses_http_routes_outside_node_waypoint_and_sidecar() {
     let config = translated_config(&[virtual_service("split", split_spec(json!({})))]);
     let slice = node_waypoint_slice(&config, &node_waypoint_runtime());
-    let sidecar = runtime_for_topology(MeshTopology::Sidecar);
-    prepare_gateway_config_from_mesh_slice(&slice, &sidecar)
-        .expect_err("only a NodeWaypoint serves carried HTTP routes");
+    for topology in [MeshTopology::Ambient, MeshTopology::ServiceWaypoint] {
+        prepare_gateway_config_from_mesh_slice(&slice, &runtime_for_topology(topology))
+            .expect_err("only a NodeWaypoint or a Sidecar serves carried HTTP routes");
+    }
 }
 
 #[test]
@@ -881,4 +890,383 @@ fn a_malformed_gateways_field_does_not_bind_the_mesh() {
             "gateways {gateways} must not bind the mesh"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// Sidecar projection (issue #7423). The Sidecar reuses the NodeWaypoint route
+// machinery; only the transport (per-workload SVID-mTLS) and the listener the
+// routes are served on (outbound capture only) differ.
+// ---------------------------------------------------------------------------
+
+fn sidecar_runtime() -> MeshRuntimeConfig {
+    runtime_for_topology(MeshTopology::Sidecar)
+}
+
+fn sidecar_slice(config: &GatewayConfig, runtime: &MeshRuntimeConfig) -> MeshSlice {
+    MeshSlice::from_gateway_config(config, runtime.mesh_slice_request())
+}
+
+fn ninety_ten_split_spec() -> serde_json::Value {
+    let mut spec = split_spec(json!({}));
+    spec["http"][0]["route"][0]["weight"] = json!(90);
+    spec["http"][0]["route"][1]["weight"] = json!(10);
+    spec
+}
+
+#[test]
+fn sidecar_requests_and_receives_bound_routes_their_plugins_and_upstreams() {
+    let runtime = sidecar_runtime();
+    let request = runtime.mesh_slice_request();
+    assert!(request.sidecar_http_routes, "a Sidecar asks for the routes");
+    assert!(!request.node_waypoint_capture_scoping);
+
+    let config = translated_config(&[virtual_service("split", guarded_split_spec())]);
+    let slice = sidecar_slice(&config, &runtime);
+    let proxy_ids = carried_ids(&slice.http_routes.proxies);
+    assert!(
+        !proxy_ids.is_empty(),
+        "the Sidecar slice carries the routes"
+    );
+    assert!(proxy_ids.iter().all(|id| id.starts_with("istio-vs-")));
+    let upstream_ids = carried_ids(&slice.http_routes.upstreams);
+    assert_eq!(
+        upstream_ids.len(),
+        1,
+        "the weighted split upstream rides along"
+    );
+    assert!(
+        slice.http_routes.plugin_configs.iter().any(|plugin| {
+            plugin
+                .get("plugin_name")
+                .and_then(serde_json::Value::as_str)
+                == Some("mesh_route_dispatch")
+        }),
+        "the route's match dispatch rules ride along"
+    );
+
+    // The same projection a NodeWaypoint gets: one implementation.
+    let node_waypoint = node_waypoint_slice(&config, &node_waypoint_runtime());
+    assert_eq!(slice.http_routes, node_waypoint.http_routes);
+
+    // A request without the flag (Ambient-shaped) gets nothing.
+    let unflagged = MeshSliceRequest {
+        sidecar_http_routes: false,
+        ..runtime.mesh_slice_request()
+    };
+    assert!(
+        MeshSlice::from_gateway_config(&config, unflagged)
+            .http_routes
+            .is_empty()
+    );
+}
+
+#[test]
+fn sidecar_routes_honour_export_to_and_round_trip_both_wires() {
+    let hidden = translated_config(&[virtual_service(
+        "split",
+        split_spec(json!({"exportTo": ["other"]})),
+    )]);
+    assert!(
+        sidecar_slice(&hidden, &sidecar_runtime())
+            .http_routes
+            .is_empty(),
+        "a VirtualService not exported to the Sidecar's namespace is not served"
+    );
+
+    let config = translated_config(&[virtual_service("split", split_spec(json!({})))]);
+    let slice = sidecar_slice(&config, &sidecar_runtime());
+    let native: MeshSlice =
+        serde_json::from_value(serde_json::to_value(&slice).expect("serialize"))
+            .expect("native slice JSON decodes");
+    assert!(native.content_eq(&slice));
+    let carrier = build_slice_carriers(&slice)
+        .into_iter()
+        .find(|carrier| matches!(carrier, MeshSliceCarrier::HttpRoutes(_)))
+        .expect("xDS emits the HTTP route carrier for a Sidecar slice");
+    let bytes = carrier.encode_value().expect("encode");
+    assert_eq!(
+        MeshSliceCarrier::decode(carrier.type_url(), &bytes)
+            .expect("decode")
+            .expect("recognized carrier"),
+        MeshSliceCarrier::HttpRoutes(slice.http_routes.clone())
+    );
+}
+
+/// The Sidecar rebinds a carried split onto its own mesh transport: each leg
+/// becomes the destination Service's workloads over pinned SVID-mTLS, never
+/// the Service DNS name over plain HTTP, and the shadowed Service keeps its
+/// materialized upstream while its route yields to the VirtualService route.
+#[test]
+fn sidecar_split_dials_the_service_workloads_over_svid_mtls() {
+    let config = translated_config(&[virtual_service("split", split_spec(json!({})))]);
+    let runtime = sidecar_runtime();
+    let slice = sidecar_slice(&config, &runtime);
+    let split_id = carried_ids(&slice.http_routes.upstreams).remove(0);
+    let prepared =
+        prepare_gateway_config_from_mesh_slice(&slice, &runtime).expect("slice materializes");
+
+    let routes = carried_route_proxies(&prepared);
+    assert_eq!(routes.len(), 1, "the VirtualService route is served");
+    assert_eq!(routes[0].upstream_id.as_deref(), Some(split_id.as_str()));
+    let split = prepared
+        .upstreams
+        .iter()
+        .find(|upstream| upstream.id == split_id)
+        .expect("split upstream served");
+    let mut hosts: Vec<&str> = split
+        .targets
+        .iter()
+        .map(|target| target.host.as_str())
+        .collect();
+    hosts.sort_unstable();
+    assert_eq!(hosts, vec!["10.0.0.11", "10.0.0.12"]);
+    for target in &split.targets {
+        assert_eq!(
+            target
+                .tags
+                .get(ferrum_edge::proxy::mesh_mtls_pool::MESH_MTLS_TARGET_TAG)
+                .map(String::as_str),
+            Some("true"),
+            "every leg rides the Sidecar SVID-mTLS transport"
+        );
+        assert!(
+            target.tags.contains_key("mesh.spiffe_id"),
+            "every leg pins the destination workload identity"
+        );
+        assert_eq!(target.service_port_policy_key, Some(8080));
+    }
+
+    assert!(
+        prepared
+            .upstreams
+            .iter()
+            .any(|upstream| upstream.id == "__mesh-out-upstream-default-reviews-8080"),
+        "the shadowed Service keeps its materialized upstream"
+    );
+    assert!(
+        !prepared
+            .proxies
+            .iter()
+            .any(|proxy| proxy.id == "__mesh-outbound-default-reviews-8080"),
+        "the Service route yields to the VirtualService route on the same host and path"
+    );
+    assert!(
+        prepared
+            .proxies
+            .iter()
+            .any(|proxy| proxy.id == "__mesh-outbound-default-ratings-8080"),
+        "a Service no route shadows keeps its own route"
+    );
+    prepared
+        .validate_unique_listen_paths()
+        .expect("carried and materialized routes do not collide");
+}
+
+/// Issue #7423 acceptance: a 90/10 VirtualService split on a Sidecar sends
+/// 90% of N requests to one leg and 10% to the other, through the production
+/// load balancer over the prepared Sidecar config.
+#[test]
+fn sidecar_ninety_ten_split_dispatches_ninety_ten_over_n_requests() {
+    let config = translated_config(&[virtual_service("split", ninety_ten_split_spec())]);
+    let runtime = sidecar_runtime();
+    let slice = sidecar_slice(&config, &runtime);
+    let split_id = carried_ids(&slice.http_routes.upstreams).remove(0);
+    let prepared =
+        prepare_gateway_config_from_mesh_slice(&slice, &runtime).expect("slice materializes");
+
+    let cache = ferrum_edge::LoadBalancerCache::new(&prepared);
+    let snapshot = cache.load();
+    const REQUESTS: usize = 1000;
+    let mut counts: HashMap<String, usize> = HashMap::new();
+    for _ in 0..REQUESTS {
+        let selection = ferrum_edge::LoadBalancerCache::select_target_from(
+            &snapshot,
+            DEFAULT_NAMESPACE,
+            &split_id,
+            "",
+            None,
+        )
+        .expect("the split upstream selects a target");
+        let service = selection
+            .target
+            .tags
+            .get(ferrum_edge::config::types::UPSTREAM_TARGET_SERVICE_NAME_TAG)
+            .cloned()
+            .expect("each rebound target names its Service");
+        *counts.entry(service).or_default() += 1;
+    }
+    let reviews = counts.get("reviews").copied().unwrap_or_default();
+    let ratings = counts.get("ratings").copied().unwrap_or_default();
+    assert_eq!(reviews + ratings, REQUESTS, "only the two legs are dialed");
+    let reviews_share = reviews as f64 / REQUESTS as f64;
+    assert!(
+        (reviews_share - 0.9).abs() <= 0.02,
+        "90/10 split sent {reviews}/{ratings} of {REQUESTS} requests"
+    );
+}
+
+/// A split across DestinationRule-governed Services is dispatched leg by leg
+/// on a Sidecar too (issue #7387 machinery), each leg the Service port's own
+/// rule-bearing Sidecar upstream, with the configured 90/10 weights.
+#[test]
+fn sidecar_split_across_destination_rule_governed_services_is_dispatched_leg_by_leg() {
+    let config = translated_config(&[
+        virtual_service("split", ninety_ten_split_spec()),
+        destination_rule("reviews-dr", "reviews.default.svc.cluster.local", "RANDOM"),
+        destination_rule(
+            "ratings-dr",
+            "ratings.default.svc.cluster.local",
+            "ROUND_ROBIN",
+        ),
+    ]);
+    let runtime = sidecar_runtime();
+    let slice = sidecar_slice(&config, &runtime);
+    let split_id = carried_ids(&slice.http_routes.upstreams).remove(0);
+    let prepared =
+        prepare_gateway_config_from_mesh_slice(&slice, &runtime).expect("slice materializes");
+    let legs: Vec<(String, u64)> = prepared
+        .plugin_configs
+        .iter()
+        .filter(|plugin| plugin.plugin_name == "mesh_route_dispatch")
+        .filter_map(|plugin| plugin.config.get("weighted_splits"))
+        .flat_map(|splits| splits.as_array().into_iter().flatten())
+        .filter(|split| split["upstream_id"] == json!(split_id))
+        .flat_map(|split| split["legs"].as_array().into_iter().flatten())
+        .filter_map(|leg| {
+            Some((
+                leg["upstream_id"].as_str()?.to_string(),
+                leg["weight"].as_u64()?,
+            ))
+        })
+        .collect();
+    assert_eq!(
+        legs,
+        vec![
+            ("__mesh-out-upstream-default-reviews-8080".to_string(), 90),
+            ("__mesh-out-upstream-default-ratings-8080".to_string(), 10),
+        ]
+    );
+    for (leg, _) in &legs {
+        let upstream = prepared
+            .upstreams
+            .iter()
+            .find(|upstream| &upstream.id == leg)
+            .expect("each leg is a materialized Sidecar upstream");
+        assert!(upstream.targets.iter().all(|target| {
+            target
+                .tags
+                .get(ferrum_edge::proxy::mesh_mtls_pool::MESH_MTLS_TARGET_TAG)
+                .is_some_and(|value| value == "true")
+        }));
+    }
+}
+
+/// A Sidecar refuses a route that names an in-cluster Service its slice does
+/// not model, exactly like a NodeWaypoint: it never dials a Service DNS name
+/// in plaintext, and the Service keeps its materialized route.
+#[test]
+fn sidecar_refuses_a_route_to_an_unmodeled_cluster_service() {
+    let config = translated_config(&[virtual_service(
+        "missing",
+        json!({
+            "hosts": ["reviews.default.svc.cluster.local"],
+            "http": [{
+                "route": [{
+                    "destination": {
+                        "host": "missing.default.svc.cluster.local",
+                        "port": {"number": 8080}
+                    }
+                }]
+            }]
+        }),
+    )]);
+    let runtime = sidecar_runtime();
+    let slice = sidecar_slice(&config, &runtime);
+    assert!(!slice.http_routes.proxies.is_empty());
+    let prepared =
+        prepare_gateway_config_from_mesh_slice(&slice, &runtime).expect("slice materializes");
+    assert!(carried_route_proxies(&prepared).is_empty());
+    assert!(
+        prepared
+            .proxies
+            .iter()
+            .any(|proxy| proxy.id == "__mesh-outbound-default-reviews-8080"),
+        "the Service route is materialized again"
+    );
+}
+
+/// Carried routes are client-side: served on the Sidecar's outbound capture
+/// listener and on non-mesh listeners (gateway parity), never on an inbound
+/// mesh listener, where a peer could otherwise name a routed host and have
+/// this Sidecar dial it onward with its own identity.
+#[test]
+fn sidecar_carried_routes_are_never_served_on_the_inbound_listener() {
+    use ferrum_edge::RouterCache;
+    use ferrum_edge::modes::mesh::MeshTrafficDirection;
+    use ferrum_edge::router_cache::{MeshRouteScope, MeshScopedResolution};
+
+    let config = translated_config(&[virtual_service("split", split_spec(json!({})))]);
+    let runtime = sidecar_runtime();
+    let slice = sidecar_slice(&config, &runtime);
+    let prepared =
+        prepare_gateway_config_from_mesh_slice(&slice, &runtime).expect("slice materializes");
+    let cache = RouterCache::new(&prepared, 1024);
+    let host = Some("reviews.default.svc.cluster.local");
+    let routed_id = |direction: Option<MeshTrafficDirection>| match cache
+        .resolve_mesh_scoped_route_for_test(
+            host,
+            "/",
+            None,
+            false,
+            MeshRouteScope {
+                direction,
+                ..MeshRouteScope::default()
+            },
+        ) {
+        MeshScopedResolution::Routed(route) => Some(route.route_match().proxy.id.clone()),
+        MeshScopedResolution::NotFound | MeshScopedResolution::Refused => None,
+    };
+
+    let outbound = routed_id(Some(MeshTrafficDirection::Outbound)).expect("outbound routes");
+    assert!(
+        outbound.starts_with("istio-vs-"),
+        "the outbound capture leg applies the VirtualService route, got {outbound:?}"
+    );
+    let non_mesh = routed_id(None).expect("non-mesh listeners keep VirtualService routes");
+    assert!(non_mesh.starts_with("istio-vs-"));
+    assert!(
+        routed_id(Some(MeshTrafficDirection::Inbound))
+            .is_none_or(|id| !id.starts_with("istio-vs-")),
+        "an inbound mesh listener must never serve a carried VirtualService route"
+    );
+}
+
+/// A carried route claiming the local workload's own inbound route slot (same
+/// namespace, path and host) is refused on a Sidecar: the local inbound route
+/// keeps the slot and the slice still applies, instead of the listen-path
+/// conflict refusing the whole generation.
+#[test]
+fn sidecar_refuses_a_carried_route_that_claims_the_local_inbound_route() {
+    let config = translated_config(&[virtual_service("split", split_spec(json!({})))]);
+    let mut runtime = sidecar_runtime();
+    runtime.workload_spiffe_id = Some("spiffe://cluster.local/ns/default/sa/reviews".to_string());
+    runtime.workload_labels = HashMap::from([("app".to_string(), "reviews".to_string())]);
+    let slice = sidecar_slice(&config, &runtime);
+    assert!(!slice.http_routes.proxies.is_empty());
+    let prepared =
+        prepare_gateway_config_from_mesh_slice(&slice, &runtime).expect("slice materializes");
+    assert!(
+        prepared
+            .proxies
+            .iter()
+            .any(|proxy| proxy.id == "__mesh-inbound-default-reviews-8080"),
+        "the local reviews inbound route is served"
+    );
+    assert!(
+        carried_route_proxies(&prepared).is_empty(),
+        "the carried route claiming the local service's slot is refused"
+    );
+    prepared
+        .validate_unique_listen_paths()
+        .expect("no listen-path conflict reaches the generation");
 }

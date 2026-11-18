@@ -1085,6 +1085,7 @@ async fn test_mesh_subscribe_receives_initial_mesh_slice() {
         ambient_udp_source_scoping: false,
         remote_discovery: false,
         node_waypoint_capture_scoping: false,
+        sidecar_http_routes: false,
     });
     let mut stream = client.mesh_subscribe(request).await.unwrap().into_inner();
     let update = stream.message().await.unwrap().unwrap();
@@ -1180,6 +1181,7 @@ async fn test_mesh_subscribe_waypoint_name_narrows_initial_slice() {
         ambient_udp_source_scoping: false,
         remote_discovery: false,
         node_waypoint_capture_scoping: false,
+        sidecar_http_routes: false,
     });
     let mut stream = client.mesh_subscribe(request).await.unwrap().into_inner();
     let update = stream.message().await.unwrap().unwrap();
@@ -1205,6 +1207,7 @@ async fn test_native_mesh_client_installs_mesh_slice_from_cp() {
         labels: HashMap::from([("app".to_string(), "api".to_string())]),
         ambient_udp_source_scoping: false,
         node_waypoint_capture_scoping: false,
+        sidecar_http_routes: false,
         primary_retry_secs: 0,
         timings: MeshStreamTimings::production(),
     };
@@ -1873,6 +1876,7 @@ async fn test_mesh_subscribe_rejects_token_with_wrong_issuer() {
         ambient_udp_source_scoping: false,
         remote_discovery: false,
         node_waypoint_capture_scoping: false,
+        sidecar_http_routes: false,
     });
 
     let result = client.mesh_subscribe(request).await;
@@ -4833,6 +4837,7 @@ async fn test_cp_rejects_mesh_subscribe_with_mismatched_namespace() {
         ambient_udp_source_scoping: false,
         remote_discovery: false,
         node_waypoint_capture_scoping: false,
+        sidecar_http_routes: false,
     });
 
     let result = client.mesh_subscribe(request).await;
@@ -6406,6 +6411,7 @@ async fn request_native_admission(
                         ambient_udp_source_scoping: false,
                         remote_discovery: false,
                         node_waypoint_capture_scoping: false,
+                        sidecar_http_routes: false,
                     },
                 ))
                 .await
@@ -6485,6 +6491,7 @@ async fn open_mesh_subscribe_stream_with_token(
         ambient_udp_source_scoping: false,
         remote_discovery: false,
         node_waypoint_capture_scoping: false,
+        sidecar_http_routes: false,
     });
     request.metadata_mut().insert(
         "authorization",

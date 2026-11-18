@@ -73,6 +73,7 @@ fn client_config_with_timings(
         labels: HashMap::new(),
         ambient_udp_source_scoping: false,
         node_waypoint_capture_scoping: false,
+        sidecar_http_routes: false,
         primary_retry_secs: 0,
         timings,
     }

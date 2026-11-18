@@ -575,6 +575,7 @@ mod audience_binding {
             ambient_udp_source_scoping: false,
             remote_discovery,
             node_waypoint_capture_scoping: false,
+            sidecar_http_routes: false,
         };
         client.mesh_subscribe(tonic::Request::new(request)).await?;
         Ok(())

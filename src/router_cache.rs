@@ -73,7 +73,9 @@ enum MeshRouteDirectionFilter {
     Unfiltered,
     /// Admit non-mesh routes plus mesh routes whose direction equals this
     /// request's listener direction (`None` ⇒ a non-mesh listener, which admits
-    /// no direction-scoped mesh route).
+    /// no direction-scoped mesh route). A carried VirtualService HTTP route is
+    /// never admitted on an inbound mesh listener
+    /// (`modes::mesh::mesh_route_admitted_for_direction`, issue #7423).
     MatchingDirection(Option<crate::modes::mesh::MeshTrafficDirection>),
 }
 
@@ -2091,10 +2093,7 @@ impl RouterCache {
         let admit = |rm: &RouteMatch| match direction_filter {
             MeshRouteDirectionFilter::Unfiltered => true,
             MeshRouteDirectionFilter::MatchingDirection(req_dir) => {
-                match crate::modes::mesh::mesh_route_direction(&rm.proxy.id) {
-                    None => true,
-                    Some(route_dir) => req_dir == Some(route_dir),
-                }
+                crate::modes::mesh::mesh_route_admitted_for_direction(&rm.proxy.id, req_dir)
             }
         };
         if let Some(host) = host {
@@ -3750,8 +3749,10 @@ fn complete_mesh_scoped_resolution(
 
     let found = match found {
         Some(route)
-            if crate::modes::mesh::mesh_route_direction(&route.proxy.id)
-                .is_some_and(|direction| Some(direction) != mesh.direction) =>
+            if !crate::modes::mesh::mesh_route_admitted_for_direction(
+                &route.proxy.id,
+                mesh.direction,
+            ) =>
         {
             exclude_wrong_direction()
         }

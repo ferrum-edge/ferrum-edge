@@ -1392,15 +1392,15 @@ fn accepted_status(
 }
 
 /// `status.ferrum.translation.mesh_http_routes` for a mesh-bound
-/// VirtualService with `http[]` routes (issue #7390): mesh data planes apply
-/// those routes only on the NodeWaypoint topology.
-pub const VIRTUAL_SERVICE_MESH_HTTP_ROUTES_SCOPE: &str = "node_waypoint_only";
+/// VirtualService with `http[]` routes (issues #7390, #7423): mesh data planes
+/// apply those routes on the Sidecar and NodeWaypoint topologies only.
+pub const VIRTUAL_SERVICE_MESH_HTTP_ROUTES_SCOPE: &str = "sidecar_and_node_waypoint";
 
 /// The `FerrumAccepted` message note naming the topologies that do NOT apply a
-/// mesh-bound VirtualService's `http[]` routes (issue #7390).
+/// mesh-bound VirtualService's `http[]` routes (issues #7390, #7423).
 pub const VIRTUAL_SERVICE_MESH_HTTP_ROUTES_NOTE: &str = "mesh http[] routes are applied only by \
-     NodeWaypoint data planes; Sidecar, Ambient and ServiceWaypoint data planes ignore them and \
-     route to the destination Service";
+     Sidecar and NodeWaypoint data planes; Ambient and ServiceWaypoint data planes ignore them \
+     and route to the destination Service";
 
 /// Status for `VirtualService`. The translator consumes `spec.http` routes
 /// (incl. `mirror` / `rewrite` / `redirect` / `corsPolicy`) and `spec.tcp` /
@@ -1437,10 +1437,11 @@ fn virtual_service_status(
         Ok(_translation) => {
             let deferred = virtual_service_deferred_fields(&object.spec);
             let clamped = virtual_service_clamped_fields(&object.spec);
-            // Issue #7390: a mesh-bound VirtualService's `http[]` routes reach
-            // only NodeWaypoint data planes (`MeshSlice.http_routes`); Sidecar,
-            // Ambient and ServiceWaypoint data planes keep routing to the plain
-            // Service. Say so instead of reporting the route count alone.
+            // Issues #7390, #7423: a mesh-bound VirtualService's `http[]`
+            // routes reach only Sidecar and NodeWaypoint data planes
+            // (`MeshSlice.http_routes`); Ambient and ServiceWaypoint data planes
+            // keep routing to the plain Service. Say so instead of reporting
+            // the route count alone.
             let mesh_http_routes = (http_route_count > 0
                 && crate::config_sources::k8s::virtual_service_binds_mesh(object))
             .then_some(VIRTUAL_SERVICE_MESH_HTTP_ROUTES_SCOPE);

@@ -126,6 +126,9 @@ pub struct NativeMeshClientConfig {
     /// so it needs the dedicated cross-namespace capture destination/policy
     /// inventory. See `MeshSliceRequest::node_waypoint_capture_scoping`.
     pub node_waypoint_capture_scoping: bool,
+    /// This DP is a Sidecar that serves mesh-bound VirtualService `http[]`
+    /// routes (issue #7423). See `MeshSliceRequest::sidecar_http_routes`.
+    pub sidecar_http_routes: bool,
     /// Shared CP-failover primary-retry interval
     /// (`FERRUM_DP_CP_FAILOVER_PRIMARY_RETRY_SECS`). When > 0 and connected to a
     /// fallback CP after a first slice is installed, the client proactively
@@ -152,6 +155,7 @@ impl NativeMeshClientConfig {
             waypoint_name: self.waypoint_name.clone().unwrap_or_default(),
             ambient_udp_source_scoping: self.ambient_udp_source_scoping,
             node_waypoint_capture_scoping: self.node_waypoint_capture_scoping,
+            sidecar_http_routes: self.sidecar_http_routes,
             // Ordinary LOCAL mesh subscription: this data plane talks to its
             // own control plane and presents the distinct, fixed local-mesh
             // JWT audience. The CP rejects both missing audiences (legacy
@@ -966,6 +970,7 @@ mod tests {
             labels: HashMap::new(),
             ambient_udp_source_scoping: false,
             node_waypoint_capture_scoping: false,
+            sidecar_http_routes: false,
             primary_retry_secs: 0,
             timings: MeshStreamTimings::production(),
         }

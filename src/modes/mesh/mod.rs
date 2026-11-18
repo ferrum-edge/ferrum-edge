@@ -353,6 +353,24 @@ impl MeshTopology {
     fn uses_node_waypoint_capture_scoping(self) -> bool {
         matches!(self, Self::NodeWaypoint)
     }
+
+    /// Whether this topology serves the VirtualService `http[]` routes a mesh
+    /// slice carries (`MeshSlice::http_routes`, issues #7233 and #7423): the
+    /// NodeWaypoint capture listener and the Sidecar outbound capture
+    /// listener. Ambient is the L4 data plane and does no L7 routing (as in
+    /// Istio); ServiceWaypoint projection is a documented follow-up.
+    #[inline]
+    pub(crate) fn serves_virtual_service_http_routes(self) -> bool {
+        matches!(self, Self::NodeWaypoint | Self::Sidecar)
+    }
+
+    /// Whether this topology asks the control plane for the VirtualService
+    /// `http[]` routes on a Sidecar slice (`MeshSliceRequest::sidecar_http_routes`).
+    /// NodeWaypoint gets them through its own capture-scoping request.
+    #[inline]
+    fn requests_sidecar_http_routes(self) -> bool {
+        matches!(self, Self::Sidecar)
+    }
 }
 
 /// Control-protocol source for mesh runtime config.
@@ -1017,6 +1035,7 @@ impl MeshRuntimeConfig {
             waypoint_name: self.service_waypoint_name(),
             ambient_udp_source_scoping: self.topology.uses_ambient_udp_source_scoping(),
             node_waypoint_capture_scoping: self.topology.uses_node_waypoint_capture_scoping(),
+            sidecar_http_routes: self.topology.requests_sidecar_http_routes(),
             labels: self.workload_labels.clone(),
             // Same `FERRUM_DP_CP_FAILOVER_PRIMARY_RETRY_SECS` interval the xDS
             // client uses — the knob is protocol-agnostic failover/failback.
@@ -1069,6 +1088,7 @@ impl MeshRuntimeConfig {
             waypoint_name: self.service_waypoint_name(),
             ambient_udp_source_scoping: self.topology.uses_ambient_udp_source_scoping(),
             node_waypoint_capture_scoping: self.topology.uses_node_waypoint_capture_scoping(),
+            sidecar_http_routes: self.topology.requests_sidecar_http_routes(),
             stream_channel_capacity: self.xds_stream_channel_capacity,
             primary_retry_secs: self.xds_primary_retry_secs,
             connect_timeout_seconds: self.xds_connect_timeout_seconds,
@@ -1548,6 +1568,7 @@ impl MeshRuntimeConfig {
             enforce_sidecar_identity_narrowing: self.sidecar_identity_narrowing,
             ambient_udp_source_scoping: self.topology.uses_ambient_udp_source_scoping(),
             node_waypoint_capture_scoping: self.topology.uses_node_waypoint_capture_scoping(),
+            sidecar_http_routes: self.topology.requests_sidecar_http_routes(),
         }
     }
 
@@ -4281,7 +4302,8 @@ type DecodedHttpRouteSet = (
 /// Decode the VirtualService HTTP routes a slice carries (issue #7233).
 ///
 /// The set is producer input, so it is re-checked here before anything is
-/// materialized: only a NodeWaypoint serves it; every element is an object of
+/// materialized: only a NodeWaypoint or a Sidecar serves it (issue #7423);
+/// every element is an object of
 /// its resource type in the slice namespace with a translator-owned id; every
 /// plugin association resolves to a carried plugin config owned by that
 /// proxy; and every upstream id a proxy or `mesh_route_dispatch` rule names
@@ -4297,9 +4319,10 @@ fn decode_http_route_set(
     if set.is_empty() {
         return Ok((Vec::new(), Vec::new(), Vec::new()));
     }
-    if runtime.topology != MeshTopology::NodeWaypoint {
+    if !runtime.topology.serves_virtual_service_http_routes() {
         return Err(anyhow::anyhow!(
-            "Mesh slice carries VirtualService HTTP routes, which only a NodeWaypoint serves"
+            "Mesh slice carries VirtualService HTTP routes, which only a NodeWaypoint or a \
+             Sidecar serves"
         ));
     }
     let proxies: Vec<Proxy> = set
@@ -4566,12 +4589,13 @@ fn destination_rule_originates_tls_for_host(mesh_slice: &MeshSlice, host: &str, 
     })
 }
 
-/// Rebind the VirtualService HTTP routes a NodeWaypoint slice carries onto the
-/// NodeWaypoint mesh transport (issue #7233).
+/// Rebind the VirtualService HTTP routes a NodeWaypoint (issue #7233) or
+/// Sidecar (issue #7423) slice carries onto that topology's mesh transport.
 ///
 /// The translator's routes dial Service DNS names over plain HTTP. Served as
 /// they are, a carried route would replace the materialized Service route's
-/// pinned, node-to-node HBONE targets with a plaintext dial. So every in-mesh
+/// pinned mesh targets (node-to-node HBONE on a NodeWaypoint, per-workload
+/// SVID-mTLS on a Sidecar) with a plaintext dial. So every in-mesh
 /// destination is rebound onto the Service port's materialized upstream
 /// (`materialize_mesh_outbound_proxies` keeps those upstreams even when a
 /// carried route shadows the Service's own route):
@@ -4616,10 +4640,27 @@ fn bind_carried_http_routes_to_node_waypoint_transport(
     runtime: &MeshRuntimeConfig,
     mesh_slice: &MeshSlice,
 ) {
-    if runtime.topology != MeshTopology::NodeWaypoint || mesh_slice.http_routes.is_empty() {
+    if !runtime.topology.serves_virtual_service_http_routes() || mesh_slice.http_routes.is_empty() {
         return;
     }
     let hosts = CarriedRouteHostIndex::new(mesh_slice, &runtime.cluster_domain);
+    // Sidecar (issue #7423): the local workload's own inbound and `ingress[]`
+    // routes share the route table with the carried routes. A carried route
+    // that claims one of their (namespace, port, path) slots on an
+    // overlapping host would be a listen-path conflict that refuses the whole
+    // slice, so it is refused instead and the local route keeps the slot
+    // (self-calls keep their loopback route, as for the Service route the
+    // outbound materializer yields).
+    let local_inbound_routes: Vec<Proxy> = if runtime.topology == MeshTopology::Sidecar {
+        config
+            .proxies
+            .iter()
+            .filter(|proxy| is_mesh_inbound_route_id(&proxy.id) && !proxy.dispatch_kind.is_stream())
+            .cloned()
+            .collect()
+    } else {
+        Vec::new()
+    };
     // The materialized upstream for a modeled Service port, if any.
     let service_upstream = |config: &GatewayConfig, namespace: &str, name: &str, port: u16| {
         let id = mesh_outbound_upstream_id(namespace, name, port);
@@ -4819,6 +4860,8 @@ fn bind_carried_http_routes_to_node_waypoint_transport(
     // Direct external backends a wildcard DestinationRule names (no rule
     // can apply to a direct backend).
     let mut wildcard_direct_backend_refused = 0usize;
+    // Sidecar routes that claim the local workload's own inbound route slot.
+    let mut local_inbound_route_conflicts = 0usize;
     for index in 0..config.proxies.len() {
         let proxy = &config.proxies[index];
         if !config::is_virtual_service_http_route_proxy_id(&proxy.id) {
@@ -4829,6 +4872,18 @@ fn bind_carried_http_routes_to_node_waypoint_transport(
         let backend_host = proxy.backend_host.clone();
         let backend_port = proxy.backend_port;
         let mut keep = true;
+        if !local_inbound_routes.is_empty() {
+            let claimed_hosts = carried_route_claimed_hosts(proxy, &hosts, &runtime.cluster_domain);
+            if local_inbound_routes.iter().any(|local| {
+                local.namespace == proxy.namespace
+                    && local.listen_port == proxy.listen_port
+                    && local.listen_path == proxy.listen_path
+                    && crate::config::types::hosts_overlap(&claimed_hosts, &local.hosts)
+            }) {
+                local_inbound_route_conflicts += 1;
+                keep = false;
+            }
+        }
         let mut proxy_upstream: Option<String> = None;
         // Every destination the route can reach, as authorization lists
         // candidates: the own destination, each weighted split's legs (never
@@ -5101,12 +5156,14 @@ fn bind_carried_http_routes_to_node_waypoint_transport(
             oversized_weighted_routes,
             tls_origination_refused,
             wildcard_direct_backend_refused,
-            "NodeWaypoint VirtualService routes refused: a destination is an in-cluster Service \
-             this waypoint cannot reach over its mesh transport, a weighted split that must \
+            local_inbound_route_conflicts,
+            "Mesh VirtualService routes refused: a destination is an in-cluster Service \
+             this data plane cannot reach over its mesh transport, a weighted split that must \
              be dispatched leg by leg cannot be represented, a direct external backend's \
-             DestinationRule asks for TLS origination a direct backend cannot carry, or a \
-             wildcard DestinationRule names a direct external backend no rule can apply to; \
-             their hosts use the materialized Service routes"
+             DestinationRule asks for TLS origination a direct backend cannot carry, a \
+             wildcard DestinationRule names a direct external backend no rule can apply to, \
+             or (Sidecar) a route claims the local workload's own inbound route; their hosts \
+             use the materialized Service routes"
         );
         config
             .proxies
@@ -5155,6 +5212,30 @@ fn bind_carried_http_routes_to_node_waypoint_transport(
         // get their Service routes back.
         materialize_mesh_outbound_proxies(config, runtime, mesh_slice);
     }
+}
+
+/// The hosts a carried route answers once
+/// [`expand_carried_route_service_hosts`] has run: its declared hosts plus
+/// every host spelling of each modeled Service it declares. Over-approximates
+/// (it ignores spellings another carried route keeps), which only refuses
+/// more on a conflict check.
+fn carried_route_claimed_hosts(
+    proxy: &Proxy,
+    hosts: &CarriedRouteHostIndex,
+    cluster_domain: &str,
+) -> Vec<String> {
+    let mut claimed = proxy.hosts.clone();
+    for host in &proxy.hosts {
+        if let CarriedRouteHost::Service(namespace, name) = hosts.classify(&proxy.namespace, host) {
+            for variant in mesh_service_host_variants(&name, &namespace, cluster_domain) {
+                if !variant.contains('.') && namespace != proxy.namespace {
+                    continue;
+                }
+                claimed.push(variant);
+            }
+        }
+    }
+    claimed
 }
 
 /// A leg-dispatched split's legs: `(leg upstream id, weight)` (issue #7387).
@@ -6853,6 +6934,30 @@ pub(crate) fn mesh_route_direction(id: &str) -> Option<MeshTrafficDirection> {
         Some(MeshTrafficDirection::Outbound)
     } else {
         None
+    }
+}
+
+/// Whether a route may serve a request accepted on a listener of direction
+/// `request_direction` (`None` = a non-mesh listener).
+///
+/// A direction-scoped mesh route ([`mesh_route_direction`]) serves only its
+/// own direction. A carried VirtualService HTTP route (issues #7233, #7423)
+/// is CLIENT-side routing: it serves the outbound capture leg (Sidecar
+/// `:15001`, the NodeWaypoint capture backend) and never an INBOUND mesh
+/// listener. Served there, a peer (or, under PERMISSIVE, a plaintext client)
+/// could name a routed host and have this proxy dial it onward with its own
+/// mesh identity. Gateway-bound VirtualService routes share the id space and
+/// keep serving non-mesh listeners. Every other route is unscoped.
+pub(crate) fn mesh_route_admitted_for_direction(
+    id: &str,
+    request_direction: Option<MeshTrafficDirection>,
+) -> bool {
+    match mesh_route_direction(id) {
+        Some(route_direction) => request_direction == Some(route_direction),
+        None => {
+            request_direction != Some(MeshTrafficDirection::Inbound)
+                || !config::is_virtual_service_http_route_proxy_id(id)
+        }
     }
 }
 
@@ -9174,26 +9279,38 @@ fn materialize_mesh_outbound_proxies(
             // (not its route): the VirtualService routes its slice carries are
             // rebound onto these secured per-workload targets
             // (`bind_carried_http_routes_to_node_waypoint_transport`, #7233).
-            let shadowed = config.proxies.iter().any(|p| {
+            // A Sidecar does the same when a carried VirtualService route is
+            // what shadows the Service (issue #7423).
+            let mut shadowed = false;
+            let mut shadowed_by_carried_route = false;
+            for p in &config.proxies {
                 if (p.namespace == proxy.namespace && p.id == proxy.id)
                     || p.dispatch_kind.is_stream()
                     || is_mesh_outbound_route_id(&p.id)
                 {
-                    return false;
+                    continue;
                 }
                 let shadows_or_collides = p.listen_path == proxy.listen_path
                     || p.listen_path.is_none()
                     || p.listen_path
                         .as_deref()
                         .is_some_and(|lp| lp.starts_with('~'));
-                shadows_or_collides && crate::config::types::hosts_overlap(&p.hosts, &proxy.hosts)
-            });
+                if shadows_or_collides
+                    && crate::config::types::hosts_overlap(&p.hosts, &proxy.hosts)
+                {
+                    shadowed = true;
+                    shadowed_by_carried_route |=
+                        config::is_virtual_service_http_route_proxy_id(&p.id);
+                }
+            }
             if shadowed {
                 debug!(
                     proxy_id = %sanitize_startup_scalar(proxy.id.to_string()),
                     "Skipping outbound route materialization; an existing operator proxy already routes this host/path"
                 );
-                if transport != MeshEgressTransport::NodeWaypointCapturedService {
+                let keep_upstream = transport == MeshEgressTransport::NodeWaypointCapturedService
+                    || (transport == MeshEgressTransport::SidecarMtls && shadowed_by_carried_route);
+                if !keep_upstream {
                     continue;
                 }
             }
@@ -12898,8 +13015,8 @@ pub(crate) fn apply_destination_rules_with_tenant_file_roots(
 }
 
 /// Let the DestinationRule drive the backend scheme of every external
-/// weighted-split leg a NodeWaypoint carried route dispatches (issue #7387,
-/// Istio semantics).
+/// weighted-split leg a NodeWaypoint or Sidecar carried route dispatches
+/// (issues #7387, #7423, Istio semantics).
 ///
 /// A leg-dispatched split sends each external host through its own residual
 /// upstream (`<split>-external-<n>`, one target), where that host's
@@ -12916,7 +13033,7 @@ fn project_node_waypoint_leg_origination(
     runtime: &MeshRuntimeConfig,
     applied: &HashMap<usize, AppliedClientTlsModes>,
 ) {
-    if runtime.topology != MeshTopology::NodeWaypoint || applied.is_empty() {
+    if !runtime.topology.serves_virtual_service_http_routes() || applied.is_empty() {
         return;
     }
     let originating: HashSet<(String, String)> = applied
@@ -30990,6 +31107,29 @@ mod tests {
         assert!(!runtime.native_client_config().node_waypoint_capture_scoping);
         assert!(!runtime.xds_client_config().node_waypoint_capture_scoping);
         assert!(!runtime.mesh_slice_request().node_waypoint_capture_scoping);
+
+        // Issue #7423: only a Sidecar asks the CP to carry VirtualService
+        // `http[]` routes on its own flag (a NodeWaypoint gets them through
+        // its capture scoping); Ambient and ServiceWaypoint ask for none.
+        for (topology, expected) in [
+            (MeshTopology::Sidecar, true),
+            (MeshTopology::Ambient, false),
+            (MeshTopology::NodeWaypoint, false),
+            (MeshTopology::ServiceWaypoint, false),
+        ] {
+            let mut scoped = runtime.clone();
+            scoped.topology = topology;
+            assert_eq!(scoped.native_client_config().sidecar_http_routes, expected);
+            assert_eq!(scoped.xds_client_config().sidecar_http_routes, expected);
+            assert_eq!(scoped.mesh_slice_request().sidecar_http_routes, expected);
+            assert_eq!(
+                scoped
+                    .native_client_config()
+                    .subscribe_request("test")
+                    .sidecar_http_routes,
+                expected
+            );
+        }
 
         let mut config = GatewayConfig::default();
         inject_mesh_global_plugins(&mut config, &runtime, &MeshSlice::default());

@@ -525,6 +525,7 @@ fn k8s_proxy_config_reaches_native_and_xds_equivalent_mesh_slices() {
         waypoint_name: None,
         ambient_udp_source_scoping: false,
         node_waypoint_capture_scoping: false,
+        sidecar_http_routes: false,
     };
     let native = MeshSlice::from_gateway_config(&gateway_config, request);
     assert_eq!(native.proxy_configs.len(), 1);
@@ -553,6 +554,7 @@ fn k8s_proxy_config_reaches_native_and_xds_equivalent_mesh_slices() {
         waypoint_name: native.waypoint_name.clone(),
         ambient_udp_source_scoping: false,
         node_waypoint_capture_scoping: false,
+        sidecar_http_routes: false,
         stream_channel_capacity: 1,
         primary_retry_secs: 0,
         connect_timeout_seconds: 0,
