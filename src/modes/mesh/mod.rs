@@ -6201,7 +6201,13 @@ fn build_east_west_service_proxies_and_upstreams(
             let upstream = Upstream {
                 labels: Default::default(),
                 id: upstream_id.clone(),
-                name: Some(upstream_id.clone()),
+                // The Service host is the upstream's logical destination name,
+                // so DestinationRule selection (exact and wildcard, Istio
+                // precedence) looks the rule up by Service hostname as Istio's
+                // AUTO_PASSTHROUGH SNI-DNAT clusters do (issue #7424). Only the
+                // passthrough-safe part of the rule applies; see
+                // `sni_passthrough_destination_rule_view`.
+                name: Some(cross_cluster_service_base_fqdn(service, cluster_domain)),
                 namespace: namespace.to_string(),
                 targets,
                 algorithm: LoadBalancerAlgorithm::RoundRobin,
@@ -6707,6 +6713,76 @@ fn mesh_east_west_service_upstream_id(namespace: &str, name: &str, sni_label: &s
     let namespace = sanitize_egress_host_id_part(namespace);
     let name = sanitize_egress_host_id_part(name);
     format!("__mesh-ew-upstream-{namespace}-{name}.{sni_label}")
+}
+
+/// The `(namespace, id)` of every SNI-passthrough Service upstream an
+/// EastWestGateway data plane materializes from `mesh_slice`
+/// ([`build_east_west_service_proxies_and_upstreams`]), with the owning Service
+/// port each one serves. Empty on every other topology.
+///
+/// Forward-derived with the materializer's own label and id helpers, so a
+/// port the materializer skips (an ambiguous alias) is never listed; a port it
+/// skips for having no targets or for yielding to an explicit
+/// `EastWestGateway` entry is listed but names no upstream, which is harmless.
+fn east_west_sni_passthrough_upstream_owner_ports(
+    runtime: &MeshRuntimeConfig,
+    mesh_slice: &MeshSlice,
+) -> Vec<(NamespacedResourceId, u16)> {
+    if runtime.topology != MeshTopology::EastWestGateway {
+        return Vec::new();
+    }
+    mesh_slice
+        .services
+        .iter()
+        .flat_map(|service| {
+            service.ports.iter().filter_map(move |service_port| {
+                let label = cross_cluster_service_sni_label(service, service_port)?;
+                Some((
+                    NamespacedResourceId::new(
+                        runtime.namespace.as_str(),
+                        mesh_east_west_service_upstream_id(
+                            &service.namespace,
+                            &service.name,
+                            &label,
+                        ),
+                    ),
+                    service_port.port,
+                ))
+            })
+        })
+        .collect()
+}
+
+/// The part of a DestinationRule that governs an EastWestGateway
+/// SNI-passthrough Service upstream (issue #7424).
+///
+/// Istio builds the AUTO_PASSTHROUGH gateway's clusters in
+/// `buildOutboundSniDnatClusters` (`pilot/pkg/networking/core/cluster.go`):
+/// it looks the rule up by Service hostname
+/// (`SidecarScope.DestinationRule(TrafficDirectionOutbound, proxy,
+/// service.Hostname)`) and applies it with `SniDnatClusterMode`, under which
+/// `applyTrafficPolicy` (`pilot/pkg/networking/core/cluster_traffic_policy.go`)
+/// keeps the connection pool, outlier detection and load balancer (locality
+/// included) but skips upstream TLS and PROXY protocol (`if opts.clusterMode
+/// != SniDnatClusterMode`): the gateway forwards the client's end-to-end mTLS
+/// bytes and must never originate TLS of its own.
+///
+/// So the view drops `tls` at every scope (top level, `portLevelSettings`,
+/// subsets). That also keeps a mesh-wide `ISTIO_MUTUAL` rule from failing the
+/// slice closed on a gateway that has no SVID to present, since it never
+/// needs one on this leg. Subsets are dropped too: Ferrum's east-west alias
+/// SNI (`p<port>.<fqdn>`) carries no subset, so no passthrough route can
+/// select one.
+fn sni_passthrough_destination_rule_view(dr: &MeshDestinationRule) -> MeshDestinationRule {
+    let mut view = dr.clone();
+    if let Some(policy) = view.traffic_policy.as_mut() {
+        policy.tls = None;
+    }
+    for policy in view.port_level_settings.values_mut() {
+        policy.tls = None;
+    }
+    view.subsets.clear();
+    view
 }
 
 // ── Sidecar inbound route materialization ─────────────────────────────────
@@ -12087,6 +12163,18 @@ pub(crate) fn apply_destination_rules_with_tenant_file_roots(
             spec.service_port.port,
         );
     }
+    // EastWestGateway SNI-passthrough Service upstreams (issue #7424) join the
+    // same map under their owning Service port: each serves exactly one port's
+    // alias, so a `portLevelSettings` entry for a sibling port must not land on
+    // it, and the owner entry's selection-time fields govern the whole
+    // upstream. Forward-derived from the slice with the materializer's own id
+    // and label helpers, never parsed out of an id. They are also recorded
+    // apart so only the passthrough-safe part of a rule reaches them.
+    let mut sni_passthrough_upstream_keys: HashSet<NamespacedResourceId> = HashSet::new();
+    for (key, port) in east_west_sni_passthrough_upstream_owner_ports(runtime, mesh_slice) {
+        outbound_upstream_owner_port.insert(key.clone(), port);
+        sni_passthrough_upstream_keys.insert(key);
+    }
 
     // Target-service ownership evidence for the matched destination host, built
     // once per apply from the SAME indexes the slice builder's admission pass
@@ -12165,6 +12253,19 @@ pub(crate) fn apply_destination_rules_with_tenant_file_roots(
             )
         })
         .collect();
+    let sni_passthrough_upstreams: Vec<bool> = config
+        .upstreams
+        .iter()
+        .map(|upstream| {
+            !sni_passthrough_upstream_keys.is_empty()
+                && sni_passthrough_upstream_keys.contains(&NamespacedResourceId::new(
+                    upstream.namespace.as_str(),
+                    upstream.id.as_str(),
+                ))
+        })
+        .collect();
+    let is_sni_passthrough =
+        |idx: usize| sni_passthrough_upstreams.get(idx).copied().unwrap_or(false);
     let mut winning_tier_by_upstream_host: Vec<Vec<Option<DestinationRuleWinner>>> =
         Vec::with_capacity(config.upstreams.len());
     for (upstream_idx, upstream) in config.upstreams.iter().enumerate() {
@@ -12316,13 +12417,24 @@ pub(crate) fn apply_destination_rules_with_tenant_file_roots(
             &mesh_slice.istio_root_namespace,
             tenant_file_roots,
         );
-        if let Err(error) = &prepared {
+        // An EastWestGateway SNI-passthrough upstream never receives the
+        // rule's TLS (see `sni_passthrough_destination_rule_view`), so a
+        // refused TLS file neither fails it closed nor counts toward the
+        // warnings below.
+        let tls_bearing_indices: Vec<usize> = matching_upstream_indices
+            .iter()
+            .copied()
+            .filter(|&idx| !is_sni_passthrough(idx))
+            .collect();
+        if let Err(error) = &prepared
+            && !tls_bearing_indices.is_empty()
+        {
             // HBONE and Sidecar mesh-mTLS dispatch never reads backend TLS
             // material: those transports run only for plaintext-scheme proxies
             // and authenticate with the gateway SVID. Refusing the material
             // therefore leaves their traffic on the mesh identity, so the
             // warning must not claim it fails closed.
-            let mesh_transport_upstreams = matching_upstream_indices
+            let mesh_transport_upstreams = tls_bearing_indices
                 .iter()
                 .filter(|&&idx| {
                     config
@@ -12331,7 +12443,7 @@ pub(crate) fn apply_destination_rules_with_tenant_file_roots(
                         .is_some_and(upstream_uses_mesh_transport)
                 })
                 .count();
-            let tls_upstreams = matching_upstream_indices.len() - mesh_transport_upstreams;
+            let tls_upstreams = tls_bearing_indices.len() - mesh_transport_upstreams;
             let reason = sanitize_startup_scalar(error);
             if tls_upstreams > 0 {
                 warn!(
@@ -12356,9 +12468,14 @@ pub(crate) fn apply_destination_rules_with_tenant_file_roots(
                      identity, which never uses that material"
                 );
             }
-            tls_file_refused_upstreams.extend(matching_upstream_indices.iter().copied());
+            tls_file_refused_upstreams.extend(tls_bearing_indices.iter().copied());
         }
         let dr = prepared.as_ref().map_or(dr, |prepared| prepared.as_ref());
+        // Built once per rule, only when it governs a passthrough upstream.
+        let passthrough_view = matching_upstream_indices
+            .iter()
+            .any(|&idx| is_sni_passthrough(idx))
+            .then(|| sni_passthrough_destination_rule_view(dr));
 
         let connect_timeout_ms = dr
             .traffic_policy
@@ -12366,6 +12483,10 @@ pub(crate) fn apply_destination_rules_with_tenant_file_roots(
             .and_then(|tp| tp.connect_timeout_ms);
 
         for idx in matching_upstream_indices {
+            let dr = match passthrough_view.as_ref() {
+                Some(view) if is_sni_passthrough(idx) => view,
+                _ => dr,
+            };
             let upstream = &mut config.upstreams[idx];
             if let Some(ref policy) = dr.traffic_policy {
                 apply_traffic_policy_to_upstream(upstream, policy, runtime)?;
@@ -13413,8 +13534,7 @@ fn upstream_destination_rule_match_hosts(
         hosts.push(DestinationRuleMatchHost {
             host: name,
             // A name that merely repeats the id is a synthetic identifier
-            // (east-west Service upstreams, UDP listener upstreams), not a
-            // destination host.
+            // (UDP listener upstreams), not a destination host.
             wildcard_eligible: name != upstream.id,
         });
     }
@@ -13453,7 +13573,8 @@ impl DestinationRuleMatchHost<'_> {
 /// forward-derived from the slice or the reserved mesh id space, never parsed
 /// out of an operator id:
 ///
-/// * a materialized per-port Service upstream (`outbound_upstream_owner_port`);
+/// * a materialized per-port Service upstream (`outbound_upstream_owner_port`),
+///   EastWestGateway SNI-passthrough Service upstreams included (issue #7424);
 /// * an EgressGateway ServiceEntry upstream: its id is exactly
 ///   `mesh_egress_upstream_id` of a visible ServiceEntry, one of that entry's
 ///   hosts (the upstream's `name`) and one of its ports;

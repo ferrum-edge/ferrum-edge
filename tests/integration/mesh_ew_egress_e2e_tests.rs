@@ -18,13 +18,16 @@
 
 use std::collections::HashMap;
 
+use ferrum_edge::config::types::{GatewayConfig, LoadBalancerAlgorithm, Proxy, Upstream};
 use ferrum_edge::config_sources::k8s::{
     K8sMetadata, K8sObject, K8sTranslationOptions, translate_k8s_objects,
 };
 use ferrum_edge::identity::spiffe::TrustDomain;
 use ferrum_edge::modes::mesh::config::{
-    AppProtocol, EastWestGateway, MultiClusterConfig, Resolution, ServiceEntry,
-    ServiceEntryLocation, ServicePort, ServiceTargetPort, WorkloadPort,
+    AppProtocol, EastWestGateway, MeshDestinationRule, MeshLoadBalancer, MeshOutlierDetection,
+    MeshSimpleLb, MeshSubset, MeshTrafficPolicy, MeshTrafficPolicyTls, MtlsMode,
+    MultiClusterConfig, Resolution, ServiceEntry, ServiceEntryLocation, ServicePort,
+    ServiceTargetPort, WorkloadPort,
 };
 use ferrum_edge::modes::mesh::{MeshTopology, runtime::MeshRuntimeState};
 use ferrum_edge::modes::mesh::{
@@ -1683,4 +1686,437 @@ fn mesh_runtime_state_install_and_snapshot_round_trip() {
     let slice_ref = snapshot.as_ref().as_ref().expect("snapshot has slice");
     assert_eq!(slice_ref.version, "v-test");
     assert_eq!(slice_ref.namespace, DEFAULT_NAMESPACE);
+}
+
+// ── DestinationRule on EastWestGateway SNI-passthrough legs (issue #7424) ──
+//
+// Istio's AUTO_PASSTHROUGH gateway looks the rule up by Service hostname and
+// applies it in `SniDnatClusterMode` (`buildOutboundSniDnatClusters`,
+// `pilot/pkg/networking/core/cluster.go`; `applyTrafficPolicy`,
+// `pilot/pkg/networking/core/cluster_traffic_policy.go`): connection pool,
+// outlier detection and load balancer apply; upstream TLS never does.
+
+const EW_REVIEWS_UPSTREAM: &str = "__mesh-ew-upstream-default-reviews.p8080";
+const EW_REVIEWS_PROXY: &str = "__mesh-ew-svc-default-reviews.p8080";
+
+fn ew_rule(
+    namespace: &str,
+    name: &str,
+    host: &str,
+    traffic_policy: MeshTrafficPolicy,
+) -> MeshDestinationRule {
+    MeshDestinationRule {
+        name: name.to_string(),
+        namespace: namespace.to_string(),
+        host: host.to_string(),
+        traffic_policy: Some(traffic_policy),
+        port_level_settings: HashMap::new(),
+        subsets: Vec::new(),
+        export_to: vec!["*".to_string()],
+    }
+}
+
+fn ew_timeout_rule(namespace: &str, name: &str, host: &str, ms: u64) -> MeshDestinationRule {
+    ew_rule(
+        namespace,
+        name,
+        host,
+        MeshTrafficPolicy {
+            connect_timeout_ms: Some(ms),
+            ..MeshTrafficPolicy::default()
+        },
+    )
+}
+
+/// A client TLS block that would originate TLS on any other upstream
+/// (`SIMPLE` also names an origination SNI).
+fn ew_tls_policy(mode: MtlsMode) -> MeshTrafficPolicyTls {
+    MeshTrafficPolicyTls {
+        mode,
+        sni: (mode == MtlsMode::Simple).then(|| "origination.example.com".to_string()),
+        ..MeshTrafficPolicyTls::default()
+    }
+}
+
+/// The east-west gateway in `default` serving `reviews` (8080) through the
+/// production control-plane admission and data-plane materialization.
+fn prepare_east_west_with_rules(
+    rules: Vec<MeshDestinationRule>,
+) -> Result<GatewayConfig, anyhow::Error> {
+    let workload = workload_for(
+        "reviews",
+        DEFAULT_NAMESPACE,
+        [("app", "reviews")],
+        ["10.0.0.5", "10.0.0.6"],
+    );
+    let service = service_for("reviews", DEFAULT_NAMESPACE, &[&workload]);
+    let mut mesh = mesh_config_with(vec![workload], vec![service], Vec::new());
+    mesh.destination_rules = rules;
+    prepare_gateway_config_via_mesh_slice(
+        gateway_config_with_mesh(Vec::new(), Vec::new(), mesh),
+        &east_west_runtime(),
+    )
+}
+
+fn ew_upstream<'a>(config: &'a GatewayConfig, id: &str) -> &'a Upstream {
+    config
+        .upstreams
+        .iter()
+        .find(|upstream| upstream.id == id)
+        .unwrap_or_else(|| panic!("east-west upstream {id} materialized"))
+}
+
+fn ew_proxy<'a>(config: &'a GatewayConfig, id: &str) -> &'a Proxy {
+    config
+        .proxies
+        .iter()
+        .find(|proxy| proxy.id == id)
+        .unwrap_or_else(|| panic!("east-west proxy {id} materialized"))
+}
+
+fn ew_connect_timeout(rules: Vec<MeshDestinationRule>) -> u64 {
+    let prepared = prepare_east_west_with_rules(rules).expect("east-west prepared");
+    ew_proxy(&prepared, EW_REVIEWS_PROXY).backend_connect_timeout_ms
+}
+
+/// Every backend TLS field of a passthrough upstream stays at its
+/// materialized default: no rule TLS reached any scope.
+fn assert_no_rule_tls(upstream: &Upstream) {
+    assert_eq!(upstream.backend_tls_sni, None, "no origination SNI");
+    assert_eq!(upstream.backend_tls_server_ca_cert_path, None);
+    assert_eq!(upstream.backend_tls_client_cert_path, None);
+    assert_eq!(upstream.backend_tls_client_key_path, None);
+    assert!(!upstream.backend_tls_refused);
+    assert!(upstream.resolved_subset_tls.is_empty());
+    assert!(
+        upstream
+            .port_overrides
+            .values()
+            .all(|slot| slot.tls.is_none()),
+        "no per-port TLS slot"
+    );
+}
+
+#[test]
+fn east_west_passthrough_upstream_is_named_by_its_service_host() {
+    let prepared = prepare_east_west_with_rules(Vec::new()).expect("east-west prepared");
+    assert_eq!(
+        ew_upstream(&prepared, EW_REVIEWS_UPSTREAM).name.as_deref(),
+        Some("reviews.default.svc.cluster.local")
+    );
+}
+
+#[test]
+fn an_exact_destination_rule_governs_the_east_west_passthrough_leg() {
+    let prepared = prepare_east_west_with_rules(vec![ew_rule(
+        DEFAULT_NAMESPACE,
+        "reviews",
+        "reviews",
+        MeshTrafficPolicy {
+            connect_timeout_ms: Some(1234),
+            max_connections: Some(42),
+            tcp_idle_timeout_seconds: Some(90),
+            load_balancer: Some(MeshLoadBalancer::Simple(MeshSimpleLb::LeastRequest)),
+            outlier_detection: Some(MeshOutlierDetection {
+                consecutive_errors: Some(7),
+                interval_seconds: None,
+                base_ejection_seconds: None,
+                max_ejection_percent: None,
+            }),
+            ..MeshTrafficPolicy::default()
+        },
+    )])
+    .expect("east-west prepared");
+
+    let proxy = ew_proxy(&prepared, EW_REVIEWS_PROXY);
+    assert_eq!(proxy.backend_connect_timeout_ms, 1234, "connectTimeout");
+    assert_eq!(proxy.tcp_idle_timeout_seconds, Some(90), "tcp idleTimeout");
+    assert_eq!(
+        proxy.backend_scheme,
+        Some(ferrum_edge::config::types::BackendScheme::Tcp)
+    );
+    assert!(proxy.passthrough);
+
+    let upstream = ew_upstream(&prepared, EW_REVIEWS_UPSTREAM);
+    assert_eq!(upstream.algorithm, LoadBalancerAlgorithm::LeastConnections);
+    assert_eq!(
+        upstream
+            .port_overrides
+            .get(&8080)
+            .and_then(|slot| slot.max_connections),
+        Some(42),
+        "maxConnections lands on the Service port slot"
+    );
+    let passive = upstream
+        .health_checks
+        .as_ref()
+        .and_then(|health| health.passive.as_ref())
+        .expect("passive health");
+    assert_eq!(passive.unhealthy_threshold, 7, "outlierDetection");
+}
+
+#[test]
+fn a_wildcard_destination_rule_governs_the_east_west_passthrough_leg() {
+    assert_eq!(
+        ew_connect_timeout(vec![ew_timeout_rule(
+            "istio-system",
+            "mesh-default",
+            "*",
+            1111
+        )]),
+        1111,
+        "a root catch-all names the Service host"
+    );
+    assert_eq!(
+        ew_connect_timeout(vec![ew_timeout_rule(
+            DEFAULT_NAMESPACE,
+            "ns-wild",
+            "*.default.svc.cluster.local",
+            2222,
+        )]),
+        2222,
+        "a namespace wildcard names the Service host"
+    );
+}
+
+/// Istio precedence: lookup tier first (client, then service, then root),
+/// then the most specific host within the winning tier.
+#[test]
+fn east_west_destination_rule_selection_follows_istio_precedence() {
+    assert_eq!(
+        ew_connect_timeout(vec![
+            ew_timeout_rule("istio-system", "catch-all", "*", 1111),
+            ew_timeout_rule("istio-system", "svc-wild", "*.svc.cluster.local", 2222),
+        ]),
+        2222,
+        "a longer wildcard suffix beats a shorter one"
+    );
+    assert_eq!(
+        ew_connect_timeout(vec![
+            ew_timeout_rule("istio-system", "svc-wild", "*.svc.cluster.local", 2222),
+            ew_timeout_rule(
+                "istio-system",
+                "exact",
+                "reviews.default.svc.cluster.local",
+                3333,
+            ),
+        ]),
+        3333,
+        "an exact host beats a wildcard in one tier"
+    );
+    assert_eq!(
+        ew_connect_timeout(vec![
+            ew_timeout_rule(
+                "istio-system",
+                "exact",
+                "reviews.default.svc.cluster.local",
+                3333,
+            ),
+            ew_timeout_rule(DEFAULT_NAMESPACE, "client-wild", "*.cluster.local", 4444),
+        ]),
+        4444,
+        "the client tier wins before host specificity is compared"
+    );
+}
+
+/// The DP half of the lookup with the gateway and the Service in different
+/// namespaces: the Service namespace's exact rule beats the root default, the
+/// gateway namespace's wildcard beats both, and an unrelated namespace's rule
+/// is refused.
+#[test]
+fn east_west_destination_rule_service_tier_uses_the_services_namespace() {
+    let timeout_for = |rules: Vec<MeshDestinationRule>| {
+        let mut runtime = east_west_runtime();
+        runtime.namespace = "gateways".to_string();
+        let workload = workload_for("reviews", "bookinfo", [("app", "reviews")], ["10.0.0.5"]);
+        let service = service_for("reviews", "bookinfo", &[&workload]);
+        let mut slice = mesh_slice_with(&runtime, vec![workload], vec![service], Vec::new());
+        slice.istio_root_namespace = "istio-system".to_string();
+        slice.destination_rules = rules;
+        let prepared =
+            prepare_gateway_config_from_mesh_slice(&slice, &runtime).expect("east-west prepared");
+        ew_proxy(&prepared, "__mesh-ew-svc-bookinfo-reviews.p8080").backend_connect_timeout_ms
+    };
+    assert_eq!(
+        timeout_for(vec![
+            ew_timeout_rule("istio-system", "mesh-default", "*", 1111),
+            ew_timeout_rule("bookinfo", "reviews", "reviews", 2222),
+        ]),
+        2222,
+        "the Service namespace's rule outranks the root default"
+    );
+    assert_eq!(
+        timeout_for(vec![
+            ew_timeout_rule("bookinfo", "reviews", "reviews", 2222),
+            ew_timeout_rule("gateways", "gw-wild", "*.bookinfo.svc.cluster.local", 3333),
+        ]),
+        3333,
+        "the gateway's own namespace is the client tier"
+    );
+    assert_eq!(
+        timeout_for(vec![
+            ew_timeout_rule("istio-system", "mesh-default", "*", 1111),
+            ew_timeout_rule("evil", "hijack", "reviews.bookinfo.svc.cluster.local", 9999),
+        ]),
+        1111,
+        "a namespace outside the lookup path never governs the leg"
+    );
+}
+
+/// A mesh-wide `ISTIO_MUTUAL` default must not fail the gateway's slice
+/// closed: this gateway has no SVID paths and no CA backend, which refuses
+/// ISTIO_MUTUAL on every TLS-originating upstream, but the passthrough leg
+/// never originates TLS. The rule's other fields still apply.
+#[test]
+fn a_mesh_wide_istio_mutual_rule_does_not_fail_the_passthrough_leg_closed() {
+    let prepared = prepare_east_west_with_rules(vec![ew_rule(
+        "istio-system",
+        "mesh-mtls",
+        "*.cluster.local",
+        MeshTrafficPolicy {
+            connect_timeout_ms: Some(2500),
+            tls: Some(ew_tls_policy(MtlsMode::IstioMutual)),
+            ..MeshTrafficPolicy::default()
+        },
+    )])
+    .expect("an ISTIO_MUTUAL default must not reject the east-west slice");
+    assert_eq!(
+        ew_proxy(&prepared, EW_REVIEWS_PROXY).backend_connect_timeout_ms,
+        2500
+    );
+    assert_no_rule_tls(ew_upstream(&prepared, EW_REVIEWS_UPSTREAM));
+}
+
+/// TLS origination never reaches the passthrough leg at any scope: top-level,
+/// `portLevelSettings`, or subset. Subsets are not projected at all (the alias
+/// SNI carries no subset), and the proxy stays plain TCP passthrough.
+#[test]
+fn destination_rule_tls_is_never_applied_on_the_passthrough_leg() {
+    for mode in [MtlsMode::Simple, MtlsMode::IstioMutual] {
+        let mut dr = ew_rule(
+            DEFAULT_NAMESPACE,
+            "reviews",
+            "reviews.default.svc.cluster.local",
+            MeshTrafficPolicy {
+                tls: Some(ew_tls_policy(mode)),
+                ..MeshTrafficPolicy::default()
+            },
+        );
+        dr.port_level_settings.insert(
+            8080,
+            MeshTrafficPolicy {
+                max_connections: Some(9),
+                tls: Some(ew_tls_policy(mode)),
+                ..MeshTrafficPolicy::default()
+            },
+        );
+        dr.subsets = vec![MeshSubset {
+            name: "v1".to_string(),
+            labels: HashMap::from([("version".to_string(), "v1".to_string())]),
+            traffic_policy: Some(MeshTrafficPolicy {
+                tls: Some(ew_tls_policy(mode)),
+                ..MeshTrafficPolicy::default()
+            }),
+        }];
+        let prepared = prepare_east_west_with_rules(vec![dr])
+            .unwrap_or_else(|error| panic!("{mode:?}: east-west prepared: {error}"));
+        let upstream = ew_upstream(&prepared, EW_REVIEWS_UPSTREAM);
+        assert_no_rule_tls(upstream);
+        assert!(upstream.subsets.is_none(), "{mode:?}: no subsets projected");
+        assert_eq!(
+            upstream
+                .port_overrides
+                .get(&8080)
+                .and_then(|slot| slot.max_connections),
+            Some(9),
+            "{mode:?}: the port entry's non-TLS fields still apply"
+        );
+        let proxy = ew_proxy(&prepared, EW_REVIEWS_PROXY);
+        assert_eq!(
+            proxy.backend_scheme,
+            Some(ferrum_edge::config::types::BackendScheme::Tcp)
+        );
+        assert!(proxy.passthrough);
+    }
+}
+
+/// Each per-port passthrough upstream takes only its own Service port's
+/// `portLevelSettings` entry.
+#[test]
+fn east_west_port_level_settings_stay_on_their_own_port() {
+    let mut workload = workload_for(
+        "reviews",
+        DEFAULT_NAMESPACE,
+        [("app", "reviews")],
+        ["10.0.0.5"],
+    );
+    workload.ports = vec![
+        WorkloadPort {
+            port: 8080,
+            protocol: AppProtocol::Http,
+            name: Some("http".to_string()),
+        },
+        WorkloadPort {
+            port: 9090,
+            protocol: AppProtocol::Tcp,
+            name: Some("tcp".to_string()),
+        },
+    ];
+    let mut service = service_for("reviews", DEFAULT_NAMESPACE, &[&workload]);
+    service.ports = vec![
+        ServicePort {
+            port: 8080,
+            protocol: AppProtocol::Http,
+            name: Some("http".to_string()),
+            target_port: None,
+        },
+        ServicePort {
+            port: 9090,
+            protocol: AppProtocol::Tcp,
+            name: Some("tcp".to_string()),
+            target_port: None,
+        },
+    ];
+    let mut dr = ew_rule(
+        DEFAULT_NAMESPACE,
+        "reviews",
+        "reviews",
+        MeshTrafficPolicy::default(),
+    );
+    dr.port_level_settings.insert(
+        9090,
+        MeshTrafficPolicy {
+            max_connections: Some(5),
+            load_balancer: Some(MeshLoadBalancer::Simple(MeshSimpleLb::Random)),
+            ..MeshTrafficPolicy::default()
+        },
+    );
+    let mut mesh = mesh_config_with(vec![workload], vec![service], Vec::new());
+    mesh.destination_rules = vec![dr];
+    let prepared = prepare_gateway_config_via_mesh_slice(
+        gateway_config_with_mesh(Vec::new(), Vec::new(), mesh),
+        &east_west_runtime(),
+    )
+    .expect("east-west prepared");
+
+    let tcp = ew_upstream(&prepared, "__mesh-ew-upstream-default-reviews.p9090");
+    assert_eq!(
+        tcp.port_overrides
+            .get(&9090)
+            .and_then(|slot| slot.max_connections),
+        Some(5)
+    );
+    assert_eq!(
+        tcp.algorithm,
+        LoadBalancerAlgorithm::Random,
+        "the owning port's selection-time policy governs its one-port upstream"
+    );
+    let http = ew_upstream(&prepared, EW_REVIEWS_UPSTREAM);
+    assert!(
+        http.port_overrides
+            .values()
+            .all(|slot| slot.max_connections.is_none()),
+        "the 9090 entry must not leak onto the 8080 upstream"
+    );
+    assert_eq!(http.algorithm, LoadBalancerAlgorithm::RoundRobin);
 }
