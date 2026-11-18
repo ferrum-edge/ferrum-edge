@@ -2090,12 +2090,13 @@ impl RouterCache {
         // to a lower-priority valid route instead of returning a wrong-direction
         // route. A no-op (and zero-cost via short-circuit) on the normal
         // `Unfiltered` lookup path.
-        let admit = |rm: &RouteMatch| match direction_filter {
+        let admit_id = |id: &str| match direction_filter {
             MeshRouteDirectionFilter::Unfiltered => true,
             MeshRouteDirectionFilter::MatchingDirection(req_dir) => {
-                crate::modes::mesh::mesh_route_admitted_for_direction(&rm.proxy.id, req_dir)
+                crate::modes::mesh::mesh_route_admitted_for_direction(id, req_dir)
             }
         };
+        let admit = |rm: &RouteMatch| admit_id(&rm.proxy.id);
         if let Some(host) = host {
             // 1. Exact host match — exact path, prefix, regex, then host-only
             if table.has_exact_path_routes
@@ -2107,7 +2108,7 @@ impl RouterCache {
             }
             if let Some(routes) = table.exact_hosts.get(host)
                 && let Some(route_match) =
-                    find_prefix_match_indexed(routes, path, port_ctx).filter(|rm| admit(rm))
+                    find_admitted_prefix_match_indexed(routes, path, port_ctx, admit)
             {
                 return Some(route_match);
             }
@@ -2121,6 +2122,7 @@ impl RouterCache {
             if table.has_host_only_routes
                 && let Some(candidates) = table.exact_hosts_host_only.get(host)
                 && let Some(proxy) = select_port_aware_proxy(candidates, port_ctx)
+                && admit_id(&proxy.id)
             {
                 return Some(RouteMatch {
                     proxy: Arc::clone(proxy),
@@ -2144,7 +2146,7 @@ impl RouterCache {
             for (pattern, routes) in &table.wildcard_hosts {
                 if wildcard_matches(pattern, host)
                     && let Some(route_match) =
-                        find_prefix_match_indexed(routes, path, port_ctx).filter(|rm| admit(rm))
+                        find_admitted_prefix_match_indexed(routes, path, port_ctx, admit)
                 {
                     return Some(route_match);
                 }
@@ -2163,6 +2165,7 @@ impl RouterCache {
                 for (pattern, candidates) in &table.wildcard_hosts_host_only {
                     if wildcard_matches(pattern, host)
                         && let Some(proxy) = select_port_aware_proxy(candidates, port_ctx)
+                        && admit_id(&proxy.id)
                     {
                         return Some(RouteMatch {
                             proxy: Arc::clone(proxy),
@@ -2183,7 +2186,7 @@ impl RouterCache {
             return Some(route_match);
         }
         if let Some(route_match) =
-            find_prefix_match_indexed(&table.catch_all, path, port_ctx).filter(|rm| admit(rm))
+            find_admitted_prefix_match_indexed(&table.catch_all, path, port_ctx, admit)
         {
             return Some(route_match);
         }
@@ -3488,6 +3491,20 @@ fn find_prefix_match_indexed(
     path: &str,
     port_ctx: HttpPortMatchContext,
 ) -> Option<RouteMatch> {
+    find_admitted_prefix_match_indexed(routes, path, port_ctx, |_| true)
+}
+
+/// [`find_prefix_match_indexed`] that skips a prefix whose selected route
+/// `admit` refuses and keeps walking to shorter prefixes (issue #7423). The
+/// mesh direction filter needs this: a carried VirtualService `/api` route
+/// refused on an inbound listener must not hide the local inbound `/` route of
+/// the same host.
+fn find_admitted_prefix_match_indexed(
+    routes: &IndexedPrefixRoutes,
+    path: &str,
+    port_ctx: HttpPortMatchContext,
+    admit: impl Fn(&RouteMatch) -> bool,
+) -> Option<RouteMatch> {
     if routes.path_index.is_empty() {
         return None;
     }
@@ -3499,11 +3516,13 @@ fn find_prefix_match_indexed(
     };
 
     let pick = |candidates: &Vec<PortScopedProxy>, matched_prefix_len: usize| {
-        select_port_aware_proxy(candidates, port_ctx).map(|proxy| RouteMatch {
-            proxy: Arc::clone(proxy),
-            path_params: Vec::new(),
-            matched_prefix_len,
-        })
+        select_port_aware_proxy(candidates, port_ctx)
+            .map(|proxy| RouteMatch {
+                proxy: Arc::clone(proxy),
+                path_params: Vec::new(),
+                matched_prefix_len,
+            })
+            .filter(|route_match| admit(route_match))
     };
 
     // 1. Exact match (most common case for the scale test pattern)
