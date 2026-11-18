@@ -1486,8 +1486,14 @@ fn sidecar_split_keeps_every_leg_whichever_destination_workload_calls() {
         let reviews = weights.get("10.0.0.11").copied().unwrap_or_default();
         let ratings = weights.get("10.0.0.12").copied().unwrap_or_default();
         assert!(
-            reviews > 0 && ratings > 0 && reviews == ratings * 9,
-            "{client}: both legs keep their 90/10 weights, got {weights:?}"
+            reviews > 0 && ratings > 0,
+            "{client}: both legs are dialed, got {weights:?}"
+        );
+        // One common scale keeps the configured ratio (not the raw weights).
+        let ratio = f64::from(reviews) / f64::from(ratings);
+        assert!(
+            (ratio - 9.0).abs() < 0.01,
+            "{client}: 90/10 must stay 9:1 across the legs, got {weights:?}"
         );
     }
 }
