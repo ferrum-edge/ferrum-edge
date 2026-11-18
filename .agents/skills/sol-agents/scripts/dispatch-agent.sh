@@ -114,7 +114,7 @@ fi
 
 cd "$physical_worktree"
 
-printf '[sol-agents] dispatch model=gpt-6.1-sol effort=%s fast=%s service_tier=%s worktree=%s bin=%s\n' \
+printf '[sol-agents] dispatch model=gpt-6.2-sol effort=%s fast=%s service_tier=%s worktree=%s bin=%s\n' \
   "$effort" "$fast" "$service_tier" "$physical_worktree" "$codex_bin" >&2
 
 config_args=(
@@ -126,7 +126,7 @@ if [[ "$fast" == 'true' ]]; then
 fi
 
 exec "$codex_bin" exec \
-  --model gpt-6.1-sol \
+  --model gpt-6.2-sol \
   "${config_args[@]}" \
   --sandbox danger-full-access \
   --cd "$physical_worktree" \

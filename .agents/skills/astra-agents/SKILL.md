@@ -1,11 +1,11 @@
 ---
 name: astra-agents
-description: Dispatch and orchestrate external GPT-6 Astra Codex CLI agents for Ferrum Edge issues, PRs, review-feedback fixes, CI repair, and shepherding, with optional fast mode only when the user explicitly requests it. Use when the user asks Codex or GPT to delegate to Astra or Codex CLI workers, run multiple GPT-6 Astra agents, select low/medium/high/xhigh/max/ultra reasoning effort, resume interrupted Astra runs, or drive agent-owned branches and PRs. Do not use for Codex-native collaboration subagents or ordinary single-agent work.
+description: Dispatch and orchestrate external GPT-6.2 Astra Codex CLI agents for Ferrum Edge issues, PRs, review-feedback fixes, CI repair, and shepherding, with optional fast mode only when the user explicitly requests it. Use when the user asks Codex or GPT to delegate to Astra or Codex CLI workers, run multiple GPT-6.2 Astra agents, select low/medium/high/xhigh/max/ultra reasoning effort, resume interrupted Astra runs, or drive agent-owned branches and PRs. Do not use for Codex-native collaboration subagents or ordinary single-agent work.
 ---
 
 # Astra agents
 
-Act as the Codex orchestrator. Treat external GPT-6 Astra Codex CLI processes as implementation
+Act as the Codex orchestrator. Treat external GPT-6.2 Astra Codex CLI processes as implementation
 workers. Own task decomposition, worktree isolation, effort selection, liveness, independent diff
 review, and the final merge recommendation. Require each worker to carry its assigned scope through
 the stopping point in the prompt. Never accept a worker's report without checking the repository
@@ -49,8 +49,8 @@ prompt, including continuation prompts and any permitted nested delegation.
    - `codex` on `PATH`.
 3. Confirm that the installed CLI supports `--model`, `--config`, `--sandbox`, `--cd`, and reading
    a prompt from stdin with `-`. If the user explicitly requests fast mode, also confirm the
-   bundled model catalog lists the `fast` service tier for `gpt-6-astra`.
-4. Use the pinned model `gpt-6-astra`. Stop and report the exact error if authentication, model
+   bundled model catalog lists the `fast` service tier for `gpt-6.2-astra`.
+4. Use the pinned model `gpt-6.2-astra`. Stop and report the exact error if authentication, model
    access, requested effort, or requested service tier is rejected. Do not silently substitute
    another model, effort, or service tier. Confirm the installed model catalog advertises the
    selected effort (including `ultra`) before dispatch.
@@ -113,7 +113,7 @@ Omit it for every other run, including continuations unless they remain within t
 request. Use `--no-fast` when standard mode is explicitly requested. Record the selected mode
 beside each worker.
 
-The launcher pins `gpt-6-astra`, the reasoning effort, `danger-full-access`, the verified worktree
+The launcher pins `gpt-6.2-astra`, the reasoning effort, `danger-full-access`, the verified worktree
 root, and stdin prompt mode. It pins `service_tier="default"` normally and selects
 `service_tier="fast"` with `features.fast_mode=true` only with `--fast`. The prompt file reaches
 EOF cleanly, avoiding the non-TTY hang caused by a prompt argument with open stdin. Delete the
@@ -206,12 +206,12 @@ into prompts. Never put credentials, tokens, cookies, or secrets in prompts or w
 - An explicitly requested review receives no response: verify the trigger, bot identity,
   availability, and head SHA before posting another trigger.
 - Model, effort, or service-tier mismatch: stop the worker, record the exact diagnostic, correct
-  the launch contract, and relaunch. Never claim a selected effort, `gpt-6-astra`, or fast mode
+  the launch contract, and relaunch. Never claim a selected effort, `gpt-6.2-astra`, or fast mode
   without launch evidence.
 
 ## Model contract source
 
-The installed Codex `models_cache.json` entry for `gpt-6-astra` advertises
+The installed Codex `models_cache.json` entry for `gpt-6.2-astra` advertises
 `low`, `medium`, `high`, `xhigh`, `max`, and `ultra` (verified 2026-09-05).
-The [API model page](https://developers.openai.com/api/docs/models/gpt-6-astra)
+The [API model page](https://developers.openai.com/api/docs/models/gpt-6.2-astra)
 lists API efforts through `max`; `ultra` is specific to the Codex harness.
