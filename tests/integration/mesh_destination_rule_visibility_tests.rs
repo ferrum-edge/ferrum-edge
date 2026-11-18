@@ -2744,8 +2744,9 @@ fn a_static_service_entrys_dns_endpoint_does_not_enter_rule_arbitration() {
 
 /// sol F4 (narrowed): an upstream id, or a name that only repeats it, is never
 /// a wildcard candidate, so a catch-all cannot latch onto a synthetic dotted
-/// identifier such as an east-west Service upstream's; an exact rule still
-/// matches an id as before.
+/// identifier; an exact rule still matches an id as before. (Since #7424 the
+/// east-west Service upstreams are named by their Service host and are
+/// governed through it; this fixture keeps the name-equals-id shape.)
 #[test]
 fn a_wildcard_never_names_an_upstream_id() {
     use ferrum_edge::_test_support::apply_destination_rules_with_tenant_roots_for_test as apply;
