@@ -3486,19 +3486,12 @@ fn find_exact_path_match_indexed(
 ///
 /// This is the key optimization that prevents throughput degradation as proxy count
 /// scales from tens to tens of thousands.
-fn find_prefix_match_indexed(
-    routes: &IndexedPrefixRoutes,
-    path: &str,
-    port_ctx: HttpPortMatchContext,
-) -> Option<RouteMatch> {
-    find_admitted_prefix_match_indexed(routes, path, port_ctx, |_| true)
-}
-
-/// [`find_prefix_match_indexed`] that skips a prefix whose selected route
-/// `admit` refuses and keeps walking to shorter prefixes (issue #7423). The
-/// mesh direction filter needs this: a carried VirtualService `/api` route
-/// refused on an inbound listener must not hide the local inbound `/` route of
-/// the same host.
+///
+/// A prefix whose selected route `admit` refuses is skipped and the walk keeps
+/// going to shorter prefixes (issue #7423). The mesh direction filter needs
+/// this: a carried VirtualService `/api` route refused on an inbound listener
+/// must not hide the local inbound `/` route of the same host. The cached
+/// lookup admits everything.
 fn find_admitted_prefix_match_indexed(
     routes: &IndexedPrefixRoutes,
     path: &str,
