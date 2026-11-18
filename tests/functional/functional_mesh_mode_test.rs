@@ -14665,10 +14665,133 @@ fn capture_jump_count(rules: &str) -> usize {
         .count()
 }
 
+/// `PREROUTING` jumps into either fail-closed host-UDP guard generation
+/// (`FERRUM_MESH_UDP_HOST_GUARD_A` / `_B`). While one is installed, every
+/// enrolled pod's UDP egress on that family is DROPped, so capture is not live
+/// for that family even though its capture jump already exists.
 #[cfg(target_os = "linux")]
-fn host_udp_capture_snapshot(
-    capture_port: u16,
-) -> Result<(usize, usize, usize, usize, usize), String> {
+fn guard_jump_count(rules: &str) -> usize {
+    rules
+        .lines()
+        .filter(|line| {
+            line.starts_with("-A PREROUTING ") && line.contains("FERRUM_MESH_UDP_HOST_GUARD")
+        })
+        .count()
+}
+
+/// Ferrum-owned host-UDP objects observed in the host namespace at one instant.
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct HostUdpCaptureSnapshot {
+    v4_jumps: usize,
+    v6_jumps: usize,
+    v4_guards: usize,
+    v6_guards: usize,
+    v4_routes: usize,
+    v6_routes: usize,
+    listeners: usize,
+}
+
+#[cfg(target_os = "linux")]
+impl HostUdpCaptureSnapshot {
+    /// Capture is LIVE for both families: the capture jumps, fwmark rules and
+    /// the transparent listener exist AND both fail-closed guards are released.
+    ///
+    /// `HostUdpCaptureManager::apply` installs the capture chain and binds the
+    /// listener while the DROP guard is still up, then releases the guard in one
+    /// script that removes the IPv4 guard before the IPv6 one (#7425). Treating
+    /// "jumps + listener present" as live let the test send IPv6 datagrams into
+    /// the still-installed IPv6 guard: IPv4 round trips passed, the IPv6 one was
+    /// dropped, and the client receive timed out with EAGAIN.
+    fn capture_live(&self) -> bool {
+        self.v4_jumps >= 1
+            && self.v6_jumps >= 1
+            && self.v4_guards == 0
+            && self.v6_guards == 0
+            && self.v4_routes >= 1
+            && self.v6_routes >= 1
+            && self.listeners >= 1
+    }
+
+    /// The capture path is retired: no capture jump, fwmark rule, or listener.
+    /// A retained fail-closed guard is deliberately NOT part of this predicate:
+    /// the unacknowledged shutdown branch must leave it installed, and the
+    /// caller asserts which branch was taken.
+    fn capture_absent(&self) -> bool {
+        self.v4_jumps == 0
+            && self.v6_jumps == 0
+            && self.v4_routes == 0
+            && self.v6_routes == 0
+            && self.listeners == 0
+    }
+}
+
+/// #7425: the live gate's readiness must not report capture live while a
+/// fail-closed guard jump is still installed on either family — the exact
+/// mid-release state (IPv4 guard gone, IPv6 guard still DROPping) that sent the
+/// IPv6 round trip into the guard. Runs without root: it parses
+/// `iptables-save` text shaped like the live mangle table.
+#[cfg(target_os = "linux")]
+#[test]
+fn host_udp_capture_readiness_waits_for_both_guards_released() {
+    let capture_only = "*mangle\n\
+        :PREROUTING ACCEPT [0:0]\n\
+        :FERRUM_MESH_UDP_HOST - [0:0]\n\
+        -A PREROUTING -p udp -j FERRUM_MESH_UDP_HOST\n\
+        -A FERRUM_MESH_UDP_HOST -i hu1 -p udp -j TPROXY --on-port 15002\n\
+        COMMIT\n";
+    let guarded = "*mangle\n\
+        :PREROUTING ACCEPT [0:0]\n\
+        :FERRUM_MESH_UDP_HOST - [0:0]\n\
+        :FERRUM_MESH_UDP_HOST_GUARD_B - [0:0]\n\
+        -A PREROUTING -p udp -j FERRUM_MESH_UDP_HOST_GUARD_B\n\
+        -A PREROUTING -p udp -j FERRUM_MESH_UDP_HOST\n\
+        -A FERRUM_MESH_UDP_HOST_GUARD_B -i hu1 -p udp -j DROP\n\
+        COMMIT\n";
+    assert_eq!(capture_jump_count(guarded), 1);
+    assert_eq!(guard_jump_count(guarded), 1);
+    assert_eq!(guard_jump_count(capture_only), 0);
+
+    let live = HostUdpCaptureSnapshot {
+        v4_jumps: capture_jump_count(capture_only),
+        v6_jumps: capture_jump_count(capture_only),
+        v4_guards: guard_jump_count(capture_only),
+        v6_guards: guard_jump_count(capture_only),
+        v4_routes: 1,
+        v6_routes: 1,
+        listeners: 1,
+    };
+    assert!(live.capture_live());
+
+    // IPv4 guard released, IPv6 guard still installed: NOT live.
+    let v6_still_guarded = HostUdpCaptureSnapshot {
+        v6_guards: guard_jump_count(guarded),
+        ..live
+    };
+    assert!(!v6_still_guarded.capture_live());
+    let v4_still_guarded = HostUdpCaptureSnapshot {
+        v4_guards: guard_jump_count(guarded),
+        ..live
+    };
+    assert!(!v4_still_guarded.capture_live());
+
+    // A guard retained by the unacknowledged shutdown branch does not stop the
+    // capture path from counting as retired; the test asserts that branch itself.
+    let retired_with_guard = HostUdpCaptureSnapshot {
+        v4_jumps: 0,
+        v6_jumps: 0,
+        v4_guards: 1,
+        v6_guards: 1,
+        v4_routes: 0,
+        v6_routes: 0,
+        listeners: 0,
+    };
+    assert!(retired_with_guard.capture_absent());
+    assert!(!live.capture_absent());
+}
+
+#[cfg(target_os = "linux")]
+fn host_udp_capture_snapshot(capture_port: u16) -> Result<HostUdpCaptureSnapshot, String> {
     let v4_rules = checked_command_stdout("iptables-save", &["-t", "mangle"])?;
     let v6_rules = checked_command_stdout("ip6tables-save", &["-t", "mangle"])?;
     let v4_route_rules = checked_command_stdout("ip", &["rule", "show"])?;
@@ -14696,13 +14819,46 @@ fn host_udp_capture_snapshot(
                 .is_some_and(|local| local.ends_with(&port_suffix))
         })
         .count();
-    Ok((
-        capture_jump_count(&v4_rules),
-        capture_jump_count(&v6_rules),
+    Ok(HostUdpCaptureSnapshot {
+        v4_jumps: capture_jump_count(&v4_rules),
+        v6_jumps: capture_jump_count(&v6_rules),
+        v4_guards: guard_jump_count(&v4_rules),
+        v6_guards: guard_jump_count(&v6_rules),
         v4_routes,
         v6_routes,
         listeners,
-    ))
+    })
+}
+
+/// Wait for the production readiness markers (`<registry>/.udp-ready/<pod_uid>`)
+/// of every listed pod. `HostUdpCaptureManager::apply` publishes them only after
+/// the fail-closed guard is released, i.e. once that pod's egress genuinely goes
+/// through the capture path: it is the product's own per-pod "capture is live"
+/// signal, the one the node-agent opens its BPF UDP gate on.
+#[cfg(target_os = "linux")]
+fn wait_for_host_udp_ready_markers(
+    registry_dir: &std::path::Path,
+    pod_uids: &[&str],
+    timeout: Duration,
+) -> Result<(), String> {
+    let ready_dir = registry_dir.join(".udp-ready");
+    let deadline = Instant::now() + timeout;
+    loop {
+        let missing: Vec<&str> = pod_uids
+            .iter()
+            .copied()
+            .filter(|uid| !ready_dir.join(uid).is_file())
+            .collect();
+        if missing.is_empty() {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "host UDP readiness markers not published within {timeout:?} for {missing:?}"
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -14714,28 +14870,18 @@ fn wait_for_host_udp_capture(
     let deadline = Instant::now() + timeout;
     loop {
         match host_udp_capture_snapshot(capture_port) {
-            Ok((v4_jumps, v6_jumps, v4_routes, v6_routes, listeners)) => {
+            Ok(snapshot) => {
                 let ready = if active {
-                    v4_jumps >= 1
-                        && v6_jumps >= 1
-                        && v4_routes >= 1
-                        && v6_routes >= 1
-                        && listeners >= 1
+                    snapshot.capture_live()
                 } else {
-                    v4_jumps == 0
-                        && v6_jumps == 0
-                        && v4_routes == 0
-                        && v6_routes == 0
-                        && listeners == 0
+                    snapshot.capture_absent()
                 };
                 if ready {
                     return Ok(());
                 }
                 if Instant::now() >= deadline {
                     return Err(format!(
-                        "host UDP capture did not become {} (v4_jumps={v4_jumps} \
-                         v6_jumps={v6_jumps} v4_routes={v4_routes} \
-                         v6_routes={v6_routes} listeners={listeners})",
+                        "host UDP capture did not become {} ({snapshot:?})",
                         if active { "active" } else { "absent" }
                     ));
                 }
@@ -14965,9 +15111,20 @@ async fn functional_mesh_live_host_udp_capture_proxy_backend_round_trip() {
         "host-UDP source gateway A did not start\n{}",
         captured_output(&temp_a)
     );
+    // Live means guard released on BOTH families, not merely "capture jumps and
+    // listener present": the manager builds the capture path behind its DROP
+    // guard and releases the IPv4 guard before the IPv6 one (#7425).
     if let Err(error) = wait_for_host_udp_capture(capture_port, true, Duration::from_secs(25)) {
         panic!(
             "ProxyHostUdpBackend did not install host capture: {error}\n{}",
+            captured_output(&temp_a)
+        );
+    }
+    if let Err(error) =
+        wait_for_host_udp_ready_markers(registry.path(), &[POD_A, POD_B], Duration::from_secs(10))
+    {
+        panic!(
+            "ProxyHostUdpBackend did not publish per-pod capture readiness: {error}\n{}",
             captured_output(&temp_a)
         );
     }
@@ -15016,7 +15173,8 @@ async fn functional_mesh_live_host_udp_capture_proxy_backend_round_trip() {
     )
     .unwrap_or_else(|error| {
         panic!(
-            "host-UDP pod B round trip failed: {error}\n{}",
+            "host-UDP pod B round trip failed: {error} (capture at failure: {:?})\n{}",
+            host_udp_capture_snapshot(capture_port),
             captured_output(&temp_a)
         )
     });
@@ -15039,7 +15197,8 @@ async fn functional_mesh_live_host_udp_capture_proxy_backend_round_trip() {
         )
         .unwrap_or_else(|error| {
             panic!(
-                "host-UDP IPv6 round trip failed: {error}\n{}",
+                "host-UDP IPv6 round trip failed: {error} (capture at failure: {:?})\n{}",
+                host_udp_capture_snapshot(capture_port),
                 captured_output(&temp_a)
             )
         });
