@@ -114,7 +114,7 @@ fi
 
 cd "$physical_worktree"
 
-printf '[astra-agents] dispatch model=gpt-6-astra effort=%s fast=%s service_tier=%s worktree=%s bin=%s\n' \
+printf '[astra-agents] dispatch model=gpt-6.2-astra effort=%s fast=%s service_tier=%s worktree=%s bin=%s\n' \
   "$effort" "$fast" "$service_tier" "$physical_worktree" "$codex_bin" >&2
 
 config_args=(
@@ -126,7 +126,7 @@ if [[ "$fast" == 'true' ]]; then
 fi
 
 exec "$codex_bin" exec \
-  --model gpt-6-astra \
+  --model gpt-6.2-astra \
   "${config_args[@]}" \
   --sandbox danger-full-access \
   --cd "$physical_worktree" \
