@@ -123,15 +123,23 @@ class SourceRewriteTests(unittest.TestCase):
                 (DEB822.replace("Signed-By:", "Enabled: 0o0\nTrusted: yes\nSigned-By:", 1), True),
                 # A `.` continuation line keeps Enabled from matching `no`, leaving the stanza active.
                 (DEB822.replace("Signed-By:", "Enabled: no\n .\nTrusted: yes\nSigned-By:", 1), True),
-                # Raw NUL bytes in deb822 input are refused.
+                # A tab-indented continuation after empty `Enabled:` retains `\n\t`,
+                # so keyword `no` does not match and the stanza remains active;
+                # `strtol` still skips leading whitespace for numeric `Trusted:\n\t1`.
+                (DEB822.replace("Signed-By:", "Enabled:\n\tno\nTrusted: yes\nSigned-By:", 1), True),
+                (DEB822.replace("Signed-By:", "Trusted:\n\t1\nSigned-By:", 1), True),
+                # Raw NUL bytes and bare CR characters in deb822 input are refused.
                 (DEB822.replace("Signed-By:", "Trusted: yes\x00no\nSigned-By:", 1), True),
+                (DEB822.replace("Signed-By:", "Enabled: no\rTrusted: yes\nSigned-By:", 1), True),
                 (DEB822.replace("Signed-By:", "Allow-Insecure: on\nSigned-By:", 1), True),
                 (DEB822.replace("Signed-By:", "Allow-Downgrade-To-Insecure: yes\nSigned-By:", 1), True),
                 (DEB822.replace("Signed-By:", "Allow-Weak:\n  enable\nSigned-By:", 1), True),
                 ("deb [trusted=yes] http://azure.archive.ubuntu.com/ubuntu noble main\n", False),
                 ('deb [trusted="yes"] http://azure.archive.ubuntu.com/ubuntu noble main\n', False),
+                ('deb [trusted=" 1"] http://azure.archive.ubuntu.com/ubuntu noble main\n', False),
                 ("deb [%74rusted=%79es] http://azure.archive.ubuntu.com/ubuntu noble main\n", False),
                 ("deb [trusted%3dyes] http://azure.archive.ubuntu.com/ubuntu noble main\n", False),
+                ("deb [trusted=yes%5d ] http://azure.archive.ubuntu.com/ubuntu noble main\n", False),
                 ("deb [trusted=yes%00no] http://azure.archive.ubuntu.com/ubuntu noble main\n", False),
                 ("deb [trusted=true] http://azure.archive.ubuntu.com/ubuntu noble main\n", False),
                 ("deb [trusted=01] http://azure.archive.ubuntu.com/ubuntu noble main\n", False),
@@ -141,7 +149,11 @@ class SourceRewriteTests(unittest.TestCase):
                 ("deb [arch=amd64 allow-insecure=on] http://azure.archive.ubuntu.com/ubuntu noble main\n", False),
                 ("deb [allow-downgrade-to-insecure=1] http://azure.archive.ubuntu.com/ubuntu noble main\n", False),
                 ("deb [allow-weak=with] http://azure.archive.ubuntu.com/ubuntu noble main\n", False),
-                ('deb [a=["]x trusted=yes b="] http://x" c=d] http://us.archive.ubuntu.com/ubuntu noble main\n', False)):
+                ('deb [a=["]x trusted=yes b="] http://x" c=d] http://us.archive.ubuntu.com/ubuntu noble main\n', False),
+                ("deb \x0b[ trusted=yes ] http://azure.archive.ubuntu.com/ubuntu/ noble-updates main\n", False),
+                ("deb \x0c[ trusted=yes ] http://azure.archive.ubuntu.com/ubuntu/ noble-updates main\n", False),
+                ("deb\x0b[ trusted=yes ] http://azure.archive.ubuntu.com/ubuntu/ noble-updates main\n", False),
+                ("unknown-type http://azure.archive.ubuntu.com/ubuntu/ noble main\n", False)):
             with self.subTest(text=text), self.assertRaises(ValueError):
                 sources.rewrite(text, deb822)
 
@@ -162,10 +174,11 @@ class SourceRewriteTests(unittest.TestCase):
         self.assertIn(sources.CANONICAL, rewritten)
         self.assertTrue(rewritten.endswith(disabled), "disabled stanza stays untouched")
 
-        # C23 binary `0b0` and C int narrowing `0x100000000` both evaluate to 0 (disabled).
-        for false_spelling in ("0b0", "0x100000000"):
-            with self.subTest(enabled=false_spelling):
-                variant = disabled.replace("Enabled : no", f"Enabled: {false_spelling}")
+        # C23 binary `0b0`, C int narrowing `0x100000000`, space-indented
+        # continuation `\n  no`, and tab-indented numeric `\n\t0` all disable.
+        for enabled_field in ("Enabled: 0b0", "Enabled: 0x100000000", "Enabled:\n  no", "Enabled:\n\t0"):
+            with self.subTest(enabled=enabled_field):
+                variant = disabled.replace("Enabled : no", enabled_field)
                 rewritten_v, changed_v = sources.rewrite(DEB822 + "\n" + variant, deb822=True)
                 self.assertTrue(changed_v)
                 self.assertTrue(rewritten_v.endswith(variant))

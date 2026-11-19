@@ -32,7 +32,7 @@ _MIRROR_URI = re.compile(
 # before the colon.
 _DEB822_FIELD = re.compile(r"^([^:\r\n]+):(.*)$")
 _LINE_SPLIT = re.compile(r"[^\n]*\n|[^\n]+")
-_ONE_LINE_PREFIX = re.compile(r"^\s*deb(?:-src)?[ \t]+")
+_ONE_LINE_PREFIX = re.compile(r"^[ \t]*deb(?:-src)?[ \t]+")
 _UNSAFE_FIELDS = frozenset({
     "trusted",
     "allow-insecure",
@@ -43,7 +43,7 @@ _UNSAFE_FIELDS = frozenset({
 # compiled with glibc C23 `__isoc23_strtol` on Ubuntu 26.04 LP64 (64-bit signed
 # long narrowed to 32-bit signed int), accepting strict C23 integer literals
 # (decimal, 0-octal, 0x/0X hex, 0b/0B binary; no Python `_`, `0o`, or non-ASCII
-# digits), followed by case-insensitive keyword sets.
+# digits), followed by exact case-insensitive keyword sets.
 _C_STRTOL_INT = re.compile(
     r"^[+-]?(?:0[xX][0-9A-Fa-f]+|0[bB][01]+|0[0-7]*|[1-9][0-9]*)$"
 )
@@ -58,12 +58,14 @@ _APT_FALSE = frozenset({"no", "false", "without", "off", "disable"})
 
 def _parse_apt_bool(value):
     """Return True/False per APT's StringToBool, or None if unrecognized."""
-    s = value.strip(_ASCII_SPACE_STR)
-    if not s:
+    if not value:
         return None
-    if _C_STRTOL_INT.match(s):
-        sign = -1 if s[0] == "-" else 1
-        mag = s[1:] if s[0] in "+-" else s
+    # C23 strtol skips leading ASCII whitespace but requires the entire
+    # remaining string (no trailing whitespace) to parse as an integer.
+    num_text = value.lstrip(_ASCII_SPACE_STR)
+    if _C_STRTOL_INT.match(num_text):
+        sign = -1 if num_text[0] == "-" else 1
+        mag = num_text[1:] if num_text[0] in "+-" else num_text
         if mag.startswith(("0x", "0X")):
             val = sign * int(mag, 16)
         elif mag.startswith(("0b", "0B")):
@@ -82,7 +84,8 @@ def _parse_apt_bool(value):
         if res == 0:
             return False
         return None
-    low = s.lower()
+    # Keyword comparisons use strcasecmp on the full string (no whitespace strip).
+    low = value.lower()
     if low in _APT_TRUE:
         return True
     if low in _APT_FALSE:
@@ -120,8 +123,8 @@ def _rewrite_uris(value):
 def _apt_dequote_word(raw):
     """Decode %HH escapes and strip double quotes like APT's ParseQuoteWord.
 
-    Refuses embedded NUL bytes (raw or `%00`), which would truncate C-string
-    comparisons inside APT's `StringToBool`.
+    Refuses ASCII control characters (including raw or `%00` NUL bytes), which
+    can truncate C-string comparisons or desync option/URI boundaries in APT.
     """
     chars = []
     i, n = 0, len(raw)
@@ -129,13 +132,13 @@ def _apt_dequote_word(raw):
         ch = raw[i]
         if ch == "%" and i + 2 < n and raw[i + 1] in _HEX_DIGITS and raw[i + 2] in _HEX_DIGITS:
             byte_val = int(raw[i + 1:i + 3], 16)
-            if byte_val == 0:
-                raise ValueError(f"apt token {raw!r} contains percent-encoded NUL byte")
+            if byte_val < 0x20 or byte_val == 0x7F:
+                raise ValueError(f"apt token {raw!r} contains percent-encoded control byte 0x{byte_val:02x}")
             chars.append(chr(byte_val))
             i += 3
             continue
-        if ch == "\x00":
-            raise ValueError(f"apt token {raw!r} contains embedded NUL byte")
+        if ord(ch) < 0x20 or ord(ch) == 0x7F:
+            raise ValueError(f"apt token {raw!r} contains control character")
         if ch != '"':
             chars.append(ch)
         i += 1
@@ -162,6 +165,10 @@ def _decode_one_line_options(opts_bracket):
             else:
                 i += 1
         option = _apt_dequote_word(inner[start:i])
+        # APT's sourcelist.cc strips a trailing decoded `]` (including `%5d`),
+        # so fail closed on any decoded `]` inside an option token.
+        if "]" in option:
+            raise ValueError(f"ambiguous ']' in apt option {option!r} in {opts_bracket!r}")
         if "=" not in option:
             raise ValueError(f"malformed apt option {option!r} in {opts_bracket!r}")
         key, value = option.split("=", 1)
@@ -255,7 +262,16 @@ def _process_deb822_stanza(lines):
         fields[active_field] = [field.group(2)]
 
     def field_value(name):
-        return "\n".join(fields[name]).strip(_ASCII_SPACE_STR)
+        # Match APT pkgTagSection::Scan (tagfile.cc:566-573): trim trailing
+        # ASCII whitespace, then skip leading ASCII whitespace after `:` except
+        # stop at `\n` unless followed by an ASCII space `' '` (0x20).
+        raw_block = "\n".join(fields[name]).rstrip(_ASCII_SPACE_STR)
+        pos, n = 0, len(raw_block)
+        while pos < n and raw_block[pos] in _ASCII_SPACE:
+            if raw_block[pos] == "\n" and (pos + 1 >= n or raw_block[pos + 1] != " "):
+                break
+            pos += 1
+        return raw_block[pos:]
 
     # APT skips stanzas with Enabled set to a false boolean spelling.
     if "enabled" in fields and _is_apt_false(field_value("enabled")):
@@ -299,7 +315,10 @@ def rewrite_deb822(text):
     # APT's pkgTagSection::Scan ends a record only on an empty line (\n or \r\n),
     # NOT on a whitespace-only continuation line such as "  \n".
     for line in _LINE_SPLIT.findall(text):
-        if line.rstrip("\r\n") == "":
+        body = line.rstrip("\r\n")
+        if "\r" in body:
+            raise ValueError(f"apt source contains bare CR character on line {line!r}")
+        if body == "":
             if stanza:
                 rewritten, hit = _process_deb822_stanza(stanza)
                 out.extend(rewritten)
@@ -319,25 +338,31 @@ def rewrite_one_line(text):
     out, changed = [], False
     for line in _LINE_SPLIT.findall(text):
         body = line.rstrip("\r\n")
+        if "\r" in body:
+            raise ValueError(f"apt source contains bare CR character on line {line!r}")
         ending = line[len(body):]
-        if body.lstrip().startswith("#") or not body.strip():
+        stripped = body.lstrip(_ASCII_SPACE_STR)
+        if not stripped or stripped.startswith("#"):
             out.append(body + ending)
             continue
         parsed = _parse_one_line(body)
-        if parsed:
-            head, opts_bracket, _raw_uri, decoded_uri, tail = parsed
-            _check_one_line_options(opts_bracket)
-            if is_mirror(decoded_uri):
-                body = head + CANONICAL + tail
-                changed = True
+        if not parsed:
+            raise ValueError(f"unsupported or malformed apt source line: {body!r}")
+        head, opts_bracket, _raw_uri, decoded_uri, tail = parsed
+        _check_one_line_options(opts_bracket)
+        if is_mirror(decoded_uri):
+            body = head + CANONICAL + tail
+            changed = True
         out.append(body + ending)
     return "".join(out), changed
 
 
 def rewrite(text, deb822):
     """Return (rewritten text, changed). Refuses active entries disabling signatures."""
-    if "\x00" in text:
-        raise ValueError("apt source contains embedded NUL byte")
+    for ch in text:
+        code = ord(ch)
+        if (code < 0x20 and ch not in "\t\r\n") or code == 0x7F:
+            raise ValueError(f"apt source contains unsupported control character 0x{code:02x}")
     return rewrite_deb822(text) if deb822 else rewrite_one_line(text)
 
 
