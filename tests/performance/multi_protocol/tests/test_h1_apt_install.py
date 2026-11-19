@@ -83,16 +83,40 @@ class SourceRewriteTests(unittest.TestCase):
                 (DEB822.replace("us-east-2.ec2.archive", "archive"), True),
                 ("deb http://ports.ubuntu.com/ubuntu-ports noble main\n", False),
                 ("deb https://evil.example/archive.ubuntu.com/ubuntu noble main\n", False),
+                ("deb mirror+file:/etc/apt/vendor-mirrors.txt stable main\n", False),
+                ("Types: deb\nURIs: mirror+https://vendor.example/mirrors.txt\nSuites: stable\n", True),
                 ("Types: deb\nURIs: http://archive.ubuntu.com.evil.example/ubuntu/\nSuites: noble\n", True)):
             with self.subTest(text=text):
                 self.assertEqual(sources.rewrite(text, deb822), (text, False))
 
     def test_sources_that_disable_signatures_are_refused(self):
-        for text, deb822 in ((DEB822.replace("Signed-By:", "Trusted: yes\nSigned-By:", 1), True),
-                             ("deb [trusted=yes] http://azure.archive.ubuntu.com/ubuntu noble main\n", False),
-                             ("deb [arch=amd64 allow-insecure=yes] http://azure.archive.ubuntu.com/ubuntu noble main\n", False)):
+        for text, deb822 in (
+                (DEB822.replace("Signed-By:", "Trusted: yes\nSigned-By:", 1), True),
+                (DEB822.replace("Signed-By:", "Trusted: true\nSigned-By:", 1), True),
+                (DEB822.replace("Signed-By:", "Trusted: 1\nSigned-By:", 1), True),
+                (DEB822.replace("Signed-By:", "Allow-Insecure: on\nSigned-By:", 1), True),
+                (DEB822.replace("Signed-By:", "Allow-Weak:\n  enable\nSigned-By:", 1), True),
+                ("deb [trusted=yes] http://azure.archive.ubuntu.com/ubuntu noble main\n", False),
+                ("deb [trusted=true] http://azure.archive.ubuntu.com/ubuntu noble main\n", False),
+                ("deb [trusted=1] http://azure.archive.ubuntu.com/ubuntu noble main\n", False),
+                ("deb [arch=amd64 allow-insecure=on] http://azure.archive.ubuntu.com/ubuntu noble main\n", False),
+                ("deb [allow-weak=with] http://azure.archive.ubuntu.com/ubuntu noble main\n", False)):
             with self.subTest(text=text), self.assertRaises(ValueError):
                 sources.rewrite(text, deb822)
+
+    def test_comments_and_explicit_false_trust_flags_are_allowed(self):
+        deb822_with_comment = "# Trusted: yes\n" + DEB822.replace("Signed-By:", "Trusted: no\nSigned-By:", 1)
+        rewritten, changed = sources.rewrite(deb822_with_comment, deb822=True)
+        self.assertTrue(changed)
+        self.assertIn(sources.CANONICAL, rewritten)
+
+        one_line_with_comment = (
+            "# deb [trusted=yes] http://azure.archive.ubuntu.com/ubuntu noble main\n"
+            f"deb [signed-by={KEYRING} trusted=no] http://azure.archive.ubuntu.com/ubuntu noble main # [trusted=yes]\n"
+        )
+        rewritten_one, changed_one = sources.rewrite(one_line_with_comment, deb822=False)
+        self.assertTrue(changed_one)
+        self.assertIn(sources.CANONICAL, rewritten_one)
 
     def test_cli_exit_codes(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -112,19 +136,29 @@ class SourceRewriteTests(unittest.TestCase):
 FAKE_APT = r"""#!/usr/bin/env bash
 set -u
 list=""
-for arg in "$@"; do
-  case "$arg" in Dir::Etc::sourcelist=*) list=${arg#Dir::Etc::sourcelist=} ;; esac
-done
 action=update
-for arg in "$@"; do [ "$arg" = install ] && action=install; done
+for arg in "$@"; do
+  case "$arg" in
+    Dir::Etc::sourcelist=*) list=${arg#Dir::Etc::sourcelist=} ;;
+    --download-only) action=download ;;
+    --no-download) action=unpack ;;
+  esac
+done
 case "$list" in "$FAKE_ETC"/*) phase=primary ;; *) phase=fallback ;; esac
-printf '%s\t%s\t%s\n' "$phase" "$action" "$*" >> "$FAKE_LOG/apt.log"
+printf '%s\t%s\t%s\t%s\n' "$phase" "$action" "${DEBIAN_FRONTEND:-}" "$*" >> "$FAKE_LOG/apt.log"
 if [ "$phase" = fallback ] && [ -f "$list" ]; then cp "$list" "$FAKE_LOG/fallback-source"; fi
 case "${FAKE_APT_FAIL:-}" in
   primary-update) [ "$phase/$action" = primary/update ] && exit 100 ;;
-  primary-install) [ "$phase/$action" = primary/install ] && exit 100 ;;
-  stall) [ "$phase/$action" = primary/install ] && exec sleep 60 ;;
-  all) [ "$action" = install ] && exit 100 ;;
+  primary-update-warn)
+    if [ "$phase/$action" = primary/update ]; then
+      case " $* " in
+        *" APT::Update::Error-Mode=any "*) exit 100 ;;
+      esac
+    fi
+    ;;
+  primary-download) [ "$phase/$action" = primary/download ] && exit 100 ;;
+  stall) [ "$phase/$action" = primary/download ] && exec sleep 60 ;;
+  all) [ "$action" = download ] && exit 100 ;;
 esac
 exit 0
 """
@@ -151,6 +185,7 @@ class InstallScriptTests(unittest.TestCase):
                    FAKE_LOG=str(self.log), FAKE_APT_FAIL=fail, H1_APT_SUDO="",
                    H1_APT_ETC_DIR=str(self.etc), H1_APT_PRIMARY_TIMEOUT=primary_timeout,
                    H1_APT_FALLBACK_TIMEOUT="60")
+        env.pop("DEBIAN_FRONTEND", None)
         return subprocess.run(["bash", str(SCRIPT), *packages], env=env, capture_output=True,
                               text=True, timeout=120)
 
@@ -163,20 +198,29 @@ class InstallScriptTests(unittest.TestCase):
                        "Acquire::Retries=3", "Acquire::http::Timeout=30"):
             self.assertIn(f"-o {option}", argv)
 
-    def test_primary_success_uses_ubuntu_sources_for_update_and_install(self):
+    def test_primary_success_fetches_bounded_then_unpacks_offline(self):
         (self.etc / "sources.list.d/ubuntu.sources").write_text(DEB822)
         (self.etc / "sources.list").write_text("# moved to ubuntu.sources\n")
         result = self.run_script()
         self.assertEqual(result.returncode, 0, result.stderr)
         calls = self.calls()
-        self.assertEqual([(p, a) for p, a, _ in calls], [("primary", "update"), ("primary", "install")])
-        for _, _, argv in calls:
+        self.assertEqual([(p, a) for p, a, _, _ in calls],
+                         [("primary", "update"), ("primary", "download"), ("primary", "unpack")])
+        for _, action, frontend, argv in calls:
+            self.assertEqual(frontend, "noninteractive")
             self.assert_apt_options(argv, self.etc / "sources.list.d/ubuntu.sources")
-        self.assertTrue(calls[1][2].endswith("install -y --no-install-recommends clang-18 llvm-18"))
+            if action == "update":
+                self.assertIn("-o APT::Update::Error-Mode=any", argv)
+        self.assertTrue(calls[1][3].endswith("install -y --no-install-recommends --download-only clang-18 llvm-18"))
+        self.assertTrue(calls[2][3].endswith("install -y --no-install-recommends --no-download clang-18 llvm-18"))
         self.assertFalse((self.log / "dpkg.log").exists())
 
     def test_failed_or_stalled_primary_falls_back_to_signed_canonical_archive(self):
-        for fail, primary_timeout in (("primary-update", "300"), ("primary-install", "300"), ("stall", "2")):
+        for fail, primary_timeout in (
+                ("primary-update", "300"),
+                ("primary-update-warn", "300"),
+                ("primary-download", "300"),
+                ("stall", "2")):
             with self.subTest(fail=fail):
                 for leftover in self.log.iterdir():
                     leftover.unlink()
@@ -187,22 +231,26 @@ class InstallScriptTests(unittest.TestCase):
                 self.assertLess(time.monotonic() - started, 30)
                 self.assertIn("::warning::", result.stdout)
                 fallback = [c for c in self.calls() if c[0] == "fallback"]
-                self.assertEqual([a for _, a, _ in fallback], ["update", "install"])
-                source = re.search(r"Dir::Etc::sourcelist=(\S+)", fallback[0][2]).group(1)
+                self.assertEqual([a for _, a, _, _ in fallback], ["update", "download", "unpack"])
+                source = re.search(r"Dir::Etc::sourcelist=(\S+)", fallback[0][3]).group(1)
                 self.assertTrue(source.endswith(".sources"))
-                for _, _, argv in fallback:
+                for _, action, frontend, argv in fallback:
+                    self.assertEqual(frontend, "noninteractive")
                     self.assert_apt_options(argv, source)
+                    if action == "update":
+                        self.assertIn("-o APT::Update::Error-Mode=any", argv)
                 self.assertFalse(Path(source).exists(), "temporary fallback source is removed")
                 self.assertEqual((self.log / "fallback-source").read_text(),
                                  sources.rewrite(DEB822, deb822=True)[0])
-                self.assertEqual((self.log / "dpkg.log").read_text(), "--configure -a\n")
+                self.assertFalse((self.log / "dpkg.log").exists(),
+                                 "bounded fetch never kills dpkg mid-unpack")
 
     def test_one_line_sources_list_falls_back_with_list_format(self):
         (self.etc / "sources.list").write_text(ONE_LINE)
-        result = self.run_script("primary-install")
+        result = self.run_script("primary-download")
         self.assertEqual(result.returncode, 0, result.stderr)
         fallback = [c for c in self.calls() if c[0] == "fallback"]
-        source = re.search(r"Dir::Etc::sourcelist=(\S+)", fallback[0][2]).group(1)
+        source = re.search(r"Dir::Etc::sourcelist=(\S+)", fallback[0][3]).group(1)
         self.assertTrue(source.endswith(".list"))
         self.assertEqual((self.log / "fallback-source").read_text(),
                          sources.rewrite(ONE_LINE, deb822=False)[0])
@@ -211,9 +259,9 @@ class InstallScriptTests(unittest.TestCase):
         (self.etc / "sources.list.d/ubuntu.sources").write_text(DEB822)
         result = self.run_script("all")
         self.assertNotEqual(result.returncode, 0)
-        self.assertEqual([(p, a) for p, a, _ in self.calls()],
-                         [("primary", "update"), ("primary", "install"),
-                          ("fallback", "update"), ("fallback", "install")])
+        self.assertEqual([(p, a) for p, a, _, _ in self.calls()],
+                         [("primary", "update"), ("primary", "download"),
+                          ("fallback", "update"), ("fallback", "download")])
 
     def test_missing_ubuntu_sources_fails_before_apt(self):
         result = self.run_script()
@@ -223,8 +271,8 @@ class InstallScriptTests(unittest.TestCase):
 
     def test_unsigned_source_is_never_rewritten(self):
         (self.etc / "sources.list").write_text(
-            "deb [trusted=yes] http://azure.archive.ubuntu.com/ubuntu noble main\n")
-        result = self.run_script("primary-install")
+            "deb [trusted=true] http://azure.archive.ubuntu.com/ubuntu noble main\n")
+        result = self.run_script("primary-download")
         self.assertEqual(result.returncode, 1)
         self.assertEqual([c[0] for c in self.calls()], ["primary", "primary"])
 

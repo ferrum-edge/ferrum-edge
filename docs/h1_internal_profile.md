@@ -154,12 +154,15 @@ Tests discovery also runs the H1 Python tests.
 Every job installs its Ubuntu packages through
 `tests/performance/multi_protocol/h1_apt_install.sh`. Like `setup-rust-ci`, it
 refreshes and installs from the image's Ubuntu source only, with matching
-`Dir::Etc` options on `apt-get update` and `apt-get install`. The first attempt
-gets a 300 s budget. When the runner's regional mirror fails or stalls, the
-script retries once from a temporary copy of that source that points at
-`http://archive.ubuntu.com/ubuntu/`. That retry gets 600 s. Only the URI
-changes: `Suites`, `Components` and `Signed-By` stay as they are, and a source
-that disables signature checks is never rewritten.
+`Dir::Etc` options across `apt-get update` (`APT::Update::Error-Mode=any`),
+`--download-only`, and offline `--no-download` installation under
+`DEBIAN_FRONTEND=noninteractive`. Only the network fetch phases run under the
+300 s primary budget so a mirror timeout never interrupts `dpkg` mid-unpack.
+When the runner's regional mirror fails or stalls, the fetch is retried once
+(600 s budget) from a temporary copy of that source that rewrites only regional
+Ubuntu mirrors or Ubuntu mirror lists to `http://archive.ubuntu.com/ubuntu/`.
+`Suites`, `Components`, and `Signed-By` stay intact, and active entries that
+disable signature verification (under any APT truthy spelling) are refused.
 
 The measurement campaign runs only on manual dispatch:
 

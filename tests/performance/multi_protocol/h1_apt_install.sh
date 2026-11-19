@@ -6,15 +6,18 @@
 # Mirrors .github/actions/setup-rust-ci: only Ubuntu's own source definition
 # is refreshed and installed from (an outage in an unrelated third-party
 # repository on the image must not block canonical packages), and the same
-# Dir::Etc options reach both `apt-get update` and `apt-get install`.
+# Dir::Etc options reach `apt-get update`, download, and local install.
 #
 # The runner's regional mirror (for example us-east-2.ec2.archive.ubuntu.com)
 # has throttled downloads to ~50 KB/s, turning a ~30 s install into a job
-# timeout. The primary attempt therefore runs under a hard budget; if it fails
-# or stalls, the same packages are retried once from a temporary copy of the
-# Ubuntu source pointing at http://archive.ubuntu.com/ubuntu/. That copy keeps
-# the runner's Types/Suites/Components/Signed-By unchanged (h1_apt_sources.py),
-# so signature verification is never weakened.
+# timeout. Only the network phases (`update` with Error-Mode=any and
+# `install --download-only`) run under the short mirror deadline, so a timeout
+# never interrupts dpkg mid-unpack or leaves database locks behind. If the
+# primary mirror fails or stalls, the fetch is retried once from a temporary
+# copy of the Ubuntu source pointing at http://archive.ubuntu.com/ubuntu/
+# (keeping Types/Suites/Components/Signed-By unchanged via h1_apt_sources.py).
+# Once all packages are downloaded, `install --no-download` unpacks and
+# configures them offline with DEBIAN_FRONTEND=noninteractive.
 #
 # Test seams: H1_APT_ETC_DIR (default /etc/apt), H1_APT_SUDO (default sudo;
 # empty runs apt directly), H1_APT_PRIMARY_TIMEOUT / H1_APT_FALLBACK_TIMEOUT
@@ -49,8 +52,18 @@ else
   exit 1
 fi
 
-# Run one apt command as root, killed (whole process group, including the
-# download methods) once the attempt's deadline passes.
+apt_options() {
+  local sources=$1
+  APT_OPTS=(
+    -o "Dir::Etc::sourcelist=$sources"
+    -o "Dir::Etc::sourceparts=-"
+    -o "Acquire::Retries=3"
+    -o "Acquire::http::Timeout=30"
+  )
+}
+
+# Run one network apt command as root, killed (whole process group, including
+# download methods) once the fetch deadline passes.
 bounded() {
   local deadline=$1
   shift
@@ -59,34 +72,45 @@ bounded() {
     echo "apt budget exhausted before: $*" >&2
     return 124
   fi
-  "${privileged[@]}" timeout --kill-after=30 "$remaining" "$@"
+  "${privileged[@]}" env DEBIAN_FRONTEND=noninteractive \
+    timeout --kill-after=30 "$remaining" "$@"
 }
 
-attempt() {
+fetch_attempt() {
   local label=$1 sources=$2 budget=$3
   local deadline=$((SECONDS + budget)) status=0
-  local options=(
-    -o "Dir::Etc::sourcelist=$sources"
-    -o "Dir::Etc::sourceparts=-"
-    -o "Acquire::Retries=3"
-    -o "Acquire::http::Timeout=30"
-  )
-  echo "::group::apt-get ($label, ${budget}s budget) from $sources"
-  bounded "$deadline" apt-get "${options[@]}" -o "APT::Get::List-Cleanup=0" update || status=$?
+  apt_options "$sources"
+  echo "::group::apt-get fetch ($label, ${budget}s budget) from $sources"
+  bounded "$deadline" apt-get "${APT_OPTS[@]}" \
+    -o "APT::Get::List-Cleanup=0" \
+    -o "APT::Update::Error-Mode=any" \
+    update || status=$?
   if [ "$status" -eq 0 ]; then
-    bounded "$deadline" apt-get "${options[@]}" install -y --no-install-recommends "${packages[@]}" \
+    bounded "$deadline" apt-get "${APT_OPTS[@]}" \
+      install -y --no-install-recommends --download-only "${packages[@]}" \
       || status=$?
   fi
   echo "::endgroup::"
   return "$status"
 }
 
+install_downloaded() {
+  local label=$1 sources=$2
+  apt_options "$sources"
+  echo "::group::apt-get local install ($label) from $sources"
+  "${privileged[@]}" env DEBIAN_FRONTEND=noninteractive \
+    apt-get "${APT_OPTS[@]}" \
+    install -y --no-install-recommends --no-download "${packages[@]}"
+  echo "::endgroup::"
+}
+
 status=0
-attempt primary "$ubuntu_sources" "$primary_timeout" || status=$?
+fetch_attempt primary "$ubuntu_sources" "$primary_timeout" || status=$?
 if [ "$status" -eq 0 ]; then
+  install_downloaded primary "$ubuntu_sources"
   exit 0
 fi
-echo "::warning::Ubuntu apt install from the runner mirror failed or timed out (status $status); retrying from http://archive.ubuntu.com/ubuntu/"
+echo "::warning::Ubuntu apt fetch from the runner mirror failed or timed out (status $status); retrying from http://archive.ubuntu.com/ubuntu/"
 
 workdir=$(mktemp -d)
 trap 'rm -rf "$workdir"' EXIT
@@ -109,7 +133,5 @@ case "$rewrite" in
     ;;
 esac
 
-# A primary attempt killed while dpkg was unpacking leaves packages half
-# configured; finish that before installing again.
-"${privileged[@]}" timeout --kill-after=30 120 dpkg --configure -a
-attempt fallback "$fallback" "$fallback_timeout"
+fetch_attempt fallback "$fallback" "$fallback_timeout"
+install_downloaded fallback "$fallback"
