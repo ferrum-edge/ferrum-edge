@@ -234,7 +234,7 @@ jobs:
               --test unit_gateway_core_tests
           elif [ "$COVERAGE_KIND" = "unit" ]; then
             case "$UNIT_TARGET" in
-              "")
+              lib)
                 cargo llvm-cov --no-report \
                   --lib
                 ;;
