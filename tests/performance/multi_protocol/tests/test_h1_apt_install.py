@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -485,6 +486,30 @@ class SourceRewriteTests(unittest.TestCase):
         )
         self.assertEqual(sources.rewrite(deb822_upper_scheme, deb822=True), (deb822_upper_scheme, False))
 
+        # Percent-decoded UTF-8 bytes in one-line suites (`profile%c3%a9`) must
+        # match both literal `profileé` and flat `/ubuntu/dists/profile%25c3%25a9/` + `/`.
+        one_line_utf8_bytes = (
+            f"deb [signed-by={KEYRING}] https://archive.ubuntu.com/ubuntu/dists/profile%25c3%25a9/ /\n"
+            f"deb [signed-by={alt_keyring}] https://us-east-2.ec2.archive.ubuntu.com/ubuntu/ profile%c3%a9 main\n"
+        )
+        self.assertEqual(sources.rewrite(one_line_utf8_bytes, deb822=False), (one_line_utf8_bytes, False))
+
+        one_line_utf8_literal_vs_pct = (
+            f"deb [signed-by={KEYRING}] ftp://archive.ubuntu.com/ubuntu/ %c3%a9 main\n"
+            f"deb [signed-by={KEYRING}] https://us-east-2.ec2.archive.ubuntu.com/ubuntu/ \u00e9 universe\n"
+        )
+        self.assertEqual(
+            sources.rewrite(one_line_utf8_literal_vs_pct, deb822=False),
+            (one_line_utf8_literal_vs_pct, False),
+        )
+
+        # `#` inside `[...]` brackets in a one-line suite is NOT a comment in APT.
+        one_line_bracket_hash = (
+            f"deb [signed-by={KEYRING}] https://archive.ubuntu.com/ubuntu/dists/%5bprofile%23debug%5d/ /\n"
+            f"deb [signed-by={alt_keyring}] https://us-east-2.ec2.archive.ubuntu.com/ubuntu/ [profile#debug] main\n"
+        )
+        self.assertEqual(sources.rewrite(one_line_bracket_hash, deb822=False), (one_line_bracket_hash, False))
+
     @unittest.skipUnless(shutil.which("apt-get") and Path(KEYRING).exists(), "needs hosted Ubuntu apt-get")
     def test_hosted_apt_accepts_rewritten_mixed_and_distinct_policy_sources(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -924,6 +949,40 @@ class SourceRewriteTests(unittest.TestCase):
                     ),
                     "http://archive.ubuntu.com",
                 ),
+                (
+                    "percent-utf8-suite.list",
+                    f"deb [signed-by={KEYRING}] https://archive.ubuntu.com/ubuntu/dists/profile%25c3%25a9/ /\n"
+                    f"deb [signed-by={alt_keyring}] https://us-east-2.ec2.archive.ubuntu.com/ubuntu/ profile%c3%a9 main\n"
+                    f"deb [signed-by={KEYRING}] https://us-east-2.ec2.archive.ubuntu.com/ubuntu/ resolute-updates main\n",
+                    False,
+                    True,
+                    (
+                        "https://archive.ubuntu.com/ubuntu/dists/resolute-updates/InRelease",
+                        "https://us-east-2.ec2.archive.ubuntu.com/ubuntu/dists/profile%c3%a9/InRelease",
+                    ),
+                    (
+                        "Repo-URI: https://archive.ubuntu.com/ubuntu/dists/profile%c3%a9/",
+                        "Repo-URI: https://us-east-2.ec2.archive.ubuntu.com/ubuntu/",
+                    ),
+                    "http://archive.ubuntu.com",
+                ),
+                (
+                    "bracket-hash-suite.list",
+                    f"deb [signed-by={KEYRING}] https://archive.ubuntu.com/ubuntu/dists/%5bprofile%23debug%5d/ /\n"
+                    f"deb [signed-by={alt_keyring}] https://us-east-2.ec2.archive.ubuntu.com/ubuntu/ [profile#debug] main\n"
+                    f"deb [signed-by={KEYRING}] https://us-east-2.ec2.archive.ubuntu.com/ubuntu/ resolute-updates main\n",
+                    False,
+                    True,
+                    (
+                        "https://archive.ubuntu.com/ubuntu/dists/resolute-updates/InRelease",
+                        "https://us-east-2.ec2.archive.ubuntu.com/ubuntu/dists/[profile#debug]/InRelease",
+                    ),
+                    (
+                        "Repo-URI: https://archive.ubuntu.com/ubuntu/dists/[profile#debug]/",
+                        "Repo-URI: https://us-east-2.ec2.archive.ubuntu.com/ubuntu/",
+                    ),
+                    "http://archive.ubuntu.com",
+                ),
             ):
                 with self.subTest(case=name):
                     rewritten, changed = sources.rewrite(raw, deb822)
@@ -934,6 +993,7 @@ class SourceRewriteTests(unittest.TestCase):
                         "-o", f"Dir::Etc::sourcelist={out}",
                         "-o", "Dir::Etc::sourceparts=-",
                         "-o", f"Dir::State::lists={lists}",
+                        "-o", "Acquire::URIEncode=+~ ",
                         "-o", "Debug::NoLocking=1",
                     ]
                     if required_uris:
@@ -1028,7 +1088,11 @@ class SourceRewriteTests(unittest.TestCase):
                 ("deb mirror://etc/apt/apt-mirrors.txt noble main\n", False),
                 ("Types: deb\nURIs: mirror://etc/apt/apt-mirrors.txt\nSuites: noble\n", True),
                 ("Types: deb\nURIs: mirror+https://vendor.example/mirrors.txt\nSuites: stable\n", True),
-                ("Types: deb\nURIs: http://archive.ubuntu.com.evil.example/ubuntu/\nSuites: noble\n", True)):
+                ("Types: deb\nURIs: http://archive.ubuntu.com.evil.example/ubuntu/\nSuites: noble\n", True),
+                ("deb HTTPS://azure.archive.ubuntu.com/ubuntu/ noble main\n", False),
+                ("deb MIRROR+HTTPS://mirrors.ubuntu.com/mirrors.txt noble main\n", False),
+                ("Types: deb\nURIs: HTTPS://us-east-2.ec2.archive.ubuntu.com/ubuntu/\nSuites: noble\n", True),
+                ("Types: deb\nURIs: MIRROR+FILE:/etc/apt/apt-mirrors.txt\nSuites: noble\n", True)):
             with self.subTest(text=text):
                 self.assertEqual(sources.rewrite(text, deb822), (text, False))
 
@@ -1134,6 +1198,7 @@ class SourceRewriteTests(unittest.TestCase):
             source.write_text(DEB822)
             dest = root / "out.sources"
             self.assertEqual(sources.main(["x", str(source), str(dest)]), 0)
+            self.assertEqual(stat.S_IMODE(dest.stat().st_mode), 0o600)
             self.assertIn(sources.CANONICAL, dest.read_text())
             dest.unlink()
             self.assertEqual(sources.main(["x", str(source), str(root / "out.list")]), 2)
@@ -1228,7 +1293,7 @@ class InstallScriptTests(unittest.TestCase):
     def assert_apt_options(self, argv, source):
         for option in (f"Dir::Etc::sourcelist={source}", "Dir::Etc::sourceparts=-",
                        "Acquire::Retries=3", "Acquire::http::Timeout=30",
-                       "Acquire::https::Timeout=30"):
+                       "Acquire::https::Timeout=30", "Acquire::URIEncode=+~ "):
             self.assertIn(f"-o {option}", argv)
 
     def test_primary_success_fetches_bounded_then_unpacks_offline(self):

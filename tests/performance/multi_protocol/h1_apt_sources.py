@@ -20,6 +20,7 @@ Usage: ``python3 h1_apt_sources.py SOURCE DEST``. Exit 0 after writing a
 rewritten DEST, 3 when SOURCE has no regional Ubuntu mirror eligible for
 canonical rewrite (DEST is not written), 2 on usage or parse errors.
 """
+import os
 import re
 import sys
 from pathlib import Path
@@ -28,12 +29,14 @@ CANONICAL = "https://archive.ubuntu.com/ubuntu/"
 
 # Regional/cloud mirrors of the primary archive (``azure.``, ``us-east-2.ec2.``,
 # ``<cc>.``) and Ubuntu mirror-list indirections used by hosted runner images.
+# Schemes are matched exact-lowercase (APT selects acquisition methods by exact
+# scheme name), hostnames case-insensitively, and paths case-sensitively.
 # Require `mirror+file:` with empty authority (`///`) or path-only (`/`) for
 # the local apt-mirrors.txt list so a remote `mirror://etc/...` URI never matches.
 _MIRROR_URI = re.compile(
-    r"^(?:(?i:https?://(?:[A-Za-z0-9-]+\.)+archive\.ubuntu\.com(?::(?:80|443)?)?)/ubuntu/?"
-    r"|(?i:mirror\+file:)(?:///|/)etc/apt/apt-mirrors\.txt"
-    r"|(?i:mirror(?:\+https?)?://mirrors\.ubuntu\.com)/\S+)$"
+    r"^(?:https?://(?i:(?:[A-Za-z0-9-]+\.)+archive\.ubuntu\.com)(?::(?:80|443)?)?/ubuntu/?"
+    r"|mirror\+file:(?:///|/)etc/apt/apt-mirrors\.txt"
+    r"|mirror(?:\+https?)?://(?i:mirrors\.ubuntu\.com)/\S+)$"
 )
 # Only portless lowercase `http://archive.ubuntu.com/ubuntu/` URIs (including
 # empty `:`) share the portless `archive.ubuntu.com/ubuntu/` Release index and
@@ -143,24 +146,24 @@ _ATOI_RE = re.compile(r"^[ \t\r\n\v\f]*([+-]?[0-9]+)")
 
 
 def _apt_dequote_percent(raw):
-    """Decode %HH escapes per APT's DeQuoteString (without stripping quotes)."""
-    chars = []
+    """Decode %HH escapes per APT's DeQuoteString, preserving raw bytes."""
+    buf = bytearray()
     i, n = 0, len(raw)
     while i < n:
         if raw[i] == "%" and i + 2 < n and raw[i + 1] in _HEX_DIGITS and raw[i + 2] in _HEX_DIGITS:
-            chars.append(chr(int(raw[i + 1:i + 3], 16)))
+            buf.append(int(raw[i + 1:i + 3], 16))
             i += 3
         else:
-            chars.append(raw[i])
+            buf.extend(raw[i].encode("utf-8", "surrogateescape"))
             i += 1
-    return "".join(chars)
+    return buf.decode("utf-8", "surrogateescape")
 
 
 def _apt_quote_string(raw, bad):
     """Port of APT's `QuoteString` (`apt-pkg/contrib/strutl.cc:352-367`)."""
     bad_bytes = bad.encode("ascii")
     out = []
-    for byte_val in raw.encode("utf-8"):
+    for byte_val in raw.encode("utf-8", "surrogateescape"):
         if byte_val in bad_bytes or byte_val == 0x25 or byte_val <= 0x20 or byte_val >= 0x7F:
             out.append(f"%{byte_val:02x}")
         else:
@@ -397,11 +400,13 @@ def _rewrite_uris(value, rewrite_mirrors=True, upgrade_http_canonical=False):
 def _apt_dequote_word(raw, lineno=None):
     """Decode %HH escapes and strip double quotes like APT's ParseQuoteWord.
 
+    Preserves raw bytes via UTF-8/surrogateescape so percent-decoded non-ASCII
+    bytes match APT's byte-level `QuoteString`/`URItoFileName` encoding.
     Refuses ASCII control characters (including raw or `%00` NUL bytes), which
     can truncate C-string comparisons or desync option/URI boundaries in APT.
     """
     loc = f"line {lineno}: " if lineno is not None else ""
-    chars = []
+    buf = bytearray()
     i, n = 0, len(raw)
     while i < n:
         ch = raw[i]
@@ -409,15 +414,15 @@ def _apt_dequote_word(raw, lineno=None):
             byte_val = int(raw[i + 1:i + 3], 16)
             if byte_val < 0x20 or byte_val == 0x7F:
                 raise ValueError(f"{loc}apt token contains percent-encoded control byte 0x{byte_val:02x}")
-            chars.append(chr(byte_val))
+            buf.append(byte_val)
             i += 3
             continue
         if ord(ch) < 0x20 or ord(ch) == 0x7F:
             raise ValueError(f"{loc}apt token contains control character")
         if ch != '"':
-            chars.append(ch)
+            buf.extend(ch.encode("utf-8", "surrogateescape"))
         i += 1
-    return "".join(chars)
+    return buf.decode("utf-8", "surrogateescape")
 
 
 def _decode_one_line_options(opts_bracket, lineno=None):
@@ -468,6 +473,22 @@ def _check_one_line_options(opts_bracket, lineno=None):
             raise ValueError(
                 f"{loc}source sets unsafe option [{unsafe}]; refusing to rewrite"
             )
+
+
+def _strip_one_line_comment(text):
+    """Strip `#` comments outside double quotes and `[...]` per APT sourcelist.cc."""
+    in_quote = False
+    in_bracket = False
+    for idx, ch in enumerate(text):
+        if ch == '"' and not in_bracket:
+            in_quote = not in_quote
+        elif ch == "[" and not in_quote:
+            in_bracket = True
+        elif ch == "]" and in_bracket:
+            in_bracket = False
+        elif ch == "#" and not in_quote and not in_bracket:
+            return text[:idx]
+    return text
 
 
 def _parse_one_line(body, lineno=None):
@@ -526,8 +547,9 @@ def _parse_one_line(body, lineno=None):
     raw_uri = body[uri_start:pos]
     decoded_uri = _apt_dequote_word(raw_uri, lineno)
     tail = body[pos:]
-    # Extract the suite token (first word after URI, before any `#` comment).
-    suite_scan = tail.split("#", 1)[0].lstrip(_ASCII_SPACE_STR)
+    # Extract the suite token (first word after URI, honoring `"` and `[...]`
+    # brackets per APT's ParseQuoteWord and comment stripping in sourcelist.cc).
+    suite_scan = _strip_one_line_comment(tail).lstrip(_ASCII_SPACE_STR)
     suite = None
     if suite_scan:
         j, m = 0, len(suite_scan)
@@ -535,7 +557,12 @@ def _parse_one_line(body, lineno=None):
             if suite_scan[j] == '"':
                 close = suite_scan.find('"', j + 1)
                 if close == -1:
-                    break
+                    raise ValueError(f"{loc}unterminated quote in apt suite")
+                j = close + 1
+            elif suite_scan[j] == "[":
+                close = suite_scan.find("]", j + 1)
+                if close == -1:
+                    raise ValueError(f"{loc}unterminated '[' in apt suite")
                 j = close + 1
             else:
                 j += 1
@@ -829,7 +856,9 @@ def main(argv):
             file=sys.stderr,
         )
         return 3
-    with dest.open("w", encoding="utf-8", newline="") as handle:
+    fd = os.open(dest, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    os.fchmod(fd, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8", newline="") as handle:
         handle.write(text)
     return 0
 
