@@ -2,16 +2,22 @@
 
 Used only by ``h1_apt_install.sh`` when the hosted runner's regional mirror
 (for example ``us-east-2.ec2.archive.ubuntu.com``) stalls or serves unusable
-indexes. Only the mirror URI changes: every other field (``Types``,
-``Suites``, ``Components``, ``Signed-By``, one-line ``[signed-by=...]``
-options, comments) is kept byte for byte, so GPG verification is never
-weakened and no unsigned repository is introduced. Disabled deb822 stanzas
-(``Enabled: no``), ``security.ubuntu.com``, and any non-Ubuntu URI (including
-third-party ``mirror+...`` lists) are left as they are.
+indexes. Eligible regional Ubuntu mirror URIs are rewritten to
+``https://archive.ubuntu.com/ubuntu/``; when a regional rewrite occurs,
+compatible active lowercase portless ``http://archive.ubuntu.com/ubuntu/``
+entries are also upgraded to HTTPS so APT does not reuse a plaintext Release
+index for an overlapping suite. Every other field (``Types``, ``Suites``,
+``Components``, ``Signed-By``, one-line ``[signed-by=...]`` options, comments)
+is preserved, so GPG verification is never weakened and no unsigned repository
+is introduced. Disabled deb822 stanzas (``Enabled: no``),
+``security.ubuntu.com``, non-Ubuntu URIs (including third-party ``mirror+...``
+lists), and regional suites that share an APT Release index with an entry that
+cannot be upgraded or has a different policy or repository layout keep their
+original URI.
 
 Usage: ``python3 h1_apt_sources.py SOURCE DEST``. Exit 0 after writing a
-rewritten DEST, 3 when SOURCE names no regional Ubuntu mirror (DEST is not
-written), 2 on usage or parse errors.
+rewritten DEST, 3 when SOURCE has no regional Ubuntu mirror eligible for
+canonical rewrite (DEST is not written), 2 on usage or parse errors.
 """
 import re
 import sys
@@ -32,21 +38,17 @@ _MIRROR_URI = re.compile(
 # portless `archive.ubuntu.com/ubuntu/` Release index in APT; explicit nonzero
 # ports (`:80`, `:443`) and different host casing keep distinct Release filenames.
 _HTTP_CANONICAL = re.compile(r"^(?i:http)://archive\.ubuntu\.com:?/ubuntu/?$")
-# Per-Release-index options compared by APT (`debmetaindex.cc:780-845,1236-1247,1444-1490`).
-_RELEASE_POLICY_FIELDS = (
-    "signed-by",
-    "check-valid-until",
-    "valid-until-min",
-    "valid-until-max",
-    "check-date",
-    "date-max-future",
-    "snapshot",
-    "inrelease-path",
-    "trusted",
-    "allow-insecure",
-    "allow-weak",
-    "allow-downgrade-to-insecure",
-)
+# Structural deb822 fields that do not define per-Release/per-target merge
+# policy; every other field (Signed-By, Snapshot, Include, Exclude,
+# Architectures, Languages, Targets, PDiffs, By-Hash, Check-Valid-Until, etc.)
+# must match before two entries can safely share an APT Release index.
+_DEB822_NON_POLICY_FIELDS = frozenset({
+    "types",
+    "uris",
+    "suites",
+    "components",
+    "enabled",
+})
 _POLICY_CONFLICT = object()
 # APT's pkgTagSection::Scan splits on the first `:` and trims ASCII whitespace
 # before the colon.
@@ -181,6 +183,11 @@ def _release_index_key(uri, suite):
     return (norm_authority, path)
 
 
+def _suite_policy(policy, suite):
+    """Combine entry options with flat-vs-component layout (`debmetaindex.cc:195`)."""
+    return (policy, suite.endswith("/"))
+
+
 def _register_entry_keys(release_policies, uris, suites, policy):
     for uri in uris:
         is_https = uri.lower().startswith("https://")
@@ -195,10 +202,11 @@ def _register_entry_keys(release_policies, uris, suites, policy):
             if not is_https and not upgradeable_http:
                 release_policies[key] = _POLICY_CONFLICT
                 continue
+            effective_policy = _suite_policy(policy, suite)
             existing = release_policies.get(key)
             if existing is None:
-                release_policies[key] = policy
-            elif existing != policy:
+                release_policies[key] = effective_policy
+            elif existing != effective_policy:
                 release_policies[key] = _POLICY_CONFLICT
 
 
@@ -206,7 +214,7 @@ def _canonical_keys_compatible(release_policies, suites, policy):
     for suite in suites:
         key = _release_index_key(CANONICAL, suite)
         existing = release_policies.get(key)
-        if existing is not None and existing != policy:
+        if existing is not None and existing != _suite_policy(policy, suite):
             return False
     return True
 
@@ -214,10 +222,11 @@ def _canonical_keys_compatible(release_policies, suites, policy):
 def _register_canonical_keys(release_policies, suites, policy):
     for suite in suites:
         key = _release_index_key(CANONICAL, suite)
+        effective_policy = _suite_policy(policy, suite)
         existing = release_policies.get(key)
         if existing is None:
-            release_policies[key] = policy
-        elif existing != policy:
+            release_policies[key] = effective_policy
+        elif existing != effective_policy:
             release_policies[key] = _POLICY_CONFLICT
 
 
@@ -387,12 +396,11 @@ def _parse_one_line(body):
 
 def _one_line_policy(opts_bracket):
     if not opts_bracket:
-        return tuple((field, None) for field in _RELEASE_POLICY_FIELDS)
-    values = {}
+        return ()
+    effective = {}
     for key, value in _decode_one_line_options(opts_bracket):
-        if key in _RELEASE_POLICY_FIELDS:
-            values[key] = value
-    return tuple((field, values.get(field)) for field in _RELEASE_POLICY_FIELDS)
+        effective[key] = value
+    return tuple(sorted(effective.items()))
 
 
 def _inspect_deb822_stanza(lines):
@@ -441,8 +449,11 @@ def _inspect_deb822_stanza(lines):
     uris = _ASCII_TOKEN.findall(field_value("uris")) if "uris" in fields else []
     suites = _ASCII_TOKEN.findall(field_value("suites")) if "suites" in fields else []
     policy = tuple(
-        (field, field_value(field) if field in fields else None)
-        for field in _RELEASE_POLICY_FIELDS
+        sorted(
+            (name, field_value(name))
+            for name in fields
+            if name not in _DEB822_NON_POLICY_FIELDS
+        )
     )
     return True, uris, suites, policy
 
