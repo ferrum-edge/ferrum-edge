@@ -23,16 +23,22 @@ from coverage_plan import (
     ALL_FUNCTIONAL_SHARDS,
     ALL_INTEGRATION_REMAINDER_SHARDS,
     ALL_SHARDS,
+    ALL_UNIT_SHARDS,
     CANONICAL_SHARD_ORDER,
     CONTROLLER_PATHS,
     FUNCTIONAL_DATA_SHARD,
     INTEGRATION_REMAINDER_FILTERSET,
-    LIB_UNIT_SHARD,
+    LIB_SHARD,
     MESH_PLATFORM_SHARD,
     MESH_ROUTING_SHARD,
     PROTOCOLS_SHARD,
     SCOPED_INTEGRATION_FILTERS,
     SHARD_DEFINITIONS,
+    UNIT_CORE_SHARD,
+    UNIT_GATEWAY_CORE_SHARD,
+    UNIT_PLUGINS_A_SHARD,
+    UNIT_PLUGINS_B_SHARD,
+    UNIT_SHARD_ORDER,
     VALID_MODES,
     parse_planned_shards,
     select_plan,
@@ -141,14 +147,31 @@ INVALID_MODE_CONTRACT = (
 )
 # The functional coverage step must reach the instrumented gateway from every
 # binary-resolution path the suites use, and must not rebuild it per test.
-# The lib-unit shard's single llvm-cov invocation: the inline harness plus all
-# four unit targets, each on its own continuation line (issue #7282).
+# The five split unit coverage shards and their Cargo targets (matching ci.yml).
+EXPECTED_UNIT_SHARD_TARGETS = {
+    LIB_SHARD: "",
+    UNIT_CORE_SHARD: "unit_tests",
+    UNIT_PLUGINS_A_SHARD: "unit_plugins_a_tests",
+    UNIT_PLUGINS_B_SHARD: "unit_plugins_b_tests",
+    UNIT_GATEWAY_CORE_SHARD: "unit_gateway_core_tests",
+}
+UNIT_STEP_TOKENS = (
+    "if: matrix.kind == 'unit'",
+    "UNIT_TARGET: ${{ matrix.target }}",
+    "save: ${{ matrix.shard == 'unit-core' && 'true' || 'false' }}",
+)
+# Every unit target must appear on its own llvm-cov continuation line in the
+# unit dispatch step (issue #7282).
 COVERAGE_UNIT_TOKENS = (
     "--lib",
     "--test unit_tests",
     "--test unit_plugins_a_tests",
     "--test unit_plugins_b_tests",
     "--test unit_gateway_core_tests",
+)
+UPLOAD_REPORT_GUARD = (
+    "if: always() && needs.coverage-plan.outputs.mode != 'skip' && "
+    "steps.generate-reports.outcome == 'success'"
 )
 FUNCTIONAL_STEP_TOKENS = (
     "if: matrix.kind == 'functional'",
@@ -256,8 +279,13 @@ def validate_planner_contract(failures: list[str]) -> None:
         failures,
     )
     require(
-        SHARD_DEFINITIONS[LIB_UNIT_SHARD]["kind"] == "lib-unit",
-        "lib-unit must remain the lib/unit coverage shard",
+        ALL_UNIT_SHARDS == set(EXPECTED_UNIT_SHARD_TARGETS)
+        and all(
+            SHARD_DEFINITIONS[shard]["kind"] == "unit"
+            and SHARD_DEFINITIONS[shard]["target"] == target
+            for shard, target in EXPECTED_UNIT_SHARD_TARGETS.items()
+        ),
+        "unit coverage shards must cover --lib and all four unit targets",
         failures,
     )
     for shard, expected in FROZEN_FILTER_MODULES.items():
@@ -432,6 +460,12 @@ def validate_workflow_text(text: str, failures: list[str]) -> None:
         for line in shard_body.splitlines()
         if not line.lstrip().startswith("#")
     )
+    for unit_step_token in UNIT_STEP_TOKENS:
+        require(
+            unit_step_token in shard_body,
+            f"coverage-shard unit coverage must retain {unit_step_token}",
+            failures,
+        )
     for unit_token in COVERAGE_UNIT_TOKENS:
         require(
             re.search(
@@ -440,8 +474,7 @@ def validate_workflow_text(text: str, failures: list[str]) -> None:
                 active_shard_lines,
             )
             is not None,
-            f"coverage-shard must keep `{unit_token}` in the combined lib + unit "
-            "coverage invocation",
+            f"coverage-shard must keep `{unit_token}` in the unit coverage dispatch",
             failures,
         )
     for token in FUNCTIONAL_STEP_TOKENS:
@@ -541,6 +574,16 @@ def validate_workflow_text(text: str, failures: list[str]) -> None:
         failures,
     )
     require(
+        "id: generate-reports" in merge_body,
+        "Merge Coverage must assign id: generate-reports to report generation",
+        failures,
+    )
+    require(
+        UPLOAD_REPORT_GUARD in merge_body,
+        "Merge Coverage must gate Upload coverage report on generate-reports succeeding",
+        failures,
+    )
+    require(
         "name: coverage-report" in merge_body,
         "Merge Coverage must keep publishing the coverage-report artifact",
         failures,
@@ -551,8 +594,9 @@ def validate_docs(failures: list[str]) -> None:
     coverage_doc = DOCS_COVERAGE_PATH.read_text(encoding="utf-8")
     ci_cd_doc = DOCS_CI_CD_PATH.read_text(encoding="utf-8")
     require(
-        "shard-scoped" in coverage_doc and "lib-unit" in coverage_doc,
-        "docs/coverage.md must describe shard-scoped PR coverage planning",
+        "shard-scoped" in coverage_doc
+        and all(shard in coverage_doc for shard in UNIT_SHARD_ORDER),
+        "docs/coverage.md must describe shard-scoped PR coverage planning and all five unit shards",
         failures,
     )
     require(
@@ -561,7 +605,7 @@ def validate_docs(failures: list[str]) -> None:
         failures,
     )
     require(
-        "plugin" in coverage_doc and "lib-unit" in coverage_doc,
+        "plugin" in coverage_doc and UNIT_CORE_SHARD in coverage_doc,
         "docs/coverage.md must preserve plugin-mode artifact reuse",
         failures,
     )
@@ -663,8 +707,9 @@ def self_test_artifact_transport(failures: list[str]) -> None:
             shutil.copy2(PLANNER_PATH, scripts / PLANNER_PATH.name)
             (scripts / "fixtures").mkdir()
             shutil.copy2(fixture_path, scripts / "fixtures/coverage_transport.sh")
+            transport_shards = (*UNIT_SHARD_ORDER, ADMIN_API_SHARD)
             artifacts = []
-            for artifact_id, shard in ((11, LIB_UNIT_SHARD), (12, ADMIN_API_SHARD)):
+            for artifact_id, shard in enumerate(transport_shards, start=11):
                 artifact = {"id": artifact_id, "name": f"coverage-data-{shard}", "expired": False}
                 artifacts.append(artifact)
                 contents = io.BytesIO()
@@ -728,6 +773,10 @@ case "$*" in
   'api --paginate --slurp repos/example/coverage/actions/runs/42/artifacts') cat metadata.json ;;
   'api repos/example/coverage/actions/artifacts/11/zip') download 11 ;;
   'api repos/example/coverage/actions/artifacts/12/zip') download 12 ;;
+  'api repos/example/coverage/actions/artifacts/13/zip') download 13 ;;
+  'api repos/example/coverage/actions/artifacts/14/zip') download 14 ;;
+  'api repos/example/coverage/actions/artifacts/15/zip') download 15 ;;
+  'api repos/example/coverage/actions/artifacts/16/zip') download 16 ;;
   *) echo "unexpected artifact request: $*" >&2; exit 1 ;;
 esac
 """, encoding="utf-8")
@@ -743,7 +792,7 @@ esac
                      "TRANSPORT_TEST_CASE": case,
                      "GITHUB_REPOSITORY": "example/coverage", "GITHUB_RUN_ID": "42",
                      "GITHUB_STEP_SUMMARY": str(root / "summary.md"),
-                     "PLANNED_SHARDS": json.dumps([LIB_UNIT_SHARD, ADMIN_API_SHARD])},
+                     "PLANNED_SHARDS": json.dumps(list(transport_shards))},
                 capture_output=True, text=True, timeout=30,
             )
             should_succeed = case in {"valid", "zip64", "retry", "same-profile-path"}
@@ -758,7 +807,7 @@ esac
             if should_succeed and result.returncode == 0:
                 target = root / "target/llvm-cov-target"
                 expected_profiles = {}
-                for shard in (LIB_UNIT_SHARD, ADMIN_API_SHARD):
+                for shard in transport_shards:
                     stem = "ferrum-edge-functional-pool_0" if case == "same-profile-path" else shard
                     expected_profiles[f"{stem}.fanin-{shard}.profraw"] = f"profile-{shard}".encode()
                 # The report reads every top-level *.profraw: each shard's
@@ -767,7 +816,8 @@ esac
                 require(reported == expected_profiles, f"transport {case}: shard profiles lost or changed: {sorted(reported)}", failures)
                 obj = target / "debug/deps/shared-object"
                 require(obj.read_bytes() == b"object-admin-api" and (obj.stat().st_mode & 0o777) == 0o755, "shared object overwrite order or executable mode changed", failures)
-                expected_downloads = ["11", "11", "12"] if case == "retry" else ["11", "12"]
+                expected_ids = [str(i) for i in range(11, 11 + len(transport_shards))]
+                expected_downloads = ["11", *expected_ids] if case == "retry" else expected_ids
                 require((root / "downloads").read_text().splitlines() == expected_downloads, "transport downloaded unplanned or reordered artifacts", failures)
                 require(not (root / "coverage-data").exists() and not list(root.rglob("*.tar")), "transport left an intermediate archive", failures)
 
@@ -872,14 +922,37 @@ jobs:
       matrix:
         include: ${{ fromJSON(needs.coverage-plan.outputs.shard-matrix) }}
     steps:
+      - uses: ./.github/actions/setup-rust-ci
+        with:
+          shared-key: "ci-coverage"
+          save: ${{ matrix.shard == 'unit-core' && 'true' || 'false' }}
       - run: echo "${{ matrix.shard }}"
-      - run: |
-          cargo llvm-cov --no-report \\
-            --lib \\
-            --test unit_tests \\
-            --test unit_plugins_a_tests \\
-            --test unit_plugins_b_tests \\
-            --test unit_gateway_core_tests
+      - if: matrix.kind == 'unit'
+        run: |
+          case "$UNIT_TARGET" in
+            "")
+              cargo llvm-cov --no-report \\
+                --lib
+              ;;
+            unit_tests)
+              cargo llvm-cov --no-report \\
+                --test unit_tests
+              ;;
+            unit_plugins_a_tests)
+              cargo llvm-cov --no-report \\
+                --test unit_plugins_a_tests
+              ;;
+            unit_plugins_b_tests)
+              cargo llvm-cov --no-report \\
+                --test unit_plugins_b_tests
+              ;;
+            unit_gateway_core_tests)
+              cargo llvm-cov --no-report \\
+                --test unit_gateway_core_tests
+              ;;
+          esac
+        env:
+          UNIT_TARGET: ${{ matrix.target }}
       - if: matrix.kind == 'integration'
         run: |
           nextest_args+=(-E "$INTEGRATION_FILTERSET")
@@ -924,6 +997,10 @@ jobs:
           PLANNED_SHARDS: ${{ needs.coverage-plan.outputs.shards }}
           COVERAGE_MODE: ${{ needs.coverage-plan.outputs.mode }}
           PLUGIN_GATE: ${{ needs.coverage-plan.outputs.plugin_gate }}
+      - id: generate-reports
+        name: Generate coverage reports
+        if: needs.coverage-plan.outputs.mode != 'skip'
+        run: mkdir -p coverage-report
       - name: Check coverage thresholds
         if: needs.coverage-plan.outputs.mode != 'skip'
         run: |
@@ -934,6 +1011,7 @@ jobs:
             echo --min-changed-plugins-line
           fi
       - name: Upload coverage report
+        if: always() && needs.coverage-plan.outputs.mode != 'skip' && steps.generate-reports.outcome == 'success'
         uses: actions/upload-artifact@sha
         with:
           name: coverage-report
@@ -995,14 +1073,19 @@ jobs:
             "restored CARGO_BUILD_JOBS=3",
         ),
         (
-            "            --test unit_tests \\\n",
+            "            unit_tests)\n              cargo llvm-cov --no-report \\\n                --test unit_tests\n              ;;\n",
             "",
-            "narrowed lib-unit coverage set",
+            "narrowed unit coverage set",
         ),
         (
-            "            --test unit_plugins_b_tests \\\n",
+            "            unit_plugins_b_tests)\n              cargo llvm-cov --no-report \\\n                --test unit_plugins_b_tests\n              ;;\n",
             "",
             "dropped unit_plugins_b_tests coverage target",
+        ),
+        (
+            "if: always() && needs.coverage-plan.outputs.mode != 'skip' && steps.generate-reports.outcome == 'success'",
+            "if: always() && needs.coverage-plan.outputs.mode != 'skip'",
+            "unguarded coverage report upload on shard failure",
         ),
         (
             "      - run: python3 .github/scripts/verify_coverage_workflow.py\n",
@@ -1081,13 +1164,13 @@ jobs:
     require(proxy.mode == "full" and set(proxy.shards) == set(CANONICAL_SHARD_ORDER), "proxy positive vs full shared matrix", failures)
     require(mesh.mode == "shards" and MESH_ROUTING_SHARD in mesh.shards, "mesh positive", failures)
     require(protocol.mode == "shards" and PROTOCOLS_SHARD in protocol.shards, "protocol positive", failures)
-    require(plugin.mode == "plugin" and plugin.shards == (LIB_UNIT_SHARD,), "plugin positive", failures)
+    require(plugin.mode == "plugin" and plugin.shards == UNIT_SHARD_ORDER, "plugin positive", failures)
     require(unknown.mode == "full" and unknown.shards == CANONICAL_SHARD_ORDER, "unknown fail-closed", failures)
     require(merge_group.mode == "shards", "merge_group remains path-gated", failures)
     require(main_event.mode == "full", "main push stays full", failures)
 
     try:
-        parse_planned_shards(json.dumps([LIB_UNIT_SHARD, ADMIN_API_SHARD]))
+        parse_planned_shards(json.dumps([*UNIT_SHARD_ORDER, ADMIN_API_SHARD]))
     except ValueError as error:
         failures.append(f"planned-shard parser self-test failed: {error}")
 

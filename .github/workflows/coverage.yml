@@ -172,10 +172,10 @@ jobs:
       # --test` builds under the test profile).
       CARGO_PROFILE_DEV_DEBUG: "line-tables-only"
       CARGO_PROFILE_TEST_DEBUG: "line-tables-only"
-    # The lib-unit shard compiles the aggregated tests/unit_tests binary,
-    # whose single-crate rustc frontend exceeds hosted-runner RAM cold — the
-    # swap step below keeps the VM alive through that window (see ci.yml
-    # test-unit for the incident pattern).
+    # Unit shards compile large instrumented unit-test crates whose rustc
+    # frontend can exceed hosted-runner RAM cold — the swap step below keeps the
+    # VM alive through that window (see ci.yml test-unit for the incident
+    # pattern).
     strategy:
       fail-fast: false
       matrix:
@@ -197,9 +197,10 @@ jobs:
       - uses: ./.github/actions/setup-rust-ci
         with:
           shared-key: "ci-coverage"
-          # The lib-unit shard compiles the superset of the instrumented
-          # dependency graph and is the lane's sole producer on main.
-          save: ${{ matrix.kind == 'lib-unit' && 'true' || 'false' }}
+          # The unit-core shard compiles the superset of the instrumented
+          # dependency graph (matching ci.yml's core shard for ci-debug) and is
+          # the lane's sole producer on main.
+          save: ${{ matrix.shard == 'unit-core' && 'true' || 'false' }}
           # Publish a complete instrumented dependency lane only after success.
           cache-on-failure: "false"
 
@@ -215,19 +216,41 @@ jobs:
         run: cargo llvm-cov clean --workspace
 
       - name: Run lib and unit coverage
-        if: matrix.kind == 'lib-unit'
+        if: matrix.kind == 'unit'
         run: |
           set -euo pipefail
-          # One llvm-cov invocation compiles lib + the four unit targets together so a
-          # runner-loss after the library suite does not throw away that compile
-          # and then recompile ferrum-edge for the unit-test target (#3888).
-          cargo llvm-cov --no-report \
-            --lib \
-            --test unit_tests \
-            --test unit_plugins_a_tests \
-            --test unit_plugins_b_tests \
-            --test unit_gateway_core_tests
+          # Each unit shard compiles and runs exactly one instrumented target,
+          # mirroring ci.yml's test-unit split so no hosted runner compiles
+          # multiple giant unit-test binaries concurrently (runs 44421056963 and
+          # 44464896365 lost the runner in the old combined lib-unit shard).
+          case "$UNIT_TARGET" in
+            "")
+              cargo llvm-cov --no-report \
+                --lib
+              ;;
+            unit_tests)
+              cargo llvm-cov --no-report \
+                --test unit_tests
+              ;;
+            unit_plugins_a_tests)
+              cargo llvm-cov --no-report \
+                --test unit_plugins_a_tests
+              ;;
+            unit_plugins_b_tests)
+              cargo llvm-cov --no-report \
+                --test unit_plugins_b_tests
+              ;;
+            unit_gateway_core_tests)
+              cargo llvm-cov --no-report \
+                --test unit_gateway_core_tests
+              ;;
+            *)
+              echo "::error::unexpected unit coverage target: ${UNIT_TARGET}" >&2
+              exit 1
+              ;;
+          esac
         env:
+          UNIT_TARGET: ${{ matrix.target }}
           RUST_BACKTRACE: 1
 
       - name: Run integration coverage shard
@@ -688,7 +711,8 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           PLANNED_SHARDS: ${{ needs.coverage-plan.outputs.shards }}
 
-      - name: Generate coverage reports
+      - id: generate-reports
+        name: Generate coverage reports
         if: needs.coverage-plan.outputs.mode != 'skip'
         run: |
           set -euo pipefail
@@ -795,7 +819,7 @@ jobs:
           MERGE_BASE_SHA: ${{ github.event.merge_group.base_sha }}
 
       - name: Upload coverage report
-        if: always() && needs.coverage-plan.outputs.mode != 'skip'
+        if: always() && needs.coverage-plan.outputs.mode != 'skip' && steps.generate-reports.outcome == 'success'
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: coverage-report

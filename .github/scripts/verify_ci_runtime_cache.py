@@ -111,16 +111,31 @@ _FIPS_HANDSHAKE_TESTS_COMMAND_RE = re.compile(
 )
 _PRODUCTION_SMOKE_NAME_RE = re.compile(r"(?m)^    name: Production Dockerfile eBPF image smoke$")
 _CACHE_ON_FAILURE_RE = re.compile(r"(?m)^[ \t]+cache-on-failure:[ \t]*(.*)$")
-# The lib-unit coverage shard compiles the inline harness and all four unit
-# targets in ONE llvm-cov invocation (issue #7282: matching only `--lib` and
+# The unit coverage shards dispatch the inline harness and all four unit
+# targets via explicit literal branches (issue #7282: matching only `--lib` and
 # `--test unit_tests` let three of the four targets drop out unnoticed).
 _COVERAGE_UNIT_TESTS_COMMAND_RE = re.compile(
-    r"(?m)^\s*cargo llvm-cov --no-report\s+\\\n"
-    r"\s*--lib\s+\\\n"
-    r"\s*--test unit_tests\s+\\\n"
-    r"\s*--test unit_plugins_a_tests\s+\\\n"
-    r"\s*--test unit_plugins_b_tests\s+\\\n"
-    r"\s*--test unit_gateway_core_tests\s*$"
+    r'(?m)^\s*case "\$UNIT_TARGET" in\n'
+    r'\s*""\)\n'
+    r"\s*cargo llvm-cov --no-report\s+\\\n"
+    r"\s*--lib\n"
+    r"\s*;;\n"
+    r"\s*unit_tests\)\n"
+    r"\s*cargo llvm-cov --no-report\s+\\\n"
+    r"\s*--test unit_tests\n"
+    r"\s*;;\n"
+    r"\s*unit_plugins_a_tests\)\n"
+    r"\s*cargo llvm-cov --no-report\s+\\\n"
+    r"\s*--test unit_plugins_a_tests\n"
+    r"\s*;;\n"
+    r"\s*unit_plugins_b_tests\)\n"
+    r"\s*cargo llvm-cov --no-report\s+\\\n"
+    r"\s*--test unit_plugins_b_tests\n"
+    r"\s*;;\n"
+    r"\s*unit_gateway_core_tests\)\n"
+    r"\s*cargo llvm-cov --no-report\s+\\\n"
+    r"\s*--test unit_gateway_core_tests\n"
+    r"\s*;;"
 )
 _ROOT_DESCRIPTION_BLOCK_RE = re.compile(r"(?m)^description:[^\n]*\n(?:(?:[ \t]+[^\n]*)?\n)*")
 
@@ -4819,13 +4834,13 @@ def check_docs_and_coverage(failures: list[str]) -> None:
     )
     # The FIPS producer, handoff, test-artifact, installer and shared-key doc
     # contracts are asserted once above (issue #7282 removed a second, weaker
-    # copy); the lib-unit coverage command is pinned exactly below.
-    lib_unit = coverage
+    # copy); the unit coverage dispatch is pinned exactly below.
+    unit_dispatch = coverage
     require(
-        _COVERAGE_UNIT_TESTS_COMMAND_RE.search(lib_unit)
+        _COVERAGE_UNIT_TESTS_COMMAND_RE.search(unit_dispatch)
         is not None,
-        "coverage lib-unit must compile lib and all four unit targets in one "
-        "llvm-cov invocation",
+        "coverage unit shards must dispatch lib and all four unit targets "
+        "through explicit llvm-cov branches",
         failures,
     )
 
@@ -4986,17 +5001,17 @@ def self_test() -> int:
     coverage_workflow = read_pinned(COVERAGE_WORKFLOW)
     require(
         _COVERAGE_UNIT_TESTS_COMMAND_RE.search(coverage_workflow) is not None,
-        "self-test: the checked-in lib-unit coverage command must match",
+        "self-test: the checked-in unit coverage dispatch must match",
         failures,
     )
     require(
         _COVERAGE_UNIT_TESTS_COMMAND_RE.search(
             coverage_workflow.replace(
-                "            --test unit_plugins_b_tests \\\n", "", 1
+                "                --test unit_plugins_b_tests\n", "", 1
             )
         )
         is None,
-        "self-test: dropping unit_plugins_b_tests from lib-unit coverage must fail",
+        "self-test: dropping unit_plugins_b_tests from unit coverage must fail",
         failures,
     )
     source_digest = "a" * 64
