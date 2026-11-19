@@ -173,6 +173,9 @@ jobs:
         with:
           persist-credentials: false
       - name: Install Ubuntu observer and software sampling tools
+        env:
+          H1_APT_POLICY_OUT: ${{ runner.temp }}/h1-trace/apt-install-package-origins.txt
+          H1_APT_POLICY_PACKAGES: linux-perf linux-tools-generic linux-tools-common libbpf-dev clang-18 libdw1t64 libunwind8
         run: |
           bash tests/performance/multi_protocol/h1_apt_install.sh clang-18 llvm-18 libbpf-dev libelf-dev \
             zlib1g-dev gcc libc6-dev binutils util-linux linux-perf linux-tools-generic linux-tools-common python3-yaml
@@ -243,6 +246,9 @@ jobs:
             test "$PAYLOADS" != all
           fi
       - name: Hosted prerequisites and memory headroom
+        env:
+          H1_APT_POLICY_OUT: h1-profile-evidence/apt-install-package-origins.txt
+          H1_APT_POLICY_PACKAGES: linux-perf linux-tools-generic linux-tools-common libbpf-dev clang-18 libdw1t64 libunwind8
         run: |
           bash tests/performance/multi_protocol/h1_apt_install.sh protobuf-compiler libssl-dev \
             libcurl4-openssl-dev clang lsof binutils clang-18 llvm-18 libbpf-dev libelf-dev zlib1g-dev \

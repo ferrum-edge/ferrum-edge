@@ -170,7 +170,13 @@ cannot be upgraded or has a different policy, repository root, or layout keeps
 its regional URI for all of its suites so distinct Release indexes are
 preserved. `Suites`, `Components`, and `Signed-By` stay intact, and active
 entries that disable signature verification (under any APT truthy spelling)
-are refused when deriving the fallback source.
+are refused when deriving the fallback source. When no regional mirror is
+eligible for rewrite, the helper retries the original source unchanged while
+preserving the image's failover tuning. In `trace-fixtures` and `measurement`,
+`h1_apt_install.sh` also captures `apt-cache policy` for the preflight package
+set using the winning attempt's `Dir::Etc` options before removing any
+temporary fallback source, retaining `apt-install-package-origins.txt` in the
+job evidence artifact.
 
 The measurement campaign runs only on manual dispatch:
 

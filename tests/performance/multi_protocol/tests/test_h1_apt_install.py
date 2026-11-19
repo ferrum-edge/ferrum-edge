@@ -22,6 +22,7 @@ sys.path.insert(0, str(HERE))
 import h1_apt_sources as sources
 
 SCRIPT = HERE / "h1_apt_install.sh"
+TRACE_COMMANDS = HERE / "h1_trace_commands.sh"
 WORKFLOW = ROOT / ".github/workflows/h1-internal-profile.yml"
 KEYRING = "/usr/share/keyrings/ubuntu-archive-keyring.gpg"
 
@@ -1348,7 +1349,12 @@ for arg in "$@"; do
     --no-download) action=unpack ;;
   esac
 done
-case "$list" in "$FAKE_ETC"/*) phase=primary ;; *) phase=fallback ;; esac
+case "$list" in
+  "$FAKE_ETC"/*)
+    if [ -e "$FAKE_LOG/failed-once" ]; then phase=retry; else phase=primary; fi
+    ;;
+  *) phase=fallback ;;
+esac
 joined=""
 for arg in "$@"; do
   if [ -n "$joined" ]; then joined+=$'\x1f'; fi
@@ -1366,10 +1372,36 @@ case "${FAKE_APT_FAIL:-}" in
     fi
     ;;
   primary-download) [ "$phase/$action" = primary/download ] && exit 100 ;;
+  first-download)
+    if [ "$phase/$action" = primary/download ] && [ ! -e "$FAKE_LOG/failed-once" ]; then
+      : > "$FAKE_LOG/failed-once"
+      exit 100
+    fi
+    ;;
   stall) [ "$phase/$action" = primary/download ] && exec sleep 60 ;;
   all) [ "$action" = download ] && exit 100 ;;
 esac
 exit 0
+"""
+
+FAKE_APT_CACHE = r"""#!/usr/bin/env bash
+set -u
+list=""
+for arg in "$@"; do
+  case "$arg" in
+    Dir::Etc::sourcelist=*) list=${arg#Dir::Etc::sourcelist=} ;;
+  esac
+done
+exists=0
+if [ -n "$list" ] && [ -f "$list" ]; then exists=1; fi
+joined=""
+for arg in "$@"; do
+  if [ -n "$joined" ]; then joined+=$'\x1f'; fi
+  joined+="$arg"
+done
+printf '%s\t%s\t%s\n' "$exists" "$list" "$joined" >> "$FAKE_LOG/apt-cache.log"
+printf 'policy-source=%s\n' "$list"
+if [ "$exists" -eq 1 ]; then cat "$list"; fi
 """
 
 TIMEOUT_SHIM = r"""#!/usr/bin/env bash
@@ -1388,18 +1420,21 @@ class InstallScriptTests(unittest.TestCase):
             path.mkdir(parents=True)
         self.real_timeout = shutil.which("timeout")
         (self.bin / "apt-get").write_text(FAKE_APT)
+        (self.bin / "apt-cache").write_text(FAKE_APT_CACHE)
         (self.bin / "timeout").write_text(TIMEOUT_SHIM)
-        for tool in ("apt-get", "timeout"):
+        for tool in ("apt-get", "apt-cache", "timeout"):
             (self.bin / tool).chmod(0o755)
 
     def tearDown(self):
         self.tmp.cleanup()
 
-    def run_script(self, fail="", primary_timeout="300", packages=("clang-18", "llvm-18")):
+    def run_script(self, fail="", primary_timeout="300", packages=("clang-18", "llvm-18"),
+                   policy_out="", policy_packages=""):
         env = dict(os.environ, PATH=f"{self.bin}:{os.environ['PATH']}", FAKE_ETC=str(self.etc),
                    FAKE_LOG=str(self.log), FAKE_APT_FAIL=fail, REAL_TIMEOUT=self.real_timeout,
                    H1_APT_SUDO="", H1_APT_ETC_DIR=str(self.etc),
-                   H1_APT_PRIMARY_TIMEOUT=primary_timeout, H1_APT_FALLBACK_TIMEOUT="60")
+                   H1_APT_PRIMARY_TIMEOUT=primary_timeout, H1_APT_FALLBACK_TIMEOUT="60",
+                   H1_APT_POLICY_OUT=str(policy_out), H1_APT_POLICY_PACKAGES=policy_packages)
         env.pop("DEBIAN_FRONTEND", None)
         env.pop("IN_TIMEOUT", None)
         return subprocess.run(["bash", str(SCRIPT), *packages], env=env, capture_output=True,
@@ -1413,6 +1448,16 @@ class InstallScriptTests(unittest.TestCase):
         for line in path.read_text().splitlines():
             phase, action, frontend, in_timeout, argv = line.split("\t", 4)
             rows.append((phase, action, frontend, in_timeout, argv.split("\x1f")))
+        return rows
+
+    def cache_calls(self):
+        path = self.log / "apt-cache.log"
+        if not path.exists():
+            return []
+        rows = []
+        for line in path.read_text().splitlines():
+            exists, source, argv = line.split("\t", 2)
+            rows.append((exists == "1", source, argv.split("\x1f")))
         return rows
 
     def assert_apt_options(self, argv, source, phase):
@@ -1518,6 +1563,66 @@ class InstallScriptTests(unittest.TestCase):
         result = self.run_script("primary-download")
         self.assertEqual(result.returncode, 1)
         self.assertEqual([c[0] for c in self.calls()], ["primary", "primary"])
+        self.assertEqual(self.cache_calls(), [])
+
+    def test_exit_3_unchanged_retry_preserves_image_failover_tuning(self):
+        canonical_only = DEB822.replace("http://us-east-2.ec2.archive.ubuntu.com/ubuntu/", sources.CANONICAL)
+        source_path = self.etc / "sources.list.d/ubuntu.sources"
+        source_path.write_text(canonical_only)
+        result = self.run_script("first-download")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("retrying it unchanged", result.stdout)
+        calls = self.calls()
+        self.assertEqual([(p, a, t) for p, a, _, t, _ in calls],
+                         [("primary", "update", "1"),
+                          ("primary", "download", "1"),
+                          ("retry", "update", "1"),
+                          ("retry", "download", "1"),
+                          ("retry", "unpack", "0")])
+        for phase, _, frontend, _, argv in calls:
+            self.assertEqual(frontend, "noninteractive")
+            self.assert_apt_options(argv, source_path, phase)
+        self.assertEqual(self.cache_calls(), [])
+
+    def test_policy_capture_uses_winning_source_before_fallback_cleanup(self):
+        source_path = self.etc / "sources.list.d/ubuntu.sources"
+        source_path.write_text(DEB822)
+
+        # Primary success with default package list.
+        primary_out = Path(self.tmp.name) / "evidence" / "primary-policy.txt"
+        result = self.run_script(policy_out=primary_out)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        cache_calls = self.cache_calls()
+        self.assertEqual(len(cache_calls), 1)
+        exists, source, argv = cache_calls[0]
+        self.assertTrue(exists)
+        self.assertEqual(source, str(source_path))
+        self.assert_apt_options(argv, source_path, "primary")
+        self.assertEqual(argv[-4:], ["policy", "--", "clang-18", "llvm-18"])
+        self.assertIn("http://us-east-2.ec2.archive.ubuntu.com/ubuntu/", primary_out.read_text())
+
+        # Canonical fallback success with explicit preflight package list: apt-cache
+        # must observe the temporary canonical source before the EXIT trap removes it.
+        for leftover in self.log.iterdir():
+            leftover.unlink()
+        fallback_out = Path(self.tmp.name) / "evidence" / "fallback-policy.txt"
+        result = self.run_script(
+            fail="primary-download",
+            policy_out=fallback_out,
+            policy_packages="linux-perf libbpf-dev clang-18",
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        cache_calls = self.cache_calls()
+        self.assertEqual(len(cache_calls), 1)
+        exists, fallback_source, argv = cache_calls[0]
+        self.assertTrue(exists, "temporary canonical source must still exist during policy capture")
+        self.assertFalse(Path(fallback_source).exists(), "temporary canonical source removed on exit")
+        self.assert_apt_options(argv, fallback_source, "fallback")
+        self.assertEqual(argv[-5:], ["policy", "--", "linux-perf", "libbpf-dev", "clang-18"])
+        captured = fallback_out.read_text()
+        self.assertIn(f"policy-source={fallback_source}\n", captured)
+        self.assertIn(sources.CANONICAL, captured)
+        self.assertNotIn("us-east-2.ec2.archive.ubuntu.com", captured)
 
 
 class WorkflowWiringTests(unittest.TestCase):
@@ -1543,6 +1648,23 @@ class WorkflowWiringTests(unittest.TestCase):
         install = re.search(r"h1_apt_install\.sh ((?:[^\n\\]|\\\n)+)", job).group(1)
         self.assertEqual(" ".join(install.replace("\\\n", " ").split()), TRACE_PACKAGES)
         self.assertIn("test_h1_apt_install.py", job)
+
+    def test_trace_and_measurement_capture_install_package_origins(self):
+        match = re.search(
+            r"^\s*package-origins\)\s+exec\s+apt-cache\s+policy\s+([^\n;]+?)\s*;;",
+            TRACE_COMMANDS.read_text(),
+            re.M,
+        )
+        self.assertIsNotNone(match)
+        expected_packages = " ".join(match.group(1).split())
+        jobs = self.jobs()
+        for job_name, expected_out in (
+                ("trace-fixtures", "${{ runner.temp }}/h1-trace/apt-install-package-origins.txt"),
+                ("measurement", "h1-profile-evidence/apt-install-package-origins.txt")):
+            with self.subTest(job=job_name):
+                job = jobs[job_name]
+                self.assertIn(f"H1_APT_POLICY_OUT: {expected_out}\n", job)
+                self.assertIn(f"H1_APT_POLICY_PACKAGES: {expected_packages}\n", job)
 
     def test_helper_path_triggers_the_workflow(self):
         self.assertIn("      - tests/performance/multi_protocol/h1_*\n", WORKFLOW.read_text())

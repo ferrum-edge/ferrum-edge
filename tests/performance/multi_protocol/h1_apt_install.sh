@@ -19,9 +19,13 @@
 # Once all packages are downloaded, `install --no-download` unpacks and
 # configures them offline with DEBIAN_FRONTEND=noninteractive.
 #
-# Test seams: H1_APT_ETC_DIR (default /etc/apt), H1_APT_SUDO (default sudo;
-# empty runs apt directly), H1_APT_PRIMARY_TIMEOUT / H1_APT_FALLBACK_TIMEOUT
-# (seconds, defaults 300 / 600).
+# Test seams / optional provenance: H1_APT_ETC_DIR (default /etc/apt),
+# H1_APT_SUDO (default sudo; empty runs apt directly),
+# H1_APT_PRIMARY_TIMEOUT / H1_APT_FALLBACK_TIMEOUT (seconds, defaults 300 / 600),
+# H1_APT_POLICY_OUT (if set, captures `apt-cache policy` using the winning
+# attempt's Dir::Etc options before temporary-source cleanup), and
+# H1_APT_POLICY_PACKAGES (whitespace-separated package list for that capture,
+# defaulting to the installed package arguments).
 set -euo pipefail
 
 if [ "$#" -eq 0 ]; then
@@ -34,6 +38,14 @@ etc_dir=${H1_APT_ETC_DIR:-/etc/apt}
 primary_timeout=${H1_APT_PRIMARY_TIMEOUT:-300}
 fallback_timeout=${H1_APT_FALLBACK_TIMEOUT:-600}
 sudo_cmd=${H1_APT_SUDO-sudo}
+policy_out=${H1_APT_POLICY_OUT:-}
+policy_packages=()
+if [ -n "${H1_APT_POLICY_PACKAGES:-}" ]; then
+  IFS=$' \t\n' read -r -d '' -a policy_packages < <(printf '%s\0' "$H1_APT_POLICY_PACKAGES")
+fi
+if [ "${#policy_packages[@]}" -eq 0 ]; then
+  policy_packages=("${packages[@]}")
+fi
 for budget in "$primary_timeout" "$fallback_timeout"; do
   if ! [[ $budget =~ ^[1-9][0-9]{0,4}$ ]]; then
     echo "::error::apt budgets must be positive whole seconds" >&2
@@ -59,8 +71,8 @@ apt_options() {
     -o "Dir::Etc::sourceparts=-"
     -o "Acquire::URIEncode=+~ "
   )
-  # Inherit the runner image's faster mirror-list failover tuning on primary;
-  # apply explicit retries/timeouts on the direct canonical fallback.
+  # Inherit the runner image's faster mirror-list failover tuning on primary and
+  # unchanged retries; apply explicit retries/timeouts on the direct canonical fallback.
   if [ "$label" = fallback ]; then
     APT_OPTS+=(
       -o "Acquire::Retries=3"
@@ -109,6 +121,11 @@ install_downloaded() {
   ${privileged[@]+"${privileged[@]}"} env DEBIAN_FRONTEND=noninteractive \
     apt-get "${APT_OPTS[@]}" \
     install -y --no-install-recommends --no-download -- "${packages[@]}"
+  if [ -n "$policy_out" ]; then
+    mkdir -p -- "$(dirname -- "$policy_out")"
+    ${privileged[@]+"${privileged[@]}"} apt-cache "${APT_OPTS[@]}" \
+      policy -- "${policy_packages[@]}" > "$policy_out"
+  fi
   echo "::endgroup::"
 }
 
@@ -133,10 +150,12 @@ case "$rewrite" in
   0)
     chmod 600 "$fallback"
     echo "::warning::retrying Ubuntu apt fetch from https://archive.ubuntu.com/ubuntu/"
+    retry_label=fallback
     ;;
   3)
     echo "::warning::$ubuntu_sources has no regional Ubuntu mirror eligible for canonical rewrite; retrying it unchanged"
     fallback=$ubuntu_sources
+    retry_label=retry
     ;;
   *)
     echo "::error::could not derive a canonical Ubuntu apt source from $ubuntu_sources" >&2
@@ -144,5 +163,5 @@ case "$rewrite" in
     ;;
 esac
 
-fetch_attempt fallback "$fallback" "$fallback_timeout"
-install_downloaded fallback "$fallback"
+fetch_attempt "$retry_label" "$fallback" "$fallback_timeout"
+install_downloaded "$retry_label" "$fallback"
