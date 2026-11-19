@@ -212,27 +212,30 @@ lane's failure history are on issue
 ### Sanitizer build profile
 
 `cargo fuzz run` (cargo-fuzz 0.13.1) builds with `--release`, so both libFuzzer
-lanes compile with `fuzz/Cargo.toml`'s `[profile.release]`; the workflows leave
-`RUSTFLAGS` empty apart from what cargo-fuzz adds for ASan and
-SanitizerCoverage. Even with the extra swap, the `opt-level = 3` build lost the
-smoke runner in 5 of 30 pushes to main: in run 44461627224 one rustc compiling
-the `ferrum-edge` library reached 14.66 GiB RSS plus 9.26 GiB swap on a 15.6 GiB
+lanes compile with `fuzz/Cargo.toml`'s `[profile.release]`. Cargo-fuzz already
+passes `--config 'profile.release.debug="line-tables-only"'` plus ASan,
+SanitizerCoverage, and `-Ccodegen-units=16`, without setting `-Copt-level`.
+Even with the extra swap, the `opt-level = 3` build lost the smoke runner in
+5 of 30 pushes to main: in run 44461627224 compiling the `ferrum-edge` library
+peaked at 14.66 GiB largest-process RSS (with 2.33 GiB host swap used) and
+9.26 GiB host swap used (with 12.53 GiB largest-process RSS) on a 15.6 GiB
 runner, `MemAvailable` fell to 0.17 GiB, and that crate alone took 39 minutes
 under ~48.6 GiB of swap I/O. The profile is now:
 
 | Setting | Value | Why |
 |---------|-------|-----|
-| `[profile.release]` `opt-level` | `2` | Dependencies and the target binaries stay optimized; they were never the memory peak |
-| `[profile.release.package.ferrum-edge]` `opt-level` | `1` | Cuts the inlining/unrolling/vectorization IR growth in the one crate that held the peak (including the generics it monomorphizes); O1 is ASan's usual floor for reasonable speed |
-| `debug` | `"line-tables-only"` | File/line and inlined-frame data for ASan and libFuzzer stack traces, without `limited` debuginfo's per-function type and scope DWARF |
+| `[profile.release]` `opt-level` | `2` | Target dependencies and fuzz binaries stay optimized (host build scripts and proc macros keep Cargo's O0 default); they were never the memory peak |
+| `[profile.release.package.ferrum-edge]` `opt-level` | `1` | Cuts the inlining/unrolling/vectorization IR growth in the `ferrum-edge` compilation (including the generic instances emitted there); O1 is ASan's usual floor for reasonable speed |
+| `debug` | `"line-tables-only"` | Aligns direct Cargo builds with what cargo-fuzz 0.13.1 already passes to the hosted lanes, retaining file:line and inlined-frame data for ASan and libFuzzer stack traces |
 
-Debuginfo is the secondary saving: `line-tables-only` with `CARGO_BUILD_JOBS=2`
-alone still lost the runner (run 43900143614), so the `opt-level` change carries
-the fix.
+An earlier branch trial (`workflow_dispatch` run 43900143614) confirmed that
+`CARGO_BUILD_JOBS=2` with the existing `line-tables-only` debug level still
+lost the runner; the `opt-level` reduction is the active change, with actual
+peak-memory savings pending measurement in hosted `Fuzz build resources:` logs.
 
 `[profile.fuzz]` and `[profile.fuzz-with-sanitizer]` inherit `release`, including
-the package override. The code under test runs slower at O1, which the bounds
-absorb: the smoke's `-runs=512` finished in 0–2 seconds per target at O3 against
-an 8 second cap, and the scheduled lane is time-bounded, so slower execution only
-lowers its execution count. The `Fuzz build resources:` records above are the
-measurement to compare against the figures here.
+the package override. Historical O3 timings showed headroom (the smoke's
+`-runs=512` finished in 0–2 seconds per target against the 8 second cap), and
+the scheduled lane is time-bounded, so slower execution lowers its execution
+count; verify each target's `Done 512 runs` line and `Fuzz build resources:`
+records in hosted runs of the new profile.
