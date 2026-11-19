@@ -111,7 +111,7 @@ if [ "$status" -eq 0 ]; then
   install_downloaded primary "$ubuntu_sources"
   exit 0
 fi
-echo "::warning::Ubuntu apt fetch from the runner mirror failed or timed out (status $status); retrying from https://archive.ubuntu.com/ubuntu/"
+echo "::warning::Ubuntu apt fetch from the runner mirror failed or timed out (status $status)"
 
 workdir=$(mktemp -d)
 trap 'rm -rf "$workdir"' EXIT
@@ -123,7 +123,10 @@ chmod 755 "$workdir"
 rewrite=0
 python3 "$here/h1_apt_sources.py" "$ubuntu_sources" "$fallback" || rewrite=$?
 case "$rewrite" in
-  0) chmod 644 "$fallback" ;;
+  0)
+    chmod 644 "$fallback"
+    echo "::warning::retrying Ubuntu apt fetch from https://archive.ubuntu.com/ubuntu/"
+    ;;
   3)
     echo "::warning::$ubuntu_sources has no regional Ubuntu mirror eligible for canonical rewrite; retrying it unchanged"
     fallback=$ubuntu_sources

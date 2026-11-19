@@ -29,12 +29,10 @@ _MIRROR_URI = re.compile(
     r"|(?i:mirror(?:\+https?)?://mirrors\.ubuntu\.com)/\S+)$"
 )
 # Only portless canonical URIs (including empty `:`) share the portless
-# `archive.ubuntu.com/ubuntu/` Release index in APT; explicit ports like `:80`
-# or `:443` keep distinct Release-index filenames in `URItoFileName`.
+# `archive.ubuntu.com/ubuntu/` Release index in APT; explicit nonzero ports
+# like `:80` or `:443` keep distinct Release-index filenames in `URItoFileName`.
 _HTTP_CANONICAL = re.compile(r"^(?i:http://archive\.ubuntu\.com):?/ubuntu/?$")
-_HTTPS_CANONICAL = re.compile(r"^(?i:https://archive\.ubuntu\.com):?/ubuntu/?$")
-# Per-Release-index options in APT (debmetaindex.cc): entries sharing a
-# (URI, Suite) Release index must agree on these or APT rejects the source.
+# Per-Release-index options compared by APT (`debmetaindex.cc:780-845,1236-1247,1444-1490`).
 _RELEASE_POLICY_FIELDS = (
     "signed-by",
     "check-valid-until",
@@ -48,24 +46,6 @@ _RELEASE_POLICY_FIELDS = (
     "allow-insecure",
     "allow-weak",
     "allow-downgrade-to-insecure",
-    "shadowed",
-)
-# One-line `sources.list` options are stored and looked up case-sensitively in
-# APT (`sourcelist.cc:240`, `debmetaindex.cc:1242,1456`).
-_ONE_LINE_POLICY_FIELDS = (
-    "signed-by",
-    "check-valid-until",
-    "valid-until-min",
-    "valid-until-max",
-    "check-date",
-    "date-max-future",
-    "snapshot",
-    "inrelease-path",
-    "trusted",
-    "allow-insecure",
-    "allow-weak",
-    "allow-downgrade-to-insecure",
-    "SHADOWED",
 )
 _POLICY_CONFLICT = object()
 # APT's pkgTagSection::Scan splits on the first `:` and trims ASCII whitespace
@@ -149,31 +129,96 @@ def _is_http_canonical(uri):
     return bool(_HTTP_CANONICAL.match(uri))
 
 
-def _is_canonical(uri):
-    return bool(_HTTP_CANONICAL.match(uri) or _HTTPS_CANONICAL.match(uri))
-
-
 def _should_rewrite_uri(uri, rewrite_mirrors=True, upgrade_http_canonical=False):
     return (rewrite_mirrors and is_mirror(uri)) or (
         upgrade_http_canonical and _is_http_canonical(uri)
     )
 
 
-def _register_suite_policy(suite_policies, suites, policy):
-    for suite in suites:
-        existing = suite_policies.get(suite)
-        if existing is None:
-            suite_policies[suite] = policy
-        elif existing != policy:
-            suite_policies[suite] = _POLICY_CONFLICT
+def _release_index_key(uri, suite):
+    """Return APT's effective Release-index key matching URItoFileName(constructMetaIndexURI(...))."""
+    base = uri if uri.endswith("/") else uri + "/"
+    if suite == "/":
+        meta_uri = base + "Release"
+    elif suite.endswith("/"):
+        meta_uri = base + suite + "Release"
+    else:
+        meta_uri = base + "dists/" + suite + "/Release"
+    # Match APT ::URI (strutl.cc:1751-1795) + URItoFileName (strutl.cc:521-533):
+    # strip scheme and userinfo, lowercase host, drop empty/zero port, keep
+    # explicit nonzero ports and case-sensitive path.
+    scheme_sep = meta_uri.find("://")
+    if scheme_sep == -1:
+        colon = meta_uri.find(":")
+        rest = meta_uri[colon + 1:] if colon != -1 else meta_uri
+        return ("", rest)
+    rest = meta_uri[scheme_sep + 3:]
+    slash = rest.find("/")
+    authority = rest if slash == -1 else rest[:slash]
+    path = "" if slash == -1 else rest[slash:]
+    if "@" in authority:
+        authority = authority.rsplit("@", 1)[1]
+    if authority.startswith("["):
+        end_v6 = authority.find("]")
+        if end_v6 != -1:
+            host = authority[:end_v6 + 1].lower()
+            port_part = authority[end_v6 + 1:]
+        else:
+            host, port_part = authority.lower(), ""
+    elif ":" in authority:
+        host_raw, port_raw = authority.rsplit(":", 1)
+        host, port_part = host_raw.lower(), ":" + port_raw
+    else:
+        host, port_part = authority.lower(), ""
+    if port_part.startswith(":"):
+        digits = port_part[1:]
+        if digits.isdigit() and int(digits) > 0:
+            norm_authority = f"{host}:{int(digits)}"
+        else:
+            norm_authority = host
+    else:
+        norm_authority = host
+    return (norm_authority, path)
 
 
-def _suites_compatible(suite_policies, suites, policy):
+def _register_entry_keys(release_policies, uris, suites, policy):
+    for uri in uris:
+        is_https = uri.lower().startswith("https://")
+        upgradeable_http = _is_http_canonical(uri)
+        for suite in suites:
+            key = _release_index_key(uri, suite)
+            # An existing non-HTTPS entry that shares a Release index with
+            # CANONICAL but is not a plain upgradeable HTTP canonical URI (for
+            # example `http://reader@archive.ubuntu.com/ubuntu/`) blocks merges
+            # onto that index so APT neither hits a policy conflict nor reuses
+            # a plaintext Release index for a rewritten HTTPS mirror.
+            if not is_https and not upgradeable_http and key == _release_index_key(CANONICAL, suite):
+                release_policies[key] = _POLICY_CONFLICT
+                continue
+            existing = release_policies.get(key)
+            if existing is None:
+                release_policies[key] = policy
+            elif existing != policy:
+                release_policies[key] = _POLICY_CONFLICT
+
+
+def _canonical_keys_compatible(release_policies, suites, policy):
     for suite in suites:
-        existing = suite_policies.get(suite)
+        key = _release_index_key(CANONICAL, suite)
+        existing = release_policies.get(key)
         if existing is not None and existing != policy:
             return False
     return True
+
+
+def _register_canonical_keys(release_policies, suites, policy):
+    for suite in suites:
+        key = _release_index_key(CANONICAL, suite)
+        existing = release_policies.get(key)
+        if existing is None:
+            release_policies[key] = policy
+        elif existing != policy:
+            release_policies[key] = _POLICY_CONFLICT
 
 
 _ASCII_TOKEN = re.compile(r"[^ \t\r\n\v\f]+")
@@ -255,10 +300,15 @@ def _decode_one_line_options(opts_bracket):
 def _check_one_line_options(opts_bracket):
     if not opts_bracket:
         return
+    # APT stores one-line option names case-sensitively (`sourcelist.cc:240`)
+    # and looks up exact lowercase trust keys (`debmetaindex.cc:1236,1444`).
+    effective = {}
     for key, value in _decode_one_line_options(opts_bracket):
-        if key.lower() in _UNSAFE_FIELDS and _is_apt_true(value):
+        effective[key] = value
+    for unsafe in _UNSAFE_FIELDS:
+        if unsafe in effective and _is_apt_true(effective[unsafe]):
             raise ValueError(
-                f"source sets [{key}={value}]; refusing to rewrite unsafe source"
+                f"source sets [{unsafe}={effective[unsafe]}]; refusing to rewrite unsafe source"
             )
 
 
@@ -337,12 +387,12 @@ def _parse_one_line(body):
 
 def _one_line_policy(opts_bracket):
     if not opts_bracket:
-        return tuple((field, None) for field in _ONE_LINE_POLICY_FIELDS)
+        return tuple((field, None) for field in _RELEASE_POLICY_FIELDS)
     values = {}
     for key, value in _decode_one_line_options(opts_bracket):
-        if key in _ONE_LINE_POLICY_FIELDS:
+        if key in _RELEASE_POLICY_FIELDS:
             values[key] = value
-    return tuple((field, values.get(field)) for field in _ONE_LINE_POLICY_FIELDS)
+    return tuple((field, values.get(field)) for field in _RELEASE_POLICY_FIELDS)
 
 
 def _inspect_deb822_stanza(lines):
@@ -442,22 +492,23 @@ def rewrite_deb822(text):
     if stanza:
         chunks.append(("stanza", stanza))
 
-    # Pass 1: validate every active stanza and record signing policies already
-    # bound to canonical archive.ubuntu.com Release indexes.
+    # Pass 1: validate every active stanza and record signing policies keyed by
+    # APT's effective Release filename across ALL active entries.
     inspected = []
-    suite_policies = {}
+    release_policies = {}
     for kind, lines in chunks:
         if kind != "stanza":
             inspected.append((kind, lines, None))
             continue
         info = _inspect_deb822_stanza(lines)
         active, uris, suites, policy = info
-        if active and any(_is_canonical(u) for u in uris):
-            _register_suite_policy(suite_policies, suites, policy)
+        if active:
+            _register_entry_keys(release_policies, uris, suites, policy)
         inspected.append((kind, lines, info))
 
     # Pass 2: decide which regional-mirror stanzas can rewrite onto CANONICAL
-    # without colliding with a different signing policy on the same suite.
+    # without colliding with a different signing policy or un-upgradeable
+    # non-HTTPS entry on the destination Release index.
     rewritten_indices = set()
     for idx, (kind, _lines, info) in enumerate(inspected):
         if kind != "stanza":
@@ -465,10 +516,10 @@ def rewrite_deb822(text):
         active, uris, suites, policy = info
         if not active or not any(is_mirror(u) for u in uris):
             continue
-        if not _suites_compatible(suite_policies, suites, policy):
+        if not _canonical_keys_compatible(release_policies, suites, policy):
             continue
         rewritten_indices.add(idx)
-        _register_suite_policy(suite_policies, suites, policy)
+        _register_canonical_keys(release_policies, suites, policy)
 
     if not rewritten_indices:
         return text, False
@@ -490,7 +541,7 @@ def rewrite_deb822(text):
         elif (
             active
             and any(_is_http_canonical(u) for u in uris)
-            and _suites_compatible(suite_policies, suites, policy)
+            and _canonical_keys_compatible(release_policies, suites, policy)
         ):
             new_lines, _ = _rewrite_deb822_stanza_uris(
                 lines, rewrite_mirrors=False, upgrade_http_canonical=True
@@ -502,9 +553,10 @@ def rewrite_deb822(text):
 
 
 def rewrite_one_line(text):
-    # Pass 1: validate every active line and record canonical suite policies.
+    # Pass 1: validate every active line and record Release-index policies
+    # across ALL active entries (including userinfo/flat-suite variants).
     records = []
-    suite_policies = {}
+    release_policies = {}
     for line in _LINE_SPLIT.findall(text):
         body = line.rstrip("\r\n")
         if "\r" in body:
@@ -521,12 +573,12 @@ def rewrite_one_line(text):
         _check_one_line_options(opts_bracket)
         policy = _one_line_policy(opts_bracket)
         suites = [suite] if suite else []
-        if _is_canonical(decoded_uri):
-            _register_suite_policy(suite_policies, suites, policy)
+        _register_entry_keys(release_policies, [decoded_uri], suites, policy)
         records.append(("entry", (line, head, decoded_uri, tail, ending), (suites, policy)))
 
     # Pass 2: select regional-mirror entries that can safely map onto CANONICAL
-    # without colliding with a distinct signing policy on the same suite.
+    # without colliding with a distinct signing policy or un-upgradeable
+    # non-HTTPS entry on the destination Release index.
     rewritten_indices = set()
     for idx, (kind, payload, meta) in enumerate(records):
         if kind != "entry":
@@ -535,10 +587,10 @@ def rewrite_one_line(text):
         suites, policy = meta
         if not is_mirror(decoded_uri):
             continue
-        if not _suites_compatible(suite_policies, suites, policy):
+        if not _canonical_keys_compatible(release_policies, suites, policy):
             continue
         rewritten_indices.add(idx)
-        _register_suite_policy(suite_policies, suites, policy)
+        _register_canonical_keys(release_policies, suites, policy)
 
     if not rewritten_indices:
         return text, False
@@ -554,7 +606,7 @@ def rewrite_one_line(text):
         suites, policy = meta
         if idx in rewritten_indices or (
             _is_http_canonical(decoded_uri)
-            and _suites_compatible(suite_policies, suites, policy)
+            and _canonical_keys_compatible(release_policies, suites, policy)
         ):
             out.append(head + CANONICAL + tail + ending)
         else:

@@ -220,6 +220,37 @@ class SourceRewriteTests(unittest.TestCase):
         self.assertIn("https://archive.ubuntu.com/ubuntu/ resolute main\n", rewritten_case)
         self.assertIn("https://azure.archive.ubuntu.com/ubuntu/ resolute universe\n", rewritten_case)
 
+        # APT ignores capitalized `Trusted=yes` in one-line options (exact-case lookup).
+        one_line_upper_trusted = (
+            f"deb [signed-by={KEYRING} Trusted=yes] https://azure.archive.ubuntu.com/ubuntu/ noble main\n"
+        )
+        rewritten_ut, changed_ut = sources.rewrite(one_line_upper_trusted, deb822=False)
+        self.assertTrue(changed_ut)
+        self.assertIn("https://archive.ubuntu.com/ubuntu/", rewritten_ut)
+
+        # Userinfo (`reader@`) shares APT's scheme-and-userinfo-stripped Release
+        # filename with `https://archive.ubuntu.com/ubuntu/`, so a regional mirror
+        # for the same suite must not merge onto it (with either same or distinct keyring).
+        for second_key in (KEYRING, alt_keyring):
+            with self.subTest(userinfo_second_key=second_key):
+                deb822_userinfo = (
+                    "Types: deb\nURIs: http://reader@archive.ubuntu.com/ubuntu/\nSuites: resolute\n"
+                    f"Components: main\nSigned-By: {KEYRING}\n\n"
+                    "Types: deb\nURIs: https://us-east-2.ec2.archive.ubuntu.com/ubuntu/\nSuites: resolute\n"
+                    f"Components: universe\nSigned-By: {second_key}\n"
+                )
+                self.assertEqual(sources.rewrite(deb822_userinfo, deb822=True), (deb822_userinfo, False))
+
+        # Flat-repository suite `dists/resolute/` maps to the exact same APT Release
+        # filename as ordinary suite `resolute`.
+        deb822_flat_suite = (
+            "Types: deb\nURIs: http://archive.ubuntu.com/ubuntu/\nSuites: resolute\n"
+            f"Components: main\nSigned-By: {KEYRING}\n\n"
+            "Types: deb\nURIs: https://us-east-2.ec2.archive.ubuntu.com/ubuntu/\nSuites: dists/resolute/\n"
+            f"Signed-By: {alt_keyring}\n"
+        )
+        self.assertEqual(sources.rewrite(deb822_flat_suite, deb822=True), (deb822_flat_suite, False))
+
     @unittest.skipUnless(shutil.which("apt-get") and Path(KEYRING).exists(), "needs hosted Ubuntu apt-get")
     def test_hosted_apt_accepts_rewritten_mixed_and_distinct_policy_sources(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -301,6 +332,29 @@ class SourceRewriteTests(unittest.TestCase):
                     True,
                     "https://archive.ubuntu.com/ubuntu/dists/resolute/InRelease",
                     "http://archive.ubuntu.com",
+                ),
+                (
+                    "userinfo-distinct.sources",
+                    "Types: deb\nURIs: http://reader@archive.ubuntu.com/ubuntu/\nSuites: resolute\n"
+                    f"Components: main\nSigned-By: {KEYRING}\n\n"
+                    "Types: deb\nURIs: https://us-east-2.ec2.archive.ubuntu.com/ubuntu/\nSuites: resolute\n"
+                    f"Components: universe\nSigned-By: {alt_keyring}\n\n"
+                    "Types: deb\nURIs: https://us-east-2.ec2.archive.ubuntu.com/ubuntu/\nSuites: resolute-updates\n"
+                    f"Components: main\nSigned-By: {KEYRING}\n",
+                    True,
+                    True,
+                    "https://archive.ubuntu.com/ubuntu/dists/resolute-updates/InRelease",
+                    None,
+                ),
+                (
+                    "userinfo-same-policy.list",
+                    f"deb [signed-by={KEYRING}] http://reader@archive.ubuntu.com/ubuntu/ resolute main\n"
+                    f"deb [signed-by={KEYRING}] https://us-east-2.ec2.archive.ubuntu.com/ubuntu/ resolute universe\n"
+                    f"deb [signed-by={KEYRING}] https://us-east-2.ec2.archive.ubuntu.com/ubuntu/ resolute-updates main\n",
+                    False,
+                    True,
+                    "https://archive.ubuntu.com/ubuntu/dists/resolute-updates/InRelease",
+                    None,
                 ),
             ):
                 with self.subTest(case=name):
