@@ -125,7 +125,7 @@ python3 "$here/h1_apt_sources.py" "$ubuntu_sources" "$fallback" || rewrite=$?
 case "$rewrite" in
   0) chmod 644 "$fallback" ;;
   3)
-    echo "::warning::$ubuntu_sources names no regional Ubuntu mirror; retrying it unchanged"
+    echo "::warning::$ubuntu_sources has no regional Ubuntu mirror eligible for canonical rewrite; retrying it unchanged"
     fallback=$ubuntu_sources
     ;;
   *)

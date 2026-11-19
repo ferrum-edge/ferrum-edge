@@ -24,19 +24,15 @@ CANONICAL = "https://archive.ubuntu.com/ubuntu/"
 # Require `mirror+file:` with empty authority (`///`) or path-only (`/`) for
 # the local apt-mirrors.txt list so a remote `mirror://etc/...` URI never matches.
 _MIRROR_URI = re.compile(
-    r"^(?:https?://(?:[A-Za-z0-9-]+\.)+archive\.ubuntu\.com(?::(?:80|443)?)?/ubuntu/?"
-    r"|mirror\+file:(?:///|/)etc/apt/apt-mirrors\.txt"
-    r"|mirror(?:\+https?)?://mirrors\.ubuntu\.com/\S+)$",
-    re.IGNORECASE,
+    r"^(?:(?i:https?://(?:[A-Za-z0-9-]+\.)+archive\.ubuntu\.com(?::(?:80|443)?)?)/ubuntu/?"
+    r"|(?i:mirror\+file:)(?:///|/)etc/apt/apt-mirrors\.txt"
+    r"|(?i:mirror(?:\+https?)?://mirrors\.ubuntu\.com)/\S+)$"
 )
-_HTTP_CANONICAL = re.compile(
-    r"^http://archive\.ubuntu\.com(?::(?:80)?)?/ubuntu/?$",
-    re.IGNORECASE,
-)
-_HTTPS_CANONICAL = re.compile(
-    r"^https://archive\.ubuntu\.com(?::(?:443)?)?/ubuntu/?$",
-    re.IGNORECASE,
-)
+# Only portless canonical URIs (including empty `:`) share the portless
+# `archive.ubuntu.com/ubuntu/` Release index in APT; explicit ports like `:80`
+# or `:443` keep distinct Release-index filenames in `URItoFileName`.
+_HTTP_CANONICAL = re.compile(r"^(?i:http://archive\.ubuntu\.com):?/ubuntu/?$")
+_HTTPS_CANONICAL = re.compile(r"^(?i:https://archive\.ubuntu\.com):?/ubuntu/?$")
 # Per-Release-index options in APT (debmetaindex.cc): entries sharing a
 # (URI, Suite) Release index must agree on these or APT rejects the source.
 _RELEASE_POLICY_FIELDS = (
@@ -46,11 +42,30 @@ _RELEASE_POLICY_FIELDS = (
     "valid-until-max",
     "check-date",
     "date-max-future",
+    "snapshot",
     "inrelease-path",
     "trusted",
     "allow-insecure",
     "allow-weak",
     "allow-downgrade-to-insecure",
+    "shadowed",
+)
+# One-line `sources.list` options are stored and looked up case-sensitively in
+# APT (`sourcelist.cc:240`, `debmetaindex.cc:1242,1456`).
+_ONE_LINE_POLICY_FIELDS = (
+    "signed-by",
+    "check-valid-until",
+    "valid-until-min",
+    "valid-until-max",
+    "check-date",
+    "date-max-future",
+    "snapshot",
+    "inrelease-path",
+    "trusted",
+    "allow-insecure",
+    "allow-weak",
+    "allow-downgrade-to-insecure",
+    "SHADOWED",
 )
 _POLICY_CONFLICT = object()
 # APT's pkgTagSection::Scan splits on the first `:` and trims ASCII whitespace
@@ -322,13 +337,12 @@ def _parse_one_line(body):
 
 def _one_line_policy(opts_bracket):
     if not opts_bracket:
-        return tuple((field, None) for field in _RELEASE_POLICY_FIELDS)
+        return tuple((field, None) for field in _ONE_LINE_POLICY_FIELDS)
     values = {}
     for key, value in _decode_one_line_options(opts_bracket):
-        low = key.lower()
-        if low in _RELEASE_POLICY_FIELDS:
-            values[low] = value
-    return tuple((field, values.get(field)) for field in _RELEASE_POLICY_FIELDS)
+        if key in _ONE_LINE_POLICY_FIELDS:
+            values[key] = value
+    return tuple((field, values.get(field)) for field in _ONE_LINE_POLICY_FIELDS)
 
 
 def _inspect_deb822_stanza(lines):
@@ -459,21 +473,25 @@ def rewrite_deb822(text):
     if not rewritten_indices:
         return text, False
 
-    # Pass 3: rewrite eligible regional stanzas and upgrade overlapping active
-    # HTTP canonical stanzas to HTTPS (leaving disabled stanzas and conflicting
-    # regional stanzas untouched so distinct Release indexes are preserved).
+    # Pass 3: rewrite eligible regional stanzas and upgrade compatible active
+    # portless HTTP canonical stanzas to HTTPS (leaving disabled stanzas and
+    # conflicting entries untouched so distinct Release indexes are preserved).
     out = []
     for idx, (kind, lines, info) in enumerate(inspected):
         if kind != "stanza":
             out.extend(lines)
             continue
-        active, uris, _suites, _policy = info
+        active, uris, suites, policy = info
         if idx in rewritten_indices:
             new_lines, _ = _rewrite_deb822_stanza_uris(
                 lines, rewrite_mirrors=True, upgrade_http_canonical=True
             )
             out.extend(new_lines)
-        elif active and any(_is_http_canonical(u) for u in uris):
+        elif (
+            active
+            and any(_is_http_canonical(u) for u in uris)
+            and _suites_compatible(suite_policies, suites, policy)
+        ):
             new_lines, _ = _rewrite_deb822_stanza_uris(
                 lines, rewrite_mirrors=False, upgrade_http_canonical=True
             )
@@ -525,15 +543,19 @@ def rewrite_one_line(text):
     if not rewritten_indices:
         return text, False
 
-    # Pass 3: rewrite eligible regional entries and upgrade active HTTP
-    # canonical entries to HTTPS while preserving conflicting distinct indexes.
+    # Pass 3: rewrite eligible regional entries and upgrade compatible active
+    # portless HTTP canonical entries to HTTPS while preserving conflicts.
     out = []
-    for idx, (kind, payload, _meta) in enumerate(records):
+    for idx, (kind, payload, meta) in enumerate(records):
         if kind != "entry":
             out.append(payload)
             continue
         orig_line, head, decoded_uri, tail, ending = payload
-        if idx in rewritten_indices or _is_http_canonical(decoded_uri):
+        suites, policy = meta
+        if idx in rewritten_indices or (
+            _is_http_canonical(decoded_uri)
+            and _suites_compatible(suite_policies, suites, policy)
+        ):
             out.append(head + CANONICAL + tail + ending)
         else:
             out.append(orig_line)
@@ -566,7 +588,10 @@ def main(argv):
         print(f"cannot rewrite {source}: {error}", file=sys.stderr)
         return 2
     if not changed:
-        print(f"{source} names no regional Ubuntu archive mirror", file=sys.stderr)
+        print(
+            f"{source} has no regional Ubuntu archive mirror eligible for canonical rewrite",
+            file=sys.stderr,
+        )
         return 3
     with dest.open("w", encoding="utf-8", newline="") as handle:
         handle.write(text)

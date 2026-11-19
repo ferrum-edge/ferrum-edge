@@ -162,6 +162,64 @@ class SourceRewriteTests(unittest.TestCase):
         self.assertIn(f"deb [signed-by={KEYRING}] https://archive.ubuntu.com/ubuntu/ resolute main\n", rewritten_or)
         self.assertIn(f"deb [signed-by={alt_keyring}] https://azure.archive.ubuntu.com/ubuntu/ resolute universe\n", rewritten_or)
 
+        # Explicit `:80` keeps its own Release index in APT; a regional rewrite
+        # on another suite must NOT merge `:80` onto portless HTTPS.
+        deb822_port80 = (
+            "Types: deb\nURIs: http://archive.ubuntu.com:80/ubuntu/\nSuites: resolute\n"
+            f"Components: main\nSigned-By: {KEYRING}\n\n"
+            "Types: deb\nURIs: https://archive.ubuntu.com/ubuntu/\nSuites: resolute\n"
+            f"Components: universe\nSigned-By: {alt_keyring}\n\n"
+            "Types: deb\nURIs: https://us-east-2.ec2.archive.ubuntu.com/ubuntu/\nSuites: resolute-updates\n"
+            f"Components: main\nSigned-By: {KEYRING}\n"
+        )
+        rewritten_p80, changed_p80 = sources.rewrite(deb822_port80, deb822=True)
+        self.assertTrue(changed_p80)
+        self.assertIn("URIs: http://archive.ubuntu.com:80/ubuntu/\n", rewritten_p80)
+        self.assertEqual(rewritten_p80.count("URIs: https://archive.ubuntu.com/ubuntu/\n"), 2)
+
+        # Portless HTTP + HTTPS with conflicting Signed-By on the same suite must
+        # not be merged when another suite triggers a regional rewrite.
+        deb822_http_https_conflict = deb822_port80.replace(
+            "http://archive.ubuntu.com:80/ubuntu/",
+            "http://archive.ubuntu.com/ubuntu/",
+            1,
+        )
+        rewritten_hhc, changed_hhc = sources.rewrite(deb822_http_https_conflict, deb822=True)
+        self.assertTrue(changed_hhc)
+        self.assertIn("URIs: http://archive.ubuntu.com/ubuntu/\n", rewritten_hhc)
+
+        # Conflicting Snapshot / snapshot= pins keep distinct Release indexes.
+        deb822_snapshot = (
+            "Types: deb\nURIs: https://us-east-2.ec2.archive.ubuntu.com/ubuntu/\nSuites: resolute\n"
+            f"Components: main\nSigned-By: {KEYRING}\nSnapshot: 20260401T000000Z\n\n"
+            "Types: deb\nURIs: https://azure.archive.ubuntu.com/ubuntu/\nSuites: resolute\n"
+            f"Components: universe\nSigned-By: {KEYRING}\nSnapshot: 20260501T000000Z\n"
+        )
+        rewritten_snap_d, changed_snap_d = sources.rewrite(deb822_snapshot, deb822=True)
+        self.assertTrue(changed_snap_d)
+        self.assertIn("URIs: https://archive.ubuntu.com/ubuntu/\n", rewritten_snap_d)
+        self.assertIn("URIs: https://azure.archive.ubuntu.com/ubuntu/\n", rewritten_snap_d)
+
+        one_line_snapshot = (
+            f"deb [signed-by={KEYRING} snapshot=20260401T000000Z] https://us-east-2.ec2.archive.ubuntu.com/ubuntu/ resolute main\n"
+            f"deb [signed-by={KEYRING} snapshot=20260501T000000Z] https://azure.archive.ubuntu.com/ubuntu/ resolute universe\n"
+        )
+        rewritten_snap_o, changed_snap_o = sources.rewrite(one_line_snapshot, deb822=False)
+        self.assertTrue(changed_snap_o)
+        self.assertIn("https://archive.ubuntu.com/ubuntu/ resolute main\n", rewritten_snap_o)
+        self.assertIn("https://azure.archive.ubuntu.com/ubuntu/ resolute universe\n", rewritten_snap_o)
+
+        # One-line options are case-sensitive in APT: `Signed-By=` does not
+        # overwrite lowercase `signed-by=`, so these two entries have different keyrings.
+        one_line_case = (
+            f"deb [signed-by={KEYRING} Signed-By={alt_keyring}] https://us-east-2.ec2.archive.ubuntu.com/ubuntu/ resolute main\n"
+            f"deb [signed-by={alt_keyring}] https://azure.archive.ubuntu.com/ubuntu/ resolute universe\n"
+        )
+        rewritten_case, changed_case = sources.rewrite(one_line_case, deb822=False)
+        self.assertTrue(changed_case)
+        self.assertIn("https://archive.ubuntu.com/ubuntu/ resolute main\n", rewritten_case)
+        self.assertIn("https://azure.archive.ubuntu.com/ubuntu/ resolute universe\n", rewritten_case)
+
     @unittest.skipUnless(shutil.which("apt-get") and Path(KEYRING).exists(), "needs hosted Ubuntu apt-get")
     def test_hosted_apt_accepts_rewritten_mixed_and_distinct_policy_sources(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -170,7 +228,7 @@ class SourceRewriteTests(unittest.TestCase):
             (lists / "partial").mkdir(parents=True)
             alt_keyring = root / "ubuntu-alt.gpg"
             shutil.copyfile(KEYRING, alt_keyring)
-            for name, raw, deb822, expect_changed, expect_https_canonical in (
+            for name, raw, deb822, expect_changed, expect_inrelease, forbid_substr in (
                 (
                     "same-policy.sources",
                     "Types: deb\nURIs: http://archive.ubuntu.com:/ubuntu/\nSuites: resolute\n"
@@ -179,7 +237,8 @@ class SourceRewriteTests(unittest.TestCase):
                     f"Components: universe\nSigned-By: {KEYRING}\n",
                     True,
                     True,
-                    True,
+                    "https://archive.ubuntu.com/ubuntu/dists/resolute/InRelease",
+                    "http://archive.ubuntu.com",
                 ),
                 (
                     "distinct-policy.sources",
@@ -189,7 +248,8 @@ class SourceRewriteTests(unittest.TestCase):
                     f"Components: universe\nSigned-By: {alt_keyring}\n",
                     True,
                     True,
-                    True,
+                    "https://archive.ubuntu.com/ubuntu/dists/resolute/InRelease",
+                    "http://archive.ubuntu.com",
                 ),
                 (
                     "distinct-policy.list",
@@ -197,7 +257,50 @@ class SourceRewriteTests(unittest.TestCase):
                     f"deb [signed-by={alt_keyring}] https://azure.archive.ubuntu.com/ubuntu/ resolute universe\n",
                     False,
                     True,
+                    "https://archive.ubuntu.com/ubuntu/dists/resolute/InRelease",
+                    "http://archive.ubuntu.com",
+                ),
+                (
+                    "port80-distinct.sources",
+                    "Types: deb\nURIs: http://archive.ubuntu.com:80/ubuntu/\nSuites: resolute\n"
+                    f"Components: main\nSigned-By: {KEYRING}\n\n"
+                    "Types: deb\nURIs: https://archive.ubuntu.com/ubuntu/\nSuites: resolute\n"
+                    f"Components: universe\nSigned-By: {alt_keyring}\n\n"
+                    "Types: deb\nURIs: https://us-east-2.ec2.archive.ubuntu.com/ubuntu/\nSuites: resolute-updates\n"
+                    f"Components: main\nSigned-By: {KEYRING}\n",
                     True,
+                    True,
+                    "https://archive.ubuntu.com/ubuntu/dists/resolute-updates/InRelease",
+                    None,
+                ),
+                (
+                    "snapshot-distinct.sources",
+                    "Types: deb\nURIs: https://us-east-2.ec2.archive.ubuntu.com/ubuntu/\nSuites: resolute\n"
+                    f"Components: main\nSigned-By: {KEYRING}\nSnapshot: 20260401T000000Z\n\n"
+                    "Types: deb\nURIs: https://azure.archive.ubuntu.com/ubuntu/\nSuites: resolute\n"
+                    f"Components: universe\nSigned-By: {KEYRING}\nSnapshot: 20260501T000000Z\n",
+                    True,
+                    True,
+                    "/dists/resolute/InRelease",
+                    "http://archive.ubuntu.com",
+                ),
+                (
+                    "snapshot-distinct.list",
+                    f"deb [signed-by={KEYRING} snapshot=20260401T000000Z] https://us-east-2.ec2.archive.ubuntu.com/ubuntu/ resolute main\n"
+                    f"deb [signed-by={KEYRING} snapshot=20260501T000000Z] https://azure.archive.ubuntu.com/ubuntu/ resolute universe\n",
+                    False,
+                    True,
+                    "/dists/resolute/InRelease",
+                    "http://archive.ubuntu.com",
+                ),
+                (
+                    "mixed-case-option.list",
+                    f"deb [signed-by={KEYRING} Signed-By={alt_keyring}] https://us-east-2.ec2.archive.ubuntu.com/ubuntu/ resolute main\n"
+                    f"deb [signed-by={alt_keyring}] https://azure.archive.ubuntu.com/ubuntu/ resolute universe\n",
+                    False,
+                    True,
+                    "https://archive.ubuntu.com/ubuntu/dists/resolute/InRelease",
+                    "http://archive.ubuntu.com",
                 ),
             ):
                 with self.subTest(case=name):
@@ -219,9 +322,9 @@ class SourceRewriteTests(unittest.TestCase):
                         timeout=30,
                     )
                     self.assertEqual(proc.returncode, 0, proc.stderr)
-                    if expect_https_canonical:
-                        self.assertIn("https://archive.ubuntu.com/ubuntu/dists/resolute/InRelease", proc.stdout)
-                        self.assertNotIn("http://archive.ubuntu.com", proc.stdout)
+                    self.assertIn(expect_inrelease, proc.stdout)
+                    if forbid_substr:
+                        self.assertNotIn(forbid_substr, proc.stdout)
 
     def test_one_line_adjacent_uri_after_option_bracket_is_rewritten_and_checked(self):
         adjacent = f"deb [signed-by={KEYRING} ]http://azure.archive.ubuntu.com/ubuntu/ noble main\n"
