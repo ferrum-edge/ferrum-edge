@@ -833,6 +833,14 @@ pub mod _test_support {
             .into_owned()
     }
 
+    /// The production `mesh_route_dispatch` upstream-reference check the
+    /// validation pipeline runs on every candidate config.
+    pub fn validate_mesh_route_dispatch_upstream_references_for_test(
+        config: &crate::config::types::GatewayConfig,
+    ) -> Result<(), Vec<String>> {
+        crate::proxy::validate_mesh_route_dispatch_upstream_references(config)
+    }
+
     /// Release an xDS node permit through the production last-stream cleanup
     /// fence. The closure runs while same-key registration is excluded, which
     /// lets external tests prove a departing generation cannot delete its

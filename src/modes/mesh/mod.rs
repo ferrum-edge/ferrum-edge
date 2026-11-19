@@ -1769,6 +1769,9 @@ fn prepare_normalized_gateway_config_for_mesh(
     fail_closed_node_waypoint_udp_dtls_scoped_policies(&mut config, runtime);
     apply_destination_rules(&mut config, runtime, mesh_slice)?;
     project_mesh_source_locality(&mut config, runtime, mesh_slice);
+    // After DestinationRules and locality, so the route-scoped clones carry
+    // the same projected policy as the Service upstreams they copy.
+    clone_sidecar_carried_destination_upstreams(&mut config, runtime, mesh_slice);
     // Project slice-filtered ServiceEntries back into the prepared mesh
     // block so introspection consumers (admin diagnostics, projected-config
     // snapshots, future helpers) see the same `export_to` / sidecar-narrowed
@@ -4651,11 +4654,6 @@ fn bind_carried_http_routes_to_node_waypoint_transport(
     } else {
         HashSet::new()
     };
-    // Every in-mesh Service port a carried route can dial (direct backend,
-    // dispatch rule, split leg): on a Sidecar its upstream's targets get the
-    // destination Service authority (see
-    // `stamp_sidecar_carried_destination_authority`).
-    let mut carried_service_destinations: HashSet<(String, String, u16)> = HashSet::new();
     // Sidecar (issue #7423): the local workload's own inbound and `ingress[]`
     // routes share the route table with the carried routes. A carried route
     // that claims one of their (namespace, port, path) slots on an
@@ -4748,11 +4746,6 @@ fn bind_carried_http_routes_to_node_waypoint_transport(
                     ) {
                         governed_by_destination_rule = true;
                     }
-                    carried_service_destinations.insert((
-                        service_namespace.clone(),
-                        service_name.clone(),
-                        target.port,
-                    ));
                     let Some(service_upstream_id) =
                         service_upstream(config, &service_namespace, &service_name, target.port)
                     else {
@@ -4789,6 +4782,8 @@ fn bind_carried_http_routes_to_node_waypoint_transport(
                                     &mut rebound_target,
                                     &service_namespace,
                                     &service_name,
+                                    target.port,
+                                    true,
                                 );
                             }
                             rebound_target
@@ -4886,6 +4881,10 @@ fn bind_carried_http_routes_to_node_waypoint_transport(
     let mut wildcard_direct_backend_refused = 0usize;
     // Sidecar routes that claim the local workload's own inbound route slot.
     let mut local_inbound_route_conflicts = 0usize;
+    // Direct or dispatch-rule destinations in another namespace.
+    let mut cross_namespace_refused = 0usize;
+    // Sidecar `rewrite.authority` that does not name the selected destination.
+    let mut authority_rewrite_refused = 0usize;
     for index in 0..config.proxies.len() {
         let proxy = &config.proxies[index];
         if !config::is_virtual_service_http_route_proxy_id(&proxy.id) {
@@ -4952,12 +4951,18 @@ fn bind_carried_http_routes_to_node_waypoint_transport(
                         candidates.insert(format!("{backend_host}|{backend_port}"));
                     }
                     CarriedRouteHost::UnmodeledService => keep = false,
+                    // A Service upstream lives in its own namespace while the
+                    // route and its references resolve in the route's, so a
+                    // cross-namespace destination would leave a dangling
+                    // reference that refuses the whole generation: refuse the
+                    // route instead (the host keeps its Service route).
+                    CarriedRouteHost::Service(service_namespace, _)
+                        if service_namespace != namespace =>
+                    {
+                        cross_namespace_refused += 1;
+                        keep = false;
+                    }
                     CarriedRouteHost::Service(service_namespace, service_name) => {
-                        carried_service_destinations.insert((
-                            service_namespace.clone(),
-                            service_name.clone(),
-                            backend_port,
-                        ));
                         match service_upstream(
                             config,
                             &service_namespace,
@@ -5004,11 +5009,36 @@ fn bind_carried_http_routes_to_node_waypoint_transport(
                 let Some(destination) = rule.get("destination") else {
                     continue;
                 };
+                // Sidecar: an explicit `rewrite.authority` is forwarded as the
+                // `:authority` the destination Sidecar routes by, so it must
+                // name the selected destination Service (checked below).
+                let rewrite_authority = sidecar
+                    .then(|| {
+                        rule.get("rewrite")
+                            .and_then(|rewrite| rewrite.get("authority"))
+                            .and_then(serde_json::Value::as_str)
+                    })
+                    .flatten();
                 if let Some(upstream_id) = destination
                     .get("upstream_id")
                     .and_then(serde_json::Value::as_str)
                 {
                     if failed_splits.contains(&(namespace.clone(), upstream_id.to_string())) {
+                        keep = false;
+                    }
+                    // A split spans Services: one rewritten authority cannot
+                    // name every in-mesh leg's destination.
+                    if rewrite_authority.is_some()
+                        && config.upstreams.iter().any(|upstream| {
+                            upstream.namespace == namespace
+                                && upstream.id == upstream_id
+                                && upstream
+                                    .targets
+                                    .iter()
+                                    .any(crate::proxy::mesh_mtls_pool::target_mesh_mtls_enabled)
+                        })
+                    {
+                        authority_rewrite_refused += 1;
                         keep = false;
                     }
                     if !note_split(upstream_id, &mut candidates, &mut route_splits) {
@@ -5040,12 +5070,25 @@ fn bind_carried_http_routes_to_node_waypoint_transport(
                         candidates.insert(format!("{host}|{port}"));
                     }
                     CarriedRouteHost::UnmodeledService => keep = false,
+                    CarriedRouteHost::Service(service_namespace, _)
+                        if service_namespace != namespace =>
+                    {
+                        cross_namespace_refused += 1;
+                        keep = false;
+                    }
                     CarriedRouteHost::Service(service_namespace, service_name) => {
-                        carried_service_destinations.insert((
-                            service_namespace.clone(),
-                            service_name.clone(),
-                            port,
-                        ));
+                        if let Some(authority) = rewrite_authority
+                            && !authority_names_service(
+                                authority,
+                                &service_namespace,
+                                &service_name,
+                                port,
+                                &runtime.cluster_domain,
+                            )
+                        {
+                            authority_rewrite_refused += 1;
+                            keep = false;
+                        }
                         match service_upstream(config, &service_namespace, &service_name, port) {
                             Some(id) => {
                                 candidates.insert(id.clone());
@@ -5192,13 +5235,17 @@ fn bind_carried_http_routes_to_node_waypoint_transport(
             wildcard_direct_backend_refused,
             local_inbound_route_conflicts,
             source_namespace_refused = source_namespace_refused.len(),
+            cross_namespace_refused,
+            authority_rewrite_refused,
             "Mesh VirtualService routes refused: a destination is an in-cluster Service \
-             this data plane cannot reach over its mesh transport, a weighted split that must \
+             this data plane cannot reach over its mesh transport (one in another namespace \
+             included), a weighted split that must \
              be dispatched leg by leg cannot be represented, a direct external backend's \
              DestinationRule asks for TLS origination a direct backend cannot carry, a \
              wildcard DestinationRule names a direct external backend no rule can apply to, \
-             or (Sidecar) a route claims the local workload's own inbound route or applies \
-             only to other source namespaces; their hosts use the materialized Service routes"
+             or (Sidecar) a route claims the local workload's own inbound route, applies \
+             only to other source namespaces, or rewrites the authority to a host its \
+             destination does not answer; their hosts use the materialized Service routes"
         );
         config
             .proxies
@@ -5247,58 +5294,242 @@ fn bind_carried_http_routes_to_node_waypoint_transport(
         // get their Service routes back.
         materialize_mesh_outbound_proxies(config, runtime, mesh_slice);
     }
-    // Last: re-materialization above replaces the upstreams it rebuilds.
-    if sidecar {
-        stamp_sidecar_carried_destination_authority(config, &carried_service_destinations);
-    }
 }
 
 /// Pin the destination Service authority on a Sidecar mesh-mTLS target a
 /// carried VirtualService route dials (issue #7423).
 ///
 /// The destination Sidecar routes an inbound request by its `:authority`,
-/// against that Service's host variants. A carried route does not preserve
-/// the client `Host` (and on a split or a dispatch branch the client `Host`
-/// names the VirtualService host, not the selected Service), so without this
-/// the authority falls back to the pod dial address and the destination
-/// answers 404. `<service>.<namespace>.svc` is one of the destination's
-/// registered host variants; a multi-port destination already carries its
-/// Service port as [`crate::proxy::mesh_mtls_pool::MESH_MTLS_AUTHORITY_PORT_TAG`].
-/// Non-mesh-mTLS targets (external hosts) are left alone.
+/// against that Service's host variants and, for a multi-port Service, its
+/// port. A carried route does not preserve the client `Host` (and on a split or
+/// a dispatch branch the client `Host` names the VirtualService host, not the
+/// selected Service), so without this the authority falls back to the pod dial
+/// address and the destination answers 404. The selected Service port is
+/// always stamped: the source's egress-narrowed view can hide the destination's
+/// other ports. With `stamp_host` off (a rule that rewrites the authority) only
+/// the port is stamped, so the admitted rewritten host is forwarded with it.
+/// Only route-scoped targets are stamped (split clones and
+/// [`clone_sidecar_carried_destination_upstreams`]); the shared Service
+/// upstream keeps the client `Host`. Non-mesh-mTLS targets are left alone.
 fn stamp_sidecar_destination_authority(
     target: &mut UpstreamTarget,
     service_namespace: &str,
     service_name: &str,
+    service_port: u16,
+    stamp_host: bool,
 ) {
     if !crate::proxy::mesh_mtls_pool::target_mesh_mtls_enabled(target) {
         return;
     }
+    if stamp_host {
+        target.tags.insert(
+            crate::proxy::mesh_mtls_pool::MESH_MTLS_AUTHORITY_HOST_TAG.to_string(),
+            format!("{service_name}.{service_namespace}.svc"),
+        );
+    } else {
+        target
+            .tags
+            .remove(crate::proxy::mesh_mtls_pool::MESH_MTLS_AUTHORITY_HOST_TAG);
+    }
     target.tags.insert(
-        crate::proxy::mesh_mtls_pool::MESH_MTLS_AUTHORITY_HOST_TAG.to_string(),
-        format!("{service_name}.{service_namespace}.svc"),
+        crate::proxy::mesh_mtls_pool::MESH_MTLS_AUTHORITY_PORT_TAG.to_string(),
+        service_port.to_string(),
     );
 }
 
-/// [`stamp_sidecar_destination_authority`] for every target of each Service
-/// port upstream a carried route can reach (`(namespace, service, port)`). The
-/// upstream is shared with that Service's own route, whose requests then name
-/// the same Service host variant (the client `Host` still rides
-/// `x-forwarded-host`).
-fn stamp_sidecar_carried_destination_authority(
+/// Whether an explicit `rewrite.authority` names the selected destination
+/// Service: one of its host variants, with no port or its selected port.
+/// Anything else would reach a destination Sidecar that cannot route it.
+fn authority_names_service(
+    authority: &str,
+    service_namespace: &str,
+    service_name: &str,
+    service_port: u16,
+    cluster_domain: &str,
+) -> bool {
+    let authority = authority.trim();
+    let (host, port) = match split_carried_authority(authority) {
+        Some(parts) => parts,
+        None => return false,
+    };
+    if port.is_some_and(|port| port != service_port) {
+        return false;
+    }
+    let host = host.trim_end_matches('.').to_ascii_lowercase();
+    mesh_service_host_variants(service_name, service_namespace, cluster_domain)
+        .iter()
+        .any(|variant| variant.eq_ignore_ascii_case(&host))
+}
+
+/// Split `host[:port]`; `None` for an empty host or an unparsable port.
+fn split_carried_authority(authority: &str) -> Option<(&str, Option<u16>)> {
+    let (host, port) = match authority.rsplit_once(':') {
+        Some((host, port)) => (host, Some(port.parse::<u16>().ok()?)),
+        None => (authority, None),
+    };
+    (!host.is_empty()).then_some((host, port))
+}
+
+/// Upstream id of the route-scoped clone of a Sidecar Service upstream that
+/// carried routes dial (see [`clone_sidecar_carried_destination_upstreams`]).
+fn sidecar_carried_destination_upstream_id(service_upstream_id: &str, stamp_host: bool) -> String {
+    let rest = service_upstream_id
+        .strip_prefix(MESH_OUTBOUND_UPSTREAM_ID_PREFIX)
+        .unwrap_or(service_upstream_id);
+    if stamp_host {
+        format!("__mesh-out-vs-upstream-{rest}")
+    } else {
+        format!("__mesh-out-vs-rw-upstream-{rest}")
+    }
+}
+
+/// Give a Sidecar's carried VirtualService routes their own clones of the
+/// Service upstreams they dial (issue #7423), after DestinationRules applied.
+///
+/// A carried route's direct destination, each `mesh_route_dispatch` rule
+/// destination and each leg of a leg-dispatched split name a Service port's
+/// materialized upstream. That upstream is shared with the Service's own
+/// route, which must keep presenting the client `Host`. So each such
+/// reference is moved to a route-scoped clone (same targets, same
+/// DestinationRule projection, its own load-balancer and health state) whose
+/// targets carry the destination Service authority
+/// ([`stamp_sidecar_destination_authority`]). A rule that rewrites the
+/// authority (admitted by the binding only when it names that destination)
+/// gets a clone stamped with the port alone, so the rewritten host is
+/// forwarded. The Service and port are read forward from the slice's Service
+/// inventory, never parsed from ids.
+fn clone_sidecar_carried_destination_upstreams(
     config: &mut GatewayConfig,
-    destinations: &HashSet<(String, String, u16)>,
+    runtime: &MeshRuntimeConfig,
+    mesh_slice: &MeshSlice,
 ) {
-    for (namespace, name, port) in destinations {
-        let id = mesh_outbound_upstream_id(namespace, name, *port);
-        if let Some(upstream) = config
-            .upstreams
-            .iter_mut()
-            .find(|upstream| upstream.namespace == *namespace && upstream.id == id)
+    if runtime.topology != MeshTopology::Sidecar {
+        return;
+    }
+    let mut owners: HashMap<(String, String), (String, String, u16)> = HashMap::new();
+    for service in &mesh_slice.services {
+        for service_port in service_http_family_ports(service) {
+            owners.insert(
+                (
+                    service.namespace.clone(),
+                    mesh_outbound_upstream_id(&service.namespace, &service.name, service_port.port),
+                ),
+                (
+                    service.namespace.clone(),
+                    service.name.clone(),
+                    service_port.port,
+                ),
+            );
+        }
+    }
+    let carried: HashSet<(String, String)> = config
+        .proxies
+        .iter()
+        .filter(|proxy| config::is_virtual_service_http_route_proxy_id(&proxy.id))
+        .map(|proxy| (proxy.namespace.clone(), proxy.id.clone()))
+        .collect();
+    if carried.is_empty() {
+        return;
+    }
+    // (namespace, Service upstream id, stamp host)
+    let mut needed: BTreeSet<(String, String, bool)> = BTreeSet::new();
+    let mut redirect = |namespace: &str, id: &mut String, stamp_host: bool| {
+        if owners.contains_key(&(namespace.to_string(), id.clone())) {
+            needed.insert((namespace.to_string(), id.clone(), stamp_host));
+            *id = sidecar_carried_destination_upstream_id(id, stamp_host);
+        }
+    };
+    for proxy in &mut config.proxies {
+        if !carried.contains(&(proxy.namespace.clone(), proxy.id.clone())) {
+            continue;
+        }
+        if let Some(upstream_id) = proxy.upstream_id.as_mut() {
+            redirect(&proxy.namespace, upstream_id, true);
+        }
+    }
+    for plugin in &mut config.plugin_configs {
+        if plugin.plugin_name != "mesh_route_dispatch"
+            || !plugin.proxy_id.as_ref().is_some_and(|proxy_id| {
+                carried.contains(&(plugin.namespace.clone(), proxy_id.clone()))
+            })
         {
-            for target in &mut upstream.targets {
-                stamp_sidecar_destination_authority(target, namespace, name);
+            continue;
+        }
+        let namespace = plugin.namespace.clone();
+        if let Some(rules) = plugin
+            .config
+            .get_mut("rules")
+            .and_then(serde_json::Value::as_array_mut)
+        {
+            for rule in rules {
+                let rewrites_authority = rule
+                    .get("rewrite")
+                    .and_then(|rewrite| rewrite.get("authority"))
+                    .is_some_and(serde_json::Value::is_string);
+                if let Some(serde_json::Value::String(upstream_id)) = rule
+                    .get_mut("destination")
+                    .and_then(|destination| destination.get_mut("upstream_id"))
+                {
+                    redirect(&namespace, upstream_id, !rewrites_authority);
+                }
             }
         }
+        if let Some(splits) = plugin
+            .config
+            .get_mut("weighted_splits")
+            .and_then(serde_json::Value::as_array_mut)
+        {
+            for split in splits {
+                for leg in split
+                    .get_mut("legs")
+                    .and_then(serde_json::Value::as_array_mut)
+                    .into_iter()
+                    .flatten()
+                {
+                    if let Some(serde_json::Value::String(upstream_id)) = leg.get_mut("upstream_id")
+                    {
+                        redirect(&namespace, upstream_id, true);
+                    }
+                }
+            }
+        }
+    }
+    for (namespace, service_upstream_id, stamp_host) in needed {
+        let Some((service_namespace, service_name, service_port)) =
+            owners.get(&(namespace.clone(), service_upstream_id.clone()))
+        else {
+            continue;
+        };
+        let clone_id = sidecar_carried_destination_upstream_id(&service_upstream_id, stamp_host);
+        if config
+            .upstreams
+            .iter()
+            .any(|upstream| upstream.namespace == namespace && upstream.id == clone_id)
+        {
+            continue;
+        }
+        let Some(service_upstream) = config
+            .upstreams
+            .iter()
+            .find(|upstream| upstream.namespace == namespace && upstream.id == service_upstream_id)
+        else {
+            continue;
+        };
+        let mut clone = service_upstream.clone();
+        clone.id = clone_id.clone();
+        // A distinct name: upstream names are unique per namespace, and
+        // DestinationRules have already been applied by host.
+        clone.name = Some(clone_id);
+        for target in &mut clone.targets {
+            stamp_sidecar_destination_authority(
+                target,
+                service_namespace,
+                service_name,
+                *service_port,
+                stamp_host,
+            );
+        }
+        config.upstreams.push(clone);
     }
 }
 

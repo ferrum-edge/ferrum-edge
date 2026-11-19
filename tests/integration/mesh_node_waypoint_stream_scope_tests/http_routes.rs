@@ -12,7 +12,7 @@ use std::sync::Arc;
 
 use ferrum_edge::_test_support::{
     install_plugin_finalizers_for_test, mesh_mtls_dispatch_authority_for_test,
-    run_before_proxy_hooks_for_test,
+    run_before_proxy_hooks_for_test, validate_mesh_route_dispatch_upstream_references_for_test,
 };
 use ferrum_edge::RouterCache;
 use ferrum_edge::config::types::{GatewayConfig, UPSTREAM_TARGET_SERVICE_NAME_TAG};
@@ -20,7 +20,9 @@ use ferrum_edge::config_sources::k8s::{
     K8sMetadata, K8sObject, K8sTranslationOptions, translate_k8s_objects,
 };
 use ferrum_edge::identity::spiffe::{SpiffeId, TrustDomain};
-use ferrum_edge::modes::mesh::config::{MeshConfig, PolicyScope, WorkloadRef, WorkloadSelector};
+use ferrum_edge::modes::mesh::config::{
+    AppProtocol, MeshConfig, PolicyScope, ServicePort, WorkloadPort, WorkloadRef, WorkloadSelector,
+};
 use ferrum_edge::modes::mesh::runtime::PolicyScopeCache;
 use ferrum_edge::modes::mesh::slice::{MeshSlice, MeshSliceRequest};
 use ferrum_edge::modes::mesh::{
@@ -926,14 +928,18 @@ fn prepared_sidecar(config: &GatewayConfig, runtime: &MeshRuntimeConfig) -> Gate
         .expect("slice materializes")
 }
 
-/// The proxy a request for `host` + `path` resolves to on a listener of
-/// `direction`, the way the request frontends resolve it.
+/// The proxy a request for `authority` (`host[:port]`) + `path` resolves to
+/// on a listener of `direction`, the way the request frontends resolve it.
 fn routed_proxy_id(
     prepared: &GatewayConfig,
-    host: &str,
+    authority: &str,
     path: &str,
     direction: Option<MeshTrafficDirection>,
 ) -> Option<String> {
+    let (host, authority_port) = match authority.rsplit_once(':') {
+        Some((host, port)) => (host, Some(port.parse::<u16>().expect("authority port"))),
+        None => (authority, None),
+    };
     let cache = RouterCache::new(prepared, 1024);
     match cache.resolve_mesh_scoped_route_for_test(
         Some(host),
@@ -942,19 +948,13 @@ fn routed_proxy_id(
         false,
         MeshRouteScope {
             direction,
+            authority_port,
             ..MeshRouteScope::default()
         },
     ) {
         MeshScopedResolution::Routed(route) => Some(route.route_match().proxy.id.clone()),
         MeshScopedResolution::NotFound | MeshScopedResolution::Refused => None,
     }
-}
-
-/// The host part of an `:authority`.
-fn authority_host(authority: &str) -> &str {
-    authority
-        .rsplit_once(':')
-        .map_or(authority, |(host, _)| host)
 }
 
 fn ninety_ten_split_spec() -> serde_json::Value {
@@ -1128,9 +1128,9 @@ fn sidecar_split_dials_the_service_workloads_over_svid_mtls() {
             Some("reviews.default.svc.cluster.local"),
         );
         assert_eq!(
-            authority_host(&authority),
-            format!("{service}.default.svc"),
-            "leg {service} presents its own Service authority"
+            authority,
+            format!("{service}.default.svc:8080"),
+            "leg {service} presents its own Service host and port"
         );
         let destination = prepared_sidecar(&config, &sidecar_runtime_for(&service));
         assert_eq!(
@@ -1147,9 +1147,11 @@ fn sidecar_split_dials_the_service_workloads_over_svid_mtls() {
     }
 }
 
-/// Review finding sol F2 / dsf F1: a direct route to another Service is
-/// rebound onto that Service's upstream, whose targets present that Service
-/// as the `:authority`.
+/// Review findings sol F2 / dsf F1 (rounds 1 and 2): a direct route to
+/// another Service dials a route-scoped clone of that Service's upstream,
+/// whose targets present that Service's host and port. The shared Service
+/// upstream is untouched, so plain Service traffic keeps the client `Host`
+/// and port exactly as before.
 #[test]
 fn sidecar_direct_route_presents_the_destination_service_authority() {
     let config = translated_config(&[virtual_service(
@@ -1173,12 +1175,12 @@ fn sidecar_direct_route_presents_the_destination_service_authority() {
         .upstream_id
         .as_deref()
         .expect("the route is bound to an upstream");
-    assert_eq!(upstream_id, "__mesh-out-upstream-default-ratings-8080");
+    assert_eq!(upstream_id, "__mesh-out-vs-upstream-default-ratings-8080");
     let upstream = prepared
         .upstreams
         .iter()
         .find(|upstream| upstream.id == upstream_id)
-        .expect("the ratings upstream is materialized");
+        .expect("the route-scoped ratings upstream is materialized");
     assert!(!upstream.targets.is_empty());
     for target in &upstream.targets {
         let authority = mesh_mtls_dispatch_authority_for_test(
@@ -1186,7 +1188,332 @@ fn sidecar_direct_route_presents_the_destination_service_authority() {
             routes[0].preserve_host_header,
             Some("reviews.default.svc.cluster.local"),
         );
-        assert_eq!(authority_host(&authority), "ratings.default.svc");
+        assert_eq!(authority, "ratings.default.svc:8080");
+    }
+
+    // Plain Service traffic to the same destination keeps the client Host.
+    let service_route = prepared
+        .proxies
+        .iter()
+        .find(|proxy| proxy.id == "__mesh-outbound-default-ratings-8080")
+        .expect("the ratings Service route is served");
+    assert_eq!(
+        service_route.upstream_id.as_deref(),
+        Some("__mesh-out-upstream-default-ratings-8080")
+    );
+    let shared = prepared
+        .upstreams
+        .iter()
+        .find(|upstream| upstream.id == "__mesh-out-upstream-default-ratings-8080")
+        .expect("the shared ratings upstream is materialized");
+    for target in &shared.targets {
+        assert!(
+            !target.tags.contains_key("mesh.mtls_authority_host"),
+            "the shared Service upstream is never stamped"
+        );
+        assert_eq!(
+            mesh_mtls_dispatch_authority_for_test(
+                target,
+                service_route.preserve_host_header,
+                Some("ratings.default.svc.cluster.local:8080"),
+            ),
+            "ratings.default.svc.cluster.local:8080",
+            "plain Service traffic keeps the client Host and port"
+        );
+    }
+}
+
+/// Review finding sol F2 (round 2): the source's egress view can import one
+/// port of a destination that serves several. The carried route still
+/// presents the selected Service port, so the destination Sidecar, which
+/// sees every port, routes it to that port's inbound route.
+#[test]
+fn sidecar_carried_route_presents_the_service_port_of_a_narrowed_multi_port_destination() {
+    let mut config = translated_config(&[virtual_service(
+        "direct",
+        json!({
+            "hosts": ["reviews.default.svc.cluster.local"],
+            "http": [{
+                "route": [{
+                    "destination": {
+                        "host": "ratings.default.svc.cluster.local",
+                        "port": {"number": 8080}
+                    }
+                }]
+            }]
+        }),
+    )]);
+    let mesh = config.mesh.as_mut().expect("mesh block");
+    let ratings = mesh
+        .services
+        .iter_mut()
+        .find(|service| service.name == "ratings")
+        .expect("ratings service");
+    ratings.ports.push(ServicePort {
+        port: 9090,
+        protocol: AppProtocol::Http,
+        name: Some("http-alt".to_string()),
+        target_port: None,
+    });
+    mesh.workloads
+        .iter_mut()
+        .find(|workload| workload.service_name == "ratings")
+        .expect("ratings workload")
+        .ports
+        .push(WorkloadPort {
+            port: 9090,
+            protocol: AppProtocol::Http,
+            name: Some("http-alt".to_string()),
+        });
+
+    // The client's egress scope imports ratings:8080 only.
+    let runtime = sidecar_runtime();
+    let mut slice = sidecar_slice(&config, &runtime);
+    slice
+        .services
+        .iter_mut()
+        .find(|service| service.name == "ratings")
+        .expect("ratings imported")
+        .ports
+        .retain(|port| port.port == 8080);
+    let prepared =
+        prepare_gateway_config_from_mesh_slice(&slice, &runtime).expect("slice materializes");
+    let routes = carried_route_proxies(&prepared);
+    assert_eq!(routes.len(), 1, "the VirtualService route is served");
+    let upstream_id = routes[0].upstream_id.as_deref().expect("bound upstream");
+    let target = prepared
+        .upstreams
+        .iter()
+        .find(|upstream| upstream.id == upstream_id)
+        .and_then(|upstream| upstream.targets.first())
+        .expect("a ratings target");
+    let authority = mesh_mtls_dispatch_authority_for_test(
+        target,
+        routes[0].preserve_host_header,
+        Some("reviews.default.svc.cluster.local"),
+    );
+    assert_eq!(authority, "ratings.default.svc:8080");
+
+    let destination = prepared_sidecar(&config, &sidecar_runtime_for("ratings"));
+    assert_eq!(
+        routed_proxy_id(
+            &destination,
+            &authority,
+            "/",
+            Some(MeshTrafficDirection::Inbound)
+        )
+        .as_deref(),
+        Some("__mesh-inbound-default-ratings-8080"),
+        "the two-port destination routes the presented port"
+    );
+    assert_eq!(
+        routed_proxy_id(
+            &destination,
+            "ratings.default.svc",
+            "/",
+            Some(MeshTrafficDirection::Inbound)
+        ),
+        None,
+        "without the port the two-port destination cannot pick a route"
+    );
+}
+
+fn authority_rewrite_spec(authority: &str) -> serde_json::Value {
+    json!({
+        "hosts": ["reviews.default.svc.cluster.local"],
+        "http": [{
+            "match": [{"uri": {"prefix": "/api"}}],
+            "rewrite": {"authority": authority},
+            "route": [{
+                "destination": {
+                    "host": "ratings.default.svc.cluster.local",
+                    "port": {"number": 8080}
+                }
+            }]
+        }]
+    })
+}
+
+/// Review finding sol F3 (round 2): an explicit `rewrite.authority` that
+/// names the selected destination reaches dispatch unchanged (the destination
+/// stamp does not override it); one the destination cannot route refuses the
+/// route instead of being silently mis-sent.
+#[tokio::test]
+async fn sidecar_authority_rewrite_reaches_dispatch_unchanged() {
+    const REWRITTEN: &str = "ratings.default.svc.cluster.local:8080";
+    let config = translated_config(&[virtual_service("api", authority_rewrite_spec(REWRITTEN))]);
+    let prepared = prepared_sidecar(&config, &sidecar_runtime_for("details"));
+    let routes = carried_route_proxies(&prepared);
+    assert_eq!(routes.len(), 1, "an admitted authority rewrite is served");
+    let route = routes[0].clone();
+    let dispatch = prepared
+        .plugin_configs
+        .iter()
+        .find(|plugin| {
+            plugin.plugin_name == "mesh_route_dispatch"
+                && plugin.proxy_id.as_deref() == Some(route.id.as_str())
+        })
+        .expect("the rewrite rides a dispatch rule");
+    let mut plugins = vec![
+        create_plugin("mesh_route_dispatch", &dispatch.config)
+            .expect("dispatch config constructs")
+            .expect("built-in plugin"),
+    ];
+    install_plugin_finalizers_for_test(&mut plugins).expect("chain assembles");
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "GET".to_string(),
+        "/api/users".to_string(),
+    );
+    ctx.mesh_direction = Some(MeshTrafficDirection::Outbound);
+    ctx.matched_proxy = Some(Arc::new(route.clone()));
+    let mut headers = HashMap::from([(
+        "host".to_string(),
+        "reviews.default.svc.cluster.local".to_string(),
+    )]);
+    ctx.headers = headers.clone();
+    let result = run_before_proxy_hooks_for_test(&plugins, &mut ctx, &mut headers).await;
+    assert!(matches!(result, PluginResult::Continue));
+    let selected = ctx
+        .route_override_upstream_id
+        .clone()
+        .expect("the rule selects its destination");
+    assert_eq!(selected, "__mesh-out-vs-rw-upstream-default-ratings-8080");
+    let target = prepared
+        .upstreams
+        .iter()
+        .find(|upstream| upstream.id == selected)
+        .and_then(|upstream| upstream.targets.first())
+        .expect("a ratings target");
+    // The rewrite flips host preservation on the effective proxy.
+    let preserve = route.preserve_host_header || ctx.route_override_authority.is_some();
+    assert_eq!(
+        mesh_mtls_dispatch_authority_for_test(
+            target,
+            preserve,
+            headers.get("host").map(String::as_str)
+        ),
+        REWRITTEN
+    );
+
+    let foreign = translated_config(&[virtual_service(
+        "api",
+        authority_rewrite_spec("api.example.com"),
+    )]);
+    let prepared = prepared_sidecar(&foreign, &sidecar_runtime_for("details"));
+    assert!(
+        carried_route_proxies(&prepared).is_empty(),
+        "a rewritten authority the destination cannot route refuses the route"
+    );
+}
+
+/// Add `other/ratings` to a Sidecar slice, as an egress scope importing it
+/// would.
+fn import_other_namespace_ratings(slice: &mut MeshSlice) {
+    let workload = workload_for("ratings", "other", [("app", "ratings")], ["10.0.1.12"]);
+    slice
+        .services
+        .push(service_for("ratings", "other", &[&workload]));
+    slice.workloads.push(workload);
+}
+
+fn assert_references_resolve(prepared: &GatewayConfig) {
+    prepared
+        .validate_upstream_references()
+        .expect("every proxy upstream reference resolves");
+    validate_mesh_route_dispatch_upstream_references_for_test(prepared)
+        .expect("every dispatch upstream reference resolves");
+}
+
+/// Review finding sol F1 (round 2): a carried route whose destination (direct
+/// or a dispatch branch) is a Service in another namespace is refused, so no
+/// dangling upstream reference reaches the generation and the rest of the
+/// slice keeps serving.
+#[test]
+fn sidecar_refuses_cross_namespace_carried_destinations() {
+    let runtime = sidecar_runtime();
+    for (name, spec) in [
+        (
+            "direct",
+            json!({
+                "hosts": ["reviews.default.svc.cluster.local"],
+                "http": [{
+                    "route": [{
+                        "destination": {
+                            "host": "ratings.other.svc.cluster.local",
+                            "port": {"number": 8080}
+                        }
+                    }]
+                }]
+            }),
+        ),
+        (
+            "branch",
+            json!({
+                "hosts": ["reviews.default.svc.cluster.local"],
+                "http": [
+                    {
+                        "match": [{
+                            "uri": {"prefix": "/"},
+                            "headers": {"x-version": {"exact": "v2"}}
+                        }],
+                        "route": [{
+                            "destination": {
+                                "host": "ratings.other.svc.cluster.local",
+                                "port": {"number": 8080}
+                            }
+                        }]
+                    },
+                    {
+                        "route": [{
+                            "destination": {
+                                "host": "details.default.svc.cluster.local",
+                                "port": {"number": 8080}
+                            }
+                        }]
+                    }
+                ]
+            }),
+        ),
+    ] {
+        let config = translated_config(&[virtual_service(name, spec)]);
+        let mut slice = sidecar_slice(&config, &runtime);
+        assert!(!slice.http_routes.proxies.is_empty(), "{name}: carried");
+        import_other_namespace_ratings(&mut slice);
+        let prepared = prepare_gateway_config_from_mesh_slice(&slice, &runtime)
+            .expect("the slice still materializes");
+        assert_references_resolve(&prepared);
+        for route in carried_route_proxies(&prepared) {
+            assert!(
+                !route.backend_host.contains(".other."),
+                "{name}: no surviving carried route dials another namespace"
+            );
+            assert!(
+                route
+                    .upstream_id
+                    .as_deref()
+                    .is_none_or(|id| !id.contains("-other-")),
+                "{name}: no surviving carried route names another namespace's upstream"
+            );
+        }
+        for plugin in prepared
+            .plugin_configs
+            .iter()
+            .filter(|plugin| plugin.plugin_name == "mesh_route_dispatch")
+        {
+            assert!(
+                !plugin.config.to_string().contains("ratings.other")
+                    && !plugin.config.to_string().contains("-other-ratings-"),
+                "{name}: no surviving dispatch rule names another namespace"
+            );
+        }
+        assert!(
+            prepared
+                .proxies
+                .iter()
+                .any(|proxy| proxy.id == "__mesh-outbound-default-reviews-8080"),
+            "{name}: the host keeps its Service route"
+        );
     }
 }
 
@@ -1270,8 +1597,14 @@ fn sidecar_split_across_destination_rule_governed_services_is_dispatched_leg_by_
     assert_eq!(
         legs,
         vec![
-            ("__mesh-out-upstream-default-reviews-8080".to_string(), 90),
-            ("__mesh-out-upstream-default-ratings-8080".to_string(), 10),
+            (
+                "__mesh-out-vs-upstream-default-reviews-8080".to_string(),
+                90
+            ),
+            (
+                "__mesh-out-vs-upstream-default-ratings-8080".to_string(),
+                10
+            ),
         ]
     );
     for (leg, _) in &legs {
@@ -1570,7 +1903,7 @@ async fn sidecar_source_namespace_is_decided_from_the_local_workload() {
     );
     assert_eq!(
         ctx.route_override_upstream_id.as_deref(),
-        Some("__mesh-out-upstream-default-ratings-8080")
+        Some("__mesh-out-vs-upstream-default-ratings-8080")
     );
 
     let foreign = translated_config(&[virtual_service("api", source_namespace_spec("prod"))]);
