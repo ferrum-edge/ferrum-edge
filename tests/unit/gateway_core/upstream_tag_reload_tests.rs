@@ -63,6 +63,7 @@ fn upstream_with_target(id: &str, target: UpstreamTarget, updated_at: DateTime<U
         created_at: updated_at,
         updated_at,
         k8s_service_uid: None,
+        admission_upstream_id: None,
         pending_limit_scope: None,
     }
 }

@@ -105,6 +105,7 @@ fn unix_upstream(socket_path: &str, h2c: bool, stamp: DateTime<Utc>) -> Upstream
         source_locality: None,
         source_labels: Default::default(),
         k8s_service_uid: None,
+        admission_upstream_id: None,
         pending_limit_scope: None,
         locality_lb_strict: false,
         locality_lb_setting: None,

@@ -833,6 +833,24 @@ pub mod _test_support {
             .into_owned()
     }
 
+    /// Acquire one destination-wide active-request permit
+    /// (`connectionPool.http.http2MaxRequests`) for `proxy` exactly as backend
+    /// admission does: the same cap resolution and the same destination scope.
+    pub fn try_acquire_destination_active_request_for_test(
+        limiter: &crate::backend_active_request_limit::BackendActiveRequestLimiter,
+        proxy: &crate::config::types::Proxy,
+        policy_port: u16,
+    ) -> Result<
+        Option<crate::backend_active_request_limit::BackendActiveRequestGuard>,
+        crate::backend_active_request_limit::BackendActiveRequestLimitExceeded,
+    > {
+        let cap = crate::proxy::resolve_backend_http2_max_requests(proxy, policy_port);
+        limiter.try_acquire(
+            crate::proxy::destination_active_request_scope(proxy, policy_port),
+            cap,
+        )
+    }
+
     /// The production `mesh_route_dispatch` upstream-reference check the
     /// validation pipeline runs on every candidate config.
     pub fn validate_mesh_route_dispatch_upstream_references_for_test(

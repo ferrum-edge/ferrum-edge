@@ -3102,6 +3102,7 @@ fn node_waypoint_udp_listener_upstream(
         created_at: now,
         updated_at: now,
         k8s_service_uid,
+        admission_upstream_id: None,
         pending_limit_scope: None,
     }
 }
@@ -5083,6 +5084,11 @@ fn bind_carried_http_routes_to_node_waypoint_transport(
                                 &service_namespace,
                                 &service_name,
                                 port,
+                                mesh_slice.services.iter().any(|service| {
+                                    service.namespace == service_namespace
+                                        && service.name == service_name
+                                        && service_http_family_ports(service).len() > 1
+                                }),
                                 &runtime.cluster_domain,
                             )
                         {
@@ -5300,15 +5306,17 @@ fn bind_carried_http_routes_to_node_waypoint_transport(
 /// carried VirtualService route dials (issue #7423).
 ///
 /// The destination Sidecar routes an inbound request by its `:authority`,
-/// against that Service's host variants and, for a multi-port Service, its
+/// against that Service's host variants and, when the request names one, its
 /// port. A carried route does not preserve the client `Host` (and on a split or
 /// a dispatch branch the client `Host` names the VirtualService host, not the
 /// selected Service), so without this the authority falls back to the pod dial
-/// address and the destination answers 404. The selected Service port is
-/// always stamped: the source's egress-narrowed view can hide the destination's
-/// other ports. With `stamp_host` off (a rule that rewrites the authority) only
-/// the port is stamped, so the admitted rewritten host is forwarded with it.
-/// Only route-scoped targets are stamped (split clones and
+/// address and the destination answers 404. With `stamp_host` on, the
+/// destination host and the selected Service port are stamped (the port
+/// always: the source's egress-narrowed view can hide the destination's other
+/// ports, and the destination needs it to pick among them). With `stamp_host`
+/// off (a rule whose admitted `rewrite.authority` the binding checked) both
+/// tags are removed, so the rewritten authority is forwarded verbatim, port or
+/// no port. Only route-scoped targets are stamped (split clones and
 /// [`clone_sidecar_carried_destination_upstreams`]); the shared Service
 /// upstream keeps the client `Host`. Non-mesh-mTLS targets are left alone.
 fn stamp_sidecar_destination_authority(
@@ -5326,25 +5334,32 @@ fn stamp_sidecar_destination_authority(
             crate::proxy::mesh_mtls_pool::MESH_MTLS_AUTHORITY_HOST_TAG.to_string(),
             format!("{service_name}.{service_namespace}.svc"),
         );
+        target.tags.insert(
+            crate::proxy::mesh_mtls_pool::MESH_MTLS_AUTHORITY_PORT_TAG.to_string(),
+            service_port.to_string(),
+        );
     } else {
         target
             .tags
             .remove(crate::proxy::mesh_mtls_pool::MESH_MTLS_AUTHORITY_HOST_TAG);
+        target
+            .tags
+            .remove(crate::proxy::mesh_mtls_pool::MESH_MTLS_AUTHORITY_PORT_TAG);
     }
-    target.tags.insert(
-        crate::proxy::mesh_mtls_pool::MESH_MTLS_AUTHORITY_PORT_TAG.to_string(),
-        service_port.to_string(),
-    );
 }
 
 /// Whether an explicit `rewrite.authority` names the selected destination
-/// Service: one of its host variants, with no port or its selected port.
-/// Anything else would reach a destination Sidecar that cannot route it.
+/// Service in a form its Sidecar can route when forwarded verbatim: one of its
+/// host variants with its selected port, or with no port when the Service has
+/// a single HTTP port (`multi_port` is false). A port-less authority cannot
+/// pick among a multi-port Service's ports. Anything else would reach a
+/// destination Sidecar that cannot route it.
 fn authority_names_service(
     authority: &str,
     service_namespace: &str,
     service_name: &str,
     service_port: u16,
+    multi_port: bool,
     cluster_domain: &str,
 ) -> bool {
     let authority = authority.trim();
@@ -5352,8 +5367,10 @@ fn authority_names_service(
         Some(parts) => parts,
         None => return false,
     };
-    if port.is_some_and(|port| port != service_port) {
-        return false;
+    match port {
+        Some(port) if port != service_port => return false,
+        None if multi_port => return false,
+        _ => {}
     }
     let host = host.trim_end_matches('.').to_ascii_lowercase();
     mesh_service_host_variants(service_name, service_namespace, cluster_domain)
@@ -5393,11 +5410,14 @@ fn sidecar_carried_destination_upstream_id(service_upstream_id: &str, stamp_host
 /// reference is moved to a route-scoped clone (same targets, same
 /// DestinationRule projection, its own load-balancer and health state) whose
 /// targets carry the destination Service authority
-/// ([`stamp_sidecar_destination_authority`]). A rule that rewrites the
-/// authority (admitted by the binding only when it names that destination)
-/// gets a clone stamped with the port alone, so the rewritten host is
-/// forwarded. The Service and port are read forward from the slice's Service
-/// inventory, never parsed from ids.
+/// ([`stamp_sidecar_destination_authority`]). The clone keeps the Service
+/// upstream's admission identity (`Upstream::admission_upstream_id`), so the
+/// destination's `http2MaxRequests` and `http1MaxPendingRequests` lanes are
+/// shared with the Service route. A rule that rewrites the authority
+/// (admitted by the binding only when the destination can route it verbatim)
+/// gets a clone with no authority tags, so the rewritten authority is
+/// forwarded unchanged. The Service and port are read forward from the slice's
+/// Service inventory, never parsed from ids.
 fn clone_sidecar_carried_destination_upstreams(
     config: &mut GatewayConfig,
     runtime: &MeshRuntimeConfig,
@@ -5520,6 +5540,9 @@ fn clone_sidecar_carried_destination_upstreams(
         // A distinct name: upstream names are unique per namespace, and
         // DestinationRules have already been applied by host.
         clone.name = Some(clone_id);
+        // Admitted as the Service upstream it copies, so the destination's
+        // active-request and pending lanes are shared with the Service route.
+        clone.admission_upstream_id = Some(service_upstream_id.clone());
         for target in &mut clone.targets {
             stamp_sidecar_destination_authority(
                 target,
@@ -6719,6 +6742,7 @@ fn build_east_west_service_proxies_and_upstreams(
                 created_at: now,
                 updated_at: now,
                 k8s_service_uid: None,
+                admission_upstream_id: None,
                 pending_limit_scope: None,
             };
             upstreams.push(upstream);
@@ -9263,6 +9287,7 @@ fn mesh_ingress_unix_upstream(
         created_at: now,
         updated_at: now,
         k8s_service_uid: None,
+        admission_upstream_id: None,
         pending_limit_scope: None,
     }
 }
@@ -12380,6 +12405,7 @@ fn mesh_outbound_route_upstream(
         dispatch_port_override_fallback: None,
         api_spec_id: None,
         k8s_service_uid,
+        admission_upstream_id: None,
         pending_limit_scope: None,
         created_at: now,
         updated_at: now,
@@ -15649,6 +15675,7 @@ fn build_egress_upstream(
         created_at: now,
         updated_at: now,
         k8s_service_uid: None,
+        admission_upstream_id: None,
         pending_limit_scope: None,
     }
 }
@@ -31749,6 +31776,7 @@ mod tests {
             created_at: now,
             updated_at: now,
             k8s_service_uid: None,
+            admission_upstream_id: None,
             pending_limit_scope: None,
         }
     }
@@ -37123,6 +37151,7 @@ mod tests {
             created_at: loaded_at,
             updated_at: loaded_at,
             k8s_service_uid: None,
+            admission_upstream_id: None,
             pending_limit_scope: None,
         });
         let mesh_slice = MeshSlice {
@@ -37355,6 +37384,7 @@ mod tests {
             created_at: now,
             updated_at: now,
             k8s_service_uid: None,
+            admission_upstream_id: None,
             pending_limit_scope: None,
         }
     }
@@ -37838,6 +37868,7 @@ mod tests {
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
             k8s_service_uid: None,
+            admission_upstream_id: None,
             pending_limit_scope: None,
         });
         let mut config_b = config_a.clone();

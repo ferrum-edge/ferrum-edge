@@ -49657,9 +49657,19 @@ pub(crate) fn destination_active_request_scope<'a>(
     proxy: &'a Proxy,
     policy_port: u16,
 ) -> crate::backend_active_request_limit::DestinationScope<'a> {
+    // A route-scoped upstream clone (issue #7423) is admitted as the
+    // upstream it copies, precomputed onto the effective proxy's pending scope
+    // (also on upstream-id route overrides), so a Service port has one lane
+    // whichever route dials it.
+    let destination = proxy
+        .pending_limit_scope
+        .as_deref()
+        .and_then(crate::backend_pending_limit::BackendPendingScopeBase::admission_destination)
+        .or(proxy.upstream_id.as_deref())
+        .unwrap_or(proxy.id.as_str());
     crate::backend_active_request_limit::DestinationScope {
         namespace: proxy.namespace.as_str(),
-        destination: proxy.upstream_id.as_deref().unwrap_or(proxy.id.as_str()),
+        destination,
         policy_port,
         subset: proxy.upstream_subset.as_deref(),
     }
@@ -81639,6 +81649,7 @@ mod tests {
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
             k8s_service_uid: None,
+            admission_upstream_id: None,
             pending_limit_scope: None,
         };
         upstream.port_overrides.insert(
@@ -81701,6 +81712,7 @@ mod tests {
                 created_at: chrono::Utc::now(),
                 updated_at: chrono::Utc::now(),
                 k8s_service_uid: None,
+                admission_upstream_id: None,
                 pending_limit_scope: None,
             }],
             ..GatewayConfig::default()
@@ -82336,6 +82348,7 @@ mod tests {
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
             k8s_service_uid: None,
+            admission_upstream_id: None,
             pending_limit_scope: None,
         };
         // The fallback projects even when the per-port map is empty (the SD case).
@@ -82417,6 +82430,7 @@ mod tests {
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
             k8s_service_uid: None,
+            admission_upstream_id: None,
             pending_limit_scope: None,
         };
         upstream.normalize_fields();

@@ -12,9 +12,12 @@ use std::sync::Arc;
 
 use ferrum_edge::_test_support::{
     install_plugin_finalizers_for_test, mesh_mtls_dispatch_authority_for_test,
-    run_before_proxy_hooks_for_test, validate_mesh_route_dispatch_upstream_references_for_test,
+    run_before_proxy_hooks_for_test, try_acquire_destination_active_request_for_test,
+    validate_mesh_route_dispatch_upstream_references_for_test,
 };
 use ferrum_edge::RouterCache;
+use ferrum_edge::backend_active_request_limit::BackendActiveRequestLimiter;
+use ferrum_edge::config::db_backend::namespaced_runtime_key;
 use ferrum_edge::config::types::{GatewayConfig, UPSTREAM_TARGET_SERVICE_NAME_TAG};
 use ferrum_edge::config_sources::k8s::{
     K8sMetadata, K8sObject, K8sTranslationOptions, translate_k8s_objects,
@@ -1405,6 +1408,225 @@ async fn sidecar_authority_rewrite_reaches_dispatch_unchanged() {
         carried_route_proxies(&prepared).is_empty(),
         "a rewritten authority the destination cannot route refuses the route"
     );
+}
+
+/// Run the carried `/api` route's dispatch chain for `/api/users` with no peer
+/// certificate (outbound capture) and return the `:authority` Sidecar mTLS
+/// dispatch presents for the selected destination, with the selected upstream.
+async fn rewritten_dispatch_authority(prepared: &GatewayConfig) -> (String, String) {
+    let route = carried_route_proxies(prepared)
+        .into_iter()
+        .find(|proxy| proxy.listen_path.as_deref() == Some("/api"))
+        .expect("the /api route is served")
+        .clone();
+    let dispatch = prepared
+        .plugin_configs
+        .iter()
+        .find(|plugin| {
+            plugin.plugin_name == "mesh_route_dispatch"
+                && plugin.proxy_id.as_deref() == Some(route.id.as_str())
+        })
+        .expect("the rewrite rides a dispatch rule");
+    let mut plugins = vec![
+        create_plugin("mesh_route_dispatch", &dispatch.config)
+            .expect("dispatch config constructs")
+            .expect("built-in plugin"),
+    ];
+    install_plugin_finalizers_for_test(&mut plugins).expect("chain assembles");
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "GET".to_string(),
+        "/api/users".to_string(),
+    );
+    ctx.mesh_direction = Some(MeshTrafficDirection::Outbound);
+    ctx.matched_proxy = Some(Arc::new(route.clone()));
+    let mut headers = HashMap::from([(
+        "host".to_string(),
+        "reviews.default.svc.cluster.local".to_string(),
+    )]);
+    ctx.headers = headers.clone();
+    let result = run_before_proxy_hooks_for_test(&plugins, &mut ctx, &mut headers).await;
+    assert!(matches!(result, PluginResult::Continue));
+    let selected = ctx
+        .route_override_upstream_id
+        .clone()
+        .expect("the rule selects its destination");
+    let target = prepared
+        .upstreams
+        .iter()
+        .find(|upstream| upstream.id == selected)
+        .and_then(|upstream| upstream.targets.first())
+        .expect("a destination target");
+    // The rewrite flips host preservation on the effective proxy.
+    let preserve = route.preserve_host_header || ctx.route_override_authority.is_some();
+    let authority = mesh_mtls_dispatch_authority_for_test(
+        target,
+        preserve,
+        headers.get("host").map(String::as_str),
+    );
+    (authority, selected)
+}
+
+fn add_second_ratings_port(config: &mut GatewayConfig) {
+    let mesh = config.mesh.as_mut().expect("mesh block");
+    mesh.services
+        .iter_mut()
+        .find(|service| service.name == "ratings")
+        .expect("ratings service")
+        .ports
+        .push(ServicePort {
+            port: 9090,
+            protocol: AppProtocol::Http,
+            name: Some("http-alt".to_string()),
+            target_port: None,
+        });
+    mesh.workloads
+        .iter_mut()
+        .find(|workload| workload.service_name == "ratings")
+        .expect("ratings workload")
+        .ports
+        .push(WorkloadPort {
+            port: 9090,
+            protocol: AppProtocol::Http,
+            name: Some("http-alt".to_string()),
+        });
+}
+
+/// Review finding dsf F2 (round 3): a port-less `rewrite.authority` is
+/// forwarded verbatim (no Service port appended) and the single-port
+/// destination routes it. On a multi-port destination a port-less authority
+/// could not pick a port, so the route is withheld instead of altered.
+#[tokio::test]
+async fn sidecar_portless_authority_rewrite_is_forwarded_verbatim() {
+    const REWRITTEN: &str = "ratings.default.svc.cluster.local";
+    let config = translated_config(&[virtual_service("api", authority_rewrite_spec(REWRITTEN))]);
+    let prepared = prepared_sidecar(&config, &sidecar_runtime_for("details"));
+    let (authority, selected) = rewritten_dispatch_authority(&prepared).await;
+    assert_eq!(selected, "__mesh-out-vs-rw-upstream-default-ratings-8080");
+    assert_eq!(
+        authority, REWRITTEN,
+        "the rewrite reaches dispatch unchanged"
+    );
+    let destination = prepared_sidecar(&config, &sidecar_runtime_for("ratings"));
+    assert_eq!(
+        routed_proxy_id(
+            &destination,
+            &authority,
+            "/",
+            Some(MeshTrafficDirection::Inbound)
+        )
+        .as_deref(),
+        Some("__mesh-inbound-default-ratings-8080"),
+        "the single-port destination routes the port-less authority"
+    );
+
+    // The same rewrite to a two-port destination cannot be routed without a
+    // port, even when the client's egress view imports only one port.
+    let mut multi_port = config.clone();
+    add_second_ratings_port(&mut multi_port);
+    let runtime = sidecar_runtime_for("details");
+    let mut slice = sidecar_slice(&multi_port, &runtime);
+    assert!(
+        slice.http_routes.proxies.is_empty(),
+        "the control plane withholds a port-less rewrite to a multi-port Service"
+    );
+    for service in &mut slice.services {
+        if service.name == "ratings" {
+            service.ports.retain(|port| port.port == 8080);
+        }
+    }
+    let prepared =
+        prepare_gateway_config_from_mesh_slice(&slice, &runtime).expect("slice materializes");
+    assert!(carried_route_proxies(&prepared).is_empty());
+}
+
+/// Review findings sol F1 / dsf F1 (round 3): the route-scoped clones share
+/// the destination's `http2MaxRequests` lane with the Service route. With a
+/// cap of 1, a request held on the plain Service route refuses both carried
+/// variants (the stamped clone and the authority-rewrite clone), and releasing
+/// it admits them again.
+#[test]
+fn sidecar_carried_route_clones_share_the_destination_active_request_lane() {
+    let mut cap = virtual_service(
+        "ratings-cap",
+        json!({
+            "host": "ratings.default.svc.cluster.local",
+            "trafficPolicy": {"connectionPool": {"http": {"http2MaxRequests": 1}}}
+        }),
+    );
+    cap.kind = "DestinationRule".to_string();
+    let mut spec = authority_rewrite_spec("ratings.default.svc.cluster.local:8080");
+    spec["http"].as_array_mut().expect("http").push(json!({
+        "route": [{
+            "destination": {
+                "host": "ratings.default.svc.cluster.local",
+                "port": {"number": 8080}
+            }
+        }]
+    }));
+    let config = translated_config(&[virtual_service("api", spec), cap]);
+    let mut prepared = prepared_sidecar(&config, &sidecar_runtime_for("details"));
+    // Publication normalizes the prepared generation (`update_config`).
+    prepared.normalize_fields();
+
+    let plain = prepared
+        .proxies
+        .iter()
+        .find(|proxy| proxy.id == "__mesh-outbound-default-ratings-8080")
+        .expect("the ratings Service route")
+        .clone();
+    let carried = carried_route_proxies(&prepared)
+        .into_iter()
+        .find(|proxy| proxy.listen_path.as_deref() == Some("/"))
+        .expect("the carried / route")
+        .clone();
+    assert_eq!(
+        carried.upstream_id.as_deref(),
+        Some("__mesh-out-vs-upstream-default-ratings-8080")
+    );
+    let api = carried_route_proxies(&prepared)
+        .into_iter()
+        .find(|proxy| proxy.listen_path.as_deref() == Some("/api"))
+        .expect("the carried /api route")
+        .clone();
+    let upstreams: HashMap<String, Arc<ferrum_edge::config::types::Upstream>> = prepared
+        .upstreams
+        .iter()
+        .map(|upstream| {
+            (
+                namespaced_runtime_key(&upstream.namespace, &upstream.id),
+                Arc::new(upstream.clone()),
+            )
+        })
+        .collect();
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "GET".to_string(),
+        "/api/users".to_string(),
+    );
+    ctx.route_override_upstream_id =
+        Some("__mesh-out-vs-rw-upstream-default-ratings-8080".to_string());
+    let rewritten = ctx.apply_route_overrides_with_upstreams(Arc::new(api), &upstreams);
+    assert_eq!(
+        rewritten.upstream_id.as_deref(),
+        Some("__mesh-out-vs-rw-upstream-default-ratings-8080")
+    );
+
+    let limiter = BackendActiveRequestLimiter::new();
+    let held = try_acquire_destination_active_request_for_test(&limiter, &plain, 8080)
+        .expect("the first request is admitted")
+        .expect("the DestinationRule cap applies to the Service route");
+    try_acquire_destination_active_request_for_test(&limiter, &carried, 8080)
+        .expect_err("the carried route shares the held lane");
+    try_acquire_destination_active_request_for_test(&limiter, &rewritten, 8080)
+        .expect_err("the authority-rewrite branch shares the held lane");
+    drop(held);
+    let carried_permit = try_acquire_destination_active_request_for_test(&limiter, &carried, 8080)
+        .expect("the lane is free again")
+        .expect("the DestinationRule cap applies to the carried route");
+    try_acquire_destination_active_request_for_test(&limiter, &plain, 8080)
+        .expect_err("a carried request holds the Service route's lane too");
+    drop(carried_permit);
 }
 
 /// Add `other/ratings` to a Sidecar slice, as an egress scope importing it
