@@ -1038,8 +1038,14 @@ def self_test() -> int:
         failures.append("SHARD_DEFINITIONS must cover every canonical shard")
     for name, expected_target in UNIT_SHARD_TARGETS:
         definition = SHARD_DEFINITIONS[name]
-        if definition["kind"] != "unit" or definition.get("target") != expected_target:
-            failures.append(f"{name} shard must have kind=unit and target={expected_target}")
+        if (
+            definition["kind"] != "unit"
+            or definition.get("target") != expected_target
+            or definition.get("filters") != ""
+        ):
+            failures.append(
+                f"{name} shard must have kind=unit, target={expected_target}, and empty filters"
+            )
     for name in ALL_INTEGRATION_SHARDS:
         if SHARD_DEFINITIONS[name]["kind"] != "integration":
             failures.append(f"{name} shard kind must remain integration")
@@ -1104,10 +1110,22 @@ def self_test() -> int:
     for raw, label in (
         ("[]", "empty planned shards"),
         (json.dumps([ADMIN_API_SHARD]), "missing unit shards"),
-        (json.dumps([UNIT_LIB_SHARD, ADMIN_API_SHARD]), "partial unit shards"),
+        (json.dumps([UNIT_LIB_SHARD, ADMIN_API_SHARD]), "partial unit shards without unit-core"),
+        (json.dumps([UNIT_CORE_SHARD, ADMIN_API_SHARD]), "partial unit shards with only unit-core"),
         (json.dumps(["lib-unit", ADMIN_API_SHARD]), "legacy lib-unit shard"),
         (json.dumps([ADMIN_API_SHARD, *UNIT_SHARD_ORDER]), "out of order shards"),
-        (json.dumps([UNIT_CORE_SHARD, UNIT_LIB_SHARD, UNIT_PLUGINS_A_SHARD, UNIT_PLUGINS_B_SHARD, UNIT_GATEWAY_CORE_SHARD]), "out of order unit shards"),
+        (
+            json.dumps(
+                [
+                    UNIT_CORE_SHARD,
+                    UNIT_LIB_SHARD,
+                    UNIT_PLUGINS_A_SHARD,
+                    UNIT_PLUGINS_B_SHARD,
+                    UNIT_GATEWAY_CORE_SHARD,
+                ]
+            ),
+            "out of order unit shards",
+        ),
         (json.dumps([*UNIT_SHARD_ORDER, "not-a-shard"]), "unknown shard"),
         (json.dumps([*UNIT_SHARD_ORDER, UNIT_LIB_SHARD]), "duplicate shard"),
         (json.dumps([*UNIT_SHARD_ORDER, "admin-api; rm -rf"]), "hostile shard name"),

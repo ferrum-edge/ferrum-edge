@@ -332,6 +332,7 @@ def validate_planner_contract(failures: list[str]) -> None:
         and all(
             SHARD_DEFINITIONS[shard]["kind"] == "unit"
             and SHARD_DEFINITIONS[shard].get("target") == target
+            and SHARD_DEFINITIONS[shard].get("filters") == ""
             for shard, target in FROZEN_UNIT_TARGETS
         ),
         "planner must define the five split unit coverage shards with exact targets and unit-core cache producer",
@@ -823,7 +824,8 @@ download() {
 case "$*" in
   'api --paginate --slurp repos/example/coverage/actions/runs/42/artifacts') cat metadata.json ;;
   'api repos/example/coverage/actions/artifacts/1'[1-6]'/zip')
-    id="${*#api repos/example/coverage/actions/artifacts/}"
+    # Strip from $2 directly: `${*#prefix}` applies per positional arg in bash.
+    id="${2#repos/example/coverage/actions/artifacts/}"
     download "${id%/zip}" ;;
   *) echo "unexpected artifact request: $*" >&2; exit 1 ;;
 esac
