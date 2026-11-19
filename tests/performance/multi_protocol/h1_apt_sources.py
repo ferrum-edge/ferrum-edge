@@ -40,10 +40,13 @@ _UNSAFE_FIELDS = frozenset({
     "allow-downgrade-to-insecure",
 })
 # APT's StringToBool (apt-pkg/contrib/strutl.cc): `int Res = strtol(s, &end, 0)`
-# on LP64 Linux (64-bit signed long narrowed to 32-bit signed int), accepting
-# only strict C integer literals (no Python `_`, `0o`, `0b`, or non-ASCII digits),
-# followed by case-insensitive keyword sets.
-_C_STRTOL_INT = re.compile(r"^[+-]?(?:0[xX][0-9A-Fa-f]+|0[0-7]*|[1-9][0-9]*)$")
+# compiled with glibc C23 `__isoc23_strtol` on Ubuntu 26.04 LP64 (64-bit signed
+# long narrowed to 32-bit signed int), accepting strict C23 integer literals
+# (decimal, 0-octal, 0x/0X hex, 0b/0B binary; no Python `_`, `0o`, or non-ASCII
+# digits), followed by case-insensitive keyword sets.
+_C_STRTOL_INT = re.compile(
+    r"^[+-]?(?:0[xX][0-9A-Fa-f]+|0[bB][01]+|0[0-7]*|[1-9][0-9]*)$"
+)
 _LONG_MIN = -(1 << 63)
 _LONG_MAX = (1 << 63) - 1
 _HEX_DIGITS = frozenset("0123456789abcdefABCDEF")
@@ -63,6 +66,8 @@ def _parse_apt_bool(value):
         mag = s[1:] if s[0] in "+-" else s
         if mag.startswith(("0x", "0X")):
             val = sign * int(mag, 16)
+        elif mag.startswith(("0b", "0B")):
+            val = sign * int(mag, 2)
         elif mag.startswith("0") and len(mag) > 1:
             val = sign * int(mag, 8)
         else:
@@ -113,15 +118,24 @@ def _rewrite_uris(value):
 
 
 def _apt_dequote_word(raw):
-    """Decode %HH escapes and strip double quotes like APT's ParseQuoteWord."""
+    """Decode %HH escapes and strip double quotes like APT's ParseQuoteWord.
+
+    Refuses embedded NUL bytes (raw or `%00`), which would truncate C-string
+    comparisons inside APT's `StringToBool`.
+    """
     chars = []
     i, n = 0, len(raw)
     while i < n:
         ch = raw[i]
         if ch == "%" and i + 2 < n and raw[i + 1] in _HEX_DIGITS and raw[i + 2] in _HEX_DIGITS:
-            chars.append(chr(int(raw[i + 1:i + 3], 16)))
+            byte_val = int(raw[i + 1:i + 3], 16)
+            if byte_val == 0:
+                raise ValueError(f"apt token {raw!r} contains percent-encoded NUL byte")
+            chars.append(chr(byte_val))
             i += 3
             continue
+        if ch == "\x00":
+            raise ValueError(f"apt token {raw!r} contains embedded NUL byte")
         if ch != '"':
             chars.append(ch)
         i += 1
@@ -168,7 +182,7 @@ def _check_one_line_options(opts_bracket):
 
 
 def _parse_one_line(body):
-    """Parse `(head, opts_bracket, uri, tail)` from a one-line deb entry."""
+    """Parse `(head, opts_bracket, raw_uri, decoded_uri, tail)` from a one-line deb entry."""
     prefix = _ONE_LINE_PREFIX.match(body)
     if not prefix:
         return None
@@ -184,6 +198,8 @@ def _parse_one_line(body):
                     raise ValueError(f"unterminated quote in apt option bracket on line {body!r}")
                 i = close + 1
                 continue
+            if body[i] == "[":
+                raise ValueError(f"nested '[' in apt option bracket on line {body!r}")
             if body[i] == "]":
                 end_bracket = i
                 break
@@ -199,10 +215,23 @@ def _parse_one_line(body):
             raise ValueError(f"malformed apt source line after option bracket: {body!r}")
     uri_start = pos
     while pos < n and body[pos] not in _ASCII_SPACE:
-        pos += 1
+        if body[pos] == '"':
+            close = body.find('"', pos + 1)
+            if close == -1:
+                raise ValueError(f"unterminated quote in apt URI on line {body!r}")
+            pos = close + 1
+        elif body[pos] == "[":
+            close = body.find("]", pos + 1)
+            if close == -1:
+                raise ValueError(f"unterminated '[' in apt URI on line {body!r}")
+            pos = close + 1
+        else:
+            pos += 1
     if pos == uri_start:
         return None
-    return body[:uri_start], opts_bracket, body[uri_start:pos], body[pos:]
+    raw_uri = body[uri_start:pos]
+    decoded_uri = _apt_dequote_word(raw_uri)
+    return body[:uri_start], opts_bracket, raw_uri, decoded_uri, body[pos:]
 
 
 def _process_deb822_stanza(lines):
@@ -214,24 +243,27 @@ def _process_deb822_stanza(lines):
         if body.startswith("#"):
             continue
         if body[:1] in (" ", "\t", "\v", "\f"):
-            stripped = body.strip()
-            if active_field and stripped and stripped != ".":
-                fields[active_field].append(stripped)
+            # Preserve raw continuation content (including `.` lines) so boolean
+            # fields match APT's `pkgTagSection::Find` / `FindB` semantics.
+            if active_field is not None:
+                fields[active_field].append(body)
             continue
         field = _DEB822_FIELD.match(body)
         if not field:
             raise ValueError(f"malformed deb822 line: {body!r}")
         active_field = field.group(1).rstrip(" \t\v\f").lower()
-        val = field.group(2).strip()
-        fields[active_field] = [val] if val else []
+        fields[active_field] = [field.group(2)]
+
+    def field_value(name):
+        return "\n".join(fields[name]).strip(_ASCII_SPACE_STR)
 
     # APT skips stanzas with Enabled set to a false boolean spelling.
-    if "enabled" in fields and _is_apt_false(" ".join(fields["enabled"])):
+    if "enabled" in fields and _is_apt_false(field_value("enabled")):
         return lines, False
 
     for unsafe in _UNSAFE_FIELDS:
-        if unsafe in fields and _is_apt_true(" ".join(fields[unsafe])):
-            raw = " ".join(fields[unsafe])
+        if unsafe in fields and _is_apt_true(field_value(unsafe)):
+            raw = field_value(unsafe)
             raise ValueError(
                 f"source sets {unsafe}: {raw}; refusing to rewrite unsafe source"
             )
@@ -244,7 +276,7 @@ def _process_deb822_stanza(lines):
             out.append(body + ending)
             continue
         if body[:1] in (" ", "\t", "\v", "\f"):
-            if in_uris and body.strip() and body.strip() != ".":
+            if in_uris and body.strip():
                 value, hit = _rewrite_uris(body)
                 changed |= hit
                 body = value
@@ -293,9 +325,9 @@ def rewrite_one_line(text):
             continue
         parsed = _parse_one_line(body)
         if parsed:
-            head, opts_bracket, uri, tail = parsed
+            head, opts_bracket, _raw_uri, decoded_uri, tail = parsed
             _check_one_line_options(opts_bracket)
-            if is_mirror(uri):
+            if is_mirror(decoded_uri):
                 body = head + CANONICAL + tail
                 changed = True
         out.append(body + ending)
@@ -304,6 +336,8 @@ def rewrite_one_line(text):
 
 def rewrite(text, deb822):
     """Return (rewritten text, changed). Refuses active entries disabling signatures."""
+    if "\x00" in text:
+        raise ValueError("apt source contains embedded NUL byte")
     return rewrite_deb822(text) if deb822 else rewrite_one_line(text)
 
 
