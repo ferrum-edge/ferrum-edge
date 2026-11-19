@@ -84,6 +84,31 @@ _APT_TRUE = frozenset({"yes", "true", "with", "on", "enable"})
 _APT_FALSE = frozenset({"no", "false", "without", "off", "disable"})
 
 
+def _c_strtol_clamped(text, base):
+    """Parse an ASCII integer literal with LP64 signed `long` saturation.
+
+    Strips leading zeroes and saturates before calling Python's `int()` so
+    inputs exceeding CPython's 4,300-digit decimal string limit never raise.
+    """
+    sign = -1 if text[0] == "-" else 1
+    mag = text[1:] if text[0] in "+-" else text
+    if base == 16 and mag.startswith(("0x", "0X")):
+        mag = mag[2:]
+    elif base == 2 and mag.startswith(("0b", "0B")):
+        mag = mag[2:]
+    digits = mag.lstrip("0")
+    if not digits:
+        return 0
+    if len(digits) > 64:
+        return _LONG_MAX if sign > 0 else _LONG_MIN
+    val = sign * int(digits, base)
+    if val > _LONG_MAX:
+        return _LONG_MAX
+    if val < _LONG_MIN:
+        return _LONG_MIN
+    return val
+
+
 def _parse_apt_bool(value):
     """Return True/False per APT's StringToBool, or None if unrecognized."""
     if not value:
@@ -92,20 +117,16 @@ def _parse_apt_bool(value):
     # remaining string (no trailing whitespace) to parse as an integer.
     num_text = value.lstrip(_ASCII_SPACE_STR)
     if _C_STRTOL_INT.match(num_text):
-        sign = -1 if num_text[0] == "-" else 1
         mag = num_text[1:] if num_text[0] in "+-" else num_text
         if mag.startswith(("0x", "0X")):
-            val = sign * int(mag, 16)
+            base = 16
         elif mag.startswith(("0b", "0B")):
-            val = sign * int(mag, 2)
+            base = 2
         elif mag.startswith("0") and len(mag) > 1:
-            val = sign * int(mag, 8)
+            base = 8
         else:
-            val = sign * int(mag, 10)
-        if val > _LONG_MAX:
-            val = _LONG_MAX
-        elif val < _LONG_MIN:
-            val = _LONG_MIN
+            base = 10
+        val = _c_strtol_clamped(num_text, base)
         res = ((val + (1 << 31)) % (1 << 32)) - (1 << 31)
         if res == 1:
             return True
@@ -250,12 +271,7 @@ def _parse_apt_uri(raw):
         if match:
             # Match glibc LP64 `atoi` (`(int)strtol(s, NULL, 10)`) assigned to
             # `unsigned int URI::Port` (32-bit wrap; e.g. 4294967296 -> 0).
-            val = int(match.group(1), 10)
-            if val > _LONG_MAX:
-                val = _LONG_MAX
-            elif val < _LONG_MIN:
-                val = _LONG_MIN
-            port = val & 0xFFFFFFFF
+            port = _c_strtol_clamped(match.group(1), 10) & 0xFFFFFFFF
         host = host[:pos]
     return (access, user, password, host, port, path)
 
@@ -772,6 +788,15 @@ def rewrite_deb822(text):
     return "".join(out), True
 
 
+def _one_line_comment_boundary_stable(orig_body, head, tail):
+    """Return True if replacing the URI with CANONICAL keeps the `#` comment boundary intact."""
+    _orig_code, orig_comment = _strip_one_line_comment(orig_body)
+    candidate = head + CANONICAL + tail
+    new_code, new_comment = _strip_one_line_comment(candidate)
+    expected_code = head + CANONICAL + tail[:len(tail) - len(orig_comment)]
+    return new_comment == orig_comment and new_code == expected_code
+
+
 def rewrite_one_line(text):
     # Pass 1: validate every active line and record Release-index policies
     # across ALL active entries (including userinfo/flat-suite variants).
@@ -793,19 +818,23 @@ def rewrite_one_line(text):
         _check_one_line_options(opts_bracket, lineno)
         policy = _one_line_policy(opts_bracket, lineno)
         suites = [suite] if suite else []
+        boundary_ok = _one_line_comment_boundary_stable(body, head, tail)
         _register_entry_keys(release_policies, [decoded_uri], suites, policy)
-        records.append(("entry", (line, head, decoded_uri, tail, ending), (suites, policy)))
+        if not boundary_ok and _is_http_canonical(decoded_uri):
+            for s in suites:
+                release_policies[_release_index_key(CANONICAL, s)] = _POLICY_CONFLICT
+        records.append(("entry", (line, head, decoded_uri, tail, ending, boundary_ok), (suites, policy)))
 
     # Pass 2: select regional-mirror entries that can safely map onto CANONICAL
-    # without colliding with a distinct signing policy or un-upgradeable
-    # non-HTTPS entry on the destination Release index.
+    # without colliding with a distinct signing policy, un-upgradeable non-HTTPS
+    # entry, or shifting APT's `#` comment boundary.
     rewritten_indices = set()
     for idx, (kind, payload, meta) in enumerate(records):
         if kind != "entry":
             continue
-        _orig_line, _head, decoded_uri, _tail, _ending = payload
+        _orig_line, _head, decoded_uri, _tail, _ending, boundary_ok = payload
         suites, policy = meta
-        if not is_mirror(decoded_uri):
+        if not is_mirror(decoded_uri) or not boundary_ok:
             continue
         if not _canonical_keys_compatible(release_policies, suites, policy):
             continue
@@ -822,10 +851,11 @@ def rewrite_one_line(text):
         if kind != "entry":
             out.append(payload)
             continue
-        orig_line, head, decoded_uri, tail, ending = payload
+        orig_line, head, decoded_uri, tail, ending, boundary_ok = payload
         suites, policy = meta
         if idx in rewritten_indices or (
-            _is_http_canonical(decoded_uri)
+            boundary_ok
+            and _is_http_canonical(decoded_uri)
             and _canonical_keys_compatible(release_policies, suites, policy)
         ):
             out.append(head + CANONICAL + tail + ending)

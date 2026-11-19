@@ -53,15 +53,21 @@ else
 fi
 
 apt_options() {
-  local sources=$1
+  local label=$1 sources=$2
   APT_OPTS=(
     -o "Dir::Etc::sourcelist=$sources"
     -o "Dir::Etc::sourceparts=-"
-    -o "Acquire::Retries=3"
-    -o "Acquire::http::Timeout=30"
-    -o "Acquire::https::Timeout=30"
     -o "Acquire::URIEncode=+~ "
   )
+  # Inherit the runner image's faster mirror-list failover tuning on primary;
+  # apply explicit retries/timeouts on the direct canonical fallback.
+  if [ "$label" = fallback ]; then
+    APT_OPTS+=(
+      -o "Acquire::Retries=3"
+      -o "Acquire::http::Timeout=30"
+      -o "Acquire::https::Timeout=30"
+    )
+  fi
 }
 
 # Run one network apt command as root, killed (whole process group, including
@@ -81,7 +87,7 @@ bounded() {
 fetch_attempt() {
   local label=$1 sources=$2 budget=$3
   local deadline=$((SECONDS + budget)) status=0
-  apt_options "$sources"
+  apt_options "$label" "$sources"
   echo "::group::apt-get fetch ($label, ${budget}s budget) from $sources"
   bounded "$deadline" apt-get "${APT_OPTS[@]}" \
     -o "APT::Get::List-Cleanup=0" \
@@ -98,7 +104,7 @@ fetch_attempt() {
 
 install_downloaded() {
   local label=$1 sources=$2
-  apt_options "$sources"
+  apt_options "$label" "$sources"
   echo "::group::apt-get local install ($label) from $sources"
   ${privileged[@]+"${privileged[@]}"} env DEBIAN_FRONTEND=noninteractive \
     apt-get "${APT_OPTS[@]}" \

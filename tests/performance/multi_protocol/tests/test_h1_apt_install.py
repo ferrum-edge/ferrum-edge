@@ -538,15 +538,26 @@ class SourceRewriteTests(unittest.TestCase):
             (one_line_quoted_bracket_hash, False),
         )
 
-        # 32-bit atoi port wrap: `http://archive.ubuntu.com:4294967296/ubuntu/`
-        # wraps to port 0 (portless HTTP) in APT and must block merges.
-        deb822_port_wrap = (
-            "Types: deb\nURIs: http://archive.ubuntu.com:4294967296/ubuntu/\nSuites: resolute\n"
-            f"Components: main\nSigned-By: {KEYRING}\n\n"
-            "Types: deb\nURIs: https://us-east-2.ec2.archive.ubuntu.com/ubuntu/\nSuites: resolute\n"
-            f"Components: universe\nSigned-By: {KEYRING}\n"
-        )
-        self.assertEqual(sources.rewrite(deb822_port_wrap, deb822=True), (deb822_port_wrap, False))
+        # 32-bit atoi port wrap (including >4300 leading zeroes exceeding
+        # CPython's decimal int string limit): wraps to port 0 and blocks merges.
+        for port_text in ("4294967296", "0" * 5000 + "4294967296"):
+            with self.subTest(port_len=len(port_text)):
+                deb822_port_wrap = (
+                    f"Types: deb\nURIs: http://archive.ubuntu.com:{port_text}/ubuntu/\nSuites: resolute\n"
+                    f"Components: main\nSigned-By: {KEYRING}\n\n"
+                    "Types: deb\nURIs: https://us-east-2.ec2.archive.ubuntu.com/ubuntu/\nSuites: resolute\n"
+                    f"Components: universe\nSigned-By: {KEYRING}\n"
+                )
+                self.assertEqual(sources.rewrite(deb822_port_wrap, deb822=True), (deb822_port_wrap, False))
+
+        # Replacing a mirror URI whose raw text contains `[` or `]` must not
+        # shift where APT's `#` comment boundary falls.
+        for bracket_uri_line in (
+            f'deb [signed-by={KEYRING}] "mirror+https://mirrors.ubuntu.com/list[" profile#debug main\n',
+            f"deb [signed-by={KEYRING}] mirror://mirrors.ubuntu.com/mirrors.txt] noble x[[y] # comment extra\n",
+        ):
+            with self.subTest(line=bracket_uri_line):
+                self.assertEqual(sources.rewrite(bracket_uri_line, deb822=False), (bracket_uri_line, False))
 
     @unittest.skipUnless(shutil.which("apt-get") and Path(KEYRING).exists(), "needs hosted Ubuntu apt-get")
     def test_hosted_apt_accepts_rewritten_mixed_and_distinct_policy_sources(self):
@@ -1072,6 +1083,19 @@ class SourceRewriteTests(unittest.TestCase):
                     (),
                     None,
                 ),
+                (
+                    "bracket-in-uri-comment-boundary.list",
+                    f'deb [signed-by={KEYRING}] "mirror+https://mirrors.ubuntu.com/list[" profile#debug main\n'
+                    f"deb [signed-by={KEYRING}] https://us-east-2.ec2.archive.ubuntu.com/ubuntu/ resolute-updates main\n",
+                    False,
+                    True,
+                    (),
+                    (
+                        "https://archive.ubuntu.com/ubuntu/dists/resolute-updates/main/binary-",
+                        "mirror+https://mirrors.ubuntu.com/list[/dists/profile#debug/main/binary-",
+                    ),
+                    "http://archive.ubuntu.com",
+                ),
             ):
                 with self.subTest(case=name):
                     rewritten, changed = sources.rewrite(raw, deb822)
@@ -1391,12 +1415,17 @@ class InstallScriptTests(unittest.TestCase):
             rows.append((phase, action, frontend, in_timeout, argv.split("\x1f")))
         return rows
 
-    def assert_apt_options(self, argv, source):
+    def assert_apt_options(self, argv, source, phase):
         pairs = list(zip(argv, argv[1:]))
         for option in (f"Dir::Etc::sourcelist={source}", "Dir::Etc::sourceparts=-",
-                       "Acquire::Retries=3", "Acquire::http::Timeout=30",
-                       "Acquire::https::Timeout=30", "Acquire::URIEncode=+~ "):
+                       "Acquire::URIEncode=+~ "):
             self.assertIn(("-o", option), pairs)
+        fallback_only = ("Acquire::Retries=3", "Acquire::http::Timeout=30", "Acquire::https::Timeout=30")
+        for option in fallback_only:
+            if phase == "fallback":
+                self.assertIn(("-o", option), pairs)
+            else:
+                self.assertNotIn(("-o", option), pairs)
 
     def test_primary_success_fetches_bounded_then_unpacks_offline(self):
         (self.etc / "sources.list.d/ubuntu.sources").write_text(DEB822)
@@ -1408,9 +1437,9 @@ class InstallScriptTests(unittest.TestCase):
                          [("primary", "update", "1"),
                           ("primary", "download", "1"),
                           ("primary", "unpack", "0")])
-        for _, action, frontend, _, argv in calls:
+        for phase, action, frontend, _, argv in calls:
             self.assertEqual(frontend, "noninteractive")
-            self.assert_apt_options(argv, self.etc / "sources.list.d/ubuntu.sources")
+            self.assert_apt_options(argv, self.etc / "sources.list.d/ubuntu.sources", phase)
             if action == "update":
                 self.assertIn(("-o", "APT::Update::Error-Mode=any"), list(zip(argv, argv[1:])))
         self.assertEqual(
@@ -1446,9 +1475,9 @@ class InstallScriptTests(unittest.TestCase):
                     if arg.startswith("Dir::Etc::sourcelist=")
                 )
                 self.assertTrue(source.endswith(".sources"))
-                for _, action, frontend, _, argv in fallback:
+                for phase, action, frontend, _, argv in fallback:
                     self.assertEqual(frontend, "noninteractive")
-                    self.assert_apt_options(argv, source)
+                    self.assert_apt_options(argv, source, phase)
                     if action == "update":
                         self.assertIn(("-o", "APT::Update::Error-Mode=any"), list(zip(argv, argv[1:])))
                 self.assertFalse(Path(source).exists(), "temporary fallback source is removed")
