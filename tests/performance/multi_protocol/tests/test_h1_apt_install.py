@@ -410,6 +410,52 @@ class SourceRewriteTests(unittest.TestCase):
         )
         self.assertEqual(sources.rewrite(deb822_flat_roots, deb822=True), (deb822_flat_roots, False))
 
+        # Bracketed host alias `http://[archive.ubuntu.com]/ubuntu/` and non-HTTP
+        # slashless `tor+https:archive.ubuntu.com/ubuntu/` normalize to the same
+        # APT Release key and must block merges; compatible `https:archive.ubuntu.com/ubuntu/`
+        # normalizes to HTTPS canonical and allows merging.
+        deb822_bracket_http = (
+            "Types: deb\nURIs: http://[archive.ubuntu.com]/ubuntu/\nSuites: resolute\n"
+            f"Components: main\nSigned-By: {KEYRING}\n\n"
+            "Types: deb\nURIs: https://us-east-2.ec2.archive.ubuntu.com/ubuntu/\nSuites: resolute\n"
+            f"Components: universe\nSigned-By: {KEYRING}\n"
+        )
+        self.assertEqual(sources.rewrite(deb822_bracket_http, deb822=True), (deb822_bracket_http, False))
+
+        deb822_tor_slashless = (
+            "Types: deb\nURIs: tor+https:archive.ubuntu.com/ubuntu/\nSuites: resolute\n"
+            f"Components: main\nSigned-By: {KEYRING}\n\n"
+            "Types: deb\nURIs: https://us-east-2.ec2.archive.ubuntu.com/ubuntu/\nSuites: resolute\n"
+            f"Components: universe\nSigned-By: {alt_keyring}\n"
+        )
+        self.assertEqual(sources.rewrite(deb822_tor_slashless, deb822=True), (deb822_tor_slashless, False))
+
+        deb822_https_slashless = (
+            "Types: deb\nURIs: https:archive.ubuntu.com/ubuntu/\nSuites: resolute\n"
+            f"Components: main\nSigned-By: {KEYRING}\n\n"
+            "Types: deb\nURIs: https://us-east-2.ec2.archive.ubuntu.com/ubuntu/\nSuites: resolute\n"
+            f"Components: universe\nSigned-By: {KEYRING}\n"
+        )
+        rewritten_hs, changed_hs = sources.rewrite(deb822_https_slashless, deb822=True)
+        self.assertTrue(changed_hs)
+        self.assertIn("URIs: https://archive.ubuntu.com/ubuntu/\n", rewritten_hs)
+
+        # Credentialed HTTPS canonical entry (`https://reader@archive.ubuntu.com/ubuntu/`)
+        # keeps a distinct REPO_URI from anonymous `https://archive.ubuntu.com/ubuntu/`
+        # and must not merge even when Signed-By matches.
+        deb822_https_userinfo = (
+            "Types: deb\nURIs: https://reader@archive.ubuntu.com/ubuntu/\nSuites: resolute\n"
+            f"Components: main\nSigned-By: {KEYRING}\n\n"
+            "Types: deb\nURIs: https://us-east-2.ec2.archive.ubuntu.com/ubuntu/\nSuites: resolute\n"
+            f"Components: universe\nSigned-By: {KEYRING}\n"
+        )
+        self.assertEqual(sources.rewrite(deb822_https_userinfo, deb822=True), (deb822_https_userinfo, False))
+
+        # Parse errors must not echo inline credentials from malformed source lines.
+        with self.assertRaises(ValueError) as exc:
+            sources.rewrite("deb [unclosed https://user:secretpass@example.com/ubuntu/ noble main\n", deb822=False)
+        self.assertNotIn("secretpass", str(exc.exception))
+
     @unittest.skipUnless(shutil.which("apt-get") and Path(KEYRING).exists(), "needs hosted Ubuntu apt-get")
     def test_hosted_apt_accepts_rewritten_mixed_and_distinct_policy_sources(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -755,6 +801,58 @@ class SourceRewriteTests(unittest.TestCase):
                     ),
                     (
                         "Repo-URI: https://archive.ubuntu.com/ubuntu/dists/resolute/",
+                        "Repo-URI: https://us-east-2.ec2.archive.ubuntu.com/ubuntu/",
+                    ),
+                    "http://archive.ubuntu.com",
+                ),
+                (
+                    "bracket-host-http.sources",
+                    "Types: deb\nURIs: http://[archive.ubuntu.com]/ubuntu/\nSuites: resolute\n"
+                    f"Components: main\nSigned-By: {KEYRING}\n\n"
+                    "Types: deb\nURIs: https://us-east-2.ec2.archive.ubuntu.com/ubuntu/\nSuites: resolute\n"
+                    f"Components: universe\nSigned-By: {alt_keyring}\n\n"
+                    "Types: deb\nURIs: https://us-east-2.ec2.archive.ubuntu.com/ubuntu/\nSuites: resolute-updates\n"
+                    f"Components: main\nSigned-By: {KEYRING}\n",
+                    True,
+                    True,
+                    (
+                        "https://archive.ubuntu.com/ubuntu/dists/resolute-updates/InRelease",
+                        "https://us-east-2.ec2.archive.ubuntu.com/ubuntu/dists/resolute/InRelease",
+                    ),
+                    (),
+                    None,
+                ),
+                (
+                    "slashless-https-compatible.sources",
+                    "Types: deb\nURIs: https:archive.ubuntu.com/ubuntu/\nSuites: resolute\n"
+                    f"Components: main\nSigned-By: {KEYRING}\n\n"
+                    "Types: deb\nURIs: https://us-east-2.ec2.archive.ubuntu.com/ubuntu/\nSuites: resolute\n"
+                    f"Components: universe\nSigned-By: {KEYRING}\n",
+                    True,
+                    True,
+                    ("https://archive.ubuntu.com/ubuntu/dists/resolute/InRelease",),
+                    (
+                        "https://archive.ubuntu.com/ubuntu/dists/resolute/main/binary-",
+                        "https://archive.ubuntu.com/ubuntu/dists/resolute/universe/binary-",
+                    ),
+                    "http://archive.ubuntu.com",
+                ),
+                (
+                    "https-userinfo-distinct.sources",
+                    "Types: deb\nURIs: https://reader@archive.ubuntu.com/ubuntu/\nSuites: resolute\n"
+                    f"Components: main\nSigned-By: {KEYRING}\n\n"
+                    "Types: deb\nURIs: https://us-east-2.ec2.archive.ubuntu.com/ubuntu/\nSuites: resolute\n"
+                    f"Components: universe\nSigned-By: {KEYRING}\n\n"
+                    "Types: deb\nURIs: https://us-east-2.ec2.archive.ubuntu.com/ubuntu/\nSuites: resolute-updates\n"
+                    f"Components: main\nSigned-By: {KEYRING}\n",
+                    True,
+                    True,
+                    (
+                        "https://archive.ubuntu.com/ubuntu/dists/resolute-updates/InRelease",
+                        "https://us-east-2.ec2.archive.ubuntu.com/ubuntu/dists/resolute/InRelease",
+                    ),
+                    (
+                        "Repo-URI: https://reader@archive.ubuntu.com/ubuntu/",
                         "Repo-URI: https://us-east-2.ec2.archive.ubuntu.com/ubuntu/",
                     ),
                     "http://archive.ubuntu.com",

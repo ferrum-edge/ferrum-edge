@@ -138,59 +138,142 @@ def _should_rewrite_uri(uri, rewrite_mirrors=True, upgrade_http_canonical=False)
     )
 
 
-_NETWORK_SCHEMES = frozenset({"http", "https", "ftp"})
+_ATOI_RE = re.compile(r"^[ \t\r\n\v\f]*([+-]?[0-9]+)")
 
 
-def _normalize_apt_authority_and_path(uri):
-    """Return `(authority, path)` matching APT's `::URI` + `URItoFileName` rules.
+def _apt_dequote_percent(raw):
+    """Decode %HH escapes per APT's DeQuoteString (without stripping quotes)."""
+    chars = []
+    i, n = 0, len(raw)
+    while i < n:
+        if raw[i] == "%" and i + 2 < n and raw[i + 1] in _HEX_DIGITS and raw[i + 2] in _HEX_DIGITS:
+            chars.append(chr(int(raw[i + 1:i + 3], 16)))
+            i += 3
+        else:
+            chars.append(raw[i])
+            i += 1
+    return "".join(chars)
 
-    Strips scheme and userinfo, preserves host spelling and path case, drops
-    empty/zero ports while keeping explicit nonzero ports, and normalizes
-    network URIs written without `//` (such as `http:archive.ubuntu.com/ubuntu/`,
-    which APT's `FixupURI` normalizes to `http://archive.ubuntu.com/ubuntu/`).
+
+def _apt_quote_string(raw, bad):
+    """Percent-encode characters in `bad` or outside printable ASCII per APT QuoteString."""
+    out = []
+    for ch in raw:
+        code = ord(ch)
+        if ch in bad or code <= 0x20 or code >= 0x7F:
+            out.append(f"%{code:02X}")
+        else:
+            out.append(ch)
+    return "".join(out)
+
+
+def _parse_apt_uri(raw):
+    """Port of APT's `::URI::CopyFrom` (`apt-pkg/contrib/strutl.cc:1648-1759`).
+
+    Returns `(access, user, password, host, port, path)`.
     """
-    scheme_sep = uri.find("://")
-    if scheme_sep != -1:
-        rest = uri[scheme_sep + 3:]
+    n = len(raw)
+    first_colon = raw.find(":")
+    if first_colon == -1:
+        first_colon = n
+    single_slash = first_colon
+    if first_colon + 3 < n and raw[first_colon + 1] == "/" and raw[first_colon + 2] == "/":
+        single_slash += 3
+    in_bracket = False
+    while single_slash < n and (raw[single_slash] != "/" or in_bracket):
+        if raw[single_slash] == "[":
+            in_bracket = True
+        elif in_bracket and raw[single_slash] == "]":
+            in_bracket = False
+        single_slash += 1
+
+    access = raw[:first_colon]
+    path = raw[single_slash:] if single_slash < n else ""
+    if not path:
+        path = "/"
+
+    if first_colon + 2 < n and raw[first_colon + 1] == "/" and raw[first_colon + 2] == "/":
+        start = first_colon + 3
     else:
-        colon = uri.find(":")
-        if colon != -1 and uri[:colon].lower() in _NETWORK_SCHEMES:
-            rest = uri[colon + 1:].lstrip("/")
-        else:
-            rest = uri[colon + 1:] if colon != -1 else uri
-            return ("", rest)
-    slash = rest.find("/")
-    authority = rest if slash == -1 else rest[:slash]
-    path = "" if slash == -1 else rest[slash:]
-    if "@" in authority:
-        authority = authority.rsplit("@", 1)[1]
-    if authority.startswith("["):
-        end_v6 = authority.find("]")
-        if end_v6 != -1:
-            host = authority[:end_v6 + 1]
-            port_part = authority[end_v6 + 1:]
-        else:
-            host, port_part = authority, ""
-    elif ":" in authority:
-        host_raw, port_raw = authority.rsplit(":", 1)
-        host, port_part = host_raw, ":" + port_raw
+        start = first_colon + 1
+    if start >= n:
+        return (access, "", "", "", 0, path)
+    if start > single_slash:
+        start = single_slash
+
+    scan_from = min(start + 1, single_slash)
+    at = raw.rfind("@", scan_from, single_slash)
+    user = ""
+    password = ""
+    if at == -1:
+        host = raw[start:single_slash] if start < single_slash else ""
     else:
-        host, port_part = authority, ""
-    if port_part.startswith(":"):
-        digits = port_part[1:]
-        if digits.isdigit() and int(digits) > 0:
-            norm_authority = f"{host}:{int(digits)}"
+        host = raw[at + 1:single_slash]
+        second_colon = raw.find(":", scan_from, at)
+        if second_colon == -1:
+            user = _apt_dequote_percent(raw[start:at])
         else:
-            norm_authority = host
-    else:
-        norm_authority = host
-    return (norm_authority, path)
+            user = _apt_dequote_percent(raw[start:second_colon])
+            password = _apt_dequote_percent(raw[second_colon + 1:at])
+
+    # Strip RFC 2732 `[]` brackets identically to strutl.cc:1723-1749.
+    port_end = 0
+    in_bracket = False
+    host_chars = []
+    for ch in host:
+        if ch == "[":
+            in_bracket = True
+            continue
+        if in_bracket and ch == "]":
+            in_bracket = False
+            port_end = len(host_chars)
+            continue
+        host_chars.append(ch)
+    if in_bracket:
+        return (access, user, password, "", 0, path)
+    host = "".join(host_chars)
+
+    port = 0
+    pos = host.rfind(":")
+    if pos != -1 and pos >= port_end:
+        match = _ATOI_RE.match(host[pos + 1:])
+        port = int(match.group(1)) if match else 0
+        host = host[:pos]
+    return (access, user, password, host, port, path)
 
 
-def _repo_root(uri):
-    """Return APT's effective post-FixupURI repository root `(authority, path)`."""
+def _format_apt_uri(access, user, password, host, port, path):
+    """Port of APT's `::URI::operator string()` (`strutl.cc:1764-1806`)."""
+    parts = []
+    if access:
+        parts.append(f"{access}:")
+    if host:
+        if access:
+            parts.append("//")
+        if user:
+            parts.append(_apt_quote_string(user, ":/?#[]@"))
+            if password:
+                parts.append(":" + _apt_quote_string(password, ":/?#[]@"))
+            parts.append("@")
+        if access and ("/" in host or ":" in host):
+            parts.append(f"[{host}]")
+        else:
+            parts.append(host)
+        if port != 0:
+            parts.append(f":{port}")
+    if path:
+        if not path.startswith("/"):
+            parts.append("/" + path)
+        else:
+            parts.append(path)
+    return "".join(parts)
+
+
+def _full_repo_uri(uri):
+    """Return APT's normalized full `REPO_URI` (including scheme and userinfo)."""
     base = uri if uri.endswith("/") else uri + "/"
-    return _normalize_apt_authority_and_path(base)
+    access, user, password, host, port, path = _parse_apt_uri(base)
+    return _format_apt_uri(access.lower(), user, password, host, port, path)
 
 
 def _release_index_key(uri, suite):
@@ -202,15 +285,16 @@ def _release_index_key(uri, suite):
         meta_uri = base + suite + "Release"
     else:
         meta_uri = base + "dists/" + suite + "/Release"
-    return _normalize_apt_authority_and_path(meta_uri)
+    _access, _user, _password, host, port, path = _parse_apt_uri(meta_uri)
+    return (host, port, path)
 
 
 def _suite_policy(policy, uri, suite):
-    """Combine entry options, flat-vs-component layout, REPO_URI root, and RELEASE."""
-    return (policy, suite.endswith("/"), _repo_root(uri), "" if suite == "/" else suite)
+    """Combine entry options, flat-vs-component layout, full REPO_URI, and RELEASE."""
+    return (policy, suite.endswith("/"), _full_repo_uri(uri), "" if suite == "/" else suite)
 
 
-_CANONICAL_AUTHORITY = _repo_root(CANONICAL)[0]
+_CANONICAL_HOST, _CANONICAL_PORT = _parse_apt_uri(CANONICAL)[3:5]
 _CANONICAL_WILDCARD = object()
 
 
@@ -220,20 +304,22 @@ def _has_arch_var(text):
 
 def _register_entry_keys(release_policies, uris, suites, policy):
     for uri in uris:
-        is_https = uri.lower().startswith("https://")
+        access, _user, _password, host, port, _path = _parse_apt_uri(uri)
+        is_https = access.lower() == "https"
         upgradeable_http = _is_http_canonical(uri)
-        authority, _ = _repo_root(uri)
-        if _has_arch_var(uri) and authority == _CANONICAL_AUTHORITY:
+        if _has_arch_var(uri) and host == _CANONICAL_HOST and port == _CANONICAL_PORT:
             release_policies[_CANONICAL_WILDCARD] = _POLICY_CONFLICT
         for suite in suites:
-            if _has_arch_var(suite) and authority == _CANONICAL_AUTHORITY:
+            if _has_arch_var(suite) and host == _CANONICAL_HOST and port == _CANONICAL_PORT:
                 release_policies[_CANONICAL_WILDCARD] = _POLICY_CONFLICT
             key = _release_index_key(uri, suite)
             # Any non-HTTPS entry that is not an upgradeable portless HTTP
             # canonical URI (e.g. `http://reader@archive.ubuntu.com/ubuntu/`,
-            # `http:archive.ubuntu.com/ubuntu/`, or `.../ubuntu/dists/` with
-            # flat suite `resolute/`) blocks merges onto its effective Release
-            # key so APT neither hits a policy conflict nor reuses plaintext HTTP.
+            # `http:archive.ubuntu.com/ubuntu/`, `http://[archive.ubuntu.com]/ubuntu/`,
+            # `tor+https:archive.ubuntu.com/ubuntu/`, or `.../ubuntu/dists/`
+            # with flat suite `resolute/`) blocks merges onto its effective
+            # Release key so APT neither hits a policy conflict nor reuses
+            # non-HTTPS transport.
             if not is_https and not upgradeable_http:
                 release_policies[key] = _POLICY_CONFLICT
                 continue
@@ -250,7 +336,7 @@ def _canonical_keys_compatible(release_policies, suites, policy):
     if _CANONICAL_WILDCARD in release_policies:
         return False
     has_existing_canonical = any(
-        isinstance(k, tuple) and k[0] == _CANONICAL_AUTHORITY
+        isinstance(k, tuple) and k[0] == _CANONICAL_HOST and k[1] == _CANONICAL_PORT
         for k in release_policies
     )
     for suite in suites:
@@ -294,12 +380,13 @@ def _rewrite_uris(value, rewrite_mirrors=True, upgrade_http_canonical=False):
     return leading + " ".join(rewritten), True
 
 
-def _apt_dequote_word(raw):
+def _apt_dequote_word(raw, lineno=None):
     """Decode %HH escapes and strip double quotes like APT's ParseQuoteWord.
 
     Refuses ASCII control characters (including raw or `%00` NUL bytes), which
     can truncate C-string comparisons or desync option/URI boundaries in APT.
     """
+    loc = f"line {lineno}: " if lineno is not None else ""
     chars = []
     i, n = 0, len(raw)
     while i < n:
@@ -307,20 +394,21 @@ def _apt_dequote_word(raw):
         if ch == "%" and i + 2 < n and raw[i + 1] in _HEX_DIGITS and raw[i + 2] in _HEX_DIGITS:
             byte_val = int(raw[i + 1:i + 3], 16)
             if byte_val < 0x20 or byte_val == 0x7F:
-                raise ValueError(f"apt token {raw!r} contains percent-encoded control byte 0x{byte_val:02x}")
+                raise ValueError(f"{loc}apt token contains percent-encoded control byte 0x{byte_val:02x}")
             chars.append(chr(byte_val))
             i += 3
             continue
         if ord(ch) < 0x20 or ord(ch) == 0x7F:
-            raise ValueError(f"apt token {raw!r} contains control character")
+            raise ValueError(f"{loc}apt token contains control character")
         if ch != '"':
             chars.append(ch)
         i += 1
     return "".join(chars)
 
 
-def _decode_one_line_options(opts_bracket):
+def _decode_one_line_options(opts_bracket, lineno=None):
     """Parse APT one-line `[k=v ...]` options per ParseQuoteWord + sourcelist.cc."""
+    loc = f"line {lineno}: " if lineno is not None else ""
     inner = opts_bracket[1:-1]
     pairs = []
     i, n = 0, len(inner)
@@ -334,41 +422,43 @@ def _decode_one_line_options(opts_bracket):
             if inner[i] == '"':
                 close = inner.find('"', i + 1)
                 if close == -1:
-                    raise ValueError(f"unterminated quote in apt option bracket {opts_bracket!r}")
+                    raise ValueError(f"{loc}unterminated quote in apt option bracket")
                 i = close + 1
             else:
                 i += 1
-        option = _apt_dequote_word(inner[start:i])
+        option = _apt_dequote_word(inner[start:i], lineno)
         # APT's sourcelist.cc strips a trailing decoded `]` (including `%5d`),
         # so fail closed on any decoded `]` inside an option token.
         if "]" in option:
-            raise ValueError(f"ambiguous ']' in apt option {option!r} in {opts_bracket!r}")
+            raise ValueError(f"{loc}ambiguous ']' in apt option")
         if "=" not in option:
-            raise ValueError(f"malformed apt option {option!r} in {opts_bracket!r}")
+            raise ValueError(f"{loc}malformed apt option (missing '=')")
         key, value = option.split("=", 1)
         if not key:
-            raise ValueError(f"empty apt option key in {opts_bracket!r}")
+            raise ValueError(f"{loc}empty apt option key")
         pairs.append((key, value))
     return pairs
 
 
-def _check_one_line_options(opts_bracket):
+def _check_one_line_options(opts_bracket, lineno=None):
     if not opts_bracket:
         return
+    loc = f"line {lineno}: " if lineno is not None else ""
     # APT stores one-line option names case-sensitively (`sourcelist.cc:240`)
     # and looks up exact lowercase trust keys (`debmetaindex.cc:1236,1444`).
     effective = {}
-    for key, value in _decode_one_line_options(opts_bracket):
+    for key, value in _decode_one_line_options(opts_bracket, lineno):
         effective[key] = value
     for unsafe in _UNSAFE_FIELDS:
         if unsafe in effective and _is_apt_true(effective[unsafe]):
             raise ValueError(
-                f"source sets [{unsafe}={effective[unsafe]}]; refusing to rewrite unsafe source"
+                f"{loc}source sets unsafe option [{unsafe}]; refusing to rewrite"
             )
 
 
-def _parse_one_line(body):
+def _parse_one_line(body, lineno=None):
     """Parse `(head, opts_bracket, raw_uri, decoded_uri, suite, tail)` from a one-line deb entry."""
+    loc = f"line {lineno}: " if lineno is not None else ""
     prefix = _ONE_LINE_PREFIX.match(body)
     if not prefix:
         return None
@@ -381,17 +471,17 @@ def _parse_one_line(body):
             if body[i] == '"':
                 close = body.find('"', i + 1)
                 if close == -1:
-                    raise ValueError(f"unterminated quote in apt option bracket on line {body!r}")
+                    raise ValueError(f"{loc}unterminated quote in apt option bracket")
                 i = close + 1
                 continue
             if body[i] == "[":
-                raise ValueError(f"nested '[' in apt option bracket on line {body!r}")
+                raise ValueError(f"{loc}nested '[' in apt option bracket")
             if body[i] == "]":
                 end_bracket = i
                 break
             i += 1
         if end_bracket == -1:
-            raise ValueError(f"unterminated apt option bracket on line {body!r}")
+            raise ValueError(f"{loc}unterminated apt option bracket")
         opts_bracket = body[pos:end_bracket + 1]
         # APT only accepts an adjacent URI after `]` when `]` starts a word
         # (preceded by ASCII whitespace or immediately after `[`). A mid-word
@@ -402,25 +492,25 @@ def _parse_one_line(body):
         while pos < n and body[pos] in _ASCII_SPACE:
             pos += 1
         if pos == ws_start and not bracket_word_start:
-            raise ValueError(f"malformed apt source line after option bracket: {body!r}")
+            raise ValueError(f"{loc}malformed apt source line after option bracket")
     uri_start = pos
     while pos < n and body[pos] not in _ASCII_SPACE:
         if body[pos] == '"':
             close = body.find('"', pos + 1)
             if close == -1:
-                raise ValueError(f"unterminated quote in apt URI on line {body!r}")
+                raise ValueError(f"{loc}unterminated quote in apt URI")
             pos = close + 1
         elif body[pos] == "[":
             close = body.find("]", pos + 1)
             if close == -1:
-                raise ValueError(f"unterminated '[' in apt URI on line {body!r}")
+                raise ValueError(f"{loc}unterminated '[' in apt URI")
             pos = close + 1
         else:
             pos += 1
     if pos == uri_start:
         return None
     raw_uri = body[uri_start:pos]
-    decoded_uri = _apt_dequote_word(raw_uri)
+    decoded_uri = _apt_dequote_word(raw_uri, lineno)
     tail = body[pos:]
     # Extract the suite token (first word after URI, before any `#` comment).
     suite_scan = tail.split("#", 1)[0].lstrip(_ASCII_SPACE_STR)
@@ -436,24 +526,25 @@ def _parse_one_line(body):
             else:
                 j += 1
         if j > 0:
-            suite = _apt_dequote_word(suite_scan[:j])
+            suite = _apt_dequote_word(suite_scan[:j], lineno)
     return body[:uri_start], opts_bracket, raw_uri, decoded_uri, suite, tail
 
 
-def _one_line_policy(opts_bracket):
+def _one_line_policy(opts_bracket, lineno=None):
     if not opts_bracket:
         return ()
     effective = {}
-    for key, value in _decode_one_line_options(opts_bracket):
+    for key, value in _decode_one_line_options(opts_bracket, lineno):
         effective[key] = value
     return tuple(sorted(effective.items()))
 
 
-def _inspect_deb822_stanza(lines):
+def _inspect_deb822_stanza(lines, start_lineno=1):
     """Validate one deb822 stanza and return `(active, uris, suites, policy)`."""
     fields = {}
     active_field = None
-    for line in lines:
+    for offset, line in enumerate(lines):
+        lineno = start_lineno + offset
         body = line.rstrip("\r\n")
         if body.startswith("#"):
             continue
@@ -465,7 +556,7 @@ def _inspect_deb822_stanza(lines):
             continue
         field = _DEB822_FIELD.match(body)
         if not field:
-            raise ValueError(f"malformed deb822 line: {body!r}")
+            raise ValueError(f"line {lineno}: malformed deb822 field line")
         active_field = field.group(1).rstrip(" \t\v\f").lower()
         fields[active_field] = [field.group(2)]
 
@@ -487,9 +578,8 @@ def _inspect_deb822_stanza(lines):
 
     for unsafe in _UNSAFE_FIELDS:
         if unsafe in fields and _is_apt_true(field_value(unsafe)):
-            raw = field_value(unsafe)
             raise ValueError(
-                f"source sets {unsafe}: {raw}; refusing to rewrite unsafe source"
+                f"stanza at line {start_lineno}: sets unsafe field {unsafe}; refusing to rewrite"
             )
 
     uris = _ASCII_TOKEN.findall(field_value("uris")) if "uris" in fields else []
@@ -535,29 +625,32 @@ def rewrite_deb822(text):
     # a record only on an empty line (\n or \r\n), NOT on a whitespace-only line.
     chunks = []
     stanza = []
-    for line in _LINE_SPLIT.findall(text):
+    stanza_start = 1
+    for lineno, line in enumerate(_LINE_SPLIT.findall(text), start=1):
         body = line.rstrip("\r\n")
         if "\r" in body:
-            raise ValueError(f"apt source contains bare CR character on line {line!r}")
+            raise ValueError(f"line {lineno}: apt source contains bare CR character")
         if body == "":
             if stanza:
-                chunks.append(("stanza", stanza))
+                chunks.append(("stanza", stanza_start, stanza))
                 stanza = []
-            chunks.append(("blank", [line]))
+            chunks.append(("blank", lineno, [line]))
         else:
+            if not stanza:
+                stanza_start = lineno
             stanza.append(line)
     if stanza:
-        chunks.append(("stanza", stanza))
+        chunks.append(("stanza", stanza_start, stanza))
 
     # Pass 1: validate every active stanza and record signing policies keyed by
     # APT's effective Release filename across ALL active entries.
     inspected = []
     release_policies = {}
-    for kind, lines in chunks:
+    for kind, start_lineno, lines in chunks:
         if kind != "stanza":
             inspected.append((kind, lines, None))
             continue
-        info = _inspect_deb822_stanza(lines)
+        info = _inspect_deb822_stanza(lines, start_lineno)
         active, uris, suites, policy = info
         if active:
             _register_entry_keys(release_policies, uris, suites, policy)
@@ -634,21 +727,21 @@ def rewrite_one_line(text):
     # across ALL active entries (including userinfo/flat-suite variants).
     records = []
     release_policies = {}
-    for line in _LINE_SPLIT.findall(text):
+    for lineno, line in enumerate(_LINE_SPLIT.findall(text), start=1):
         body = line.rstrip("\r\n")
         if "\r" in body:
-            raise ValueError(f"apt source contains bare CR character on line {line!r}")
+            raise ValueError(f"line {lineno}: apt source contains bare CR character")
         ending = line[len(body):]
         stripped = body.lstrip(_ASCII_SPACE_STR)
         if not stripped or stripped.startswith("#"):
             records.append(("raw", line, None))
             continue
-        parsed = _parse_one_line(body)
+        parsed = _parse_one_line(body, lineno)
         if not parsed:
-            raise ValueError(f"unsupported or malformed apt source line: {body!r}")
+            raise ValueError(f"line {lineno}: unsupported or malformed apt source entry")
         head, opts_bracket, _raw_uri, decoded_uri, suite, tail = parsed
-        _check_one_line_options(opts_bracket)
-        policy = _one_line_policy(opts_bracket)
+        _check_one_line_options(opts_bracket, lineno)
+        policy = _one_line_policy(opts_bracket, lineno)
         suites = [suite] if suite else []
         _register_entry_keys(release_policies, [decoded_uri], suites, policy)
         records.append(("entry", (line, head, decoded_uri, tail, ending), (suites, policy)))

@@ -169,8 +169,8 @@ or line) with a suite that shares an APT Release index with an entry that
 cannot be upgraded or has a different policy, repository root, or layout keeps
 its regional URI for all of its suites so distinct Release indexes are
 preserved. `Suites`, `Components`, and `Signed-By` stay intact, and active
-intact, and active entries that disable signature verification (under any APT
-truthy spelling) are refused.
+entries that disable signature verification (under any APT truthy spelling)
+are refused when deriving the fallback source.
 
 The measurement campaign runs only on manual dispatch:
 
