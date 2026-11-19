@@ -98,9 +98,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `gzwrite()`). It comes in through `rdkafka-sys` (the `kafka_logging`
   plugin's librdkafka) in the root, `fuzz/` and `tests/performance/mesh/`
   lockfiles. `chrono` is now marked unmaintained (RUSTSEC-2026-0543, no known
-  vulnerability); it is a direct dependency and also comes in through sqlx,
-  the GCP SDK, mongodb and testcontainers, so `deny.toml` time-boxes it until
-  2026-12-31 while the move to `time` is tracked in #7419.
+  vulnerability); it is a direct dependency and is also compiled through sqlx's
+  `chrono` feature and `google-cloud-auth` 1.13.0, so `deny.toml` time-boxes it
+  until 2026-12-31 while the move to `time` is tracked in #7419.
 - **A backend's WebSocket upgrade refusal no longer trips the route's circuit
   breaker** (GHSA-7x2j-3389-2h35). A backend that answered the gateway's
   upgrade request with its own `401`/`403`/`404`/`429` became a gateway `502`
@@ -201,8 +201,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   anywhere, holds the namespace-registry lease and every namespace's admission
   lease from the scan through the delete, and returns `503` when the store or
   the leases are unavailable (#7394).
+- **The RUSTSEC-2026-0543 (`chrono`, unmaintained) exception lists only the
+  parents that compile chrono** (#7419). `deny.toml` and the advisory exception
+  register now name `ferrum-edge` itself, sqlx's `chrono` feature and
+  `google-cloud-auth` 1.13.0. `serde_with` (through the `google-cloud-*` crates,
+  `mongodb` and `testcontainers`) lists chrono in `Cargo.lock` only through weak
+  features and does not build it. `google-cloud-auth` 1.16.0 already dropped
+  chrono, so retiring the exception needs no upstream change: bump the
+  `google-cloud-*` pins, switch sqlx to its `time` feature and migrate to `time`
+  with unchanged timestamp formats. The expiry stays 2026-12-31.
+- **Carried mesh VirtualService HTTP routes are never served on inbound mesh
+  listeners** (#7423). Sidecar `:15006` and waypoint HBONE `:15008` no longer
+  match them. Before, a peer, or a plaintext client under PERMISSIVE, could name
+  a routed host and have the proxy dial it onward with its own mesh identity.
 
 ### Added
+- **Sidecar data planes apply mesh-bound VirtualService `http[]` routes**
+  (#7423). Weighted splits, match dispatch, rewrites, retries, timeouts, faults
+  and mirrors run client-side on the outbound capture listener, reusing the
+  NodeWaypoint route machinery. Every in-mesh leg dials the destination
+  workloads over pinned SVID-mTLS through a route-scoped upstream clone that
+  presents the destination Service (`<service>.<namespace>.svc:<port>`) as the
+  `:authority`; an explicit `rewrite.authority` naming that destination is
+  forwarded verbatim, and plain Service routes are unchanged. The clones share
+  the Service's DestinationRule `http2MaxRequests` and `http1MaxPendingRequests`
+  lanes. `match.sourceNamespace` is decided from the Sidecar's own workload
+  namespace. Sidecars request the routes with the new
+  `MeshSubscribeRequest.sidecar_http_routes` (proto field 10) / xDS
+  node-metadata flag. ServiceWaypoint projection and a live weighted-split
+  assertion remain follow-ups.
 - **`mesh_route_dispatch` `weighted_splits`** (#7387). A new config table
   `[{upstream_id, legs: [{upstream_id, weight, originate_tls}]}]` resolves a
   weighted split leg by leg. Once the whole dispatch group's destination is
@@ -493,6 +520,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `test-support` feature.
 
 ### Changed
+- **BREAKING:** (issue #7424) DestinationRules now govern an EastWestGateway's
+  auto-materialized SNI-passthrough Service upstreams. Each upstream is selected
+  by its Service host (exact and wildcard, with Istio's client → Service → root
+  precedence and most-specific-host rule). `connectionPool.tcp`
+  (`connectTimeout`, `maxConnections`, `tcpKeepalive`, `idleTimeout`),
+  `outlierDetection`, `loadBalancer` and `localityLbSetting` apply on the
+  passthrough leg, and only the `portLevelSettings` entry for the upstream's own
+  Service port applies. Rule `tls` is never applied there (no TLS origination,
+  matching Istio's `SniDnatClusterMode`), subsets are not projected, and a
+  mesh-wide `ISTIO_MUTUAL` rule no longer risks rejecting the gateway's slice.
+  Before this change no DestinationRule applied to these upstreams.
+- **BREAKING:** (issue #7423) The VirtualService status field
+  `status.ferrum.translation.mesh_http_routes` changes value from
+  `node_waypoint_only` to `sidecar_and_node_waypoint`, and the `FerrumAccepted`
+  note names only Ambient and ServiceWaypoint as ignoring mesh `http[]` routes.
+- A carried mesh VirtualService route whose direct or dispatch-rule destination
+  is a Service in another namespace is refused on every topology, NodeWaypoint
+  included, and its host keeps the Service route (#7423). Before, it left a
+  dangling upstream reference that refused the whole data-plane configuration.
 - Refresh bundled public trust data (#7402): `webpki-roots` 1.0.12 drops the
   Buypass Class 2 and Class 3, DigiCert Trusted Root G4, QuoVadis Root CA 1 G3
   and 3 G3, and Certigna roots from the default outbound trust store, following
@@ -1054,11 +1100,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the control plane. Upgrade CP and DPs together.
 - **The Kubernetes status of a mesh-bound VirtualService reports where its
   `http[]` routes apply** (#7390): `status.ferrum.translation.mesh_http_routes:
-  node_waypoint_only` plus a `FerrumAccepted` message note. Mesh data planes
-  apply VirtualService `http[]` routes only on NodeWaypoint; Sidecar, Ambient
-  and ServiceWaypoint keep routing to the destination Service. The sidecar GA
-  headline, README, FEATURES and `docs/mesh_supported_matrix.md` no longer
-  imply otherwise.
+  sidecar_and_node_waypoint` (#7423) plus a `FerrumAccepted` message note. Mesh
+  data planes apply VirtualService `http[]` routes on Sidecar and NodeWaypoint;
+  Ambient and ServiceWaypoint keep routing to the destination Service. The
+  sidecar GA headline, README, FEATURES and `docs/mesh_supported_matrix.md` no
+  longer imply otherwise.
 
 ### Fixed
 - CI: restore the gateway config that the daily `performance-regression.yml`

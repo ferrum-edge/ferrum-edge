@@ -28,6 +28,68 @@ applied by editing the file (see [File Mode](#file-mode-ferrum_modefile)).
 
 ## Upgrading to the next release (unreleased)
 
+### EastWestGateway passthrough legs now follow DestinationRules (#7424)
+
+An EastWestGateway data plane now applies DestinationRules to its
+auto-materialized SNI-passthrough Service upstreams. Each upstream is looked up
+by the Service host `<name>.<namespace>.svc.<cluster-domain>`, with the usual
+lookup order (the gateway's own namespace, then the Service's namespace, then
+the root namespace) and most-specific-host precedence. Exact and wildcard hosts
+both apply. Before this release these upstreams were ignored by every
+DestinationRule.
+
+What now applies on the passthrough leg: `connectionPool.tcp.connectTimeout`,
+`maxConnections`, `tcpKeepalive`, `idleTimeout`, `outlierDetection`,
+`loadBalancer` and `localityLbSetting`, plus the `portLevelSettings` entry for
+that upstream's own Service port. What never applies: `tls` at any scope (the
+gateway forwards the client's end-to-end mTLS and never originates TLS) and
+subsets.
+
+**Operator action:** review DestinationRules that cover Services exposed through
+an east-west gateway, mesh-wide root-namespace wildcards (`*`,
+`*.cluster.local`) in particular. Their connection limits, timeouts,
+load-balancing and outlier settings now also shape cross-cluster traffic
+entering through the gateway. A rule meant only for in-cluster clients can be
+narrowed with `exportTo` so it is not visible to the gateway's namespace.
+
+### Sidecar VirtualService HTTP routes (#7423)
+
+Sidecar data planes now apply the `http[]` routes of VirtualServices bound to
+the mesh (`spec.gateways` omitted or naming `mesh`) in their namespace, subject
+to `exportTo` and any Sidecar egress scope. Before, a Sidecar ignored them and
+routed those hosts to the plain Service. East-west traffic from Sidecars now
+follows weighted splits, match dispatch, rewrites, retries, timeouts, faults and
+mirrors, exactly as on a NodeWaypoint.
+
+- A route whose destination is an in-cluster Service the Sidecar's slice does
+  not model is refused, and the host keeps its Service route. So is a route that
+  claims the Sidecar's own inbound route (same path and host); the inbound route
+  is always kept.
+- `match.sourceNamespace` is decided from the Sidecar's own workload. Rules
+  naming another namespace are removed, and a route left with no rule is
+  refused.
+- A carried route presents its selected destination Service
+  (`<service>.<namespace>.svc:<port>`) as the `:authority`, and the client Host
+  rides `x-forwarded-host`. An explicit `rewrite.authority` that names that
+  destination is forwarded verbatim; a port-less rewrite is accepted only for a
+  single-port Service, and any rewrite the destination could not route refuses
+  the route. Plain Service traffic is unchanged.
+- A carried route whose direct or dispatch-rule destination is a Service in
+  another namespace is refused on every topology, NodeWaypoint included, and its
+  host keeps the Service route. Before, such a route left a dangling upstream
+  reference that refused the whole configuration.
+- Carried traffic shares the destination's DestinationRule `http2MaxRequests`
+  and `http1MaxPendingRequests` budgets with plain Service traffic.
+- Destination AuthorizationPolicy and RequestAuthentication still apply at the
+  destination Sidecar. Carried VirtualService routes are never served on any
+  inbound mesh listener, NodeWaypoint included.
+- VirtualService status `status.ferrum.translation.mesh_http_routes` changes
+  from `node_waypoint_only` to `sidecar_and_node_waypoint`. Tooling that matched
+  `node_waypoint_only` must be updated.
+
+**Operator action:** upgrade the control plane and data planes together, and
+review mesh-bound VirtualServices before upgrading Sidecars.
+
 ### A backend's WebSocket upgrade refusal is relayed to the client (GHSA-7x2j-3389-2h35)
 
 When a backend answers the gateway's WebSocket upgrade with its own `3xx`,
