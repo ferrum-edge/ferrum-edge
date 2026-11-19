@@ -2495,9 +2495,16 @@ signal"). Main pushes 2026-11-13..16:
   out over the compile. Capping that step at `CARGO_BUILD_JOBS=2` with
   `CARGO_PROFILE_RELEASE_DEBUG=line-tables-only` was tried on a branch
   (`workflow_dispatch` run 43900143614) and lost the runner the same way, so it
-  was not adopted. The lane stays as it is; it needs a smaller compile (for
-  example a fuzz-only slice of the crate) or a larger runner, not another swap
-  or job-cap tweak.
+  was not adopted, which showed the peak is LLVM optimization work, not
+  debuginfo or job parallelism. `fuzz/Cargo.toml` now compiles the release
+  profile that cargo-fuzz uses at `opt-level = 2` with a
+  `[profile.release.package.ferrum-edge]` override to `opt-level = 1` and
+  `debug = "line-tables-only"`, which cuts the inlining/unrolling/vectorization
+  IR growth in that one crate without editing either frozen workflow (see
+  [fuzz.md](fuzz.md#sanitizer-build-profile)). Its `Fuzz build resources:`
+  records on main are the evidence. If the runner is still lost, the remaining
+  options are a smaller compile (for example a fuzz-only slice of the crate) or
+  a larger runner, not another swap or job-cap tweak.
 
 ##### Release image-family contract (`-ebpf-tools`)
 

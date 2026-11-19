@@ -103,10 +103,10 @@ rejects crash artifacts larger than 64 KiB before upload.
 
 `cargo fuzz run` defaults to AddressSanitizer, so the bounded budget is a
 sanitizer build in both libFuzzer lanes. That build, not the fuzzing, is the
-cost: about 47 minutes for the first target plus about 8 minutes of serial
-per-target rebuilds, for fewer than ten seconds of fuzzing in total. Caching
-the sanitizer target directory did not help: rust-cache drops the
-`ferrum-edge` path dependency and every vendored patch crate, so a restore
+cost (measured at `opt-level = 3`, before the build profile below): about 47
+minutes for the first target plus about 8 minutes of serial per-target
+rebuilds, for fewer than ten seconds of fuzzing in total. Caching the sanitizer
+target directory did not help: rust-cache drops the `ferrum-edge` path dependency and every vendored patch crate, so a restore
 (about three minutes for 7.2 GB) saved about three minutes of compile, and the
 entry evicted `ci-standalone-cargo` on alternate main runs. The property gate
 reuses compiler output only through `Swatinem/rust-cache` and installs no
@@ -208,3 +208,31 @@ fails visibly if allocation or activation fails; toolchain, profile, sanitizer,
 targets, and every libFuzzer bound are unchanged. Trial data and the scheduled
 lane's failure history are on issue
 [#4694](https://github.com/ferrum-edge/ferrum-edge/issues/4694).
+
+### Sanitizer build profile
+
+`cargo fuzz run` (cargo-fuzz 0.13.1) builds with `--release`, so both libFuzzer
+lanes compile with `fuzz/Cargo.toml`'s `[profile.release]`; the workflows leave
+`RUSTFLAGS` empty apart from what cargo-fuzz adds for ASan and
+SanitizerCoverage. Even with the extra swap, the `opt-level = 3` build lost the
+smoke runner in 5 of 30 pushes to main: in run 44461627224 one rustc compiling
+the `ferrum-edge` library reached 14.66 GiB RSS plus 9.26 GiB swap on a 15.6 GiB
+runner, `MemAvailable` fell to 0.17 GiB, and that crate alone took 39 minutes
+under ~48.6 GiB of swap I/O. The profile is now:
+
+| Setting | Value | Why |
+|---------|-------|-----|
+| `[profile.release]` `opt-level` | `2` | Dependencies and the target binaries stay optimized; they were never the memory peak |
+| `[profile.release.package.ferrum-edge]` `opt-level` | `1` | Cuts the inlining/unrolling/vectorization IR growth in the one crate that held the peak (including the generics it monomorphizes); O1 is ASan's usual floor for reasonable speed |
+| `debug` | `"line-tables-only"` | File/line and inlined-frame data for ASan and libFuzzer stack traces, without `limited` debuginfo's per-function type and scope DWARF |
+
+Debuginfo is the secondary saving: `line-tables-only` with `CARGO_BUILD_JOBS=2`
+alone still lost the runner (run 43900143614), so the `opt-level` change carries
+the fix.
+
+`[profile.fuzz]` and `[profile.fuzz-with-sanitizer]` inherit `release`, including
+the package override. The code under test runs slower at O1, which the bounds
+absorb: the smoke's `-runs=512` finished in 0–2 seconds per target at O3 against
+an 8 second cap, and the scheduled lane is time-bounded, so slower execution only
+lowers its execution count. The `Fuzz build resources:` records above are the
+measurement to compare against the figures here.

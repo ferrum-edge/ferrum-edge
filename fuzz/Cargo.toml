@@ -114,16 +114,66 @@ test = false
 doc = false
 bench = false
 
+# Sanitizer build profiles.
+#
+# `cargo fuzz run` (cargo-fuzz 0.13.1, as pinned in fuzz-smoke-main.yml and
+# fuzz.yml) builds with `cargo build --release`, so `[profile.release]` below is
+# the profile both libFuzzer lanes actually compile with ("Finished `release`
+# profile" in the hosted log). cargo-fuzz adds ASan and SanitizerCoverage through
+# RUSTFLAGS, which the workflows otherwise leave empty, so nothing on the command
+# line overrides the `opt-level` or `debug` chosen here. This crate has no
+# ancestor workspace, so it is its own workspace root and these profiles apply.
+#
+# At Cargo's release default of `opt-level = 3`, compiling the `ferrum-edge`
+# library with ASan + SanCov pushed one rustc to 14.66 GiB RSS plus 9.26 GiB swap
+# on a 15.6 GiB runner (MemAvailable 0.17 GiB, ~48.6 GiB of swap I/O, 39 minutes
+# for that one crate in run 44461627224), and the same step lost the runner in
+# 5 of 30 pushes to main. `ferrum-edge` is the only crate that large: it is where
+# every serde/tokio/hyper generic it uses is monomorphized, and an override for a
+# package applies to those instantiations too. So:
+#
+# - `[profile.release.package.ferrum-edge]` drops just that crate to
+#   `opt-level = 1`. A package override applies to any package in the graph,
+#   including this non-member path dependency, and leaves `panic`/`lto` (which
+#   overrides cannot set) with the profile. O1 is the floor clang's
+#   AddressSanitizer documentation gives for reasonable performance: it keeps
+#   trivial-helper inlining and the basic scalar cleanups that make
+#   instrumented code tolerable, without O3's aggressive inlining, unrolling
+#   and vectorization, which multiply the IR LLVM holds (and instruments) for
+#   each codegen unit.
+# - Every other crate (libfuzzer-sys, the vendored protocol crates, serde_json,
+#   the target binaries) uses `opt-level = 2`, one step below the old build.
+#   Those crates were never the peak, so a blanket `opt-level = 1` would cut
+#   little more memory while slowing every dependency the targets call into.
+#   The parsers under test are mostly `ferrum-edge` code and do run slower at
+#   O1; the lane budgets absorb that (see the next paragraph).
+# - `debug = "line-tables-only"` keeps the file:line and inlined-frame data
+#   llvm-symbolizer needs for ASan and libFuzzer crash stacks, and drops the
+#   per-function type and scope DWARF that `debug = 1` ("limited") still emits.
+#   This is a secondary saving: line-tables-only plus `CARGO_BUILD_JOBS=2` alone
+#   still lost the runner (workflow_dispatch run 43900143614), so the opt-level
+#   change above is what carries the fix.
+#
+# Both libFuzzer lanes stay meaningful at these levels: the smoke's `-runs=512`
+# finished in 0-2 seconds per target at O3 against an 8 second cap, and the
+# weekly lane is time-bounded (`-max_total_time=300`), so slower execution only
+# lowers its execution count. `[profile.fuzz]` and `[profile.fuzz-with-sanitizer]`
+# are not selected by cargo-fuzz 0.13.1; they inherit `release` (including the
+# package override) so any build that does select them gets the same profile.
 [profile.release]
-debug = 1
+opt-level = 2
+debug = "line-tables-only"
+
+[profile.release.package.ferrum-edge]
+opt-level = 1
 
 [profile.dev]
 debug = 1
 
 [profile.fuzz]
 inherits = "release"
-debug = 1
+debug = "line-tables-only"
 
 [profile.fuzz-with-sanitizer]
 inherits = "release"
-debug = 1
+debug = "line-tables-only"
