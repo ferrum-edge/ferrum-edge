@@ -72,7 +72,7 @@ bounded() {
     echo "apt budget exhausted before: $*" >&2
     return 124
   fi
-  "${privileged[@]}" env DEBIAN_FRONTEND=noninteractive \
+  ${privileged[@]+"${privileged[@]}"} env DEBIAN_FRONTEND=noninteractive \
     timeout --kill-after=30 "$remaining" "$@"
 }
 
@@ -98,7 +98,7 @@ install_downloaded() {
   local label=$1 sources=$2
   apt_options "$sources"
   echo "::group::apt-get local install ($label) from $sources"
-  "${privileged[@]}" env DEBIAN_FRONTEND=noninteractive \
+  ${privileged[@]+"${privileged[@]}"} env DEBIAN_FRONTEND=noninteractive \
     apt-get "${APT_OPTS[@]}" \
     install -y --no-install-recommends --no-download -- "${packages[@]}"
   echo "::endgroup::"

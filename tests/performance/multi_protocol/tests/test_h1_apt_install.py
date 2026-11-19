@@ -94,19 +94,29 @@ class SourceRewriteTests(unittest.TestCase):
     def test_sources_that_disable_signatures_are_refused(self):
         for text, deb822 in (
                 (DEB822.replace("Signed-By:", "Trusted: yes\nSigned-By:", 1), True),
+                (DEB822.replace("Signed-By:", "Trusted : yes\nSigned-By:", 1), True),
                 (DEB822.replace("Signed-By:", "Trusted: true\nSigned-By:", 1), True),
                 (DEB822.replace("Signed-By:", "Trusted: 1\nSigned-By:", 1), True),
                 (DEB822.replace("Signed-By:", "Trusted: 01\nSigned-By:", 1), True),
                 (DEB822.replace("Signed-By:", "Trusted: 0x1\nSigned-By:", 1), True),
                 (DEB822.replace("Signed-By:", "Trusted: +1\nSigned-By:", 1), True),
+                (DEB822.replace("Signed-By:", "Trusted: 0x100000001\nSigned-By:", 1), True),
+                # Python-only numeric forms (underscores / 0o) are rejected by APT's strtol,
+                # so Enabled keeps its default (true) and the stanza remains active.
+                (DEB822.replace("Signed-By:", "Enabled: 0_0\nTrusted: yes\nSigned-By:", 1), True),
+                (DEB822.replace("Signed-By:", "Enabled: 0x_0\nTrusted: yes\nSigned-By:", 1), True),
+                (DEB822.replace("Signed-By:", "Enabled: 0o0\nTrusted: yes\nSigned-By:", 1), True),
                 (DEB822.replace("Signed-By:", "Allow-Insecure: on\nSigned-By:", 1), True),
                 (DEB822.replace("Signed-By:", "Allow-Downgrade-To-Insecure: yes\nSigned-By:", 1), True),
                 (DEB822.replace("Signed-By:", "Allow-Weak:\n  enable\nSigned-By:", 1), True),
                 ("deb [trusted=yes] http://azure.archive.ubuntu.com/ubuntu noble main\n", False),
                 ('deb [trusted="yes"] http://azure.archive.ubuntu.com/ubuntu noble main\n', False),
+                ("deb [%74rusted=%79es] http://azure.archive.ubuntu.com/ubuntu noble main\n", False),
+                ("deb [trusted%3dyes] http://azure.archive.ubuntu.com/ubuntu noble main\n", False),
                 ("deb [trusted=true] http://azure.archive.ubuntu.com/ubuntu noble main\n", False),
                 ("deb [trusted=01] http://azure.archive.ubuntu.com/ubuntu noble main\n", False),
                 ("deb [trusted=0x1] http://azure.archive.ubuntu.com/ubuntu noble main\n", False),
+                ("deb [trusted=0x100000001] http://azure.archive.ubuntu.com/ubuntu noble main\n", False),
                 ("deb [arch=amd64 allow-insecure=on] http://azure.archive.ubuntu.com/ubuntu noble main\n", False),
                 ("deb [allow-downgrade-to-insecure=1] http://azure.archive.ubuntu.com/ubuntu noble main\n", False),
                 ("deb [allow-weak=with] http://azure.archive.ubuntu.com/ubuntu noble main\n", False)):
@@ -114,20 +124,27 @@ class SourceRewriteTests(unittest.TestCase):
                 sources.rewrite(text, deb822)
 
     def test_disabled_deb822_stanza_is_preserved_and_does_not_block_retry(self):
-        disabled = textwrap.dedent(f"""\
-            Types: deb
-            Enabled: no
-            Trusted: yes
-            URIs: http://us-east-2.ec2.archive.ubuntu.com/ubuntu/
-            Suites: resolute-proposed
-            Components: main
-            Signed-By: {KEYRING}
-            """)
+        disabled = (
+            "Types: deb\n"
+            "URIs: http://us-east-2.ec2.archive.ubuntu.com/ubuntu/\n"
+            "   \n"
+            "Enabled : no\n"
+            "Trusted: yes\n"
+            "Suites: resolute-proposed\n"
+            "Components: main\n"
+            f"Signed-By: {KEYRING}\n"
+        )
         combined = DEB822 + "\n" + disabled
         rewritten, changed = sources.rewrite(combined, deb822=True)
         self.assertTrue(changed)
         self.assertIn(sources.CANONICAL, rewritten)
         self.assertTrue(rewritten.endswith(disabled), "disabled stanza stays untouched")
+
+        # C int narrowing: 0x100000000 narrows to 0 (disabled) per APT StringToBool.
+        narrowed_disabled = disabled.replace("Enabled : no", "Enabled: 0x100000000")
+        rewritten_n, changed_n = sources.rewrite(DEB822 + "\n" + narrowed_disabled, deb822=True)
+        self.assertTrue(changed_n)
+        self.assertTrue(rewritten_n.endswith(narrowed_disabled))
 
     def test_comments_and_explicit_false_trust_flags_are_allowed(self):
         deb822_with_comment = "# Trusted: yes\n" + DEB822.replace("Signed-By:", "Trusted: no\nSigned-By:", 1)
@@ -143,7 +160,7 @@ class SourceRewriteTests(unittest.TestCase):
         self.assertTrue(changed_one)
         self.assertIn(sources.CANONICAL, rewritten_one)
 
-    def test_cli_exit_codes(self):
+    def test_cli_exit_codes_and_crlf_preservation(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             source = root / "ubuntu.sources"
@@ -156,6 +173,22 @@ class SourceRewriteTests(unittest.TestCase):
             source.write_text(DEB822.replace("us-east-2.ec2.archive", "archive"))
             self.assertEqual(sources.main(["x", str(source), str(dest)]), 3)
             self.assertFalse(dest.exists())
+
+            disabled_crlf = (
+                "Types: deb\r\n"
+                "Enabled: no\r\n"
+                "Trusted: yes\r\n"
+                "URIs: http://us-east-2.ec2.archive.ubuntu.com/ubuntu/\r\n"
+                "Suites: resolute-proposed\r\n"
+                "Components: main\r\n"
+                f"Signed-By: {KEYRING}\r\n"
+            )
+            combined_crlf = DEB822.replace("\n", "\r\n") + "\r\n" + disabled_crlf
+            source.write_bytes(combined_crlf.encode("utf-8"))
+            self.assertEqual(sources.main(["x", str(source), str(dest)]), 0)
+            raw_out = dest.read_bytes().decode("utf-8")
+            self.assertIn(f"URIs: {sources.CANONICAL}\r\n", raw_out)
+            self.assertTrue(raw_out.endswith(disabled_crlf), "disabled CRLF stanza preserved byte for byte")
 
 
 FAKE_APT = r"""#!/usr/bin/env bash

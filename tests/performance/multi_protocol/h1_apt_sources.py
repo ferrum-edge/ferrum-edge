@@ -14,7 +14,6 @@ rewritten DEST, 3 when SOURCE names no regional Ubuntu mirror (DEST is not
 written), 2 on usage or parse errors.
 """
 import re
-import shlex
 import sys
 from pathlib import Path
 
@@ -29,36 +28,55 @@ _MIRROR_URI = re.compile(
     r"|mirror\+file:(?:///|/)etc/apt/apt-mirrors\.txt"
     r"|mirror(?:\+https?)?://mirrors\.ubuntu\.com/\S+)$"
 )
-_DEB822_FIELD = re.compile(r"^([A-Za-z][A-Za-z0-9-]*):(.*)$")
-_ONE_LINE = re.compile(
-    r"^(?P<head>\s*deb(?:-src)?\s+(?:(?P<opts>\[[^\]]*\])\s+)?)(?P<uri>\S+)(?P<tail>(?:\s.*)?)$"
-)
+# APT's pkgTagSection::Scan splits on the first `:` and trims ASCII whitespace
+# before the colon.
+_DEB822_FIELD = re.compile(r"^([^:\r\n]+):(.*)$")
+_LINE_SPLIT = re.compile(r"[^\n]*\n|[^\n]+")
+_ONE_LINE_PREFIX = re.compile(r"^\s*deb(?:-src)?[ \t]+")
 _UNSAFE_FIELDS = frozenset({
     "trusted",
     "allow-insecure",
     "allow-weak",
     "allow-downgrade-to-insecure",
 })
-# APT's StringToBool spellings (apt-pkg/contrib/strutl.cc): strtol(val, 0) == 0|1
-# (including C octal such as 01 / 00, hex 0x1, signed +1) plus keyword sets.
-_C_OCTAL = re.compile(r"^[+-]?0[0-7]+$")
+# APT's StringToBool (apt-pkg/contrib/strutl.cc): `int Res = strtol(s, &end, 0)`
+# on LP64 Linux (64-bit signed long narrowed to 32-bit signed int), accepting
+# only strict C integer literals (no Python `_`, `0o`, `0b`, or non-ASCII digits),
+# followed by case-insensitive keyword sets.
+_C_STRTOL_INT = re.compile(r"^[+-]?(?:0[xX][0-9A-Fa-f]+|0[0-7]*|[1-9][0-9]*)$")
+_LONG_MIN = -(1 << 63)
+_LONG_MAX = (1 << 63) - 1
+_HEX_DIGITS = frozenset("0123456789abcdefABCDEF")
+_ASCII_SPACE = frozenset(" \t\r\n\v\f")
+_ASCII_SPACE_STR = " \t\r\n\v\f"
 _APT_TRUE = frozenset({"yes", "true", "with", "on", "enable"})
 _APT_FALSE = frozenset({"no", "false", "without", "off", "disable"})
 
 
 def _parse_apt_bool(value):
     """Return True/False per APT's StringToBool, or None if unrecognized."""
-    s = value.strip()
+    s = value.strip(_ASCII_SPACE_STR)
     if not s:
         return None
-    try:
-        num = int(s, 8) if _C_OCTAL.match(s) else int(s, 0)
-    except ValueError:
-        num = None
-    if num == 1:
-        return True
-    if num == 0:
-        return False
+    if _C_STRTOL_INT.match(s):
+        sign = -1 if s[0] == "-" else 1
+        mag = s[1:] if s[0] in "+-" else s
+        if mag.startswith(("0x", "0X")):
+            val = sign * int(mag, 16)
+        elif mag.startswith("0") and len(mag) > 1:
+            val = sign * int(mag, 8)
+        else:
+            val = sign * int(mag, 10)
+        if val > _LONG_MAX:
+            val = _LONG_MAX
+        elif val < _LONG_MIN:
+            val = _LONG_MIN
+        res = ((val + (1 << 31)) % (1 << 32)) - (1 << 31)
+        if res == 1:
+            return True
+        if res == 0:
+            return False
+        return None
     low = s.lower()
     if low in _APT_TRUE:
         return True
@@ -94,22 +112,48 @@ def _rewrite_uris(value):
     return leading + " ".join(rewritten), True
 
 
-def _decode_one_line_options(opts_bracket):
-    """Parse APT one-line `[k=v ...]` options, honoring quoted values."""
-    inner = opts_bracket[1:-1].strip()
-    if not inner:
-        return []
-    # APT accepts quoted values such as trusted="yes" or [signed-by="/path"].
-    try:
-        tokens = shlex.split(inner, posix=True)
-    except ValueError as error:
-        raise ValueError(f"malformed apt option bracket {opts_bracket!r}: {error}") from error
-    pairs = []
-    for token in tokens:
-        if "=" not in token:
+def _apt_dequote_word(raw):
+    """Decode %HH escapes and strip double quotes like APT's ParseQuoteWord."""
+    chars = []
+    i, n = 0, len(raw)
+    while i < n:
+        ch = raw[i]
+        if ch == "%" and i + 2 < n and raw[i + 1] in _HEX_DIGITS and raw[i + 2] in _HEX_DIGITS:
+            chars.append(chr(int(raw[i + 1:i + 3], 16)))
+            i += 3
             continue
-        key, value = token.split("=", 1)
-        pairs.append((key.strip(), value.strip()))
+        if ch != '"':
+            chars.append(ch)
+        i += 1
+    return "".join(chars)
+
+
+def _decode_one_line_options(opts_bracket):
+    """Parse APT one-line `[k=v ...]` options per ParseQuoteWord + sourcelist.cc."""
+    inner = opts_bracket[1:-1]
+    pairs = []
+    i, n = 0, len(inner)
+    while True:
+        while i < n and inner[i] in _ASCII_SPACE:
+            i += 1
+        if i >= n:
+            break
+        start = i
+        while i < n and inner[i] not in _ASCII_SPACE:
+            if inner[i] == '"':
+                close = inner.find('"', i + 1)
+                if close == -1:
+                    raise ValueError(f"unterminated quote in apt option bracket {opts_bracket!r}")
+                i = close + 1
+            else:
+                i += 1
+        option = _apt_dequote_word(inner[start:i])
+        if "=" not in option:
+            raise ValueError(f"malformed apt option {option!r} in {opts_bracket!r}")
+        key, value = option.split("=", 1)
+        if not key:
+            raise ValueError(f"empty apt option key in {opts_bracket!r}")
+        pairs.append((key, value))
     return pairs
 
 
@@ -123,21 +167,63 @@ def _check_one_line_options(opts_bracket):
             )
 
 
+def _parse_one_line(body):
+    """Parse `(head, opts_bracket, uri, tail)` from a one-line deb entry."""
+    prefix = _ONE_LINE_PREFIX.match(body)
+    if not prefix:
+        return None
+    pos, n = prefix.end(), len(body)
+    opts_bracket = None
+    if pos < n and body[pos] == "[":
+        i = pos + 1
+        end_bracket = -1
+        while i < n:
+            if body[i] == '"':
+                close = body.find('"', i + 1)
+                if close == -1:
+                    raise ValueError(f"unterminated quote in apt option bracket on line {body!r}")
+                i = close + 1
+                continue
+            if body[i] == "]":
+                end_bracket = i
+                break
+            i += 1
+        if end_bracket == -1:
+            raise ValueError(f"unterminated apt option bracket on line {body!r}")
+        opts_bracket = body[pos:end_bracket + 1]
+        pos = end_bracket + 1
+        ws_start = pos
+        while pos < n and body[pos] in _ASCII_SPACE:
+            pos += 1
+        if pos == ws_start:
+            raise ValueError(f"malformed apt source line after option bracket: {body!r}")
+    uri_start = pos
+    while pos < n and body[pos] not in _ASCII_SPACE:
+        pos += 1
+    if pos == uri_start:
+        return None
+    return body[:uri_start], opts_bracket, body[uri_start:pos], body[pos:]
+
+
 def _process_deb822_stanza(lines):
     """Inspect and rewrite a single deb822 stanza; return (lines, changed)."""
     fields = {}
     active_field = None
     for line in lines:
         body = line.rstrip("\r\n")
-        if body.startswith("#") or not body.strip():
+        if body.startswith("#"):
             continue
-        field = None if body.startswith((" ", "\t")) else _DEB822_FIELD.match(body)
-        if field:
-            active_field = field.group(1).lower()
-            val = field.group(2).strip()
-            fields[active_field] = [val] if val else []
-        elif active_field and body[:1] in (" ", "\t") and body.strip() != ".":
-            fields[active_field].append(body.strip())
+        if body[:1] in (" ", "\t", "\v", "\f"):
+            stripped = body.strip()
+            if active_field and stripped and stripped != ".":
+                fields[active_field].append(stripped)
+            continue
+        field = _DEB822_FIELD.match(body)
+        if not field:
+            raise ValueError(f"malformed deb822 line: {body!r}")
+        active_field = field.group(1).rstrip(" \t\v\f").lower()
+        val = field.group(2).strip()
+        fields[active_field] = [val] if val else []
 
     # APT skips stanzas with Enabled set to a false boolean spelling.
     if "enabled" in fields and _is_apt_false(" ".join(fields["enabled"])):
@@ -154,20 +240,23 @@ def _process_deb822_stanza(lines):
     for line in lines:
         body = line.rstrip("\r\n")
         ending = line[len(body):]
-        if body.startswith("#") or not body.strip():
+        if body.startswith("#"):
             out.append(body + ending)
             continue
-        field = None if body.startswith((" ", "\t")) else _DEB822_FIELD.match(body)
+        if body[:1] in (" ", "\t", "\v", "\f"):
+            if in_uris and body.strip() and body.strip() != ".":
+                value, hit = _rewrite_uris(body)
+                changed |= hit
+                body = value
+            out.append(body + ending)
+            continue
+        field = _DEB822_FIELD.match(body)
         if field:
-            in_uris = field.group(1).lower() == "uris"
+            in_uris = field.group(1).rstrip(" \t\v\f").lower() == "uris"
             if in_uris:
                 value, hit = _rewrite_uris(field.group(2))
                 changed |= hit
                 body = f"{field.group(1)}:{value}"
-        elif in_uris and body[:1] in (" ", "\t") and body.strip() != ".":
-            value, hit = _rewrite_uris(body)
-            changed |= hit
-            body = value
         out.append(body + ending)
     return out, changed
 
@@ -175,8 +264,10 @@ def _process_deb822_stanza(lines):
 def rewrite_deb822(text):
     out, changed = [], False
     stanza = []
-    for line in text.splitlines(keepends=True):
-        if not line.strip():
+    # APT's pkgTagSection::Scan ends a record only on an empty line (\n or \r\n),
+    # NOT on a whitespace-only continuation line such as "  \n".
+    for line in _LINE_SPLIT.findall(text):
+        if line.rstrip("\r\n") == "":
             if stanza:
                 rewritten, hit = _process_deb822_stanza(stanza)
                 out.extend(rewritten)
@@ -194,17 +285,18 @@ def rewrite_deb822(text):
 
 def rewrite_one_line(text):
     out, changed = [], False
-    for line in text.splitlines(keepends=True):
+    for line in _LINE_SPLIT.findall(text):
         body = line.rstrip("\r\n")
         ending = line[len(body):]
-        if body.lstrip().startswith("#"):
+        if body.lstrip().startswith("#") or not body.strip():
             out.append(body + ending)
             continue
-        match = _ONE_LINE.match(body)
-        if match:
-            _check_one_line_options(match.group("opts"))
-            if is_mirror(match.group("uri")):
-                body = match.group("head") + CANONICAL + match.group("tail")
+        parsed = _parse_one_line(body)
+        if parsed:
+            head, opts_bracket, uri, tail = parsed
+            _check_one_line_options(opts_bracket)
+            if is_mirror(uri):
+                body = head + CANONICAL + tail
                 changed = True
         out.append(body + ending)
     return "".join(out), changed
@@ -225,14 +317,17 @@ def main(argv):
         print("SOURCE and DEST must use the same apt source format suffix", file=sys.stderr)
         return 2
     try:
-        text, changed = rewrite(source.read_text(), deb822)
+        with source.open("r", encoding="utf-8", newline="") as handle:
+            raw = handle.read()
+        text, changed = rewrite(raw, deb822)
     except (OSError, UnicodeDecodeError, ValueError) as error:
         print(f"cannot rewrite {source}: {error}", file=sys.stderr)
         return 2
     if not changed:
         print(f"{source} names no regional Ubuntu archive mirror", file=sys.stderr)
         return 3
-    dest.write_text(text)
+    with dest.open("w", encoding="utf-8", newline="") as handle:
+        handle.write(text)
     return 0
 
 
