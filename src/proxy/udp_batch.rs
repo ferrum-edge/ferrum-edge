@@ -33,8 +33,10 @@ use std::net::SocketAddr;
 pub struct RecvMmsgBatch {
     #[cfg(feature = "bench-udp-profile")]
     pub profile_direction: crate::udp_profile::Direction,
-    /// Per-slot datagram buffers. Each is MAX_DGRAM_SIZE bytes.
-    bufs: Vec<Vec<u8>>,
+    /// Per-slot uninitialized datagram buffers. Slot `i` starts at L1D-staggered
+    /// offset `(i & 7) * 512` bytes to avoid 64 KiB cache-set aliasing across
+    /// burst receives while keeping untouched tail pages unfaulted.
+    bufs: Vec<Vec<std::mem::MaybeUninit<u8>>>,
     /// Per-slot source addresses (converted from sockaddr_storage after recv).
     result_addrs: Vec<SocketAddr>,
     /// Per-slot received datagram lengths (from mmsghdr.msg_len).
@@ -45,10 +47,15 @@ pub struct RecvMmsgBatch {
     iovecs: Vec<libc::iovec>,
     /// Pre-allocated mmsghdr array (one per slot).
     msgs: Vec<libc::mmsghdr>,
-    /// Per-slot cmsg buffers sized for UDP_GRO + IP_PKTINFO / IPV6_PKTINFO.
-    /// A single allocation large enough for the worst-case (v6) so both v4
-    /// and v6 datagrams land in the same buffer without a resize.
-    cmsg_bufs: Vec<Vec<u8>>,
+    /// Contiguous flat cmsg buffer (`capacity * cmsg_hdrs_per_slot` headers)
+    /// sized for UDP_GRO + IP_PKTINFO / IPV6_PKTINFO (+ optional
+    /// RECVORIGDSTADDR). Backed by `Vec<libc::cmsghdr>` so every slot base is
+    /// strictly `cmsghdr`-aligned by the type system.
+    cmsg_buf: Vec<libc::cmsghdr>,
+    /// Number of `libc::cmsghdr` elements reserved per slot.
+    cmsg_hdrs_per_slot: usize,
+    /// Byte length per slot in `cmsg_buf`.
+    cmsg_stride: usize,
     /// Per-slot GRO segment size parsed from cmsg after recvmmsg.
     /// `None` = single datagram (no GRO coalescing), `Some(n)` = coalesced with segment size n.
     gro_segments: Vec<Option<u16>>,
@@ -72,6 +79,13 @@ pub struct RecvMmsgBatch {
     parse_orig_dst: bool,
     /// Maximum datagrams per recvmmsg call.
     capacity: usize,
+    /// High-water mark of slots whose static pointer fields (`msg_name`,
+    /// `msg_iov`, `msg_control`) have been initialized.
+    initialized: usize,
+    /// Number of slots written by the kernel in the previous `recvmmsg` call
+    /// whose mutable length/flag fields must be reset before the next syscall.
+    /// Zero after `WouldBlock` so trailing drain probes touch zero slots.
+    dirty_count: usize,
     /// Number of datagrams received in the last `recv()` call.
     count: usize,
 }
@@ -104,9 +118,10 @@ pub enum SendMmsgPushResult {
 }
 
 // SAFETY: The raw pointers in `iovecs` (`*mut c_void`) and `msgs` (`*mut iovec`)
-// point into `Vec` buffers owned by the same struct. They are only dereferenced
-// inside `recv()` which rebuilds them from scratch before each `recvmmsg` call.
-// The struct is exclusively owned by a single tokio task (the UDP listener loop).
+// point into fixed-size heap `Vec` buffers (`bufs`, `raw_addrs`, `iovecs`,
+// `cmsg_buf`) owned by this struct that never resize or reallocate after
+// `new()`. They are only dereferenced inside `recv()`. The struct is
+// exclusively owned by a single tokio task (the UDP listener loop).
 #[cfg(target_os = "linux")]
 unsafe impl Send for RecvMmsgBatch {}
 
@@ -125,11 +140,26 @@ impl RecvMmsgBatch {
         let capacity = capacity.max(1);
         // cmsg buffer must hold UDP_GRO (u16) + IP_PKTINFO / IPV6_PKTINFO in the
         // same allocation; sized for the v6 worst case so both families fit.
-        let cmsg_space = crate::socket_opts::recv_cmsg_space();
+        // Backed by `Vec<libc::cmsghdr>` so every slot is guaranteed aligned
+        // for `CMSG_FIRSTHDR`/`CMSG_NXTHDR`.
+        let hdr_size = std::mem::size_of::<libc::cmsghdr>();
+        let cmsg_raw = crate::socket_opts::recv_cmsg_space();
+        let cmsg_hdrs_per_slot = cmsg_raw.div_ceil(hdr_size).max(1);
+        let cmsg_stride = cmsg_hdrs_per_slot * hdr_size;
         Self {
             #[cfg(feature = "bench-udp-profile")]
             profile_direction: crate::udp_profile::Direction::Other,
-            bufs: (0..capacity).map(|_| vec![0u8; MAX_DGRAM_SIZE]).collect(),
+            bufs: (0..capacity)
+                .map(|i| {
+                    let cap = MAX_DGRAM_SIZE + (i & 7) * 512;
+                    let mut v = Vec::<std::mem::MaybeUninit<u8>>::with_capacity(cap);
+                    // SAFETY: `MaybeUninit<u8>` requires no initialization; the
+                    // kernel writes `msg_len` bytes starting at `(i & 7) * 512`
+                    // before `datagram(i)` reads them.
+                    unsafe { v.set_len(cap) };
+                    v
+                })
+                .collect(),
             result_addrs: vec![SocketAddr::from(([0, 0, 0, 0], 0)); capacity],
             result_lens: vec![0u32; capacity],
             raw_addrs: vec![unsafe { std::mem::zeroed() }; capacity],
@@ -141,12 +171,16 @@ impl RecvMmsgBatch {
                 capacity
             ],
             msgs: vec![unsafe { std::mem::zeroed() }; capacity],
-            cmsg_bufs: (0..capacity).map(|_| vec![0u8; cmsg_space]).collect(),
+            cmsg_buf: vec![unsafe { std::mem::zeroed() }; capacity * cmsg_hdrs_per_slot],
+            cmsg_hdrs_per_slot,
+            cmsg_stride,
             gro_segments: vec![None; capacity],
             local_addrs: vec![None; capacity],
             orig_dsts: vec![None; capacity],
             parse_orig_dst,
             capacity,
+            initialized: 0,
+            dirty_count: 0,
             count: 0,
         }
     }
@@ -162,10 +196,13 @@ impl RecvMmsgBatch {
     /// Panics (debug) if `i` is out of bounds.
     pub fn datagram(&self, i: usize) -> (&[u8], SocketAddr) {
         debug_assert!(i < self.count);
-        (
-            &self.bufs[i][..self.result_lens[i] as usize],
-            self.result_addrs[i],
-        )
+        let offset = (i & 7) * 512;
+        let len = (self.result_lens[i] as usize).min(MAX_DGRAM_SIZE);
+        // SAFETY: `recvmmsg` wrote `len` initialized bytes at `bufs[i][offset..]`.
+        let slice = unsafe {
+            std::slice::from_raw_parts(self.bufs[i].as_ptr().add(offset).cast::<u8>(), len)
+        };
+        (slice, self.result_addrs[i])
     }
 
     /// Returns the GRO segment size for slot `i`, if the kernel coalesced
@@ -220,29 +257,43 @@ impl RecvMmsgBatch {
             return Err(std::io::Error::from(std::io::ErrorKind::WouldBlock));
         }
 
-        // Rebuild pointer arrays. This is cheap (N pointer writes) and avoids
-        // self-referential struct issues.
-        for i in 0..n {
-            self.raw_addrs[i] = unsafe { std::mem::zeroed() };
+        // Reset only the slots the kernel actually wrote in the previous call.
+        // Static pointer fields (`msg_name`, `msg_iov`, `msg_control`) are
+        // wired once per slot up to `self.initialized`, and `raw_addrs` /
+        // `cmsg_buf` do not need pre-zeroing because the kernel writes
+        // `msg_namelen` / `msg_controllen` bytes and reports both lengths back.
+        let addr_cap = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+        let cmsg_stride = self.cmsg_stride;
+        for i in 0..self.dirty_count {
+            let hdr = &mut self.msgs[i].msg_hdr;
+            hdr.msg_namelen = addr_cap;
+            hdr.msg_controllen = cmsg_stride;
+            hdr.msg_flags = 0;
+            self.msgs[i].msg_len = 0;
+        }
+        self.dirty_count = 0;
 
-            self.iovecs[i] = libc::iovec {
-                iov_base: self.bufs[i].as_mut_ptr() as *mut libc::c_void,
-                iov_len: MAX_DGRAM_SIZE,
-            };
+        if n > self.initialized {
+            let cmsg_base = self.cmsg_buf.as_mut_ptr();
+            let cmsg_hdrs_per_slot = self.cmsg_hdrs_per_slot;
+            for i in self.initialized..n {
+                let offset = (i & 7) * 512;
+                self.iovecs[i] = libc::iovec {
+                    iov_base: unsafe { self.bufs[i].as_mut_ptr().add(offset) } as *mut libc::c_void,
+                    iov_len: MAX_DGRAM_SIZE,
+                };
 
-            // Zero the cmsg buffer for GRO metadata.
-            self.cmsg_bufs[i].fill(0);
-
-            self.msgs[i] = unsafe { std::mem::zeroed() };
-            self.msgs[i].msg_hdr.msg_name =
-                std::ptr::addr_of_mut!(self.raw_addrs[i]) as *mut libc::c_void;
-            self.msgs[i].msg_hdr.msg_namelen =
-                std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
-            self.msgs[i].msg_hdr.msg_iov = std::ptr::addr_of_mut!(self.iovecs[i]);
-            self.msgs[i].msg_hdr.msg_iovlen = 1;
-            // Attach cmsg buffer for GRO segment size metadata.
-            self.msgs[i].msg_hdr.msg_control = self.cmsg_bufs[i].as_mut_ptr() as *mut libc::c_void;
-            self.msgs[i].msg_hdr.msg_controllen = self.cmsg_bufs[i].len();
+                self.msgs[i] = unsafe { std::mem::zeroed() };
+                self.msgs[i].msg_hdr.msg_name =
+                    std::ptr::addr_of_mut!(self.raw_addrs[i]) as *mut libc::c_void;
+                self.msgs[i].msg_hdr.msg_namelen = addr_cap;
+                self.msgs[i].msg_hdr.msg_iov = std::ptr::addr_of_mut!(self.iovecs[i]);
+                self.msgs[i].msg_hdr.msg_iovlen = 1;
+                self.msgs[i].msg_hdr.msg_control =
+                    unsafe { cmsg_base.add(i * cmsg_hdrs_per_slot) } as *mut libc::c_void;
+                self.msgs[i].msg_hdr.msg_controllen = cmsg_stride;
+            }
+            self.initialized = n;
         }
 
         // Single syscall to receive up to n datagrams.
@@ -265,6 +316,7 @@ impl RecvMmsgBatch {
         }
 
         let received = ret as usize;
+        self.dirty_count = received;
         #[cfg(feature = "bench-udp-profile")]
         {
             crate::udp_profile::recvmmsg(self.profile_direction, n, &Ok(received));
@@ -282,19 +334,24 @@ impl RecvMmsgBatch {
         for i in 0..received {
             self.result_lens[i] = self.msgs[i].msg_len;
             #[cfg(feature = "bench-udp-profile")]
-            let address = sockaddr_storage_to_std(&self.raw_addrs[i]).inspect_err(|_| {
-                crate::udp_profile::batch_count(
-                    self.profile_direction,
-                    BatchField::RxParseErrors,
-                    1,
-                );
-            });
+            let address =
+                sockaddr_storage_to_std(&self.raw_addrs[i], self.msgs[i].msg_hdr.msg_namelen)
+                    .inspect_err(|_| {
+                        crate::udp_profile::batch_count(
+                            self.profile_direction,
+                            BatchField::RxParseErrors,
+                            1,
+                        );
+                    });
             #[cfg(not(feature = "bench-udp-profile"))]
-            let address = sockaddr_storage_to_std(&self.raw_addrs[i]);
+            let address =
+                sockaddr_storage_to_std(&self.raw_addrs[i], self.msgs[i].msg_hdr.msg_namelen);
             self.result_addrs[i] = address?;
-            // Parse GRO cmsg to get segment size (if kernel coalesced datagrams).
-            self.gro_segments[i] =
-                crate::socket_opts::extract_gro_segment_size(&self.msgs[i].msg_hdr);
+            // Single-pass parse of GRO, IP(v6)_PKTINFO, and optional orig-dst
+            // ancillary messages. Exits immediately when `msg_controllen == 0`.
+            let cmsgs =
+                crate::socket_opts::extract_recv_cmsgs(&self.msgs[i].msg_hdr, parse_orig_dst);
+            self.gro_segments[i] = cmsgs.gro_segment;
             #[cfg(feature = "bench-udp-profile")]
             {
                 if self.msgs[i].msg_hdr.msg_flags & libc::MSG_TRUNC != 0 {
@@ -334,32 +391,36 @@ impl RecvMmsgBatch {
                     );
                 }
             }
-            // Parse IP(v6)_PKTINFO cmsg to recover the local destination address.
-            // Present when the socket has IP_PKTINFO / IPV6_RECVPKTINFO enabled;
-            // `None` otherwise (non-Linux, pktinfo disabled, or connected socket).
-            self.local_addrs[i] =
-                crate::socket_opts::extract_pktinfo_local_addr(&self.msgs[i].msg_hdr);
-            // Parse IP(v6)_RECVORIGDSTADDR cmsg to recover the original
-            // (pre-TPROXY) destination. Only the mesh UDP capture socket enables
-            // `IP_RECVORIGDSTADDR`, so gate the scan on `parse_orig_dst`: plain
-            // UDP proxy listeners would always get `None` and must not pay the
-            // ancillary-data walk per datagram on the hot path (codex r2 P2).
-            self.orig_dsts[i] = if parse_orig_dst {
-                crate::socket_opts::extract_origdst(&self.msgs[i].msg_hdr)
-            } else {
-                None
-            };
+            self.local_addrs[i] = cmsgs.pktinfo;
+            self.orig_dsts[i] = cmsgs.orig_dst;
         }
         self.count = received;
         Ok(received)
     }
 }
 
-/// Convert a `libc::sockaddr_storage` to `std::net::SocketAddr`.
+/// Convert a `libc::sockaddr_storage` to `std::net::SocketAddr`, verifying
+/// that `addr_len` covers the address family's sockaddr struct.
 #[cfg(target_os = "linux")]
-fn sockaddr_storage_to_std(addr: &libc::sockaddr_storage) -> std::io::Result<SocketAddr> {
+#[inline]
+fn sockaddr_storage_to_std(
+    addr: &libc::sockaddr_storage,
+    addr_len: libc::socklen_t,
+) -> std::io::Result<SocketAddr> {
+    if (addr_len as usize) < std::mem::size_of::<libc::sa_family_t>() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "truncated sockaddr from recvmmsg",
+        ));
+    }
     match addr.ss_family as libc::c_int {
         libc::AF_INET => {
+            if (addr_len as usize) < std::mem::size_of::<libc::sockaddr_in>() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "truncated IPv4 sockaddr from recvmmsg",
+                ));
+            }
             let a = unsafe { &*(addr as *const _ as *const libc::sockaddr_in) };
             Ok(SocketAddr::new(
                 std::net::IpAddr::V4(std::net::Ipv4Addr::from(u32::from_be(a.sin_addr.s_addr))),
@@ -367,6 +428,12 @@ fn sockaddr_storage_to_std(addr: &libc::sockaddr_storage) -> std::io::Result<Soc
             ))
         }
         libc::AF_INET6 => {
+            if (addr_len as usize) < std::mem::size_of::<libc::sockaddr_in6>() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "truncated IPv6 sockaddr from recvmmsg",
+                ));
+            }
             let a = unsafe { &*(addr as *const _ as *const libc::sockaddr_in6) };
             Ok(SocketAddr::V6(std::net::SocketAddrV6::new(
                 std::net::Ipv6Addr::from(a.sin6_addr.s6_addr),
@@ -379,6 +446,127 @@ fn sockaddr_storage_to_std(addr: &libc::sockaddr_storage) -> std::io::Result<Soc
             std::io::ErrorKind::InvalidData,
             format!("unsupported address family: {}", family),
         )),
+    }
+}
+
+/// Lightweight batched receive for a connected plain-UDP backend socket.
+///
+/// Connected backend sockets need neither source addresses (`msg_name = NULL`)
+/// nor ancillary control messages (`msg_control = NULL`). Slot payload buffers
+/// are allocated uninitialized (`MaybeUninit<u8>`) so spare slots beyond the
+/// first datagram never fault pages or pollute L1/L2 cache during single-packet
+/// request/response exchanges, while bursts still drain up to `capacity`
+/// datagrams in a single `recvmmsg(2)` crossing.
+///
+/// When `recvmmsg(fd, msgs, n, MSG_DONTWAIT, NULL)` returns `0 < k < n`, the
+/// kernel already drained the socket queue to `EAGAIN` inside that single
+/// syscall, allowing the caller to clear Tokio's edge-triggered readiness
+/// without issuing a trailing `try_recv()` syscall.
+#[cfg(target_os = "linux")]
+pub struct BackendRecvBatch {
+    bufs: Vec<Vec<std::mem::MaybeUninit<u8>>>,
+    iovecs: Vec<libc::iovec>,
+    msgs: Vec<libc::mmsghdr>,
+    capacity: usize,
+    initialized: usize,
+    dirty_count: usize,
+    count: usize,
+}
+
+// SAFETY: `iovecs` and `msgs` point into fixed-size heap `Vec` buffers owned by
+// this struct that never resize or reallocate after `new()`. Owned exclusively
+// by one per-session reply task.
+#[cfg(target_os = "linux")]
+unsafe impl Send for BackendRecvBatch {}
+
+#[cfg(target_os = "linux")]
+impl BackendRecvBatch {
+    pub fn new(capacity: usize) -> Self {
+        let capacity = capacity.max(1);
+        let bufs = (0..capacity)
+            .map(|_| {
+                let mut buf = Vec::<std::mem::MaybeUninit<u8>>::with_capacity(MAX_DGRAM_SIZE);
+                // SAFETY: `MaybeUninit<u8>` requires no initialization; the
+                // kernel writes `msg_len` bytes before `datagram()` reads them.
+                unsafe { buf.set_len(MAX_DGRAM_SIZE) };
+                buf
+            })
+            .collect();
+        Self {
+            bufs,
+            iovecs: vec![
+                libc::iovec {
+                    iov_base: std::ptr::null_mut(),
+                    iov_len: 0,
+                };
+                capacity
+            ],
+            msgs: vec![unsafe { std::mem::zeroed() }; capacity],
+            capacity,
+            initialized: 0,
+            dirty_count: 0,
+            count: 0,
+        }
+    }
+
+    #[inline]
+    pub fn capacity(&self) -> usize {
+        self.capacity
+    }
+
+    /// Receive up to `max_count` datagrams from a connected UDP socket.
+    pub fn recv(&mut self, fd: std::os::fd::RawFd, max_count: usize) -> std::io::Result<usize> {
+        let n = max_count.min(self.capacity);
+        if n == 0 {
+            self.count = 0;
+            return Err(std::io::Error::from(std::io::ErrorKind::WouldBlock));
+        }
+
+        for i in 0..self.dirty_count {
+            self.msgs[i].msg_hdr.msg_flags = 0;
+            self.msgs[i].msg_len = 0;
+        }
+        self.dirty_count = 0;
+
+        if n > self.initialized {
+            for i in self.initialized..n {
+                self.iovecs[i] = libc::iovec {
+                    iov_base: self.bufs[i].as_mut_ptr() as *mut libc::c_void,
+                    iov_len: MAX_DGRAM_SIZE,
+                };
+                self.msgs[i] = unsafe { std::mem::zeroed() };
+                self.msgs[i].msg_hdr.msg_iov = std::ptr::addr_of_mut!(self.iovecs[i]);
+                self.msgs[i].msg_hdr.msg_iovlen = 1;
+            }
+            self.initialized = n;
+        }
+
+        let ret = unsafe {
+            libc::recvmmsg(
+                fd,
+                self.msgs.as_mut_ptr(),
+                n as libc::c_uint,
+                libc::MSG_DONTWAIT,
+                std::ptr::null_mut(),
+            )
+        };
+        if ret < 0 {
+            self.count = 0;
+            return Err(std::io::Error::last_os_error());
+        }
+        let received = ret as usize;
+        self.dirty_count = received;
+        self.count = received;
+        Ok(received)
+    }
+
+    /// Payload slice for slot `i` (`i < received`).
+    #[inline]
+    pub fn datagram(&self, i: usize) -> &[u8] {
+        debug_assert!(i < self.count);
+        let len = (self.msgs[i].msg_len as usize).min(MAX_DGRAM_SIZE);
+        // SAFETY: `recvmmsg` initialized the first `len` bytes of `bufs[i]`.
+        unsafe { std::slice::from_raw_parts(self.bufs[i].as_ptr().cast::<u8>(), len) }
     }
 }
 
@@ -953,23 +1141,16 @@ impl GsoBatchBuf {
         if self.count == 0 {
             return Ok(0);
         }
+        // Avoid attaching a UDP_SEGMENT (GSO) cmsg when flushing a single
+        // datagram: there is nothing for the kernel to segment, so passing
+        // `None` skips `udp_cmsg_send` and GSO skb setup on the kernel side.
+        let gso_seg = (self.count > 1).then_some(self.segment_size as u16);
         let result = if let Some(local) = local {
-            crate::socket_opts::send_with_pktinfo(
-                fd,
-                &self.buf,
-                local,
-                dest,
-                dest_len,
-                Some(self.segment_size as u16),
-            )
+            crate::socket_opts::send_with_pktinfo(fd, &self.buf, local, dest, dest_len, gso_seg)
+        } else if let Some(seg) = gso_seg {
+            crate::socket_opts::send_with_gso(fd, &self.buf, seg, dest, dest_len)
         } else {
-            crate::socket_opts::send_with_gso(
-                fd,
-                &self.buf,
-                self.segment_size as u16,
-                dest,
-                dest_len,
-            )
+            crate::socket_opts::send_with_prebuilt_pktinfo(fd, &self.buf, dest, dest_len, None)
         };
         #[cfg(feature = "bench-udp-profile")]
         crate::udp_profile::gso(
