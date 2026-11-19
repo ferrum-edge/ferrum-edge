@@ -216,7 +216,6 @@ impl BackendPendingScopeBase {
         namespace: &str,
         upstream_id: &str,
         k8s_service_uid: Option<&str>,
-        admission_upstream_id: None,
         subset: Option<&str>,
     ) -> Self {
         let mut buf = String::with_capacity(

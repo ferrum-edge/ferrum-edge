@@ -3067,7 +3067,6 @@ fn node_waypoint_udp_listener_upstream(
     namespace: &str,
     targets: Vec<UpstreamTarget>,
     k8s_service_uid: Option<String>,
-    admission_upstream_id: None,
     now: chrono::DateTime<chrono::Utc>,
 ) -> Upstream {
     Upstream {
@@ -3103,6 +3102,7 @@ fn node_waypoint_udp_listener_upstream(
         created_at: now,
         updated_at: now,
         k8s_service_uid,
+        admission_upstream_id: None,
         pending_limit_scope: None,
     }
 }
@@ -12371,7 +12371,6 @@ fn mesh_outbound_route_upstream(
     service_fqdn: &str,
     targets: Vec<UpstreamTarget>,
     k8s_service_uid: Option<String>,
-    admission_upstream_id: None,
     now: chrono::DateTime<chrono::Utc>,
 ) -> Upstream {
     Upstream {
@@ -12406,6 +12405,7 @@ fn mesh_outbound_route_upstream(
         dispatch_port_override_fallback: None,
         api_spec_id: None,
         k8s_service_uid,
+        admission_upstream_id: None,
         pending_limit_scope: None,
         created_at: now,
         updated_at: now,
