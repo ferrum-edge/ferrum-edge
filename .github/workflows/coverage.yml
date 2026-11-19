@@ -172,10 +172,10 @@ jobs:
       # --test` builds under the test profile).
       CARGO_PROFILE_DEV_DEBUG: "line-tables-only"
       CARGO_PROFILE_TEST_DEBUG: "line-tables-only"
-    # Unit shards compile large instrumented unit-test crates whose rustc
-    # frontend can exceed hosted-runner RAM cold — the swap step below keeps the
-    # VM alive through that window (see ci.yml test-unit for the incident
-    # pattern).
+    # The lib-unit shard compiles the aggregated tests/unit_tests binary,
+    # whose single-crate rustc frontend exceeds hosted-runner RAM cold — the
+    # swap step below keeps the VM alive through that window (see ci.yml
+    # test-unit for the incident pattern).
     strategy:
       fail-fast: false
       matrix:
@@ -197,10 +197,10 @@ jobs:
       - uses: ./.github/actions/setup-rust-ci
         with:
           shared-key: "ci-coverage"
-          # The unit-core shard compiles the superset of the instrumented
-          # dependency graph (matching ci.yml's core shard for ci-debug) and is
-          # the lane's sole producer on main.
-          save: ${{ matrix.shard == 'unit-core' && 'true' || 'false' }}
+          # Keep one designated cache producer for ci-coverage: lib-unit today
+          # and unit-core once coverage_plan.py switches to split unit shards
+          # (phase 2 of the required-workflow-safe split).
+          save: ${{ (matrix.kind == 'lib-unit' || matrix.shard == 'unit-core') && 'true' || 'false' }}
           # Publish a complete instrumented dependency lane only after success.
           cache-on-failure: "false"
 
@@ -216,40 +216,55 @@ jobs:
         run: cargo llvm-cov clean --workspace
 
       - name: Run lib and unit coverage
-        if: matrix.kind == 'unit'
+        if: matrix.kind == 'lib-unit' || matrix.kind == 'unit'
         run: |
           set -euo pipefail
-          # Each unit shard compiles and runs exactly one instrumented target,
-          # mirroring ci.yml's test-unit split so no hosted runner compiles
-          # multiple giant unit-test binaries concurrently (runs 44421056963 and
-          # 44464896365 lost the runner in the old combined lib-unit shard).
-          case "$UNIT_TARGET" in
-            "")
-              cargo llvm-cov --no-report \
-                --lib
-              ;;
-            unit_tests)
-              cargo llvm-cov --no-report \
-                --test unit_tests
-              ;;
-            unit_plugins_a_tests)
-              cargo llvm-cov --no-report \
-                --test unit_plugins_a_tests
-              ;;
-            unit_plugins_b_tests)
-              cargo llvm-cov --no-report \
-                --test unit_plugins_b_tests
-              ;;
-            unit_gateway_core_tests)
-              cargo llvm-cov --no-report \
-                --test unit_gateway_core_tests
-              ;;
-            *)
-              echo "::error::unexpected unit coverage target: ${UNIT_TARGET}" >&2
-              exit 1
-              ;;
-          esac
+          # Phase 1 of splitting lib-unit into five unit shards (runs 44421056963
+          # and 44464896365 lost the runner in the combined shard). Because the
+          # required-workflows ruleset executes coverage.yml from refs/heads/main
+          # while coverage_plan.py runs from the PR tree, accept both the legacy
+          # `lib-unit` row and the split `unit` rows here before switching the
+          # planner in phase 2.
+          if [ "$COVERAGE_KIND" = "lib-unit" ]; then
+            cargo llvm-cov --no-report \
+              --lib \
+              --test unit_tests \
+              --test unit_plugins_a_tests \
+              --test unit_plugins_b_tests \
+              --test unit_gateway_core_tests
+          elif [ "$COVERAGE_KIND" = "unit" ]; then
+            case "$UNIT_TARGET" in
+              "")
+                cargo llvm-cov --no-report \
+                  --lib
+                ;;
+              unit_tests)
+                cargo llvm-cov --no-report \
+                  --test unit_tests
+                ;;
+              unit_plugins_a_tests)
+                cargo llvm-cov --no-report \
+                  --test unit_plugins_a_tests
+                ;;
+              unit_plugins_b_tests)
+                cargo llvm-cov --no-report \
+                  --test unit_plugins_b_tests
+                ;;
+              unit_gateway_core_tests)
+                cargo llvm-cov --no-report \
+                  --test unit_gateway_core_tests
+                ;;
+              *)
+                echo "::error::unexpected unit coverage target: ${UNIT_TARGET}" >&2
+                exit 1
+                ;;
+            esac
+          else
+            echo "::error::unexpected coverage shard kind: ${COVERAGE_KIND}" >&2
+            exit 1
+          fi
         env:
+          COVERAGE_KIND: ${{ matrix.kind }}
           UNIT_TARGET: ${{ matrix.target }}
           RUST_BACKTRACE: 1
 
@@ -535,9 +550,16 @@ jobs:
             -type d \( -name incremental -o -name .fingerprint \) -prune -o \
             -type f ! -name '*.rlib' ! -name '*.rmeta' ! -name '*.d' ! -name '*.o' -print \
             > coverage-files.txt
-          echo "packaging $(grep -c '' coverage-files.txt) files ($(grep -c '\.profraw$' coverage-files.txt) profraw)"
+          profraw_count="$(grep -c '\.profraw$' coverage-files.txt || true)"
+          echo "packaging $(grep -c '' coverage-files.txt) files (${profraw_count} profraw)"
+          if [ "$profraw_count" -eq 0 ]; then
+            echo "::error::coverage shard ${COVERAGE_SHARD} produced 0 .profraw files" >&2
+            exit 1
+          fi
           tar -cf "coverage-${{ matrix.shard }}.tar" -T coverage-files.txt
           ls -lh "coverage-${{ matrix.shard }}.tar"
+        env:
+          COVERAGE_SHARD: ${{ matrix.shard }}
 
       - name: Upload coverage data
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
@@ -711,8 +733,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           PLANNED_SHARDS: ${{ needs.coverage-plan.outputs.shards }}
 
-      - id: generate-reports
-        name: Generate coverage reports
+      - name: Generate coverage reports
         if: needs.coverage-plan.outputs.mode != 'skip'
         run: |
           set -euo pipefail
@@ -819,7 +840,7 @@ jobs:
           MERGE_BASE_SHA: ${{ github.event.merge_group.base_sha }}
 
       - name: Upload coverage report
-        if: always() && needs.coverage-plan.outputs.mode != 'skip' && steps.generate-reports.outcome == 'success'
+        if: always() && needs.coverage-plan.outputs.mode != 'skip'
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: coverage-report
