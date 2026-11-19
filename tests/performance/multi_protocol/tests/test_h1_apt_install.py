@@ -52,6 +52,7 @@ TRACE_PACKAGES = ("clang-18 llvm-18 libbpf-dev libelf-dev zlib1g-dev gcc libc6-d
 
 class SourceRewriteTests(unittest.TestCase):
     def test_deb822_rewrites_only_the_regional_mirror(self):
+        self.assertEqual(sources.CANONICAL, "https://archive.ubuntu.com/ubuntu/")
         text, changed = sources.rewrite(DEB822, deb822=True)
         self.assertTrue(changed)
         self.assertEqual(text, DEB822.replace("http://us-east-2.ec2.archive.ubuntu.com/ubuntu/",
@@ -59,6 +60,28 @@ class SourceRewriteTests(unittest.TestCase):
         self.assertIn("URIs: http://security.ubuntu.com/ubuntu/", text)
         self.assertEqual(text.count(f"Signed-By: {KEYRING}"), 2)
         self.assertIn("Suites: resolute resolute-updates resolute-backports", text)
+
+    def test_https_sources_stay_https_on_fallback(self):
+        for raw, deb822 in (
+                (DEB822.replace("http://us-east-2.ec2", "https://us-east-2.ec2", 1), True),
+                (DEB822.replace("http://us-east-2.ec2.archive.ubuntu.com/ubuntu/",
+                                "mirror+https://mirrors.ubuntu.com/mirrors.txt", 1), True),
+                (f"deb [signed-by={KEYRING}] https://azure.archive.ubuntu.com/ubuntu/ noble main\n", False),
+                (f"deb [signed-by={KEYRING}] mirror+https://mirrors.ubuntu.com/mirrors.txt noble main\n", False)):
+            with self.subTest(raw=raw):
+                rewritten, changed = sources.rewrite(raw, deb822)
+                self.assertTrue(changed)
+                self.assertIn("https://archive.ubuntu.com/ubuntu/", rewritten)
+                self.assertNotIn("http://archive.ubuntu.com/ubuntu/", rewritten)
+
+    def test_deb822_non_ascii_whitespace_does_not_split_uri_tokens(self):
+        unsplit = f"Types: deb\nURIs: http://evil.example/\u00a0http://azure.archive.ubuntu.com/ubuntu/\nSuites: noble\nComponents: main\nSigned-By: {KEYRING}\n"
+        self.assertEqual(sources.rewrite(unsplit, deb822=True), (unsplit, False))
+
+        neighbor = f"Types: deb\nURIs: http://evil.example/\u00a0foo http://azure.archive.ubuntu.com/ubuntu/\nSuites: noble\nComponents: main\nSigned-By: {KEYRING}\n"
+        rewritten, changed = sources.rewrite(neighbor, deb822=True)
+        self.assertTrue(changed)
+        self.assertIn(f"URIs: http://evil.example/\u00a0foo {sources.CANONICAL}\n", rewritten)
 
     def test_deb822_mirror_list_and_continuation_uris(self):
         text = ("Types: deb\nURIs: mirror+file:/etc/apt/apt-mirrors.txt\n"
@@ -297,7 +320,8 @@ class InstallScriptTests(unittest.TestCase):
 
     def assert_apt_options(self, argv, source):
         for option in (f"Dir::Etc::sourcelist={source}", "Dir::Etc::sourceparts=-",
-                       "Acquire::Retries=3", "Acquire::http::Timeout=30"):
+                       "Acquire::Retries=3", "Acquire::http::Timeout=30",
+                       "Acquire::https::Timeout=30"):
             self.assertIn(f"-o {option}", argv)
 
     def test_primary_success_fetches_bounded_then_unpacks_offline(self):

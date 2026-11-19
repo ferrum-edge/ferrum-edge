@@ -17,7 +17,7 @@ import re
 import sys
 from pathlib import Path
 
-CANONICAL = "http://archive.ubuntu.com/ubuntu/"
+CANONICAL = "https://archive.ubuntu.com/ubuntu/"
 
 # Regional/cloud mirrors of the primary archive (``azure.``, ``us-east-2.ec2.``,
 # ``<cc>.``) and Ubuntu mirror-list indirections used by hosted runner images.
@@ -105,9 +105,12 @@ def is_mirror(uri):
     return bool(_MIRROR_URI.match(uri))
 
 
+_ASCII_TOKEN = re.compile(r"[^ \t\r\n\v\f]+")
+
+
 def _rewrite_uris(value):
-    """Rewrite one URIs field value; return (value, changed)."""
-    tokens = value.split()
+    """Rewrite one URIs field value on ASCII whitespace boundaries; return (value, changed)."""
+    tokens = _ASCII_TOKEN.findall(value)
     rewritten, changed = [], False
     for token in tokens:
         if is_mirror(token):
@@ -116,7 +119,7 @@ def _rewrite_uris(value):
             rewritten.append(token)
     if not changed:
         return value, False
-    leading = value[:len(value) - len(value.lstrip())]
+    leading = value[:len(value) - len(value.lstrip(_ASCII_SPACE_STR))]
     return leading + " ".join(rewritten), True
 
 

@@ -14,7 +14,7 @@
 # `install --download-only`) run under the short mirror deadline, so a timeout
 # never interrupts dpkg mid-unpack or leaves database locks behind. If the
 # primary mirror fails or stalls, the fetch is retried once from a temporary
-# copy of the Ubuntu source pointing at http://archive.ubuntu.com/ubuntu/
+# copy of the Ubuntu source pointing at https://archive.ubuntu.com/ubuntu/
 # (keeping Types/Suites/Components/Signed-By unchanged via h1_apt_sources.py).
 # Once all packages are downloaded, `install --no-download` unpacks and
 # configures them offline with DEBIAN_FRONTEND=noninteractive.
@@ -59,6 +59,7 @@ apt_options() {
     -o "Dir::Etc::sourceparts=-"
     -o "Acquire::Retries=3"
     -o "Acquire::http::Timeout=30"
+    -o "Acquire::https::Timeout=30"
   )
 }
 
@@ -110,7 +111,7 @@ if [ "$status" -eq 0 ]; then
   install_downloaded primary "$ubuntu_sources"
   exit 0
 fi
-echo "::warning::Ubuntu apt fetch from the runner mirror failed or timed out (status $status); retrying from http://archive.ubuntu.com/ubuntu/"
+echo "::warning::Ubuntu apt fetch from the runner mirror failed or timed out (status $status); retrying from https://archive.ubuntu.com/ubuntu/"
 
 workdir=$(mktemp -d)
 trap 'rm -rf "$workdir"' EXIT

@@ -160,7 +160,7 @@ refreshes and installs from the image's Ubuntu source only, with matching
 300 s primary budget so a mirror timeout never interrupts `dpkg` mid-unpack.
 When the runner's regional mirror fails or stalls, the fetch is retried once
 (600 s budget) from a temporary copy of that source that rewrites only regional
-Ubuntu mirrors or Ubuntu mirror lists to `http://archive.ubuntu.com/ubuntu/`.
+Ubuntu mirrors or Ubuntu mirror lists to `https://archive.ubuntu.com/ubuntu/`.
 `Suites`, `Components`, and `Signed-By` stay intact, and active entries that
 disable signature verification (under any APT truthy spelling) are refused.
 
