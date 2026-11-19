@@ -87,7 +87,7 @@ fetch_attempt() {
     update || status=$?
   if [ "$status" -eq 0 ]; then
     bounded "$deadline" apt-get "${APT_OPTS[@]}" \
-      install -y --no-install-recommends --download-only "${packages[@]}" \
+      install -y --no-install-recommends --download-only -- "${packages[@]}" \
       || status=$?
   fi
   echo "::endgroup::"
@@ -100,7 +100,7 @@ install_downloaded() {
   echo "::group::apt-get local install ($label) from $sources"
   "${privileged[@]}" env DEBIAN_FRONTEND=noninteractive \
     apt-get "${APT_OPTS[@]}" \
-    install -y --no-install-recommends --no-download "${packages[@]}"
+    install -y --no-install-recommends --no-download -- "${packages[@]}"
   echo "::endgroup::"
 }
 
