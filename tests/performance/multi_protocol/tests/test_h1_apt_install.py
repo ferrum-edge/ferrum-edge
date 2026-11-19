@@ -74,6 +74,50 @@ class SourceRewriteTests(unittest.TestCase):
                 self.assertIn("https://archive.ubuntu.com/ubuntu/", rewritten)
                 self.assertNotIn("http://archive.ubuntu.com/ubuntu/", rewritten)
 
+    def test_mixed_http_canonical_and_regional_mirror_normalizes_active_entries_to_https(self):
+        disabled_http = (
+            "Types: deb\n"
+            "Enabled: no\n"
+            "URIs: http://archive.ubuntu.com/ubuntu/\n"
+            "Suites: resolute-proposed\n"
+            "Components: main\n"
+            f"Signed-By: {KEYRING}\n"
+        )
+        mixed_deb822 = (
+            "Types: deb\n"
+            "URIs: http://archive.ubuntu.com/ubuntu/\n"
+            "Suites: resolute\n"
+            "Components: main\n"
+            f"Signed-By: {KEYRING}\n\n"
+            "Types: deb\n"
+            "URIs: https://us-east-2.ec2.archive.ubuntu.com/ubuntu/\n"
+            "Suites: resolute\n"
+            "Components: universe\n"
+            f"Signed-By: {KEYRING}\n\n"
+            + disabled_http
+        )
+        rewritten_d, changed_d = sources.rewrite(mixed_deb822, deb822=True)
+        self.assertTrue(changed_d)
+        self.assertEqual(rewritten_d.count("URIs: https://archive.ubuntu.com/ubuntu/\n"), 2)
+        self.assertTrue(rewritten_d.endswith(disabled_http), "disabled HTTP canonical stanza stays untouched")
+
+        mixed_one_line = (
+            f"deb [signed-by={KEYRING}] http://archive.ubuntu.com/ubuntu/ resolute main\n"
+            f"deb [signed-by={KEYRING}] https://azure.archive.ubuntu.com/ubuntu/ resolute universe\n"
+        )
+        rewritten_o, changed_o = sources.rewrite(mixed_one_line, deb822=False)
+        self.assertTrue(changed_o)
+        self.assertEqual(rewritten_o.count("https://archive.ubuntu.com/ubuntu/"), 2)
+        self.assertNotIn("http://archive.ubuntu.com/ubuntu/", rewritten_o)
+
+    def test_one_line_adjacent_uri_after_option_bracket_is_rewritten_and_checked(self):
+        adjacent = f"deb [signed-by={KEYRING} ]http://azure.archive.ubuntu.com/ubuntu/ noble main\n"
+        rewritten, changed = sources.rewrite(adjacent, deb822=False)
+        self.assertTrue(changed)
+        self.assertEqual(rewritten, f"deb [signed-by={KEYRING} ]{sources.CANONICAL} noble main\n")
+        with self.assertRaises(ValueError):
+            sources.rewrite("deb [trusted=yes]http://azure.archive.ubuntu.com/ubuntu/ noble main\n", deb822=False)
+
     def test_deb822_non_ascii_whitespace_does_not_split_uri_tokens(self):
         unsplit = f"Types: deb\nURIs: http://evil.example/\u00a0http://azure.archive.ubuntu.com/ubuntu/\nSuites: noble\nComponents: main\nSigned-By: {KEYRING}\n"
         self.assertEqual(sources.rewrite(unsplit, deb822=True), (unsplit, False))

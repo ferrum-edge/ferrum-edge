@@ -28,6 +28,7 @@ _MIRROR_URI = re.compile(
     r"|mirror\+file:(?:///|/)etc/apt/apt-mirrors\.txt"
     r"|mirror(?:\+https?)?://mirrors\.ubuntu\.com/\S+)$"
 )
+_HTTP_CANONICAL = re.compile(r"^http://archive\.ubuntu\.com/ubuntu/?$")
 # APT's pkgTagSection::Scan splits on the first `:` and trims ASCII whitespace
 # before the colon.
 _DEB822_FIELD = re.compile(r"^([^:\r\n]+):(.*)$")
@@ -105,15 +106,19 @@ def is_mirror(uri):
     return bool(_MIRROR_URI.match(uri))
 
 
+def _should_rewrite_uri(uri, upgrade_http_canonical=False):
+    return is_mirror(uri) or (upgrade_http_canonical and bool(_HTTP_CANONICAL.match(uri)))
+
+
 _ASCII_TOKEN = re.compile(r"[^ \t\r\n\v\f]+")
 
 
-def _rewrite_uris(value):
+def _rewrite_uris(value, upgrade_http_canonical=False):
     """Rewrite one URIs field value on ASCII whitespace boundaries; return (value, changed)."""
     tokens = _ASCII_TOKEN.findall(value)
     rewritten, changed = [], False
     for token in tokens:
-        if is_mirror(token):
+        if _should_rewrite_uri(token, upgrade_http_canonical):
             token, changed = CANONICAL, True
         if token not in rewritten:
             rewritten.append(token)
@@ -218,11 +223,8 @@ def _parse_one_line(body):
             raise ValueError(f"unterminated apt option bracket on line {body!r}")
         opts_bracket = body[pos:end_bracket + 1]
         pos = end_bracket + 1
-        ws_start = pos
         while pos < n and body[pos] in _ASCII_SPACE:
             pos += 1
-        if pos == ws_start:
-            raise ValueError(f"malformed apt source line after option bracket: {body!r}")
     uri_start = pos
     while pos < n and body[pos] not in _ASCII_SPACE:
         if body[pos] == '"':
@@ -244,7 +246,7 @@ def _parse_one_line(body):
     return body[:uri_start], opts_bracket, raw_uri, decoded_uri, body[pos:]
 
 
-def _process_deb822_stanza(lines):
+def _process_deb822_stanza(lines, upgrade_http_canonical=False):
     """Inspect and rewrite a single deb822 stanza; return (lines, changed)."""
     fields = {}
     active_field = None
@@ -296,7 +298,7 @@ def _process_deb822_stanza(lines):
             continue
         if body[:1] in (" ", "\t", "\v", "\f"):
             if in_uris and body.strip():
-                value, hit = _rewrite_uris(body)
+                value, hit = _rewrite_uris(body, upgrade_http_canonical)
                 changed |= hit
                 body = value
             out.append(body + ending)
@@ -305,14 +307,14 @@ def _process_deb822_stanza(lines):
         if field:
             in_uris = field.group(1).rstrip(" \t\v\f").lower() == "uris"
             if in_uris:
-                value, hit = _rewrite_uris(field.group(2))
+                value, hit = _rewrite_uris(field.group(2), upgrade_http_canonical)
                 changed |= hit
                 body = f"{field.group(1)}:{value}"
         out.append(body + ending)
     return out, changed
 
 
-def rewrite_deb822(text):
+def _rewrite_deb822_pass(text, upgrade_http_canonical=False):
     out, changed = [], False
     stanza = []
     # APT's pkgTagSection::Scan ends a record only on an empty line (\n or \r\n),
@@ -323,7 +325,7 @@ def rewrite_deb822(text):
             raise ValueError(f"apt source contains bare CR character on line {line!r}")
         if body == "":
             if stanza:
-                rewritten, hit = _process_deb822_stanza(stanza)
+                rewritten, hit = _process_deb822_stanza(stanza, upgrade_http_canonical)
                 out.extend(rewritten)
                 changed |= hit
                 stanza = []
@@ -331,13 +333,24 @@ def rewrite_deb822(text):
         else:
             stanza.append(line)
     if stanza:
-        rewritten, hit = _process_deb822_stanza(stanza)
+        rewritten, hit = _process_deb822_stanza(stanza, upgrade_http_canonical)
         out.extend(rewritten)
         changed |= hit
     return "".join(out), changed
 
 
-def rewrite_one_line(text):
+def rewrite_deb822(text):
+    rewritten, changed = _rewrite_deb822_pass(text, upgrade_http_canonical=False)
+    if not changed:
+        return rewritten, False
+    # APT keys Release indexes without the scheme and reuses the first entry's
+    # URI for overlapping suites, so upgrade any active HTTP canonical entry in
+    # the temporary fallback source to HTTPS whenever a rewrite occurs.
+    normalized, _ = _rewrite_deb822_pass(rewritten, upgrade_http_canonical=True)
+    return normalized, True
+
+
+def _rewrite_one_line_pass(text, upgrade_http_canonical=False):
     out, changed = [], False
     for line in _LINE_SPLIT.findall(text):
         body = line.rstrip("\r\n")
@@ -353,11 +366,19 @@ def rewrite_one_line(text):
             raise ValueError(f"unsupported or malformed apt source line: {body!r}")
         head, opts_bracket, _raw_uri, decoded_uri, tail = parsed
         _check_one_line_options(opts_bracket)
-        if is_mirror(decoded_uri):
+        if _should_rewrite_uri(decoded_uri, upgrade_http_canonical):
             body = head + CANONICAL + tail
             changed = True
         out.append(body + ending)
     return "".join(out), changed
+
+
+def rewrite_one_line(text):
+    rewritten, changed = _rewrite_one_line_pass(text, upgrade_http_canonical=False)
+    if not changed:
+        return rewritten, False
+    normalized, _ = _rewrite_one_line_pass(rewritten, upgrade_http_canonical=True)
+    return normalized, True
 
 
 def rewrite(text, deb822):
