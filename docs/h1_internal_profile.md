@@ -164,10 +164,11 @@ regional Ubuntu mirrors or Ubuntu mirror lists to
 `https://archive.ubuntu.com/ubuntu/`. Whenever a regional rewrite occurs,
 compatible active lowercase portless HTTP `archive.ubuntu.com` entries in the
 temporary fallback source are also upgraded to HTTPS so APT does not merge
-overlapping suites onto a plaintext Release index; any regional suite that
-shares an APT Release index with an entry that cannot be upgraded or has a
-different policy or repository layout keeps its regional URI so distinct
-Release indexes are preserved. `Suites`, `Components`, and `Signed-By` stay
+overlapping suites onto a plaintext Release index; any regional entry (stanza
+or line) with a suite that shares an APT Release index with an entry that
+cannot be upgraded or has a different policy, repository root, or layout keeps
+its regional URI for all of its suites so distinct Release indexes are
+preserved. `Suites`, `Components`, and `Signed-By` stay intact, and active
 intact, and active entries that disable signature verification (under any APT
 truthy spelling) are refused.
 

@@ -354,6 +354,62 @@ class SourceRewriteTests(unittest.TestCase):
             (one_line_flat_vs_comp, False),
         )
 
+        # Two-hop multi-suite HTTP propagation (A B + B C + userinfo blocking C):
+        # both HTTP stanzas stay HTTP, regional A stays regional, only D rewrites.
+        deb822_two_hop = (
+            "Types: deb\nURIs: http://archive.ubuntu.com/ubuntu/\nSuites: resolute resolute-updates\n"
+            f"Components: main\nSigned-By: {KEYRING}\n\n"
+            "Types: deb\nURIs: http://archive.ubuntu.com/ubuntu/\nSuites: resolute-updates resolute-backports\n"
+            f"Components: main\nSigned-By: {KEYRING}\n\n"
+            "Types: deb\nURIs: http://reader@archive.ubuntu.com/ubuntu/\nSuites: resolute-backports\n"
+            f"Components: universe\nSigned-By: {KEYRING}\n\n"
+            "Types: deb\nURIs: https://us-east-2.ec2.archive.ubuntu.com/ubuntu/\nSuites: resolute\n"
+            f"Components: universe\nSigned-By: {KEYRING}\n\n"
+            "Types: deb\nURIs: https://us-east-2.ec2.archive.ubuntu.com/ubuntu/\nSuites: resolute-proposed\n"
+            f"Components: main\nSigned-By: {KEYRING}\n"
+        )
+        rewritten_2h, changed_2h = sources.rewrite(deb822_two_hop, deb822=True)
+        self.assertTrue(changed_2h)
+        self.assertEqual(rewritten_2h.count("URIs: http://archive.ubuntu.com/ubuntu/\n"), 2)
+        self.assertIn(
+            "URIs: https://us-east-2.ec2.archive.ubuntu.com/ubuntu/\nSuites: resolute\n",
+            rewritten_2h,
+        )
+        self.assertIn(
+            "URIs: https://archive.ubuntu.com/ubuntu/\nSuites: resolute-proposed\n",
+            rewritten_2h,
+        )
+
+        # Alternate APT URI spelling without `//` (`http:archive.ubuntu.com/ubuntu/`)
+        # normalizes in APT to the same Release index and must block merges.
+        deb822_no_slashes = (
+            "Types: deb\nURIs: http:archive.ubuntu.com/ubuntu/\nSuites: resolute\n"
+            f"Components: main\nSigned-By: {KEYRING}\n\n"
+            "Types: deb\nURIs: https://us-east-2.ec2.archive.ubuntu.com/ubuntu/\nSuites: resolute\n"
+            f"Components: universe\nSigned-By: {alt_keyring}\n"
+        )
+        self.assertEqual(sources.rewrite(deb822_no_slashes, deb822=True), (deb822_no_slashes, False))
+
+        # `$(ARCH)` expands dynamically at APT runtime and must not merge onto
+        # an existing canonical entry with a conflicting keyring.
+        deb822_arch_var = (
+            "Types: deb\nURIs: https://archive.ubuntu.com/ubuntu/\nSuites: resolute-$(ARCH)\n"
+            f"Components: main\nSigned-By: {KEYRING}\n\n"
+            "Types: deb\nURIs: https://us-east-2.ec2.archive.ubuntu.com/ubuntu/\nSuites: resolute-amd64\n"
+            f"Components: universe\nSigned-By: {alt_keyring}\n"
+        )
+        self.assertEqual(sources.rewrite(deb822_arch_var, deb822=True), (deb822_arch_var, False))
+
+        # Matching flat layouts with different REPO_URI roots (`/ubuntu/dists/resolute/`
+        # + `/` vs `/ubuntu/` + `dists/resolute/`) must not merge.
+        deb822_flat_roots = (
+            "Types: deb\nURIs: https://archive.ubuntu.com/ubuntu/dists/resolute/\nSuites: /\n"
+            f"Signed-By: {KEYRING}\n\n"
+            "Types: deb\nURIs: https://us-east-2.ec2.archive.ubuntu.com/ubuntu/\nSuites: dists/resolute/\n"
+            f"Signed-By: {KEYRING}\n"
+        )
+        self.assertEqual(sources.rewrite(deb822_flat_roots, deb822=True), (deb822_flat_roots, False))
+
     @unittest.skipUnless(shutil.which("apt-get") and Path(KEYRING).exists(), "needs hosted Ubuntu apt-get")
     def test_hosted_apt_accepts_rewritten_mixed_and_distinct_policy_sources(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -372,7 +428,10 @@ class SourceRewriteTests(unittest.TestCase):
                     True,
                     True,
                     ("https://archive.ubuntu.com/ubuntu/dists/resolute/InRelease",),
-                    ("https://archive.ubuntu.com/ubuntu/dists/resolute/main/binary-",),
+                    (
+                        "https://archive.ubuntu.com/ubuntu/dists/resolute/main/binary-",
+                        "https://archive.ubuntu.com/ubuntu/dists/resolute/universe/binary-",
+                    ),
                     "http://archive.ubuntu.com",
                 ),
                 (
@@ -648,6 +707,55 @@ class SourceRewriteTests(unittest.TestCase):
                     (
                         "https://archive.ubuntu.com/ubuntu/dists/resolute/Packages",
                         "https://us-east-2.ec2.archive.ubuntu.com/ubuntu/dists/resolute/main/binary-",
+                    ),
+                    "http://archive.ubuntu.com",
+                ),
+                (
+                    "no-slashes-http.sources",
+                    "Types: deb\nURIs: http:archive.ubuntu.com/ubuntu/\nSuites: resolute\n"
+                    f"Components: main\nSigned-By: {KEYRING}\n\n"
+                    "Types: deb\nURIs: https://us-east-2.ec2.archive.ubuntu.com/ubuntu/\nSuites: resolute\n"
+                    f"Components: universe\nSigned-By: {alt_keyring}\n\n"
+                    "Types: deb\nURIs: https://us-east-2.ec2.archive.ubuntu.com/ubuntu/\nSuites: resolute-updates\n"
+                    f"Components: main\nSigned-By: {KEYRING}\n",
+                    True,
+                    True,
+                    (
+                        "https://archive.ubuntu.com/ubuntu/dists/resolute-updates/InRelease",
+                        "https://us-east-2.ec2.archive.ubuntu.com/ubuntu/dists/resolute/InRelease",
+                    ),
+                    (),
+                    None,
+                ),
+                (
+                    "arch-var-distinct.sources",
+                    "Types: deb\nURIs: https://archive.ubuntu.com/ubuntu/\nSuites: resolute-$(ARCH)\n"
+                    f"Components: main\nSigned-By: {KEYRING}\n\n"
+                    "Types: deb\nURIs: https://us-east-2.ec2.archive.ubuntu.com/ubuntu/\nSuites: resolute-amd64 resolute-arm64\n"
+                    f"Components: universe\nSigned-By: {alt_keyring}\n",
+                    True,
+                    False,
+                    ("https://us-east-2.ec2.archive.ubuntu.com/ubuntu/dists/resolute-amd64/InRelease",),
+                    (),
+                    "http://archive.ubuntu.com",
+                ),
+                (
+                    "flat-repo-root-distinct.sources",
+                    "Types: deb\nURIs: https://archive.ubuntu.com/ubuntu/dists/resolute/\nSuites: /\n"
+                    f"Signed-By: {KEYRING}\n\n"
+                    "Types: deb\nURIs: https://us-east-2.ec2.archive.ubuntu.com/ubuntu/\nSuites: dists/resolute/\n"
+                    f"Signed-By: {KEYRING}\n\n"
+                    "Types: deb\nURIs: https://us-east-2.ec2.archive.ubuntu.com/ubuntu/\nSuites: resolute-updates\n"
+                    f"Components: main\nSigned-By: {KEYRING}\n",
+                    True,
+                    True,
+                    (
+                        "https://archive.ubuntu.com/ubuntu/dists/resolute-updates/InRelease",
+                        "https://us-east-2.ec2.archive.ubuntu.com/ubuntu/dists/resolute/InRelease",
+                    ),
+                    (
+                        "Repo-URI: https://archive.ubuntu.com/ubuntu/dists/resolute/",
+                        "Repo-URI: https://us-east-2.ec2.archive.ubuntu.com/ubuntu/",
                     ),
                     "http://archive.ubuntu.com",
                 ),

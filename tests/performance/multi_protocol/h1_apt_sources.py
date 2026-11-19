@@ -11,9 +11,10 @@ index for an overlapping suite. Every other field (``Types``, ``Suites``,
 is preserved, so GPG verification is never weakened and no unsigned repository
 is introduced. Disabled deb822 stanzas (``Enabled: no``),
 ``security.ubuntu.com``, non-Ubuntu URIs (including third-party ``mirror+...``
-lists), and regional suites that share an APT Release index with an entry that
-cannot be upgraded or has a different policy or repository layout keep their
-original URI.
+lists), and any regional entry (stanza or line) with a suite that shares an
+APT Release index with an entry that cannot be upgraded or has a different
+policy, repository root, or layout keep their original URI for all of their
+suites.
 
 Usage: ``python3 h1_apt_sources.py SOURCE DEST``. Exit 0 after writing a
 rewritten DEST, 3 when SOURCE has no regional Ubuntu mirror eligible for
@@ -137,24 +138,27 @@ def _should_rewrite_uri(uri, rewrite_mirrors=True, upgrade_http_canonical=False)
     )
 
 
-def _release_index_key(uri, suite):
-    """Return APT's effective Release-index key matching URItoFileName(constructMetaIndexURI(...))."""
-    base = uri if uri.endswith("/") else uri + "/"
-    if suite == "/":
-        meta_uri = base + "Release"
-    elif suite.endswith("/"):
-        meta_uri = base + suite + "Release"
+_NETWORK_SCHEMES = frozenset({"http", "https", "ftp"})
+
+
+def _normalize_apt_authority_and_path(uri):
+    """Return `(authority, path)` matching APT's `::URI` + `URItoFileName` rules.
+
+    Strips scheme and userinfo, preserves host spelling and path case, drops
+    empty/zero ports while keeping explicit nonzero ports, and normalizes
+    network URIs written without `//` (such as `http:archive.ubuntu.com/ubuntu/`,
+    which APT's `FixupURI` normalizes to `http://archive.ubuntu.com/ubuntu/`).
+    """
+    scheme_sep = uri.find("://")
+    if scheme_sep != -1:
+        rest = uri[scheme_sep + 3:]
     else:
-        meta_uri = base + "dists/" + suite + "/Release"
-    # Match APT ::URI (strutl.cc:1751-1805) + URItoFileName (strutl.cc:521-533):
-    # strip scheme and userinfo, preserve host spelling and path case, drop
-    # empty/zero port, keep explicit nonzero ports.
-    scheme_sep = meta_uri.find("://")
-    if scheme_sep == -1:
-        colon = meta_uri.find(":")
-        rest = meta_uri[colon + 1:] if colon != -1 else meta_uri
-        return ("", rest)
-    rest = meta_uri[scheme_sep + 3:]
+        colon = uri.find(":")
+        if colon != -1 and uri[:colon].lower() in _NETWORK_SCHEMES:
+            rest = uri[colon + 1:].lstrip("/")
+        else:
+            rest = uri[colon + 1:] if colon != -1 else uri
+            return ("", rest)
     slash = rest.find("/")
     authority = rest if slash == -1 else rest[:slash]
     path = "" if slash == -1 else rest[slash:]
@@ -183,26 +187,58 @@ def _release_index_key(uri, suite):
     return (norm_authority, path)
 
 
-def _suite_policy(policy, suite):
-    """Combine entry options with flat-vs-component layout (`debmetaindex.cc:195`)."""
-    return (policy, suite.endswith("/"))
+def _repo_root(uri):
+    """Return APT's effective post-FixupURI repository root `(authority, path)`."""
+    base = uri if uri.endswith("/") else uri + "/"
+    return _normalize_apt_authority_and_path(base)
+
+
+def _release_index_key(uri, suite):
+    """Return APT's effective Release-index key matching URItoFileName(constructMetaIndexURI(...))."""
+    base = uri if uri.endswith("/") else uri + "/"
+    if suite == "/":
+        meta_uri = base + "Release"
+    elif suite.endswith("/"):
+        meta_uri = base + suite + "Release"
+    else:
+        meta_uri = base + "dists/" + suite + "/Release"
+    return _normalize_apt_authority_and_path(meta_uri)
+
+
+def _suite_policy(policy, uri, suite):
+    """Combine entry options, flat-vs-component layout, REPO_URI root, and RELEASE."""
+    return (policy, suite.endswith("/"), _repo_root(uri), "" if suite == "/" else suite)
+
+
+_CANONICAL_AUTHORITY = _repo_root(CANONICAL)[0]
+_CANONICAL_WILDCARD = object()
+
+
+def _has_arch_var(text):
+    return "$(ARCH)" in text
 
 
 def _register_entry_keys(release_policies, uris, suites, policy):
     for uri in uris:
         is_https = uri.lower().startswith("https://")
         upgradeable_http = _is_http_canonical(uri)
+        authority, _ = _repo_root(uri)
+        if _has_arch_var(uri) and authority == _CANONICAL_AUTHORITY:
+            release_policies[_CANONICAL_WILDCARD] = _POLICY_CONFLICT
         for suite in suites:
+            if _has_arch_var(suite) and authority == _CANONICAL_AUTHORITY:
+                release_policies[_CANONICAL_WILDCARD] = _POLICY_CONFLICT
             key = _release_index_key(uri, suite)
             # Any non-HTTPS entry that is not an upgradeable portless HTTP
-            # canonical URI (e.g. `http://reader@archive.ubuntu.com/ubuntu/` or
-            # `http://archive.ubuntu.com/ubuntu/dists/` with flat suite
-            # `resolute/`) blocks merges onto its effective Release key so APT
-            # neither hits a policy conflict nor reuses plaintext HTTP.
+            # canonical URI (e.g. `http://reader@archive.ubuntu.com/ubuntu/`,
+            # `http:archive.ubuntu.com/ubuntu/`, or `.../ubuntu/dists/` with
+            # flat suite `resolute/`) blocks merges onto its effective Release
+            # key so APT neither hits a policy conflict nor reuses plaintext HTTP.
             if not is_https and not upgradeable_http:
                 release_policies[key] = _POLICY_CONFLICT
                 continue
-            effective_policy = _suite_policy(policy, suite)
+            post_uri = CANONICAL if upgradeable_http else uri
+            effective_policy = _suite_policy(policy, post_uri, suite)
             existing = release_policies.get(key)
             if existing is None:
                 release_policies[key] = effective_policy
@@ -211,18 +247,28 @@ def _register_entry_keys(release_policies, uris, suites, policy):
 
 
 def _canonical_keys_compatible(release_policies, suites, policy):
+    if _CANONICAL_WILDCARD in release_policies:
+        return False
+    has_existing_canonical = any(
+        isinstance(k, tuple) and k[0] == _CANONICAL_AUTHORITY
+        for k in release_policies
+    )
     for suite in suites:
+        if _has_arch_var(suite) and has_existing_canonical:
+            return False
         key = _release_index_key(CANONICAL, suite)
         existing = release_policies.get(key)
-        if existing is not None and existing != _suite_policy(policy, suite):
+        if existing is not None and existing != _suite_policy(policy, CANONICAL, suite):
             return False
     return True
 
 
 def _register_canonical_keys(release_policies, suites, policy):
     for suite in suites:
+        if _has_arch_var(suite):
+            release_policies[_CANONICAL_WILDCARD] = _POLICY_CONFLICT
         key = _release_index_key(CANONICAL, suite)
-        effective_policy = _suite_policy(policy, suite)
+        effective_policy = _suite_policy(policy, CANONICAL, suite)
         existing = release_policies.get(key)
         if existing is None:
             release_policies[key] = effective_policy
