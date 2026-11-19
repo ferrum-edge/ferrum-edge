@@ -36,7 +36,8 @@ CANONICAL = "https://archive.ubuntu.com/ubuntu/"
 _MIRROR_URI = re.compile(
     r"^(?:https?://(?i:(?:[A-Za-z0-9-]+\.)+archive\.ubuntu\.com)(?::(?:80|443)?)?/ubuntu/?"
     r"|mirror\+file:(?:///|/)etc/apt/apt-mirrors\.txt"
-    r"|mirror(?:\+https?)?://(?i:mirrors\.ubuntu\.com)/\S+)$"
+    r"|mirror(?:\+https?)?://(?i:mirrors\.ubuntu\.com)/\S+)$",
+    re.ASCII,
 )
 # Only portless lowercase `http://archive.ubuntu.com/ubuntu/` URIs (including
 # empty `:`) share the portless `archive.ubuntu.com/ubuntu/` Release index and
@@ -246,7 +247,15 @@ def _parse_apt_uri(raw):
     pos = host.rfind(":")
     if pos != -1 and pos >= port_end:
         match = _ATOI_RE.match(host[pos + 1:])
-        port = int(match.group(1)) if match else 0
+        if match:
+            # Match glibc LP64 `atoi` (`(int)strtol(s, NULL, 10)`) assigned to
+            # `unsigned int URI::Port` (32-bit wrap; e.g. 4294967296 -> 0).
+            val = int(match.group(1), 10)
+            if val > _LONG_MAX:
+                val = _LONG_MAX
+            elif val < _LONG_MIN:
+                val = _LONG_MIN
+            port = val & 0xFFFFFFFF
         host = host[:pos]
     return (access, user, password, host, port, path)
 
@@ -475,25 +484,26 @@ def _check_one_line_options(opts_bracket, lineno=None):
             )
 
 
-def _strip_one_line_comment(text):
-    """Strip `#` comments outside double quotes and `[...]` per APT sourcelist.cc."""
-    in_quote = False
-    in_bracket = False
-    for idx, ch in enumerate(text):
-        if ch == '"' and not in_bracket:
-            in_quote = not in_quote
-        elif ch == "[" and not in_quote:
-            in_bracket = True
-        elif ch == "]" and in_bracket:
-            in_bracket = False
-        elif ch == "#" and not in_quote and not in_bracket:
-            return text[:idx]
-    return text
+def _strip_one_line_comment(body):
+    """Port of APT's `ParseFileOldStyle` comment strip (`sourcelist.cc:385-399`).
+
+    Returns `(code_part, comment_part)`: strips from the first `#` whose
+    preceding prefix does not have more `[` than `]` (ignoring double quotes,
+    matching APT).
+    """
+    pos = body.find("#")
+    while pos != -1:
+        if body.count("[", 0, pos) > body.count("]", 0, pos):
+            pos = body.find("#", pos + 1)
+            continue
+        return body[:pos], body[pos:]
+    return body, ""
 
 
-def _parse_one_line(body, lineno=None):
+def _parse_one_line(raw_body, lineno=None):
     """Parse `(head, opts_bracket, raw_uri, decoded_uri, suite, tail)` from a one-line deb entry."""
     loc = f"line {lineno}: " if lineno is not None else ""
+    body, comment = _strip_one_line_comment(raw_body)
     prefix = _ONE_LINE_PREFIX.match(body)
     if not prefix:
         return None
@@ -546,10 +556,9 @@ def _parse_one_line(body, lineno=None):
         return None
     raw_uri = body[uri_start:pos]
     decoded_uri = _apt_dequote_word(raw_uri, lineno)
-    tail = body[pos:]
-    # Extract the suite token (first word after URI, honoring `"` and `[...]`
-    # brackets per APT's ParseQuoteWord and comment stripping in sourcelist.cc).
-    suite_scan = _strip_one_line_comment(tail).lstrip(_ASCII_SPACE_STR)
+    tail = body[pos:] + comment
+    # Extract the suite token from the comment-stripped tail per ParseQuoteWord.
+    suite_scan = body[pos:].lstrip(_ASCII_SPACE_STR)
     suite = None
     if suite_scan:
         j, m = 0, len(suite_scan)

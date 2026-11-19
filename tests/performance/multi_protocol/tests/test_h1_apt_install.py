@@ -503,12 +503,50 @@ class SourceRewriteTests(unittest.TestCase):
             (one_line_utf8_literal_vs_pct, False),
         )
 
-        # `#` inside `[...]` brackets in a one-line suite is NOT a comment in APT.
+        # `#` inside `[...]` brackets in a one-line suite is NOT a comment in APT,
+        # matching APT's full-line `[` > `]` count loop (`sourcelist.cc:385-399`).
         one_line_bracket_hash = (
             f"deb [signed-by={KEYRING}] https://archive.ubuntu.com/ubuntu/dists/%5bprofile%23debug%5d/ /\n"
             f"deb [signed-by={alt_keyring}] https://us-east-2.ec2.archive.ubuntu.com/ubuntu/ [profile#debug] main\n"
         )
         self.assertEqual(sources.rewrite(one_line_bracket_hash, deb822=False), (one_line_bracket_hash, False))
+
+        one_line_nested_bracket_hash = (
+            f"deb [signed-by={KEYRING}] https://archive.ubuntu.com/ubuntu/ [[profile]#debug] main\n"
+            f"deb [signed-by={alt_keyring}] https://us-east-2.ec2.archive.ubuntu.com/ubuntu/ %5b%5bprofile%5d%23debug%5d main\n"
+        )
+        self.assertEqual(
+            sources.rewrite(one_line_nested_bracket_hash, deb822=False),
+            (one_line_nested_bracket_hash, False),
+        )
+
+        one_line_unbalanced_bracket_hash = (
+            f"deb [signed-by={KEYRING}] https://archive.ubuntu.com/ubuntu/dists/%5b%5bx%5d%23y/ /\n"
+            f"deb [signed-by={alt_keyring}] https://us-east-2.ec2.archive.ubuntu.com/ubuntu/ [[x]#y main\n"
+        )
+        self.assertEqual(
+            sources.rewrite(one_line_unbalanced_bracket_hash, deb822=False),
+            (one_line_unbalanced_bracket_hash, False),
+        )
+
+        one_line_quoted_bracket_hash = (
+            f"deb [signed-by={KEYRING}] https://archive.ubuntu.com/ubuntu/dists/%5b%23y/ /\n"
+            f'deb [signed-by={alt_keyring}] https://us-east-2.ec2.archive.ubuntu.com/ubuntu/ "["#y main\n'
+        )
+        self.assertEqual(
+            sources.rewrite(one_line_quoted_bracket_hash, deb822=False),
+            (one_line_quoted_bracket_hash, False),
+        )
+
+        # 32-bit atoi port wrap: `http://archive.ubuntu.com:4294967296/ubuntu/`
+        # wraps to port 0 (portless HTTP) in APT and must block merges.
+        deb822_port_wrap = (
+            "Types: deb\nURIs: http://archive.ubuntu.com:4294967296/ubuntu/\nSuites: resolute\n"
+            f"Components: main\nSigned-By: {KEYRING}\n\n"
+            "Types: deb\nURIs: https://us-east-2.ec2.archive.ubuntu.com/ubuntu/\nSuites: resolute\n"
+            f"Components: universe\nSigned-By: {KEYRING}\n"
+        )
+        self.assertEqual(sources.rewrite(deb822_port_wrap, deb822=True), (deb822_port_wrap, False))
 
     @unittest.skipUnless(shutil.which("apt-get") and Path(KEYRING).exists(), "needs hosted Ubuntu apt-get")
     def test_hosted_apt_accepts_rewritten_mixed_and_distinct_policy_sources(self):
@@ -983,6 +1021,57 @@ class SourceRewriteTests(unittest.TestCase):
                     ),
                     "http://archive.ubuntu.com",
                 ),
+                (
+                    "nested-bracket-hash-suite.list",
+                    f"deb [signed-by={KEYRING}] https://archive.ubuntu.com/ubuntu/ [[profile]#debug] main\n"
+                    f"deb [signed-by={alt_keyring}] https://us-east-2.ec2.archive.ubuntu.com/ubuntu/ %5b%5bprofile%5d%23debug%5d main\n"
+                    f"deb [signed-by={KEYRING}] https://us-east-2.ec2.archive.ubuntu.com/ubuntu/ resolute-updates main\n",
+                    False,
+                    True,
+                    (
+                        "https://archive.ubuntu.com/ubuntu/dists/resolute-updates/InRelease",
+                        "https://us-east-2.ec2.archive.ubuntu.com/ubuntu/dists/[[profile]#debug]/InRelease",
+                    ),
+                    (
+                        "Repo-URI: https://archive.ubuntu.com/ubuntu/",
+                        "Repo-URI: https://us-east-2.ec2.archive.ubuntu.com/ubuntu/",
+                    ),
+                    "http://archive.ubuntu.com",
+                ),
+                (
+                    "unbalanced-and-quoted-bracket-hash.list",
+                    f"deb [signed-by={KEYRING}] https://archive.ubuntu.com/ubuntu/dists/%5b%5bx%5d%23y/ /\n"
+                    f"deb [signed-by={alt_keyring}] https://us-east-2.ec2.archive.ubuntu.com/ubuntu/ [[x]#y main\n"
+                    f"deb [signed-by={KEYRING}] https://archive.ubuntu.com/ubuntu/dists/%5b%23z/ /\n"
+                    f'deb [signed-by={alt_keyring}] https://us-east-2.ec2.archive.ubuntu.com/ubuntu/ "["#z main\n'
+                    f"deb [signed-by={KEYRING}] https://us-east-2.ec2.archive.ubuntu.com/ubuntu/ resolute-updates main\n",
+                    False,
+                    True,
+                    (
+                        "https://archive.ubuntu.com/ubuntu/dists/resolute-updates/InRelease",
+                        "https://us-east-2.ec2.archive.ubuntu.com/ubuntu/dists/[[x]#y/InRelease",
+                        "https://us-east-2.ec2.archive.ubuntu.com/ubuntu/dists/[#z/InRelease",
+                    ),
+                    (),
+                    "http://archive.ubuntu.com",
+                ),
+                (
+                    "port-wrap-http.sources",
+                    "Types: deb\nURIs: http://archive.ubuntu.com:4294967296/ubuntu/\nSuites: resolute\n"
+                    f"Components: main\nSigned-By: {KEYRING}\n\n"
+                    "Types: deb\nURIs: https://us-east-2.ec2.archive.ubuntu.com/ubuntu/\nSuites: resolute\n"
+                    f"Components: universe\nSigned-By: {alt_keyring}\n\n"
+                    "Types: deb\nURIs: https://us-east-2.ec2.archive.ubuntu.com/ubuntu/\nSuites: resolute-updates\n"
+                    f"Components: main\nSigned-By: {KEYRING}\n",
+                    True,
+                    True,
+                    (
+                        "https://archive.ubuntu.com/ubuntu/dists/resolute-updates/InRelease",
+                        "https://us-east-2.ec2.archive.ubuntu.com/ubuntu/dists/resolute/InRelease",
+                    ),
+                    (),
+                    None,
+                ),
             ):
                 with self.subTest(case=name):
                     rewritten, changed = sources.rewrite(raw, deb822)
@@ -1092,7 +1181,8 @@ class SourceRewriteTests(unittest.TestCase):
                 ("deb HTTPS://azure.archive.ubuntu.com/ubuntu/ noble main\n", False),
                 ("deb MIRROR+HTTPS://mirrors.ubuntu.com/mirrors.txt noble main\n", False),
                 ("Types: deb\nURIs: HTTPS://us-east-2.ec2.archive.ubuntu.com/ubuntu/\nSuites: noble\n", True),
-                ("Types: deb\nURIs: MIRROR+FILE:/etc/apt/apt-mirrors.txt\nSuites: noble\n", True)):
+                ("Types: deb\nURIs: MIRROR+FILE:/etc/apt/apt-mirrors.txt\nSuites: noble\n", True),
+                ("Types: deb\nURIs: https://us-east-2.ec2.arch\u0131ve.ubuntu.com/ubuntu/\nSuites: noble\n", True)):
             with self.subTest(text=text):
                 self.assertEqual(sources.rewrite(text, deb822), (text, False))
 
@@ -1235,7 +1325,12 @@ for arg in "$@"; do
   esac
 done
 case "$list" in "$FAKE_ETC"/*) phase=primary ;; *) phase=fallback ;; esac
-printf '%s\t%s\t%s\t%s\t%s\n' "$phase" "$action" "${DEBIAN_FRONTEND:-}" "${IN_TIMEOUT:-0}" "$*" >> "$FAKE_LOG/apt.log"
+joined=""
+for arg in "$@"; do
+  if [ -n "$joined" ]; then joined+=$'\x1f'; fi
+  joined+="$arg"
+done
+printf '%s\t%s\t%s\t%s\t%s\n' "$phase" "$action" "${DEBIAN_FRONTEND:-}" "${IN_TIMEOUT:-0}" "$joined" >> "$FAKE_LOG/apt.log"
 if [ "$phase" = fallback ] && [ -f "$list" ]; then cp "$list" "$FAKE_LOG/fallback-source"; fi
 case "${FAKE_APT_FAIL:-}" in
   primary-update) [ "$phase/$action" = primary/update ] && exit 100 ;;
@@ -1288,13 +1383,20 @@ class InstallScriptTests(unittest.TestCase):
 
     def calls(self):
         path = self.log / "apt.log"
-        return [line.split("\t") for line in path.read_text().splitlines()] if path.exists() else []
+        if not path.exists():
+            return []
+        rows = []
+        for line in path.read_text().splitlines():
+            phase, action, frontend, in_timeout, argv = line.split("\t", 4)
+            rows.append((phase, action, frontend, in_timeout, argv.split("\x1f")))
+        return rows
 
     def assert_apt_options(self, argv, source):
+        pairs = list(zip(argv, argv[1:]))
         for option in (f"Dir::Etc::sourcelist={source}", "Dir::Etc::sourceparts=-",
                        "Acquire::Retries=3", "Acquire::http::Timeout=30",
                        "Acquire::https::Timeout=30", "Acquire::URIEncode=+~ "):
-            self.assertIn(f"-o {option}", argv)
+            self.assertIn(("-o", option), pairs)
 
     def test_primary_success_fetches_bounded_then_unpacks_offline(self):
         (self.etc / "sources.list.d/ubuntu.sources").write_text(DEB822)
@@ -1310,9 +1412,15 @@ class InstallScriptTests(unittest.TestCase):
             self.assertEqual(frontend, "noninteractive")
             self.assert_apt_options(argv, self.etc / "sources.list.d/ubuntu.sources")
             if action == "update":
-                self.assertIn("-o APT::Update::Error-Mode=any", argv)
-        self.assertTrue(calls[1][4].endswith("install -y --no-install-recommends --download-only -- clang-18 llvm-18"))
-        self.assertTrue(calls[2][4].endswith("install -y --no-install-recommends --no-download -- clang-18 llvm-18"))
+                self.assertIn(("-o", "APT::Update::Error-Mode=any"), list(zip(argv, argv[1:])))
+        self.assertEqual(
+            calls[1][4][-7:],
+            ["install", "-y", "--no-install-recommends", "--download-only", "--", "clang-18", "llvm-18"],
+        )
+        self.assertEqual(
+            calls[2][4][-7:],
+            ["install", "-y", "--no-install-recommends", "--no-download", "--", "clang-18", "llvm-18"],
+        )
 
     def test_failed_or_stalled_primary_falls_back_to_signed_canonical_archive(self):
         for fail, primary_timeout in (
@@ -1332,13 +1440,17 @@ class InstallScriptTests(unittest.TestCase):
                 fallback = [c for c in self.calls() if c[0] == "fallback"]
                 self.assertEqual([(a, t) for _, a, _, t, _ in fallback],
                                  [("update", "1"), ("download", "1"), ("unpack", "0")])
-                source = re.search(r"Dir::Etc::sourcelist=(\S+)", fallback[0][4]).group(1)
+                source = next(
+                    arg.split("=", 1)[1]
+                    for arg in fallback[0][4]
+                    if arg.startswith("Dir::Etc::sourcelist=")
+                )
                 self.assertTrue(source.endswith(".sources"))
                 for _, action, frontend, _, argv in fallback:
                     self.assertEqual(frontend, "noninteractive")
                     self.assert_apt_options(argv, source)
                     if action == "update":
-                        self.assertIn("-o APT::Update::Error-Mode=any", argv)
+                        self.assertIn(("-o", "APT::Update::Error-Mode=any"), list(zip(argv, argv[1:])))
                 self.assertFalse(Path(source).exists(), "temporary fallback source is removed")
                 self.assertEqual((self.log / "fallback-source").read_text(),
                                  sources.rewrite(DEB822, deb822=True)[0])
@@ -1348,7 +1460,11 @@ class InstallScriptTests(unittest.TestCase):
         result = self.run_script("primary-download")
         self.assertEqual(result.returncode, 0, result.stderr)
         fallback = [c for c in self.calls() if c[0] == "fallback"]
-        source = re.search(r"Dir::Etc::sourcelist=(\S+)", fallback[0][4]).group(1)
+        source = next(
+            arg.split("=", 1)[1]
+            for arg in fallback[0][4]
+            if arg.startswith("Dir::Etc::sourcelist=")
+        )
         self.assertTrue(source.endswith(".list"))
         self.assertEqual((self.log / "fallback-source").read_text(),
                          sources.rewrite(ONE_LINE, deb822=False)[0])
