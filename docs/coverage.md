@@ -145,13 +145,13 @@ treats coverage as a main-branch backstop:
   matrix so the tooling change is exercised before it lands.
 - Push to `main`, `schedule`, `workflow_dispatch`, empty or unavailable diffs,
   and malformed or hostile changed-path transport fail closed to the full
-  matrix (lib-unit, the five scoped integration shards, the two
-  integration-remainder shards, and the three functional shards), which
-  enforces the overall and `src/plugins/` floors. `coverage.yml` also accepts
-  split `kind: unit` shards (with `unit-core` as `ci-coverage` producer) and
-  fails packaging if any shard writes zero `.profraw` files, preparing phase 2
-  of the required-workflow-safe `lib-unit` split without breaking PR runs
-  executed from `refs/heads/main`. Classifiable
+  matrix (the five split unit shards — `unit-lib`, `unit-core`,
+  `unit-plugins-a`, `unit-plugins-b`, and `unit-gateway-core` — the five scoped
+  integration shards, the two integration-remainder shards, and the three
+  functional shards), which enforces the overall and `src/plugins/` floors.
+  `unit-core` is the designated `ci-coverage` cache producer; `coverage.yml`
+  still accepts legacy `lib-unit` rows for rollback safety and fails packaging
+  if any shard writes zero `.profraw` files. Classifiable
   paths use the conservative repository-relative `[A-Za-z0-9._+@~ /-]`
   alphabet, so Markdown controls cannot alter the Coverage Plan summary. A
   skipped planned shard cannot green the merge aggregate.
@@ -163,14 +163,14 @@ treats coverage as a main-branch backstop:
 possible future opt-in; the workflow does not currently use it. When selected,
 it works as follows:
 
-- Plugin-only diffs use the plugin mode: they run the `lib-unit` shard
-  (`--lib` and the four unit targets) and the merge job reuses that shard's
+- Plugin-only diffs use the plugin mode: they run the five split unit shards
+  (`--lib` and the four unit targets) and the merge job reuses those shards'
   profraw/artifacts instead of re-collecting coverage. Only this mode and the
   shard-scoped mode enforce the changed-line plugin gate
   (`MIN_CHANGED_PLUGIN_LINE_COVERAGE`) on coverable `src/plugins/` lines; mixed
   plugin and core changes select the affected core shards and keep that gate.
-- Classifiable core diffs run a shard-scoped plan: `lib-unit` plus only the
-  integration shards that own the changed tree. `src/admin/**` selects the
+- Classifiable core diffs run a shard-scoped plan: the five split unit shards
+  plus only the integration shards that own the changed tree. `src/admin/**` selects the
   admin shards, `src/modes/mesh/**` the mesh shards, and protocol trees such as
   `src/http3/**` the protocol data-plane shard. Shared runtime trees
   (`src/config/**`, `src/config_delta.rs`, `src/proxy/**`, `src/dns/**`,

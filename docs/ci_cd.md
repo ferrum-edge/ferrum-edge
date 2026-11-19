@@ -961,7 +961,7 @@ shared by every debug-profile job through identical `CARGO_BUILD_JOBS` /
 `ci-standalone-cargo` (produced by Standalone Cargo Workspaces), the main-only
 `fuzz-property-smoke` lane (Fuzz Smoke's property build, line-tables-only
 debuginfo), the registry-only `fuzz-sanitizer-smoke` lane
-(`cache-targets: "false"`), `ci-coverage` (produced by the coverage `lib-unit` shard),
+(`cache-targets: "false"`), `ci-coverage` (produced by the coverage `unit-core` shard, formerly `lib-unit`),
 and the separately governed FIPS contract lane. The direct eBPF-program cache also retains its main-push writer;
 binary and benchmark sites are restore-only (`save-if: "false"`).
 
@@ -1786,7 +1786,7 @@ separately (PR #3889).
 Cargo downloads and target dependencies, without the sccache directory, and
 defaults to restore-only.
 The Unit core shard owns `ci-debug`, Lint owns `ci-lint`, and coverage's
-lib-unit shard owns `ci-coverage`. All three explicitly set
+`unit-core` shard (formerly `lib-unit`) owns `ci-coverage`. All three explicitly set
 `cache-on-failure: "false"`: a failed setup/fetch/compile must not reserve an
 incomplete immutable key that later exact-hit consumers cannot enrich.
 This also forgoes saving when tests fail after compilation; no compile-complete

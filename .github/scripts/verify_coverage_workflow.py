@@ -23,16 +23,19 @@ from coverage_plan import (
     ALL_FUNCTIONAL_SHARDS,
     ALL_INTEGRATION_REMAINDER_SHARDS,
     ALL_SHARDS,
+    ALL_UNIT_SHARDS,
     CANONICAL_SHARD_ORDER,
     CONTROLLER_PATHS,
     FUNCTIONAL_DATA_SHARD,
     INTEGRATION_REMAINDER_FILTERSET,
-    LIB_UNIT_SHARD,
     MESH_PLATFORM_SHARD,
     MESH_ROUTING_SHARD,
     PROTOCOLS_SHARD,
     SCOPED_INTEGRATION_FILTERS,
     SHARD_DEFINITIONS,
+    UNIT_CORE_SHARD,
+    UNIT_SHARD_ORDER,
+    UNIT_SHARD_TARGETS,
     VALID_MODES,
     parse_planned_shards,
     select_plan,
@@ -48,6 +51,14 @@ DOCS_COVERAGE_PATH = REPO_ROOT / "docs" / "coverage.md"
 DOCS_CI_CD_PATH = REPO_ROOT / "docs" / "ci_cd.md"
 INTEGRATION_REGISTRY_PATH = REPO_ROOT / "tests" / "integration" / "mod.rs"
 INTEGRATION_MODULE_RE = re.compile(r"(?m)^\s*(?:pub\s+)?mod\s+([a-z0-9_]+)\s*;")
+
+FROZEN_UNIT_TARGETS: tuple[tuple[str, str], ...] = (
+    ("unit-lib", "lib"),
+    ("unit-core", "unit_tests"),
+    ("unit-plugins-a", "unit_plugins_a_tests"),
+    ("unit-plugins-b", "unit_plugins_b_tests"),
+    ("unit-gateway-core", "unit_gateway_core_tests"),
+)
 
 FROZEN_FILTER_MODULES = {
     ADMIN_API_SHARD: {
@@ -313,8 +324,17 @@ def validate_planner_contract(failures: list[str]) -> None:
         failures,
     )
     require(
-        SHARD_DEFINITIONS[LIB_UNIT_SHARD]["kind"] == "lib-unit",
-        "lib-unit must remain the lib/unit coverage shard",
+        UNIT_SHARD_TARGETS == FROZEN_UNIT_TARGETS
+        and UNIT_SHARD_ORDER == tuple(shard for shard, _target in FROZEN_UNIT_TARGETS)
+        and CANONICAL_SHARD_ORDER[: len(FROZEN_UNIT_TARGETS)] == UNIT_SHARD_ORDER
+        and UNIT_CORE_SHARD == "unit-core"
+        and UNIT_CORE_SHARD in ALL_UNIT_SHARDS
+        and all(
+            SHARD_DEFINITIONS[shard]["kind"] == "unit"
+            and SHARD_DEFINITIONS[shard].get("target") == target
+            for shard, target in FROZEN_UNIT_TARGETS
+        ),
+        "planner must define the five split unit coverage shards with exact targets and unit-core cache producer",
         failures,
     )
     for shard, expected in FROZEN_FILTER_MODULES.items():
@@ -624,8 +644,9 @@ def validate_docs(failures: list[str]) -> None:
     coverage_doc = DOCS_COVERAGE_PATH.read_text(encoding="utf-8")
     ci_cd_doc = DOCS_CI_CD_PATH.read_text(encoding="utf-8")
     require(
-        "shard-scoped" in coverage_doc and "lib-unit" in coverage_doc,
-        "docs/coverage.md must describe shard-scoped PR coverage planning",
+        "shard-scoped" in coverage_doc
+        and all(shard in coverage_doc for shard in UNIT_SHARD_ORDER),
+        "docs/coverage.md must describe shard-scoped PR coverage planning and the split unit shards",
         failures,
     )
     require(
@@ -634,8 +655,8 @@ def validate_docs(failures: list[str]) -> None:
         failures,
     )
     require(
-        "plugin" in coverage_doc and "lib-unit" in coverage_doc,
-        "docs/coverage.md must preserve plugin-mode artifact reuse",
+        "plugin" in coverage_doc and "unit-core" in coverage_doc,
+        "docs/coverage.md must preserve plugin-mode artifact reuse and unit-core cache ownership",
         failures,
     )
     require(
@@ -736,8 +757,10 @@ def self_test_artifact_transport(failures: list[str]) -> None:
             shutil.copy2(PLANNER_PATH, scripts / PLANNER_PATH.name)
             (scripts / "fixtures").mkdir()
             shutil.copy2(fixture_path, scripts / "fixtures/coverage_transport.sh")
+            transport_shards = (*UNIT_SHARD_ORDER, ADMIN_API_SHARD)
+            expected_ids = [str(11 + i) for i in range(len(transport_shards))]
             artifacts = []
-            for artifact_id, shard in ((11, LIB_UNIT_SHARD), (12, ADMIN_API_SHARD)):
+            for artifact_id, shard in enumerate(transport_shards, start=11):
                 artifact = {"id": artifact_id, "name": f"coverage-data-{shard}", "expired": False}
                 artifacts.append(artifact)
                 contents = io.BytesIO()
@@ -799,8 +822,9 @@ download() {
 }
 case "$*" in
   'api --paginate --slurp repos/example/coverage/actions/runs/42/artifacts') cat metadata.json ;;
-  'api repos/example/coverage/actions/artifacts/11/zip') download 11 ;;
-  'api repos/example/coverage/actions/artifacts/12/zip') download 12 ;;
+  'api repos/example/coverage/actions/artifacts/1'[1-6]'/zip')
+    id="${*#api repos/example/coverage/actions/artifacts/}"
+    download "${id%/zip}" ;;
   *) echo "unexpected artifact request: $*" >&2; exit 1 ;;
 esac
 """, encoding="utf-8")
@@ -816,7 +840,7 @@ esac
                      "TRANSPORT_TEST_CASE": case,
                      "GITHUB_REPOSITORY": "example/coverage", "GITHUB_RUN_ID": "42",
                      "GITHUB_STEP_SUMMARY": str(root / "summary.md"),
-                     "PLANNED_SHARDS": json.dumps([LIB_UNIT_SHARD, ADMIN_API_SHARD])},
+                     "PLANNED_SHARDS": json.dumps(list(transport_shards))},
                 capture_output=True, text=True, timeout=30,
             )
             should_succeed = case in {"valid", "zip64", "retry", "same-profile-path"}
@@ -831,7 +855,7 @@ esac
             if should_succeed and result.returncode == 0:
                 target = root / "target/llvm-cov-target"
                 expected_profiles = {}
-                for shard in (LIB_UNIT_SHARD, ADMIN_API_SHARD):
+                for shard in transport_shards:
                     stem = "ferrum-edge-functional-pool_0" if case == "same-profile-path" else shard
                     expected_profiles[f"{stem}.fanin-{shard}.profraw"] = f"profile-{shard}".encode()
                 # The report reads every top-level *.profraw: each shard's
@@ -840,7 +864,7 @@ esac
                 require(reported == expected_profiles, f"transport {case}: shard profiles lost or changed: {sorted(reported)}", failures)
                 obj = target / "debug/deps/shared-object"
                 require(obj.read_bytes() == b"object-admin-api" and (obj.stat().st_mode & 0o777) == 0o755, "shared object overwrite order or executable mode changed", failures)
-                expected_downloads = ["11", "11", "12"] if case == "retry" else ["11", "12"]
+                expected_downloads = ["11", *expected_ids] if case == "retry" else expected_ids
                 require((root / "downloads").read_text().splitlines() == expected_downloads, "transport downloaded unplanned or reordered artifacts", failures)
                 require(not (root / "coverage-data").exists() and not list(root.rglob("*.tar")), "transport left an intermediate archive", failures)
 
@@ -1232,13 +1256,13 @@ jobs:
     require(proxy.mode == "full" and set(proxy.shards) == set(CANONICAL_SHARD_ORDER), "proxy positive vs full shared matrix", failures)
     require(mesh.mode == "shards" and MESH_ROUTING_SHARD in mesh.shards, "mesh positive", failures)
     require(protocol.mode == "shards" and PROTOCOLS_SHARD in protocol.shards, "protocol positive", failures)
-    require(plugin.mode == "plugin" and plugin.shards == (LIB_UNIT_SHARD,), "plugin positive", failures)
+    require(plugin.mode == "plugin" and plugin.shards == UNIT_SHARD_ORDER, "plugin positive", failures)
     require(unknown.mode == "full" and unknown.shards == CANONICAL_SHARD_ORDER, "unknown fail-closed", failures)
     require(merge_group.mode == "shards", "merge_group remains path-gated", failures)
     require(main_event.mode == "full", "main push stays full", failures)
 
     try:
-        parse_planned_shards(json.dumps([LIB_UNIT_SHARD, ADMIN_API_SHARD]))
+        parse_planned_shards(json.dumps([*UNIT_SHARD_ORDER, ADMIN_API_SHARD]))
     except ValueError as error:
         failures.append(f"planned-shard parser self-test failed: {error}")
 
