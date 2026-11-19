@@ -147,7 +147,11 @@ treats coverage as a main-branch backstop:
   and malformed or hostile changed-path transport fail closed to the full
   matrix (lib-unit, the five scoped integration shards, the two
   integration-remainder shards, and the three functional shards), which
-  enforces the overall and `src/plugins/` floors. Classifiable
+  enforces the overall and `src/plugins/` floors. `coverage.yml` also accepts
+  split `kind: unit` shards (with `unit-core` as `ci-coverage` producer) and
+  fails packaging if any shard writes zero `.profraw` files, preparing phase 2
+  of the required-workflow-safe `lib-unit` split without breaking PR runs
+  executed from `refs/heads/main`. Classifiable
   paths use the conservative repository-relative `[A-Za-z0-9._+@~ /-]`
   alphabet, so Markdown controls cannot alter the Coverage Plan summary. A
   skipped planned shard cannot green the merge aggregate.

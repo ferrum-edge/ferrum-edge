@@ -141,6 +141,63 @@ INVALID_MODE_CONTRACT = (
 )
 # The functional coverage step must reach the instrumented gateway from every
 # binary-resolution path the suites use, and must not rebuild it per test.
+# Phase-1 split unit-shard support in coverage.yml alongside legacy lib-unit,
+# plus fail-closed target validation and a non-empty .profraw packaging guard.
+UNIT_SPLIT_TOKENS = (
+    "if: matrix.kind == 'lib-unit' || matrix.kind == 'unit'",
+    "save: ${{ (matrix.kind == 'lib-unit' || matrix.shard == 'unit-core') && 'true' || 'false' }}",
+    "COVERAGE_KIND: ${{ matrix.kind }}",
+    "UNIT_TARGET: ${{ matrix.target }}",
+)
+_UNIT_DISPATCH_BLOCK_RE = re.compile(
+    r'(?m)^\s*if \[ "\$COVERAGE_KIND" = "lib-unit" \]; then\n'
+    r"\s*cargo llvm-cov --no-report\s+\\\n"
+    r"\s*--lib\s+\\\n"
+    r"\s*--test unit_tests\s+\\\n"
+    r"\s*--test unit_plugins_a_tests\s+\\\n"
+    r"\s*--test unit_plugins_b_tests\s+\\\n"
+    r"\s*--test unit_gateway_core_tests\n"
+    r'\s*elif \[ "\$COVERAGE_KIND" = "unit" \]; then\n'
+    r'\s*case "\$UNIT_TARGET" in\n'
+    r"\s*lib\)\n"
+    r"\s*cargo llvm-cov --no-report\s+\\\n"
+    r"\s*--lib\n"
+    r"\s*;;\n"
+    r"\s*unit_tests\)\n"
+    r"\s*cargo llvm-cov --no-report\s+\\\n"
+    r"\s*--test unit_tests\n"
+    r"\s*;;\n"
+    r"\s*unit_plugins_a_tests\)\n"
+    r"\s*cargo llvm-cov --no-report\s+\\\n"
+    r"\s*--test unit_plugins_a_tests\n"
+    r"\s*;;\n"
+    r"\s*unit_plugins_b_tests\)\n"
+    r"\s*cargo llvm-cov --no-report\s+\\\n"
+    r"\s*--test unit_plugins_b_tests\n"
+    r"\s*;;\n"
+    r"\s*unit_gateway_core_tests\)\n"
+    r"\s*cargo llvm-cov --no-report\s+\\\n"
+    r"\s*--test unit_gateway_core_tests\n"
+    r"\s*;;\n"
+    r"\s*\*\)\n"
+    r'\s*echo "::error::unexpected unit coverage target: \$\{UNIT_TARGET\}" >&2\n'
+    r"\s*exit 1\n"
+    r"\s*;;\n"
+    r"\s*esac\n"
+    r"\s*else\n"
+    r'\s*echo "::error::unexpected coverage shard kind: \$\{COVERAGE_KIND\}" >&2\n'
+    r"\s*exit 1\n"
+    r"\s*fi"
+)
+_PACKAGE_NONEMPTY_PROFRAW_RE = re.compile(
+    r'(?m)^\s*profraw_count="\$\(grep -c \'\\\.profraw\$\' coverage-files\.txt \|\| true\)"\n'
+    r'(?:\s*echo [^\n]+\n)?'
+    r'\s*if \[ "\$profraw_count" -eq 0 \]; then\n'
+    r'(?:\s*echo [^\n]+\n)?'
+    r'\s*exit 1\n'
+    r'\s*fi\n'
+    r'\s*tar -cf "coverage-\$\{\{ matrix\.shard \}\}\.tar" -T coverage-files\.txt'
+)
 # The lib-unit shard's single llvm-cov invocation: the inline harness plus all
 # four unit targets, each on its own continuation line (issue #7282).
 COVERAGE_UNIT_TOKENS = (
@@ -444,6 +501,22 @@ def validate_workflow_text(text: str, failures: list[str]) -> None:
             "coverage invocation",
             failures,
         )
+    for token in UNIT_SPLIT_TOKENS:
+        require(
+            token in active_shard_lines,
+            f"coverage-shard unit split readiness must retain {token}",
+            failures,
+        )
+    require(
+        _UNIT_DISPATCH_BLOCK_RE.search(active_shard_lines) is not None,
+        "coverage-shard must bind lib-unit and split unit targets (with explicit `lib` sentinel and fail-closed arms) to COVERAGE_KIND",
+        failures,
+    )
+    require(
+        _PACKAGE_NONEMPTY_PROFRAW_RE.search(active_shard_lines) is not None,
+        "coverage-shard Package coverage data must exit 1 before tar when 0 .profraw files are found",
+        failures,
+    )
     for token in FUNCTIONAL_STEP_TOKENS:
         require(
             token in shard_body,
@@ -872,14 +945,62 @@ jobs:
       matrix:
         include: ${{ fromJSON(needs.coverage-plan.outputs.shard-matrix) }}
     steps:
+      - uses: ./.github/actions/setup-rust-ci
+        with:
+          shared-key: "ci-coverage"
+          save: ${{ (matrix.kind == 'lib-unit' || matrix.shard == 'unit-core') && 'true' || 'false' }}
       - run: echo "${{ matrix.shard }}"
-      - run: |
-          cargo llvm-cov --no-report \\
-            --lib \\
-            --test unit_tests \\
-            --test unit_plugins_a_tests \\
-            --test unit_plugins_b_tests \\
-            --test unit_gateway_core_tests
+      - if: matrix.kind == 'lib-unit' || matrix.kind == 'unit'
+        run: |
+          if [ "$COVERAGE_KIND" = "lib-unit" ]; then
+            cargo llvm-cov --no-report \\
+              --lib \\
+              --test unit_tests \\
+              --test unit_plugins_a_tests \\
+              --test unit_plugins_b_tests \\
+              --test unit_gateway_core_tests
+          elif [ "$COVERAGE_KIND" = "unit" ]; then
+            case "$UNIT_TARGET" in
+              lib)
+                cargo llvm-cov --no-report \\
+                  --lib
+                ;;
+              unit_tests)
+                cargo llvm-cov --no-report \\
+                  --test unit_tests
+                ;;
+              unit_plugins_a_tests)
+                cargo llvm-cov --no-report \\
+                  --test unit_plugins_a_tests
+                ;;
+              unit_plugins_b_tests)
+                cargo llvm-cov --no-report \\
+                  --test unit_plugins_b_tests
+                ;;
+              unit_gateway_core_tests)
+                cargo llvm-cov --no-report \\
+                  --test unit_gateway_core_tests
+                ;;
+              *)
+                echo "::error::unexpected unit coverage target: ${UNIT_TARGET}" >&2
+                exit 1
+                ;;
+            esac
+          else
+            echo "::error::unexpected coverage shard kind: ${COVERAGE_KIND}" >&2
+            exit 1
+          fi
+        env:
+          COVERAGE_KIND: ${{ matrix.kind }}
+          UNIT_TARGET: ${{ matrix.target }}
+      - name: Package coverage data
+        run: |
+          profraw_count="$(grep -c '\\.profraw$' coverage-files.txt || true)"
+          if [ "$profraw_count" -eq 0 ]; then
+            echo "::error::coverage shard ${COVERAGE_SHARD} produced 0 .profraw files" >&2
+            exit 1
+          fi
+          tar -cf "coverage-${{ matrix.shard }}.tar" -T coverage-files.txt
       - if: matrix.kind == 'integration'
         run: |
           nextest_args+=(-E "$INTEGRATION_FILTERSET")
@@ -995,14 +1116,44 @@ jobs:
             "restored CARGO_BUILD_JOBS=3",
         ),
         (
-            "            --test unit_tests \\\n",
+            "              --test unit_tests \\\n",
             "",
             "narrowed lib-unit coverage set",
         ),
         (
-            "            --test unit_plugins_b_tests \\\n",
+            "              --test unit_plugins_b_tests \\\n",
             "",
             "dropped unit_plugins_b_tests coverage target",
+        ),
+        (
+            "              lib)\n",
+            '              "")\n',
+            "empty target sentinel silently runs --lib",
+        ),
+        (
+            'elif [ "$COVERAGE_KIND" = "unit" ]; then',
+            'elif [ "$COVERAGE_KIND" = "units" ]; then',
+            "misspelled unit COVERAGE_KIND branch",
+        ),
+        (
+            "              *)\n                echo \"::error::unexpected unit coverage target: ${UNIT_TARGET}\" >&2\n                exit 1\n                ;;\n",
+            "",
+            "dropped fail-closed unit target arm",
+        ),
+        (
+            "          else\n            echo \"::error::unexpected coverage shard kind: ${COVERAGE_KIND}\" >&2\n            exit 1\n",
+            "",
+            "dropped fail-closed unknown COVERAGE_KIND arm",
+        ),
+        (
+            'if [ "$profraw_count" -eq 0 ]; then',
+            'if false; then',
+            "dropped zero-profraw shard packaging guard",
+        ),
+        (
+            '          if [ "$profraw_count" -eq 0 ]; then\n            echo "::error::coverage shard ${COVERAGE_SHARD} produced 0 .profraw files" >&2\n            exit 1\n          fi',
+            '          if [ "$profraw_count" -eq 0 ]; then\n            echo "::error::coverage shard ${COVERAGE_SHARD} produced 0 .profraw files" >&2\n            true\n          fi',
+            "zero-profraw guard does not exit 1 before tar",
         ),
         (
             "      - run: python3 .github/scripts/verify_coverage_workflow.py\n",
