@@ -456,6 +456,35 @@ class SourceRewriteTests(unittest.TestCase):
             sources.rewrite("deb [unclosed https://user:secretpass@example.com/ubuntu/ noble main\n", deb822=False)
         self.assertNotIn("secretpass", str(exc.exception))
 
+        # APT's pkgAcquire::URIEncode encodes `+` as `%2b`, so regional suite
+        # `profile+debug` collides with flat `/ubuntu/dists/profile%2bdebug/` + `/`.
+        deb822_encoded_plus = (
+            "Types: deb\nURIs: https://archive.ubuntu.com/ubuntu/dists/profile%2bdebug/\nSuites: /\n"
+            f"Signed-By: {KEYRING}\n\n"
+            "Types: deb\nURIs: https://us-east-2.ec2.archive.ubuntu.com/ubuntu/\nSuites: profile+debug\n"
+            f"Components: main\nSigned-By: {alt_keyring}\n"
+        )
+        self.assertEqual(sources.rewrite(deb822_encoded_plus, deb822=True), (deb822_encoded_plus, False))
+
+        # Bracketed host containing `/` flattens to the same URItoFileName key.
+        deb822_bracket_slash = (
+            "Types: deb\nURIs: http://[archive.ubuntu.com/ubuntu]/\nSuites: resolute\n"
+            f"Components: main\nSigned-By: {KEYRING}\n\n"
+            "Types: deb\nURIs: https://us-east-2.ec2.archive.ubuntu.com/ubuntu/\nSuites: resolute\n"
+            f"Components: universe\nSigned-By: {KEYRING}\n"
+        )
+        self.assertEqual(sources.rewrite(deb822_bracket_slash, deb822=True), (deb822_bracket_slash, False))
+
+        # Capitalized `HTTPS:` selects a different APT method than `https:` and
+        # must block merges rather than being treated as ordinary `https:`.
+        deb822_upper_scheme = (
+            "Types: deb\nURIs: HTTPS://archive.ubuntu.com/ubuntu/\nSuites: resolute\n"
+            f"Components: main\nSigned-By: {KEYRING}\n\n"
+            "Types: deb\nURIs: https://us-east-2.ec2.archive.ubuntu.com/ubuntu/\nSuites: resolute\n"
+            f"Components: universe\nSigned-By: {KEYRING}\n"
+        )
+        self.assertEqual(sources.rewrite(deb822_upper_scheme, deb822=True), (deb822_upper_scheme, False))
+
     @unittest.skipUnless(shutil.which("apt-get") and Path(KEYRING).exists(), "needs hosted Ubuntu apt-get")
     def test_hosted_apt_accepts_rewritten_mixed_and_distinct_policy_sources(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -857,6 +886,44 @@ class SourceRewriteTests(unittest.TestCase):
                     ),
                     "http://archive.ubuntu.com",
                 ),
+                (
+                    "encoded-suite-plus.sources",
+                    "Types: deb\nURIs: https://archive.ubuntu.com/ubuntu/dists/profile%2bdebug/\nSuites: /\n"
+                    f"Signed-By: {KEYRING}\n\n"
+                    "Types: deb\nURIs: https://us-east-2.ec2.archive.ubuntu.com/ubuntu/\nSuites: profile+debug\n"
+                    f"Components: main\nSigned-By: {alt_keyring}\n\n"
+                    "Types: deb\nURIs: https://us-east-2.ec2.archive.ubuntu.com/ubuntu/\nSuites: resolute-updates\n"
+                    f"Components: main\nSigned-By: {KEYRING}\n",
+                    True,
+                    True,
+                    (
+                        "https://archive.ubuntu.com/ubuntu/dists/resolute-updates/InRelease",
+                        "https://us-east-2.ec2.archive.ubuntu.com/ubuntu/dists/profile%2bdebug/InRelease",
+                    ),
+                    (
+                        "Repo-URI: https://archive.ubuntu.com/ubuntu/dists/profile%2bdebug/",
+                        "Repo-URI: https://us-east-2.ec2.archive.ubuntu.com/ubuntu/",
+                    ),
+                    "http://archive.ubuntu.com",
+                ),
+                (
+                    "tor-slashless-distinct.sources",
+                    "Types: deb\nURIs: tor+https:archive.ubuntu.com/ubuntu/\nSuites: resolute\n"
+                    f"Components: main\nSigned-By: {KEYRING}\n\n"
+                    "Types: deb\nURIs: https://us-east-2.ec2.archive.ubuntu.com/ubuntu/\nSuites: resolute\n"
+                    f"Components: universe\nSigned-By: {alt_keyring}\n\n"
+                    "Types: deb\nURIs: https://us-east-2.ec2.archive.ubuntu.com/ubuntu/\nSuites: resolute-updates\n"
+                    f"Components: main\nSigned-By: {KEYRING}\n",
+                    True,
+                    True,
+                    (),
+                    (
+                        "Repo-URI: tor+https://archive.ubuntu.com/ubuntu/",
+                        "Repo-URI: https://us-east-2.ec2.archive.ubuntu.com/ubuntu/",
+                        "https://archive.ubuntu.com/ubuntu/dists/resolute-updates/main/binary-",
+                    ),
+                    "http://archive.ubuntu.com",
+                ),
             ):
                 with self.subTest(case=name):
                     rewritten, changed = sources.rewrite(raw, deb822)
@@ -869,17 +936,18 @@ class SourceRewriteTests(unittest.TestCase):
                         "-o", f"Dir::State::lists={lists}",
                         "-o", "Debug::NoLocking=1",
                     ]
-                    proc = subprocess.run(
-                        ["apt-get", *base_opts, "update", "--print-uris"],
-                        capture_output=True,
-                        text=True,
-                        timeout=30,
-                    )
-                    self.assertEqual(proc.returncode, 0, proc.stderr)
-                    for expected in required_uris:
-                        self.assertIn(expected, proc.stdout)
-                    if forbid_substr:
-                        self.assertNotIn(forbid_substr, proc.stdout)
+                    if required_uris:
+                        proc = subprocess.run(
+                            ["apt-get", *base_opts, "update", "--print-uris"],
+                            capture_output=True,
+                            text=True,
+                            timeout=30,
+                        )
+                        self.assertEqual(proc.returncode, 0, proc.stderr)
+                        for expected in required_uris:
+                            self.assertIn(expected, proc.stdout)
+                        if forbid_substr:
+                            self.assertNotIn(forbid_substr, proc.stdout)
                     if required_targets:
                         targets = subprocess.run(
                             [
@@ -897,6 +965,8 @@ class SourceRewriteTests(unittest.TestCase):
                         self.assertEqual(targets.returncode, 0, targets.stderr)
                         for expected_target in required_targets:
                             self.assertIn(expected_target, targets.stdout)
+                        if forbid_substr:
+                            self.assertNotIn(forbid_substr, targets.stdout)
 
     def test_one_line_adjacent_uri_after_option_bracket_is_rewritten_and_checked(self):
         adjacent = f"deb [signed-by={KEYRING} ]http://azure.archive.ubuntu.com/ubuntu/ noble main\n"

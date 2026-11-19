@@ -115,16 +115,16 @@ echo "::warning::Ubuntu apt fetch from the runner mirror failed or timed out (st
 
 workdir=$(mktemp -d)
 trap 'rm -rf "$workdir"' EXIT
+chmod 700 "$workdir"
 case "$ubuntu_sources" in
   *.sources) fallback=$workdir/ubuntu-canonical.sources ;;
   *) fallback=$workdir/ubuntu-canonical.list ;;
 esac
-chmod 755 "$workdir"
 rewrite=0
 python3 "$here/h1_apt_sources.py" "$ubuntu_sources" "$fallback" || rewrite=$?
 case "$rewrite" in
   0)
-    chmod 644 "$fallback"
+    chmod 600 "$fallback"
     echo "::warning::retrying Ubuntu apt fetch from https://archive.ubuntu.com/ubuntu/"
     ;;
   3)

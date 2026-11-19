@@ -35,10 +35,11 @@ _MIRROR_URI = re.compile(
     r"|(?i:mirror\+file:)(?:///|/)etc/apt/apt-mirrors\.txt"
     r"|(?i:mirror(?:\+https?)?://mirrors\.ubuntu\.com)/\S+)$"
 )
-# Only portless lowercase-host canonical URIs (including empty `:`) share the
-# portless `archive.ubuntu.com/ubuntu/` Release index in APT; explicit nonzero
-# ports (`:80`, `:443`) and different host casing keep distinct Release filenames.
-_HTTP_CANONICAL = re.compile(r"^(?i:http)://archive\.ubuntu\.com:?/ubuntu/?$")
+# Only portless lowercase `http://archive.ubuntu.com/ubuntu/` URIs (including
+# empty `:`) share the portless `archive.ubuntu.com/ubuntu/` Release index and
+# use APT's exact `http` method; explicit nonzero ports (`:80`, `:443`) and
+# different host/scheme casing keep distinct Release filenames or methods.
+_HTTP_CANONICAL = re.compile(r"^http://archive\.ubuntu\.com:?/ubuntu/?$")
 # Structural deb822 fields that do not define per-Release/per-target merge
 # policy; every other field (Signed-By, Snapshot, Include, Exclude,
 # Architectures, Languages, Targets, PDiffs, By-Hash, Check-Valid-Until, etc.)
@@ -156,15 +157,20 @@ def _apt_dequote_percent(raw):
 
 
 def _apt_quote_string(raw, bad):
-    """Percent-encode characters in `bad` or outside printable ASCII per APT QuoteString."""
+    """Port of APT's `QuoteString` (`apt-pkg/contrib/strutl.cc:352-367`)."""
+    bad_bytes = bad.encode("ascii")
     out = []
-    for ch in raw:
-        code = ord(ch)
-        if ch in bad or code <= 0x20 or code >= 0x7F:
-            out.append(f"%{code:02X}")
+    for byte_val in raw.encode("utf-8"):
+        if byte_val in bad_bytes or byte_val == 0x25 or byte_val <= 0x20 or byte_val >= 0x7F:
+            out.append(f"%{byte_val:02x}")
         else:
-            out.append(ch)
+            out.append(chr(byte_val))
     return "".join(out)
+
+
+def _apt_uri_encode(part):
+    """Port of APT's `pkgAcquire::URIEncode` (`apt-pkg/acquire.cc:65-69`)."""
+    return _apt_quote_string(part, "+~ ")
 
 
 def _parse_apt_uri(raw):
@@ -270,31 +276,41 @@ def _format_apt_uri(access, user, password, host, port, path):
 
 
 def _full_repo_uri(uri):
-    """Return APT's normalized full `REPO_URI` (including scheme and userinfo)."""
+    """Return APT's normalized full `REPO_URI` (preserving exact scheme case and userinfo)."""
     base = uri if uri.endswith("/") else uri + "/"
     access, user, password, host, port, path = _parse_apt_uri(base)
-    return _format_apt_uri(access.lower(), user, password, host, port, path)
+    return _format_apt_uri(access, user, password, host, port, path)
+
+
+_URI_FILENAME_BAD = r'\|{}[]<>"^~_=!@#$%^&*'
 
 
 def _release_index_key(uri, suite):
-    """Return APT's effective Release-index key matching URItoFileName(constructMetaIndexURI(...))."""
-    base = uri if uri.endswith("/") else uri + "/"
+    """Port of APT's `URItoFileName(constructMetaIndexURI(FixupURI(uri), suite, "Release"))`.
+
+    Matches `apt-pkg/deb/debmetaindex.cc:165-174` and `apt-pkg/contrib/strutl.cc:521-533`.
+    """
+    base = _full_repo_uri(uri)
+    if not base.endswith("/"):
+        base += "/"
     if suite == "/":
         meta_uri = base + "Release"
     elif suite.endswith("/"):
-        meta_uri = base + suite + "Release"
+        meta_uri = base + _apt_uri_encode(suite) + "Release"
     else:
-        meta_uri = base + "dists/" + suite + "/Release"
+        meta_uri = base + "dists/" + _apt_uri_encode(suite) + "/Release"
     _access, _user, _password, host, port, path = _parse_apt_uri(meta_uri)
-    return (host, port, path)
+    stripped = _format_apt_uri("", "", "", host, port, path)
+    return _apt_quote_string(stripped, _URI_FILENAME_BAD).replace("/", "_")
 
 
 def _suite_policy(policy, uri, suite):
-    """Combine entry options, flat-vs-component layout, full REPO_URI, and RELEASE."""
+    """Conservative merge-compatibility key: entry options, layout, full REPO_URI, and RELEASE."""
     return (policy, suite.endswith("/"), _full_repo_uri(uri), "" if suite == "/" else suite)
 
 
 _CANONICAL_HOST, _CANONICAL_PORT = _parse_apt_uri(CANONICAL)[3:5]
+_CANONICAL_FILENAME_PREFIX = f"{_CANONICAL_HOST}_"
 _CANONICAL_WILDCARD = object()
 
 
@@ -305,7 +321,9 @@ def _has_arch_var(text):
 def _register_entry_keys(release_policies, uris, suites, policy):
     for uri in uris:
         access, _user, _password, host, port, _path = _parse_apt_uri(uri)
-        is_https = access.lower() == "https"
+        # Match APT's exact lowercase method name (`https`); capitalized
+        # schemes like `HTTPS:` select a different/missing method in APT.
+        is_https = access == "https"
         upgradeable_http = _is_http_canonical(uri)
         if _has_arch_var(uri) and host == _CANONICAL_HOST and port == _CANONICAL_PORT:
             release_policies[_CANONICAL_WILDCARD] = _POLICY_CONFLICT
@@ -314,12 +332,8 @@ def _register_entry_keys(release_policies, uris, suites, policy):
                 release_policies[_CANONICAL_WILDCARD] = _POLICY_CONFLICT
             key = _release_index_key(uri, suite)
             # Any non-HTTPS entry that is not an upgradeable portless HTTP
-            # canonical URI (e.g. `http://reader@archive.ubuntu.com/ubuntu/`,
-            # `http:archive.ubuntu.com/ubuntu/`, `http://[archive.ubuntu.com]/ubuntu/`,
-            # `tor+https:archive.ubuntu.com/ubuntu/`, or `.../ubuntu/dists/`
-            # with flat suite `resolute/`) blocks merges onto its effective
-            # Release key so APT neither hits a policy conflict nor reuses
-            # non-HTTPS transport.
+            # canonical URI blocks merges onto its effective Release filename
+            # so APT neither hits a policy conflict nor reuses non-HTTPS transport.
             if not is_https and not upgradeable_http:
                 release_policies[key] = _POLICY_CONFLICT
                 continue
@@ -336,7 +350,7 @@ def _canonical_keys_compatible(release_policies, suites, policy):
     if _CANONICAL_WILDCARD in release_policies:
         return False
     has_existing_canonical = any(
-        isinstance(k, tuple) and k[0] == _CANONICAL_HOST and k[1] == _CANONICAL_PORT
+        isinstance(k, str) and k.startswith(_CANONICAL_FILENAME_PREFIX)
         for k in release_policies
     )
     for suite in suites:
