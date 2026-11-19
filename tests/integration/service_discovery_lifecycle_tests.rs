@@ -112,6 +112,7 @@ fn upstream_with_sd(
         created_at: chrono::Utc::now(),
         updated_at: chrono::Utc::now(),
         k8s_service_uid: None,
+        admission_upstream_id: None,
         pending_limit_scope: None,
     }
 }

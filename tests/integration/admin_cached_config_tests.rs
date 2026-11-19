@@ -237,6 +237,7 @@ fn create_test_upstream(id: &str, name: &str) -> Upstream {
         created_at: Utc::now(),
         updated_at: Utc::now(),
         k8s_service_uid: None,
+        admission_upstream_id: None,
         pending_limit_scope: None,
     }
 }

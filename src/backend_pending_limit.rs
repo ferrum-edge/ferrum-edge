@@ -195,6 +195,12 @@ pub struct BackendPendingScopeBase {
     /// Structured rejection logs only; never a Prometheus label or
     /// authorization input.
     digest: u64,
+    /// The canonical upstream id the destination-wide active-request breaker
+    /// (`http2MaxRequests`) keys this destination by, when it differs from the
+    /// dialed upstream: a route-scoped clone is admitted as the upstream it
+    /// copies (issue #7423, `Upstream::admission_upstream_id`). `None` keeps
+    /// the dialed upstream id.
+    admission_destination: Option<Arc<str>>,
 }
 
 impl BackendPendingScopeBase {
@@ -210,6 +216,7 @@ impl BackendPendingScopeBase {
         namespace: &str,
         upstream_id: &str,
         k8s_service_uid: Option<&str>,
+        admission_upstream_id: None,
         subset: Option<&str>,
     ) -> Self {
         let mut buf = String::with_capacity(
@@ -237,7 +244,23 @@ impl BackendPendingScopeBase {
         Self {
             prefix: Arc::from(buf),
             digest,
+            admission_destination: None,
         }
+    }
+
+    /// Admit the destination under `upstream_id` for the active-request
+    /// breaker (see the field docs). The pending-limit identity is unchanged.
+    #[must_use]
+    pub fn with_admission_destination(mut self, upstream_id: &str) -> Self {
+        self.admission_destination = Some(Arc::from(upstream_id));
+        self
+    }
+
+    /// The canonical upstream id the active-request breaker keys this
+    /// destination by, when it differs from the dialed upstream.
+    #[inline]
+    pub fn admission_destination(&self) -> Option<&str> {
+        self.admission_destination.as_deref()
     }
 
     /// Opaque FNV-1a digest of the logical identity (excluding policy port).

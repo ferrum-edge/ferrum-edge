@@ -14285,6 +14285,7 @@ fn row_to_upstream_inner(row: &AnyRow, id_preview: &str) -> Result<Upstream, any
         created_at: parse_datetime_column(row, "created_at"),
         updated_at: parse_datetime_column(row, "updated_at"),
         k8s_service_uid: None,
+        admission_upstream_id: None,
         pending_limit_scope: None,
     })
 }

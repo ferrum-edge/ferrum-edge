@@ -4489,6 +4489,7 @@ pub(crate) fn upstream_for_route_with_session(
         created_at: now,
         updated_at: now,
         k8s_service_uid: None,
+        admission_upstream_id: None,
         pending_limit_scope: None,
     };
     if let Some(session) = session {

@@ -1898,6 +1898,13 @@ impl MeshSlice {
                         .collect();
                     sidecar.includes_service(&host_scope.scope_namespace, &host_refs, Some(&[port]))
                 },
+                // A Sidecar forwards an admitted `rewrite.authority` verbatim
+                // (issue #7423), so a port-less one must name a single-port
+                // destination in the destination's full inventory, which the
+                // Sidecar's egress-narrowed view may not show.
+                request
+                    .sidecar_http_routes
+                    .then_some(cluster_domain.as_str()),
             )
         } else {
             MeshHttpRouteSet::default()
@@ -3612,6 +3619,7 @@ fn node_waypoint_http_route_set(
     namespace: &str,
     service_waypoint_namespaces: &Option<BTreeSet<String>>,
     destination_admitted: &dyn Fn(&str, &str, u16) -> bool,
+    portless_rewrite_cluster_domain: Option<&str>,
 ) -> MeshHttpRouteSet {
     use crate::config::types::{PluginConfig, Upstream};
     use crate::modes::mesh::config::{
@@ -3737,6 +3745,23 @@ fn node_waypoint_http_route_set(
             );
             continue;
         }
+        if let Some(cluster_domain) = portless_rewrite_cluster_domain
+            && route_plugins.iter().any(|plugin| {
+                portless_authority_rewrite_names_multi_port_service(
+                    plugin,
+                    proxy,
+                    mesh,
+                    cluster_domain,
+                )
+            })
+        {
+            debug!(
+                proxy_id = %sanitize_startup_cause(format!("{:?}", proxy.id.to_string()), &[]),
+                "VirtualService HTTP route rewrites the authority to a port-less host of a \
+                 multi-port Service; not carrying it to the Sidecar slice"
+            );
+            continue;
+        }
         if !destinations
             .iter()
             .all(|(host, port)| destination_admitted(proxy_namespace, host, *port))
@@ -3786,6 +3811,65 @@ fn node_waypoint_http_route_set(
         }
     }
     set
+}
+
+/// Whether a route's `mesh_route_dispatch` instance has a rule that rewrites
+/// the authority to a host with no port while its destination is an in-mesh
+/// Service with more than one HTTP port in the full inventory (issue #7423).
+/// A Sidecar forwards an admitted rewrite verbatim, and the destination Sidecar
+/// cannot pick among several ports without one. Over-matching (any Service
+/// alias match) only withholds more routes.
+fn portless_authority_rewrite_names_multi_port_service(
+    plugin: &crate::config::types::PluginConfig,
+    proxy: &crate::config::types::Proxy,
+    mesh: &MeshConfig,
+    cluster_domain: &str,
+) -> bool {
+    if plugin.plugin_name != "mesh_route_dispatch" {
+        return false;
+    }
+    plugin
+        .config
+        .get("rules")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .any(|rule| {
+            let Some(authority) = rule
+                .get("rewrite")
+                .and_then(|rewrite| rewrite.get("authority"))
+                .and_then(serde_json::Value::as_str)
+            else {
+                return false;
+            };
+            if authority.trim().contains(':') {
+                return false;
+            }
+            let destination = rule.get("destination");
+            if destination
+                .and_then(|destination| destination.get("upstream_id"))
+                .is_some()
+            {
+                // A split destination is refused by the data plane.
+                return false;
+            }
+            let host = destination
+                .and_then(|destination| destination.get("backend_host"))
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or(proxy.backend_host.as_str())
+                .trim()
+                .trim_end_matches('.')
+                .to_ascii_lowercase();
+            mesh.services.iter().any(|service| {
+                crate::modes::mesh::service_http_family_ports(service).len() > 1
+                    && service_host_aliases(&service.name, &service.namespace, cluster_domain)
+                        .iter()
+                        .any(|alias| {
+                            *alias == host
+                                && (alias.contains('.') || service.namespace == proxy.namespace)
+                        })
+            })
+        })
 }
 
 /// Id prefix shared by every route plugin the K8s translator attaches to a

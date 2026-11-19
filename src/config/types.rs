@@ -2371,6 +2371,18 @@ pub struct Upstream {
     #[serde(skip)]
     pub pending_limit_scope:
         Option<std::sync::Arc<crate::backend_pending_limit::BackendPendingScopeBase>>,
+    /// Canonical admission identity of a route-scoped upstream clone (issue
+    /// #7423): the id of the upstream (same namespace) it copies. A Sidecar
+    /// dials carried VirtualService destinations through such clones
+    /// (`modes::mesh::clone_sidecar_carried_destination_upstreams`), which
+    /// keep their own routing and load-balancer identity but must share the
+    /// destination's admission lanes (`http2MaxRequests`,
+    /// `http1MaxPendingRequests`) with the upstream they copy.
+    /// [`GatewayConfig::resolve_pending_limit_scopes`] folds it into the
+    /// precomputed scopes. `#[serde(skip)]` — set only by mesh
+    /// materialization; never an operator input field.
+    #[serde(skip)]
+    pub admission_upstream_id: Option<String>,
     #[serde(default = "Utc::now")]
     pub created_at: DateTime<Utc>,
     #[serde(default = "Utc::now")]
@@ -4243,6 +4255,18 @@ const LISTEN_PATH_PARAMETER_ERROR: &str = "listen_path with `;` requires `allow_
 /// the same Service FQDN in `name`; using that FQDN prevents endpoint fan-out
 /// from multiplying the Service's cap. The optional Kubernetes UID remains an
 /// additive recreate fence, and the policy port is appended at acquire time.
+/// The upstream a route-scoped clone is admitted as
+/// (`Upstream::admission_upstream_id`, same namespace), if it resolves.
+fn admission_source_upstream<'a>(
+    upstream: &Upstream,
+    upstreams: &HashMap<(&str, &str), &'a Upstream>,
+) -> Option<&'a Upstream> {
+    let source = upstream.admission_upstream_id.as_deref()?;
+    upstreams
+        .get(&(upstream.namespace.as_str(), source))
+        .copied()
+}
+
 fn pending_limit_logical_id(upstream: &Upstream) -> &str {
     let is_mesh_http_egress = upstream
         .id
@@ -5026,50 +5050,70 @@ impl GatewayConfig {
     /// stamps `Upstream.k8s_service_uid`). Invoked from `normalize_fields`
     /// beside `resolve_dispatch_port_overrides`.
     pub fn resolve_pending_limit_scopes(&mut self) {
-        for upstream in &mut self.upstreams {
-            let scope = {
-                let logical_id = pending_limit_logical_id(upstream);
-                std::sync::Arc::new(crate::backend_pending_limit::BackendPendingScopeBase::new(
-                    upstream.namespace.as_str(),
-                    logical_id,
-                    upstream.k8s_service_uid.as_deref(),
-                    // Top-level only: route overrides clear `upstream_subset`
-                    // when the effective upstream changes.
-                    None,
-                ))
-            };
-            upstream.pending_limit_scope = Some(scope);
-        }
-
         let upstream_by_key: HashMap<(&str, &str), &Upstream> = self
             .upstreams
             .iter()
             .map(|u| ((u.namespace.as_str(), u.id.as_str()), u))
             .collect();
-
-        for proxy in &mut self.proxies {
-            let (logical_id, uid) = if let Some(ref upstream_id) = proxy.upstream_id {
-                match upstream_by_key.get(&(proxy.namespace.as_str(), upstream_id.as_str())) {
-                    Some(upstream) => (
-                        pending_limit_logical_id(upstream),
-                        upstream.k8s_service_uid.as_deref(),
+        // A route-scoped clone (issue #7423) is admitted as the upstream it
+        // copies (`Upstream::admission_upstream_id`), so every route dialing
+        // one Service port shares that destination's lanes. An unresolvable
+        // admission id keeps the clone's own identity.
+        let scope_for = |upstream: &Upstream, subset: Option<&str>| {
+            let source = admission_source_upstream(upstream, &upstream_by_key);
+            let admitted = source.unwrap_or(upstream);
+            let scope = crate::backend_pending_limit::BackendPendingScopeBase::new(
+                upstream.namespace.as_str(),
+                pending_limit_logical_id(admitted),
+                admitted.k8s_service_uid.as_deref(),
+                subset,
+            );
+            match source {
+                Some(source) => scope.with_admission_destination(source.id.as_str()),
+                None => scope,
+            }
+        };
+        let upstream_scopes: Vec<_> = self
+            .upstreams
+            .iter()
+            // Top-level only: route overrides clear `upstream_subset` when the
+            // effective upstream changes.
+            .map(|upstream| std::sync::Arc::new(scope_for(upstream, None)))
+            .collect();
+        let proxy_scopes: Vec<_> = self
+            .proxies
+            .iter()
+            .map(|proxy| {
+                let scope = match proxy.upstream_id.as_deref() {
+                    Some(upstream_id) => {
+                        match upstream_by_key.get(&(proxy.namespace.as_str(), upstream_id)) {
+                            Some(upstream) => scope_for(upstream, proxy.upstream_subset.as_deref()),
+                            None => crate::backend_pending_limit::BackendPendingScopeBase::new(
+                                proxy.namespace.as_str(),
+                                upstream_id,
+                                None,
+                                proxy.upstream_subset.as_deref(),
+                            ),
+                        }
+                    }
+                    // Direct-backend proxy: the proxy itself is the logical
+                    // destination. Distinct proxies do not share a lane unless
+                    // they intentionally share an upstream_id.
+                    None => crate::backend_pending_limit::BackendPendingScopeBase::new(
+                        proxy.namespace.as_str(),
+                        proxy.id.as_str(),
+                        None,
+                        proxy.upstream_subset.as_deref(),
                     ),
-                    None => (upstream_id.as_str(), None),
-                }
-            } else {
-                // Direct-backend proxy: the proxy itself is the logical
-                // destination. Distinct proxies do not share a lane unless
-                // they intentionally share an upstream_id.
-                (proxy.id.as_str(), None)
-            };
-            proxy.pending_limit_scope = Some(std::sync::Arc::new(
-                crate::backend_pending_limit::BackendPendingScopeBase::new(
-                    proxy.namespace.as_str(),
-                    logical_id,
-                    uid,
-                    proxy.upstream_subset.as_deref(),
-                ),
-            ));
+                };
+                std::sync::Arc::new(scope)
+            })
+            .collect();
+        for (upstream, scope) in self.upstreams.iter_mut().zip(upstream_scopes) {
+            upstream.pending_limit_scope = Some(scope);
+        }
+        for (proxy, scope) in self.proxies.iter_mut().zip(proxy_scopes) {
+            proxy.pending_limit_scope = Some(scope);
         }
     }
 

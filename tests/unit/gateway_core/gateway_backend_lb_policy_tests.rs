@@ -337,6 +337,7 @@ fn sticky_session_cookie_omits_max_age_on_set_cookie() {
         created_at: chrono::Utc::now(),
         updated_at: chrono::Utc::now(),
         k8s_service_uid: None,
+        admission_upstream_id: None,
         pending_limit_scope: None,
     };
     assert!(upstream.validate_fields().is_ok());
