@@ -67,8 +67,8 @@ jobs:
           components: rustfmt, clippy
       - name: Hosted prerequisites
         run: |
-          sudo apt-get update
-          sudo apt-get install -y protobuf-compiler libssl-dev libcurl4-openssl-dev clang
+          bash tests/performance/multi_protocol/h1_apt_install.sh \
+            protobuf-compiler libssl-dev libcurl4-openssl-dev clang
       - name: Formatting (hosted only)
         run: cargo fmt --all -- --check
       - name: H1 harness formatting, lint and cancellation/retirement regressions
@@ -118,8 +118,8 @@ jobs:
           components: clippy
       - name: Hosted prerequisites
         run: |
-          sudo apt-get update
-          sudo apt-get install -y protobuf-compiler libssl-dev libcurl4-openssl-dev clang
+          bash tests/performance/multi_protocol/h1_apt_install.sh \
+            protobuf-compiler libssl-dev libcurl4-openssl-dev clang
       - name: Compile, lint, and pin the external binary
         run: |
           set -euo pipefail
@@ -165,16 +165,19 @@ jobs:
   trace-fixtures:
     name: H1 syscall and CPU capability fixtures (hosted only)
     runs-on: ubuntu-26.04
-    timeout-minutes: 20
+    # The install alone normally takes ~30 s; the budget absorbs one bounded
+    # regional-mirror stall plus the canonical-archive retry (h1_apt_install.sh).
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - name: Install Ubuntu observer and software sampling tools
+        env:
+          H1_APT_POLICY_OUT: ${{ runner.temp }}/h1-trace/apt-install-package-origins.txt
+          H1_APT_POLICY_PACKAGES: linux-perf linux-tools-generic linux-tools-common libbpf-dev clang-18 libdw1t64 libunwind8
         run: |
-          sudo apt-get update -o Dir::Etc::sourcelist=sources.list.d/ubuntu.sources \
-            -o Dir::Etc::sourceparts=- -o APT::Get::List-Cleanup=0 -o Acquire::Retries=3
-          sudo apt-get install -y --no-install-recommends clang-18 llvm-18 libbpf-dev libelf-dev \
+          bash tests/performance/multi_protocol/h1_apt_install.sh clang-18 llvm-18 libbpf-dev libelf-dev \
             zlib1g-dev gcc libc6-dev binutils util-linux linux-perf linux-tools-generic linux-tools-common python3-yaml
       - name: Compile and lint shared observer and optimized DWARF fixture
         run: |
@@ -189,8 +192,10 @@ jobs:
             tests/performance/multi_protocol/h1_trace_fixture.c -pthread -o "$RUNNER_TEMP/h1-trace/build/h1_trace_fixture"
           bash -n tests/performance/multi_protocol/h1_trace_commands.sh
           bash -n tests/performance/multi_protocol/run_gateway_protocol_bench.sh
-          python3 -m py_compile tests/performance/multi_protocol/h1_trace*.py
+          bash -n tests/performance/multi_protocol/h1_apt_install.sh
+          python3 -m py_compile tests/performance/multi_protocol/h1_trace*.py tests/performance/multi_protocol/h1_apt_sources.py
           python3 -m unittest discover -v -s tests/performance/multi_protocol/tests -p 'test_h1_trace.py'
+          python3 -m unittest discover -v -s tests/performance/multi_protocol/tests -p 'test_h1_apt_install.py'
       - name: Verify root-owned raw artifact handoff to the ordinary runner
         run: |
           sudo --preserve-env=GITHUB_ACTIONS,RUNNER_ENVIRONMENT \
@@ -241,9 +246,13 @@ jobs:
             test "$PAYLOADS" != all
           fi
       - name: Hosted prerequisites and memory headroom
+        env:
+          H1_APT_POLICY_OUT: h1-profile-evidence/apt-install-package-origins.txt
+          H1_APT_POLICY_PACKAGES: linux-perf linux-tools-generic linux-tools-common libbpf-dev clang-18 libdw1t64 libunwind8
         run: |
-          sudo apt-get update
-          sudo apt-get install -y protobuf-compiler libssl-dev libcurl4-openssl-dev clang lsof binutils clang-18 llvm-18 libbpf-dev libelf-dev zlib1g-dev linux-perf linux-tools-generic linux-tools-common
+          bash tests/performance/multi_protocol/h1_apt_install.sh protobuf-compiler libssl-dev \
+            libcurl4-openssl-dev clang lsof binutils clang-18 llvm-18 libbpf-dev libelf-dev zlib1g-dev \
+            linux-perf linux-tools-generic linux-tools-common
           sudo fallocate -l 12G /mnt/h1-profile-swap
           sudo chmod 600 /mnt/h1-profile-swap
           sudo mkswap /mnt/h1-profile-swap

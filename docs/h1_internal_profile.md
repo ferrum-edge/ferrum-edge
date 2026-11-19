@@ -151,6 +151,33 @@ contracts, the explicit H1 cadence/safety matrix below, supported-protocol
 trailer gates, and H1 schema/completeness tests. The independent Benchmark Harness
 Tests discovery also runs the H1 Python tests.
 
+Every job installs its Ubuntu packages through
+`tests/performance/multi_protocol/h1_apt_install.sh`. Like `setup-rust-ci`, it
+refreshes and installs from the image's Ubuntu source only, with matching
+`Dir::Etc` options across `apt-get update` (`APT::Update::Error-Mode=any`),
+`--download-only`, and offline `--no-download` installation under
+`DEBIAN_FRONTEND=noninteractive`. Only the network fetch phases run under the
+300 s primary budget so a mirror timeout never interrupts `dpkg` mid-unpack.
+When the runner's regional mirror fails or stalls, the fetch is retried once
+(600 s budget) from a temporary copy of that source that rewrites eligible
+regional Ubuntu mirrors or Ubuntu mirror lists to
+`https://archive.ubuntu.com/ubuntu/`. Whenever a regional rewrite occurs,
+compatible active lowercase portless HTTP `archive.ubuntu.com` entries in the
+temporary fallback source are also upgraded to HTTPS so APT does not merge
+overlapping suites onto a plaintext Release index; any regional entry (stanza
+or line) with a suite that shares an APT Release index with an entry that
+cannot be upgraded or has a different policy, repository root, or layout keeps
+its regional URI for all of its suites so distinct Release indexes are
+preserved. `Suites`, `Components`, and `Signed-By` stay intact, and active
+entries that disable signature verification (under any APT truthy spelling)
+are refused when deriving the fallback source. When no regional mirror is
+eligible for rewrite, the helper retries the original source unchanged while
+preserving the image's failover tuning. In `trace-fixtures` and `measurement`,
+`h1_apt_install.sh` also captures `apt-cache policy` for the preflight package
+set using the winning attempt's `Dir::Etc` options before removing any
+temporary fallback source, retaining `apt-install-package-origins.txt` in the
+job evidence artifact.
+
 The measurement campaign runs only on manual dispatch:
 
 ```sh
