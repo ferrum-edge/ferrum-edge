@@ -5087,7 +5087,9 @@ impl GatewayConfig {
                 let scope = match proxy.upstream_id.as_deref() {
                     Some(upstream_id) => {
                         match upstream_by_key.get(&(proxy.namespace.as_str(), upstream_id)) {
-                            Some(upstream) => scope_for(upstream, proxy.upstream_subset.as_deref()),
+                            Some(&upstream) => {
+                                scope_for(upstream, proxy.upstream_subset.as_deref())
+                            }
                             None => crate::backend_pending_limit::BackendPendingScopeBase::new(
                                 proxy.namespace.as_str(),
                                 upstream_id,
