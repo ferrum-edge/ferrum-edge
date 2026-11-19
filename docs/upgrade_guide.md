@@ -83,9 +83,8 @@ mirrors, exactly as on a NodeWaypoint.
 - Destination AuthorizationPolicy and RequestAuthentication still apply at the
   destination Sidecar. Carried VirtualService routes are never served on any
   inbound mesh listener, NodeWaypoint included.
-- VirtualService status `status.ferrum.translation.mesh_http_routes` changes
-  from `node_waypoint_only` to `sidecar_and_node_waypoint`. Tooling that matched
-  `node_waypoint_only` must be updated.
+- VirtualService status `status.ferrum.translation.mesh_http_routes` reports
+  `sidecar_and_node_waypoint`.
 
 **Operator action:** upgrade the control plane and data planes together, and
 review mesh-bound VirtualServices before upgrading Sidecars.
