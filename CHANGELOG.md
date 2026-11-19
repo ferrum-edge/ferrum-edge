@@ -220,13 +220,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (#7423). Weighted splits, match dispatch, rewrites, retries, timeouts, faults
   and mirrors run client-side on the outbound capture listener, reusing the
   NodeWaypoint route machinery. Every in-mesh leg dials the destination
-  workloads over pinned SVID-mTLS through a route-scoped upstream clone that
-  presents the destination Service (`<service>.<namespace>.svc:<port>`) as the
-  `:authority`; an explicit `rewrite.authority` naming that destination is
-  forwarded verbatim, and plain Service routes are unchanged. The clones share
-  the Service's DestinationRule `http2MaxRequests` and `http1MaxPendingRequests`
-  lanes. `match.sourceNamespace` is decided from the Sidecar's own workload
-  namespace. Sidecars request the routes with the new
+  workloads over SVID-mTLS (pinned to the workload identity in-cluster; scoped
+  to the remote trust domain for cross-cluster legs, see `docs/mesh.md`) through
+  a route-scoped upstream clone that presents the destination Service
+  (`<service>.<namespace>.svc:<port>`) as the `:authority`; an explicit
+  `rewrite.authority` naming that destination is forwarded verbatim, and plain
+  Service routes are unchanged. The clones share the Service's DestinationRule
+  `http2MaxRequests` and `http1MaxPendingRequests` lanes.
+  `match.sourceNamespace` is decided from the Sidecar's own workload namespace.
+  Sidecars request the routes with the new
   `MeshSubscribeRequest.sidecar_http_routes` (proto field 10) / xDS
   node-metadata flag. ServiceWaypoint projection and a live weighted-split
   assertion remain follow-ups.
@@ -531,10 +533,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   matching Istio's `SniDnatClusterMode`), subsets are not projected, and a
   mesh-wide `ISTIO_MUTUAL` rule no longer risks rejecting the gateway's slice.
   Before this change no DestinationRule applied to these upstreams.
-- **BREAKING:** (issue #7423) The VirtualService status field
-  `status.ferrum.translation.mesh_http_routes` changes value from
-  `node_waypoint_only` to `sidecar_and_node_waypoint`, and the `FerrumAccepted`
-  note names only Ambient and ServiceWaypoint as ignoring mesh `http[]` routes.
 - A carried mesh VirtualService route whose direct or dispatch-rule destination
   is a Service in another namespace is refused on every topology, NodeWaypoint
   included, and its host keeps the Service route (#7423). Before, it left a
