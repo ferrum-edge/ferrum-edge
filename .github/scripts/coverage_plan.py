@@ -12,7 +12,11 @@ from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 
 
-LIB_UNIT_SHARD = "lib-unit"
+UNIT_LIB_SHARD = "unit-lib"
+UNIT_CORE_SHARD = "unit-core"
+UNIT_PLUGINS_A_SHARD = "unit-plugins-a"
+UNIT_PLUGINS_B_SHARD = "unit-plugins-b"
+UNIT_GATEWAY_CORE_SHARD = "unit-gateway-core"
 ADMIN_API_SHARD = "admin-api"
 ADMIN_CONFIG_SHARD = "admin-config"
 MESH_ROUTING_SHARD = "mesh-routing"
@@ -23,6 +27,18 @@ INTEGRATION_REMAINDER_2_SHARD = "integration-remainder-2"
 FUNCTIONAL_1_SHARD = "functional-1"
 FUNCTIONAL_2_SHARD = "functional-2"
 FUNCTIONAL_DATA_SHARD = "functional-data"
+
+# Split the former combined lib-unit shard into one runner per unit test binary
+# (mirroring ci.yml's test-unit matrix). `unit-core` is the designated producer
+# of the shared `ci-coverage` dependency cache in coverage.yml.
+UNIT_SHARD_TARGETS: tuple[tuple[str, str], ...] = (
+    (UNIT_LIB_SHARD, "lib"),
+    (UNIT_CORE_SHARD, "unit_tests"),
+    (UNIT_PLUGINS_A_SHARD, "unit_plugins_a_tests"),
+    (UNIT_PLUGINS_B_SHARD, "unit_plugins_b_tests"),
+    (UNIT_GATEWAY_CORE_SHARD, "unit_gateway_core_tests"),
+)
+UNIT_SHARD_ORDER = tuple(shard for shard, _target in UNIT_SHARD_TARGETS)
 
 INTEGRATION_SHARD_ORDER = (
     ADMIN_API_SHARD,
@@ -50,12 +66,13 @@ FUNCTIONAL_PARTITION_SHARDS = (
 FUNCTIONAL_SHARD_ORDER = (*FUNCTIONAL_PARTITION_SHARDS, FUNCTIONAL_DATA_SHARD)
 
 CANONICAL_SHARD_ORDER = (
-    LIB_UNIT_SHARD,
+    *UNIT_SHARD_ORDER,
     *INTEGRATION_SHARD_ORDER,
     *INTEGRATION_REMAINDER_SHARDS,
     *FUNCTIONAL_SHARD_ORDER,
 )
 
+ALL_UNIT_SHARDS = frozenset(UNIT_SHARD_ORDER)
 ADMIN_SHARDS = frozenset({ADMIN_API_SHARD, ADMIN_CONFIG_SHARD})
 MESH_SHARDS = frozenset({MESH_ROUTING_SHARD, MESH_PLATFORM_SHARD})
 ALL_INTEGRATION_SHARDS = frozenset(INTEGRATION_SHARD_ORDER)
@@ -64,7 +81,7 @@ ALL_FUNCTIONAL_SHARDS = frozenset(FUNCTIONAL_SHARD_ORDER)
 # Every shard a path-scoped plan can select. Selecting all of them promotes the
 # plan to the full matrix, which adds the integration remainder and functional
 # shards.
-SCOPED_SHARDS = frozenset({LIB_UNIT_SHARD, *INTEGRATION_SHARD_ORDER})
+SCOPED_SHARDS = frozenset({*UNIT_SHARD_ORDER, *INTEGRATION_SHARD_ORDER})
 ALL_SHARDS = frozenset(CANONICAL_SHARD_ORDER)
 # Serving modes that start admin + proxy (and optionally DB/CP), but are not mesh.
 ADMIN_AND_PROTOCOL_SHARDS = frozenset({*ADMIN_SHARDS, PROTOCOLS_SHARD})
@@ -200,10 +217,14 @@ def functional_partition_definition(shard: str, index: int) -> dict[str, str]:
 
 
 SHARD_DEFINITIONS: dict[str, dict[str, str]] = {
-    LIB_UNIT_SHARD: {
-        "shard": LIB_UNIT_SHARD,
-        "kind": "lib-unit",
-        "filters": "",
+    **{
+        shard: {
+            "shard": shard,
+            "kind": "unit",
+            "target": target,
+            "filters": "",
+        }
+        for shard, target in UNIT_SHARD_TARGETS
     },
     ADMIN_API_SHARD: {
         "shard": ADMIN_API_SHARD,
@@ -375,9 +396,9 @@ class CoveragePlan:
     @property
     def matrix_include(self) -> list[dict[str, str]]:
         # GitHub rejects an empty `matrix.include` even when the shard job is
-        # skipped, so skip plans still emit a dummy lib-unit row that never runs.
+        # skipped, so skip plans still emit a dummy unit-lib row that never runs.
         if not self.shards:
-            return [dict(SHARD_DEFINITIONS[LIB_UNIT_SHARD])]
+            return [dict(SHARD_DEFINITIONS[UNIT_LIB_SHARD])]
         return [dict(SHARD_DEFINITIONS[name]) for name in self.shards]
 
 
@@ -468,14 +489,14 @@ def plugin_plan(reason: str) -> CoveragePlan:
     return CoveragePlan(
         mode="plugin",
         reason=reason,
-        shards=(LIB_UNIT_SHARD,),
+        shards=UNIT_SHARD_ORDER,
         plugin_gate=True,
     )
 
 
 def shard_plan(reason: str, shards: set[str], plugin_gate: bool) -> CoveragePlan:
     selected = set(shards)
-    selected.add(LIB_UNIT_SHARD)
+    selected.update(UNIT_SHARD_ORDER)
     ordered = ordered_shards(selected)
     if set(ordered) == SCOPED_SHARDS:
         return full_plan(reason, plugin_gate=plugin_gate)
@@ -601,8 +622,8 @@ def parse_planned_shards(raw: str) -> list[str]:
         shards.append(item)
     if shards != list(ordered_shards(set(shards))):
         raise ValueError("planned shards must be in canonical coverage order")
-    if LIB_UNIT_SHARD not in shards:
-        raise ValueError("planned shards must include lib-unit")
+    if not ALL_UNIT_SHARDS.issubset(shards):
+        raise ValueError("planned shards must include all unit shards")
     return shards
 
 
@@ -642,8 +663,8 @@ def _expect_plan(
             f"{event_name} {changed!r}: expected plugin_gate={plugin_gate}, "
             f"selected {plan.plugin_gate}"
         )
-    if mode != "skip" and LIB_UNIT_SHARD not in plan.shards:
-        return f"{event_name} {changed!r}: non-skip plan omitted lib-unit"
+    if mode != "skip" and not ALL_UNIT_SHARDS.issubset(plan.shards):
+        return f"{event_name} {changed!r}: non-skip plan omitted unit shards"
     if set(plan.shards) - ALL_SHARDS:
         return f"{event_name} {changed!r}: plan selected unknown shards"
     return None
@@ -651,14 +672,14 @@ def _expect_plan(
 
 def self_test() -> int:
     all_shards = CANONICAL_SHARD_ORDER
-    lib_unit = (LIB_UNIT_SHARD,)
-    admin = ordered_shards({LIB_UNIT_SHARD, *ADMIN_SHARDS})
-    mesh = ordered_shards({LIB_UNIT_SHARD, *MESH_SHARDS})
-    protocol = ordered_shards({LIB_UNIT_SHARD, PROTOCOLS_SHARD})
-    admin_and_protocol = ordered_shards({LIB_UNIT_SHARD, *ADMIN_AND_PROTOCOL_SHARDS})
-    mesh_and_protocol = ordered_shards({LIB_UNIT_SHARD, *MESH_AND_PROTOCOL_SHARDS})
-    config_sources = ordered_shards({LIB_UNIT_SHARD, *CONFIG_SOURCES_SHARDS})
-    mesh_platform = ordered_shards({LIB_UNIT_SHARD, MESH_PLATFORM_SHARD})
+    unit_shards = UNIT_SHARD_ORDER
+    admin = ordered_shards({*UNIT_SHARD_ORDER, *ADMIN_SHARDS})
+    mesh = ordered_shards({*UNIT_SHARD_ORDER, *MESH_SHARDS})
+    protocol = ordered_shards({*UNIT_SHARD_ORDER, PROTOCOLS_SHARD})
+    admin_and_protocol = ordered_shards({*UNIT_SHARD_ORDER, *ADMIN_AND_PROTOCOL_SHARDS})
+    mesh_and_protocol = ordered_shards({*UNIT_SHARD_ORDER, *MESH_AND_PROTOCOL_SHARDS})
+    config_sources = ordered_shards({*UNIT_SHARD_ORDER, *CONFIG_SOURCES_SHARDS})
+    mesh_platform = ordered_shards({*UNIT_SHARD_ORDER, MESH_PLATFORM_SHARD})
 
     # Exact ownership lock for every classifiable shared/isolated representative.
     # Equality prevents a later edit from silently narrowing (or widening) a mapping.
@@ -720,9 +741,9 @@ def self_test() -> int:
         ("pull_request", ["src/http3/server.rs"], "shards", protocol, False),
         ("pull_request", ["src/dtls/mod.rs"], "shards", protocol, False),
         ("pull_request", ["src/tls_offload.rs"], "shards", protocol, False),
-        ("pull_request", ["src/plugins/cors.rs"], "plugin", lib_unit, True),
-        ("pull_request", ["src/plugin_cache.rs"], "plugin", lib_unit, True),
-        ("pull_request", ["tests/unit/plugins/cors_tests.rs"], "plugin", lib_unit, True),
+        ("pull_request", ["src/plugins/cors.rs"], "plugin", unit_shards, True),
+        ("pull_request", ["src/plugin_cache.rs"], "plugin", unit_shards, True),
+        ("pull_request", ["tests/unit/plugins/cors_tests.rs"], "plugin", unit_shards, True),
         (
             "pull_request",
             ["src/plugins/cors.rs", "src/admin/mod.rs"],
@@ -741,7 +762,7 @@ def self_test() -> int:
             "pull_request",
             ["src/admin/mod.rs", "src/modes/mesh/config.rs"],
             "shards",
-            ordered_shards({LIB_UNIT_SHARD, *ADMIN_SHARDS, *MESH_SHARDS}),
+            ordered_shards({*UNIT_SHARD_ORDER, *ADMIN_SHARDS, *MESH_SHARDS}),
             False,
         ),
         (
@@ -790,7 +811,7 @@ def self_test() -> int:
         ("merge_group", ["src/proxy/mod.rs"], "full", all_shards, False),
         ("merge_group", ["src/modes/mesh/mod.rs"], "shards", mesh, False),
         ("merge_group", ["src/http3/mod.rs"], "shards", protocol, False),
-        ("merge_group", ["src/plugins/cors.rs"], "plugin", lib_unit, True),
+        ("merge_group", ["src/plugins/cors.rs"], "plugin", unit_shards, True),
         ("merge_group", ["src/cli.rs"], "full", all_shards, False),
         ("merge_group", ["docs/configuration.md"], "skip", (), False),
         ("merge_group", [], "full", all_shards, False),
@@ -876,10 +897,10 @@ def self_test() -> int:
             )
             continue
         plan = select_scoped_plan("pull_request", [path])
-        if LIB_UNIT_SHARD not in plan.shards:
-            failures.append(f"{path}: non-skip ownership plan omitted lib-unit")
+        if not ALL_UNIT_SHARDS.issubset(plan.shards):
+            failures.append(f"{path}: non-skip ownership plan omitted unit shards")
         full_only = ALL_INTEGRATION_REMAINDER_SHARDS | ALL_FUNCTIONAL_SHARDS
-        if set(plan.shards) - {LIB_UNIT_SHARD} - full_only != set(expected):
+        if set(plan.shards) - ALL_UNIT_SHARDS - full_only != set(expected):
             failures.append(
                 f"{path}: plan shards {plan.shards} drifted from ownership lock"
             )
@@ -1000,8 +1021,8 @@ def self_test() -> int:
         failures.append("protocol diffs must not select admin or mesh shards")
 
     plugin_only = select_scoped_plan("pull_request", ["src/plugins/cors.rs"])
-    if plugin_only.shards != lib_unit or plugin_only.mode != "plugin":
-        failures.append("plugin-only diffs must stay on plugin mode with lib-unit only")
+    if plugin_only.shards != unit_shards or plugin_only.mode != "plugin":
+        failures.append("plugin-only diffs must stay on plugin mode with all unit shards")
 
     mixed = select_scoped_plan("pull_request", ["src/plugins/cors.rs", "src/proxy/http.rs"])
     if mixed.mode == "plugin":
@@ -1010,13 +1031,21 @@ def self_test() -> int:
         failures.append("mixed plugin and proxy diffs must select the full shard matrix")
     if not mixed.plugin_gate:
         failures.append("mixed plugin and core diffs must keep the plugin gate")
-    if LIB_UNIT_SHARD not in mixed.shards:
-        failures.append("mixed plugin and core diffs must still run lib-unit")
+    if not ALL_UNIT_SHARDS.issubset(mixed.shards):
+        failures.append("mixed plugin and core diffs must still run all unit shards")
 
     if SHARD_DEFINITIONS.keys() != ALL_SHARDS:
         failures.append("SHARD_DEFINITIONS must cover every canonical shard")
-    if SHARD_DEFINITIONS[LIB_UNIT_SHARD]["kind"] != "lib-unit":
-        failures.append("lib-unit shard kind must remain lib-unit")
+    for name, expected_target in UNIT_SHARD_TARGETS:
+        definition = SHARD_DEFINITIONS[name]
+        if (
+            definition["kind"] != "unit"
+            or definition.get("target") != expected_target
+            or definition.get("filters") != ""
+        ):
+            failures.append(
+                f"{name} shard must have kind=unit, target={expected_target}, and empty filters"
+            )
     for name in ALL_INTEGRATION_SHARDS:
         if SHARD_DEFINITIONS[name]["kind"] != "integration":
             failures.append(f"{name} shard kind must remain integration")
@@ -1074,17 +1103,32 @@ def self_test() -> int:
                 failures.append(f"path-scoped plans must not select {name}")
 
     try:
-        parse_planned_shards(json.dumps([LIB_UNIT_SHARD, ADMIN_API_SHARD]))
+        parse_planned_shards(json.dumps([*UNIT_SHARD_ORDER, ADMIN_API_SHARD]))
     except ValueError as error:
         failures.append(f"valid planned shards were rejected: {error}")
 
     for raw, label in (
         ("[]", "empty planned shards"),
-        (json.dumps([ADMIN_API_SHARD]), "missing lib-unit"),
-        (json.dumps([ADMIN_API_SHARD, LIB_UNIT_SHARD]), "out of order shards"),
-        (json.dumps([LIB_UNIT_SHARD, "not-a-shard"]), "unknown shard"),
-        (json.dumps([LIB_UNIT_SHARD, LIB_UNIT_SHARD]), "duplicate shard"),
-        (json.dumps([LIB_UNIT_SHARD, "admin-api; rm -rf"]), "hostile shard name"),
+        (json.dumps([ADMIN_API_SHARD]), "missing unit shards"),
+        (json.dumps([UNIT_LIB_SHARD, ADMIN_API_SHARD]), "partial unit shards without unit-core"),
+        (json.dumps([UNIT_CORE_SHARD, ADMIN_API_SHARD]), "partial unit shards with only unit-core"),
+        (json.dumps(["lib-unit", ADMIN_API_SHARD]), "legacy lib-unit shard"),
+        (json.dumps([ADMIN_API_SHARD, *UNIT_SHARD_ORDER]), "out of order shards"),
+        (
+            json.dumps(
+                [
+                    UNIT_CORE_SHARD,
+                    UNIT_LIB_SHARD,
+                    UNIT_PLUGINS_A_SHARD,
+                    UNIT_PLUGINS_B_SHARD,
+                    UNIT_GATEWAY_CORE_SHARD,
+                ]
+            ),
+            "out of order unit shards",
+        ),
+        (json.dumps([*UNIT_SHARD_ORDER, "not-a-shard"]), "unknown shard"),
+        (json.dumps([*UNIT_SHARD_ORDER, UNIT_LIB_SHARD]), "duplicate shard"),
+        (json.dumps([*UNIT_SHARD_ORDER, "admin-api; rm -rf"]), "hostile shard name"),
         ("{", "malformed JSON"),
         ("null", "non-array JSON"),
     ):
@@ -1095,8 +1139,8 @@ def self_test() -> int:
         else:
             failures.append(f"{label} were accepted")
 
-    if artifact_names_for_shards([LIB_UNIT_SHARD, ADMIN_API_SHARD]) != [
-        "coverage-data-lib-unit",
+    if artifact_names_for_shards([*UNIT_SHARD_ORDER, ADMIN_API_SHARD]) != [
+        *(f"coverage-data-{name}" for name in UNIT_SHARD_ORDER),
         "coverage-data-admin-api",
     ]:
         failures.append("artifact names must follow the planned shard order")
@@ -1104,12 +1148,12 @@ def self_test() -> int:
     skip = skip_plan("no coverage-relevant files changed")
     if skip.shards:
         failures.append("skip plans must not select coverage shards")
-    if skip.matrix_include != [SHARD_DEFINITIONS[LIB_UNIT_SHARD]]:
-        failures.append("skip plans must emit a dummy lib-unit matrix row")
+    if skip.matrix_include != [SHARD_DEFINITIONS[UNIT_LIB_SHARD]]:
+        failures.append("skip plans must emit a dummy unit-lib matrix row")
 
     plugin = plugin_plan("plugin coverage-relevant files changed")
-    if plugin.matrix_include != [SHARD_DEFINITIONS[LIB_UNIT_SHARD]]:
-        failures.append("plugin plans must emit only the lib-unit matrix entry")
+    if plugin.matrix_include != [SHARD_DEFINITIONS[name] for name in UNIT_SHARD_ORDER]:
+        failures.append("plugin plans must emit all split unit matrix entries")
 
     full = full_plan("full coverage is required for push")
     if [entry["shard"] for entry in full.matrix_include] != list(CANONICAL_SHARD_ORDER):
