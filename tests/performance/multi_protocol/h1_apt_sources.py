@@ -28,10 +28,10 @@ _MIRROR_URI = re.compile(
     r"|(?i:mirror\+file:)(?:///|/)etc/apt/apt-mirrors\.txt"
     r"|(?i:mirror(?:\+https?)?://mirrors\.ubuntu\.com)/\S+)$"
 )
-# Only portless canonical URIs (including empty `:`) share the portless
-# `archive.ubuntu.com/ubuntu/` Release index in APT; explicit nonzero ports
-# like `:80` or `:443` keep distinct Release-index filenames in `URItoFileName`.
-_HTTP_CANONICAL = re.compile(r"^(?i:http://archive\.ubuntu\.com):?/ubuntu/?$")
+# Only portless lowercase-host canonical URIs (including empty `:`) share the
+# portless `archive.ubuntu.com/ubuntu/` Release index in APT; explicit nonzero
+# ports (`:80`, `:443`) and different host casing keep distinct Release filenames.
+_HTTP_CANONICAL = re.compile(r"^(?i:http)://archive\.ubuntu\.com:?/ubuntu/?$")
 # Per-Release-index options compared by APT (`debmetaindex.cc:780-845,1236-1247,1444-1490`).
 _RELEASE_POLICY_FIELDS = (
     "signed-by",
@@ -144,9 +144,9 @@ def _release_index_key(uri, suite):
         meta_uri = base + suite + "Release"
     else:
         meta_uri = base + "dists/" + suite + "/Release"
-    # Match APT ::URI (strutl.cc:1751-1795) + URItoFileName (strutl.cc:521-533):
-    # strip scheme and userinfo, lowercase host, drop empty/zero port, keep
-    # explicit nonzero ports and case-sensitive path.
+    # Match APT ::URI (strutl.cc:1751-1805) + URItoFileName (strutl.cc:521-533):
+    # strip scheme and userinfo, preserve host spelling and path case, drop
+    # empty/zero port, keep explicit nonzero ports.
     scheme_sep = meta_uri.find("://")
     if scheme_sep == -1:
         colon = meta_uri.find(":")
@@ -161,15 +161,15 @@ def _release_index_key(uri, suite):
     if authority.startswith("["):
         end_v6 = authority.find("]")
         if end_v6 != -1:
-            host = authority[:end_v6 + 1].lower()
+            host = authority[:end_v6 + 1]
             port_part = authority[end_v6 + 1:]
         else:
-            host, port_part = authority.lower(), ""
+            host, port_part = authority, ""
     elif ":" in authority:
         host_raw, port_raw = authority.rsplit(":", 1)
-        host, port_part = host_raw.lower(), ":" + port_raw
+        host, port_part = host_raw, ":" + port_raw
     else:
-        host, port_part = authority.lower(), ""
+        host, port_part = authority, ""
     if port_part.startswith(":"):
         digits = port_part[1:]
         if digits.isdigit() and int(digits) > 0:
@@ -187,12 +187,12 @@ def _register_entry_keys(release_policies, uris, suites, policy):
         upgradeable_http = _is_http_canonical(uri)
         for suite in suites:
             key = _release_index_key(uri, suite)
-            # An existing non-HTTPS entry that shares a Release index with
-            # CANONICAL but is not a plain upgradeable HTTP canonical URI (for
-            # example `http://reader@archive.ubuntu.com/ubuntu/`) blocks merges
-            # onto that index so APT neither hits a policy conflict nor reuses
-            # a plaintext Release index for a rewritten HTTPS mirror.
-            if not is_https and not upgradeable_http and key == _release_index_key(CANONICAL, suite):
+            # Any non-HTTPS entry that is not an upgradeable portless HTTP
+            # canonical URI (e.g. `http://reader@archive.ubuntu.com/ubuntu/` or
+            # `http://archive.ubuntu.com/ubuntu/dists/` with flat suite
+            # `resolute/`) blocks merges onto its effective Release key so APT
+            # neither hits a policy conflict nor reuses plaintext HTTP.
+            if not is_https and not upgradeable_http:
                 release_policies[key] = _POLICY_CONFLICT
                 continue
             existing = release_policies.get(key)
@@ -505,6 +505,26 @@ def rewrite_deb822(text):
         if active:
             _register_entry_keys(release_policies, uris, suites, policy)
         inspected.append((kind, lines, info))
+
+    # Fixpoint: if an active multi-suite portless HTTP canonical stanza cannot
+    # be upgraded (because any of its suites is blocked/conflicting), it will
+    # remain on HTTP, so block all of its suites on CANONICAL to prevent
+    # plaintext Release-index reuse by a rewritten HTTPS mirror.
+    changed_block = True
+    while changed_block:
+        changed_block = False
+        for kind, _lines, info in inspected:
+            if kind != "stanza":
+                continue
+            active, uris, suites, policy = info
+            if not active or not any(_is_http_canonical(u) for u in uris):
+                continue
+            if not _canonical_keys_compatible(release_policies, suites, policy):
+                for suite in suites:
+                    key = _release_index_key(CANONICAL, suite)
+                    if release_policies.get(key) is not _POLICY_CONFLICT:
+                        release_policies[key] = _POLICY_CONFLICT
+                        changed_block = True
 
     # Pass 2: decide which regional-mirror stanzas can rewrite onto CANONICAL
     # without colliding with a different signing policy or un-upgradeable

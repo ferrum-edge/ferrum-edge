@@ -251,6 +251,48 @@ class SourceRewriteTests(unittest.TestCase):
         )
         self.assertEqual(sources.rewrite(deb822_flat_suite, deb822=True), (deb822_flat_suite, False))
 
+        # Multi-suite HTTP canonical stanza whose second suite is blocked must
+        # block its other suites too so a regional mirror cannot merge onto HTTP.
+        deb822_multi_suite_blocked = (
+            "Types: deb\nURIs: http://archive.ubuntu.com/ubuntu/\nSuites: resolute resolute-updates\n"
+            f"Components: main\nSigned-By: {KEYRING}\n\n"
+            "Types: deb\nURIs: http://reader@archive.ubuntu.com/ubuntu/\nSuites: resolute-updates\n"
+            f"Components: universe\nSigned-By: {KEYRING}\n\n"
+            "Types: deb\nURIs: https://us-east-2.ec2.archive.ubuntu.com/ubuntu/\nSuites: resolute\n"
+            f"Components: universe\nSigned-By: {KEYRING}\n"
+        )
+        self.assertEqual(
+            sources.rewrite(deb822_multi_suite_blocked, deb822=True),
+            (deb822_multi_suite_blocked, False),
+        )
+
+        # URI/suite split (`.../ubuntu/dists/` + `resolute/`) resolves to the
+        # same Release path as `.../ubuntu/` + `resolute`.
+        deb822_uri_suite_split = (
+            "Types: deb\nURIs: http://archive.ubuntu.com/ubuntu/dists/\nSuites: resolute/\n"
+            f"Signed-By: {KEYRING}\n\n"
+            "Types: deb\nURIs: https://us-east-2.ec2.archive.ubuntu.com/ubuntu/\nSuites: resolute\n"
+            f"Components: main\nSigned-By: {KEYRING}\n"
+        )
+        self.assertEqual(
+            sources.rewrite(deb822_uri_suite_split, deb822=True),
+            (deb822_uri_suite_split, False),
+        )
+
+        # APT preserves host spelling in Release filenames, so uppercase HTTPS
+        # `ARCHIVE.UBUNTU.COM` with a different keyring does not collide with
+        # rewriting a regional mirror onto lowercase `archive.ubuntu.com`.
+        deb822_upper_host = (
+            "Types: deb\nURIs: https://ARCHIVE.UBUNTU.COM/ubuntu/\nSuites: resolute\n"
+            f"Components: main\nSigned-By: {alt_keyring}\n\n"
+            "Types: deb\nURIs: https://us-east-2.ec2.archive.ubuntu.com/ubuntu/\nSuites: resolute\n"
+            f"Components: universe\nSigned-By: {KEYRING}\n"
+        )
+        rewritten_uh, changed_uh = sources.rewrite(deb822_upper_host, deb822=True)
+        self.assertTrue(changed_uh)
+        self.assertIn("URIs: https://ARCHIVE.UBUNTU.COM/ubuntu/\n", rewritten_uh)
+        self.assertIn("URIs: https://archive.ubuntu.com/ubuntu/\n", rewritten_uh)
+
     @unittest.skipUnless(shutil.which("apt-get") and Path(KEYRING).exists(), "needs hosted Ubuntu apt-get")
     def test_hosted_apt_accepts_rewritten_mixed_and_distinct_policy_sources(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -259,7 +301,7 @@ class SourceRewriteTests(unittest.TestCase):
             (lists / "partial").mkdir(parents=True)
             alt_keyring = root / "ubuntu-alt.gpg"
             shutil.copyfile(KEYRING, alt_keyring)
-            for name, raw, deb822, expect_changed, expect_inrelease, forbid_substr in (
+            for name, raw, deb822, expect_changed, required_uris, forbid_substr in (
                 (
                     "same-policy.sources",
                     "Types: deb\nURIs: http://archive.ubuntu.com:/ubuntu/\nSuites: resolute\n"
@@ -268,7 +310,7 @@ class SourceRewriteTests(unittest.TestCase):
                     f"Components: universe\nSigned-By: {KEYRING}\n",
                     True,
                     True,
-                    "https://archive.ubuntu.com/ubuntu/dists/resolute/InRelease",
+                    ("https://archive.ubuntu.com/ubuntu/dists/resolute/InRelease",),
                     "http://archive.ubuntu.com",
                 ),
                 (
@@ -279,7 +321,10 @@ class SourceRewriteTests(unittest.TestCase):
                     f"Components: universe\nSigned-By: {alt_keyring}\n",
                     True,
                     True,
-                    "https://archive.ubuntu.com/ubuntu/dists/resolute/InRelease",
+                    (
+                        "https://archive.ubuntu.com/ubuntu/dists/resolute/InRelease",
+                        "https://azure.archive.ubuntu.com/ubuntu/dists/resolute/InRelease",
+                    ),
                     "http://archive.ubuntu.com",
                 ),
                 (
@@ -288,7 +333,10 @@ class SourceRewriteTests(unittest.TestCase):
                     f"deb [signed-by={alt_keyring}] https://azure.archive.ubuntu.com/ubuntu/ resolute universe\n",
                     False,
                     True,
-                    "https://archive.ubuntu.com/ubuntu/dists/resolute/InRelease",
+                    (
+                        "https://archive.ubuntu.com/ubuntu/dists/resolute/InRelease",
+                        "https://azure.archive.ubuntu.com/ubuntu/dists/resolute/InRelease",
+                    ),
                     "http://archive.ubuntu.com",
                 ),
                 (
@@ -301,7 +349,7 @@ class SourceRewriteTests(unittest.TestCase):
                     f"Components: main\nSigned-By: {KEYRING}\n",
                     True,
                     True,
-                    "https://archive.ubuntu.com/ubuntu/dists/resolute-updates/InRelease",
+                    ("https://archive.ubuntu.com/ubuntu/dists/resolute-updates/InRelease",),
                     None,
                 ),
                 (
@@ -312,7 +360,7 @@ class SourceRewriteTests(unittest.TestCase):
                     f"Components: universe\nSigned-By: {KEYRING}\nSnapshot: 20260501T000000Z\n",
                     True,
                     True,
-                    "/dists/resolute/InRelease",
+                    ("/dists/resolute/InRelease",),
                     "http://archive.ubuntu.com",
                 ),
                 (
@@ -321,7 +369,7 @@ class SourceRewriteTests(unittest.TestCase):
                     f"deb [signed-by={KEYRING} snapshot=20260501T000000Z] https://azure.archive.ubuntu.com/ubuntu/ resolute universe\n",
                     False,
                     True,
-                    "/dists/resolute/InRelease",
+                    ("/dists/resolute/InRelease",),
                     "http://archive.ubuntu.com",
                 ),
                 (
@@ -330,7 +378,10 @@ class SourceRewriteTests(unittest.TestCase):
                     f"deb [signed-by={alt_keyring}] https://azure.archive.ubuntu.com/ubuntu/ resolute universe\n",
                     False,
                     True,
-                    "https://archive.ubuntu.com/ubuntu/dists/resolute/InRelease",
+                    (
+                        "https://archive.ubuntu.com/ubuntu/dists/resolute/InRelease",
+                        "https://azure.archive.ubuntu.com/ubuntu/dists/resolute/InRelease",
+                    ),
                     "http://archive.ubuntu.com",
                 ),
                 (
@@ -343,7 +394,10 @@ class SourceRewriteTests(unittest.TestCase):
                     f"Components: main\nSigned-By: {KEYRING}\n",
                     True,
                     True,
-                    "https://archive.ubuntu.com/ubuntu/dists/resolute-updates/InRelease",
+                    (
+                        "https://archive.ubuntu.com/ubuntu/dists/resolute-updates/InRelease",
+                        "https://us-east-2.ec2.archive.ubuntu.com/ubuntu/dists/resolute/InRelease",
+                    ),
                     None,
                 ),
                 (
@@ -353,8 +407,75 @@ class SourceRewriteTests(unittest.TestCase):
                     f"deb [signed-by={KEYRING}] https://us-east-2.ec2.archive.ubuntu.com/ubuntu/ resolute-updates main\n",
                     False,
                     True,
-                    "https://archive.ubuntu.com/ubuntu/dists/resolute-updates/InRelease",
+                    (
+                        "https://archive.ubuntu.com/ubuntu/dists/resolute-updates/InRelease",
+                        "https://us-east-2.ec2.archive.ubuntu.com/ubuntu/dists/resolute/InRelease",
+                    ),
                     None,
+                ),
+                (
+                    "flat-suite-distinct.sources",
+                    "Types: deb\nURIs: http://archive.ubuntu.com/ubuntu/\nSuites: resolute\n"
+                    f"Components: main\nSigned-By: {KEYRING}\n\n"
+                    "Types: deb\nURIs: https://us-east-2.ec2.archive.ubuntu.com/ubuntu/\nSuites: dists/resolute/\n"
+                    f"Signed-By: {alt_keyring}\n\n"
+                    "Types: deb\nURIs: https://us-east-2.ec2.archive.ubuntu.com/ubuntu/\nSuites: resolute-updates\n"
+                    f"Components: main\nSigned-By: {KEYRING}\n",
+                    True,
+                    True,
+                    (
+                        "https://archive.ubuntu.com/ubuntu/dists/resolute-updates/InRelease",
+                        "https://us-east-2.ec2.archive.ubuntu.com/ubuntu/dists/resolute/InRelease",
+                    ),
+                    None,
+                ),
+                (
+                    "multi-suite-http-blocked.sources",
+                    "Types: deb\nURIs: http://archive.ubuntu.com/ubuntu/\nSuites: resolute resolute-updates\n"
+                    f"Components: main\nSigned-By: {KEYRING}\n\n"
+                    "Types: deb\nURIs: http://reader@archive.ubuntu.com/ubuntu/\nSuites: resolute-updates\n"
+                    f"Components: universe\nSigned-By: {KEYRING}\n\n"
+                    "Types: deb\nURIs: https://us-east-2.ec2.archive.ubuntu.com/ubuntu/\nSuites: resolute\n"
+                    f"Components: universe\nSigned-By: {KEYRING}\n\n"
+                    "Types: deb\nURIs: https://us-east-2.ec2.archive.ubuntu.com/ubuntu/\nSuites: resolute-backports\n"
+                    f"Components: main\nSigned-By: {KEYRING}\n",
+                    True,
+                    True,
+                    (
+                        "https://archive.ubuntu.com/ubuntu/dists/resolute-backports/InRelease",
+                        "https://us-east-2.ec2.archive.ubuntu.com/ubuntu/dists/resolute/InRelease",
+                    ),
+                    None,
+                ),
+                (
+                    "uri-suite-split.sources",
+                    "Types: deb\nURIs: http://archive.ubuntu.com/ubuntu/dists/\nSuites: resolute/\n"
+                    f"Signed-By: {KEYRING}\n\n"
+                    "Types: deb\nURIs: https://us-east-2.ec2.archive.ubuntu.com/ubuntu/\nSuites: resolute\n"
+                    f"Components: main\nSigned-By: {KEYRING}\n\n"
+                    "Types: deb\nURIs: https://us-east-2.ec2.archive.ubuntu.com/ubuntu/\nSuites: resolute-updates\n"
+                    f"Components: main\nSigned-By: {KEYRING}\n",
+                    True,
+                    True,
+                    (
+                        "https://archive.ubuntu.com/ubuntu/dists/resolute-updates/InRelease",
+                        "https://us-east-2.ec2.archive.ubuntu.com/ubuntu/dists/resolute/InRelease",
+                    ),
+                    None,
+                ),
+                (
+                    "upper-host-distinct.sources",
+                    "Types: deb\nURIs: https://ARCHIVE.UBUNTU.COM/ubuntu/\nSuites: resolute\n"
+                    f"Components: main\nSigned-By: {alt_keyring}\n\n"
+                    "Types: deb\nURIs: https://us-east-2.ec2.archive.ubuntu.com/ubuntu/\nSuites: resolute\n"
+                    f"Components: universe\nSigned-By: {KEYRING}\n",
+                    True,
+                    True,
+                    (
+                        "https://ARCHIVE.UBUNTU.COM/ubuntu/dists/resolute/InRelease",
+                        "https://archive.ubuntu.com/ubuntu/dists/resolute/InRelease",
+                    ),
+                    "http://archive.ubuntu.com",
                 ),
             ):
                 with self.subTest(case=name):
@@ -376,7 +497,8 @@ class SourceRewriteTests(unittest.TestCase):
                         timeout=30,
                     )
                     self.assertEqual(proc.returncode, 0, proc.stderr)
-                    self.assertIn(expect_inrelease, proc.stdout)
+                    for expected in required_uris:
+                        self.assertIn(expected, proc.stdout)
                     if forbid_substr:
                         self.assertNotIn(forbid_substr, proc.stdout)
 
