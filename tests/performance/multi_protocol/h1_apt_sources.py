@@ -24,11 +24,35 @@ CANONICAL = "https://archive.ubuntu.com/ubuntu/"
 # Require `mirror+file:` with empty authority (`///`) or path-only (`/`) for
 # the local apt-mirrors.txt list so a remote `mirror://etc/...` URI never matches.
 _MIRROR_URI = re.compile(
-    r"^(?:https?://(?:[A-Za-z0-9-]+\.)+archive\.ubuntu\.com/ubuntu/?"
+    r"^(?:https?://(?:[A-Za-z0-9-]+\.)+archive\.ubuntu\.com(?::(?:80|443)?)?/ubuntu/?"
     r"|mirror\+file:(?:///|/)etc/apt/apt-mirrors\.txt"
-    r"|mirror(?:\+https?)?://mirrors\.ubuntu\.com/\S+)$"
+    r"|mirror(?:\+https?)?://mirrors\.ubuntu\.com/\S+)$",
+    re.IGNORECASE,
 )
-_HTTP_CANONICAL = re.compile(r"^http://archive\.ubuntu\.com/ubuntu/?$")
+_HTTP_CANONICAL = re.compile(
+    r"^http://archive\.ubuntu\.com(?::(?:80)?)?/ubuntu/?$",
+    re.IGNORECASE,
+)
+_HTTPS_CANONICAL = re.compile(
+    r"^https://archive\.ubuntu\.com(?::(?:443)?)?/ubuntu/?$",
+    re.IGNORECASE,
+)
+# Per-Release-index options in APT (debmetaindex.cc): entries sharing a
+# (URI, Suite) Release index must agree on these or APT rejects the source.
+_RELEASE_POLICY_FIELDS = (
+    "signed-by",
+    "check-valid-until",
+    "valid-until-min",
+    "valid-until-max",
+    "check-date",
+    "date-max-future",
+    "inrelease-path",
+    "trusted",
+    "allow-insecure",
+    "allow-weak",
+    "allow-downgrade-to-insecure",
+)
+_POLICY_CONFLICT = object()
 # APT's pkgTagSection::Scan splits on the first `:` and trims ASCII whitespace
 # before the colon.
 _DEB822_FIELD = re.compile(r"^([^:\r\n]+):(.*)$")
@@ -106,19 +130,46 @@ def is_mirror(uri):
     return bool(_MIRROR_URI.match(uri))
 
 
-def _should_rewrite_uri(uri, upgrade_http_canonical=False):
-    return is_mirror(uri) or (upgrade_http_canonical and bool(_HTTP_CANONICAL.match(uri)))
+def _is_http_canonical(uri):
+    return bool(_HTTP_CANONICAL.match(uri))
+
+
+def _is_canonical(uri):
+    return bool(_HTTP_CANONICAL.match(uri) or _HTTPS_CANONICAL.match(uri))
+
+
+def _should_rewrite_uri(uri, rewrite_mirrors=True, upgrade_http_canonical=False):
+    return (rewrite_mirrors and is_mirror(uri)) or (
+        upgrade_http_canonical and _is_http_canonical(uri)
+    )
+
+
+def _register_suite_policy(suite_policies, suites, policy):
+    for suite in suites:
+        existing = suite_policies.get(suite)
+        if existing is None:
+            suite_policies[suite] = policy
+        elif existing != policy:
+            suite_policies[suite] = _POLICY_CONFLICT
+
+
+def _suites_compatible(suite_policies, suites, policy):
+    for suite in suites:
+        existing = suite_policies.get(suite)
+        if existing is not None and existing != policy:
+            return False
+    return True
 
 
 _ASCII_TOKEN = re.compile(r"[^ \t\r\n\v\f]+")
 
 
-def _rewrite_uris(value, upgrade_http_canonical=False):
+def _rewrite_uris(value, rewrite_mirrors=True, upgrade_http_canonical=False):
     """Rewrite one URIs field value on ASCII whitespace boundaries; return (value, changed)."""
     tokens = _ASCII_TOKEN.findall(value)
     rewritten, changed = [], False
     for token in tokens:
-        if _should_rewrite_uri(token, upgrade_http_canonical):
+        if _should_rewrite_uri(token, rewrite_mirrors, upgrade_http_canonical):
             token, changed = CANONICAL, True
         if token not in rewritten:
             rewritten.append(token)
@@ -197,7 +248,7 @@ def _check_one_line_options(opts_bracket):
 
 
 def _parse_one_line(body):
-    """Parse `(head, opts_bracket, raw_uri, decoded_uri, tail)` from a one-line deb entry."""
+    """Parse `(head, opts_bracket, raw_uri, decoded_uri, suite, tail)` from a one-line deb entry."""
     prefix = _ONE_LINE_PREFIX.match(body)
     if not prefix:
         return None
@@ -222,9 +273,16 @@ def _parse_one_line(body):
         if end_bracket == -1:
             raise ValueError(f"unterminated apt option bracket on line {body!r}")
         opts_bracket = body[pos:end_bracket + 1]
+        # APT only accepts an adjacent URI after `]` when `]` starts a word
+        # (preceded by ASCII whitespace or immediately after `[`). A mid-word
+        # `]` such as `[signed-by=K]http://...` is consumed as option text by APT.
+        bracket_word_start = (end_bracket == pos + 1) or (body[end_bracket - 1] in _ASCII_SPACE)
         pos = end_bracket + 1
+        ws_start = pos
         while pos < n and body[pos] in _ASCII_SPACE:
             pos += 1
+        if pos == ws_start and not bracket_word_start:
+            raise ValueError(f"malformed apt source line after option bracket: {body!r}")
     uri_start = pos
     while pos < n and body[pos] not in _ASCII_SPACE:
         if body[pos] == '"':
@@ -243,11 +301,38 @@ def _parse_one_line(body):
         return None
     raw_uri = body[uri_start:pos]
     decoded_uri = _apt_dequote_word(raw_uri)
-    return body[:uri_start], opts_bracket, raw_uri, decoded_uri, body[pos:]
+    tail = body[pos:]
+    # Extract the suite token (first word after URI, before any `#` comment).
+    suite_scan = tail.split("#", 1)[0].lstrip(_ASCII_SPACE_STR)
+    suite = None
+    if suite_scan:
+        j, m = 0, len(suite_scan)
+        while j < m and suite_scan[j] not in _ASCII_SPACE:
+            if suite_scan[j] == '"':
+                close = suite_scan.find('"', j + 1)
+                if close == -1:
+                    break
+                j = close + 1
+            else:
+                j += 1
+        if j > 0:
+            suite = _apt_dequote_word(suite_scan[:j])
+    return body[:uri_start], opts_bracket, raw_uri, decoded_uri, suite, tail
 
 
-def _process_deb822_stanza(lines, upgrade_http_canonical=False):
-    """Inspect and rewrite a single deb822 stanza; return (lines, changed)."""
+def _one_line_policy(opts_bracket):
+    if not opts_bracket:
+        return tuple((field, None) for field in _RELEASE_POLICY_FIELDS)
+    values = {}
+    for key, value in _decode_one_line_options(opts_bracket):
+        low = key.lower()
+        if low in _RELEASE_POLICY_FIELDS:
+            values[low] = value
+    return tuple((field, values.get(field)) for field in _RELEASE_POLICY_FIELDS)
+
+
+def _inspect_deb822_stanza(lines):
+    """Validate one deb822 stanza and return `(active, uris, suites, policy)`."""
     fields = {}
     active_field = None
     for line in lines:
@@ -280,7 +365,7 @@ def _process_deb822_stanza(lines, upgrade_http_canonical=False):
 
     # APT skips stanzas with Enabled set to a false boolean spelling.
     if "enabled" in fields and _is_apt_false(field_value("enabled")):
-        return lines, False
+        return False, [], [], None
 
     for unsafe in _UNSAFE_FIELDS:
         if unsafe in fields and _is_apt_true(field_value(unsafe)):
@@ -289,6 +374,16 @@ def _process_deb822_stanza(lines, upgrade_http_canonical=False):
                 f"source sets {unsafe}: {raw}; refusing to rewrite unsafe source"
             )
 
+    uris = _ASCII_TOKEN.findall(field_value("uris")) if "uris" in fields else []
+    suites = _ASCII_TOKEN.findall(field_value("suites")) if "suites" in fields else []
+    policy = tuple(
+        (field, field_value(field) if field in fields else None)
+        for field in _RELEASE_POLICY_FIELDS
+    )
+    return True, uris, suites, policy
+
+
+def _rewrite_deb822_stanza_uris(lines, rewrite_mirrors=True, upgrade_http_canonical=False):
     out, changed, in_uris = [], False, False
     for line in lines:
         body = line.rstrip("\r\n")
@@ -298,7 +393,7 @@ def _process_deb822_stanza(lines, upgrade_http_canonical=False):
             continue
         if body[:1] in (" ", "\t", "\v", "\f"):
             if in_uris and body.strip():
-                value, hit = _rewrite_uris(body, upgrade_http_canonical)
+                value, hit = _rewrite_uris(body, rewrite_mirrors, upgrade_http_canonical)
                 changed |= hit
                 body = value
             out.append(body + ending)
@@ -307,51 +402,91 @@ def _process_deb822_stanza(lines, upgrade_http_canonical=False):
         if field:
             in_uris = field.group(1).rstrip(" \t\v\f").lower() == "uris"
             if in_uris:
-                value, hit = _rewrite_uris(field.group(2), upgrade_http_canonical)
+                value, hit = _rewrite_uris(field.group(2), rewrite_mirrors, upgrade_http_canonical)
                 changed |= hit
                 body = f"{field.group(1)}:{value}"
         out.append(body + ending)
     return out, changed
 
 
-def _rewrite_deb822_pass(text, upgrade_http_canonical=False):
-    out, changed = [], False
+def rewrite_deb822(text):
+    # Split into blank-line chunks and stanzas. APT's pkgTagSection::Scan ends
+    # a record only on an empty line (\n or \r\n), NOT on a whitespace-only line.
+    chunks = []
     stanza = []
-    # APT's pkgTagSection::Scan ends a record only on an empty line (\n or \r\n),
-    # NOT on a whitespace-only continuation line such as "  \n".
     for line in _LINE_SPLIT.findall(text):
         body = line.rstrip("\r\n")
         if "\r" in body:
             raise ValueError(f"apt source contains bare CR character on line {line!r}")
         if body == "":
             if stanza:
-                rewritten, hit = _process_deb822_stanza(stanza, upgrade_http_canonical)
-                out.extend(rewritten)
-                changed |= hit
+                chunks.append(("stanza", stanza))
                 stanza = []
-            out.append(line)
+            chunks.append(("blank", [line]))
         else:
             stanza.append(line)
     if stanza:
-        rewritten, hit = _process_deb822_stanza(stanza, upgrade_http_canonical)
-        out.extend(rewritten)
-        changed |= hit
-    return "".join(out), changed
+        chunks.append(("stanza", stanza))
+
+    # Pass 1: validate every active stanza and record signing policies already
+    # bound to canonical archive.ubuntu.com Release indexes.
+    inspected = []
+    suite_policies = {}
+    for kind, lines in chunks:
+        if kind != "stanza":
+            inspected.append((kind, lines, None))
+            continue
+        info = _inspect_deb822_stanza(lines)
+        active, uris, suites, policy = info
+        if active and any(_is_canonical(u) for u in uris):
+            _register_suite_policy(suite_policies, suites, policy)
+        inspected.append((kind, lines, info))
+
+    # Pass 2: decide which regional-mirror stanzas can rewrite onto CANONICAL
+    # without colliding with a different signing policy on the same suite.
+    rewritten_indices = set()
+    for idx, (kind, _lines, info) in enumerate(inspected):
+        if kind != "stanza":
+            continue
+        active, uris, suites, policy = info
+        if not active or not any(is_mirror(u) for u in uris):
+            continue
+        if not _suites_compatible(suite_policies, suites, policy):
+            continue
+        rewritten_indices.add(idx)
+        _register_suite_policy(suite_policies, suites, policy)
+
+    if not rewritten_indices:
+        return text, False
+
+    # Pass 3: rewrite eligible regional stanzas and upgrade overlapping active
+    # HTTP canonical stanzas to HTTPS (leaving disabled stanzas and conflicting
+    # regional stanzas untouched so distinct Release indexes are preserved).
+    out = []
+    for idx, (kind, lines, info) in enumerate(inspected):
+        if kind != "stanza":
+            out.extend(lines)
+            continue
+        active, uris, _suites, _policy = info
+        if idx in rewritten_indices:
+            new_lines, _ = _rewrite_deb822_stanza_uris(
+                lines, rewrite_mirrors=True, upgrade_http_canonical=True
+            )
+            out.extend(new_lines)
+        elif active and any(_is_http_canonical(u) for u in uris):
+            new_lines, _ = _rewrite_deb822_stanza_uris(
+                lines, rewrite_mirrors=False, upgrade_http_canonical=True
+            )
+            out.extend(new_lines)
+        else:
+            out.extend(lines)
+    return "".join(out), True
 
 
-def rewrite_deb822(text):
-    rewritten, changed = _rewrite_deb822_pass(text, upgrade_http_canonical=False)
-    if not changed:
-        return rewritten, False
-    # APT keys Release indexes without the scheme and reuses the first entry's
-    # URI for overlapping suites, so upgrade any active HTTP canonical entry in
-    # the temporary fallback source to HTTPS whenever a rewrite occurs.
-    normalized, _ = _rewrite_deb822_pass(rewritten, upgrade_http_canonical=True)
-    return normalized, True
-
-
-def _rewrite_one_line_pass(text, upgrade_http_canonical=False):
-    out, changed = [], False
+def rewrite_one_line(text):
+    # Pass 1: validate every active line and record canonical suite policies.
+    records = []
+    suite_policies = {}
     for line in _LINE_SPLIT.findall(text):
         body = line.rstrip("\r\n")
         if "\r" in body:
@@ -359,26 +494,50 @@ def _rewrite_one_line_pass(text, upgrade_http_canonical=False):
         ending = line[len(body):]
         stripped = body.lstrip(_ASCII_SPACE_STR)
         if not stripped or stripped.startswith("#"):
-            out.append(body + ending)
+            records.append(("raw", line, None))
             continue
         parsed = _parse_one_line(body)
         if not parsed:
             raise ValueError(f"unsupported or malformed apt source line: {body!r}")
-        head, opts_bracket, _raw_uri, decoded_uri, tail = parsed
+        head, opts_bracket, _raw_uri, decoded_uri, suite, tail = parsed
         _check_one_line_options(opts_bracket)
-        if _should_rewrite_uri(decoded_uri, upgrade_http_canonical):
-            body = head + CANONICAL + tail
-            changed = True
-        out.append(body + ending)
-    return "".join(out), changed
+        policy = _one_line_policy(opts_bracket)
+        suites = [suite] if suite else []
+        if _is_canonical(decoded_uri):
+            _register_suite_policy(suite_policies, suites, policy)
+        records.append(("entry", (line, head, decoded_uri, tail, ending), (suites, policy)))
 
+    # Pass 2: select regional-mirror entries that can safely map onto CANONICAL
+    # without colliding with a distinct signing policy on the same suite.
+    rewritten_indices = set()
+    for idx, (kind, payload, meta) in enumerate(records):
+        if kind != "entry":
+            continue
+        _orig_line, _head, decoded_uri, _tail, _ending = payload
+        suites, policy = meta
+        if not is_mirror(decoded_uri):
+            continue
+        if not _suites_compatible(suite_policies, suites, policy):
+            continue
+        rewritten_indices.add(idx)
+        _register_suite_policy(suite_policies, suites, policy)
 
-def rewrite_one_line(text):
-    rewritten, changed = _rewrite_one_line_pass(text, upgrade_http_canonical=False)
-    if not changed:
-        return rewritten, False
-    normalized, _ = _rewrite_one_line_pass(rewritten, upgrade_http_canonical=True)
-    return normalized, True
+    if not rewritten_indices:
+        return text, False
+
+    # Pass 3: rewrite eligible regional entries and upgrade active HTTP
+    # canonical entries to HTTPS while preserving conflicting distinct indexes.
+    out = []
+    for idx, (kind, payload, _meta) in enumerate(records):
+        if kind != "entry":
+            out.append(payload)
+            continue
+        orig_line, head, decoded_uri, tail, ending = payload
+        if idx in rewritten_indices or _is_http_canonical(decoded_uri):
+            out.append(head + CANONICAL + tail + ending)
+        else:
+            out.append(orig_line)
+    return "".join(out), True
 
 
 def rewrite(text, deb822):

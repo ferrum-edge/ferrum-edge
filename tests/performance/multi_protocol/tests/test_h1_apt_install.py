@@ -85,7 +85,7 @@ class SourceRewriteTests(unittest.TestCase):
         )
         mixed_deb822 = (
             "Types: deb\n"
-            "URIs: http://archive.ubuntu.com/ubuntu/\n"
+            "URIs: http://archive.ubuntu.com:/ubuntu/\n"
             "Suites: resolute\n"
             "Components: main\n"
             f"Signed-By: {KEYRING}\n\n"
@@ -102,21 +102,139 @@ class SourceRewriteTests(unittest.TestCase):
         self.assertTrue(rewritten_d.endswith(disabled_http), "disabled HTTP canonical stanza stays untouched")
 
         mixed_one_line = (
-            f"deb [signed-by={KEYRING}] http://archive.ubuntu.com/ubuntu/ resolute main\n"
+            f"deb [signed-by={KEYRING}] http://archive.ubuntu.com:/ubuntu/ resolute main\n"
             f"deb [signed-by={KEYRING}] https://azure.archive.ubuntu.com/ubuntu/ resolute universe\n"
         )
         rewritten_o, changed_o = sources.rewrite(mixed_one_line, deb822=False)
         self.assertTrue(changed_o)
         self.assertEqual(rewritten_o.count("https://archive.ubuntu.com/ubuntu/"), 2)
-        self.assertNotIn("http://archive.ubuntu.com/ubuntu/", rewritten_o)
+        self.assertNotIn("http://archive.ubuntu.com", rewritten_o)
+
+    def test_distinct_signing_policies_preserve_distinct_release_indexes(self):
+        alt_keyring = "/etc/apt/keyrings/ubuntu-alt.gpg"
+        # Canonical + regional for the same suite with different Signed-By must not
+        # merge onto one canonical Release index (which APT would reject).
+        deb822_conflict = (
+            "Types: deb\n"
+            "URIs: http://archive.ubuntu.com/ubuntu/\n"
+            "Suites: resolute\n"
+            "Components: main\n"
+            f"Signed-By: {KEYRING}\n\n"
+            "Types: deb\n"
+            "URIs: https://us-east-2.ec2.archive.ubuntu.com/ubuntu/\n"
+            "Suites: resolute\n"
+            "Components: universe\n"
+            f"Signed-By: {alt_keyring}\n"
+        )
+        self.assertEqual(sources.rewrite(deb822_conflict, deb822=True), (deb822_conflict, False))
+
+        # Two regional mirrors for the same suite with different Signed-By: first
+        # rewrites to canonical HTTPS; second keeps its distinct regional index.
+        deb822_two_regional = (
+            "Types: deb\n"
+            "URIs: https://us-east-2.ec2.archive.ubuntu.com/ubuntu/\n"
+            "Suites: resolute\n"
+            "Components: main\n"
+            f"Signed-By: {KEYRING}\n\n"
+            "Types: deb\n"
+            "URIs: https://azure.archive.ubuntu.com/ubuntu/\n"
+            "Suites: resolute\n"
+            "Components: universe\n"
+            f"Signed-By: {alt_keyring}\n"
+        )
+        rewritten_r, changed_r = sources.rewrite(deb822_two_regional, deb822=True)
+        self.assertTrue(changed_r)
+        self.assertIn("URIs: https://archive.ubuntu.com/ubuntu/\n", rewritten_r)
+        self.assertIn("URIs: https://azure.archive.ubuntu.com/ubuntu/\n", rewritten_r)
+
+        one_line_conflict = (
+            f"deb [signed-by={KEYRING}] http://archive.ubuntu.com/ubuntu/ resolute main\n"
+            f"deb [signed-by={alt_keyring}] https://azure.archive.ubuntu.com/ubuntu/ resolute universe\n"
+        )
+        self.assertEqual(sources.rewrite(one_line_conflict, deb822=False), (one_line_conflict, False))
+
+        one_line_two_regional = (
+            f"deb [signed-by={KEYRING}] https://us-east-2.ec2.archive.ubuntu.com/ubuntu/ resolute main\n"
+            f"deb [signed-by={alt_keyring}] https://azure.archive.ubuntu.com/ubuntu/ resolute universe\n"
+        )
+        rewritten_or, changed_or = sources.rewrite(one_line_two_regional, deb822=False)
+        self.assertTrue(changed_or)
+        self.assertIn(f"deb [signed-by={KEYRING}] https://archive.ubuntu.com/ubuntu/ resolute main\n", rewritten_or)
+        self.assertIn(f"deb [signed-by={alt_keyring}] https://azure.archive.ubuntu.com/ubuntu/ resolute universe\n", rewritten_or)
+
+    @unittest.skipUnless(shutil.which("apt-get") and Path(KEYRING).exists(), "needs hosted Ubuntu apt-get")
+    def test_hosted_apt_accepts_rewritten_mixed_and_distinct_policy_sources(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            lists = root / "lists"
+            (lists / "partial").mkdir(parents=True)
+            alt_keyring = root / "ubuntu-alt.gpg"
+            shutil.copyfile(KEYRING, alt_keyring)
+            for name, raw, deb822, expect_changed, expect_https_canonical in (
+                (
+                    "same-policy.sources",
+                    "Types: deb\nURIs: http://archive.ubuntu.com:/ubuntu/\nSuites: resolute\n"
+                    f"Components: main\nSigned-By: {KEYRING}\n\n"
+                    "Types: deb\nURIs: https://us-east-2.ec2.archive.ubuntu.com/ubuntu/\nSuites: resolute\n"
+                    f"Components: universe\nSigned-By: {KEYRING}\n",
+                    True,
+                    True,
+                    True,
+                ),
+                (
+                    "distinct-policy.sources",
+                    "Types: deb\nURIs: https://us-east-2.ec2.archive.ubuntu.com/ubuntu/\nSuites: resolute\n"
+                    f"Components: main\nSigned-By: {KEYRING}\n\n"
+                    "Types: deb\nURIs: https://azure.archive.ubuntu.com/ubuntu/\nSuites: resolute\n"
+                    f"Components: universe\nSigned-By: {alt_keyring}\n",
+                    True,
+                    True,
+                    True,
+                ),
+                (
+                    "distinct-policy.list",
+                    f"deb [signed-by={KEYRING}] https://us-east-2.ec2.archive.ubuntu.com/ubuntu/ resolute main\n"
+                    f"deb [signed-by={alt_keyring}] https://azure.archive.ubuntu.com/ubuntu/ resolute universe\n",
+                    False,
+                    True,
+                    True,
+                ),
+            ):
+                with self.subTest(case=name):
+                    rewritten, changed = sources.rewrite(raw, deb822)
+                    self.assertEqual(changed, expect_changed)
+                    out = root / name
+                    out.write_text(rewritten)
+                    proc = subprocess.run(
+                        [
+                            "apt-get",
+                            "-o", f"Dir::Etc::sourcelist={out}",
+                            "-o", "Dir::Etc::sourceparts=-",
+                            "-o", f"Dir::State::lists={lists}",
+                            "-o", "Debug::NoLocking=1",
+                            "update", "--print-uris",
+                        ],
+                        capture_output=True,
+                        text=True,
+                        timeout=30,
+                    )
+                    self.assertEqual(proc.returncode, 0, proc.stderr)
+                    if expect_https_canonical:
+                        self.assertIn("https://archive.ubuntu.com/ubuntu/dists/resolute/InRelease", proc.stdout)
+                        self.assertNotIn("http://archive.ubuntu.com", proc.stdout)
 
     def test_one_line_adjacent_uri_after_option_bracket_is_rewritten_and_checked(self):
         adjacent = f"deb [signed-by={KEYRING} ]http://azure.archive.ubuntu.com/ubuntu/ noble main\n"
         rewritten, changed = sources.rewrite(adjacent, deb822=False)
         self.assertTrue(changed)
         self.assertEqual(rewritten, f"deb [signed-by={KEYRING} ]{sources.CANONICAL} noble main\n")
-        with self.assertRaises(ValueError):
-            sources.rewrite("deb [trusted=yes]http://azure.archive.ubuntu.com/ubuntu/ noble main\n", deb822=False)
+        for unsafe_or_ambiguous in (
+            "deb [trusted=yes ]http://azure.archive.ubuntu.com/ubuntu/ noble main\n",
+            "deb [signed-by=K]http://azure.archive.ubuntu.com/ubuntu/ trusted=yes ]http://evil.example/ noble main\n",
+            "deb [signed-by=K]x trusted=yes ]http://evil.example/ noble main\n",
+        ):
+            with self.subTest(line=unsafe_or_ambiguous), self.assertRaises(ValueError):
+                sources.rewrite(unsafe_or_ambiguous, deb822=False)
 
     def test_deb822_non_ascii_whitespace_does_not_split_uri_tokens(self):
         unsplit = f"Types: deb\nURIs: http://evil.example/\u00a0http://azure.archive.ubuntu.com/ubuntu/\nSuites: noble\nComponents: main\nSigned-By: {KEYRING}\n"
