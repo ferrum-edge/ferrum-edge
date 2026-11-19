@@ -213,6 +213,7 @@ async fn slice_drift_admin_auth_and_ack_nack_convergence() {
         ambient_udp_source_scoping: false,
         remote_discovery: false,
         node_waypoint_capture_scoping: false,
+        sidecar_http_routes: false,
     };
     assert!(
         client
@@ -232,6 +233,7 @@ async fn slice_drift_admin_auth_and_ack_nack_convergence() {
         ambient_udp_source_scoping: false,
         remote_discovery: false,
         node_waypoint_capture_scoping: false,
+        sidecar_http_routes: false,
     };
     let mut stream = client
         .mesh_subscribe(tonic::Request::new(subscribe.clone()))
@@ -458,6 +460,7 @@ async fn status_report_skips_session_mismatches_across_permitted_namespaces() {
             ambient_udp_source_scoping: false,
             remote_discovery: false,
             node_waypoint_capture_scoping: false,
+            sidecar_http_routes: false,
         }))
         .await
         .unwrap()
@@ -474,6 +477,7 @@ async fn status_report_skips_session_mismatches_across_permitted_namespaces() {
             ambient_udp_source_scoping: false,
             remote_discovery: false,
             node_waypoint_capture_scoping: false,
+            sidecar_http_routes: false,
         }))
         .await
         .unwrap()
@@ -531,6 +535,7 @@ async fn drift_registry_refusal_still_delivers_mesh_config_untracked() {
         ambient_udp_source_scoping: false,
         remote_discovery: false,
         node_waypoint_capture_scoping: false,
+        sidecar_http_routes: false,
     };
     let mut stream = client
         .mesh_subscribe(tonic::Request::new(subscribe))

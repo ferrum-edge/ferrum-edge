@@ -457,6 +457,7 @@ fn mesh_subscribe_request(
         waypoint_name: String::new(),
         ambient_udp_source_scoping: false,
         node_waypoint_capture_scoping: false,
+        sidecar_http_routes: false,
         remote_discovery,
     }
 }
@@ -1365,6 +1366,7 @@ async fn mesh_subscribe_refuses_tenant_a_credential_signing_a_tenant_b_claim() {
                 waypoint_name: String::new(),
                 ambient_udp_source_scoping: false,
                 node_waypoint_capture_scoping: false,
+                sidecar_http_routes: false,
                 remote_discovery: false,
             },
         ))
@@ -2009,6 +2011,7 @@ async fn mesh_subscribe_rejects_trust_bundle_token_with_kid_but_no_ns_claim() {
                 waypoint_name: String::new(),
                 ambient_udp_source_scoping: false,
                 node_waypoint_capture_scoping: false,
+                sidecar_http_routes: false,
                 remote_discovery: false,
             },
         ))

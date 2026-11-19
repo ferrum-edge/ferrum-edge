@@ -173,6 +173,13 @@ message MeshSubscribeRequest {
   // Absent/false means the subscriber receives no inventory and its capture
   // path resolves nothing (fail closed).
   bool node_waypoint_capture_scoping = 9;
+  // True when this subscriber is a Sidecar that serves the VirtualService
+  // `http[]` routes bound to the mesh (issue #7423). The CP then carries the
+  // routes visible to the subscription namespace (with `exportTo` and any
+  // Sidecar egress scope applied) on the slice's `http_routes`, exactly as for
+  // a NodeWaypoint. It widens no inventory. Absent/false means the slice
+  // carries no HTTP routes (Ambient, ServiceWaypoint and gateway subscribers).
+  bool sidecar_http_routes = 10;
 }
 
 // A MeshSubscribe response frame.

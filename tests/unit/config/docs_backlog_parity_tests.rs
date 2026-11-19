@@ -90,9 +90,9 @@ fn mesh_supported_matrix_product_deferral_index_is_current() {
     );
 }
 
-/// Issue #7390: the sidecar GA headline must not claim VirtualService routing
-/// while Sidecar data planes do not apply mesh-bound `http[]` routes (only
-/// NodeWaypoint does), and FEATURES must qualify route splits by topology.
+/// Issues #7390, #7423: the sidecar GA headline must not claim VirtualService
+/// routing until a live weighted-split assertion gates the Sidecar `http[]`
+/// projection, and FEATURES must qualify route splits by topology.
 #[test]
 fn virtual_service_http_routing_is_scoped_to_the_topologies_that_apply_it() {
     let headline_start = MESH_SUPPORTED_MATRIX
@@ -111,7 +111,7 @@ fn virtual_service_http_routing_is_scoped_to_the_topologies_that_apply_it() {
         "the headline must say VirtualService http[] routing is outside the sidecar GA track"
     );
     for topology in [
-        "| Sidecar | **Not applied**",
+        "| Sidecar | Applied",
         "| ServiceWaypoint (GAMMA) | **Not applied**",
         "| Ambient | **Not applied**",
         "| NodeWaypoint | Applied",
@@ -122,13 +122,11 @@ fn virtual_service_http_routing_is_scoped_to_the_topologies_that_apply_it() {
         );
     }
     assert!(
-        MESH_SUPPORTED_MATRIX.contains("mesh_http_routes: node_waypoint_only"),
+        MESH_SUPPORTED_MATRIX.contains("mesh_http_routes: sidecar_and_node_waypoint"),
         "matrix must name the status field that reports the scope"
     );
     assert!(
-        FEATURES.contains(
-            "Sidecar, Ambient and ServiceWaypoint data planes do not apply `http[]` routes"
-        ),
+        FEATURES.contains("Ambient and ServiceWaypoint data planes do not apply `http[]` routes"),
         "FEATURES must qualify VirtualService route splits by topology"
     );
 }

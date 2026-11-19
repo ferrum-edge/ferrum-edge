@@ -92,6 +92,7 @@ fn recover_from_snapshot(
         waypoint_name: waypoint_name.map(str::to_string),
         ambient_udp_source_scoping: false,
         node_waypoint_capture_scoping: false,
+        sidecar_http_routes: false,
         stream_channel_capacity: 1,
         primary_retry_secs: 0,
         connect_timeout_seconds: 0,

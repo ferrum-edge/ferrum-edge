@@ -676,6 +676,7 @@ async fn native_mesh_subscribe_filters_tenant_slice_and_trust_material() {
         ambient_udp_source_scoping: false,
         remote_discovery: false,
         node_waypoint_capture_scoping: false,
+        sidecar_http_routes: false,
     });
     let mut stream = client.mesh_subscribe(req).await.unwrap().into_inner();
     let first = timeout(Duration::from_secs(5), stream.message())
@@ -712,6 +713,7 @@ async fn native_mesh_subscribe_rejects_missing_claim_in_multi_scope() {
         ambient_udp_source_scoping: false,
         remote_discovery: false,
         node_waypoint_capture_scoping: false,
+        sidecar_http_routes: false,
     });
     let err = client.mesh_subscribe(req).await.unwrap_err();
     assert_eq!(err.code(), tonic::Code::PermissionDenied);

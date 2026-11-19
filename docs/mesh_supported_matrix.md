@@ -43,8 +43,9 @@ enrolled rows and required live assertion IDs; fixture detail is in the
   (required assertion IDs: `target/conformance/coverage.md`).
   VirtualService `http[]` routing (weighted splits, match dispatch, rewrites,
   retries, timeouts, faults, mirrors) is **not** part of the sidecar GA track:
-  a Sidecar data plane does not apply a mesh-bound VirtualService's `http[]`
-  routes (see *VirtualService on mesh data planes* below, issue #7390).
+  Sidecar data planes apply a mesh-bound VirtualService's `http[]` routes
+  (Experimental, issue #7423), but no live weighted-split assertion gates them
+  yet (see *VirtualService on mesh data planes* below).
   An identity-less mesh (no gateway SVID material and no CA backend) **fails
   startup closed** unless `FERRUM_MESH_ALLOW_NO_CA=true`, and
   `FERRUM_MESH_PRODUCTION_MODE=true` refuses it unconditionally; at runtime a
@@ -105,10 +106,12 @@ enrolled rows and required live assertion IDs; fixture detail is in the
   its mesh slice. Slices carry VirtualService `tcp[]`/`tls[]` routes and
   host-level `corsPolicy` (applied by client Sidecars). A mesh-bound
   VirtualService's `http[]` routes (with their `mesh_route_dispatch` rules and
-  weighted-split upstreams) ride only a **NodeWaypoint** slice (issue #7233,
-  Experimental with the topology), so route-scoped destination
-  `AuthorizationPolicy` and `RequestAuthentication` apply per VirtualService
-  route there. A merged route's `mesh_route_dispatch` branches are each
+  weighted-split upstreams) ride **NodeWaypoint** (issue #7233, Experimental
+  with the topology) and **Sidecar** (issue #7423, Experimental) slices. On a
+  NodeWaypoint, route-scoped destination `AuthorizationPolicy` and
+  `RequestAuthentication` apply per VirtualService route; a Sidecar applies the
+  routes client-side on its outbound capture listener, and destination policy
+  stays with the destination's own Sidecar, as in Istio. A merged route's `mesh_route_dispatch` branches are each
   authorized against their own destination's policy (issue #7383), and a
   weighted split naming a DestinationRule-governed Service or external host
   (exact or wildcard rule) is dispatched leg by leg, each leg through its own
@@ -120,15 +123,15 @@ enrolled rows and required live assertion IDs; fixture detail is in the
   | Topology | Mesh-bound VirtualService `http[]` routes |
   |---|---|
   | NodeWaypoint | Applied (Experimental). |
-  | Sidecar | **Not applied** — east-west traffic keeps the plain Service route. Follow-up: client-side projection. |
+  | Sidecar | Applied (Experimental), client-side on the outbound capture listener, over SVID-mTLS to each destination workload. Never served on the inbound `:15006` listener. Deterministic integration coverage only: no live weighted-split assertion in `mesh-e2e-sidecar` yet. |
   | ServiceWaypoint (GAMMA) | **Not applied** — follow-up: projection for the bound Services, where Istio applies waypoint L7 routing. |
   | Ambient | **Not applied** — as in Istio, the L4 ambient data plane does not do L7 routing; bind a waypoint. |
   | Ingress gateways (`spec.gateways` naming a Gateway) | Applied as gateway routes; unrelated to the mesh slice. |
 
   The Kubernetes status of a mesh-bound VirtualService with `http[]` routes
-  says so: `status.ferrum.translation.mesh_http_routes: node_waypoint_only`
+  says so: `status.ferrum.translation.mesh_http_routes: sidecar_and_node_waypoint`
   and a `FerrumAccepted` message note naming the data planes that ignore them
-  (issue #7390). See [mesh.md → Mesh data planes: NodeWaypoint route
+  (issues #7390, #7423). See [mesh.md → Mesh data planes: NodeWaypoint route
   carriage](mesh.md#mesh-data-planes-nodewaypoint-route-carriage).
 
 ## Wildcard-host egress ServiceEntries

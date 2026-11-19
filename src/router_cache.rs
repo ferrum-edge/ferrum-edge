@@ -73,7 +73,9 @@ enum MeshRouteDirectionFilter {
     Unfiltered,
     /// Admit non-mesh routes plus mesh routes whose direction equals this
     /// request's listener direction (`None` ⇒ a non-mesh listener, which admits
-    /// no direction-scoped mesh route).
+    /// no direction-scoped mesh route). A carried VirtualService HTTP route is
+    /// never admitted on an inbound mesh listener
+    /// (`modes::mesh::mesh_route_admitted_for_direction`, issue #7423).
     MatchingDirection(Option<crate::modes::mesh::MeshTrafficDirection>),
 }
 
@@ -2088,15 +2090,13 @@ impl RouterCache {
         // to a lower-priority valid route instead of returning a wrong-direction
         // route. A no-op (and zero-cost via short-circuit) on the normal
         // `Unfiltered` lookup path.
-        let admit = |rm: &RouteMatch| match direction_filter {
+        let admit_id = |id: &str| match direction_filter {
             MeshRouteDirectionFilter::Unfiltered => true,
             MeshRouteDirectionFilter::MatchingDirection(req_dir) => {
-                match crate::modes::mesh::mesh_route_direction(&rm.proxy.id) {
-                    None => true,
-                    Some(route_dir) => req_dir == Some(route_dir),
-                }
+                crate::modes::mesh::mesh_route_admitted_for_direction(id, req_dir)
             }
         };
+        let admit = |rm: &RouteMatch| admit_id(&rm.proxy.id);
         if let Some(host) = host {
             // 1. Exact host match — exact path, prefix, regex, then host-only
             if table.has_exact_path_routes
@@ -2108,7 +2108,7 @@ impl RouterCache {
             }
             if let Some(routes) = table.exact_hosts.get(host)
                 && let Some(route_match) =
-                    find_prefix_match_indexed(routes, path, port_ctx).filter(|rm| admit(rm))
+                    find_admitted_prefix_match_indexed(routes, path, port_ctx, admit)
             {
                 return Some(route_match);
             }
@@ -2122,6 +2122,7 @@ impl RouterCache {
             if table.has_host_only_routes
                 && let Some(candidates) = table.exact_hosts_host_only.get(host)
                 && let Some(proxy) = select_port_aware_proxy(candidates, port_ctx)
+                && admit_id(&proxy.id)
             {
                 return Some(RouteMatch {
                     proxy: Arc::clone(proxy),
@@ -2145,7 +2146,7 @@ impl RouterCache {
             for (pattern, routes) in &table.wildcard_hosts {
                 if wildcard_matches(pattern, host)
                     && let Some(route_match) =
-                        find_prefix_match_indexed(routes, path, port_ctx).filter(|rm| admit(rm))
+                        find_admitted_prefix_match_indexed(routes, path, port_ctx, admit)
                 {
                     return Some(route_match);
                 }
@@ -2164,6 +2165,7 @@ impl RouterCache {
                 for (pattern, candidates) in &table.wildcard_hosts_host_only {
                     if wildcard_matches(pattern, host)
                         && let Some(proxy) = select_port_aware_proxy(candidates, port_ctx)
+                        && admit_id(&proxy.id)
                     {
                         return Some(RouteMatch {
                             proxy: Arc::clone(proxy),
@@ -2184,7 +2186,7 @@ impl RouterCache {
             return Some(route_match);
         }
         if let Some(route_match) =
-            find_prefix_match_indexed(&table.catch_all, path, port_ctx).filter(|rm| admit(rm))
+            find_admitted_prefix_match_indexed(&table.catch_all, path, port_ctx, admit)
         {
             return Some(route_match);
         }
@@ -3484,10 +3486,17 @@ fn find_exact_path_match_indexed(
 ///
 /// This is the key optimization that prevents throughput degradation as proxy count
 /// scales from tens to tens of thousands.
-fn find_prefix_match_indexed(
+///
+/// A prefix whose selected route `admit` refuses is skipped and the walk keeps
+/// going to shorter prefixes (issue #7423). The mesh direction filter needs
+/// this: a carried VirtualService `/api` route refused on an inbound listener
+/// must not hide the local inbound `/` route of the same host. The cached
+/// lookup admits everything.
+fn find_admitted_prefix_match_indexed(
     routes: &IndexedPrefixRoutes,
     path: &str,
     port_ctx: HttpPortMatchContext,
+    admit: impl Fn(&RouteMatch) -> bool,
 ) -> Option<RouteMatch> {
     if routes.path_index.is_empty() {
         return None;
@@ -3500,11 +3509,13 @@ fn find_prefix_match_indexed(
     };
 
     let pick = |candidates: &Vec<PortScopedProxy>, matched_prefix_len: usize| {
-        select_port_aware_proxy(candidates, port_ctx).map(|proxy| RouteMatch {
-            proxy: Arc::clone(proxy),
-            path_params: Vec::new(),
-            matched_prefix_len,
-        })
+        select_port_aware_proxy(candidates, port_ctx)
+            .map(|proxy| RouteMatch {
+                proxy: Arc::clone(proxy),
+                path_params: Vec::new(),
+                matched_prefix_len,
+            })
+            .filter(|route_match| admit(route_match))
     };
 
     // 1. Exact match (most common case for the scale test pattern)
@@ -3750,8 +3761,10 @@ fn complete_mesh_scoped_resolution(
 
     let found = match found {
         Some(route)
-            if crate::modes::mesh::mesh_route_direction(&route.proxy.id)
-                .is_some_and(|direction| Some(direction) != mesh.direction) =>
+            if !crate::modes::mesh::mesh_route_admitted_for_direction(
+                &route.proxy.id,
+                mesh.direction,
+            ) =>
         {
             exclude_wrong_direction()
         }

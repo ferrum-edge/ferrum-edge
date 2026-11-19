@@ -19797,6 +19797,7 @@ extensionProviders:
             waypoint_name: None,
             ambient_udp_source_scoping: false,
             node_waypoint_capture_scoping: false,
+            sidecar_http_routes: false,
         };
         let slice = MeshSlice::from_gateway_config(&gateway_config, request);
         // Both should match — namespace-default applies to any workload, and

@@ -76,6 +76,14 @@ pub struct MeshSliceRequest {
     /// slice fields consumed by the capture resolver and, for the destinations,
     /// the NodeWaypoint source identity resolver (exact pod-UID binding only).
     pub node_waypoint_capture_scoping: bool,
+    /// This subscriber is a **Sidecar** that serves the VirtualService
+    /// `http[]` routes bound to the mesh (issue #7423): the slice carries them
+    /// on `http_routes` exactly as it does for a NodeWaypoint
+    /// ([`Self::node_waypoint_capture_scoping`]), and the Sidecar applies them
+    /// on its outbound capture listener. Set only for `MeshTopology::Sidecar`;
+    /// Ambient (the L4 data plane), ServiceWaypoint and the gateway topologies
+    /// leave it `false` and receive no routes.
+    pub sidecar_http_routes: bool,
 }
 
 impl Default for MeshSliceRequest {
@@ -92,6 +100,7 @@ impl Default for MeshSliceRequest {
             enforce_sidecar_identity_narrowing: false,
             ambient_udp_source_scoping: false,
             node_waypoint_capture_scoping: false,
+            sidecar_http_routes: false,
         }
     }
 }
@@ -115,6 +124,7 @@ impl MeshSliceRequest {
             enforce_sidecar_identity_narrowing: false,
             ambient_udp_source_scoping: false,
             node_waypoint_capture_scoping: false,
+            sidecar_http_routes: false,
         }
     }
 
@@ -136,6 +146,7 @@ impl MeshSliceRequest {
             enforce_sidecar_identity_narrowing: false,
             ambient_udp_source_scoping: false,
             node_waypoint_capture_scoping: false,
+            sidecar_http_routes: false,
         }
     }
 
@@ -186,6 +197,14 @@ impl MeshSliceRequest {
     /// [`MeshSliceRequest::node_waypoint_capture_scoping`].
     pub fn with_node_waypoint_capture_scoping(mut self, enabled: bool) -> Self {
         self.node_waypoint_capture_scoping = enabled;
+        self
+    }
+
+    /// Returns `self` marked as a Sidecar that serves mesh-bound VirtualService
+    /// `http[]` routes (issue #7423). See
+    /// [`MeshSliceRequest::sidecar_http_routes`].
+    pub fn with_sidecar_http_routes(mut self, enabled: bool) -> Self {
+        self.sidecar_http_routes = enabled;
         self
     }
 
@@ -1849,11 +1868,13 @@ impl MeshSlice {
                 .into_iter()
                 .filter(|upstream| admitted_upstream_ids.contains(upstream.id.as_str())),
         );
-        // VirtualService HTTP routes (issue #7233), NodeWaypoint first: the
-        // routes bound to the mesh in this subscription's namespace whose
-        // `exportTo` admits it, with every destination admitted by an
-        // applicable Sidecar egress scope exactly like the L4 routes above.
-        let http_routes = if request.node_waypoint_capture_scoping {
+        // VirtualService HTTP routes (issues #7233, #7423), for the topologies
+        // that serve them (NodeWaypoint and Sidecar): the routes bound to the
+        // mesh in this subscription's namespace whose `exportTo` admits it,
+        // with every destination admitted by an applicable Sidecar egress
+        // scope exactly like the L4 routes above. Ambient (the L4 data plane),
+        // ServiceWaypoint and the gateway topologies request none.
+        let http_routes = if request.node_waypoint_capture_scoping || request.sidecar_http_routes {
             node_waypoint_http_route_set(
                 config,
                 mesh,
@@ -3571,7 +3592,9 @@ pub(crate) fn mesh_route_dispatch_rule_upstream_ids(config: &serde_json::Value) 
     rules.chain(splits).collect()
 }
 
-/// Project the VirtualService HTTP routes a NodeWaypoint serves (issue #7233).
+/// Project the VirtualService HTTP routes a NodeWaypoint (issue #7233) or a
+/// Sidecar (issue #7423) serves. Both topologies receive the same route set;
+/// each data plane rebinds it onto its own mesh transport.
 ///
 /// A route rides the slice only when a [`MeshConfig::virtual_service_http_routes`]
 /// binding lists it, the binding lives in a namespace this subscription sees
@@ -3710,7 +3733,7 @@ fn node_waypoint_http_route_set(
             debug!(
                 proxy_id = %sanitize_startup_cause(format!("{:?}", proxy.id.to_string()), &[]),
                 "VirtualService HTTP route is not self-contained; not carrying it to the \
-                 NodeWaypoint slice"
+                 mesh slice"
             );
             continue;
         }
@@ -6072,6 +6095,7 @@ mod tests {
                 waypoint_name: Some("waypoint".into()),
                 ambient_udp_source_scoping: true,
                 node_waypoint_capture_scoping: false,
+                sidecar_http_routes: false,
                 ..MeshSliceRequest::default()
             },
         );
@@ -6229,6 +6253,7 @@ mod tests {
             enforce_sidecar_identity_narrowing: false,
             ambient_udp_source_scoping: false,
             node_waypoint_capture_scoping: false,
+            sidecar_http_routes: false,
         }
     }
 
@@ -6248,6 +6273,7 @@ mod tests {
             enforce_sidecar_identity_narrowing: false,
             ambient_udp_source_scoping: false,
             node_waypoint_capture_scoping: false,
+            sidecar_http_routes: false,
         }
     }
 
@@ -7460,6 +7486,7 @@ mod tests {
             waypoint_name: None,
             ambient_udp_source_scoping: false,
             node_waypoint_capture_scoping: false,
+            sidecar_http_routes: false,
         };
         let slice = MeshSlice::from_gateway_config(&config, request);
         // The slice should inherit labels from the matched workload.
@@ -7519,6 +7546,7 @@ mod tests {
             waypoint_name: None,
             ambient_udp_source_scoping: false,
             node_waypoint_capture_scoping: false,
+            sidecar_http_routes: false,
         };
 
         let slice = MeshSlice::from_gateway_config(&config, request);
@@ -7602,6 +7630,7 @@ mod tests {
             waypoint_name: None,
             ambient_udp_source_scoping: false,
             node_waypoint_capture_scoping: false,
+            sidecar_http_routes: false,
         };
 
         let slice = MeshSlice::from_gateway_config(&config, request);
@@ -7676,6 +7705,7 @@ mod tests {
             waypoint_name: None,
             ambient_udp_source_scoping: false,
             node_waypoint_capture_scoping: false,
+            sidecar_http_routes: false,
         };
 
         let slice = MeshSlice::from_gateway_config(&config, request);
@@ -7723,6 +7753,7 @@ mod tests {
             waypoint_name: None,
             ambient_udp_source_scoping: false,
             node_waypoint_capture_scoping: false,
+            sidecar_http_routes: false,
         };
         let slice = MeshSlice::from_gateway_config(&config, request);
         // Explicit labels should be used, not the workload's labels.
@@ -8311,6 +8342,7 @@ mod tests {
                 waypoint_name: None,
                 ambient_udp_source_scoping: false,
                 node_waypoint_capture_scoping: false,
+                sidecar_http_routes: false,
             },
         );
 
@@ -9139,6 +9171,7 @@ mod tests {
             enforce_sidecar_identity_narrowing: false,
             ambient_udp_source_scoping: false,
             node_waypoint_capture_scoping: false,
+            sidecar_http_routes: false,
         }
     }
 
@@ -9158,6 +9191,7 @@ mod tests {
             enforce_sidecar_identity_narrowing: false,
             ambient_udp_source_scoping: false,
             node_waypoint_capture_scoping: false,
+            sidecar_http_routes: false,
         }
     }
 

@@ -4699,6 +4699,7 @@ mod tests {
             namespace: "ferrum".to_string(),
             workload_spiffe_id: Some(this_waypoint.to_string()),
             node_waypoint_capture_scoping: true,
+            sidecar_http_routes: false,
             ..MeshSliceRequest::default()
         };
 
@@ -4913,6 +4914,7 @@ mod tests {
             namespace: "ferrum".to_string(),
             workload_spiffe_id: Some(this_waypoint.to_string()),
             node_waypoint_capture_scoping: true,
+            sidecar_http_routes: false,
             ..MeshSliceRequest::default()
         };
         let names = |policies: &[MeshPolicy]| {
@@ -5107,6 +5109,7 @@ mod tests {
             workload_spiffe_id: Some(this_waypoint.to_string()),
             enforce_sidecar_egress: true,
             node_waypoint_capture_scoping: true,
+            sidecar_http_routes: false,
             ..MeshSliceRequest::default()
         };
 

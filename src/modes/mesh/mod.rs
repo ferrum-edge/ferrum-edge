@@ -353,6 +353,24 @@ impl MeshTopology {
     fn uses_node_waypoint_capture_scoping(self) -> bool {
         matches!(self, Self::NodeWaypoint)
     }
+
+    /// Whether this topology serves the VirtualService `http[]` routes a mesh
+    /// slice carries (`MeshSlice::http_routes`, issues #7233 and #7423): the
+    /// NodeWaypoint capture listener and the Sidecar outbound capture
+    /// listener. Ambient is the L4 data plane and does no L7 routing (as in
+    /// Istio); ServiceWaypoint projection is a documented follow-up.
+    #[inline]
+    pub(crate) fn serves_virtual_service_http_routes(self) -> bool {
+        matches!(self, Self::NodeWaypoint | Self::Sidecar)
+    }
+
+    /// Whether this topology asks the control plane for the VirtualService
+    /// `http[]` routes on a Sidecar slice (`MeshSliceRequest::sidecar_http_routes`).
+    /// NodeWaypoint gets them through its own capture-scoping request.
+    #[inline]
+    fn requests_sidecar_http_routes(self) -> bool {
+        matches!(self, Self::Sidecar)
+    }
 }
 
 /// Control-protocol source for mesh runtime config.
@@ -1017,6 +1035,7 @@ impl MeshRuntimeConfig {
             waypoint_name: self.service_waypoint_name(),
             ambient_udp_source_scoping: self.topology.uses_ambient_udp_source_scoping(),
             node_waypoint_capture_scoping: self.topology.uses_node_waypoint_capture_scoping(),
+            sidecar_http_routes: self.topology.requests_sidecar_http_routes(),
             labels: self.workload_labels.clone(),
             // Same `FERRUM_DP_CP_FAILOVER_PRIMARY_RETRY_SECS` interval the xDS
             // client uses — the knob is protocol-agnostic failover/failback.
@@ -1069,6 +1088,7 @@ impl MeshRuntimeConfig {
             waypoint_name: self.service_waypoint_name(),
             ambient_udp_source_scoping: self.topology.uses_ambient_udp_source_scoping(),
             node_waypoint_capture_scoping: self.topology.uses_node_waypoint_capture_scoping(),
+            sidecar_http_routes: self.topology.requests_sidecar_http_routes(),
             stream_channel_capacity: self.xds_stream_channel_capacity,
             primary_retry_secs: self.xds_primary_retry_secs,
             connect_timeout_seconds: self.xds_connect_timeout_seconds,
@@ -1548,6 +1568,7 @@ impl MeshRuntimeConfig {
             enforce_sidecar_identity_narrowing: self.sidecar_identity_narrowing,
             ambient_udp_source_scoping: self.topology.uses_ambient_udp_source_scoping(),
             node_waypoint_capture_scoping: self.topology.uses_node_waypoint_capture_scoping(),
+            sidecar_http_routes: self.topology.requests_sidecar_http_routes(),
         }
     }
 
@@ -1748,6 +1769,9 @@ fn prepare_normalized_gateway_config_for_mesh(
     fail_closed_node_waypoint_udp_dtls_scoped_policies(&mut config, runtime);
     apply_destination_rules(&mut config, runtime, mesh_slice)?;
     project_mesh_source_locality(&mut config, runtime, mesh_slice);
+    // After DestinationRules and locality, so the route-scoped clones carry
+    // the same projected policy as the Service upstreams they copy.
+    clone_sidecar_carried_destination_upstreams(&mut config, runtime, mesh_slice);
     // Project slice-filtered ServiceEntries back into the prepared mesh
     // block so introspection consumers (admin diagnostics, projected-config
     // snapshots, future helpers) see the same `export_to` / sidecar-narrowed
@@ -4281,7 +4305,8 @@ type DecodedHttpRouteSet = (
 /// Decode the VirtualService HTTP routes a slice carries (issue #7233).
 ///
 /// The set is producer input, so it is re-checked here before anything is
-/// materialized: only a NodeWaypoint serves it; every element is an object of
+/// materialized: only a NodeWaypoint or a Sidecar serves it (issue #7423);
+/// every element is an object of
 /// its resource type in the slice namespace with a translator-owned id; every
 /// plugin association resolves to a carried plugin config owned by that
 /// proxy; and every upstream id a proxy or `mesh_route_dispatch` rule names
@@ -4297,9 +4322,10 @@ fn decode_http_route_set(
     if set.is_empty() {
         return Ok((Vec::new(), Vec::new(), Vec::new()));
     }
-    if runtime.topology != MeshTopology::NodeWaypoint {
+    if !runtime.topology.serves_virtual_service_http_routes() {
         return Err(anyhow::anyhow!(
-            "Mesh slice carries VirtualService HTTP routes, which only a NodeWaypoint serves"
+            "Mesh slice carries VirtualService HTTP routes, which only a NodeWaypoint or a \
+             Sidecar serves"
         ));
     }
     let proxies: Vec<Proxy> = set
@@ -4566,12 +4592,13 @@ fn destination_rule_originates_tls_for_host(mesh_slice: &MeshSlice, host: &str, 
     })
 }
 
-/// Rebind the VirtualService HTTP routes a NodeWaypoint slice carries onto the
-/// NodeWaypoint mesh transport (issue #7233).
+/// Rebind the VirtualService HTTP routes a NodeWaypoint (issue #7233) or
+/// Sidecar (issue #7423) slice carries onto that topology's mesh transport.
 ///
 /// The translator's routes dial Service DNS names over plain HTTP. Served as
 /// they are, a carried route would replace the materialized Service route's
-/// pinned, node-to-node HBONE targets with a plaintext dial. So every in-mesh
+/// pinned mesh targets (node-to-node HBONE on a NodeWaypoint, per-workload
+/// SVID-mTLS on a Sidecar) with a plaintext dial. So every in-mesh
 /// destination is rebound onto the Service port's materialized upstream
 /// (`materialize_mesh_outbound_proxies` keeps those upstreams even when a
 /// carried route shadows the Service's own route):
@@ -4616,10 +4643,34 @@ fn bind_carried_http_routes_to_node_waypoint_transport(
     runtime: &MeshRuntimeConfig,
     mesh_slice: &MeshSlice,
 ) {
-    if runtime.topology != MeshTopology::NodeWaypoint || mesh_slice.http_routes.is_empty() {
+    if !runtime.topology.serves_virtual_service_http_routes() || mesh_slice.http_routes.is_empty() {
         return;
     }
     let hosts = CarriedRouteHostIndex::new(mesh_slice, &runtime.cluster_domain);
+    let sidecar = runtime.topology == MeshTopology::Sidecar;
+    // Routes whose every dispatch rule named another source namespace.
+    let source_namespace_refused = if sidecar {
+        resolve_sidecar_carried_route_source_namespaces(config, runtime, mesh_slice)
+    } else {
+        HashSet::new()
+    };
+    // Sidecar (issue #7423): the local workload's own inbound and `ingress[]`
+    // routes share the route table with the carried routes. A carried route
+    // that claims one of their (namespace, port, path) slots on an
+    // overlapping host would be a listen-path conflict that refuses the whole
+    // slice, so it is refused instead and the local route keeps the slot
+    // (self-calls keep their loopback route, as for the Service route the
+    // outbound materializer yields).
+    let local_inbound_routes: Vec<Proxy> = if sidecar {
+        config
+            .proxies
+            .iter()
+            .filter(|proxy| is_mesh_inbound_route_id(&proxy.id) && !proxy.dispatch_kind.is_stream())
+            .cloned()
+            .collect()
+    } else {
+        Vec::new()
+    };
     // The materialized upstream for a modeled Service port, if any.
     let service_upstream = |config: &GatewayConfig, namespace: &str, name: &str, port: u16| {
         let id = mesh_outbound_upstream_id(namespace, name, port);
@@ -4726,6 +4777,15 @@ fn bind_carried_http_routes_to_node_waypoint_transport(
                                 UPSTREAM_TARGET_SERVICE_PORT_TAG.to_string(),
                                 target.port.to_string(),
                             );
+                            if sidecar {
+                                stamp_sidecar_destination_authority(
+                                    &mut rebound_target,
+                                    &service_namespace,
+                                    &service_name,
+                                    target.port,
+                                    true,
+                                );
+                            }
                             rebound_target
                         })
                         .collect::<Vec<_>>();
@@ -4819,6 +4879,12 @@ fn bind_carried_http_routes_to_node_waypoint_transport(
     // Direct external backends a wildcard DestinationRule names (no rule
     // can apply to a direct backend).
     let mut wildcard_direct_backend_refused = 0usize;
+    // Sidecar routes that claim the local workload's own inbound route slot.
+    let mut local_inbound_route_conflicts = 0usize;
+    // Direct or dispatch-rule destinations in another namespace.
+    let mut cross_namespace_refused = 0usize;
+    // Sidecar `rewrite.authority` that does not name the selected destination.
+    let mut authority_rewrite_refused = 0usize;
     for index in 0..config.proxies.len() {
         let proxy = &config.proxies[index];
         if !config::is_virtual_service_http_route_proxy_id(&proxy.id) {
@@ -4828,7 +4894,19 @@ fn bind_carried_http_routes_to_node_waypoint_transport(
         let proxy_id = proxy.id.clone();
         let backend_host = proxy.backend_host.clone();
         let backend_port = proxy.backend_port;
-        let mut keep = true;
+        let mut keep = !source_namespace_refused.contains(&(namespace.clone(), proxy_id.clone()));
+        if !local_inbound_routes.is_empty() {
+            let claimed_hosts = carried_route_claimed_hosts(proxy, &hosts, &runtime.cluster_domain);
+            if local_inbound_routes.iter().any(|local| {
+                local.namespace == proxy.namespace
+                    && local.listen_port == proxy.listen_port
+                    && local.listen_path == proxy.listen_path
+                    && crate::config::types::hosts_overlap(&claimed_hosts, &local.hosts)
+            }) {
+                local_inbound_route_conflicts += 1;
+                keep = false;
+            }
+        }
         let mut proxy_upstream: Option<String> = None;
         // Every destination the route can reach, as authorization lists
         // candidates: the own destination, each weighted split's legs (never
@@ -4873,6 +4951,17 @@ fn bind_carried_http_routes_to_node_waypoint_transport(
                         candidates.insert(format!("{backend_host}|{backend_port}"));
                     }
                     CarriedRouteHost::UnmodeledService => keep = false,
+                    // A Service upstream lives in its own namespace while the
+                    // route and its references resolve in the route's, so a
+                    // cross-namespace destination would leave a dangling
+                    // reference that refuses the whole generation: refuse the
+                    // route instead (the host keeps its Service route).
+                    CarriedRouteHost::Service(service_namespace, _)
+                        if service_namespace != namespace =>
+                    {
+                        cross_namespace_refused += 1;
+                        keep = false;
+                    }
                     CarriedRouteHost::Service(service_namespace, service_name) => {
                         match service_upstream(
                             config,
@@ -4920,11 +5009,36 @@ fn bind_carried_http_routes_to_node_waypoint_transport(
                 let Some(destination) = rule.get("destination") else {
                     continue;
                 };
+                // Sidecar: an explicit `rewrite.authority` is forwarded as the
+                // `:authority` the destination Sidecar routes by, so it must
+                // name the selected destination Service (checked below).
+                let rewrite_authority = sidecar
+                    .then(|| {
+                        rule.get("rewrite")
+                            .and_then(|rewrite| rewrite.get("authority"))
+                            .and_then(serde_json::Value::as_str)
+                    })
+                    .flatten();
                 if let Some(upstream_id) = destination
                     .get("upstream_id")
                     .and_then(serde_json::Value::as_str)
                 {
                     if failed_splits.contains(&(namespace.clone(), upstream_id.to_string())) {
+                        keep = false;
+                    }
+                    // A split spans Services: one rewritten authority cannot
+                    // name every in-mesh leg's destination.
+                    if rewrite_authority.is_some()
+                        && config.upstreams.iter().any(|upstream| {
+                            upstream.namespace == namespace
+                                && upstream.id == upstream_id
+                                && upstream
+                                    .targets
+                                    .iter()
+                                    .any(crate::proxy::mesh_mtls_pool::target_mesh_mtls_enabled)
+                        })
+                    {
+                        authority_rewrite_refused += 1;
                         keep = false;
                     }
                     if !note_split(upstream_id, &mut candidates, &mut route_splits) {
@@ -4956,7 +5070,25 @@ fn bind_carried_http_routes_to_node_waypoint_transport(
                         candidates.insert(format!("{host}|{port}"));
                     }
                     CarriedRouteHost::UnmodeledService => keep = false,
+                    CarriedRouteHost::Service(service_namespace, _)
+                        if service_namespace != namespace =>
+                    {
+                        cross_namespace_refused += 1;
+                        keep = false;
+                    }
                     CarriedRouteHost::Service(service_namespace, service_name) => {
+                        if let Some(authority) = rewrite_authority
+                            && !authority_names_service(
+                                authority,
+                                &service_namespace,
+                                &service_name,
+                                port,
+                                &runtime.cluster_domain,
+                            )
+                        {
+                            authority_rewrite_refused += 1;
+                            keep = false;
+                        }
                         match service_upstream(config, &service_namespace, &service_name, port) {
                             Some(id) => {
                                 candidates.insert(id.clone());
@@ -5101,12 +5233,19 @@ fn bind_carried_http_routes_to_node_waypoint_transport(
             oversized_weighted_routes,
             tls_origination_refused,
             wildcard_direct_backend_refused,
-            "NodeWaypoint VirtualService routes refused: a destination is an in-cluster Service \
-             this waypoint cannot reach over its mesh transport, a weighted split that must \
+            local_inbound_route_conflicts,
+            source_namespace_refused = source_namespace_refused.len(),
+            cross_namespace_refused,
+            authority_rewrite_refused,
+            "Mesh VirtualService routes refused: a destination is an in-cluster Service \
+             this data plane cannot reach over its mesh transport (one in another namespace \
+             included), a weighted split that must \
              be dispatched leg by leg cannot be represented, a direct external backend's \
-             DestinationRule asks for TLS origination a direct backend cannot carry, or a \
-             wildcard DestinationRule names a direct external backend no rule can apply to; \
-             their hosts use the materialized Service routes"
+             DestinationRule asks for TLS origination a direct backend cannot carry, a \
+             wildcard DestinationRule names a direct external backend no rule can apply to, \
+             or (Sidecar) a route claims the local workload's own inbound route, applies \
+             only to other source namespaces, or rewrites the authority to a host its \
+             destination does not answer; their hosts use the materialized Service routes"
         );
         config
             .proxies
@@ -5155,6 +5294,349 @@ fn bind_carried_http_routes_to_node_waypoint_transport(
         // get their Service routes back.
         materialize_mesh_outbound_proxies(config, runtime, mesh_slice);
     }
+}
+
+/// Pin the destination Service authority on a Sidecar mesh-mTLS target a
+/// carried VirtualService route dials (issue #7423).
+///
+/// The destination Sidecar routes an inbound request by its `:authority`,
+/// against that Service's host variants and, for a multi-port Service, its
+/// port. A carried route does not preserve the client `Host` (and on a split or
+/// a dispatch branch the client `Host` names the VirtualService host, not the
+/// selected Service), so without this the authority falls back to the pod dial
+/// address and the destination answers 404. The selected Service port is
+/// always stamped: the source's egress-narrowed view can hide the destination's
+/// other ports. With `stamp_host` off (a rule that rewrites the authority) only
+/// the port is stamped, so the admitted rewritten host is forwarded with it.
+/// Only route-scoped targets are stamped (split clones and
+/// [`clone_sidecar_carried_destination_upstreams`]); the shared Service
+/// upstream keeps the client `Host`. Non-mesh-mTLS targets are left alone.
+fn stamp_sidecar_destination_authority(
+    target: &mut UpstreamTarget,
+    service_namespace: &str,
+    service_name: &str,
+    service_port: u16,
+    stamp_host: bool,
+) {
+    if !crate::proxy::mesh_mtls_pool::target_mesh_mtls_enabled(target) {
+        return;
+    }
+    if stamp_host {
+        target.tags.insert(
+            crate::proxy::mesh_mtls_pool::MESH_MTLS_AUTHORITY_HOST_TAG.to_string(),
+            format!("{service_name}.{service_namespace}.svc"),
+        );
+    } else {
+        target
+            .tags
+            .remove(crate::proxy::mesh_mtls_pool::MESH_MTLS_AUTHORITY_HOST_TAG);
+    }
+    target.tags.insert(
+        crate::proxy::mesh_mtls_pool::MESH_MTLS_AUTHORITY_PORT_TAG.to_string(),
+        service_port.to_string(),
+    );
+}
+
+/// Whether an explicit `rewrite.authority` names the selected destination
+/// Service: one of its host variants, with no port or its selected port.
+/// Anything else would reach a destination Sidecar that cannot route it.
+fn authority_names_service(
+    authority: &str,
+    service_namespace: &str,
+    service_name: &str,
+    service_port: u16,
+    cluster_domain: &str,
+) -> bool {
+    let authority = authority.trim();
+    let (host, port) = match split_carried_authority(authority) {
+        Some(parts) => parts,
+        None => return false,
+    };
+    if port.is_some_and(|port| port != service_port) {
+        return false;
+    }
+    let host = host.trim_end_matches('.').to_ascii_lowercase();
+    mesh_service_host_variants(service_name, service_namespace, cluster_domain)
+        .iter()
+        .any(|variant| variant.eq_ignore_ascii_case(&host))
+}
+
+/// Split `host[:port]`; `None` for an empty host or an unparsable port.
+fn split_carried_authority(authority: &str) -> Option<(&str, Option<u16>)> {
+    let (host, port) = match authority.rsplit_once(':') {
+        Some((host, port)) => (host, Some(port.parse::<u16>().ok()?)),
+        None => (authority, None),
+    };
+    (!host.is_empty()).then_some((host, port))
+}
+
+/// Upstream id of the route-scoped clone of a Sidecar Service upstream that
+/// carried routes dial (see [`clone_sidecar_carried_destination_upstreams`]).
+fn sidecar_carried_destination_upstream_id(service_upstream_id: &str, stamp_host: bool) -> String {
+    let rest = service_upstream_id
+        .strip_prefix(MESH_OUTBOUND_UPSTREAM_ID_PREFIX)
+        .unwrap_or(service_upstream_id);
+    if stamp_host {
+        format!("__mesh-out-vs-upstream-{rest}")
+    } else {
+        format!("__mesh-out-vs-rw-upstream-{rest}")
+    }
+}
+
+/// Give a Sidecar's carried VirtualService routes their own clones of the
+/// Service upstreams they dial (issue #7423), after DestinationRules applied.
+///
+/// A carried route's direct destination, each `mesh_route_dispatch` rule
+/// destination and each leg of a leg-dispatched split name a Service port's
+/// materialized upstream. That upstream is shared with the Service's own
+/// route, which must keep presenting the client `Host`. So each such
+/// reference is moved to a route-scoped clone (same targets, same
+/// DestinationRule projection, its own load-balancer and health state) whose
+/// targets carry the destination Service authority
+/// ([`stamp_sidecar_destination_authority`]). A rule that rewrites the
+/// authority (admitted by the binding only when it names that destination)
+/// gets a clone stamped with the port alone, so the rewritten host is
+/// forwarded. The Service and port are read forward from the slice's Service
+/// inventory, never parsed from ids.
+fn clone_sidecar_carried_destination_upstreams(
+    config: &mut GatewayConfig,
+    runtime: &MeshRuntimeConfig,
+    mesh_slice: &MeshSlice,
+) {
+    if runtime.topology != MeshTopology::Sidecar {
+        return;
+    }
+    let mut owners: HashMap<(String, String), (String, String, u16)> = HashMap::new();
+    for service in &mesh_slice.services {
+        for service_port in service_http_family_ports(service) {
+            owners.insert(
+                (
+                    service.namespace.clone(),
+                    mesh_outbound_upstream_id(&service.namespace, &service.name, service_port.port),
+                ),
+                (
+                    service.namespace.clone(),
+                    service.name.clone(),
+                    service_port.port,
+                ),
+            );
+        }
+    }
+    let carried: HashSet<(String, String)> = config
+        .proxies
+        .iter()
+        .filter(|proxy| config::is_virtual_service_http_route_proxy_id(&proxy.id))
+        .map(|proxy| (proxy.namespace.clone(), proxy.id.clone()))
+        .collect();
+    if carried.is_empty() {
+        return;
+    }
+    // (namespace, Service upstream id, stamp host)
+    let mut needed: BTreeSet<(String, String, bool)> = BTreeSet::new();
+    let mut redirect = |namespace: &str, id: &mut String, stamp_host: bool| {
+        if owners.contains_key(&(namespace.to_string(), id.clone())) {
+            needed.insert((namespace.to_string(), id.clone(), stamp_host));
+            *id = sidecar_carried_destination_upstream_id(id, stamp_host);
+        }
+    };
+    for proxy in &mut config.proxies {
+        if !carried.contains(&(proxy.namespace.clone(), proxy.id.clone())) {
+            continue;
+        }
+        if let Some(upstream_id) = proxy.upstream_id.as_mut() {
+            redirect(&proxy.namespace, upstream_id, true);
+        }
+    }
+    for plugin in &mut config.plugin_configs {
+        if plugin.plugin_name != "mesh_route_dispatch"
+            || !plugin.proxy_id.as_ref().is_some_and(|proxy_id| {
+                carried.contains(&(plugin.namespace.clone(), proxy_id.clone()))
+            })
+        {
+            continue;
+        }
+        let namespace = plugin.namespace.clone();
+        if let Some(rules) = plugin
+            .config
+            .get_mut("rules")
+            .and_then(serde_json::Value::as_array_mut)
+        {
+            for rule in rules {
+                let rewrites_authority = rule
+                    .get("rewrite")
+                    .and_then(|rewrite| rewrite.get("authority"))
+                    .is_some_and(serde_json::Value::is_string);
+                if let Some(serde_json::Value::String(upstream_id)) = rule
+                    .get_mut("destination")
+                    .and_then(|destination| destination.get_mut("upstream_id"))
+                {
+                    redirect(&namespace, upstream_id, !rewrites_authority);
+                }
+            }
+        }
+        if let Some(splits) = plugin
+            .config
+            .get_mut("weighted_splits")
+            .and_then(serde_json::Value::as_array_mut)
+        {
+            for split in splits {
+                for leg in split
+                    .get_mut("legs")
+                    .and_then(serde_json::Value::as_array_mut)
+                    .into_iter()
+                    .flatten()
+                {
+                    if let Some(serde_json::Value::String(upstream_id)) = leg.get_mut("upstream_id")
+                    {
+                        redirect(&namespace, upstream_id, true);
+                    }
+                }
+            }
+        }
+    }
+    for (namespace, service_upstream_id, stamp_host) in needed {
+        let Some((service_namespace, service_name, service_port)) =
+            owners.get(&(namespace.clone(), service_upstream_id.clone()))
+        else {
+            continue;
+        };
+        let clone_id = sidecar_carried_destination_upstream_id(&service_upstream_id, stamp_host);
+        if config
+            .upstreams
+            .iter()
+            .any(|upstream| upstream.namespace == namespace && upstream.id == clone_id)
+        {
+            continue;
+        }
+        let Some(service_upstream) = config
+            .upstreams
+            .iter()
+            .find(|upstream| upstream.namespace == namespace && upstream.id == service_upstream_id)
+        else {
+            continue;
+        };
+        let mut clone = service_upstream.clone();
+        clone.id = clone_id.clone();
+        // A distinct name: upstream names are unique per namespace, and
+        // DestinationRules have already been applied by host.
+        clone.name = Some(clone_id);
+        for target in &mut clone.targets {
+            stamp_sidecar_destination_authority(
+                target,
+                service_namespace,
+                service_name,
+                *service_port,
+                stamp_host,
+            );
+        }
+        config.upstreams.push(clone);
+    }
+}
+
+/// Resolve `match.source_namespace` on the carried VirtualService routes a
+/// Sidecar serves (issue #7423).
+///
+/// `mesh_route_dispatch` judges `source_namespace` against the peer SVID, but
+/// a Sidecar serves carried routes only on its outbound capture listener,
+/// where the peer is the co-located application over plaintext and has no
+/// SVID: the predicate could never match. The source of every request there
+/// is this Sidecar's own workload, so the predicate is decided here from the
+/// trusted local workload (the same evidence `materialize_sidecar_l4_source_selectors`
+/// uses for L4 routes): a rule naming the local namespace drops the predicate
+/// (keeping its other predicates, or matching every path when it had none),
+/// and any other rule, or every such rule when the local workload is not
+/// unambiguously resolved, is removed, fail-closed. Rule order is kept. A
+/// route left with no dispatch rule applies to no request from this workload,
+/// so it is returned (`(namespace, proxy id)`) for the binding to refuse; its
+/// host then keeps the Service route.
+fn resolve_sidecar_carried_route_source_namespaces(
+    config: &mut GatewayConfig,
+    runtime: &MeshRuntimeConfig,
+    mesh_slice: &MeshSlice,
+) -> HashSet<(String, String)> {
+    let local_namespace = authoritative_sidecar_l4_source(runtime, mesh_slice)
+        .map(|source| source.namespace.to_string());
+    let mut removed = 0usize;
+    let mut emptied: HashSet<(String, String)> = HashSet::new();
+    for plugin in &mut config.plugin_configs {
+        if plugin.plugin_name != "mesh_route_dispatch"
+            || !plugin
+                .proxy_id
+                .as_deref()
+                .is_some_and(config::is_virtual_service_http_route_proxy_id)
+        {
+            continue;
+        }
+        let Some(rules) = plugin
+            .config
+            .get_mut("rules")
+            .and_then(serde_json::Value::as_array_mut)
+        else {
+            continue;
+        };
+        let before = rules.len();
+        rules.retain_mut(|rule| {
+            let Some(criteria) = rule
+                .get_mut("match")
+                .and_then(serde_json::Value::as_object_mut)
+            else {
+                return true;
+            };
+            let Some(expected) = criteria.get("source_namespace") else {
+                return true;
+            };
+            let applies = local_namespace
+                .as_deref()
+                .is_some_and(|local| expected.as_str() == Some(local));
+            if !applies {
+                removed += 1;
+                return false;
+            }
+            criteria.remove("source_namespace");
+            if criteria.is_empty() {
+                criteria.insert("uri".to_string(), serde_json::json!({ "prefix": "/" }));
+            }
+            true
+        });
+        if before > 0
+            && rules.is_empty()
+            && let Some(proxy_id) = plugin.proxy_id.clone()
+        {
+            emptied.insert((plugin.namespace.clone(), proxy_id));
+        }
+    }
+    if removed > 0 {
+        debug!(
+            removed,
+            "Sidecar VirtualService dispatch rules whose sourceNamespace does not name the local \
+             workload's namespace were removed"
+        );
+    }
+    emptied
+}
+
+/// The hosts a carried route answers once
+/// [`expand_carried_route_service_hosts`] has run: its declared hosts plus
+/// every host spelling of each modeled Service it declares. Over-approximates
+/// (it ignores spellings another carried route keeps), which only refuses
+/// more on a conflict check.
+fn carried_route_claimed_hosts(
+    proxy: &Proxy,
+    hosts: &CarriedRouteHostIndex,
+    cluster_domain: &str,
+) -> Vec<String> {
+    let mut claimed = proxy.hosts.clone();
+    for host in &proxy.hosts {
+        if let CarriedRouteHost::Service(namespace, name) = hosts.classify(&proxy.namespace, host) {
+            for variant in mesh_service_host_variants(&name, &namespace, cluster_domain) {
+                if !variant.contains('.') && namespace != proxy.namespace {
+                    continue;
+                }
+                claimed.push(variant);
+            }
+        }
+    }
+    claimed
 }
 
 /// A leg-dispatched split's legs: `(leg upstream id, weight)` (issue #7387).
@@ -6932,6 +7414,30 @@ pub(crate) fn mesh_route_direction(id: &str) -> Option<MeshTrafficDirection> {
     }
 }
 
+/// Whether a route may serve a request accepted on a listener of direction
+/// `request_direction` (`None` = a non-mesh listener).
+///
+/// A direction-scoped mesh route ([`mesh_route_direction`]) serves only its
+/// own direction. A carried VirtualService HTTP route (issues #7233, #7423)
+/// is CLIENT-side routing: it serves the outbound capture leg (Sidecar
+/// `:15001`, the NodeWaypoint capture backend) and never an INBOUND mesh
+/// listener. Served there, a peer (or, under PERMISSIVE, a plaintext client)
+/// could name a routed host and have this proxy dial it onward with its own
+/// mesh identity. Gateway-bound VirtualService routes share the id space and
+/// keep serving non-mesh listeners. Every other route is unscoped.
+pub(crate) fn mesh_route_admitted_for_direction(
+    id: &str,
+    request_direction: Option<MeshTrafficDirection>,
+) -> bool {
+    match mesh_route_direction(id) {
+        Some(route_direction) => request_direction == Some(route_direction),
+        None => {
+            request_direction != Some(MeshTrafficDirection::Inbound)
+                || !config::is_virtual_service_http_route_proxy_id(id)
+        }
+    }
+}
+
 fn mesh_outbound_proxy_id(namespace: &str, name: &str, port: u16) -> String {
     format!("{MESH_OUTBOUND_PROXY_ID_PREFIX}{namespace}-{name}-{port}").replace(['/', '.'], "-")
 }
@@ -7824,9 +8330,13 @@ fn materialize_sidecar_inbound_proxies(
                 // but ONLY its own: another local service's inbound route on an
                 // overlapping bare-name host variant still wins first-materialized,
                 // exactly as before per-port siblings existed.
+                // A carried VirtualService route (issue #7423) never claims a
+                // local inbound slot: it is outbound-only, and the route binding
+                // refuses one that collides with the inbound route kept here.
                 if config.proxies.iter().any(|p| {
                     if (p.namespace == service.namespace && sibling_ids.contains(p.id.as_str()))
                         || p.dispatch_kind.is_stream()
+                        || config::is_virtual_service_http_route_proxy_id(&p.id)
                     {
                         return false;
                     }
@@ -8401,9 +8911,12 @@ fn materialize_sidecar_ingress_listener_proxies(
         // exactly like the default inbound path. Exclude this workload's OWN
         // ingress siblings (grouped by the router); another proxy still wins
         // first-materialized.
+        // Carried VirtualService routes never claim an inbound slot (issue
+        // #7423); see the default inbound path.
         if config.proxies.iter().any(|p| {
             if (p.namespace == listener.owner_namespace && sibling_ids.contains(p.id.as_str()))
                 || p.dispatch_kind.is_stream()
+                || config::is_virtual_service_http_route_proxy_id(&p.id)
             {
                 return false;
             }
@@ -9169,6 +9682,12 @@ fn materialize_mesh_outbound_proxies(
     // `Some(local_cluster)`, or a cluster the config does not list as remote;
     // a remote one carries a configured remote cluster's name.
     let multi_cluster = mesh_slice.multi_cluster.as_ref();
+    // Whether this config serves carried VirtualService routes (issue #7423):
+    // a Sidecar then keeps every Service upstream a carried route may dial.
+    let carries_http_routes = config
+        .proxies
+        .iter()
+        .any(|proxy| config::is_virtual_service_http_route_proxy_id(&proxy.id));
     let mut materialized = 0usize;
     for service in &mesh_slice.services {
         // HTTP-family routability is read from the SERVICE port protocol
@@ -9250,26 +9769,38 @@ fn materialize_mesh_outbound_proxies(
             // (not its route): the VirtualService routes its slice carries are
             // rebound onto these secured per-workload targets
             // (`bind_carried_http_routes_to_node_waypoint_transport`, #7233).
-            let shadowed = config.proxies.iter().any(|p| {
+            // A Sidecar does the same whenever it carries VirtualService
+            // routes (issue #7423): a carried route can name a Service whose
+            // own route yields to a carried route or to the local inbound
+            // route, and it still needs that Service's secured upstream.
+            let mut shadowed = false;
+            for p in &config.proxies {
                 if (p.namespace == proxy.namespace && p.id == proxy.id)
                     || p.dispatch_kind.is_stream()
                     || is_mesh_outbound_route_id(&p.id)
                 {
-                    return false;
+                    continue;
                 }
                 let shadows_or_collides = p.listen_path == proxy.listen_path
                     || p.listen_path.is_none()
                     || p.listen_path
                         .as_deref()
                         .is_some_and(|lp| lp.starts_with('~'));
-                shadows_or_collides && crate::config::types::hosts_overlap(&p.hosts, &proxy.hosts)
-            });
+                if shadows_or_collides
+                    && crate::config::types::hosts_overlap(&p.hosts, &proxy.hosts)
+                {
+                    shadowed = true;
+                    break;
+                }
+            }
             if shadowed {
                 debug!(
                     proxy_id = %sanitize_startup_scalar(proxy.id.to_string()),
                     "Skipping outbound route materialization; an existing operator proxy already routes this host/path"
                 );
-                if transport != MeshEgressTransport::NodeWaypointCapturedService {
+                let keep_upstream = transport == MeshEgressTransport::NodeWaypointCapturedService
+                    || (transport == MeshEgressTransport::SidecarMtls && carries_http_routes);
+                if !keep_upstream {
                     continue;
                 }
             }
@@ -13019,8 +13550,8 @@ pub(crate) fn apply_destination_rules_with_tenant_file_roots(
 }
 
 /// Let the DestinationRule drive the backend scheme of every external
-/// weighted-split leg a NodeWaypoint carried route dispatches (issue #7387,
-/// Istio semantics).
+/// weighted-split leg a NodeWaypoint or Sidecar carried route dispatches
+/// (issues #7387, #7423, Istio semantics).
 ///
 /// A leg-dispatched split sends each external host through its own residual
 /// upstream (`<split>-external-<n>`, one target), where that host's
@@ -13037,7 +13568,7 @@ fn project_node_waypoint_leg_origination(
     runtime: &MeshRuntimeConfig,
     applied: &HashMap<usize, AppliedClientTlsModes>,
 ) {
-    if runtime.topology != MeshTopology::NodeWaypoint || applied.is_empty() {
+    if !runtime.topology.serves_virtual_service_http_routes() || applied.is_empty() {
         return;
     }
     let originating: HashSet<(String, String)> = applied
@@ -31111,6 +31642,29 @@ mod tests {
         assert!(!runtime.native_client_config().node_waypoint_capture_scoping);
         assert!(!runtime.xds_client_config().node_waypoint_capture_scoping);
         assert!(!runtime.mesh_slice_request().node_waypoint_capture_scoping);
+
+        // Issue #7423: only a Sidecar asks the CP to carry VirtualService
+        // `http[]` routes on its own flag (a NodeWaypoint gets them through
+        // its capture scoping); Ambient and ServiceWaypoint ask for none.
+        for (topology, expected) in [
+            (MeshTopology::Sidecar, true),
+            (MeshTopology::Ambient, false),
+            (MeshTopology::NodeWaypoint, false),
+            (MeshTopology::ServiceWaypoint, false),
+        ] {
+            let mut scoped = runtime.clone();
+            scoped.topology = topology;
+            assert_eq!(scoped.native_client_config().sidecar_http_routes, expected);
+            assert_eq!(scoped.xds_client_config().sidecar_http_routes, expected);
+            assert_eq!(scoped.mesh_slice_request().sidecar_http_routes, expected);
+            assert_eq!(
+                scoped
+                    .native_client_config()
+                    .subscribe_request("test")
+                    .sidecar_http_routes,
+                expected
+            );
+        }
 
         let mut config = GatewayConfig::default();
         inject_mesh_global_plugins(&mut config, &runtime, &MeshSlice::default());

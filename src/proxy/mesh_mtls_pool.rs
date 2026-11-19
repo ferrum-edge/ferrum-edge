@@ -76,16 +76,22 @@ pub const ISTIO_SIDECAR_INBOUND_PORT: u16 = 15006;
 /// byte-for-byte.
 pub const MESH_MTLS_AUTHORITY_PORT_TAG: &str = "mesh.mtls_authority_port";
 /// Tag carrying the destination MESH SERVICE host a Sidecar target's request
-/// `:authority` must name. Stamped ONLY by `sidecar`-topology mesh service
-/// discovery (the gateway-to-mesh bridge): a north-south gateway's client
+/// `:authority` must name. Stamped by `sidecar`-topology mesh service
+/// discovery (the gateway-to-mesh bridge) and for carried VirtualService
+/// destinations (below): a north-south gateway's client
 /// `Host` is typically a public hostname (and without `preserve_host_header`
 /// the authority falls back to the pod dial address), neither of which the
 /// destination sidecar's materialized inbound routes match — so dispatch
 /// forces this service host (`<service>.<namespace>.svc`, one of the
 /// destination's registered host variants) as the `:authority` instead. The
-/// original client `Host` still rides `x-forwarded-host`. Mesh-mode egress
-/// never stamps this tag: its outbound routes are host-routed by the service
-/// name, so the client authority is already the routing key the peer matches.
+/// original client `Host` still rides `x-forwarded-host`. Mesh-mode Sidecar
+/// egress stamps it only on the route-scoped upstream clones and split-leg
+/// targets carried VirtualService routes dial (issue #7423): such a route does
+/// not preserve the client `Host`, and on a split or dispatch branch that
+/// `Host` names the VirtualService host rather than the selected Service.
+/// The shared Service upstreams are never stamped: plain Service routes are
+/// host-routed by the service name, so the client authority is already the
+/// routing key the peer matches.
 pub const MESH_MTLS_AUTHORITY_HOST_TAG: &str = "mesh.mtls_authority_host";
 /// Outer network dial host for a Sidecar cross-cluster L4 tunnel. The target's
 /// `host` remains a scoped synthetic workload identity for LB/health maps while

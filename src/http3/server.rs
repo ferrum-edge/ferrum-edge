@@ -4025,8 +4025,10 @@ async fn handle_h3_request(
     // routes so an H3 request is never shortcut to a loopback/HBONE mesh route.
     let route_match = match route_match {
         Some(rm)
-            if crate::modes::mesh::mesh_route_direction(&rm.proxy.id)
-                .is_some_and(|route_dir| Some(route_dir) != ctx.mesh_direction) =>
+            if !crate::modes::mesh::mesh_route_admitted_for_direction(
+                &rm.proxy.id,
+                ctx.mesh_direction,
+            ) =>
         {
             state
                 .router_cache

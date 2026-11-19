@@ -430,7 +430,8 @@ impl XdsAdsServer {
         .with_sidecar_egress_dry_run(self.sidecar_enforced_dry_run)
         .with_enforce_sidecar_identity_narrowing(self.sidecar_identity_narrowing)
         .with_ambient_udp_source_scoping(scoping.ambient_udp_source_scoping)
-        .with_node_waypoint_capture_scoping(scoping.node_waypoint_capture_scoping);
+        .with_node_waypoint_capture_scoping(scoping.node_waypoint_capture_scoping)
+        .with_sidecar_http_routes(scoping.sidecar_http_routes);
         CpGrpcServer::filter_config_to_mesh_request_for_scope_and_bearer(
             config,
             &request,
@@ -568,7 +569,8 @@ impl XdsAdsServer {
             .with_sidecar_egress_dry_run(self.sidecar_enforced_dry_run)
             .with_enforce_sidecar_identity_narrowing(self.sidecar_identity_narrowing)
             .with_ambient_udp_source_scoping(scoping.ambient_udp_source_scoping)
-            .with_node_waypoint_capture_scoping(scoping.node_waypoint_capture_scoping);
+            .with_node_waypoint_capture_scoping(scoping.node_waypoint_capture_scoping)
+            .with_sidecar_http_routes(scoping.sidecar_http_routes);
         let mut config = config.clone();
         config.normalize_fields();
         config.normalize_mesh_fields();
@@ -3171,6 +3173,7 @@ mod tests {
         let scoping = XdsNodeScoping {
             ambient_udp_source_scoping: false,
             node_waypoint_capture_scoping: true,
+            sidecar_http_routes: false,
         };
         let capture_carriers = |server: &XdsAdsServer| {
             server
@@ -3298,6 +3301,7 @@ mod tests {
                 XdsNodeScoping {
                     ambient_udp_source_scoping: false,
                     node_waypoint_capture_scoping: true,
+                    sidecar_http_routes: false,
                 },
             ),
         };
@@ -3502,6 +3506,7 @@ mod tests {
                 waypoint_name: Some("waypoint".to_string()),
                 ambient_udp_source_scoping: false,
                 node_waypoint_capture_scoping: false,
+                sidecar_http_routes: false,
             },
         ));
         assert!(server.waypoint_names.get(&tenant_key).is_some());
@@ -3585,6 +3590,7 @@ mod tests {
             XdsNodeScoping {
                 ambient_udp_source_scoping: true,
                 node_waypoint_capture_scoping: false,
+                sidecar_http_routes: false,
             },
         );
         let bearer_restricted = bearer_restricted_server.filter_config_for_xds_request(
@@ -3594,6 +3600,7 @@ mod tests {
             XdsNodeScoping {
                 ambient_udp_source_scoping: true,
                 node_waypoint_capture_scoping: false,
+                sidecar_http_routes: false,
             },
         );
         let bearer_multi_namespace = bearer_multi_namespace_server.filter_config_for_xds_request(
@@ -3603,6 +3610,7 @@ mod tests {
             XdsNodeScoping {
                 ambient_udp_source_scoping: true,
                 node_waypoint_capture_scoping: false,
+                sidecar_http_routes: false,
             },
         );
 
@@ -3660,6 +3668,7 @@ mod tests {
                 waypoint_name: Some("waypoint".to_string()),
                 ambient_udp_source_scoping: false,
                 node_waypoint_capture_scoping: false,
+                sidecar_http_routes: false,
             },
         );
         let snapshot =

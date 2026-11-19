@@ -32,7 +32,7 @@ Ferrum Edge is a lightweight, extensible edge proxy designed for modern microser
 - **Service mesh**: Six topologies (sidecar, ambient, **Experimental** node waypoint, service waypoint, east-west gateway, egress), native MeshSubscribe, xDS ADS, or localized file config consumption, SPIFFE identity, HBONE, transparent DNS proxy, mesh authorization, REGISTRY_ONLY outbound policy, and Istio/GAMMA RED metrics. See [docs/mesh.md](docs/mesh.md)
 - **Runtime observability**: JWT-gated `/metrics/runtime` JSON snapshot with system/process state, HTTP status windows, error classes, DNS outcomes, backend pool churn, TCP resets, log counters, and overload state
 - **Operable alerts**: the `ferrum-gateway` chart ships Prometheus alerts and Grafana dashboards, and every alert links a first-response procedure in [docs/runbooks/gateway.md](docs/runbooks/gateway.md)
-- **Kubernetes mesh translation**: Gateway API and Istio VirtualService route splits (on gateways and the NodeWaypoint data plane; Sidecar, Ambient and ServiceWaypoint data planes do not apply VirtualService `http[]` routes), Istio AuthorizationPolicy/RequestAuthentication/PeerAuthentication, and sidecar injection webhook
+- **Kubernetes mesh translation**: Gateway API and Istio VirtualService route splits (on gateways and the Sidecar and NodeWaypoint data planes; Ambient and ServiceWaypoint data planes do not apply VirtualService `http[]` routes), Istio AuthorizationPolicy/RequestAuthentication/PeerAuthentication, and sidecar injection webhook
 
 For the full feature list, see [FEATURES.md](FEATURES.md).
 
