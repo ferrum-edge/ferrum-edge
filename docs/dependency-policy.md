@@ -221,7 +221,10 @@ before the stable-release checkpoint below.
   owner for `vendor/`, `deny.toml`, this doc, `docs/upstream-*-patches/`, and
   the vendored-patch scripts.
 - **Review cadence (SLA).** Every weekly `dependency-audit` run lists each
-  fork-only patch as `NOT YET FILED`. At each run the owner either (a) files the
+  fork-only patch: one with a dated re-affirmation (see the checkpoint below)
+  prints that record, and every other one is labelled `NOT YET FILED` with a
+  warning. Either way the patch stays `deliberate_fork_unfiled` and in the
+  deliberate-fork list above. At each run the owner either (a) files the
   upstream issue/PR and records the numbers in the inventory table, the per-patch
   `README.md` Status block, **and**
   [`docs/vendored-patch-lifecycle.json`](vendored-patch-lifecycle.json), or (b) leaves it as a conscious
