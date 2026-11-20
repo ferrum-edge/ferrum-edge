@@ -4287,18 +4287,22 @@ pub(crate) fn mesh_route_dispatch_can_emit_rule(entry: &Value) -> bool {
         && !mesh_route_dispatch_has_unsupported_predicate(entry)
 }
 
+/// The largest whole-second value an Istio duration can project to.
+///
+/// `parse_istio_duration_ms` saturates at `u64::MAX` milliseconds. The
+/// translator rounds that up to seconds (`parse_istio_duration_secs` in
+/// `istio.rs`), for example for a VirtualService `corsPolicy.maxAge`. Mesh
+/// slice decode refuses a carried value above it (issue #7440). A change to
+/// the parser's saturation point must update this constant; the istio.rs test
+/// `istio_duration_secs_max_is_the_largest_projected_value` pins the two
+/// together.
+pub(crate) const ISTIO_DURATION_SECS_MAX: u64 = u64::MAX.div_ceil(1000);
+
 /// Parse an Istio duration string to milliseconds. Supports the same suffix
 /// set as Go's `time.ParseDuration` (`ns`, `us`, `ms`, `s`, `m`, `h`); Istio's
 /// CRDs expose this format via `google.protobuf.Duration`'s string form
 /// (e.g., `"5s"`, `"500ms"`, `"30m"`, `"1.5h"`). Positive sub-millisecond
 /// inputs round up to 1 ms so duration-based policy fields do not disappear.
-/// The largest whole-second value an Istio duration can project to:
-/// `parse_istio_duration_ms` saturates at `u64::MAX` milliseconds, and the
-/// translator rounds up to seconds (`parse_istio_duration_secs` in
-/// `istio.rs`, e.g. a VirtualService `corsPolicy.maxAge`). Mesh slice decode
-/// refuses a carried value above it (issue #7440).
-pub(crate) const ISTIO_DURATION_SECS_MAX: u64 = u64::MAX.div_ceil(1000);
-
 pub(crate) fn parse_istio_duration_ms(duration: &str) -> Option<u64> {
     let trimmed = duration.trim();
     // 2-char suffixes first so they aren't shadowed by the trailing `s` or `m`.

@@ -4671,6 +4671,8 @@ fn carried_route_plugin_record_is_translator_shaped(
 ///   - `max_age` is an unsigned integer no larger than
 ///     `ISTIO_DURATION_SECS_MAX`, the largest `parse_istio_duration_secs`
 ///     output.
+///   - The origin list stays within the plugin's matcher-count and
+///     per-matcher byte bounds, checked before any regex is compiled.
 ///   - Credentials are never combined with a non-strict origin (exact `*`,
 ///     opaque `null`, an effectively universal prefix or regex). This is the
 ///     same `allowed_origin_entry_is_non_strict` rule as the translator's
@@ -4741,13 +4743,25 @@ fn carried_route_plugin_body_is_translator_shaped(
                 .get("allowed_origins")
                 .and_then(Value::as_array)
                 .is_some_and(|origins| {
+                    // The plugin's own matcher-count and per-matcher byte
+                    // bounds come first, before anything below compiles a
+                    // regex (the credentialed-origin check does), so regex
+                    // work stays within the plugin's budget.
                     !origins.is_empty()
+                        && crate::plugins::cors::validate_origin_matcher_count(origins.len())
+                            .is_ok()
                         && origins.iter().all(|origin| {
                             origin.as_object().is_some_and(|matcher| {
                                 matcher.len() == 1
                                     && matcher.iter().all(|(operator, value)| {
                                         matches!(operator.as_str(), "exact" | "prefix" | "regex")
-                                            && value.is_string()
+                                            && value.as_str().is_some_and(|value| {
+                                                crate::plugins::cors::validate_origin_matcher_len(
+                                                    "`allowed_origins` matcher",
+                                                    value,
+                                                )
+                                                .is_ok()
+                                            })
                                     })
                             })
                         })
