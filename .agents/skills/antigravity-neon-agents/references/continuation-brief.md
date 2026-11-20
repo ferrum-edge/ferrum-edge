@@ -1,4 +1,4 @@
-# Ferrum Edge Grok continuation brief
+# Ferrum Edge Antigravity Neon continuation brief
 
 Resume the existing worktree and branch named in the dispatch prompt. Follow every rule in
 `agent-brief.md`, especially isolation, direct implementation, the
@@ -14,12 +14,11 @@ inspection are allowed. Report pending CI honestly and preserve the assigned sto
 
 Complete the assigned continuation work and validation yourself in this session. Do not stop at
 partial work or hand unfinished implementation back to the controller. Perform commit, push, PR,
-review handling, and CI repair actions only when the dispatch prompt assigns them. Do not invoke
-any agent-dispatch skill or script, including `astra-agents`, `sol-agents`, `luna-agents`,
-`opus-agents`, `fable-5-1-agents`, `grok-agents`, `muse-agents`, `composer-agents`, `qwen-agents`,
-`deepseek-pro-agents`, `deepseek-flash-agents`, `opencode-laguna-agents`,
-`.agents/skills/*/scripts/dispatch-agent.sh`, Codex CLI workers, or Claude CLI workers. Do not
-spawn nested workers. The orchestrator selected this model deliberately.
+review handling, and CI repair actions only when the dispatch prompt assigns them. Do not invoke any
+agent-dispatch skill or script, including `astra-agents`, `sol-agents`, `opus-agents`,
+`muse-agents`, `qwen-agents`, `deepseek-flash-agents`, `antigravity-neon-agents`,
+`.agents/skills/*/scripts/dispatch-agent.sh`, Codex CLI workers, or Claude CLI workers. Do not spawn
+nested workers. The orchestrator selected this model deliberately.
 
 ## Reconstruct state before editing
 
