@@ -598,11 +598,17 @@ async fn bound_loopback_socket_handle() -> Option<(
     tokio::net::TcpStream,
     Arc<crate::proxy::backend_send_queue::BackendSocketHandle>,
 )> {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.ok()?;
-    let addr = listener.local_addr().ok()?;
-    let stream = tokio::net::TcpStream::connect(addr).await.ok()?;
-    let handle = crate::proxy::backend_send_queue::BackendSocketHandle::duplicate_from(&stream)?;
-    Some((listener, stream, handle))
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind loopback listener for upload_pump test");
+    let addr = listener.local_addr().expect("loopback listener addr");
+    let stream = tokio::net::TcpStream::connect(addr)
+        .await
+        .expect("connect loopback stream for upload_pump test");
+    let handle = crate::proxy::backend_send_queue::BackendSocketHandle::duplicate_from(&stream);
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    let handle = Some(handle.expect("send_queue_probe must be supported on Linux/macOS"));
+    Some((listener, stream, handle?))
 }
 
 #[cfg(unix)]
@@ -720,4 +726,177 @@ async fn prime_inline_unpolled_source_drop_does_not_hang() {
         .await
         .expect("join must not hang when unpolled empty source is dropped");
     assert_eq!(empty_outcome, Some(UploadPumpOutcome::Completed));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn prime_inline_empty_body_parks_on_write_armed_with_real_waker_and_wakes_on_arm_or_drop() {
+    let Some((_listener, _stream, socket)) = bound_loopback_socket_handle().await else {
+        return;
+    };
+
+    // Case A: real-waker waiter parks on `wait_write_armed()` until `source`
+    // is dropped unpolled, then wakes and completes immediately.
+    let (source_a, mut join_a) =
+        spawn_upload_pump(http_body_util::Full::new(Bytes::new()), None, 5_000, false);
+    join_a.bind_backend_socket(Some(socket.clone()));
+    join_a.prime_inline();
+    let waiter_a = tokio::spawn(async move { join_a.join().await });
+    tokio::task::yield_now().await;
+    tokio::task::yield_now().await;
+    assert!(
+        !waiter_a.is_finished(),
+        "primed empty pump must remain parked on wait_write_armed with a real waker"
+    );
+    drop(source_a);
+    let outcome_a = tokio::time::timeout(Duration::from_secs(1), waiter_a)
+        .await
+        .expect("unpolled source drop must wake real-waker waiter")
+        .expect("join task");
+    assert_eq!(outcome_a, Some(UploadPumpOutcome::Completed));
+
+    // Case B: real-waker waiter parks on `wait_write_armed()`, polling
+    // `source` arms `write_armed` and hands off to post-EOS drain watch,
+    // and disarming settles it cleanly.
+    let (mut source_b, mut join_b) =
+        spawn_upload_pump(http_body_util::Full::new(Bytes::new()), None, 5_000, false);
+    join_b.bind_backend_socket(Some(socket));
+    join_b.prime_inline();
+    let shared_b = Arc::clone(&source_b.shared);
+    let waiter_b = tokio::spawn(async move { join_b.join().await });
+    tokio::task::yield_now().await;
+    tokio::task::yield_now().await;
+    assert!(!waiter_b.is_finished());
+
+    let mut cx = Context::from_waker(std::task::Waker::noop());
+    assert!(matches!(source_b.poll_frame(&mut cx), Poll::Ready(None)));
+    assert!(shared_b.is_write_armed());
+    drop(source_b);
+    tokio::task::yield_now().await;
+    // Still parked in post-EOS drain watch until disarmed.
+    assert!(!waiter_b.is_finished());
+    shared_b.disarm_post_eos_drain();
+    let outcome_b = tokio::time::timeout(Duration::from_secs(1), waiter_b)
+        .await
+        .expect("disarming post-EOS drain must wake waiter")
+        .expect("join task");
+    assert_eq!(outcome_b, Some(UploadPumpOutcome::Completed));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn buffered_watcher_preserves_write_armed_when_direct_done_races_before_first_poll() {
+    let Some((_listener, _stream, socket)) = bound_loopback_socket_handle().await else {
+        return;
+    };
+    let (mut body, mut join) =
+        super::spawn_buffered_upload_pump(Bytes::from_static(b"buffered-payload"), 5_000)
+            .expect("buffered pump installed");
+    join.bind_backend_socket(Some(socket));
+
+    // Transport synchronously arms `write_armed`, consumes the sole slice,
+    // and marks `DIRECT_DONE` before the watcher ever polls once.
+    let mut cx = Context::from_waker(std::task::Waker::noop());
+    let frame = match http_body::Body::poll_frame(Pin::new(&mut body), &mut cx) {
+        Poll::Ready(Some(Ok(frame))) => frame,
+        other => panic!("expected buffered slice synchronously, got {other:?}"),
+    };
+    assert_eq!(frame.data_ref().unwrap().as_ref(), b"buffered-payload");
+    assert!(http_body::Body::is_end_stream(&body));
+    drop(body);
+
+    // Watcher must observe `write_armed == true` and stay in post-EOS drain
+    // watch rather than skipping `#4411`, then settle inline once disarmed.
+    assert!(
+        !join.settle_inline(),
+        "buffered watcher must enter post-EOS drain watch after concurrent arm + DIRECT_DONE"
+    );
+    join.disarm_post_eos_drain();
+    join.detach_if_live();
+    assert_eq!(join.runs_on_own_task(), None);
+    assert_eq!(join.join().await, Some(UploadPumpOutcome::Completed));
+}
+
+#[tokio::test]
+async fn fast_reserve_path_yields_on_coop_budget_for_ready_multi_frame_upload() {
+    // Drain the 1-slot bridge from a dedicated OS thread so `sender.try_reserve()`
+    // succeeds repeatedly on the fast path. Even when the consumer keeps pace,
+    // `tokio::task::coop::consume_budget().await` must force the inline pump to
+    // return `Pending` before relaying all 512 frames in a single poll.
+    struct PacedReadyBody {
+        remaining: usize,
+        relayed: Arc<AtomicUsize>,
+        consumed: Arc<AtomicUsize>,
+    }
+    impl http_body::Body for PacedReadyBody {
+        type Data = Bytes;
+        type Error = std::convert::Infallible;
+        fn poll_frame(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Option<Result<Frame<Bytes>, Self::Error>>> {
+            if self.remaining == 0 {
+                return Poll::Ready(None);
+            }
+            // Wait briefly for the consumer thread to pop the previous frame so
+            // the NEXT loop iteration hits `sender.try_reserve() == Ok`.
+            let sent = self.relayed.load(Ordering::Acquire);
+            while self.consumed.load(Ordering::Acquire) < sent {
+                std::hint::spin_loop();
+            }
+            self.remaining -= 1;
+            self.relayed.fetch_add(1, Ordering::AcqRel);
+            Poll::Ready(Some(Ok(Frame::data(Bytes::from_static(b"x")))))
+        }
+    }
+
+    let relayed = Arc::new(AtomicUsize::new(0));
+    let consumed = Arc::new(AtomicUsize::new(0));
+    let body = PacedReadyBody {
+        remaining: 512,
+        relayed: Arc::clone(&relayed),
+        consumed: Arc::clone(&consumed),
+    };
+    let (mut source, join) = spawn_upload_pump(body, None, 5_000, false);
+
+    let consumed_bg = Arc::clone(&consumed);
+    let drainer = std::thread::spawn(move || {
+        let mut noop_cx = Context::from_waker(std::task::Waker::noop());
+        loop {
+            match source.poll_frame(&mut noop_cx) {
+                Poll::Ready(Some(Ok(_))) => {
+                    consumed_bg.fetch_add(1, Ordering::AcqRel);
+                }
+                Poll::Ready(None) => break,
+                Poll::Ready(Some(Err(err))) => panic!("unexpected pump error: {err}"),
+                Poll::Pending => std::thread::yield_now(),
+            }
+        }
+    });
+
+    // A single poll of the inline pump inside a task with default coop budget
+    // (128) must yield before relaying all 512 frames.
+    let mut yielded_early = false;
+    let outcome = tokio::spawn(async move {
+        let mut fut = Box::pin(join.join());
+        std::future::poll_fn(|cx| match fut.as_mut().poll(cx) {
+            Poll::Pending => {
+                if relayed.load(Ordering::Acquire) < 512 {
+                    yielded_early = true;
+                }
+                Poll::Pending
+            }
+            Poll::Ready(res) => Poll::Ready((res, yielded_early)),
+        })
+        .await
+    })
+    .await
+    .expect("pump task");
+
+    drainer.join().expect("drainer thread");
+    assert_eq!(outcome.0, Some(UploadPumpOutcome::Completed));
+    assert!(
+        outcome.1,
+        "fast try_reserve path must yield via Tokio coop budget before all 512 frames finish"
+    );
 }

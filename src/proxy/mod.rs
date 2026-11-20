@@ -56015,14 +56015,26 @@ async fn proxy_to_backend_direct_h1(
     let mut checkout = checkout;
     let mut replayed_idle_race = false;
     let (response, checkout) = loop {
+        if !replayed_idle_race
+            && handoff_bound
+                .at
+                .is_none_or(|at| tokio::time::Instant::now() < at)
+            && let Some(pump) = upload_pump.as_mut()
+        {
+            // Prime any already-buffered client body frame into the bounded
+            // bridge before the final handoff gate so `writev` coalesces
+            // headers and body into a single TLS record / write while a
+            // deadline elapsing during priming still fails closed below.
+            pump.prime_inline();
+        }
         // Fail closed BEFORE the handoff (GHSA-xcg4-wj3x-gjj2).
         // `try_send_request` enqueues the request on the connection task
         // synchronously, before the response wait below is ever polled, and the
         // connection driver can put an enqueued request on the wire before a
         // dropped response future cancels it. A bound that elapsed while the
-        // checkout completed therefore refuses here, with nothing enqueued.
-        // The untouched connection never carried this request, so it goes back
-        // to the idle set.
+        // checkout or priming completed therefore refuses here, with nothing
+        // enqueued. The untouched connection never carried this request, so it
+        // goes back to the idle set.
         checkout = match direct_h1_handoff_gate(handoff_bound, checkout) {
             Ok(checkout) => checkout,
             Err(source) => {
@@ -56043,12 +56055,6 @@ async fn proxy_to_backend_direct_h1(
             }
         };
         let reused = checkout.reused();
-        if !replayed_idle_race && let Some(pump) = upload_pump.as_mut() {
-            // Prime any already-buffered client body frame into the bounded
-            // bridge before hyper serializes the request head so `writev`
-            // coalesces headers and body into a single TLS record / write.
-            pump.prime_inline();
-        }
         let send_fut = checkout.sender.try_send_request(backend_req);
         let send_fut =
             h1_send_release::await_h1_response_or_release(send_fut, checkout, |lease, cx| {
@@ -66587,14 +66593,25 @@ async fn proxy_to_backend_http2(
     // request-side receipt to offer.
     if let Some(pump) = upload_pump.as_mut() {
         pump.bind_backend_socket(sender.backend_socket());
+        // Prime any already-buffered client body frame before the final
+        // handoff gate so HEADERS and the first DATA frame can coalesce while
+        // a deadline elapsing during priming still fails closed below.
+        if grpc_deadline_at.is_none_or(|at| tokio::time::Instant::now() < at)
+            && upload_auth_deadline
+                .as_ref()
+                .is_none_or(|(plan, _, _)| tokio::time::Instant::now() < plan.at)
+        {
+            pump.prime_inline();
+        }
     }
     // Fail closed BEFORE the handoff (GHSA-xcg4-wj3x-gjj2). `send_request`
     // enqueues the request on the connection task synchronously, before the
     // bounded response-header wait below is first polled, and the connection
     // task can open the backend stream before a dropped response future cancels
     // it. A client RPC deadline or authorization lifetime that elapsed while the
-    // sender was acquired therefore refuses here, with nothing enqueued; the
-    // gateway-owned upload pump is joined first, as on every other bounded exit.
+    // sender was acquired or priming ran therefore refuses here, with nothing
+    // enqueued; the gateway-owned upload pump is joined first, as on every
+    // other bounded exit.
     if let Some((source, handoff_dispatch_bound)) =
         direct_h2_handoff_refusal(grpc_deadline_at, upload_auth_deadline.as_ref())
     {
@@ -66612,11 +66629,6 @@ async fn proxy_to_backend_http2(
             ),
             None,
         );
-    }
-    // Prime any already-buffered client body frame before handing the request
-    // to hyper's HTTP/2 sender so HEADERS and the first DATA frame can coalesce.
-    if let Some(pump) = upload_pump.as_mut() {
-        pump.prime_inline();
     }
     // Send to backend with read timeout (0 = no timeout)
     let h2_send_fut = sender.send_request(backend_req);

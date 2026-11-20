@@ -1742,9 +1742,33 @@ where
     let write_idle_dur = Duration::from_millis(write_timeout_ms);
     let write_idle: Option<tokio::time::Sleep> = None;
     tokio::pin!(write_idle);
+    // Register one pinned waiter per sticky flag for the entire pump lifetime
+    // so multi-frame uploads avoid taking `Notify`'s waiter-list mutex on
+    // every relayed frame. `enable()` runs strictly before the flag checks at
+    // the top of the loop, so no concurrent `set_flag` wakeup can be missed.
+    let cancel_notified = shared.cancel_wake.notified();
+    tokio::pin!(cancel_notified);
+    cancel_notified.as_mut().enable();
+    let write_armed_notified = shared.write_armed_wake.notified();
+    tokio::pin!(write_armed_notified);
+    if write_configured {
+        write_armed_notified.as_mut().enable();
+    }
+    let mut fast_reserved_prev = false;
     let mut source_reset = false;
     let mut source_disconnected = false;
     let outcome = 'pump: loop {
+        // When the previous iteration succeeded synchronously via
+        // `try_reserve()` (which does not charge Tokio's cooperative budget),
+        // charge one coop unit before continuing so a fast multi-MB upload
+        // yields back to the dispatcher's deadline and response-head arms.
+        // Kept off the very first iteration so `prime_inline()` stays
+        // synchronous; cancellation and authorization are checked right below
+        // after any yield.
+        if fast_reserved_prev {
+            fast_reserved_prev = false;
+            tokio::task::coop::consume_budget().await;
+        }
         // Reserve capacity BEFORE reading the client, so a transport that
         // stops draining stops the read rather than filling a buffer.
         if shared.is_cancelled() {
@@ -1760,7 +1784,10 @@ where
             write_armed = true;
         }
         let permit = match sender.try_reserve() {
-            Ok(permit) => permit,
+            Ok(permit) => {
+                fast_reserved_prev = true;
+                permit
+            }
             Err(tokio::sync::mpsc::error::TrySendError::Closed(())) => {
                 if shared.terminal_code() == PUMP_CONSUMER_DONE {
                     break 'pump UploadPumpOutcome::Completed;
@@ -1779,14 +1806,14 @@ where
                 }
                 tokio::select! {
                     biased;
-                    () = shared.wait_cancelled() => break 'pump UploadPumpOutcome::Cancelled,
+                    () = &mut cancel_notified => break 'pump UploadPumpOutcome::Cancelled,
                     () = optional_sleep_elapsed(expiry.as_mut()) => {
                         if let Some((deadline, family, latch)) = plan.as_ref() {
                             latch.record_once(deadline.termination, *family);
                         }
                         break 'pump UploadPumpOutcome::AuthorizationExpired;
                     }
-                    () = shared.wait_write_armed(), if write_configured && !write_armed => {
+                    () = &mut write_armed_notified, if write_configured && !write_armed => {
                         write_armed = true;
                         continue 'pump;
                     }
@@ -1813,14 +1840,14 @@ where
         let frame = 'frame: loop {
             let next = tokio::select! {
                 biased;
-                () = shared.wait_cancelled() => break 'pump UploadPumpOutcome::Cancelled,
+                () = &mut cancel_notified => break 'pump UploadPumpOutcome::Cancelled,
                 () = optional_sleep_elapsed(expiry.as_mut()) => {
                     if let Some((deadline, family, latch)) = plan.as_ref() {
                         latch.record_once(deadline.termination, *family);
                     }
                     break 'pump UploadPumpOutcome::AuthorizationExpired;
                 }
-                () = shared.wait_write_armed(), if write_configured && !write_armed => {
+                () = &mut write_armed_notified, if write_configured && !write_armed => {
                     write_armed = true;
                     continue 'frame;
                 }
@@ -2225,6 +2252,14 @@ async fn run_direct_upload_watch(task: DirectUploadWatch) -> UploadPumpOutcome {
     let write_idle_dur = Duration::from_millis(write_timeout_ms);
     let write_idle: Option<tokio::time::Sleep> = None;
     tokio::pin!(write_idle);
+    let cancel_notified = shared.cancel_wake.notified();
+    tokio::pin!(cancel_notified);
+    cancel_notified.as_mut().enable();
+    let write_armed_notified = shared.write_armed_wake.notified();
+    tokio::pin!(write_armed_notified);
+    if write_configured {
+        write_armed_notified.as_mut().enable();
+    }
     // `Some` from the moment the watermark is armed: a transport that never
     // polls after that is idle from the arming instant.
     let mut write_armed_at: Option<tokio::time::Instant> = None;
@@ -2262,8 +2297,8 @@ async fn run_direct_upload_watch(task: DirectUploadWatch) -> UploadPumpOutcome {
         }
         tokio::select! {
             biased;
-            () = shared.wait_cancelled() => break UploadPumpOutcome::Cancelled,
-            () = shared.wait_write_armed(), if write_configured && write_armed_at.is_none() => {
+            () = &mut cancel_notified => break UploadPumpOutcome::Cancelled,
+            () = &mut write_armed_notified, if write_configured && write_armed_at.is_none() => {
                 write_armed_at = Some(tokio::time::Instant::now());
             }
             // Re-judged at the top of the loop against the progress recorded
@@ -2278,10 +2313,14 @@ async fn run_direct_upload_watch(task: DirectUploadWatch) -> UploadPumpOutcome {
     shared
         .terminal
         .store(outcome_code(outcome), Ordering::Release);
+    // Re-read the arm flag after acquiring `DIRECT_DONE`: the transport can
+    // arm and complete the final frame between the loop's arm check and its
+    // `progress.consumer` load.
+    let write_armed = write_armed_at.is_some() || (write_configured && shared.is_write_armed());
     settle_after_terminal(PostTerminal {
         outcome,
         write_configured,
-        write_armed: write_armed_at.is_some(),
+        write_armed,
         write_timeout_ms,
         socket: &socket,
         shared: &shared,
