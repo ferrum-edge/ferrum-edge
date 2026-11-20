@@ -1714,11 +1714,27 @@ impl DtlsConnection {
             let mut out_buf = vec![0u8; dtls_buf_config().output_buf_size];
             let mut recv_buf = vec![0u8; 65536];
             let mut next_timeout: Option<Instant> = None;
+            let mut armed_timeout: Option<Instant> = None;
+            let retransmit_sleep: Option<tokio::time::Sleep> = None;
+            tokio::pin!(retransmit_sleep);
 
             loop {
-                let sleep_dur = next_timeout
-                    .map(|t| t.saturating_duration_since(Instant::now()))
-                    .unwrap_or(Duration::from_secs(60));
+                if next_timeout != armed_timeout {
+                    armed_timeout = next_timeout;
+                    match next_timeout {
+                        Some(t) => {
+                            let target = tokio::time::Instant::from_std(t);
+                            if let Some(sleep) = retransmit_sleep.as_mut().as_pin_mut() {
+                                sleep.reset(target);
+                            } else {
+                                retransmit_sleep.set(Some(tokio::time::sleep_until(target)));
+                            }
+                        }
+                        None => {
+                            retransmit_sleep.set(None);
+                        }
+                    }
+                }
 
                 let mut pending_completion: Option<oneshot::Sender<Result<(), String>>> = None;
                 let mut fatal_send_error: Option<String> = None;
@@ -1761,12 +1777,18 @@ impl DtlsConnection {
                             pending_completion = Some(completion);
                         }
                     }
-                    // Timer fired
-                    _ = tokio::time::sleep(sleep_dur) => {
+                    // Timer fired (only polled when dimpl actually armed a timeout)
+                    _ = async {
+                        match retransmit_sleep.as_mut().as_pin_mut() {
+                            Some(sleep) => sleep.await,
+                            None => std::future::pending::<()>().await,
+                        }
+                    }, if next_timeout.is_some() => {
+                        let now = Instant::now();
                         if let Some(t) = next_timeout
-                            && Instant::now() >= t
+                            && now >= t
                         {
-                            if let Err(e) = dtls.handle_timeout(Instant::now()) {
+                            if let Err(e) = dtls.handle_timeout(now) {
                                 trace!("DTLS handle_timeout error: {}", e);
                                 fatal_send_error =
                                     Some(format!("DTLS handle_timeout error: {e}"));
@@ -1790,24 +1812,33 @@ impl DtlsConnection {
                     let mut drain_round_exhausted = true;
                     for _ in 0..MAX_OUTPUTS_PER_DRAIN {
                         match dtls.poll_output(&mut out_buf) {
-                            Output::Packet(data) => match socket.send(data).await {
-                                Ok(written) if written == data.len() => {
-                                    wrote_ciphertext_datagram = true;
+                            Output::Packet(data) => {
+                                let send_res = match socket.try_send(data) {
+                                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                                        socket.send(data).await
+                                    }
+                                    other => other,
+                                };
+                                match send_res {
+                                    Ok(written) if written == data.len() => {
+                                        wrote_ciphertext_datagram = true;
+                                    }
+                                    Ok(written) => {
+                                        socket_send_error = Some(format!(
+                                            "DTLS UDP send was incomplete: wrote {written} of {} bytes",
+                                            data.len()
+                                        ));
+                                        drain_round_exhausted = false;
+                                        break;
+                                    }
+                                    Err(e) => {
+                                        socket_send_error =
+                                            Some(format!("DTLS UDP send error: {e}"));
+                                        drain_round_exhausted = false;
+                                        break;
+                                    }
                                 }
-                                Ok(written) => {
-                                    socket_send_error = Some(format!(
-                                        "DTLS UDP send was incomplete: wrote {written} of {} bytes",
-                                        data.len()
-                                    ));
-                                    drain_round_exhausted = false;
-                                    break;
-                                }
-                                Err(e) => {
-                                    socket_send_error = Some(format!("DTLS UDP send error: {e}"));
-                                    drain_round_exhausted = false;
-                                    break;
-                                }
-                            },
+                            }
                             Output::Timeout(t) => {
                                 next_timeout = Some(t);
                                 drain_round_exhausted = false;
@@ -1892,14 +1923,36 @@ impl DtlsConnection {
                 data.len()
             ));
         }
+        self.send_owned(data.to_vec()).await
+    }
+
+    /// Send owned application data through the DTLS tunnel without cloning the
+    /// caller's buffer.
+    pub async fn send_owned(&self, data: Vec<u8>) -> Result<(), anyhow::Error> {
+        let max_plaintext = dtls_buf_config().max_plaintext;
+        if data.len() > max_plaintext {
+            return Err(anyhow::anyhow!(
+                "DTLS plaintext exceeds max_plaintext ({max_plaintext} bytes, got {})",
+                data.len()
+            ));
+        }
         let (completion_tx, completion_rx) = oneshot::channel();
-        self.app_tx
-            .send(PendingAppSend {
-                data: data.to_vec(),
-                completion: completion_tx,
-            })
-            .await
-            .map_err(|_| anyhow::anyhow!("DTLS connection closed"))?;
+        let pending = PendingAppSend {
+            data,
+            completion: completion_tx,
+        };
+        match self.app_tx.try_send(pending) {
+            Ok(()) => {}
+            Err(mpsc::error::TrySendError::Full(pending)) => {
+                self.app_tx
+                    .send(pending)
+                    .await
+                    .map_err(|_| anyhow::anyhow!("DTLS connection closed"))?;
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                return Err(anyhow::anyhow!("DTLS connection closed"));
+            }
+        }
         match completion_rx.await {
             Ok(Ok(())) => Ok(()),
             Ok(Err(error)) => Err(anyhow::anyhow!(error)),
@@ -2559,10 +2612,11 @@ impl DtlsServerSender {
     /// ties fail closed.
     pub async fn send_committed(
         &self,
-        data: &[u8],
+        data: impl Into<Vec<u8>>,
         deadline: Option<tokio::time::Instant>,
     ) -> Result<(), anyhow::Error> {
-        send_frontend_app_committed(&self.app_tx, &self.auth_deadline, data, deadline).await
+        send_frontend_app_committed_owned(&self.app_tx, &self.auth_deadline, data.into(), deadline)
+            .await
     }
 
     /// Close this client's DTLS connection.
@@ -2580,10 +2634,11 @@ impl DtlsServerConn {
     /// Deadline-aware actual-commit send. See [`DtlsServerSender::send_committed`].
     pub async fn send_committed(
         &self,
-        data: &[u8],
+        data: impl Into<Vec<u8>>,
         deadline: Option<tokio::time::Instant>,
     ) -> Result<(), anyhow::Error> {
-        send_frontend_app_committed(&self.app_tx, &self.auth_deadline, data, deadline).await
+        send_frontend_app_committed_owned(&self.app_tx, &self.auth_deadline, data.into(), deadline)
+            .await
     }
 
     /// Receive decrypted application data from this client.
@@ -2620,33 +2675,41 @@ impl DtlsServerConn {
     }
 }
 
-async fn send_frontend_app_committed(
+async fn send_frontend_app_committed_owned(
     app_tx: &mpsc::Sender<FrontendAppSend>,
     auth_deadline: &FrontendSessionAuthDeadline,
-    data: &[u8],
+    data: Vec<u8>,
     deadline: Option<tokio::time::Instant>,
 ) -> Result<(), anyhow::Error> {
     if let Some(at) = deadline {
         auth_deadline.publish(at);
     }
     let effective = earliest_frontend_app_send_deadline(deadline, auth_deadline.get());
-    if matches!(
-        admit_frontend_app_send(false, effective, tokio::time::Instant::now()),
-        FrontendAppSendAdmit::Reject(FrontendAppSendReject::Expired)
-    ) {
+    if let Some(at) = effective
+        && tokio::time::Instant::now() >= at
+    {
         return Err(anyhow::anyhow!(FrontendAppSendReject::Expired.as_str()));
     }
     let (cancel_tx, cancel_rx) = oneshot::channel();
     let (completion_tx, completion_rx) = oneshot::channel();
-    app_tx
-        .send(FrontendAppSend {
-            data: data.to_vec(),
-            completion: completion_tx,
-            cancel: cancel_rx,
-            deadline,
-        })
-        .await
-        .map_err(|_| anyhow::anyhow!("DTLS server connection closed"))?;
+    let pending = FrontendAppSend {
+        data,
+        completion: completion_tx,
+        cancel: cancel_rx,
+        deadline,
+    };
+    match app_tx.try_send(pending) {
+        Ok(()) => {}
+        Err(mpsc::error::TrySendError::Full(pending)) => {
+            app_tx
+                .send(pending)
+                .await
+                .map_err(|_| anyhow::anyhow!("DTLS server connection closed"))?;
+        }
+        Err(mpsc::error::TrySendError::Closed(_)) => {
+            return Err(anyhow::anyhow!("DTLS server connection closed"));
+        }
+    }
     // Held for the whole wait: dropping this future (expiry in the proxy
     // race) closes `cancel` so a request already in the channel cannot be
     // encrypted or written later.
@@ -3399,6 +3462,12 @@ impl DtlsServer {
             // must not emit queued packets after this retirement even when the
             // session authorization deadline has not elapsed.
             let mut retired_by_trust_withdrawal = false;
+            let mut armed_timeout: Option<Instant> = None;
+            let retransmit_sleep: Option<tokio::time::Sleep> = None;
+            tokio::pin!(retransmit_sleep);
+            let handshake_sleep = handshake_deadline
+                .map(|deadline| tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)));
+            tokio::pin!(handshake_sleep);
 
             loop {
                 // Check the handshake deadline at the top of each iteration so
@@ -3417,16 +3486,22 @@ impl DtlsServer {
                     break;
                 }
 
-                let handshake_sleep_dur = if connected {
-                    Duration::from_secs(60)
-                } else {
-                    handshake_deadline
-                        .map(|deadline| deadline.saturating_duration_since(Instant::now()))
-                        .unwrap_or(Duration::from_secs(60))
-                };
-                let sleep_dur = next_timeout
-                    .map(|t| t.saturating_duration_since(Instant::now()))
-                    .unwrap_or(Duration::from_secs(60));
+                if next_timeout != armed_timeout {
+                    armed_timeout = next_timeout;
+                    match next_timeout {
+                        Some(t) => {
+                            let target = tokio::time::Instant::from_std(t);
+                            if let Some(sleep) = retransmit_sleep.as_mut().as_pin_mut() {
+                                sleep.reset(target);
+                            } else {
+                                retransmit_sleep.set(Some(tokio::time::sleep_until(target)));
+                            }
+                        }
+                        None => {
+                            retransmit_sleep.set(None);
+                        }
+                    }
+                }
 
                 let mut in_flight: Option<InFlightFrontendAppSend> = None;
 
@@ -3553,12 +3628,18 @@ impl DtlsServer {
                             }
                         }
                     }
-                    // DTLS retransmit timer
-                    _ = tokio::time::sleep(sleep_dur) => {
+                    // DTLS retransmit timer (only polled when dimpl actually armed a timeout)
+                    _ = async {
+                        match retransmit_sleep.as_mut().as_pin_mut() {
+                            Some(sleep) => sleep.await,
+                            None => std::future::pending::<()>().await,
+                        }
+                    }, if next_timeout.is_some() => {
+                        let now = Instant::now();
                         if let Some(t) = next_timeout
-                            && Instant::now() >= t
+                            && now >= t
                         {
-                            if let Err(e) = dtls.handle_timeout(Instant::now()) {
+                            if let Err(e) = dtls.handle_timeout(now) {
                                 trace!(client = %peer_addr, "DTLS timeout error: {}", e);
                                 break;
                             }
@@ -3567,7 +3648,12 @@ impl DtlsServer {
                     }
                     // Handshake deadline (top-of-loop check is primary;
                     // this is defense in depth).
-                    _ = tokio::time::sleep(handshake_sleep_dur), if !connected && handshake_deadline.is_some() => {
+                    _ = async {
+                        match handshake_sleep.as_mut().as_pin_mut() {
+                            Some(sleep) => sleep.await,
+                            None => std::future::pending::<()>().await,
+                        }
+                    }, if !connected && handshake_deadline.is_some() => {
                         record_dtls_handshake_timeout(
                             &handshake_timeout_warn,
                             &handshake_timeouts,
@@ -4501,7 +4587,10 @@ async fn send_dtls_record(
     }
     #[cfg(not(target_os = "linux"))]
     let _ = reply_local;
-    socket.send_to(data, peer).await
+    match socket.try_send_to(data, peer) {
+        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => socket.send_to(data, peer).await,
+        other => other,
+    }
 }
 
 /// Drain `poll_output()` and send packets to a specific peer address (for server-side).
