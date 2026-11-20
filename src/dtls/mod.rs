@@ -3433,8 +3433,10 @@ impl DtlsServer {
         let active_sessions = self.active_sessions.clone();
         let active_session_mirror = self.limits.active_session_mirror.clone();
         let client_cert_verifier = active.client_cert_verifier.clone();
-        let handshake_timeout = self.limits.handshake_timeout;
-        let handshake_deadline = handshake_timeout.map(|timeout| Instant::now() + timeout);
+        let handshake_deadline = self
+            .limits
+            .handshake_timeout
+            .map(|timeout| tokio::time::Instant::now() + timeout);
         let handshake_timeout_warn = self.handshake_timeout_warn.clone();
         let handshake_timeouts = self.handshake_timeouts.clone();
         let udp_port_hold = self.udp_port_hold.clone();
@@ -3531,9 +3533,10 @@ impl DtlsServer {
             let mut armed_timeout: Option<Instant> = None;
             let retransmit_sleep: Option<tokio::time::Sleep> = None;
             tokio::pin!(retransmit_sleep);
-            let handshake_sleep = handshake_timeout
-                .map(|timeout| tokio::time::sleep_until(tokio::time::Instant::now() + timeout));
+            let handshake_sleep = handshake_deadline.map(tokio::time::sleep_until);
             tokio::pin!(handshake_sleep);
+            let server_shutdown_fut = server_shutdown_rx.changed();
+            tokio::pin!(server_shutdown_fut);
 
             loop {
                 // Check the handshake deadline at the top of each iteration so
@@ -3541,7 +3544,7 @@ impl DtlsServer {
                 // in the select below.
                 if !connected
                     && let Some(deadline) = handshake_deadline
-                    && Instant::now() >= deadline
+                    && tokio::time::Instant::now() >= deadline
                 {
                     record_dtls_handshake_timeout(
                         &handshake_timeout_warn,
@@ -3679,7 +3682,7 @@ impl DtlsServer {
                         );
                         break;
                     }
-                    _ = server_shutdown_rx.changed() => {
+                    _ = &mut server_shutdown_fut => {
                         fail_queued_frontend_app_sends(
                             &mut app_in_rx,
                             auth_deadline.get(),
