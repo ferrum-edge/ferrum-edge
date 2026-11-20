@@ -4292,6 +4292,13 @@ pub(crate) fn mesh_route_dispatch_can_emit_rule(entry: &Value) -> bool {
 /// CRDs expose this format via `google.protobuf.Duration`'s string form
 /// (e.g., `"5s"`, `"500ms"`, `"30m"`, `"1.5h"`). Positive sub-millisecond
 /// inputs round up to 1 ms so duration-based policy fields do not disappear.
+/// The largest whole-second value an Istio duration can project to:
+/// `parse_istio_duration_ms` saturates at `u64::MAX` milliseconds, and the
+/// translator rounds up to seconds (`parse_istio_duration_secs` in
+/// `istio.rs`, e.g. a VirtualService `corsPolicy.maxAge`). Mesh slice decode
+/// refuses a carried value above it (issue #7440).
+pub(crate) const ISTIO_DURATION_SECS_MAX: u64 = u64::MAX.div_ceil(1000);
+
 pub(crate) fn parse_istio_duration_ms(duration: &str) -> Option<u64> {
     let trimmed = duration.trim();
     // 2-char suffixes first so they aren't shadowed by the trailing `s` or `m`.
