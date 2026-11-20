@@ -546,9 +546,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     bytes. Ferrum's decoders accept both. Deployment snapshots now carry those
     column values the way PostgreSQL and SQLite already did, so a MySQL
     deployment precondition captured before the upgrade must be re-read once.
-  - PostgreSQL: `options=` values in a database URL are now escaped by SQLx
-    (remove any manual escaping), `.pgpass` passwords are backslash-unescaped,
-    and `hostaddr` follows libpq semantics instead of aliasing `host`.
+  - PostgreSQL: structured `options[name]=value` parameters in a database URL
+    are now escaped by SQLx (drop any manual backslash escaping there); a raw
+    `options=` string is still passed through unchanged and keeps libpq-style
+    escaping. `.pgpass` passwords are backslash-unescaped, and `hostaddr`
+    follows libpq semantics instead of aliasing `host`.
   - SQLx's `tracing` field `aquired_after_secs` is now `acquired_after_secs`.
 - **BREAKING:** (issue #7424) DestinationRules now govern an EastWestGateway's
   auto-materialized SNI-passthrough Service upstreams. Each upstream is selected
