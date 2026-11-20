@@ -2670,10 +2670,15 @@ fn header_gated_spec() -> serde_json::Value {
 /// A malformed one rejects the slice update instead of being dropped with a
 /// route the binding refuses or healed by the binding's destination rewrite.
 ///
-/// Review finding dsf F1 (#7449 round 2): a valid instance the plugin cache
-/// would never build (disabled, not proxy-scoped, or not listed in its
-/// route's `plugins`) also rejects the slice, since the route would keep
-/// serving without its 404 match gate.
+/// Review finding dsf F1 (#7449 round 2) and dsf F1 / neon F1 (#7451): the
+/// record around a valid config must have exactly the shape the translator
+/// emits. A record the plugin cache would never build (disabled, not
+/// proxy-scoped, not listed in its route's `plugins`), or one that could skip
+/// or reorder the instance (an execution trigger, valid or malformed, or a
+/// priority override), or one with any other field the translator never sets
+/// (labels, an API spec id) rejects the slice. Otherwise the route would keep
+/// serving without its 404 match gate. The translator's own record is the
+/// positive case.
 #[test]
 fn every_malformed_carried_dispatch_instance_rejects_the_slice() {
     let config = translated_config(&[virtual_service("gated", header_gated_spec())]);
@@ -2695,6 +2700,41 @@ fn every_malformed_carried_dispatch_instance_rejects_the_slice() {
     for runtime in [sidecar_runtime_for("details"), node_waypoint_runtime()] {
         let topology = runtime.topology;
         let slice = MeshSlice::from_gateway_config(&config, runtime.mesh_slice_request());
+        // Positive case: the translator's own record, carried as emitted,
+        // sets only allowlisted record fields and decodes.
+        let translated_dispatch: Vec<_> = slice
+            .http_routes
+            .plugin_configs
+            .iter()
+            .filter(|plugin| plugin["plugin_name"] == json!("mesh_route_dispatch"))
+            .collect();
+        assert_eq!(
+            translated_dispatch.len(),
+            1,
+            "{topology:?}: one dispatch instance"
+        );
+        let record = translated_dispatch[0]
+            .as_object()
+            .expect("dispatch record object");
+        for key in record.keys() {
+            assert!(
+                [
+                    "id",
+                    "plugin_name",
+                    "namespace",
+                    "config",
+                    "scope",
+                    "proxy_id",
+                    "enabled",
+                    "created_at",
+                    "updated_at",
+                ]
+                .contains(&key.as_str()),
+                "{topology:?}: the translator sets record field {key}"
+            );
+        }
+        assert_eq!(record["enabled"], json!(true), "{topology:?}");
+        assert_eq!(record["scope"], json!("proxy"), "{topology:?}");
         prepare_gateway_config_from_mesh_slice(&slice, &runtime)
             .unwrap_or_else(|error| panic!("{topology:?}: the valid slice applies: {error:#}"));
         for (name, patch) in patches {
@@ -2715,7 +2755,16 @@ fn every_malformed_carried_dispatch_instance_rejects_the_slice() {
                 "{topology:?} {name}: {rendered}"
             );
         }
-        for name in ["disabled", "global scope", "unassociated"] {
+        for name in [
+            "disabled",
+            "global scope",
+            "unassociated",
+            "trigger",
+            "malformed trigger",
+            "priority override",
+            "labels",
+            "api spec id",
+        ] {
             let mut tampered = slice.clone();
             let mut dispatch_ids = Vec::new();
             for plugin in &mut tampered.http_routes.plugin_configs {
@@ -2723,6 +2772,16 @@ fn every_malformed_carried_dispatch_instance_rejects_the_slice() {
                     match name {
                         "disabled" => plugin["enabled"] = json!(false),
                         "global scope" => plugin["scope"] = json!("global"),
+                        "trigger" => {
+                            plugin["trigger"] =
+                                json!({"when": {"match": {"path": {"prefix": ["/never"]}}}});
+                        }
+                        "malformed trigger" => {
+                            plugin["trigger"] = json!({"when": {"all": []}});
+                        }
+                        "priority override" => plugin["priority_override"] = json!(1),
+                        "labels" => plugin["labels"] = json!({"team": "mesh"}),
+                        "api spec id" => plugin["api_spec_id"] = json!("spec"),
                         _ => {}
                     }
                     dispatch_ids.push(plugin["id"].clone());
@@ -2750,10 +2809,10 @@ fn every_malformed_carried_dispatch_instance_rejects_the_slice() {
                 );
             }
             let error = prepare_gateway_config_from_mesh_slice(&tampered, &runtime)
-                .expect_err("a dispatch instance the cache would not build rejects the slice");
+                .expect_err("a dispatch record the translator does not emit rejects the slice");
             let rendered = format!("{error:#}");
             assert!(
-                rendered.contains("instance its route would not construct"),
+                rendered.contains("record the translator does not emit"),
                 "{topology:?} {name}: {rendered}"
             );
         }
