@@ -2320,6 +2320,12 @@ impl MeshRouteDispatch {
         })
     }
 
+    /// Whether a request no rule matches is refused (`reject_unmatched`)
+    /// instead of reaching the proxy's default destination.
+    pub fn rejects_unmatched(&self) -> bool {
+        self.config.reject_unmatched
+    }
+
     /// The compiled rule list, in evaluation order.
     ///
     /// External test crates (`tests/unit/plugins/mesh_route_dispatch_tests.rs`)

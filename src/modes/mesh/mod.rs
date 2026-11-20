@@ -4407,6 +4407,23 @@ fn decode_http_route_set(
             Ok(upstream)
         })
         .collect::<Result<_, _>>()?;
+    // Every carried record is a namespaced resource whose id must be unique
+    // within its kind (all share the slice namespace). Two records with one id
+    // would make every later id-keyed step act on the wrong one or on both:
+    // the route binding finds and rebinds only the first split upstream while
+    // the load balancer keeps the last, Sidecar refusal and instance
+    // detachment remove every record of an id, and the route index keeps one
+    // proxy. Refused here, before any binding or filtering, for all three
+    // kinds.
+    refuse_duplicate_carried_ids("proxy", proxies.iter().map(|proxy| proxy.id.as_str()))?;
+    refuse_duplicate_carried_ids(
+        "plugin config",
+        plugin_configs.iter().map(|plugin| plugin.id.as_str()),
+    )?;
+    refuse_duplicate_carried_ids(
+        "upstream",
+        upstreams.iter().map(|upstream| upstream.id.as_str()),
+    )?;
 
     let carried_upstreams: BTreeSet<&str> = upstreams
         .iter()
@@ -4440,6 +4457,23 @@ fn decode_http_route_set(
         ));
     }
     Ok((proxies, upstreams, plugin_configs))
+}
+
+/// Refuse a carried route set in which two records of one `kind` share an id.
+/// The diagnostic names the record by ordinal and never echoes the id.
+fn refuse_duplicate_carried_ids<'a>(
+    kind: &str,
+    ids: impl Iterator<Item = &'a str>,
+) -> Result<(), anyhow::Error> {
+    let mut seen: HashSet<&str> = HashSet::new();
+    for (index, id) in ids.enumerate() {
+        if !seen.insert(id) {
+            return Err(anyhow::anyhow!(
+                "Mesh slice HTTP route {kind} {index} reuses the id of an earlier {kind}"
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Where a carried VirtualService destination host lives, from the NodeWaypoint's
@@ -5568,9 +5602,13 @@ fn clone_sidecar_carried_destination_upstreams(
 /// uses for L4 routes).
 ///
 /// Istio `match[]` entries are ORed. The translator emits one rule per
-/// in-scope entry that has a non-URI predicate (a URI-only entry emits no
-/// rule: the route's `listen_path` carries it and `reject_unmatched` is off,
-/// so unclaimed requests reach the route's own destination). So
+/// in-scope entry with a non-URI predicate. An unguarded URI-only entry can be
+/// represented by the route's `listen_path` and default destination instead
+/// (it turns `reject_unmatched` off, so unclaimed requests reach the route's
+/// own destination), but a URI-only entry still gets a rule when it needs a
+/// URI guard on a broader listen path, when it is a case-insensitive
+/// (`ignoreUriCase`) exact or prefix match, or when its `http[]` entry carries
+/// route-local actions (header transforms, fault, rewrite, redirect). So
 /// `sourceNamespace` is decided per rule (one match condition): a
 /// rule naming the local namespace drops the predicate (keeping its other
 /// predicates, or matching every path when it had none), and any other rule,
@@ -5578,6 +5616,13 @@ fn clone_sidecar_carried_destination_upstreams(
 /// is removed, fail-closed. Only that condition goes: its OR siblings, later
 /// rules and the route's own destination are kept, and a removed condition
 /// never turns into a broader match. Rule order is kept.
+///
+/// An instance with a `sourceNamespace` condition is first validated with the
+/// plugin's own constructor (`MeshRouteDispatch::new`), before anything is
+/// changed: a config the plugin would refuse refuses the route as carried, so
+/// filtering can neither hide nor heal it, and a valid object that omits
+/// `reject_unmatched` keeps its default. Instances without such a condition
+/// are left exactly as carried.
 ///
 /// When every rule of an instance is removed (issue #7440):
 /// * with `reject_unmatched` the route serves only matched requests, so it now
@@ -5597,6 +5642,8 @@ fn resolve_sidecar_carried_route_source_namespaces(
     let local_namespace = authoritative_sidecar_l4_source(runtime, mesh_slice)
         .map(|source| source.namespace.to_string());
     let mut removed = 0usize;
+    // Instances the plugin constructor refuses.
+    let mut malformed = 0usize;
     let mut emptied: HashSet<(String, String)> = HashSet::new();
     // `(namespace, plugin id)` of emptied instances whose route keeps serving
     // its fallback destination.
@@ -5610,6 +5657,42 @@ fn resolve_sidecar_carried_route_source_namespaces(
         {
             continue;
         }
+        // Only instances with a `sourceNamespace` condition are resolved
+        // here; every other instance reaches the plugin constructor exactly as
+        // carried.
+        let has_source_namespace = plugin
+            .config
+            .get("rules")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|rules| {
+                rules.iter().any(|rule| {
+                    rule.get("match")
+                        .and_then(|criteria| criteria.get("source_namespace"))
+                        .is_some()
+                })
+            });
+        let Some(proxy_id) = plugin.proxy_id.clone() else {
+            continue;
+        };
+        if !has_source_namespace {
+            continue;
+        }
+        // Validate the untrusted slice value with the plugin's own
+        // constructor before anything is touched. A config it would refuse (a
+        // non-boolean or unknown miss-policy key, an empty `source_namespace`,
+        // a zero port, an invalid matcher or transform, ...) refuses the
+        // route as carried: no rule is removed and no instance detached, so
+        // filtering can neither hide nor heal it. A valid object that omits
+        // `reject_unmatched` keeps the plugin default.
+        let reject_unmatched =
+            match crate::plugins::mesh_route_dispatch::MeshRouteDispatch::new(&plugin.config) {
+                Ok(validated) => validated.rejects_unmatched(),
+                Err(_) => {
+                    malformed += 1;
+                    emptied.insert((plugin.namespace.clone(), proxy_id));
+                    continue;
+                }
+            };
         let Some(rules) = plugin
             .config
             .get_mut("rules")
@@ -5641,18 +5724,10 @@ fn resolve_sidecar_carried_route_source_namespaces(
             }
             true
         });
-        if before > 0
-            && rules.is_empty()
-            && let Some(proxy_id) = plugin.proxy_id.clone()
-        {
-            // Absent keeps the plugin's default (`false`). The value is
-            // untrusted slice input, so a present non-boolean (which the
-            // plugin would refuse to construct) fails closed: the route is
-            // refused rather than its instance detached.
-            let reject_unmatched = match plugin.config.get("reject_unmatched") {
-                None => false,
-                Some(value) => value.as_bool().unwrap_or(true),
-            };
+        if before > 0 && rules.is_empty() {
+            // A validated instance that serves unmatched requests is detached
+            // (its route keeps its fallback); a matched-only one refuses the
+            // route.
             if reject_unmatched {
                 emptied.insert((plugin.namespace.clone(), proxy_id));
             } else {
@@ -5676,6 +5751,13 @@ fn resolve_sidecar_carried_route_source_namespaces(
             removed,
             "Sidecar VirtualService dispatch rules whose sourceNamespace does not name the local \
              workload's namespace were removed"
+        );
+    }
+    if malformed > 0 {
+        warn!(
+            malformed,
+            "Sidecar VirtualService routes refused: their route dispatch configuration fails \
+             validation"
         );
     }
     emptied
