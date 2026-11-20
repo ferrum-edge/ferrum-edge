@@ -2487,7 +2487,137 @@ fn data_plane_refuses_a_route_set_reusing_a_plugin_config_id_across_owners() {
         .expect_err("a plugin config id owned by two routes refuses the slice");
     let rendered = format!("{error:#}");
     assert!(
-        rendered.contains("reuses another plugin config's id"),
+        rendered.contains("reuses the id of an earlier plugin config"),
         "{rendered}"
+    );
+}
+
+/// Review finding neon F1 (#7447): proxy and upstream ids are namespaced
+/// resource ids too. A carried route set that reuses one for two records is
+/// refused at decode, like a reused plugin config id, before any binding or
+/// filtering could act on the wrong record or on both.
+#[test]
+fn data_plane_refuses_a_route_set_reusing_a_proxy_or_upstream_id() {
+    let runtime = sidecar_runtime_for("details");
+
+    let config = translated_config(&[virtual_service("split", split_spec(json!({})))]);
+    let slice = sidecar_slice(&config, &runtime);
+    assert_eq!(slice.http_routes.upstreams.len(), 1, "one carried split");
+    let mut tampered = slice.clone();
+    let mut duplicate = tampered.http_routes.upstreams[0].clone();
+    duplicate["targets"][0]["host"] = json!("secret.other.svc.cluster.local");
+    tampered.http_routes.upstreams.push(duplicate);
+    let error = prepare_gateway_config_from_mesh_slice(&tampered, &runtime)
+        .expect_err("a reused upstream id refuses the slice");
+    let rendered = format!("{error:#}");
+    assert!(
+        rendered.contains("reuses the id of an earlier upstream"),
+        "{rendered}"
+    );
+
+    let config = translated_config(&[virtual_service("split", guarded_split_spec())]);
+    let slice = sidecar_slice(&config, &runtime);
+    prepare_gateway_config_from_mesh_slice(&slice, &runtime)
+        .expect("the unmodified route set materializes");
+    let mut tampered = slice.clone();
+    let mut duplicate = tampered.http_routes.proxies[0].clone();
+    duplicate["listen_path"] = json!("/elsewhere");
+    tampered.http_routes.proxies.push(duplicate);
+    let error = prepare_gateway_config_from_mesh_slice(&tampered, &runtime)
+        .expect_err("a reused proxy id refuses the slice");
+    let rendered = format!("{error:#}");
+    assert!(
+        rendered.contains("reuses the id of an earlier proxy"),
+        "{rendered}"
+    );
+}
+
+/// Review findings neon F2 / sol F1 (#7447): an instance with a
+/// `sourceNamespace` condition is validated with the plugin's own constructor
+/// before any rule is removed. A config the plugin would refuse refuses the
+/// carried route, whether filtering would have emptied it (zero port, empty
+/// `sourceNamespace`) or left a valid-looking sibling behind.
+#[test]
+fn sidecar_source_namespace_validates_the_dispatch_config_before_filtering() {
+    let runtime = sidecar_runtime_for("details");
+    let served = |config: &GatewayConfig, patch: &dyn Fn(&mut serde_json::Value)| {
+        let mut slice = sidecar_slice(config, &runtime);
+        let mut patched = 0;
+        for plugin in &mut slice.http_routes.plugin_configs {
+            if plugin["plugin_name"] == json!("mesh_route_dispatch") {
+                patch(&mut plugin["config"]);
+                patched += 1;
+            }
+        }
+        assert_eq!(patched, 1, "the route carries one dispatch instance");
+        let prepared =
+            prepare_gateway_config_from_mesh_slice(&slice, &runtime).expect("slice materializes");
+        carried_route_proxies(&prepared)
+            .iter()
+            .any(|proxy| proxy.listen_path.as_deref() == Some("/api"))
+    };
+    let foreign_rule = |config: &mut serde_json::Value| -> usize {
+        config["rules"]
+            .as_array()
+            .expect("rules")
+            .iter()
+            .position(|rule| rule["match"].get("source_namespace").is_some())
+            .expect("the sourceNamespace rule")
+    };
+
+    // An instance filtering would empty (the route has a URI-only sibling).
+    let fallback = translated_config(&[virtual_service(
+        "or",
+        json!({
+            "hosts": ["reviews.default.svc.cluster.local"],
+            "http": [{
+                "match": [
+                    {"uri": {"prefix": "/api"}, "sourceNamespace": "other-ns"},
+                    {"uri": {"prefix": "/api"}}
+                ],
+                "route": route_to("ratings")
+            }]
+        }),
+    )]);
+    assert!(served(&fallback, &|_| {}), "a valid instance is detached");
+    assert!(
+        !served(&fallback, &|config| {
+            let index = foreign_rule(config);
+            config["rules"][index]["match"]["port"] = json!(0);
+        }),
+        "a zero port the plugin refuses refuses the route"
+    );
+    assert!(
+        !served(&fallback, &|config| {
+            let index = foreign_rule(config);
+            config["rules"][index]["match"]["source_namespace"] = json!("");
+        }),
+        "an empty sourceNamespace the plugin refuses refuses the route"
+    );
+
+    // An instance filtering would leave with a valid sibling rule.
+    let guarded = translated_config(&[virtual_service(
+        "guarded",
+        json!({
+            "hosts": ["reviews.default.svc.cluster.local"],
+            "http": [{
+                "match": [
+                    {"uri": {"prefix": "/api"}, "sourceNamespace": "other-ns"},
+                    {"uri": {"prefix": "/api"}, "headers": {"x-version": {"exact": "v2"}}}
+                ],
+                "route": route_to("ratings")
+            }]
+        }),
+    )]);
+    assert!(
+        served(&guarded, &|_| {}),
+        "the valid header sibling keeps it"
+    );
+    assert!(
+        !served(&guarded, &|config| {
+            let index = foreign_rule(config);
+            config["rules"][index]["match"]["port"] = json!(0);
+        }),
+        "removing the invalid rule must not heal the config"
     );
 }
