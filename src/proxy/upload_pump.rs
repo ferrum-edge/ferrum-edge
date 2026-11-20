@@ -637,6 +637,7 @@ struct PumpShared {
     write_armed_wake: tokio::sync::Notify,
     post_eos_drain_disarmed: AtomicBool,
     post_eos_drain_wake: tokio::sync::Notify,
+    primed: AtomicBool,
 }
 
 impl PumpShared {
@@ -649,6 +650,7 @@ impl PumpShared {
             write_armed_wake: tokio::sync::Notify::new(),
             post_eos_drain_disarmed: AtomicBool::new(false),
             post_eos_drain_wake: tokio::sync::Notify::new(),
+            primed: AtomicBool::new(false),
         }
     }
 
@@ -820,6 +822,12 @@ impl Drop for UploadPumpSource {
                 Ordering::AcqRel,
                 Ordering::Acquire,
             );
+        }
+        // If the transport dropped this body without ever taking a single poll,
+        // `arm_write` will never fire; disarm any primed post-EOS wait so the
+        // pump settles immediately instead of parking on `wait_write_armed`.
+        if self.arm_write_on_poll {
+            self.shared.disarm_post_eos_drain();
         }
         // A direct source has no bridge whose close the watcher could observe,
         // so the release is reported to it explicitly, with the same verdict.
@@ -1054,6 +1062,7 @@ impl UploadPumpJoin {
     /// taking a cross-task wakeup for the body. Safe under issue #4074 because
     /// the write watermark is not armed until the transport polls the body.
     pub(crate) fn prime_inline(&mut self) {
+        self.shared.primed.store(true, Ordering::Release);
         let _ = self.settle_inline();
     }
 
@@ -1908,6 +1917,30 @@ where
     // Resolving this future is what tells the join point about the terminal,
     // so a dispatcher woken by `backend_write_watermark_expired` already
     // observes the terminal state, the closed bridge, and a released body.
+    //
+    // If `prime_inline()` pulled an entire single-frame body into the bridge
+    // BEFORE the transport took its first poll of `UploadPumpSource`, the
+    // transport has not had a chance to arm `write_armed` yet. Wait for that
+    // handoff (or cancellation / post-EOS disarm / body drop) so post-EOS
+    // send-queue stall detection (issue #4411) is never bypassed on primed
+    // single-frame uploads.
+    if outcome == UploadPumpOutcome::Completed
+        && write_configured
+        && !write_armed
+        && shared.primed.load(Ordering::Acquire)
+        && socket.get().is_some()
+        && !shared.is_cancelled()
+        && !shared.is_post_eos_drain_disarmed()
+    {
+        tokio::select! {
+            biased;
+            () = shared.wait_cancelled() => {}
+            () = shared.wait_post_eos_drain_disarmed() => {}
+            () = shared.wait_write_armed() => {
+                write_armed = true;
+            }
+        }
+    }
     settle_after_terminal(PostTerminal {
         outcome,
         write_configured,

@@ -591,3 +591,133 @@ async fn cancelled_pump_behind_a_stalled_backend_keeps_the_clients_reset() {
         PUMP_SOURCE_RESET
     );
 }
+
+#[cfg(unix)]
+async fn bound_loopback_socket_handle() -> Option<(
+    tokio::net::TcpListener,
+    tokio::net::TcpStream,
+    Arc<crate::proxy::backend_send_queue::BackendSocketHandle>,
+)> {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.ok()?;
+    let addr = listener.local_addr().ok()?;
+    let stream = tokio::net::TcpStream::connect(addr).await.ok()?;
+    let handle = crate::proxy::backend_send_queue::BackendSocketHandle::duplicate_from(&stream)?;
+    Some((listener, stream, handle))
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn disarm_post_eos_drain_lets_completed_socket_bound_inline_pump_settle_in_place() {
+    let Some((_listener, _stream, socket)) = bound_loopback_socket_handle().await else {
+        return;
+    };
+    let state = Arc::new(BodyState::default());
+    let body = ProbeBody::<std::convert::Infallible> {
+        frames: VecDeque::from([Ok(Frame::data(Bytes::from_static(b"hello world")))]),
+        state: Arc::clone(&state),
+        clean_end: true,
+    };
+    let (mut source, mut join) = spawn_upload_pump(body, None, 5_000, false);
+    join.bind_backend_socket(Some(socket));
+    assert_eq!(join.runs_on_own_task(), Some(false));
+
+    // Advance the pump inline and consume the sole frame so the upload reaches
+    // EOS with `write_armed = true` (entering post-EOS drain watch).
+    let mut cx = Context::from_waker(std::task::Waker::noop());
+    join.prime_inline();
+    let frame = match source.poll_frame(&mut cx) {
+        Poll::Ready(Some(Ok(frame))) => frame,
+        other => panic!("expected primed frame synchronously, got {other:?}"),
+    };
+    assert_eq!(frame.data_ref().unwrap().as_ref(), b"hello world");
+    assert!(source.is_end_stream());
+    drop(source);
+
+    // Without disarming, the socket-bound pump stays live to watch post-EOS
+    // send-queue drain; disarming lets `detach_if_live` settle in place with
+    // zero spawned tasks.
+    assert_eq!(join.runs_on_own_task(), Some(false));
+    join.disarm_post_eos_drain();
+    join.detach_if_live();
+    assert_eq!(
+        join.runs_on_own_task(),
+        None,
+        "disarmed post-EOS inline pump must settle in place without detaching"
+    );
+    assert_eq!(join.join().await, Some(UploadPumpOutcome::Completed));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn prime_inline_preserves_post_eos_write_armed_handoff_for_single_frame_upload() {
+    let Some((_listener, _stream, socket)) = bound_loopback_socket_handle().await else {
+        return;
+    };
+    let body = http_body_util::Full::new(Bytes::from_static(b"single-frame"));
+    let (mut source, mut join) = spawn_upload_pump(body, None, 5_000, false);
+    join.bind_backend_socket(Some(socket));
+
+    // Priming before the transport polls `source` must deliver the frame into
+    // the bridge WITHOUT bypassing the post-EOS `write_armed` handoff — even
+    // when the single frame immediately reports `is_end_stream() == true`.
+    join.prime_inline();
+    assert_eq!(
+        join.runs_on_own_task(),
+        Some(false),
+        "primed single-frame pump must wait for transport write_armed handoff"
+    );
+
+    let mut cx = Context::from_waker(std::task::Waker::noop());
+    let frame = match source.poll_frame(&mut cx) {
+        Poll::Ready(Some(Ok(frame))) => frame,
+        other => panic!("expected primed frame synchronously, got {other:?}"),
+    };
+    assert_eq!(frame.data_ref().unwrap().as_ref(), b"single-frame");
+    assert!(source.is_end_stream());
+    assert!(source.shared.is_write_armed());
+    drop(source);
+
+    // Still waiting on post-EOS drain until disarmed (proving post-EOS watch
+    // was NOT bypassed).
+    assert!(
+        !join.settle_inline(),
+        "post-EOS drain watch must remain active until disarmed or drained"
+    );
+    join.disarm_post_eos_drain();
+    join.detach_if_live();
+    assert_eq!(join.runs_on_own_task(), None);
+    assert_eq!(join.join().await, Some(UploadPumpOutcome::Completed));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn prime_inline_unpolled_source_drop_does_not_hang() {
+    let Some((_listener, _stream, socket)) = bound_loopback_socket_handle().await else {
+        return;
+    };
+    // Non-empty single-frame body: priming places the frame in the 1-slot
+    // bridge and parks on capacity; dropping `source` unpolled reports
+    // `ConsumerGone` immediately.
+    let body = http_body_util::Full::new(Bytes::from_static(b"unpolled"));
+    let (source, mut join) = spawn_upload_pump(body, None, 5_000, false);
+    join.bind_backend_socket(Some(socket.clone()));
+    join.prime_inline();
+    drop(source);
+    let outcome = tokio::time::timeout(Duration::from_secs(1), join.join())
+        .await
+        .expect("join must not hang when unpolled non-empty source is dropped");
+    assert_eq!(outcome, Some(UploadPumpOutcome::ConsumerGone));
+
+    // Empty body: priming immediately observes EOF (`Completed`) and parks on
+    // the primed `write_armed` handoff; dropping `source` unpolled disarms it
+    // and resolves immediately.
+    let empty_body = http_body_util::Full::new(Bytes::new());
+    let (empty_source, mut empty_join) = spawn_upload_pump(empty_body, None, 5_000, false);
+    empty_join.bind_backend_socket(Some(socket));
+    empty_join.prime_inline();
+    drop(empty_source);
+    let empty_outcome = tokio::time::timeout(Duration::from_secs(1), empty_join.join())
+        .await
+        .expect("join must not hang when unpolled empty source is dropped");
+    assert_eq!(empty_outcome, Some(UploadPumpOutcome::Completed));
+}

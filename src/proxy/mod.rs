@@ -56056,9 +56056,19 @@ async fn proxy_to_backend_direct_h1(
             });
         // Deadline-first, unlike the checkout: the request is already enqueued,
         // so an elapsed bound must win an exact tie with the response head.
-        let bounded = await_upload_write_watermark_first(
+        // Disarm the post-EOS send-queue drain watch whenever this attempt will
+        // not be replayed on a fresh connection, so a completed inline pump
+        // settles in place instead of detaching a 100ms `SIOCOUTQ` probe task.
+        let bounded = await_upload_write_watermark_first_disarming_post_eos(
             crate::plugins::await_deadline_first(handoff_bound.at, send_fut),
             upload_pump.as_mut(),
+            |res| {
+                !matches!(
+                    res,
+                    Ok((Err(try_err), _))
+                        if reused && !replayed_idle_race && try_err.message().is_some()
+                )
+            },
         )
         .await;
         let write_watermark_expired = bounded.is_err();
@@ -60040,12 +60050,34 @@ pub(crate) async fn optional_sleep_elapsed(sleep: std::pin::Pin<&mut Option<toki
 /// so a caller that goes on to await the response body, join the pump later,
 /// or race it again never leaves it unpolled. Cancellation (dropping this
 /// future) leaves the pump inside the join, whose `Drop` does the same.
-pub(crate) async fn await_upload_write_watermark_first<F>(
+pub(crate) fn await_upload_write_watermark_first<'a, F>(
+    fut: F,
+    pump: Option<&'a mut upload_pump::UploadPumpJoin>,
+) -> impl std::future::Future<Output = Result<F::Output, ()>> + 'a
+where
+    F: std::future::Future + 'a,
+{
+    await_upload_write_watermark_first_disarming_post_eos(fut, pump, |_| false)
+}
+
+/// Like [`await_upload_write_watermark_first`], and when `should_disarm` holds
+/// for the resolved output (or the write watermark itself expired), disarms the
+/// pump's post-EOS kernel send-queue drain watch before [`UploadPumpJoin::detach_if_live`].
+///
+/// Use this at single-wait call sites where no subsequent watermark race will
+/// observe a post-EOS drain timeout (for example after HTTP/1.1 response
+/// headers arrive without an idle-race replay, or after direct-H2's final
+/// upload gate). A completed inline pump then settles in place without
+/// spawning a detached 100ms `SIOCOUTQ` probe task, while an upload still
+/// streaming frames detaches normally.
+async fn await_upload_write_watermark_first_disarming_post_eos<F, P>(
     fut: F,
     pump: Option<&mut upload_pump::UploadPumpJoin>,
+    should_disarm: P,
 ) -> Result<F::Output, ()>
 where
     F: std::future::Future,
+    P: FnOnce(&F::Output) -> bool,
 {
     let Some(pump) = pump else {
         return Ok(fut.await);
@@ -60071,12 +60103,13 @@ where
         output = &mut fut => Ok(output),
         () = pump.backend_write_watermark_expired() => Err(()),
     };
-    // The response-header wait is over, so no observer remains for the
-    // post-EOS kernel send-queue drain watch. Disarming it before
-    // `detach_if_live` lets an already-completed inline pump settle in place
-    // instead of spawning a task that sleeps 100ms to probe `SIOCOUTQ`. An
-    // upload still streaming frames is unaffected and detaches normally.
-    pump.disarm_post_eos_drain();
+    let disarm = match &raced {
+        Ok(output) => should_disarm(output),
+        Err(()) => true,
+    };
+    if disarm {
+        pump.disarm_post_eos_drain();
+    }
     pump.detach_if_live();
     raced
 }
@@ -60309,7 +60342,12 @@ where
     Fut: std::future::Future<Output = A>,
 {
     loop {
-        let outcome = await_upload_write_watermark_first(attempt(builder), pump.as_mut()).await?;
+        let outcome = await_upload_write_watermark_first_disarming_post_eos(
+            attempt(builder),
+            pump.as_mut(),
+            |_| true,
+        )
+        .await?;
         if !should_replay(&outcome) {
             return Ok(outcome);
         }
@@ -66676,11 +66714,13 @@ async fn proxy_to_backend_http2(
     // never observes the pump's terminal error. Without this arm a configured
     // `backend_write_timeout_ms` was invisible until `backend_read_timeout_ms`
     // expired (#4055).
+    let disarm_after_headers = body_completion_rx.is_none();
     let mut header_write_watermark_expired = false;
     let response = if let Some((deadline, deadline_source)) = header_deadline {
-        let bounded = await_upload_write_watermark_first(
+        let bounded = await_upload_write_watermark_first_disarming_post_eos(
             crate::plugins::await_deadline_first(Some(deadline), h2_send_fut),
             upload_pump.as_mut(),
+            |_| disarm_after_headers,
         )
         .await;
         // A send failure observed at/after the header bound, before its timer
@@ -66777,7 +66817,12 @@ async fn proxy_to_backend_http2(
             }
         }
     } else {
-        let bounded = await_upload_write_watermark_first(h2_send_fut, upload_pump.as_mut()).await;
+        let bounded = await_upload_write_watermark_first_disarming_post_eos(
+            h2_send_fut,
+            upload_pump.as_mut(),
+            |_| disarm_after_headers,
+        )
+        .await;
         match bounded {
             Ok(Ok(resp)) => Some(resp),
             Ok(Err(e)) => return map_h2_err(e),
@@ -66852,9 +66897,10 @@ async fn proxy_to_backend_http2(
         );
         let outcome = match upload_bound {
             Some((upload_deadline, bound_kind)) => {
-                let joined = await_upload_write_watermark_first(
+                let joined = await_upload_write_watermark_first_disarming_post_eos(
                     crate::plugins::await_deadline_first(Some(upload_deadline), body_completion_rx),
                     upload_pump.as_mut(),
+                    |_| true,
                 )
                 .await;
                 match joined {
@@ -66955,9 +67001,12 @@ async fn proxy_to_backend_http2(
             // the connection drops. Do not add a hidden floor here — that would
             // silently break the documented contract.
             None => {
-                let joined =
-                    await_upload_write_watermark_first(body_completion_rx, upload_pump.as_mut())
-                        .await;
+                let joined = await_upload_write_watermark_first_disarming_post_eos(
+                    body_completion_rx,
+                    upload_pump.as_mut(),
+                    |_| true,
+                )
+                .await;
                 match joined {
                     Ok(received) => received.ok(),
                     Err(()) => None,
