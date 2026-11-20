@@ -18,9 +18,9 @@ governed docs) does not fit a smaller worker.
 
 **Guard: do not use this skill when you are yourself a dispatched worker.** If the session prompt
 references this skill's `agent-brief.md` or `continuation-brief.md`, says "YOU are the implementer,"
-or assigns an existing worktree and findings to fix, implement directly in the current session.
-Do not recursively dispatch another Qwen3.8 Max, opencode, Grok, Sol, Opus, Fable, or Composer
-worker. The orchestrator selected this session's model deliberately.
+or assigns an existing worktree and findings to fix, implement directly in the current session. Do
+not recursively dispatch another Qwen3.8 Max, opencode, Sol, or Opus worker. The orchestrator
+selected this session's model deliberately.
 
 ## Remote CI validation
 
@@ -117,15 +117,14 @@ the user sets a lower limit.
 Every prompt must contain this role instruction even though the briefs repeat it:
 
 ```text
-YOU are the implementer. Complete every task and validation the controller assigns before ending.
-Do not stop at analysis, partial implementation, or a handoff for someone else to finish. Perform
+YOU are the implementer. Complete every task and validation the controller assigns before ending. Do
+not stop at analysis, partial implementation, or a handoff for someone else to finish. Perform
 commit, push, PR, review, and CI actions only when the prompt assigns them. Do not request or wait
 for a separate review-bot pass unless explicitly assigned. After the final requested push and
 report, exit; the controller owns post-push CI and review monitoring. Do not invoke agent-dispatch
-skills or scripts (including astra-agents, sol-agents, luna-agents, opus-agents, fable-5-1-agents,
-grok-agents, muse-agents, composer-agents, qwen-agents, deepseek-pro-agents, deepseek-flash-agents,
-opencode-laguna-agents, or any .agents/skills/*/scripts/dispatch-agent.sh), and do not spawn nested
-workers.
+skills or scripts (including astra-agents, sol-agents, opus-agents, muse-agents, qwen-agents,
+deepseek-flash-agents, antigravity-neon-agents, or any .agents/skills/*/scripts/dispatch-agent.sh),
+and do not spawn nested workers.
 ```
 
 This prevents a worker from replacing the selected model through nested delegation.

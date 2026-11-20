@@ -1,35 +1,36 @@
 ---
-name: luna-agents
-description: Dispatch and orchestrate GPT-6 Luna CLI subagents (low|medium|high|xhigh|max effort) for Ferrum Edge issue, PR, review-feedback, CI-repair, and shepherding work. Use when the user asks Claude to delegate to GPT-6 Luna workers. Do not use when you are a dispatched worker or for ordinary single-agent edits.
+name: antigravity-neon-agents
+description: Dispatch and orchestrate local Gemini 4 Neon subagents via the standalone Google Antigravity agy CLI harness for ferrum-edge issue/PR work — implementer, fix-round, shepherd, and read-only reviewer modes, with low/medium/high/xhigh thinking (default high), worktree isolation, and the review loop. Use when the user asks Claude to spawn Antigravity, agy, Gemini, or Gemini 4 Neon agents on issues, PRs, review findings, red CI, or an independent PR review.
 ---
 
-# GPT-6 Luna agents
+# Antigravity Gemini 4 Neon agents
 
 Act as the orchestrator. Read and follow the shared workflow in
-[the canonical skill](../../../.agents/skills/luna-agents/SKILL.md), interpreting its Codex
-orchestrator role as your Claude orchestrator role. Use the shared launcher and references;
+[the canonical skill](../../../.agents/skills/antigravity-neon-agents/SKILL.md), interpreting its
+Codex orchestrator role as your Claude orchestrator role. Use the shared launcher and references;
 do not duplicate them in this directory.
 
 ```bash
-<ABS_REPO>/.agents/skills/luna-agents/scripts/dispatch-agent.sh \
+<ABS_REPO>/.agents/skills/antigravity-neon-agents/scripts/dispatch-agent.sh \
   --worktree <ABS_WORKER_WORKTREE> \
   --prompt-file <ABS_PROMPT_FILE> \
-  --effort <low|medium|high|xhigh|max>
+  --effort <low|medium|high|xhigh>
 ```
 
-Append `--fast` only when the user explicitly requests fast mode for that dispatch or fleet.
-The shared launcher pins `gpt-6-luna`.
-It selects `service_tier="fast"` and `features.fast_mode=true` only with `--fast`; standard mode
-uses `service_tier="default"`.
+The launcher pins `gemini-4-neon` and passes `--effort` straight through as `agy --effort`
+(default `high`). Gemini 4 Neon publishes only `low`, `medium`, `high`, and `xhigh`; the launcher
+rejects `max` and `ultra` rather than clamping, and there is no fast tier or `--fast` flag.
 
-Read the canonical skill before dispatch for effort selection, preflight, isolation, failure
+Read the canonical skill before dispatch for preflight, isolation, prompt construction, failure
 handling, and verification. For implementer mode, read
-[agent-brief.md](../../../.agents/skills/luna-agents/references/agent-brief.md).
+[agent-brief.md](../../../.agents/skills/antigravity-neon-agents/references/agent-brief.md).
 For fix-round or shepherd mode, also read
-[continuation-brief.md](../../../.agents/skills/luna-agents/references/continuation-brief.md).
+[continuation-brief.md](../../../.agents/skills/antigravity-neon-agents/references/continuation-brief.md).
 Resolve all worker paths to absolute paths. Run each worker in its own background or long-lived
-execution session and retain that session's identity. Honor the user's selected effort without
-clamping or substituting. Never recursively invoke this skill from a dispatched worker.
+execution session and retain that session's identity. Never recursively invoke this skill from a
+dispatched worker.
+A worker that exits claiming it is "waiting on monitor" has ended its turn; treat every exit as a
+completion and verify its state.
 
 ## Remote CI validation
 
