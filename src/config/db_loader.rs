@@ -113,6 +113,56 @@ pub(crate) fn rewrite_query_placeholders(db_type: &str, sql: &str) -> String {
     result
 }
 
+/// SQL text Ferrum authored, rewritten for the target dialect.
+///
+/// SQLx 0.9 takes query text only as a `&'static str` or behind an explicit
+/// [`sqlx::AssertSqlSafe`]. This type is the SQL backend's single assertion
+/// point for the dynamic SQL it builds, so every constructor must uphold the
+/// invariant: the text is assembled only from SQL literals, `?` placeholder
+/// lists, numeric limits, dialect fragments chosen by `db_type`, and table or
+/// column identifiers taken from fixed allowlists (or from database metadata
+/// that was validated as a plain identifier). Request, stored, or other
+/// operator data is never formatted into it; it is bound with `.bind()`.
+#[derive(Debug, Clone)]
+pub(crate) struct FerrumSql(String);
+
+impl FerrumSql {
+    /// Rewrite `?` placeholders for `db_type` (see
+    /// [`rewrite_query_placeholders`]) and mark the result as Ferrum-authored
+    /// SQL under the type-level invariant above.
+    pub(crate) fn for_dialect(db_type: &str, sql: &str) -> Self {
+        Self(rewrite_query_placeholders(db_type, sql))
+    }
+}
+
+impl std::ops::Deref for FerrumSql {
+    type Target = str;
+
+    fn deref(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for FerrumSql {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl sqlx::SqlSafeStr for FerrumSql {
+    fn into_sql_str(self) -> sqlx::SqlStr {
+        sqlx::SqlSafeStr::into_sql_str(sqlx::AssertSqlSafe(self.0))
+    }
+}
+
+/// Lets one built statement be reused (`sqlx::query(&sql)` in a loop); each
+/// use copies the text into the query.
+impl sqlx::SqlSafeStr for &FerrumSql {
+    fn into_sql_str(self) -> sqlx::SqlStr {
+        sqlx::SqlSafeStr::into_sql_str(sqlx::AssertSqlSafe(self.0.as_str()))
+    }
+}
+
 /// Database-side "now" in epoch milliseconds. Lease expiry is always compared
 /// against the datastore's own clock, never a process clock.
 pub(crate) fn config_admission_lease_now_sql(db_type: &str) -> &'static str {
@@ -126,11 +176,13 @@ pub(crate) fn config_admission_lease_now_sql(db_type: &str) -> &'static str {
 /// Conditional lease acquisition: takes the row only when it is unowned,
 /// expired, or already owned by this owner. It never steals an unexpired
 /// owner's lease, and it bumps `generation` on every ownership change.
-pub(crate) fn config_admission_lease_acquire_sql(db_type: &str) -> String {
+pub(crate) fn config_admission_lease_acquire_sql(db_type: &str) -> FerrumSql {
     let now = config_admission_lease_now_sql(db_type);
     match db_type {
-        "mysql" => format!(
-            "INSERT INTO config_admission_locks \
+        "mysql" => FerrumSql::for_dialect(
+            db_type,
+            &format!(
+                "INSERT INTO config_admission_locks \
              (namespace, owner, expires_at, generation) VALUES (?, ?, {now} + ?, 1) \
              ON DUPLICATE KEY UPDATE \
              generation = IF(\
@@ -139,8 +191,9 @@ pub(crate) fn config_admission_lease_acquire_sql(db_type: &str) -> String {
                  generation), \
              owner = IF(expires_at <= {now} OR owner = VALUES(owner), VALUES(owner), owner), \
              expires_at = IF(owner = VALUES(owner), VALUES(expires_at), expires_at)"
+            ),
         ),
-        _ => rewrite_query_placeholders(
+        _ => FerrumSql::for_dialect(
             db_type,
             &format!(
                 "INSERT INTO config_admission_locks \
@@ -637,7 +690,7 @@ pub struct DbPoolConfig {
     /// connect, failover, replica, reconnect, migrate). Default: 10.
     ///
     /// Enforced by [`await_pool_connect_with_timeout`] around sqlx
-    /// `AnyPoolOptions::connect` — sqlx 0.8's native PG/MySQL drivers ignore a
+    /// `AnyPoolOptions::connect` — sqlx's native PG/MySQL drivers (still in 0.9.1) ignore a
     /// `connect_timeout` URL query parameter, so Ferrum must bound the future
     /// itself. Separate from [`Self::acquire_timeout_seconds`], which still
     /// covers in-pool checkout wait + connect. `0` disables the bound.
@@ -1116,43 +1169,43 @@ impl DatabaseStore {
     /// causes a parse error.
     ///
     /// This method is a no-op for MySQL and SQLite (which use `?` natively).
-    fn q(&self, sql: &str) -> String {
-        rewrite_query_placeholders(&self.db_type, sql)
+    /// Dialect-rewritten, Ferrum-authored SQL; see [`FerrumSql`] for what
+    /// `sql` may contain.
+    fn q(&self, sql: &str) -> FerrumSql {
+        FerrumSql::for_dialect(&self.db_type, sql)
     }
 
-    fn proxy_route_lock_insert_sql(&self) -> String {
+    fn proxy_route_lock_insert_sql(&self) -> FerrumSql {
         match self.db_type.as_str() {
             // Same S->X upgrade trap as config_change_locks / mTLS DNS
             // admission: INSERT IGNORE takes a shared duplicate-key lock, then
             // SELECT ... FOR UPDATE upgrades it. Prefer the no-op upsert so
             // MySQL holds the exclusive row lock up front.
-            "mysql" => MYSQL_PROXY_ROUTE_LOCK_INSERT_SQL.to_string(),
-            "sqlite" => "INSERT OR IGNORE INTO proxy_route_locks \
-                 (namespace, route_key_hash, created_at) VALUES (?, ?, ?)"
-                .to_string(),
+            "mysql" => self.q(MYSQL_PROXY_ROUTE_LOCK_INSERT_SQL),
+            "sqlite" => self.q("INSERT OR IGNORE INTO proxy_route_locks \
+                 (namespace, route_key_hash, created_at) VALUES (?, ?, ?)"),
             _ => self.q("INSERT INTO proxy_route_locks \
                  (namespace, route_key_hash, created_at) VALUES (?, ?, ?) \
                  ON CONFLICT (namespace, route_key_hash) DO NOTHING"),
         }
     }
 
-    fn config_change_lock_insert_sql(&self) -> String {
+    fn config_change_lock_insert_sql(&self) -> FerrumSql {
         match self.db_type.as_str() {
             // Each namespace owns its own lock row. INSERT IGNORE + FOR UPDATE
             // deadlocks on the S->X upgrade under concurrent first-writers of
             // the same namespace; the no-op upsert acquires the exclusive lock
             // immediately.
-            "mysql" => MYSQL_CONFIG_CHANGE_LOCK_INSERT_SQL.to_string(),
-            "sqlite" => "INSERT OR IGNORE INTO config_change_locks \
-                 (lock_name, updated_at) VALUES (?, ?)"
-                .to_string(),
+            "mysql" => self.q(MYSQL_CONFIG_CHANGE_LOCK_INSERT_SQL),
+            "sqlite" => self.q("INSERT OR IGNORE INTO config_change_locks \
+                 (lock_name, updated_at) VALUES (?, ?)"),
             _ => self.q("INSERT INTO config_change_locks \
                  (lock_name, updated_at) VALUES (?, ?) \
                  ON CONFLICT (lock_name) DO NOTHING"),
         }
     }
 
-    fn config_admission_lease_acquire_sql(&self) -> String {
+    fn config_admission_lease_acquire_sql(&self) -> FerrumSql {
         config_admission_lease_acquire_sql(&self.db_type)
     }
 
@@ -1160,7 +1213,7 @@ impl DatabaseStore {
         config_admission_lease_now_sql(&self.db_type)
     }
 
-    fn config_admission_lease_renew_sql(&self) -> String {
+    fn config_admission_lease_renew_sql(&self) -> FerrumSql {
         let now = self.config_admission_lease_now_sql();
         self.q(&format!(
             "UPDATE config_admission_locks SET expires_at = {now} + ? \
@@ -1168,36 +1221,33 @@ impl DatabaseStore {
         ))
     }
 
-    fn mtls_dns_admission_lock_insert_sql(&self) -> String {
+    fn mtls_dns_admission_lock_insert_sql(&self) -> FerrumSql {
         match self.db_type.as_str() {
             // INSERT IGNORE takes a shared duplicate-key lock before the
             // SELECT ... FOR UPDATE below tries to upgrade it. Two contenders
             // can deadlock on that S->X upgrade. The no-op duplicate-key UPDATE
             // acquires the row exclusively up front, so same-namespace writers
             // serialize before the SELECT instead of mutually upgrading.
-            "mysql" => MYSQL_MTLS_DNS_ADMISSION_LOCK_INSERT_SQL.to_string(),
-            "sqlite" => "INSERT OR IGNORE INTO mtls_dns_admission_locks \
-                 (namespace, updated_at) VALUES (?, ?)"
-                .to_string(),
+            "mysql" => self.q(MYSQL_MTLS_DNS_ADMISSION_LOCK_INSERT_SQL),
+            "sqlite" => self.q("INSERT OR IGNORE INTO mtls_dns_admission_locks \
+                 (namespace, updated_at) VALUES (?, ?)"),
             _ => self.q("INSERT INTO mtls_dns_admission_locks \
                  (namespace, updated_at) VALUES (?, ?) \
                  ON CONFLICT (namespace) DO NOTHING"),
         }
     }
-    fn config_change_retention_upsert_sql(&self) -> String {
+    fn config_change_retention_upsert_sql(&self) -> FerrumSql {
         match self.db_type.as_str() {
-            "mysql" => "INSERT INTO config_change_retention \
+            "mysql" => self.q("INSERT INTO config_change_retention \
                  (namespace, retained_sequence, updated_at) VALUES (?, ?, ?) \
                  ON DUPLICATE KEY UPDATE \
                  retained_sequence = GREATEST(retained_sequence, VALUES(retained_sequence)), \
-                 updated_at = VALUES(updated_at)"
-                .to_string(),
-            "sqlite" => "INSERT INTO config_change_retention \
+                 updated_at = VALUES(updated_at)"),
+            "sqlite" => self.q("INSERT INTO config_change_retention \
                  (namespace, retained_sequence, updated_at) VALUES (?, ?, ?) \
                  ON CONFLICT (namespace) DO UPDATE SET \
                  retained_sequence = max(config_change_retention.retained_sequence, excluded.retained_sequence), \
-                 updated_at = excluded.updated_at"
-                .to_string(),
+                 updated_at = excluded.updated_at"),
             _ => self.q("INSERT INTO config_change_retention \
                  (namespace, retained_sequence, updated_at) VALUES (?, ?, ?) \
                  ON CONFLICT (namespace) DO UPDATE SET \
@@ -1210,7 +1260,7 @@ impl DatabaseStore {
         &self,
         listen_path: Option<&str>,
         exclude_id: Option<&str>,
-    ) -> String {
+    ) -> FerrumSql {
         let path_filter = if listen_path.is_some() {
             "listen_path = ?"
         } else {
@@ -1949,13 +1999,14 @@ impl DatabaseStore {
                     if let Some(sql) =
                         statement_timeout_sql(statement_timeout_seconds, is_postgres, is_mysql)
                     {
-                        conn.execute(sql.as_str()).await?;
+                        conn.execute(sqlx::AssertSqlSafe(sql)).await?;
                     }
                     // MySQL only: `max_execution_time` above does not bound a
                     // write blocked on another transaction's row lock, which is
                     // the zombie-lock pileup in issue #4146.
+                    // Same integer-only interpolation as above.
                     if let Some(sql) = lock_wait_timeout_sql(statement_timeout_seconds, is_mysql) {
-                        conn.execute(sql.as_str()).await?;
+                        conn.execute(sqlx::AssertSqlSafe(sql)).await?;
                     }
                     Ok(())
                 })
@@ -12264,7 +12315,7 @@ impl DatabaseStore {
         Ok((total, hit_batch_budget))
     }
 
-    fn audit_age_delete_sql(&self) -> String {
+    fn audit_age_delete_sql(&self) -> FerrumSql {
         let batch = crate::admin::audit::AUDIT_RETENTION_PRUNE_BATCH_SIZE;
         match self.db_type.as_str() {
             "postgres" => self.q(&format!(
@@ -12275,24 +12326,24 @@ impl DatabaseStore {
                      LIMIT {batch}\
                  )"
             )),
-            "sqlite" => format!(
+            "sqlite" => self.q(&format!(
                 "DELETE FROM audit_events WHERE rowid IN (\
                      SELECT rowid FROM audit_events \
                      WHERE namespace = ? AND ts < ? \
                      ORDER BY ts ASC, id ASC \
                      LIMIT {batch}\
                  )"
-            ),
-            _ => format!(
+            )),
+            _ => self.q(&format!(
                 "DELETE FROM audit_events \
                  WHERE namespace = ? AND ts < ? \
                  ORDER BY ts ASC, id ASC \
                  LIMIT {batch}"
-            ),
+            )),
         }
     }
 
-    fn audit_max_rows_delete_sql(&self) -> String {
+    fn audit_max_rows_delete_sql(&self) -> FerrumSql {
         let batch = crate::admin::audit::AUDIT_RETENTION_PRUNE_BATCH_SIZE;
         // Include the boundary row itself: it is the first excess event under
         // newest-first OFFSET max_rows, so `(ts, id) <= boundary` is correct.
@@ -12305,20 +12356,20 @@ impl DatabaseStore {
                      LIMIT {batch}\
                  )"
             )),
-            "sqlite" => format!(
+            "sqlite" => self.q(&format!(
                 "DELETE FROM audit_events WHERE rowid IN (\
                      SELECT rowid FROM audit_events \
                      WHERE namespace = ? AND (ts < ? OR (ts = ? AND id <= ?)) \
                      ORDER BY ts ASC, id ASC \
                      LIMIT {batch}\
                  )"
-            ),
-            _ => format!(
+            )),
+            _ => self.q(&format!(
                 "DELETE FROM audit_events \
                  WHERE namespace = ? AND (ts < ? OR (ts = ? AND id <= ?)) \
                  ORDER BY ts ASC, id ASC \
                  LIMIT {batch}"
-            ),
+            )),
         }
     }
 

@@ -643,12 +643,14 @@ async fn corrupt_proxy_columns_reject_the_row_instead_of_defaulting() {
             .load_full_config("ferrum")
             .await
             .expect("an intact row loads");
-        sqlx::query(&format!("UPDATE proxies SET {column} = ? WHERE id = ?"))
-            .bind(value)
-            .bind("cols-7192")
-            .execute(&store.pool())
-            .await
-            .unwrap();
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "UPDATE proxies SET {column} = ? WHERE id = ?"
+        )))
+        .bind(value)
+        .bind("cols-7192")
+        .execute(&store.pool())
+        .await
+        .unwrap();
 
         let error = store
             .load_full_config("ferrum")
@@ -4349,12 +4351,14 @@ async fn row_decode_diagnostics_withhold_ids_in_outer_and_inner_reasons() {
             }
             _ => unreachable!(),
         }
-        sqlx::query(&format!("UPDATE {table} SET {column} = ? WHERE id = ?"))
-            .bind(malformed)
-            .bind(token)
-            .execute(&store.pool())
-            .await
-            .unwrap();
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "UPDATE {table} SET {column} = ? WHERE id = ?"
+        )))
+        .bind(malformed)
+        .bind(token)
+        .execute(&store.pool())
+        .await
+        .unwrap();
         let error = store.load_full_config("ferrum").await.unwrap_err();
         assert!(ferrum_edge::_test_support::is_row_decode_rejection(&error));
         let rendered = ferrum_edge::startup::render_startup_error(error, &[]);

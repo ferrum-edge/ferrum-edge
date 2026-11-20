@@ -339,7 +339,7 @@ impl V001SqlBuilder {
     async fn execute_index_sql(
         &self,
         connection: &mut AnyConnection,
-        idx_sql: &str,
+        idx_sql: &'static str,
     ) -> Result<(), anyhow::Error> {
         if self.is_mysql() {
             // MySQL does not reliably support CREATE INDEX IF NOT EXISTS, so we
@@ -347,8 +347,9 @@ impl V001SqlBuilder {
             // 1061 (ER_DUP_KEYNAME: the index already exists). Matching the
             // error text instead would also accept any failure whose message
             // happens to contain "1061" and record V001 with an index missing.
-            let mysql_sql = idx_sql.replace("IF NOT EXISTS ", "");
-            if let Err(e) = sqlx::query(&mysql_sql).execute(&mut *connection).await
+            // Derived only from the static index DDL above.
+            let mysql_sql = sqlx::AssertSqlSafe(idx_sql.replace("IF NOT EXISTS ", ""));
+            if let Err(e) = sqlx::query(mysql_sql).execute(&mut *connection).await
                 && !mysql_create_index_exists_is_benign(mysql_error_number(&e))
             {
                 return Err(e.into());

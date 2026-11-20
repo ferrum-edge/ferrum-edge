@@ -718,8 +718,10 @@ async fn insert_batch(
         .await
         .map_err(|e| format!("example_audit_plugin batch transaction failed: {e}"))?;
     for chunk in batch.chunks(INSERT_MAX_ROWS_PER_STATEMENT) {
-        let insert_sql = dialect.insert_sql(chunk.len());
-        let mut query = sqlx::query(&insert_sql);
+        // Built only from the fixed table name and positional placeholders;
+        // every value is bound below.
+        let insert_sql = sqlx::AssertSqlSafe(dialect.insert_sql(chunk.len()));
+        let mut query = sqlx::query(insert_sql);
         for record in chunk {
             query = query
                 .bind(&record.id)
@@ -771,7 +773,12 @@ async fn run_retention(store: Arc<GatewayAuditStore>, retention_days: u64) {
             .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
         let mut total_deleted: u64 = 0;
         loop {
-            match sqlx::query(&delete_sql).bind(&cutoff).execute(pool).await {
+            // Fixed table name and chunk size; the cutoff is bound.
+            match sqlx::query(sqlx::AssertSqlSafe(delete_sql.as_str()))
+                .bind(&cutoff)
+                .execute(pool)
+                .await
+            {
                 Ok(result) => {
                     let deleted = result.rows_affected();
                     total_deleted = total_deleted.saturating_add(deleted);

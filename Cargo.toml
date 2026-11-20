@@ -167,7 +167,12 @@ memchr = "2"
 # Database
 # `runtime-tokio-rustls` is deliberately NOT used: it hard-wires
 # `tls-rustls-ring`. The TLS arm comes from `crypto-ring` / `fips` instead.
-sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "mysql", "sqlite", "chrono", "json"] }
+# `mysql-rsa` keeps MySQL `caching_sha2_password` / `sha256_password` working
+# over a non-TLS link: SQLx 0.9 makes the RSA password exchange optional and
+# fails that login at runtime without it. `sqlite-bundled` +
+# `sqlite-unlock-notify` replace the `sqlite` umbrella, which would also enable
+# `sqlite-load-extension` and `sqlite-deserialize`; Ferrum uses neither.
+sqlx = { version = "0.9", features = ["runtime-tokio", "postgres", "mysql", "mysql-rsa", "sqlite-bundled", "sqlite-unlock-notify", "chrono", "json"] }
 
 # Logging
 tracing = "0.1"
@@ -744,30 +749,24 @@ ferrum-edge = { path = ".", default-features = false, features = ["test-support"
 # in `fuzz/Cargo.toml` and in `tests/performance/mesh/Cargo.toml`), update the
 # three lockfiles, then drop `vendor/h3-quinn-0.0.10-ferrum-patched/`. See `docs/upstream-h3-quinn-patches/`.
 #
-# We also carry a vendored copy of sqlx-core 0.8.6 whose rustls handshake
-# treats a configured root CA as EXCLUSIVE and accepts rustls 0.23's
-# context-bearing hostname error under `verify-ca`. Upstream unions the
-# configured CA with the ~150 bundled WebPKI roots, so a `verify-ca`
-# connection — which deliberately waives the hostname check — would accept any
-# publicly-trusted certificate for any name; and upstream waives only
-# `CertificateError::NotValidForName`, so `verify-ca` rejects every trusted
-# chain whose SAN does not match once rustls reports
-# `NotValidForNameContext`. The verify-ca WebPKI verifier is also pinned to
-# the provider the handshake already selected, because the provider-less
-# builder panics when both `ring` and `aws-lc-rs` are compiled in and no
-# process default was installed. A gateway-side TLS option cannot reach SQLx
-# Any's internal verifier, and a SQLx 0.9 migration would change the whole
-# database dependency graph for a compatibility fix.
-# The same vendor also corrects Any typed-NULL conversion: REAL binds through
-# Option<f32>, and DOUBLE through Option<f64> (patch 002).
+# We also carry a vendored copy of sqlx-core 0.9.1 whose rustls connector
+# treats a configured root CA as EXCLUSIVE and builds the verify-ca verifier
+# with the provider it already selected. Upstream unions the configured CA with
+# the ~150 bundled WebPKI roots, so a `verify-ca` connection — which
+# deliberately waives the hostname check — would accept any publicly-trusted
+# certificate for any name. The provider-less verifier builder upstream uses
+# panics when both `ring` and `aws-lc-rs` are compiled in and no process
+# default was installed. A gateway-side TLS option cannot reach SQLx Any's
+# internal verifier. (The rustls context-bearing hostname-error waiver and the
+# Any typed-NULL float fix this vendor carried on 0.8.6 are upstream in 0.9.1.)
 #
 # Retirement plan: when a compatible SQLx release treats a configured root CA
-# as exclusive and handles both rustls hostname-error variants while keeping
-# chain, validity, and signature verification, and preserves native REAL/DOUBLE
-# typed-NULL parameter types, remove the `[patch.crates-io]` line (here, in
-# `fuzz/Cargo.toml` and in `tests/performance/mesh/Cargo.toml`), update the three
-# lockfiles, then drop `vendor/sqlx-core-0.8.6-ferrum-patched/` and update the drift
-# manifest. See `docs/upstream-sqlx-patches/` for both retirement plans.
+# as exclusive and builds the verify-ca verifier with the selected provider
+# while keeping chain, validity, and signature verification, remove the
+# `[patch.crates-io]` line (here, in `fuzz/Cargo.toml` and in
+# `tests/performance/mesh/Cargo.toml`), update the three lockfiles, then drop
+# `vendor/sqlx-core-0.9.1-ferrum-patched/` and update the drift manifest. See
+# `docs/upstream-sqlx-patches/001-verify-ca-name-context/README.md`.
 #
 # We also carry a vendored copy of hyper-util 0.1.21 whose legacy client stops
 # holding an HTTP/1 connection's only request sender once that connection's
@@ -826,7 +825,7 @@ ferrum-edge = { path = ".", default-features = false, features = ["test-support"
 # the three lockfiles and the drift manifest. See
 # `docs/upstream-h2-patches/001-coalesce-data-frame-writes/README.md`.
 [patch.crates-io]
-sqlx-core = { path = "vendor/sqlx-core-0.8.6-ferrum-patched" }
+sqlx-core = { path = "vendor/sqlx-core-0.9.1-ferrum-patched" }
 reqwest = { path = "vendor/reqwest-0.13.4-ferrum-patched" }
 h3 = { path = "vendor/h3-0.0.8-ferrum-patched" }
 h3-quinn = { path = "vendor/h3-quinn-0.0.10-ferrum-patched" }
