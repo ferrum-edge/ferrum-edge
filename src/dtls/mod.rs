@@ -337,7 +337,7 @@ pub(crate) async fn frontend_app_ciphertext_send_until_expiry<C, F>(
     send: F,
 ) -> Result<F::Output, FrontendAppSendReject>
 where
-    C: FrontendSendCancel + ?Sized,
+    C: FrontendSendCancel,
     F: std::future::Future,
 {
     let cancelled = match cancel.as_mut() {
@@ -415,7 +415,7 @@ async fn frontend_app_ciphertext_send_until_expiry_and_trust<C, F>(
     send: F,
 ) -> Result<F::Output, FrontendAppSendReject>
 where
-    C: FrontendSendCancel + ?Sized,
+    C: FrontendSendCancel,
     F: std::future::Future,
 {
     frontend_trust_raced_delivery(
@@ -531,6 +531,20 @@ where
     frontend_app_ciphertext_send_until_expiry(deadline, cancel, send).await
 }
 
+/// Pin the production single-`oneshot` (`completion.is_closed()` / `closed()`)
+/// ciphertext `send_to` cancellation race for external hosted tests.
+#[allow(dead_code)] // used through library `_test_support`
+pub(crate) async fn frontend_app_ciphertext_send_with_completion_cancel_for_test<F>(
+    deadline: Option<tokio::time::Instant>,
+    completion: Option<&mut oneshot::Sender<Result<(), String>>>,
+    send: F,
+) -> Result<F::Output, FrontendAppSendReject>
+where
+    F: std::future::Future,
+{
+    frontend_app_ciphertext_send_until_expiry(deadline, completion, send).await
+}
+
 /// Pin the post-registration trust-retirement race used for plaintext
 /// delivery, accept handoff, and UDP writes.
 #[allow(dead_code)] // used through library `_test_support`
@@ -631,20 +645,20 @@ pub struct FrontendDtlsConfig {
 /// Deliberately smaller than the plain-UDP listener's configurable batch; the
 /// batch uses `MaybeUninit<u8>` slots so untouched tail pages stay unfaulted.
 #[cfg(target_os = "linux")]
-const DTLS_INGRESS_CAPTURE_BATCH: usize = 16;
+const DTLS_RECV_BATCH: usize = 16;
 
-/// Datagrams drained per readiness wake-up before `DtlsServer::run` yields back
-/// to the Tokio scheduler and re-enters its `select!`.
+/// Datagrams drained per readiness wake-up (and cumulative datagrams across
+/// wakes) before `DtlsServer::run` yields back to the Tokio scheduler.
 ///
 /// `readable()` and `try_io()` do not consume Tokio cooperative budget and
 /// `dispatch_datagram` is synchronous, so an unbounded inner drain (or looping
 /// back to `readable()` without yielding) would pin a worker thread whenever
 /// the receive queue stays non-empty — starving session drivers, timers, and
 /// shutdown. After draining up to this bound, the Linux loop explicitly yields
-/// (when the limit was hit) or charges cooperative budget before re-entering
-/// `select!`.
+/// whenever cumulative datagrams since the last yield reach this cap (and
+/// charges cooperative budget on shorter ready cycles / transient errors).
 #[cfg(target_os = "linux")]
-const DTLS_INGRESS_CAPTURE_DRAIN_LIMIT: usize = 256;
+const DTLS_RECV_DRAIN_LIMIT: usize = 256;
 
 /// One immutable, accepted frontend DTLS material generation.
 ///
@@ -2977,12 +2991,13 @@ impl DtlsServer {
             use std::os::fd::AsRawFd;
             let ifindex_capture = self.limits.capture_ingress_ifindex;
             let mut recv_batch = crate::proxy::udp_batch::RecvMmsgBatch::new(
-                DTLS_INGRESS_CAPTURE_BATCH,
+                DTLS_RECV_BATCH,
                 // `IP_RECVORIGDSTADDR` is never set on a DTLS frontend socket,
                 // so the orig-dst cmsg scan would always come back empty.
                 false,
             );
             let fd = self.socket.as_raw_fd();
+            let mut since_yield: usize = 0;
             loop {
                 tokio::select! {
                     biased;
@@ -3011,12 +3026,12 @@ impl DtlsServer {
                     return Ok(());
                 }
                 let mut drained: usize = 0;
-                while drained < DTLS_INGRESS_CAPTURE_DRAIN_LIMIT {
+                while drained < DTLS_RECV_DRAIN_LIMIT {
                     if *shutdown_rx.borrow() {
                         return Ok(());
                     }
                     let received = self.socket.try_io(tokio::io::Interest::READABLE, || {
-                        recv_batch.recv(fd, DTLS_INGRESS_CAPTURE_BATCH)
+                        recv_batch.recv(fd, DTLS_RECV_BATCH)
                     });
                     match received {
                         Ok(n) if n > 0 => {
@@ -3047,6 +3062,7 @@ impl DtlsServer {
                                     | std::io::ErrorKind::ConnectionRefused
                                     | std::io::ErrorKind::ConnectionAborted
                                     | std::io::ErrorKind::Interrupted
+                                    | std::io::ErrorKind::InvalidData
                             ) =>
                         {
                             trace!("DTLS server transient recvmmsg error (ignored): {}", e);
@@ -3058,11 +3074,14 @@ impl DtlsServer {
                     }
                 }
                 // `readable()` and `try_io()` do not consume Tokio cooperative
-                // budget. Yield explicitly whenever a full drain cycle hits the
-                // cap (so session drivers, timers, and shutdown cannot be
-                // starved under sustained traffic or floods), and charge coop
-                // budget on every ready cycle / transient error retry.
-                if drained >= DTLS_INGRESS_CAPTURE_DRAIN_LIMIT {
+                // budget. Yield explicitly once cumulative datagrams since the
+                // last yield reach `DTLS_RECV_DRAIN_LIMIT` (so session drivers,
+                // timers, and shutdown cannot be starved even across consecutive
+                // sub-cap wakes), and charge coop budget on shorter ready cycles
+                // / transient error retries.
+                since_yield = since_yield.saturating_add(drained);
+                if since_yield >= DTLS_RECV_DRAIN_LIMIT {
+                    since_yield = 0;
                     tokio::task::yield_now().await;
                 } else {
                     tokio::task::coop::consume_budget().await;
@@ -3404,6 +3423,23 @@ impl DtlsServer {
                 forwarded_client,
             },
         );
+        // Symmetric fence with `DtlsServer::close()`: `close()` calls
+        // `self.shutdown_tx.send_replace(true)` strictly before walking
+        // `self.sessions` to signal each session's lock-free `shutdown_tx`.
+        // Re-checking `self.shutdown_tx.borrow()` after `insert` guarantees
+        // that any session inserted after `close()` walked its shard observes
+        // `true` here and rolls back cleanly without ever spawning, avoiding
+        // any shared `watch` waiter lock in the per-session hot `select!` loop.
+        if *self.shutdown_tx.borrow() {
+            remove_session(
+                &self.sessions,
+                &self.active_sessions,
+                self.limits.active_session_mirror.as_deref(),
+                &peer_addr,
+                generation,
+            );
+            return;
+        }
 
         // Issue #3857: capture the frontend DTLS client-trust generation BEFORE
         // snapshotting the crypto material this session handshakes with. The
@@ -3440,7 +3476,7 @@ impl DtlsServer {
         let handshake_timeout_warn = self.handshake_timeout_warn.clone();
         let handshake_timeouts = self.handshake_timeouts.clone();
         let udp_port_hold = self.udp_port_hold.clone();
-        let mut server_shutdown_rx = self.shutdown_tx.subscribe();
+        let server_shutdown_rx = self.shutdown_tx.subscribe();
 
         tokio::spawn(async move {
             // Held for as long as this driver holds `socket`.
@@ -3457,12 +3493,14 @@ impl DtlsServer {
             // (refused handshake, timeout, socket error, task cancellation).
             let mut per_source_ip_guard = per_source_ip_guard;
 
-            // If listener shutdown raced session spawn before `close()` walked
-            // `sessions`, exit before emitting any handshake flight or holding
-            // the socket / port claim past listener teardown.
+            // Defense in depth alongside the post-insert check in `spawn_session`:
+            // if listener shutdown arrived before this driver started, exit before
+            // emitting any handshake flight, then drop `server_shutdown_rx` so the
+            // per-packet loop polls only this session's lock-free `shutdown_rx`.
             if *server_shutdown_rx.borrow() {
                 return;
             }
+            drop(server_shutdown_rx);
 
             let mut dtls = Dtls::new_auto(config, certificate, Instant::now());
             // Server role (default — is_active=false)
@@ -3535,8 +3573,6 @@ impl DtlsServer {
             tokio::pin!(retransmit_sleep);
             let handshake_sleep = handshake_deadline.map(tokio::time::sleep_until);
             tokio::pin!(handshake_sleep);
-            let server_shutdown_fut = server_shutdown_rx.changed();
-            tokio::pin!(server_shutdown_fut);
 
             loop {
                 // Check the handshake deadline at the top of each iteration so
@@ -3676,13 +3712,6 @@ impl DtlsServer {
                     // queued application replies. Handshake/control records
                     // still drain after the loop.
                     _ = shutdown_rx.recv() => {
-                        fail_queued_frontend_app_sends(
-                            &mut app_in_rx,
-                            auth_deadline.get(),
-                        );
-                        break;
-                    }
-                    _ = &mut server_shutdown_fut => {
                         fail_queued_frontend_app_sends(
                             &mut app_in_rx,
                             auth_deadline.get(),
@@ -5067,74 +5096,6 @@ mod tests {
         assert_ne!(
             before, after,
             "swap_frontend_config must replace the active_config Arc"
-        );
-    }
-
-    #[tokio::test]
-    async fn completion_sender_cancellation_rejects_before_and_during_send() {
-        // Pre-cancelled completion sender never polls `send`.
-        let (mut completion_tx, completion_rx) = oneshot::channel::<Result<(), String>>();
-        drop(completion_rx);
-        let polled = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let polled_flag = Arc::clone(&polled);
-        let res =
-            frontend_app_ciphertext_send_until_expiry(None, Some(&mut completion_tx), async move {
-                polled_flag.store(true, Ordering::SeqCst);
-                Ok::<usize, std::io::Error>(1)
-            })
-            .await;
-        assert_eq!(res.unwrap_err(), FrontendAppSendReject::Cancelled);
-        assert!(
-            !polled.load(Ordering::SeqCst),
-            "already-dropped completion receiver must never poll send"
-        );
-
-        // Dropping completion receiver mid-send deterministically cancels the
-        // parked send future and drops it without completing.
-        struct SignallingPendingSend {
-            polled_tx: Option<oneshot::Sender<()>>,
-            dropped: Arc<std::sync::atomic::AtomicBool>,
-        }
-        impl std::future::Future for SignallingPendingSend {
-            type Output = Result<usize, std::io::Error>;
-            fn poll(
-                mut self: std::pin::Pin<&mut Self>,
-                _cx: &mut std::task::Context<'_>,
-            ) -> std::task::Poll<Self::Output> {
-                if let Some(tx) = self.polled_tx.take() {
-                    let _ = tx.send(());
-                }
-                std::task::Poll::Pending
-            }
-        }
-        impl Drop for SignallingPendingSend {
-            fn drop(&mut self) {
-                self.dropped.store(true, Ordering::SeqCst);
-            }
-        }
-
-        let (mut completion_tx, completion_rx) = oneshot::channel::<Result<(), String>>();
-        let (polled_tx, polled_rx) = oneshot::channel::<()>();
-        let send_dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let send_dropped_flag = Arc::clone(&send_dropped);
-        let handle = tokio::spawn(async move {
-            frontend_app_ciphertext_send_until_expiry(
-                Some(tokio::time::Instant::now() + Duration::from_secs(30)),
-                Some(&mut completion_tx),
-                SignallingPendingSend {
-                    polled_tx: Some(polled_tx),
-                    dropped: send_dropped_flag,
-                },
-            )
-            .await
-        });
-        polled_rx.await.expect("send future entered Pending");
-        drop(completion_rx);
-        let outcome = handle.await.expect("join");
-        assert_eq!(outcome.unwrap_err(), FrontendAppSendReject::Cancelled);
-        assert!(
-            send_dropped.load(Ordering::SeqCst),
-            "cancelling an in-flight send must drop the pending send future"
         );
     }
 }
