@@ -8,6 +8,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Security
+- **SQLx 0.9.1 retires two advisory exceptions.** The database layer now
+  resolves `libsqlite3-sys` 0.40.0 (bundled SQLite >= 3.54.0), which fixes
+  RUSTSEC-2026-0459 / CVE-2026-119375, and `rsa` 0.10.0 (MySQL RSA password
+  exchange), which RustSec lists as patched for RUSTSEC-2023-0071. Both
+  `deny.toml` exceptions are removed in the root, `fuzz/` and
+  `tests/performance/mesh/` lockfiles.
 - **CNI ADD no longer lets an opted-in pod start uncaptured**
   (GHSA-7x6j-vmqm-xx2v). With the chained `ferrum-cni` conflist, ADD was
   acknowledged when the node-agent could not read the pod from the Kubernetes
@@ -522,6 +528,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `test-support` feature.
 
 ### Changed
+- **SQLx moves from 0.8.6 to 0.9.1.** The vendored `sqlx-core` is rebased on
+  the 0.9.1 crate and keeps only Ferrum patch 001's exclusive configured root
+  CA and provider-pinned verify-ca verifier; the rustls hostname-error waiver
+  (patch 001 change 3) and the Any typed-NULL float fix (patch 002) are
+  upstream in 0.9.1 and retire. Dynamic SQL is passed to SQLx through
+  `sqlx::AssertSqlSafe`, asserted once in the SQL backend's dialect helper.
+  Behaviour that changes with the driver, for operators:
+  - MySQL: the connection now sends `SET NAMES utf8mb4` without a collation,
+    so the server default collation for `utf8mb4` applies to the session
+    (previously `utf8mb4_unicode_ci`). Ferrum's identity columns declare
+    `COLLATE utf8mb4_0900_bin`, so uniqueness and ordering are unchanged; set
+    `collation=` in `FERRUM_DB_URL` to pin a session collation.
+  - MySQL: `caching_sha2_password` / `sha256_password` logins over a non-TLS
+    link keep working (Ferrum enables SQLx's `mysql-rsa` feature).
+  - MySQL: SQLx Any now reports TEXT-family columns as text rather than
+    bytes. Ferrum's decoders accept both. Deployment snapshots now carry those
+    column values the way PostgreSQL and SQLite already did, so a MySQL
+    deployment precondition captured before the upgrade must be re-read once.
+  - PostgreSQL: structured `options[name]=value` parameters in a database URL
+    are now escaped by SQLx (drop any manual backslash escaping there); a raw
+    `options=` string is still passed through unchanged and keeps libpq-style
+    escaping. `.pgpass` passwords are backslash-unescaped, and `hostaddr`
+    follows libpq semantics instead of aliasing `host`.
+  - SQLx's `tracing` field `aquired_after_secs` is now `acquired_after_secs`.
 - **BREAKING:** (issue #7424) DestinationRules now govern an EastWestGateway's
   auto-materialized SNI-passthrough Service upstreams. Each upstream is selected
   by its Service host (exact and wildcard, with Istio's client → Service → root

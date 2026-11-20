@@ -23,7 +23,7 @@ Full policy: `docs/dependency-policy.md`. These are the load-bearing rules.
 ## Vendored, Patched Crates
 
 - Ferrum carries vendored upstream crates under `vendor/**`, wired via
-  `[patch.crates-io]` in `Cargo.toml`: `sqlx-core 0.8.6`, `reqwest 0.13.4`,
+  `[patch.crates-io]` in `Cargo.toml`: `sqlx-core 0.9.1`, `reqwest 0.13.4`,
   `h3 0.0.8`, `h3-quinn 0.0.10`, `tungstenite 0.29.0`,
   `tokio-tungstenite 0.29.0`, `dimpl 0.6.1`, `hyper-util 0.1.21`
   (patches 001–002), `hyper 1.10.0` (patches 001–009), and `h2 0.4.20` (coalescing,
@@ -208,13 +208,13 @@ sections:
 
 - SQL `verify-ca` exclusive root CA (issue #5534 review): the vendored
   `--lib tls_rustls::tests` pair in
-  `vendor/sqlx-core-0.8.6-ferrum-patched/src/net/tls/tls_rustls.rs`
+  `vendor/sqlx-core-0.9.1-ferrum-patched/src/net/tls/tls_rustls.rs`
   (`root_store_with_configured_ca_replaces_the_default_trust_store`,
   `verify_ca_refuses_a_certificate_from_an_unconfigured_ca`), run by the
   `test-vendor-patches` job, plus `tests/service_integration/db_tls.rs`.
   Upstream UNIONS the configured CA with the bundled public roots; combined
-  with the `verify-ca` name waiver that trusts any public certificate for any
-  name, so the store must start from `RootCertStore::empty()` whenever a CA is
+  with SQLx's `verify-ca` name waiver that trusts any public certificate for
+  any name, so the store must start from `RootCertStore::empty()` whenever a CA is
   configured. `EnvConfig::validate` additionally refuses
   `FERRUM_DB_TLS_MODE=verify-ca` with no configured CA.
 - hyper-util HTTP/1 sender release (issue #5714): the vendored

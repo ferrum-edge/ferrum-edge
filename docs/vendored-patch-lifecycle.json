@@ -68,14 +68,14 @@
   "patches": [
     {
       "id": "sqlx-core-001-verify-ca-name-context",
-      "label": "SQLx verify-ca context-bearing hostname errors",
+      "label": "SQLx verify-ca exclusive root CA and provider-pinned verifier",
       "crate": "sqlx-core",
-      "vendored_version": "0.8.6",
-      "vendor_path": "vendor/sqlx-core-0.8.6-ferrum-patched",
+      "vendored_version": "0.9.1",
+      "vendor_path": "vendor/sqlx-core-0.9.1-ferrum-patched",
       "docs_path": "docs/upstream-sqlx-patches/001-verify-ca-name-context/",
       "owner": "Ferrum Edge maintainers",
       "owner_github": null,
-      "reason": "PostgreSQL and MySQL verify-ca must accept trusted certificate chains without checking the requested hostname, including rustls context-bearing name errors.",
+      "reason": "PostgreSQL and MySQL verify-ca waive the hostname check, so a configured root CA must be the only trust anchor (upstream adds it to the bundled public roots), and the verify-ca WebPKI verifier must be built with the selected crypto provider (the provider-less builder panics when both ring and aws-lc-rs are compiled in without a process default).",
       "upstream": {
         "filing": "deliberate_fork_unfiled",
         "github_repo": "launchbadge/sqlx",
@@ -85,7 +85,7 @@
       },
       "reaffirmation": null,
       "retirement": {
-        "trigger": "A compatible SQLx release handles both rustls hostname-error variants while retaining certificate chain, validity, and handshake signature verification.",
+        "trigger": "A compatible SQLx release treats a configured root CA as exclusive and builds the verify-ca WebPKI verifier with the selected crypto provider while retaining certificate chain, validity, and handshake signature verification.",
         "co_retirement_group": null,
         "compatible_release_test": {
           "status": "not_started",
@@ -93,53 +93,10 @@
         }
       },
       "regression_tests": [
-        "vendor/sqlx-core-0.8.6-ferrum-patched (tls_rustls::tests)",
+        "vendor/sqlx-core-0.9.1-ferrum-patched (tls_rustls::tests)",
         "tests/unit/config/db_tls_snapshot_tests.rs",
         "tests/unit/config/env_config_tests.rs",
         "tests/service_integration/db_tls.rs"
-      ]
-    },
-    {
-      "id": "sqlx-core-002-typed-float-null-bindings",
-      "label": "SQLx Any native floating-point NULL parameter types",
-      "crate": "sqlx-core",
-      "vendored_version": "0.8.6",
-      "vendor_path": "vendor/sqlx-core-0.8.6-ferrum-patched",
-      "docs_path": "docs/upstream-sqlx-patches/002-typed-float-null-bindings/",
-      "owner": "Ferrum Edge maintainers",
-      "owner_github": null,
-      "reason": "SQLx Any reverses REAL and DOUBLE native parameter types when converting typed NULL arguments in 0.8.6; the correction preserves the supplied floating-point type.",
-      "upstream": {
-        "filing": "filed",
-        "github_repo": "launchbadge/sqlx",
-        "pr_number": 4359,
-        "issue_number": null,
-        "fork_ref": null
-      },
-      "reaffirmation": null,
-      "retirement": {
-        "trigger": "A compatible SQLx release preserves native REAL/DOUBLE typed-NULL parameter types and passes the hosted PostgreSQL regression. Retain the vendor while patch 001 remains.",
-        "co_retirement_group": null,
-        "compatible_release_test": {
-          "status": "blocked",
-          "notes": "Reviewed 2026-11-08 (previously 2026-10-09): latest stable SQLx/sqlx-core 0.9.0 still binds REAL NULL through f64 and DOUBLE NULL through f32. Upstream main fixes the arms in PR #4359, but no released replacement contains that fix. Preserve the hosted PostgreSQL regression and retain the vendor while patch 001 remains."
-        },
-        "merged_release_hold": {
-          "reviewed_on": "2026-11-08",
-          "expires_on": "2026-12-08",
-          "owner": "Ferrum Edge maintainers",
-          "latest_release": "0.9.0",
-          "merge_commit": "80f44db8073e9a6a61ef6488eb15341554716d35",
-          "reason": "The latest stable release lacks the merged typed-float NULL fix; retain the vendor pending a compatible release and hosted PostgreSQL qualification.",
-          "evidence": [
-            "https://docs.rs/crate/sqlx-core/0.9.0/source/src/any/arguments.rs",
-            "https://github.com/transact-rs/sqlx/blob/v0.9.0/sqlx-core/src/any/arguments.rs",
-            "https://github.com/transact-rs/sqlx/pull/4359"
-          ]
-        }
-      },
-      "regression_tests": [
-        "tests/integration/admin_conditional_write_tests.rs::postgres_conditional_restore_checks_state_and_lease_in_transaction (assert_postgres_any_float_null_parameter_types; Integration Tests conditional-live-stores)"
       ]
     },
     {

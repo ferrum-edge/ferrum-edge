@@ -58,21 +58,14 @@ unused-ignored-advisory = "deny"
 #     `default-https-client` instead.
 #   - RUSTSEC-2025-0134 (rustls-pemfile, unmaintained): PEM parsing moved to
 #     the rustls-pki-types `PemObject` API and the dependency was dropped.
+#
+# Retired 2026-11-20 by the SQLx 0.9.1 migration, which made both fixes
+# reachable (root, fuzz/ and tests/performance/mesh/ lockfiles):
+#   - RUSTSEC-2023-0071 (rsa, Marvin timing side-channel): RustSec lists
+#     `patched = [">= 0.10.0"]`, and sqlx-mysql 0.9.1 resolves rsa 0.10.0.
+#   - RUSTSEC-2026-0459 (libsqlite3-sys bundling SQLite < 3.54.0): sqlx-sqlite
+#     0.9.1 allows `>=0.30.1, <0.41`, and the lockfiles resolve 0.40.0.
 ignore = [
-    # ── rsa 0.9.10 — RUSTSEC-2023-0071, the Marvin timing side-channel in
-    # private-key operations. There is still no fixed release: RustSec lists
-    # `patched = []`; rsa 0.9.10 is the latest stable and 0.10.0-rc.18 (the
-    # latest pre-release, already required by sqlx 0.9.0) is still affected
-    # (checked 2026-09-24). One parent reaches it:
-    #   - sqlx-mysql 0.8.6 uses only `RsaPublicKey` OAEP *encryption* of the
-    #     password for MySQL `sha256_password` / `caching_sha2_password` over a
-    #     non-TLS link. That is a public-key operation, so the timing leak is not
-    #     reachable there, and FERRUM_DB_TLS_MODE avoids the exchange entirely.
-    # jsonwebtoken no longer reaches it: its backend is `aws_lc_rs` on both
-    # profiles (Cargo.toml, 2026-10-24), so RSA signing of outbound client
-    # assertions and ai_federation service-account JWTs runs on AWS-LC.
-    { id = "RUSTSEC-2023-0071", reason = "rsa 0.9.10 Marvin timing side-channel; no fixed release (patched = [], 0.9.10 latest stable, 0.10.0-rc.18 still affected, checked 2026-09-24). Only sqlx-mysql reaches it, for public-key OAEP encryption of the MySQL password (no private-key operation). jsonwebtoken uses aws_lc_rs on both profiles, so no RSA signing runs on this crate. Re-evaluate on an rsa fix. [expires:2026-12-31]" },
-
     # ── paste 1.0.15 — RUSTSEC-2024-0436, unmaintained (repository archived).
     # A proc-macro only: it runs at compile time and has no runtime or network
     # surface. Parents: tikv-jemalloc-ctl (0.6.1, and still `paste ^1` in the
@@ -117,30 +110,6 @@ ignore = [
     # when a testcontainers release ships that change.
     { id = "RUSTSEC-2026-0440", reason = "astral-tokio-tar 0.6.2 unmaintained (Astral ended maintenance 2026-11-03, patched = [], informational, no known vulnerability). Only parent is testcontainers 0.28.0 (latest, checked 2026-11-06), a dev-dependency of the secrets_functional and service_integration test targets; not in the shipped binary or images. Retire when a testcontainers release replaces it (testcontainers-rs#1006). [expires:2026-12-31]" },
 
-    # ── libsqlite3-sys 0.30.1 — RUSTSEC-2026-0459 (C SQLite CVE-2026-119375).
-    # SQLite < 3.54.0 can return uninitialized page-cache memory when a process
-    # opens a database together with a sibling `-wal` file whose page size
-    # differs. Fixed in libsqlite3-sys 0.39.0 (bundled SQLite 3.54.0), but no
-    # SQLx release can reach it (checked 2026-11-09): sqlx-sqlite 0.8.6
-    # requires `^0.30.1` and sqlx-sqlite 0.9.0 requires `>=0.30.1, <0.38.0`.
-    # One parent reaches it: sqlx-sqlite 0.8.6 via sqlx's `sqlite` feature
-    # (bundled), in the root, fuzz/ and tests/performance/mesh/ lockfiles.
-    # Exposure: production opens SQLite only at operator-configured database
-    # URLs: FERRUM_DB_URL (default `sqlite://ferrum.db`), FERRUM_DB_FAILOVER_URLS
-    # and FERRUM_DB_READ_REPLICA_URL. Every other open is an in-memory or
-    # tempdir database in tests. Exploiting it needs a less-trusted party to
-    # write one of those database files together with its `-wal`. This
-    # exception rests on every such database, its `-wal`/`-shm` files and their
-    # containing directory having only trusted writers (the gateway and its
-    # operators). For the primary and failover databases a writer already
-    # controls the gateway's configuration. A read replica is different:
-    # authoritative admin reads exclude it (`admin_read_pool`), so a replica
-    # written by a less-trusted replication account WOULD be a new boundary.
-    # Deployments with such a replica need patched SQLite, not this exception.
-    # Retire when an SQLx release allows libsqlite3-sys >= 0.39 (or a vendored
-    # sqlx-sqlite patch does).
-    { id = "RUSTSEC-2026-0459", reason = "libsqlite3-sys 0.30.1 bundles SQLite < 3.54.0 (CVE-2026-119375, crafted db + -wal pair returns uninitialized page-cache bytes; local, needs the victim to open attacker-written files). Fixed in 0.39.0, unreachable: sqlx-sqlite 0.8.6 requires ^0.30.1 and 0.9.0 requires <0.38.0 (checked 2026-11-09). Production opens SQLite only at operator-configured URLs (FERRUM_DB_URL, FERRUM_DB_FAILOVER_URLS, FERRUM_DB_READ_REPLICA_URL). Accepted on the condition that every such database, its -wal/-shm and directory have only trusted writers; a SQLite read replica written by a less-trusted account is NOT covered and needs patched SQLite. Retire when an SQLx release allows libsqlite3-sys >= 0.39. [expires:2026-12-31]" },
-
     # ── chrono 0.4.45 — RUSTSEC-2026-0543, unmaintained (announced in
     # chronotope/chrono#1768, opened 2026-01-22; RustSec advisory issued
     # 2026-11-17; all versions affected, no patched release). An
@@ -152,7 +121,7 @@ ignore = [
     #   - ferrum-edge itself: a direct dependency in about 540 Rust files
     #     (config-model timestamps, the database layer, Admin API output);
     #     tests/performance/mesh/ also declares it directly.
-    #   - sqlx 0.8.6 through our `chrono` feature: sqlx-core (vendored),
+    #   - sqlx 0.9.1 through our `chrono` feature: sqlx-core (vendored),
     #     sqlx-postgres, sqlx-mysql and sqlx-sqlite.
     #   - google-cloud-auth 1.13.0 (secrets-gcp, a hard dependency of that
     #     release), also reached through google-cloud-gax-internal 0.7.14.
@@ -172,7 +141,7 @@ ignore = [
     # `time`, and (3) migrating ferrum-edge (and the mesh benchmark) to
     # `time` with byte-identical timestamps in the database, Admin API,
     # config files, openapi.yaml and ferrum-contracts.
-    { id = "RUSTSEC-2026-0543", reason = "chrono 0.4.45 unmaintained (chronotope/chrono#1768, all versions, patched = [], informational, no known vulnerability). Compiled-in parents (cargo-deny graph, re-evaluated 2026-11-18): ferrum-edge (direct, ~540 files), sqlx 0.8.6 chrono feature (sqlx-core/-postgres/-mysql/-sqlite), google-cloud-auth 1.13.0 (secrets-gcp; 1.16.0+ uses jiff, held back by the #5912 google-cloud-* pins). serde_with 3.21.0 lists chrono in Cargo.lock only through weak features (cargo#10801) and does not compile it. Retire by bumping google-cloud-auth to >= 1.16, switching sqlx to its time feature and migrating ferrum-edge to time with byte-identical timestamp formats (issue #7419). [expires:2026-12-31]" },
+    { id = "RUSTSEC-2026-0543", reason = "chrono 0.4.45 unmaintained (chronotope/chrono#1768, all versions, patched = [], informational, no known vulnerability). Compiled-in parents (cargo-deny graph, re-evaluated 2026-11-18): ferrum-edge (direct, ~540 files), sqlx 0.9.1 chrono feature (sqlx-core/-postgres/-mysql/-sqlite), google-cloud-auth 1.13.0 (secrets-gcp; 1.16.0+ uses jiff, held back by the #5912 google-cloud-* pins). serde_with 3.21.0 lists chrono in Cargo.lock only through weak features (cargo#10801) and does not compile it. Retire by bumping google-cloud-auth to >= 1.16, switching sqlx to its time feature and migrating ferrum-edge to time with byte-identical timestamp formats (issue #7419). [expires:2026-12-31]" },
 ]
 
 [bans]

@@ -284,8 +284,8 @@ text. Governance lives in [dependency-policy.md](dependency-policy.md).
 
 ### sqlx
 
-- 001 — [verify-ca hostname-error compatibility](upstream-sqlx-patches/001-verify-ca-name-context/README.md)
-- 002 — [`Any` typed floating-point `NULL` bindings](upstream-sqlx-patches/002-typed-float-null-bindings/README.md)
+- 001 — [verify-ca exclusive root CA and provider-pinned verifier](upstream-sqlx-patches/001-verify-ca-name-context/README.md)
+- 002 — [`Any` typed floating-point `NULL` bindings](upstream-sqlx-patches/002-typed-float-null-bindings/README.md) (retired: upstream since SQLx 0.9.1)
 
 ### tungstenite
 

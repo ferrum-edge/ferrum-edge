@@ -5450,9 +5450,9 @@ async fn assert_sql_deployment_raw_preservation(
     let namespace = format!("deployment-sql-{}", uuid::Uuid::new_v4());
     let pool = db.pool();
     for table in ["proxies", "plugin_configs", "proxy_plugins"] {
-        sqlx::query(&format!(
+        sqlx::query(sqlx::AssertSqlSafe(format!(
             "ALTER TABLE {table} ADD COLUMN deployment_future_metadata TEXT"
-        ))
+        )))
         .execute(&pool)
         .await
         .unwrap();
@@ -5477,26 +5477,28 @@ async fn assert_sql_deployment_raw_preservation(
             ("deployment_future_null_text", "TEXT"),
             ("deployment_future_null_bytes", blob_type),
         ] {
-            sqlx::query(&format!(
+            sqlx::query(sqlx::AssertSqlSafe(format!(
                 "ALTER TABLE {table} ADD COLUMN {column} {sql_type}"
-            ))
+            )))
             .execute(&pool)
             .await
             .unwrap();
         }
         if dialect == "postgres" {
             for column in ["deployment_future_flag", "deployment_future_null_flag"] {
-                sqlx::query(&format!("ALTER TABLE {table} ADD COLUMN {column} BOOLEAN"))
-                    .execute(&pool)
-                    .await
-                    .unwrap();
+                sqlx::query(sqlx::AssertSqlSafe(format!(
+                    "ALTER TABLE {table} ADD COLUMN {column} BOOLEAN"
+                )))
+                .execute(&pool)
+                .await
+                .unwrap();
             }
         } else if dialect == "sqlite" {
             // SQLite can store text in an integer-affinity column. Decoding by
             // column type instead of runtime value type would fail this fixture.
-            sqlx::query(&format!(
+            sqlx::query(sqlx::AssertSqlSafe(format!(
                 "ALTER TABLE {table} ADD COLUMN deployment_future_dynamic BIGINT"
-            ))
+            )))
             .execute(&pool)
             .await
             .unwrap();
@@ -5537,10 +5539,10 @@ async fn assert_sql_deployment_raw_preservation(
     let spec_id = imported.body["id"].as_str().unwrap();
     let placeholder = if dialect == "postgres" { "$1" } else { "?" };
     for table in ["proxies", "plugin_configs", "proxy_plugins"] {
-        sqlx::query(&format!(
+        sqlx::query(sqlx::AssertSqlSafe(format!(
             "UPDATE {table} SET deployment_future_metadata = ' opaque-original ' \
              WHERE namespace = {placeholder}"
-        ))
+        )))
         .bind(&namespace)
         .execute(&pool)
         .await
@@ -5552,42 +5554,42 @@ async fn assert_sql_deployment_raw_preservation(
         }
         let second = if dialect == "postgres" { "$2" } else { "?" };
         for table in ["proxies", "plugin_configs", "proxy_plugins"] {
-            sqlx::query(&format!(
+            sqlx::query(sqlx::AssertSqlSafe(format!(
                 "UPDATE {table} SET deployment_future_metadata = ' opaque-original ', \
                  deployment_future_count = 9007199254740993, deployment_future_small = -123, \
                  deployment_future_integer = 123456, deployment_future_real = 1.25, \
                  deployment_future_double = -0.125, deployment_future_bytes = {placeholder} \
                  WHERE namespace = {second}"
-            ))
+            )))
             .bind(vec![0u8, 255, 1, 128])
             .bind(&namespace)
             .execute(&pool)
             .await
             .unwrap();
             if dialect == "postgres" {
-                sqlx::query(&format!(
+                sqlx::query(sqlx::AssertSqlSafe(format!(
                     "UPDATE {table} SET deployment_future_flag = TRUE \
                      WHERE namespace = {placeholder}"
-                ))
+                )))
                 .bind(&namespace)
                 .execute(&pool)
                 .await
                 .unwrap();
             } else if dialect == "sqlite" {
-                sqlx::query(&format!(
+                sqlx::query(sqlx::AssertSqlSafe(format!(
                     "UPDATE {table} SET deployment_future_dynamic = '007opaque' \
                      WHERE namespace = {placeholder}"
-                ))
+                )))
                 .bind(&namespace)
                 .execute(&pool)
                 .await
                 .unwrap();
             }
         }
-        sqlx::query(&format!(
+        sqlx::query(sqlx::AssertSqlSafe(format!(
             "UPDATE proxies SET hosts = ' [ ] ', created_at = '2000-01-01T00:00:00Z', \
              updated_at = '2001-01-01T00:00:00Z' WHERE namespace = {placeholder}"
-        ))
+        )))
         .bind(&namespace)
         .execute(&pool)
         .await
@@ -5658,10 +5660,10 @@ async fn assert_sql_deployment_raw_preservation(
     }
     let original = get_ns(&base, "/deployment-snapshot", &namespace).await;
     assert_eq!(original.status, 200, "{}", original.body);
-    sqlx::query(&format!(
+    sqlx::query(sqlx::AssertSqlSafe(format!(
         "UPDATE proxy_plugins SET deployment_future_metadata = 'operator' \
          WHERE namespace = {placeholder}"
-    ))
+    )))
     .bind(&namespace)
     .execute(&pool)
     .await
@@ -5723,10 +5725,10 @@ async fn assert_sql_deployment_raw_preservation(
             &["hand-added", "sql-generated"][..],
         ),
     ] {
-        let rows = sqlx::query(&format!(
+        let rows = sqlx::query(sqlx::AssertSqlSafe(format!(
             "SELECT {identity_columns}, deployment_future_metadata FROM {table} \
              WHERE namespace = {placeholder}"
-        ))
+        )))
         .bind(&namespace)
         .fetch_all(&pool)
         .await

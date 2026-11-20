@@ -2,12 +2,19 @@
 
 ## Status
 
-Fixed upstream; not yet released. Upstream corrected the same two arms in
-[launchbadge/sqlx#4359](https://github.com/launchbadge/sqlx/pull/4359), merged
-2026-08-19 on `main` after v0.9.0. SQLx v0.8.6 and v0.9.0 still reverse them.
-Owner: Ferrum Edge maintainers. This correction was accepted during issue #6010
-review and follows the weekly review and stable-release checkpoint in
-[dependency policy](../../dependency-policy.md).
+**Retired** on the move to SQLx 0.9.1. Upstream corrected the same two arms in
+[launchbadge/sqlx#4359](https://github.com/launchbadge/sqlx/pull/4359)
+(merge `80f44db8073e9a6a61ef6488eb15341554716d35`, 2026-08-19), and
+`sqlx-core` 0.9.1 (published 2026-11-18) is the first release that carries it:
+its `src/any/arguments.rs` binds `Null(Real)` through `Option<f32>::None` and
+`Null(Double)` through `Option<f64>::None`. No 0.8.x release carries the fix,
+so retiring this correction meant migrating Ferrum to SQLx 0.9.1. The vendor
+copy (`vendor/sqlx-core-0.9.1-ferrum-patched/`) remains for
+[patch 001](../001-verify-ca-name-context/README.md) only and leaves
+`src/any/arguments.rs` byte-identical to the crate. The lifecycle entry
+`sqlx-core-002-typed-float-null-bindings`, its `merged_release_hold`, and its
+inventory row were removed. This record is kept as the audit trail; the
+sections below describe the patch as it was carried on the 0.8.6 base.
 
 ## Patch
 
@@ -33,22 +40,16 @@ value loss, and the correction does not explain the earlier PostgreSQL initial
 import 500, which occurred before the preservation operations. That error's
 underlying cause remains unknown.
 
-## Release hold review
+## Release hold history
 
-Release hold reviewed 2026-11-08 by Ferrum Edge maintainers; latest stable 0.9.0; expires 2026-12-08.
-
-The latest [published crate source](https://docs.rs/crate/sqlx-core/0.9.0/source/src/any/arguments.rs)
-and [v0.9.0 tag](https://github.com/transact-rs/sqlx/blob/v0.9.0/sqlx-core/src/any/arguments.rs)
-still have the reversed NULL arms. Upstream merge
-`80f44db8073e9a6a61ef6488eb15341554716d35` corrects them, so the compatibility
-replacement test is blocked on a released fix. The weekly audit verifies that
-exact merge and latest release, and fails again on a release change, an unknown
-release/status, or expiry. This review retains the vendor and its PostgreSQL
-regression; it does not certify an unpatched SQLx replacement.
+From 2026-11-08 the lifecycle inventory carried a dated `merged_release_hold`
+for this patch (latest stable 0.9.0, expiring 2026-12-08), because the merged
+fix was not yet in a release. SQLx 0.9.1 ended the hold by shipping it.
 
 ## Regression coverage
 
-`tests/integration/admin_conditional_write_tests.rs` calls
+The behavioral regression is kept after retirement and now guards the
+upstream behavior. `tests/integration/admin_conditional_write_tests.rs` calls
 `assert_postgres_any_float_null_parameter_types` from
 `postgres_conditional_restore_checks_state_and_lease_in_transaction`. The
 existing hosted **Integration Tests (conditional-live-stores)** gate runs this
@@ -68,11 +69,6 @@ an error category, and a validated SQLSTATE if the read fails.
 
 ## Retirement
 
-Retire this correction when a compatible SQLx release preserves native
-REAL/DOUBLE typed-NULL parameter types and passes the same hosted PostgreSQL
-regression. Keep that behavioral regression after retirement. Retain the vendor
-copy and its root, fuzz and mesh `[patch.crates-io]` entries while patch 001
-still needs them. Once both patches can retire, remove the patch entries and
-update the three lockfiles, then remove the vendor copy and update the
-integrity manifest, policy inventory, and lifecycle inventory together. No SQLx version or dependency graph changes
-are part of this correction.
+Done. Retired by the SQLx 0.9.1 migration: the vendored 0.9.1 copy carries no
+change to `src/any/arguments.rs`, and the hosted PostgreSQL regression above
+stays in the **Integration Tests (conditional-live-stores)** gate.

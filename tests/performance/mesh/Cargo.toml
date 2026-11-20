@@ -30,7 +30,7 @@ tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "time"]
 # overrides synchronized with the root Cargo.toml so the benchmark builds the
 # same production dependency implementations as ferrum-edge.
 [patch.crates-io]
-sqlx-core = { path = "../../../vendor/sqlx-core-0.8.6-ferrum-patched" }
+sqlx-core = { path = "../../../vendor/sqlx-core-0.9.1-ferrum-patched" }
 reqwest = { path = "../../../vendor/reqwest-0.13.4-ferrum-patched" }
 h3 = { path = "../../../vendor/h3-0.0.8-ferrum-patched" }
 h3-quinn = { path = "../../../vendor/h3-quinn-0.0.10-ferrum-patched" }
