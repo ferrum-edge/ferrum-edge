@@ -2672,7 +2672,8 @@ fn header_gated_spec() -> serde_json::Value {
 #[test]
 fn every_malformed_carried_dispatch_instance_rejects_the_slice() {
     let config = translated_config(&[virtual_service("gated", header_gated_spec())]);
-    let patches: [(&str, fn(&mut serde_json::Value)); 3] = [
+    type DispatchPatch = (&'static str, fn(&mut serde_json::Value));
+    let patches: [DispatchPatch; 3] = [
         ("zero port", |config| {
             config["rules"][0]["match"]["port"] = json!(0);
         }),
