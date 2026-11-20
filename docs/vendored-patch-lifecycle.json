@@ -83,7 +83,11 @@
         "issue_number": null,
         "fork_ref": null
       },
-      "reaffirmation": null,
+      "reaffirmation": {
+        "date": "2026-11-20",
+        "owner": "Ferrum Edge maintainers",
+        "reason": "Re-checked against SQLx 0.9.1, which still adds a configured root CA to the bundled public roots and still builds the verify-ca verifier without the selected crypto provider; verify-ca's issuer check depends on the exclusive root CA, so the fork stays until a compatible SQLx release carries both."
+      },
       "retirement": {
         "trigger": "A compatible SQLx release treats a configured root CA as exclusive and builds the verify-ca WebPKI verifier with the selected crypto provider while retaining certificate chain, validity, and handshake signature verification.",
         "co_retirement_group": null,

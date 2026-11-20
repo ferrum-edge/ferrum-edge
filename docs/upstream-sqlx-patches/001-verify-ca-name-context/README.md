@@ -9,6 +9,8 @@ and lifecycle ID keep their original `verify-ca-name-context` name; the
 hostname-error part of the patch is upstream since SQLx 0.9.1 (see "Retired
 change 3" below).
 
+Deliberate fork — re-affirmed 2026-11-20 by Ferrum Edge maintainers: Re-checked against SQLx 0.9.1, which still adds a configured root CA to the bundled public roots and still builds the verify-ca verifier without the selected crypto provider; verify-ca's issuer check depends on the exclusive root CA, so the fork stays until a compatible SQLx release carries both.
+
 ## Patch
 
 The base is the crates.io `sqlx-core` 0.9.1 source (package checksum
