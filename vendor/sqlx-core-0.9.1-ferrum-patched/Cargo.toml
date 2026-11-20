@@ -236,7 +236,7 @@ optional = true
 default-features = false
 
 [dependencies.rustls]
-version = "0.23.24"
+version = "0.23.46"
 features = [
     "std",
     "tls12",
@@ -325,12 +325,17 @@ optional = true
 version = "1"
 optional = true
 
-[dev-dependencies.tempfile]
-version = "3.10.1"
-
-[dev-dependencies.tokio]
-version = "1.25.0"
-features = ["rt"]
+# Ferrum patch: upstream's `[dev-dependencies]` (`tempfile` and `tokio`, plus
+# the whole `sqlx` facade with the postgres/sqlite/mysql/migrate/macros drivers
+# that `cargo package` strips from this manifest because it is a path
+# dependency) serve doctests and the `migrate` feature's tests. They are
+# dropped here because the vendored copy is consumed through
+# `[patch.crates-io]`, where a dependency's dev-dependencies are never
+# resolved, while `cargo test --manifest-path ... --lib` DOES build them. The
+# `test-vendor-patches` CI job runs only the `src/net/tls/tls_rustls.rs` unit
+# tests, with the `migrate` feature off, and no module it compiles uses them.
+# `cargo test --doc` and the `migrate` tests on the vendored copy are
+# correspondingly not supported.
 
 [lints.clippy]
 cast_possible_truncation = "deny"

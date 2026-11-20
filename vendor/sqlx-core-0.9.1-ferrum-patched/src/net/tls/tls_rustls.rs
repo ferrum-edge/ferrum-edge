@@ -156,24 +156,32 @@ pub async fn connector(tls_config: TlsConfig<'_>) -> Result<RustlsConnector, Err
                 .with_no_client_auth()
         }
     } else {
-        let mut cert_store = import_root_certs();
-
-        if let Some(ca) = tls_config.root_cert_path {
-            let data = ca.data().await?;
-
-            for result in CertificateDer::pem_slice_iter(&data) {
-                let Ok(cert) = result else {
-                    return Err(Error::Tls(format!("Invalid certificate {ca}").into()));
-                };
-
-                cert_store.add(cert).map_err(|err| Error::Tls(err.into()))?;
-            }
-        }
+        // A configured root CA is EXCLUSIVE: it replaces the bundled/native
+        // trust anchors instead of joining them. `verify-ca` waives only the
+        // hostname check, so a store that still carried the public roots would
+        // accept any publicly-trusted certificate for any name.
+        let root_cert_pem = match tls_config.root_cert_path {
+            Some(ca) => Some(ca.data().await?),
+            None => None,
+        };
+        let cert_store = root_store_for(root_cert_pem.as_deref()).map_err(|err| match err {
+            RootStoreError::InvalidPem => match tls_config.root_cert_path {
+                Some(ca) => Error::Tls(format!("Invalid certificate {ca}").into()),
+                None => Error::Tls("Invalid certificate".into()),
+            },
+            RootStoreError::Rejected(err) => Error::Tls(err.into()),
+        })?;
 
         if tls_config.accept_invalid_hostnames {
-            let verifier = WebPkiServerVerifier::builder(Arc::new(cert_store))
-                .build()
-                .map_err(|err| Error::Tls(err.into()))?;
+            // Pin the verifier to the provider selected above. The provider-less
+            // builder resolves the process default from crate features and
+            // panics when both `ring` and `aws-lc-rs` are compiled in and no
+            // default was installed, which is the state of a test binary that
+            // never started the gateway.
+            let verifier =
+                WebPkiServerVerifier::builder_with_provider(Arc::new(cert_store), provider.clone())
+                    .build()
+                    .map_err(|err| Error::Tls(err.into()))?;
 
             if let Some(user_auth) = user_auth {
                 config
@@ -224,6 +232,43 @@ where
     socket.complete_io().await?;
 
     Ok(socket)
+}
+
+/// Failure building the handshake trust store.
+#[derive(Debug)]
+enum RootStoreError {
+    /// The configured root CA source did not parse as PEM certificate(s).
+    InvalidPem,
+    /// rustls refused a parsed certificate as a trust anchor.
+    Rejected(TlsError),
+}
+
+/// Build the trust store for one connector.
+///
+/// A configured root CA **replaces** the bundled WebPKI (or native) trust
+/// anchors; it is never added to them. That matches libpq's `sslrootcert`
+/// semantics and Ferrum's own rule that a custom CA is exclusive. It is also
+/// load-bearing for `verify-ca`: [`NoHostnameTlsVerifier`] waives the hostname
+/// check, so the issuer is the only remaining constraint, and a store that
+/// still held the ~150 public roots would accept any publicly-trusted
+/// certificate for any name. With no configured CA the bundled/native anchors
+/// are used unchanged.
+fn root_store_for(root_cert_pem: Option<&[u8]>) -> Result<RootCertStore, RootStoreError> {
+    let Some(pem) = root_cert_pem else {
+        return Ok(import_root_certs());
+    };
+
+    let mut cert_store = RootCertStore::empty();
+
+    for result in CertificateDer::pem_slice_iter(pem) {
+        let Ok(cert) = result else {
+            return Err(RootStoreError::InvalidPem);
+        };
+
+        cert_store.add(cert).map_err(RootStoreError::Rejected)?;
+    }
+
+    Ok(cert_store)
 }
 
 fn certs_from_pem(pem: Vec<u8>) -> Result<Vec<CertificateDer<'static>>, Error> {
@@ -514,5 +559,115 @@ MC4CAQAwBQYDK2VwBCIEID8jex+k7LAgC5JfhRHaleP+dhL1s4NemFDa1CMKvcuu
         server.reader().read_to_end(&mut received).unwrap();
         assert_eq!(received, b"ping");
         assert!(server.process_new_packets().unwrap().peer_has_closed());
+    }
+
+    // Ferrum patch 001: a configured root CA is exclusive, and the verify-ca
+    // name waiver never waives the issuer check.
+
+    /// Two unrelated self-signed P-256 test CAs. `RootCertStore::add` parses a
+    /// trust anchor without reading its validity window, and the verifier test
+    /// below pins `now` explicitly, so neither fixture can expire this module.
+    const TEST_CA_A_PEM: &str = "-----BEGIN CERTIFICATE-----
+MIIBrjCCAVOgAwIBAgIUJpJ3aq4QUQ8sM9bU5ZREzbb1SFkwCgYIKoZIzj0EAwIw
+IzEhMB8GA1UEAwwYRmVycnVtIFNRTCBUTFMgVGVzdCBDQSBBMCAXDTI2MDkxNjIw
+NTgzMVoYDzIxMjYwODIzMjA1ODMxWjAjMSEwHwYDVQQDDBhGZXJydW0gU1FMIFRM
+UyBUZXN0IENBIEEwWTATBgcqhkjOPQIBBggqhkjOPQMBBwNCAARMRh8FF/PBEmWo
+wZNxMvnxffwNJbEk1ym2fYDd+PgPz7rWQkq7WvTd2kNWODGkqWJ99ptjlcRZKzjH
+LkCJSCjWo2MwYTAdBgNVHQ4EFgQUa8F3oEZN9Qo56uOOfVb68HHZx8AwHwYDVR0j
+BBgwFoAUa8F3oEZN9Qo56uOOfVb68HHZx8AwDwYDVR0TAQH/BAUwAwEB/zAOBgNV
+HQ8BAf8EBAMCAQYwCgYIKoZIzj0EAwIDSQAwRgIhAKrN9+tfIDun+m0pbk1//yLl
+Sa7JjLbIvhSkWMez8B2kAiEAkgaWsGP/ftvw+EAZvYK2IFTennm0no/oOoqPPhuG
+lvk=
+-----END CERTIFICATE-----
+";
+
+    const TEST_CA_B_PEM: &str = "-----BEGIN CERTIFICATE-----
+MIIBrTCCAVOgAwIBAgIUJriMxJnKEORniQsX8mz69c2/TjEwCgYIKoZIzj0EAwIw
+IzEhMB8GA1UEAwwYRmVycnVtIFNRTCBUTFMgVGVzdCBDQSBCMCAXDTI2MDkxNjIw
+NTgzMVoYDzIxMjYwODIzMjA1ODMxWjAjMSEwHwYDVQQDDBhGZXJydW0gU1FMIFRM
+UyBUZXN0IENBIEIwWTATBgcqhkjOPQIBBggqhkjOPQMBBwNCAAQ3ySfYU3Me2T02
+49vCetYm5iGYHc4qPBsM8u+ajpA2VjGxRS8ExRcSFuGs14utKOOtBrs8QLiJpE3s
+KsiV15Y1o2MwYTAdBgNVHQ4EFgQUK9PBG2ViotXwoqTgYC3KjYzYRo0wHwYDVR0j
+BBgwFoAUK9PBG2ViotXwoqTgYC3KjYzYRo0wDwYDVR0TAQH/BAUwAwEB/zAOBgNV
+HQ8BAf8EBAMCAQYwCgYIKoZIzj0EAwIDSAAwRQIgIHugsS6a/OEQk6PDErB256Us
+3pnbfm6OPJ0u/r+s8DICIQDQsrDy1x+V1PS4athkSI3WKE95m42yRq6uTqYUxo0R
+EQ==
+-----END CERTIFICATE-----
+";
+
+    /// Fixed verification instant inside both fixtures' validity windows, so
+    /// the refusal below can never be an expiry artifact.
+    const FIXED_NOW_SECS: u64 = 1_800_000_000;
+
+    #[test]
+    fn root_store_with_configured_ca_replaces_the_default_trust_store() {
+        let defaults = root_store_for(None).expect("default trust anchors load");
+        assert!(
+            defaults.roots.len() > 1,
+            "the default trust store must hold more than one anchor for this test to mean anything"
+        );
+
+        let configured =
+            root_store_for(Some(TEST_CA_A_PEM.as_bytes())).expect("configured CA parses");
+        // Counting is decisive here: the additive store this patch replaced
+        // produced `defaults.roots.len() + 1` anchors for the same input, so a
+        // store of exactly one anchor proves no public root survived.
+        assert_eq!(
+            configured.roots.len(),
+            1,
+            "a configured root CA must be the ONLY trust anchor under verify-ca and verify-full"
+        );
+    }
+
+    #[test]
+    fn verify_ca_refuses_a_certificate_from_an_unconfigured_ca() {
+        #[cfg(all(
+            any(
+                feature = "_tls-rustls-aws-lc-rs",
+                feature = "_tls-rustls-aws-lc-rs-native-roots"
+            ),
+            not(feature = "_tls-rustls-ring-webpki"),
+            not(feature = "_tls-rustls-ring-native-roots")
+        ))]
+        let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+        #[cfg(any(
+            feature = "_tls-rustls-ring-webpki",
+            feature = "_tls-rustls-ring-native-roots"
+        ))]
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+
+        let cert_store =
+            root_store_for(Some(TEST_CA_A_PEM.as_bytes())).expect("configured CA parses");
+        let verifier = NoHostnameTlsVerifier {
+            verifier: WebPkiServerVerifier::builder_with_provider(Arc::new(cert_store), provider)
+                .build()
+                .expect("verify-ca verifier builds"),
+        };
+
+        let foreign: Vec<CertificateDer<'static>> =
+            CertificateDer::pem_slice_iter(TEST_CA_B_PEM.as_bytes())
+                .collect::<Result<Vec<_>, _>>()
+                .expect("unconfigured CA parses");
+        // `ServerCertVerified` is deliberately opaque, so match rather than
+        // `expect_err`.
+        let Err(error) = verifier.verify_server_cert(
+            &foreign[0],
+            &[],
+            &ServerName::try_from("db.example.com").expect("server name parses"),
+            &[],
+            UnixTime::since_unix_epoch(std::time::Duration::from_secs(FIXED_NOW_SECS)),
+        ) else {
+            panic!("verify-ca must refuse a chain that does not end at the configured CA");
+        };
+        assert!(
+            !matches!(
+                error,
+                TlsError::InvalidCertificate(
+                    CertificateError::NotValidForName
+                        | CertificateError::NotValidForNameContext { .. }
+                )
+            ),
+            "the verify-ca name waiver must never waive the issuer check: {error:?}"
+        );
     }
 }
