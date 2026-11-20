@@ -2054,8 +2054,18 @@ jobs:
         # rather than join them; otherwise any publicly-trusted certificate for
         # any name is accepted on a SQL connection. sqlx-core's default feature
         # list is empty, so the rustls TLS module is only built when a runtime
-        # and a rustls backend are named explicitly.
-        run: cargo test --manifest-path vendor/sqlx-core-0.8.6-ferrum-patched/Cargo.toml --no-default-features --features _rt-tokio,_tls-rustls-ring-webpki --lib tls_rustls::tests
+        # and a rustls backend are named explicitly. The vendored directory is
+        # resolved rather than named so a SQLx version bump in a pull request is
+        # tested by this (trusted-base) step; exactly one copy must exist.
+        run: |
+          shopt -s nullglob
+          manifests=(vendor/sqlx-core-*-ferrum-patched/Cargo.toml)
+          if [ "${#manifests[@]}" -ne 1 ]; then
+            echo "::error::expected exactly one vendor/sqlx-core-*-ferrum-patched/Cargo.toml, found ${#manifests[@]}: ${manifests[*]}"
+            exit 1
+          fi
+          echo "Testing ${manifests[0]}"
+          cargo test --manifest-path "${manifests[0]}" --no-default-features --features _rt-tokio,_tls-rustls-ring-webpki --lib tls_rustls::tests
 
       - name: Run vendored hyper-util HTTP/1 dispatch-close regressions
         # An HTTP/1 request queued while the connection closes can miss the

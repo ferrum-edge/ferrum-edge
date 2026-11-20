@@ -477,7 +477,7 @@ of the vendor copy and must keep passing after retirement:
   (`net::tls::tls_rustls::tests::root_store_with_configured_ca_replaces_the_default_trust_store`,
   `net::tls::tls_rustls::tests::verify_ca_refuses_a_certificate_from_an_unconfigured_ca`),
   run with
-  `cargo test --manifest-path vendor/sqlx-core-0.8.6-ferrum-patched/Cargo.toml --no-default-features --features _rt-tokio,_tls-rustls-ring-webpki --lib tls_rustls::tests`,
+  `cargo test --manifest-path vendor/sqlx-core-<version>-ferrum-patched/Cargo.toml --no-default-features --features _rt-tokio,_tls-rustls-ring-webpki --lib tls_rustls::tests` (CI resolves the single vendored copy),
   plus `tests/service_integration/db_tls.rs` and the
   `FERRUM_DB_TLS_MODE=verify-ca` without-CA rejection in
   `tests/unit/config/env_config_tests.rs`. Upstream ADDS the configured CA to
