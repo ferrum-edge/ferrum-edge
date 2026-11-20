@@ -3261,25 +3261,48 @@ enum UdpReplyCommitStop {
     PolicyRejected(String),
 }
 
+/// Lock-free check for whether a shutdown `watch::Receiver<bool>` has fired.
+///
+/// Uses `has_changed()` (a single atomic state load in Tokio, acquiring no
+/// `RwLock`) on the common unchanged (`false`) path, falling back to
+/// `borrow()` only after the sender actually publishes a new value. Treating
+/// a closed channel (`Err`) as triggered matches `udp_reply_shutdown_cancel`.
+#[cfg(target_os = "linux")]
+#[inline]
+fn shutdown_watch_triggered(rx: &watch::Receiver<bool>) -> bool {
+    match rx.has_changed() {
+        Ok(false) => false,
+        Ok(true) => *rx.borrow(),
+        Err(_) => true,
+    }
+}
+
 /// Shared commit-boundary & cancellation guard passed into Linux reply batching
 /// and direct-send fallback helpers.
+///
+/// Reuses the caller's single pinned `stop_notified` future so `notify_one()`
+/// on `UdpSession::stop_notify` can never be diverted to a second waiter.
 #[cfg(target_os = "linux")]
-struct UdpReplyCommitGuard<'a> {
+struct UdpReplyCommitGuard<'a, 'b> {
     session: &'a UdpSession,
     client_addr: SocketAddr,
     proxy_id: &'a str,
     authorization: Option<crate::proxy::auth_lifetime::StreamAuthDeadline>,
+    stop_notified: std::pin::Pin<&'a mut tokio::sync::futures::Notified<'b>>,
     listener_shutdown: &'a mut watch::Receiver<bool>,
     global_shutdown: &'a mut Option<watch::Receiver<bool>>,
 }
 
 #[cfg(target_os = "linux")]
-impl UdpReplyCommitGuard<'_> {
+impl UdpReplyCommitGuard<'_, '_> {
     #[inline]
     fn check_policy(&self) -> Option<UdpReplyCommitStop> {
         if self.session.stop_reply_task.load(Ordering::Acquire)
-            || *self.listener_shutdown.borrow()
-            || self.global_shutdown.as_ref().is_some_and(|rx| *rx.borrow())
+            || shutdown_watch_triggered(self.listener_shutdown)
+            || self
+                .global_shutdown
+                .as_ref()
+                .is_some_and(shutdown_watch_triggered)
         {
             return Some(UdpReplyCommitStop::Stopped);
         }
@@ -3327,7 +3350,7 @@ async fn direct_send_to_client(
     data: &[u8],
     client_addr: SocketAddr,
     local: Option<crate::socket_opts::PktinfoLocal>,
-    commit_guard: &mut UdpReplyCommitGuard<'_>,
+    commit_guard: &mut UdpReplyCommitGuard<'_, '_>,
 ) -> UdpDirectSendOutcome {
     use std::os::unix::io::AsRawFd;
     let authorization = commit_guard.authorization;
@@ -3340,33 +3363,60 @@ async fn direct_send_to_client(
         _ => None,
     };
     let Some(local) = effective_local else {
-        if let Some(stop) = commit_guard.check_commit() {
-            return UdpDirectSendOutcome::Stop(stop);
-        }
-        let stop_notified = commit_guard.session.stop_notify.notified();
-        tokio::pin!(stop_notified);
-        stop_notified.as_mut().enable();
-        if let Some(stop) = commit_guard.check_policy() {
-            return UdpDirectSendOutcome::Stop(stop);
-        }
-        let shutdown_cancel =
-            udp_reply_shutdown_cancel(commit_guard.listener_shutdown, commit_guard.global_shutdown);
-        tokio::pin!(shutdown_cancel);
-        let outcome = tokio::select! {
-            biased;
-            () = &mut stop_notified => return UdpDirectSendOutcome::Stop(UdpReplyCommitStop::Stopped),
-            () = &mut shutdown_cancel => return UdpDirectSendOutcome::Stop(UdpReplyCommitStop::Stopped),
-            outcome = udp_frontend_send_until_expiry(
-                authorization,
-                udp_direct!(frontend.send_to(data, client_addr)),
-            ) => outcome,
-        };
-        return match outcome {
-            UdpFrontendSendOutcome::AuthorizationExpired(termination) => {
-                UdpDirectSendOutcome::Stop(UdpReplyCommitStop::AuthorizationExpired(termination))
+        loop {
+            if let Some(stop) = commit_guard.check_policy() {
+                return UdpDirectSendOutcome::Stop(stop);
             }
-            UdpFrontendSendOutcome::Sent(res) => UdpDirectSendOutcome::Sent(res),
-        };
+            if let Some(termination) = udp_reply_expired_at_commit(authorization) {
+                return UdpDirectSendOutcome::Stop(UdpReplyCommitStop::AuthorizationExpired(
+                    termination,
+                ));
+            }
+            let result = frontend.try_send_to(data, client_addr);
+            #[cfg(feature = "bench-udp-profile")]
+            {
+                crate::udp_profile::batch_count(
+                    crate::udp_profile::Direction::Reply,
+                    BatchField::DirectCalls,
+                    1,
+                );
+                crate::udp_profile::direct_outcome(&result);
+            }
+            match result {
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    let shutdown_cancel = udp_reply_shutdown_cancel(
+                        commit_guard.listener_shutdown,
+                        commit_guard.global_shutdown,
+                    );
+                    tokio::pin!(shutdown_cancel);
+                    let outcome = tokio::select! {
+                        biased;
+                        () = commit_guard.stop_notified.as_mut() => {
+                            return UdpDirectSendOutcome::Stop(UdpReplyCommitStop::Stopped);
+                        }
+                        () = &mut shutdown_cancel => {
+                            return UdpDirectSendOutcome::Stop(UdpReplyCommitStop::Stopped);
+                        }
+                        outcome = udp_frontend_writable_until_expiry(
+                            authorization,
+                            frontend.writable(),
+                        ) => outcome,
+                    };
+                    match outcome {
+                        UdpFrontendSendOutcome::AuthorizationExpired(termination) => {
+                            return UdpDirectSendOutcome::Stop(
+                                UdpReplyCommitStop::AuthorizationExpired(termination),
+                            );
+                        }
+                        UdpFrontendSendOutcome::Sent(Err(e)) => {
+                            return UdpDirectSendOutcome::Sent(Err(e));
+                        }
+                        UdpFrontendSendOutcome::Sent(Ok(())) => {}
+                    }
+                }
+                other => return UdpDirectSendOutcome::Sent(other),
+            }
+        }
     };
     let (dest, dest_len) = super::udp_batch::std_to_sockaddr_storage(client_addr);
     loop {
@@ -3399,12 +3449,6 @@ async fn direct_send_to_client(
         }
         match result {
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                let stop_notified = commit_guard.session.stop_notify.notified();
-                tokio::pin!(stop_notified);
-                stop_notified.as_mut().enable();
-                if let Some(stop) = commit_guard.check_policy() {
-                    return UdpDirectSendOutcome::Stop(stop);
-                }
                 let shutdown_cancel = udp_reply_shutdown_cancel(
                     commit_guard.listener_shutdown,
                     commit_guard.global_shutdown,
@@ -3412,8 +3456,12 @@ async fn direct_send_to_client(
                 tokio::pin!(shutdown_cancel);
                 let outcome = tokio::select! {
                     biased;
-                    () = &mut stop_notified => return UdpDirectSendOutcome::Stop(UdpReplyCommitStop::Stopped),
-                    () = &mut shutdown_cancel => return UdpDirectSendOutcome::Stop(UdpReplyCommitStop::Stopped),
+                    () = commit_guard.stop_notified.as_mut() => {
+                        return UdpDirectSendOutcome::Stop(UdpReplyCommitStop::Stopped);
+                    }
+                    () = &mut shutdown_cancel => {
+                        return UdpDirectSendOutcome::Stop(UdpReplyCommitStop::Stopped);
+                    }
                     outcome = udp_frontend_writable_until_expiry(authorization, frontend.writable()) => outcome,
                 };
                 match outcome {
@@ -3485,7 +3533,7 @@ async fn direct_send_reply_or_drop(
     proxy_id: &str,
     reason: &str,
     send_drops: &mut UdpReplySendDrops,
-    commit_guard: &mut UdpReplyCommitGuard<'_>,
+    commit_guard: &mut UdpReplyCommitGuard<'_, '_>,
 ) -> Option<UdpReplyCommitStop> {
     if let Some(stop) = commit_guard.check_commit() {
         return Some(stop);
@@ -3530,15 +3578,15 @@ async fn enqueue_sendmmsg_or_direct(
     local_ip: Option<crate::socket_opts::PktinfoLocal>,
     proxy_id: &str,
     send_drops: &mut UdpReplySendDrops,
-    commit_guard: &mut UdpReplyCommitGuard<'_>,
+    commit_guard: &mut UdpReplyCommitGuard<'_, '_>,
 ) -> Option<UdpReplyCommitStop> {
     use super::udp_batch::SendMmsgPushResult;
     use std::os::unix::io::AsRawFd;
 
-    if let Some(stop) = commit_guard.check_commit() {
-        return Some(stop);
-    }
-
+    // Pure in-memory buffering (`Queued`) requires no commit check here: the
+    // caller already validated policy/expiry before queuing, and the eventual
+    // flush validates right before the syscall. Every actual flush or direct
+    // send path below checks `commit_guard.check_commit()` immediately prior.
     match send_batch.push_with_local(data, client_addr, local_ip) {
         SendMmsgPushResult::Queued => None,
         SendMmsgPushResult::Oversized => {
@@ -3617,7 +3665,7 @@ async fn drain_gso_to_sendmmsg_or_direct(
     local_ip: Option<crate::socket_opts::PktinfoLocal>,
     proxy_id: &str,
     send_drops: &mut UdpReplySendDrops,
-    commit_guard: &mut UdpReplyCommitGuard<'_>,
+    commit_guard: &mut UdpReplyCommitGuard<'_, '_>,
 ) -> Option<UdpReplyCommitStop> {
     use std::os::unix::io::AsRawFd;
 
@@ -3644,6 +3692,10 @@ async fn drain_gso_to_sendmmsg_or_direct(
             )
             .await
             {
+                // This segment was popped from `gso_batch` before cancellation;
+                // account for it in `send_drops` so settlement does not count
+                // an unsent canceled datagram as transmitted.
+                send_drops.record_datagram(dgram.len());
                 return Some(stop);
             }
             continue;
@@ -3673,11 +3725,11 @@ async fn try_gso_send_or_fallback(
     proxy_id: &str,
     local_ip: Option<crate::socket_opts::PktinfoLocal>,
     send_drops: &mut UdpReplySendDrops,
-    commit_guard: &mut UdpReplyCommitGuard<'_>,
+    commit_guard: &mut UdpReplyCommitGuard<'_, '_>,
 ) -> Option<UdpReplyCommitStop> {
-    if let Some(stop) = commit_guard.check_commit() {
-        return Some(stop);
-    }
+    // Pure in-memory buffering (`gso_batch.push`) requires no commit check here:
+    // the caller validated policy/expiry before queuing, and every actual flush
+    // or fallback send below enforces `commit_guard.check_commit()`.
     if gso_batch.push(data) {
         return None;
     }
@@ -9975,7 +10027,11 @@ async fn create_session(
                 stop_notified.as_mut().enable();
 
                 let mut commit_listener_shutdown = reply_listener_shutdown.clone();
+                let _ = commit_listener_shutdown.borrow_and_update();
                 let mut commit_global_shutdown = reply_global_shutdown.clone();
+                if let Some(ref mut rx) = commit_global_shutdown {
+                    let _ = rx.borrow_and_update();
+                }
                 let shutdown_cancel = udp_reply_shutdown_cancel(
                     &mut reply_listener_shutdown,
                     &mut reply_global_shutdown,
@@ -10277,11 +10333,16 @@ async fn create_session(
                             }
                         }
 
-                        // Final pre-send commit boundary: check stop and
-                        // authorization expiry right before the syscall even
-                        // after response hooks returned `Commit` (the timer
-                        // wheel can lag under load).
-                        if reply_session.stop_reply_task.load(Ordering::Acquire) {
+                        // Final pre-send commit boundary: check stop, lock-free
+                        // shutdown, and authorization expiry right before the
+                        // syscall even after response hooks returned `Commit`
+                        // (the timer wheel can lag under load).
+                        if reply_session.stop_reply_task.load(Ordering::Acquire)
+                            || shutdown_watch_triggered(&commit_listener_shutdown)
+                            || commit_global_shutdown
+                                .as_ref()
+                                .is_some_and(shutdown_watch_triggered)
+                        {
                             break 'reply_linux;
                         }
                         if let Some(termination) =
@@ -10311,45 +10372,20 @@ async fn create_session(
                         match send_res {
                             Ok(_) => {}
                             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                                // Frontend backpressure retry: clear Tokio's cached
-                                // WRITABLE bit immediately without a duplicate send
-                                // syscall, enter the cancellation select first, then
-                                // revalidate all policy/expiry guards before retrying
-                                // via `try_io(WRITABLE)`.
-                                let _ = frontend.try_io(tokio::io::Interest::WRITABLE, || {
-                                    Err::<(), _>(std::io::Error::from(
-                                        std::io::ErrorKind::WouldBlock,
-                                    ))
-                                });
+                                // Frontend backpressure retry: run the real send
+                                // inside `try_io(WRITABLE)` so EAGAIN and Tokio's
+                                // tick-guarded readiness clear share ONE atomic
+                                // snapshot (never erasing an intervening EPOLLOUT),
+                                // checking stop/shutdown/policy/expiry before every
+                                // attempt and racing `writable()` against the
+                                // single-armed deadline, stop, and shutdown.
                                 'singleton_retry: loop {
-                                    let writable_res = tokio::select! {
-                                        biased;
-                                        () = reply_authorization_deadline.as_mut(), if reply_authorization_plan.is_some() => {
-                                            let plan = reply_authorization_plan.expect("guarded by if");
-                                            reply_session.settle_authorization_expiry(plan.termination);
-                                            break 'reply_linux;
-                                        }
-                                        () = &mut stop_notified => break 'reply_linux,
-                                        () = &mut shutdown_cancel => break 'reply_linux,
-                                        w = frontend.writable() => w,
-                                    };
-                                    if let Err(e) = writable_res {
-                                        debug!(
-                                            proxy_id = %reply_proxy_id,
-                                            client = %udp_client_log_addr(client_addr),
-                                            "UDP frontend writable wait failed: {}",
-                                            e
-                                        );
-                                        sent_ok = false;
-                                        disconnect_error = Some((
-                                            e.to_string(),
-                                            crate::retry::classify_boxed_error(&e),
-                                            crate::plugins::DisconnectCause::RecvError,
-                                            crate::plugins::Direction::BackendToClient,
-                                        ));
-                                        break 'singleton_retry;
-                                    }
-                                    if reply_session.stop_reply_task.load(Ordering::Acquire) {
+                                    if reply_session.stop_reply_task.load(Ordering::Acquire)
+                                        || shutdown_watch_triggered(&commit_listener_shutdown)
+                                        || commit_global_shutdown
+                                            .as_ref()
+                                            .is_some_and(shutdown_watch_triggered)
+                                    {
                                         break 'reply_linux;
                                     }
                                     if let Some(source) =
@@ -10411,7 +10447,33 @@ async fn create_session(
                                     match retry_res {
                                         Ok(_) => break 'singleton_retry,
                                         Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                                            continue 'singleton_retry;
+                                            let writable_res = tokio::select! {
+                                                biased;
+                                                () = reply_authorization_deadline.as_mut(), if reply_authorization_plan.is_some() => {
+                                                    let plan = reply_authorization_plan.expect("guarded by if");
+                                                    reply_session.settle_authorization_expiry(plan.termination);
+                                                    break 'reply_linux;
+                                                }
+                                                () = &mut stop_notified => break 'reply_linux,
+                                                () = &mut shutdown_cancel => break 'reply_linux,
+                                                w = frontend.writable() => w,
+                                            };
+                                            if let Err(e) = writable_res {
+                                                debug!(
+                                                    proxy_id = %reply_proxy_id,
+                                                    client = %udp_client_log_addr(client_addr),
+                                                    "UDP frontend writable wait failed: {}",
+                                                    e
+                                                );
+                                                sent_ok = false;
+                                                disconnect_error = Some((
+                                                    e.to_string(),
+                                                    crate::retry::classify_boxed_error(&e),
+                                                    crate::plugins::DisconnectCause::RecvError,
+                                                    crate::plugins::Direction::BackendToClient,
+                                                ));
+                                                break 'singleton_retry;
+                                            }
                                         }
                                         Err(e) => {
                                             debug!(
@@ -10722,6 +10784,7 @@ async fn create_session(
                                 client_addr,
                                 proxy_id: &reply_proxy_id,
                                 authorization: reply_authorization_plan,
+                                stop_notified: stop_notified.as_mut(),
                                 listener_shutdown: &mut commit_listener_shutdown,
                                 global_shutdown: &mut commit_global_shutdown,
                             };
@@ -10826,9 +10889,15 @@ async fn create_session(
                     }
 
                     // Final revalidation + flush for the burst: enforce stop,
-                    // NodeWaypoint source + destination ownership, and
-                    // authorization expiry right before emitting queued replies.
-                    if reply_session.stop_reply_task.load(Ordering::Acquire) {
+                    // lock-free shutdown, NodeWaypoint source + destination
+                    // ownership, and authorization expiry right before emitting
+                    // queued replies.
+                    if reply_session.stop_reply_task.load(Ordering::Acquire)
+                        || shutdown_watch_triggered(&commit_listener_shutdown)
+                        || commit_global_shutdown
+                            .as_ref()
+                            .is_some_and(shutdown_watch_triggered)
+                    {
                         discard_and_settle_committed(
                             gso_batch_ref,
                             send_batch_ref,
@@ -10918,6 +10987,7 @@ async fn create_session(
                                 client_addr,
                                 proxy_id: &reply_proxy_id,
                                 authorization: reply_authorization_plan,
+                                stop_notified: stop_notified.as_mut(),
                                 listener_shutdown: &mut commit_listener_shutdown,
                                 global_shutdown: &mut commit_global_shutdown,
                             };
@@ -10961,7 +11031,12 @@ async fn create_session(
                     }
                     if !send_batch_ref.is_empty() {
                         loop {
-                            if reply_session.stop_reply_task.load(Ordering::Acquire) {
+                            if reply_session.stop_reply_task.load(Ordering::Acquire)
+                                || shutdown_watch_triggered(&commit_listener_shutdown)
+                                || commit_global_shutdown
+                                    .as_ref()
+                                    .is_some_and(shutdown_watch_triggered)
+                            {
                                 discard_and_settle_committed(
                                     gso_batch_ref,
                                     send_batch_ref,
@@ -11402,11 +11477,15 @@ async fn create_session(
                 if send_batched {
                     #[cfg(target_os = "linux")]
                     {
+                        let stop_notified = reply_stop_notify.notified();
+                        tokio::pin!(stop_notified);
+                        stop_notified.as_mut().enable();
                         let mut commit_guard = UdpReplyCommitGuard {
                             session: &reply_session,
                             client_addr,
                             proxy_id: &reply_proxy_id,
                             authorization: reply_authorization_plan,
+                            stop_notified: stop_notified.as_mut(),
                             listener_shutdown: &mut reply_listener_shutdown,
                             global_shutdown: &mut reply_global_shutdown,
                         };
@@ -11652,11 +11731,15 @@ async fn create_session(
                                 if send_batched {
                                     #[cfg(target_os = "linux")]
                                     {
+                                        let stop_notified = reply_stop_notify.notified();
+                                        tokio::pin!(stop_notified);
+                                        stop_notified.as_mut().enable();
                                         let mut commit_guard = UdpReplyCommitGuard {
                                             session: &reply_session,
                                             client_addr,
                                             proxy_id: &reply_proxy_id,
                                             authorization: reply_authorization_plan,
+                                            stop_notified: stop_notified.as_mut(),
                                             listener_shutdown: &mut reply_listener_shutdown,
                                             global_shutdown: &mut reply_global_shutdown,
                                         };
@@ -11819,7 +11902,12 @@ async fn create_session(
                     // NodeWaypoint source + destination, and authorization
                     // deadline at the final syscall boundary; discarding both
                     // batches ensures no queued reply crosses revocation.
-                    if reply_session.stop_reply_task.load(Ordering::Acquire) {
+                    if reply_session.stop_reply_task.load(Ordering::Acquire)
+                        || shutdown_watch_triggered(&reply_listener_shutdown)
+                        || reply_global_shutdown
+                            .as_ref()
+                            .is_some_and(shutdown_watch_triggered)
+                    {
                         gso_batch.discard();
                         send_batch.discard();
                         break 'reply;
@@ -11885,11 +11973,15 @@ async fn create_session(
                             gso_failed = true;
                             // Replay all buffered datagrams through sendmmsg /
                             // direct-send for segments that exceed the slot size.
+                            let stop_notified = reply_stop_notify.notified();
+                            tokio::pin!(stop_notified);
+                            stop_notified.as_mut().enable();
                             let mut commit_guard = UdpReplyCommitGuard {
                                 session: &reply_session,
                                 client_addr,
                                 proxy_id: &reply_proxy_id,
                                 authorization: reply_authorization_plan,
+                                stop_notified: stop_notified.as_mut(),
                                 listener_shutdown: &mut reply_listener_shutdown,
                                 global_shutdown: &mut reply_global_shutdown,
                             };
