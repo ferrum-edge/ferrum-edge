@@ -4483,6 +4483,24 @@ fn decode_http_route_set(
                  not emit"
             ));
         }
+        // The config BODY of every non-dispatch kind is pinned the same way:
+        // to the keys and constrained values its builder emits
+        // (`carried_route_plugin_body_is_translator_shaped`), and then to the
+        // plugin's own constructor. A dispatch body was already checked by
+        // its constructor above. Any deviation rejects the slice, before
+        // binding or detachment could drop the record with its route.
+        if plugin.plugin_name != "mesh_route_dispatch"
+            && (!carried_route_plugin_body_is_translator_shaped(
+                &plugin.plugin_name,
+                &plugin.config,
+            ) || crate::plugins::validate_plugin_config(&plugin.plugin_name, &plugin.config)
+                .is_err())
+        {
+            return Err(anyhow::anyhow!(
+                "Mesh slice HTTP route plugin config {index} carries a config body the \
+                 translator does not emit"
+            ));
+        }
     }
     for plugin in &plugin_configs {
         if plugin.plugin_name == "mesh_route_dispatch" {
@@ -4611,6 +4629,126 @@ fn carried_route_plugin_record_is_translator_shaped(
         && priority_override.is_none()
         && trigger.is_none()
         && api_spec_id.is_none()
+}
+
+/// Whether a carried route plugin's config BODY has exactly the shape its
+/// translator builder emits (issue #7440). These are the keys and
+/// constrained values each builder in [`CARRIED_ROUTE_PLUGIN_KINDS`] sets:
+/// * `request_transformer` / `response_transformer`
+///   (`route_request_transformer_plugin_for_proxy` /
+///   `route_response_transformer_plugin_for_proxy`,
+///   `src/config_sources/k8s/mod.rs`): exactly
+///   `{"rules": [], "apply_route_overrides": true}`. No static rules, only
+///   the dispatch rules' per-request transforms.
+/// * `request_termination` (`request_termination_plugin_for_proxy`, same
+///   file, called from `materialize_route_candidate` in
+///   `src/config_sources/k8s/istio.rs`): exactly `status_code` 404 and
+///   `message` `VIRTUAL_SERVICE_UNSUPPORTED_MATCH_TERMINATION_MESSAGE`. No
+///   plugin-local `trigger` or other key that could make the unconditional
+///   refusal conditional.
+/// * `request_mirror` (`route_mirror_plugin`, `istio.rs`): exactly
+///   `mirror_host`, `mirror_port` and `percentage`, as follows.
+///   - The host is a loopback IP literal, the same
+///     `is_loopback_ip_literal_host` predicate as
+///     `virtual_service_route_mirror_is_deferred`, which omits every other
+///     mirror.
+///   - The port is in 1..=65535.
+///   - The percentage is in (0, 100], since a zero mirror is omitted.
+///
+///   No `allow_plaintext`, `mirror_protocol` or other key that could send
+///   the mirrored request somewhere else.
+/// * `cors` (`route_cors_plugin`, `istio.rs`): only `allowed_origins`, a
+///   non-empty list of single-operator `exact` / `prefix` / `regex` string
+///   matchers; `allowed_methods`, `allowed_headers` and `exposed_headers`,
+///   string lists; `unmatched_preflights`, `forward` or `ignore`; and the
+///   optional `max_age` (unsigned integer) and `allow_credentials` (boolean).
+///
+/// `mesh_route_dispatch` bodies are checked by the plugin constructor (and the
+/// `weighted_splits` refusal) in `decode_http_route_set`. Any other kind is
+/// not a translator kind. The caller also runs each body through its plugin
+/// constructor.
+fn carried_route_plugin_body_is_translator_shaped(
+    plugin_name: &str,
+    config: &serde_json::Value,
+) -> bool {
+    use serde_json::Value;
+    let Some(body) = config.as_object() else {
+        return false;
+    };
+    let only = |allowed: &[&str]| body.keys().all(|key| allowed.contains(&key.as_str()));
+    let string_list = |key: &str| {
+        body.get(key)
+            .and_then(Value::as_array)
+            .is_some_and(|items| items.iter().all(Value::is_string))
+    };
+    match plugin_name {
+        "mesh_route_dispatch" => true,
+        "request_transformer" | "response_transformer" => {
+            *config == serde_json::json!({"rules": [], "apply_route_overrides": true})
+        }
+        "request_termination" => {
+            only(&["status_code", "message"])
+                && body.get("status_code").and_then(Value::as_u64) == Some(404)
+                && body.get("message").and_then(Value::as_str)
+                    == Some(
+                        crate::config_sources::k8s::VIRTUAL_SERVICE_UNSUPPORTED_MATCH_TERMINATION_MESSAGE,
+                    )
+        }
+        "request_mirror" => {
+            only(&["mirror_host", "mirror_port", "percentage"])
+                && body
+                    .get("mirror_host")
+                    .and_then(Value::as_str)
+                    .is_some_and(|host| {
+                        crate::plugins::utils::socket_host::is_loopback_ip_literal_host(
+                            host.trim(),
+                        )
+                    })
+                && body
+                    .get("mirror_port")
+                    .and_then(Value::as_u64)
+                    .is_some_and(|port| (1..=65535).contains(&port))
+                && body
+                    .get("percentage")
+                    .and_then(Value::as_f64)
+                    .is_some_and(|percentage| percentage > 0.0 && percentage <= 100.0)
+        }
+        "cors" => {
+            only(&[
+                "allowed_origins",
+                "allowed_methods",
+                "allowed_headers",
+                "exposed_headers",
+                "max_age",
+                "allow_credentials",
+                "unmatched_preflights",
+            ]) && body
+                .get("allowed_origins")
+                .and_then(Value::as_array)
+                .is_some_and(|origins| {
+                    !origins.is_empty()
+                        && origins.iter().all(|origin| {
+                            origin.as_object().is_some_and(|matcher| {
+                                matcher.len() == 1
+                                    && matcher.iter().all(|(operator, value)| {
+                                        matches!(operator.as_str(), "exact" | "prefix" | "regex")
+                                            && value.is_string()
+                                    })
+                            })
+                        })
+                })
+                && string_list("allowed_methods")
+                && string_list("allowed_headers")
+                && string_list("exposed_headers")
+                && body.get("max_age").is_none_or(Value::is_u64)
+                && body.get("allow_credentials").is_none_or(Value::is_boolean)
+                && matches!(
+                    body.get("unmatched_preflights").and_then(Value::as_str),
+                    Some("forward" | "ignore")
+                )
+        }
+        _ => false,
+    }
 }
 
 /// Refuse a carried route set in which two records of one `kind` share an id.
