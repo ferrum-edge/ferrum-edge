@@ -4310,9 +4310,11 @@ type DecodedHttpRouteSet = (
 /// every element is an object of
 /// its resource type in the slice namespace with a translator-owned id; every
 /// plugin association resolves to a carried plugin config owned by that
-/// proxy; every carried `mesh_route_dispatch` instance has a config the
-/// plugin constructor accepts and a record of exactly the translator's shape
-/// (`carried_dispatch_record_is_translator_shaped`); and every upstream id a proxy or
+/// proxy; every carried plugin-config record is a translator kind with its
+/// reserved id, in exactly the translator's record shape
+/// (`carried_route_plugin_record_is_translator_shaped`), and every carried
+/// `mesh_route_dispatch` config is one the plugin constructor accepts; and
+/// every upstream id a proxy or
 /// `mesh_route_dispatch` rule names resolves to a carried upstream (and every
 /// carried upstream is named). Any
 /// violation refuses the slice, so the previous generation keeps serving.
@@ -4468,17 +4470,17 @@ fn decode_http_route_set(
         }
         referenced_upstreams.extend(proxy.upstream_id.as_deref());
     }
-    // Every carried dispatch RECORD must have exactly the shape the translator
-    // emits (issue #7440): see `carried_dispatch_record_is_translator_shaped`.
-    // Anything else rejects the slice. The config body is checked separately,
-    // by the plugin constructor above.
+    // EVERY carried route plugin-config record, whatever its `plugin_name`,
+    // must be one of the kinds the translator attaches to a route, with that
+    // kind's reserved id, in exactly the translator's record shape (issue
+    // #7440): see `carried_route_plugin_record_is_translator_shaped`.
+    // Anything else rejects the slice. A dispatch config body is checked
+    // separately, by the plugin constructor above.
     for (index, plugin) in plugin_configs.iter().enumerate() {
-        if plugin.plugin_name == "mesh_route_dispatch"
-            && !carried_dispatch_record_is_translator_shaped(plugin, &proxies)
-        {
+        if !carried_route_plugin_record_is_translator_shaped(plugin, &proxies) {
             return Err(anyhow::anyhow!(
-                "Mesh slice HTTP route plugin config {index} is a `mesh_route_dispatch` \
-                 record the translator does not emit"
+                "Mesh slice HTTP route plugin config {index} is a record the translator does \
+                 not emit"
             ));
         }
     }
@@ -4496,44 +4498,75 @@ fn decode_http_route_set(
     Ok((proxies, upstreams, plugin_configs))
 }
 
-/// Whether a carried `mesh_route_dispatch` plugin-config record has exactly
-/// the record-level shape the VirtualService translator emits (issue #7440).
+/// The plugin kinds the VirtualService translator attaches to a carried HTTP
+/// route, each with its reserved id prefix (`<prefix><proxy id>`). Derived
+/// from the translator (issue #7440):
+/// * `istio-vs-mrd-`: `mesh_route_dispatch`, from
+///   `mesh_route_dispatch_plugin_from_rules` (`src/config_sources/k8s/mod.rs`);
+/// * `istio-vs-req-xform-` / `istio-vs-resp-xform-`: `request_transformer` /
+///   `response_transformer`, from `route_request_transformer_plugin_for_proxy`
+///   / `route_response_transformer_plugin_for_proxy` (same file), emitted
+///   when dispatch rules carry header transforms;
+/// * `istio-vs-rt-`: `request_termination`, from
+///   `request_termination_plugin_for_proxy` (same file), for a route that must
+///   refuse every request;
+/// * `istio-vs-mirror-`: `request_mirror`, from `route_mirror_plugin`
+///   (`src/config_sources/k8s/istio.rs`);
+/// * `istio-vs-cors-`: `cors`, from `route_cors_plugin` (same file).
 ///
-/// This is an allowlist, derived from `mesh_route_dispatch_plugin_from_rules`
-/// (`src/config_sources/k8s/mod.rs`). The Istio VirtualService translator
-/// (`materialize_route_candidate` in `src/config_sources/k8s/istio.rs`)
-/// attaches its result to the route with `attach_route_plugins_to_proxy`. The Gateway API translator re-points it
-/// with `retarget_dispatch_plugin`, which keeps the id/proxy_id pairing. The
-/// translator sets:
+/// `materialize_route_candidate` and its caller in `istio.rs` attach exactly
+/// these to the route with `attach_route_plugins_to_proxy`. Faults, rewrites,
+/// redirects and header transforms ride the dispatch rules, not their own
+/// plugins. No prefix is a prefix of another, so an id names one kind.
+const CARRIED_ROUTE_PLUGIN_KINDS: &[(&str, &str)] = &[
+    ("istio-vs-mrd-", "mesh_route_dispatch"),
+    ("istio-vs-req-xform-", "request_transformer"),
+    ("istio-vs-resp-xform-", "response_transformer"),
+    ("istio-vs-rt-", "request_termination"),
+    ("istio-vs-mirror-", "request_mirror"),
+    ("istio-vs-cors-", "cors"),
+];
+
+/// Whether a carried route plugin-config record has exactly the record-level
+/// shape the VirtualService translator emits (issue #7440).
+///
+/// This is an allowlist, applied to EVERY carried record whatever its
+/// `plugin_name`. The kind must be one of [`CARRIED_ROUTE_PLUGIN_KINDS`]. Every
+/// builder listed there sets the same record shape:
+/// * `id`: exactly that kind's prefix plus `proxy_id`, so a reserved prefix
+///   always matches its kind and names its own route;
 /// * `labels`: empty;
-/// * `id`: `istio-vs-mrd-<proxy id>`;
 /// * `scope`: `Proxy`, with `proxy_id` naming the route, which lists the
 ///   instance in its `plugins`;
 /// * `enabled`: `true`;
 /// * `priority_override`, `trigger`, `api_spec_id`: `None`;
-/// * `config`: `{rules, reject_unmatched}`, checked by the plugin constructor
-///   in `decode_http_route_set` (and `weighted_splits` is refused there);
+/// * `config`: kind-specific. A dispatch body is checked by the plugin
+///   constructor in `decode_http_route_set` (and `weighted_splits` is refused
+///   there). Other bodies are checked when the plugin cache builds them.
 /// * `namespace`: the route namespace, checked against the slice namespace in
 ///   `decode_http_route_set`;
 /// * `created_at` / `updated_at`: wall clock, which carries no behavior.
 ///
-/// Any other value changes how, or whether, the instance runs. A disabled,
-/// non-proxy-scoped or unassociated instance is never built by
-/// `PluginCache::build_cache`. A trigger can skip the instance per request. A
-/// priority override reorders it against the dispatch finalizer. Each of
-/// these would leave the route serving its default destination without the
-/// match gate that answers a miss with 404, or without leg selection. So
-/// anything outside the allowlist rejects the slice. The struct is
-/// destructured without `..`, so a new `PluginConfig` field fails to compile
-/// here until it is classified.
-fn carried_dispatch_record_is_translator_shaped(
+/// Any other value changes how, whether, or as what the instance runs:
+/// * A disabled, non-proxy-scoped or unassociated instance is never built by
+///   `PluginCache::build_cache`.
+/// * A trigger can skip it per request, and a priority override reorders it.
+/// * A reserved dispatch id on another kind leaves the route with no dispatch
+///   instance, and still occupies the id the binding reserves for one.
+///
+/// For a dispatch instance, each of these would leave the route serving its
+/// default destination without the match gate that answers a miss with 404,
+/// or without leg selection. So anything outside the allowlist rejects the
+/// slice. The struct is destructured without `..`, so a new `PluginConfig`
+/// field fails to compile here until it is classified.
+fn carried_route_plugin_record_is_translator_shaped(
     plugin: &crate::config::types::PluginConfig,
     proxies: &[Proxy],
 ) -> bool {
     let crate::config::types::PluginConfig {
         labels,
         id,
-        plugin_name: _,
+        plugin_name,
         namespace: _,
         config: _,
         scope,
@@ -4545,9 +4578,24 @@ fn carried_dispatch_record_is_translator_shaped(
         created_at: _,
         updated_at: _,
     } = plugin;
+    let Some(&(prefix, _)) = CARRIED_ROUTE_PLUGIN_KINDS
+        .iter()
+        .find(|(_, kind)| *kind == plugin_name.as_str())
+    else {
+        return false;
+    };
     let Some(proxy_id) = proxy_id.as_deref() else {
         return false;
     };
+    // A reserved prefix must belong to this record's kind. The exact id check
+    // below implies it, but a reserved id on the wrong kind is refused here
+    // explicitly.
+    if CARRIED_ROUTE_PLUGIN_KINDS
+        .iter()
+        .any(|&(other, kind)| kind != plugin_name.as_str() && id.starts_with(other))
+    {
+        return false;
+    }
     let associated = proxies.iter().any(|proxy| {
         proxy.id == proxy_id
             && proxy
@@ -4556,7 +4604,7 @@ fn carried_dispatch_record_is_translator_shaped(
                 .any(|association| association.plugin_config_id == *id)
     });
     labels.is_empty()
-        && id.strip_prefix("istio-vs-mrd-") == Some(proxy_id)
+        && id.strip_prefix(prefix) == Some(proxy_id)
         && *scope == PluginScope::Proxy
         && associated
         && *enabled
