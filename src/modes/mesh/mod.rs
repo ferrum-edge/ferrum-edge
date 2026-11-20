@@ -4310,9 +4310,9 @@ type DecodedHttpRouteSet = (
 /// every element is an object of
 /// its resource type in the slice namespace with a translator-owned id; every
 /// plugin association resolves to a carried plugin config owned by that
-/// proxy; every carried `mesh_route_dispatch` instance is valid for the
-/// plugin constructor, enabled, proxy-scoped and listed by its owning route,
-/// so the cache builds it; and every upstream id a proxy or
+/// proxy; every carried `mesh_route_dispatch` instance has a config the
+/// plugin constructor accepts and a record of exactly the translator's shape
+/// (`carried_dispatch_record_is_translator_shaped`); and every upstream id a proxy or
 /// `mesh_route_dispatch` rule names resolves to a carried upstream (and every
 /// carried upstream is named). Any
 /// violation refuses the slice, so the previous generation keeps serving.
@@ -4393,9 +4393,9 @@ fn decode_http_route_set(
             // host to the plain Service route (which serves requests the
             // instance's match gate answers with 404), or have its offending
             // destination rewritten into a valid one. A refusal rejects the
-            // slice, so the last accepted generation keeps serving. A
-            // disabled, non-proxy-scoped or unassociated instance is refused
-            // below, after the proxy associations are resolved.
+            // slice, so the last accepted generation keeps serving. The
+            // record around the config is checked below, after the proxy
+            // associations are resolved.
             if plugin.plugin_name == "mesh_route_dispatch"
                 && crate::plugins::mesh_route_dispatch::MeshRouteDispatch::new(&plugin.config)
                     .is_err()
@@ -4468,32 +4468,17 @@ fn decode_http_route_set(
         }
         referenced_upstreams.extend(proxy.upstream_id.as_deref());
     }
-    // A carried dispatch instance must also be one the plugin cache builds as
-    // its route's instance (issue #7440): enabled, proxy-scoped, and listed in
-    // its owning route's `plugins`. `PluginCache::build_cache` skips a
-    // disabled config and a proxy-scoped config its proxy does not reference,
-    // so such a record would leave the route serving with its listen path and
-    // default destination but without the match gate that answers a miss
-    // with 404. The translator always emits enabled, proxy-scoped, associated
-    // instances, so this refuses only nonconforming input, and the refusal
-    // rejects the slice. This mirrors the proxy-to-plugin resolution above.
+    // Every carried dispatch RECORD must have exactly the shape the translator
+    // emits (issue #7440): see `carried_dispatch_record_is_translator_shaped`.
+    // Anything else rejects the slice. The config body is checked separately,
+    // by the plugin constructor above.
     for (index, plugin) in plugin_configs.iter().enumerate() {
-        if plugin.plugin_name != "mesh_route_dispatch" {
-            continue;
-        }
-        let associated = plugin.proxy_id.as_deref().is_some_and(|proxy_id| {
-            proxies.iter().any(|proxy| {
-                proxy.id == proxy_id
-                    && proxy
-                        .plugins
-                        .iter()
-                        .any(|association| association.plugin_config_id == plugin.id)
-            })
-        });
-        if !plugin.enabled || plugin.scope != PluginScope::Proxy || !associated {
+        if plugin.plugin_name == "mesh_route_dispatch"
+            && !carried_dispatch_record_is_translator_shaped(plugin, &proxies)
+        {
             return Err(anyhow::anyhow!(
                 "Mesh slice HTTP route plugin config {index} is a `mesh_route_dispatch` \
-                 instance its route would not construct"
+                 record the translator does not emit"
             ));
         }
     }
@@ -4509,6 +4494,75 @@ fn decode_http_route_set(
         ));
     }
     Ok((proxies, upstreams, plugin_configs))
+}
+
+/// Whether a carried `mesh_route_dispatch` plugin-config record has exactly
+/// the record-level shape the VirtualService translator emits (issue #7440).
+///
+/// This is an allowlist, derived from `mesh_route_dispatch_plugin_from_rules`
+/// (`src/config_sources/k8s/mod.rs`). The Istio VirtualService translator
+/// (`materialize_route_candidate` in `src/config_sources/k8s/istio.rs`)
+/// attaches its result to the route with `attach_route_plugins_to_proxy`. The Gateway API translator re-points it
+/// with `retarget_dispatch_plugin`, which keeps the id/proxy_id pairing. The
+/// translator sets:
+/// * `labels`: empty;
+/// * `id`: `istio-vs-mrd-<proxy id>`;
+/// * `scope`: `Proxy`, with `proxy_id` naming the route, which lists the
+///   instance in its `plugins`;
+/// * `enabled`: `true`;
+/// * `priority_override`, `trigger`, `api_spec_id`: `None`;
+/// * `config`: `{rules, reject_unmatched}`, checked by the plugin constructor
+///   in `decode_http_route_set` (and `weighted_splits` is refused there);
+/// * `namespace`: the route namespace, checked against the slice namespace in
+///   `decode_http_route_set`;
+/// * `created_at` / `updated_at`: wall clock, which carries no behavior.
+///
+/// Any other value changes how, or whether, the instance runs. A disabled,
+/// non-proxy-scoped or unassociated instance is never built by
+/// `PluginCache::build_cache`. A trigger can skip the instance per request. A
+/// priority override reorders it against the dispatch finalizer. Each of
+/// these would leave the route serving its default destination without the
+/// match gate that answers a miss with 404, or without leg selection. So
+/// anything outside the allowlist rejects the slice. The struct is
+/// destructured without `..`, so a new `PluginConfig` field fails to compile
+/// here until it is classified.
+fn carried_dispatch_record_is_translator_shaped(
+    plugin: &crate::config::types::PluginConfig,
+    proxies: &[Proxy],
+) -> bool {
+    let crate::config::types::PluginConfig {
+        labels,
+        id,
+        plugin_name: _,
+        namespace: _,
+        config: _,
+        scope,
+        proxy_id,
+        enabled,
+        priority_override,
+        trigger,
+        api_spec_id,
+        created_at: _,
+        updated_at: _,
+    } = plugin;
+    let Some(proxy_id) = proxy_id.as_deref() else {
+        return false;
+    };
+    let associated = proxies.iter().any(|proxy| {
+        proxy.id == proxy_id
+            && proxy
+                .plugins
+                .iter()
+                .any(|association| association.plugin_config_id == *id)
+    });
+    labels.is_empty()
+        && id.strip_prefix("istio-vs-mrd-") == Some(proxy_id)
+        && *scope == PluginScope::Proxy
+        && associated
+        && *enabled
+        && priority_override.is_none()
+        && trigger.is_none()
+        && api_spec_id.is_none()
 }
 
 /// Refuse a carried route set in which two records of one `kind` share an id.
