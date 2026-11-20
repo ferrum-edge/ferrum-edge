@@ -5567,8 +5567,11 @@ fn clone_sidecar_carried_destination_upstreams(
 /// trusted local workload (the same evidence `materialize_sidecar_l4_source_selectors`
 /// uses for L4 routes).
 ///
-/// Istio `match[]` entries are ORed, and the translator emits one rule per
-/// entry, so `sourceNamespace` is decided per rule (one match condition): a
+/// Istio `match[]` entries are ORed. The translator emits one rule per
+/// in-scope entry that has a non-URI predicate (a URI-only entry emits no
+/// rule: the route's `listen_path` carries it and `reject_unmatched` is off,
+/// so unclaimed requests reach the route's own destination). So
+/// `sourceNamespace` is decided per rule (one match condition): a
 /// rule naming the local namespace drops the predicate (keeping its other
 /// predicates, or matching every path when it had none), and any other rule,
 /// or every such rule when the local workload is not unambiguously resolved,
