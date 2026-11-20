@@ -4312,9 +4312,12 @@ type DecodedHttpRouteSet = (
 /// plugin association resolves to a carried plugin config owned by that
 /// proxy; every carried plugin-config record is a translator kind with its
 /// reserved id, in exactly the translator's record shape
-/// (`carried_route_plugin_record_is_translator_shaped`), and every carried
-/// `mesh_route_dispatch` config is one the plugin constructor accepts; and
-/// every upstream id a proxy or
+/// (`carried_route_plugin_record_is_translator_shaped`); every carried
+/// `mesh_route_dispatch` config is one the plugin constructor accepts; every
+/// other carried config body has exactly its builder's emitted shape
+/// (`carried_route_plugin_body_is_translator_shaped`) and passes its plugin
+/// constructor where that needs no network client
+/// (`carried_route_plugin_body_constructs`); and every upstream id a proxy or
 /// `mesh_route_dispatch` rule names resolves to a carried upstream (and every
 /// carried upstream is named). Any
 /// violation refuses the slice, so the previous generation keeps serving.
@@ -4486,15 +4489,16 @@ fn decode_http_route_set(
         // The config BODY of every non-dispatch kind is pinned the same way:
         // to the keys and constrained values its builder emits
         // (`carried_route_plugin_body_is_translator_shaped`), and then to the
-        // plugin's own constructor. A dispatch body was already checked by
-        // its constructor above. Any deviation rejects the slice, before
-        // binding or detachment could drop the record with its route.
+        // plugin's own constructor where that builds no network client
+        // (`carried_route_plugin_body_constructs`). A dispatch body was
+        // already checked by its constructor above. Any deviation rejects the
+        // slice, before binding or detachment could drop the record with its
+        // route.
         if plugin.plugin_name != "mesh_route_dispatch"
             && (!carried_route_plugin_body_is_translator_shaped(
                 &plugin.plugin_name,
                 &plugin.config,
-            ) || crate::plugins::validate_plugin_config(&plugin.plugin_name, &plugin.config)
-                .is_err())
+            ) || !carried_route_plugin_body_constructs(&plugin.plugin_name, &plugin.config))
         {
             return Err(anyhow::anyhow!(
                 "Mesh slice HTTP route plugin config {index} carries a config body the \
@@ -4558,9 +4562,11 @@ const CARRIED_ROUTE_PLUGIN_KINDS: &[(&str, &str)] = &[
 ///   instance in its `plugins`;
 /// * `enabled`: `true`;
 /// * `priority_override`, `trigger`, `api_spec_id`: `None`;
-/// * `config`: kind-specific. A dispatch body is checked by the plugin
-///   constructor in `decode_http_route_set` (and `weighted_splits` is refused
-///   there). Other bodies are checked when the plugin cache builds them.
+/// * `config`: kind-specific, and also checked in `decode_http_route_set`.
+///   A dispatch body goes through the plugin constructor, and
+///   `weighted_splits` is refused. Every other body is pinned by
+///   `carried_route_plugin_body_is_translator_shaped` and
+///   `carried_route_plugin_body_constructs`.
 /// * `namespace`: the route namespace, checked against the slice namespace in
 ///   `decode_http_route_set`;
 /// * `created_at` / `updated_at`: wall clock, which carries no behavior.
@@ -4661,12 +4667,21 @@ fn carried_route_plugin_record_is_translator_shaped(
 ///   non-empty list of single-operator `exact` / `prefix` / `regex` string
 ///   matchers; `allowed_methods`, `allowed_headers` and `exposed_headers`,
 ///   string lists; `unmatched_preflights`, `forward` or `ignore`; and the
-///   optional `max_age` (unsigned integer) and `allow_credentials` (boolean).
+///   optional `max_age` and `allow_credentials` (boolean).
+///   - `max_age` is an unsigned integer no larger than
+///     `ISTIO_DURATION_SECS_MAX`, the largest `parse_istio_duration_secs`
+///     output.
+///   - Credentials are never combined with a non-strict origin (exact `*`,
+///     opaque `null`, an effectively universal prefix or regex). This is the
+///     same `allowed_origin_entry_is_non_strict` rule as the translator's
+///     `cors_policy_translatable`, which defers such a policy. The plugin
+///     constructor would accept a credentialed exact `*` and silently drop
+///     the credentials.
 ///
 /// `mesh_route_dispatch` bodies are checked by the plugin constructor (and the
 /// `weighted_splits` refusal) in `decode_http_route_set`. Any other kind is
-/// not a translator kind. The caller also runs each body through its plugin
-/// constructor.
+/// not a translator kind. The caller then also runs each body through
+/// `carried_route_plugin_body_constructs`.
 fn carried_route_plugin_body_is_translator_shaped(
     plugin_name: &str,
     config: &serde_json::Value,
@@ -4740,13 +4755,53 @@ fn carried_route_plugin_body_is_translator_shaped(
                 && string_list("allowed_methods")
                 && string_list("allowed_headers")
                 && string_list("exposed_headers")
-                && body.get("max_age").is_none_or(Value::is_u64)
+                && body.get("max_age").is_none_or(|max_age| {
+                    max_age.as_u64().is_some_and(|seconds| {
+                        seconds <= crate::config_sources::k8s::ISTIO_DURATION_SECS_MAX
+                    })
+                })
                 && body.get("allow_credentials").is_none_or(Value::is_boolean)
+                && !(body.get("allow_credentials") == Some(&Value::Bool(true))
+                    && body
+                        .get("allowed_origins")
+                        .and_then(Value::as_array)
+                        .is_some_and(|origins| {
+                            origins
+                                .iter()
+                                .any(crate::plugins::cors::allowed_origin_entry_is_non_strict)
+                        }))
                 && matches!(
                     body.get("unmatched_preflights").and_then(Value::as_str),
                     Some("forward" | "ignore")
                 )
         }
+        _ => false,
+    }
+}
+
+/// Run a carried non-dispatch config body through its plugin's own
+/// constructor, without building any network client (issue #7440).
+///
+/// The transformer, termination and CORS constructors take only the JSON
+/// config. `request_mirror`'s constructor needs a `PluginHttpClient`, which
+/// means a DNS cache and several reqwest clients. Building that for every
+/// record on every slice decode, on the apply task, is the per-record cost
+/// issue #4116 removed from config sweeps. So a carried mirror is not
+/// constructed here. Its body is pinned exhaustively by
+/// `carried_route_plugin_body_is_translator_shaped` (three keys, a loopback IP
+/// literal host, bounded port and percentage), and the plugin cache
+/// constructs it with the node's own client when it builds the generation.
+fn carried_route_plugin_body_constructs(plugin_name: &str, config: &serde_json::Value) -> bool {
+    use crate::plugins::{
+        cors::CorsPlugin, request_termination::RequestTermination,
+        request_transformer::RequestTransformer, response_transformer::ResponseTransformer,
+    };
+    match plugin_name {
+        "request_transformer" => RequestTransformer::new(config).is_ok(),
+        "response_transformer" => ResponseTransformer::new(config).is_ok(),
+        "request_termination" => RequestTermination::new(config).is_ok(),
+        "cors" => CorsPlugin::new(config).is_ok(),
+        "request_mirror" => true,
         _ => false,
     }
 }

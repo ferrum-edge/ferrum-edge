@@ -18831,6 +18831,17 @@ extensionProviders:
     }
 
     #[test]
+    fn istio_duration_secs_max_is_the_largest_projected_value() {
+        // `u64::MAX` milliseconds is the parser's saturation point; mesh slice
+        // decode bounds a carried CORS `max_age` by this value.
+        assert_eq!(
+            parse_istio_duration_secs("18446744073709551615ms"),
+            Some(crate::config_sources::k8s::ISTIO_DURATION_SECS_MAX)
+        );
+        assert_eq!(parse_istio_duration_secs("1e30ms"), None);
+    }
+
+    #[test]
     fn parse_istio_duration_ms_formats() {
         assert_eq!(parse_istio_duration_ms("5s"), Some(5000));
         assert_eq!(parse_istio_duration_ms("1.5s"), Some(1500));

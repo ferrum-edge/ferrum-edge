@@ -2906,8 +2906,10 @@ fn every_route_plugin_kind_config() -> GatewayConfig {
         "response": {"set": {"x-response-tag": "mesh"}}
     });
     spec["http"][0]["corsPolicy"] = json!({
-        "allowOrigins": [{"exact": "https://app.example"}],
-        "allowMethods": ["GET"]
+        "allowOrigins": [{"exact": "https://app.example"}, {"exact": "https://admin.example"}],
+        "allowMethods": ["GET"],
+        "maxAge": "600s",
+        "allowCredentials": true
     });
     spec["http"][0]["mirror"] = json!({"host": "127.0.0.1", "port": {"number": 9000}});
     spec["http"]
@@ -2954,6 +2956,10 @@ fn translator_route_plugin_kinds_decode_on_both_topologies() {
     }
 }
 
+/// The largest CORS `max_age` the translator can project: `u64::MAX`
+/// milliseconds rounded up to seconds (`ISTIO_DURATION_SECS_MAX`).
+const CORS_MAX_AGE_SECS_MAX: u64 = u64::MAX.div_ceil(1000);
+
 /// Review findings sol F1 / F2 (#7453): the config body of every non-dispatch
 /// kind is pinned at decode to the shape its translator builder emits, and
 /// any deviation rejects the slice on Sidecar and NodeWaypoint. A mirror may
@@ -2961,11 +2967,21 @@ fn translator_route_plugin_kinds_decode_on_both_topologies() {
 /// A termination may not become conditional (a plugin-local trigger) or stop
 /// refusing (another status). A transformer may not carry static rules, and
 /// CORS may not grow a key the translator never sets.
+///
+/// Review findings (#7455):
+/// * The termination trigger case uses a trigger the plugin itself accepts,
+///   so only the body pin can refuse it.
+/// * CORS value pins are covered: a credentialed exact `*`, which the
+///   translator defers and the plugin would silently strip; `max_age` one
+///   past the largest projected value, with the largest value itself
+///   accepted; an unsupported preflight mode; a multi-operator origin; a
+///   non-string method.
+/// * The mirror port and percentage bounds are covered.
 #[test]
 fn every_non_translator_route_plugin_body_rejects_the_slice() {
     let config = every_route_plugin_kind_config();
     type BodyPatch = (&'static str, &'static str, fn(&mut serde_json::Value));
-    let patches: [BodyPatch; 8] = [
+    let patches: &[BodyPatch] = &[
         ("request_mirror", "non-loopback host", |body| {
             body["mirror_host"] = json!("10.0.0.5");
         }),
@@ -2976,8 +2992,20 @@ fn every_non_translator_route_plugin_body_rejects_the_slice() {
         ("request_mirror", "protocol switch", |body| {
             body["mirror_protocol"] = json!("https");
         }),
+        ("request_mirror", "port zero", |body| {
+            body["mirror_port"] = json!(0);
+        }),
+        ("request_mirror", "port above range", |body| {
+            body["mirror_port"] = json!(65536);
+        }),
+        ("request_mirror", "zero percentage", |body| {
+            body["percentage"] = json!(0);
+        }),
+        ("request_mirror", "percentage above 100", |body| {
+            body["percentage"] = json!(100.5);
+        }),
         ("request_termination", "conditional trigger", |body| {
-            body["trigger"] = json!({"when": {"match": {"path": {"prefix": ["/never"]}}}});
+            body["trigger"] = json!({"path_prefix": "/never"});
         }),
         ("request_termination", "non-refusing status", |body| {
             body["status_code"] = json!(200);
@@ -2992,13 +3020,40 @@ fn every_non_translator_route_plugin_body_rejects_the_slice() {
         ("cors", "unknown key", |body| {
             body["allow_private_network"] = json!(true);
         }),
+        ("cors", "credentialed wildcard", |body| {
+            body["allowed_origins"] = json!([{"exact": "*"}]);
+            body["allow_credentials"] = json!(true);
+        }),
+        ("cors", "max_age above the projected range", |body| {
+            body["max_age"] = json!(CORS_MAX_AGE_SECS_MAX + 1);
+        }),
+        ("cors", "unsupported preflight mode", |body| {
+            body["unmatched_preflights"] = json!("reject");
+        }),
+        ("cors", "multi-operator origin", |body| {
+            body["allowed_origins"] =
+                json!([{"exact": "https://app.example", "prefix": "https://app.example"}]);
+        }),
+        ("cors", "non-string method", |body| {
+            body["allowed_methods"] = json!([1]);
+        }),
     ];
     for runtime in [sidecar_runtime_for("details"), node_waypoint_runtime()] {
         let topology = runtime.topology;
         let slice = MeshSlice::from_gateway_config(&config, runtime.mesh_slice_request());
         prepare_gateway_config_from_mesh_slice(&slice, &runtime)
             .unwrap_or_else(|error| panic!("{topology:?}: the valid slice applies: {error:#}"));
-        for (kind, name, patch) in patches {
+        // The largest `max_age` the translator can project is accepted.
+        let mut at_bound = slice.clone();
+        for plugin in &mut at_bound.http_routes.plugin_configs {
+            if plugin["plugin_name"] == json!("cors") {
+                plugin["config"]["max_age"] = json!(CORS_MAX_AGE_SECS_MAX);
+            }
+        }
+        prepare_gateway_config_from_mesh_slice(&at_bound, &runtime).unwrap_or_else(|error| {
+            panic!("{topology:?}: the largest projected max_age applies: {error:#}")
+        });
+        for &(kind, name, patch) in patches {
             let mut tampered = slice.clone();
             let mut patched = 0;
             for plugin in &mut tampered.http_routes.plugin_configs {
