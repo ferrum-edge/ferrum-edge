@@ -326,13 +326,15 @@ async fn mysql_example_audit_partial_ddl_recovers_and_accepts_text_bindings() {
     .execute(pool)
     .await
     .expect("runtime text bindings must be accepted by MySQL through sqlx::Any");
-    let context: Vec<u8> = sqlx::query_scalar(
+    // SQLx 0.9 (#4255) reports a MySQL TEXT column with a non-binary
+    // collation as Any TEXT, not BLOB, so it decodes as a `String`.
+    let context: String = sqlx::query_scalar(
         "SELECT request_context FROM example_audit_log WHERE id = 'runtime-row'",
     )
     .fetch_one(pool)
     .await
     .expect("read runtime text binding");
-    assert_eq!(context.as_slice(), b"{\"redacted\":true}");
+    assert_eq!(context, "{\"redacted\":true}");
 
     // Simulate V4 CREATE INDEX committing before its tracker insert.
     sqlx::query(
