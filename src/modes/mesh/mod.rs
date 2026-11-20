@@ -4310,8 +4310,11 @@ type DecodedHttpRouteSet = (
 /// every element is an object of
 /// its resource type in the slice namespace with a translator-owned id; every
 /// plugin association resolves to a carried plugin config owned by that
-/// proxy; and every upstream id a proxy or `mesh_route_dispatch` rule names
-/// resolves to a carried upstream (and every carried upstream is named). Any
+/// proxy; every carried `mesh_route_dispatch` instance is valid for the
+/// plugin constructor, enabled, proxy-scoped and listed by its owning route,
+/// so the cache builds it; and every upstream id a proxy or
+/// `mesh_route_dispatch` rule names resolves to a carried upstream (and every
+/// carried upstream is named). Any
 /// violation refuses the slice, so the previous generation keeps serving.
 /// Diagnostics name the element by ordinal and never echo a supplied id.
 fn decode_http_route_set(
@@ -4390,9 +4393,9 @@ fn decode_http_route_set(
             // host to the plain Service route (which serves requests the
             // instance's match gate answers with 404), or have its offending
             // destination rewritten into a valid one. A refusal rejects the
-            // slice, so the last accepted generation keeps serving. Disabled
-            // and unassociated instances are validated too: nothing later
-            // constructs them.
+            // slice, so the last accepted generation keeps serving. A
+            // disabled, non-proxy-scoped or unassociated instance is refused
+            // below, after the proxy associations are resolved.
             if plugin.plugin_name == "mesh_route_dispatch"
                 && crate::plugins::mesh_route_dispatch::MeshRouteDispatch::new(&plugin.config)
                     .is_err()
@@ -4464,6 +4467,35 @@ fn decode_http_route_set(
             }
         }
         referenced_upstreams.extend(proxy.upstream_id.as_deref());
+    }
+    // A carried dispatch instance must also be one the plugin cache builds as
+    // its route's instance (issue #7440): enabled, proxy-scoped, and listed in
+    // its owning route's `plugins`. `PluginCache::build_cache` skips a
+    // disabled config and a proxy-scoped config its proxy does not reference,
+    // so such a record would leave the route serving with its listen path and
+    // default destination but without the match gate that answers a miss
+    // with 404. The translator always emits enabled, proxy-scoped, associated
+    // instances, so this refuses only nonconforming input, and the refusal
+    // rejects the slice. This mirrors the proxy-to-plugin resolution above.
+    for (index, plugin) in plugin_configs.iter().enumerate() {
+        if plugin.plugin_name != "mesh_route_dispatch" {
+            continue;
+        }
+        let associated = plugin.proxy_id.as_deref().is_some_and(|proxy_id| {
+            proxies.iter().any(|proxy| {
+                proxy.id == proxy_id
+                    && proxy
+                        .plugins
+                        .iter()
+                        .any(|association| association.plugin_config_id == plugin.id)
+            })
+        });
+        if !plugin.enabled || plugin.scope != PluginScope::Proxy || !associated {
+            return Err(anyhow::anyhow!(
+                "Mesh slice HTTP route plugin config {index} is a `mesh_route_dispatch` \
+                 instance its route would not construct"
+            ));
+        }
     }
     for plugin in &plugin_configs {
         if plugin.plugin_name == "mesh_route_dispatch" {
@@ -4719,7 +4751,7 @@ fn bind_carried_http_routes_to_node_waypoint_transport(
     let sidecar = runtime.topology == MeshTopology::Sidecar;
     // Routes whose every dispatch rule named another source namespace.
     let source_namespace_refused = if sidecar {
-        resolve_sidecar_carried_route_source_namespaces(config, runtime, mesh_slice)?
+        resolve_sidecar_carried_route_source_namespaces(config, runtime, mesh_slice)
     } else {
         HashSet::new()
     };
@@ -5675,7 +5707,7 @@ fn resolve_sidecar_carried_route_source_namespaces(
     config: &mut GatewayConfig,
     runtime: &MeshRuntimeConfig,
     mesh_slice: &MeshSlice,
-) -> Result<HashSet<(String, String)>, anyhow::Error> {
+) -> HashSet<(String, String)> {
     let local_namespace = authoritative_sidecar_l4_source(runtime, mesh_slice)
         .map(|source| source.namespace.to_string());
     let mut removed = 0usize;
@@ -5712,23 +5744,16 @@ fn resolve_sidecar_carried_route_source_namespaces(
         if !has_source_namespace {
             continue;
         }
-        // The miss policy as the plugin constructs it. `decode_http_route_set`
-        // already validated every carried dispatch instance with this same
-        // constructor before binding started, so a refusal here is
-        // unreachable for decoded input; it still rejects the slice update
-        // (never refuses the route into the Service route, which would serve
-        // requests the instance's match gate answers with 404). A valid object
-        // that omits `reject_unmatched` keeps the plugin default.
-        let reject_unmatched =
-            match crate::plugins::mesh_route_dispatch::MeshRouteDispatch::new(&plugin.config) {
-                Ok(validated) => validated.rejects_unmatched(),
-                Err(_) => {
-                    return Err(anyhow::anyhow!(
-                        "Mesh slice carries a VirtualService route dispatch configuration that \
-                         fails validation"
-                    ));
-                }
-            };
+        // The miss policy. `decode_http_route_set` already validated every
+        // carried dispatch instance with the plugin constructor, so
+        // `reject_unmatched` is either a boolean or absent; absent keeps the
+        // plugin default (`false`). It is read here rather than constructing
+        // the instance a second time.
+        let reject_unmatched = plugin
+            .config
+            .get("reject_unmatched")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
         let Some(rules) = plugin
             .config
             .get_mut("rules")
@@ -5794,7 +5819,7 @@ fn resolve_sidecar_carried_route_source_namespaces(
              workload's namespace were removed"
         );
     }
-    Ok(emptied)
+    emptied
 }
 
 /// The hosts a carried route answers once
