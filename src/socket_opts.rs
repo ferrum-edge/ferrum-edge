@@ -1681,6 +1681,292 @@ pub fn extract_origdst(_msg: &()) -> Option<std::net::SocketAddr> {
     None
 }
 
+/// Ancillary fields parsed in a single pass from a received `msghdr`.
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RecvCmsgs {
+    pub gro_segment: Option<u16>,
+    pub pktinfo: Option<PktinfoLocal>,
+    pub orig_dst: Option<std::net::SocketAddr>,
+}
+
+/// Parse `UDP_GRO`, `IP(v6)_PKTINFO`, and (optionally) `IP(v6)_RECVORIGDSTADDR`
+/// from a received `msghdr` in a single pass over the ancillary chain.
+///
+/// Replaces separate per-option scans on the `recvmmsg` hot path and exits
+/// immediately when `msg_controllen == 0`.
+///
+/// On dual-stack `[::]` sockets with both `IPV6_RECVPKTINFO` and `IP_PKTINFO`
+/// enabled, Linux emits `IPV6_PKTINFO` (IPv4-mapped `::ffff:a.b.c.d`) followed
+/// by `IP_PKTINFO` (`a.b.c.d`) for IPv4 datagrams while reporting the peer as
+/// `SocketAddr::V6`. Preserving `IPV6_PKTINFO` over `IP_PKTINFO` keeps the
+/// reply-source address family aligned with the dual-stack peer address.
+///
+/// Every recognized record validates `cmsg_len` and remaining control-buffer
+/// bounds before reading its typed payload, failing closed (ignoring truncated
+/// records) rather than reading stale or out-of-bounds bytes.
+///
+/// # Safety
+/// If `msg.msg_controllen > 0`, `msg.msg_control` must be non-null, aligned to
+/// `libc::cmsghdr`, and valid for reads of `msg.msg_controllen` bytes (for
+/// example, a control buffer just populated by `recvmsg` or `recvmmsg`).
+#[cfg(target_os = "linux")]
+#[inline]
+pub unsafe fn extract_recv_cmsgs(msg: &libc::msghdr, parse_orig_dst: bool) -> RecvCmsgs {
+    const UDP_GRO: libc::c_int = 104;
+    const IP_RECVORIGDSTADDR: libc::c_int = 20;
+    const IPV6_RECVORIGDSTADDR: libc::c_int = 74;
+
+    let mut out = RecvCmsgs::default();
+    // `msg_controllen` is `usize` on x86_64-unknown-linux-gnu and `socklen_t`
+    // (`u32`) on musl / 32-bit targets; allow the widening cast across targets.
+    #[allow(clippy::unnecessary_cast)]
+    let ctrl_len = msg.msg_controllen as usize;
+    if ctrl_len < std::mem::size_of::<libc::cmsghdr>() || msg.msg_control.is_null() {
+        return out;
+    }
+    let ctrl_start = msg.msg_control as usize;
+    let Some(ctrl_end) = ctrl_start.checked_add(ctrl_len) else {
+        return out;
+    };
+
+    #[inline]
+    unsafe fn payload_fits<T>(
+        cmsg: *const libc::cmsghdr,
+        cmsg_len: usize,
+        cmsg_end: usize,
+    ) -> bool {
+        let min_len = unsafe { libc::CMSG_LEN(std::mem::size_of::<T>() as u32) as usize };
+        if cmsg_len < min_len {
+            return false;
+        }
+        let data_addr = unsafe { libc::CMSG_DATA(cmsg) as usize };
+        data_addr
+            .checked_add(std::mem::size_of::<T>())
+            .is_some_and(|end| end <= cmsg_end)
+    }
+
+    let mut cmsg = unsafe { libc::CMSG_FIRSTHDR(msg) };
+    while !cmsg.is_null() {
+        let cmsg_addr = cmsg as usize;
+        if cmsg_addr < ctrl_start
+            || cmsg_addr
+                .checked_add(std::mem::size_of::<libc::cmsghdr>())
+                .is_none_or(|hdr_end| hdr_end > ctrl_end)
+        {
+            break;
+        }
+        unsafe {
+            #[allow(clippy::unnecessary_cast)]
+            let cmsg_len = (*cmsg).cmsg_len as usize;
+            if cmsg_len < std::mem::size_of::<libc::cmsghdr>() {
+                break;
+            }
+            let Some(cmsg_end) = cmsg_addr.checked_add(cmsg_len) else {
+                break;
+            };
+            if cmsg_end > ctrl_end {
+                break;
+            }
+
+            let level = (*cmsg).cmsg_level;
+            let ty = (*cmsg).cmsg_type;
+            if level == libc::IPPROTO_IP && ty == libc::IP_PKTINFO {
+                if out.pktinfo.is_none()
+                    && payload_fits::<libc::in_pktinfo>(cmsg, cmsg_len, cmsg_end)
+                {
+                    let data_ptr = libc::CMSG_DATA(cmsg) as *const libc::in_pktinfo;
+                    let pi = std::ptr::read_unaligned(data_ptr);
+                    out.pktinfo = Some(PktinfoLocal {
+                        ip: std::net::IpAddr::V4(std::net::Ipv4Addr::from(u32::from_be(
+                            pi.ipi_spec_dst.s_addr,
+                        ))),
+                        ifindex: pi.ipi_ifindex as u32,
+                    });
+                }
+            } else if level == libc::IPPROTO_IPV6 && ty == libc::IPV6_PKTINFO {
+                if (out.pktinfo.is_none()
+                    || matches!(
+                        out.pktinfo,
+                        Some(PktinfoLocal {
+                            ip: std::net::IpAddr::V4(_),
+                            ..
+                        })
+                    ))
+                    && payload_fits::<libc::in6_pktinfo>(cmsg, cmsg_len, cmsg_end)
+                {
+                    let data_ptr = libc::CMSG_DATA(cmsg) as *const libc::in6_pktinfo;
+                    let pi = std::ptr::read_unaligned(data_ptr);
+                    out.pktinfo = Some(PktinfoLocal {
+                        ip: std::net::IpAddr::V6(std::net::Ipv6Addr::from(pi.ipi6_addr.s6_addr)),
+                        ifindex: pi.ipi6_ifindex,
+                    });
+                }
+            } else if level == libc::SOL_UDP && ty == UDP_GRO {
+                if out.gro_segment.is_none() && payload_fits::<u16>(cmsg, cmsg_len, cmsg_end) {
+                    let data_ptr = libc::CMSG_DATA(cmsg) as *const u16;
+                    out.gro_segment = Some(std::ptr::read_unaligned(data_ptr));
+                }
+            } else if parse_orig_dst && out.orig_dst.is_none() {
+                if level == libc::SOL_IP && ty == IP_RECVORIGDSTADDR {
+                    if payload_fits::<libc::sockaddr_in>(cmsg, cmsg_len, cmsg_end) {
+                        let data_ptr = libc::CMSG_DATA(cmsg) as *const libc::sockaddr_in;
+                        let sin = std::ptr::read_unaligned(data_ptr);
+                        out.orig_dst = Some(std::net::SocketAddr::new(
+                            std::net::IpAddr::V4(std::net::Ipv4Addr::from(u32::from_be(
+                                sin.sin_addr.s_addr,
+                            ))),
+                            u16::from_be(sin.sin_port),
+                        ));
+                    }
+                } else if level == libc::SOL_IPV6
+                    && ty == IPV6_RECVORIGDSTADDR
+                    && payload_fits::<libc::sockaddr_in6>(cmsg, cmsg_len, cmsg_end)
+                {
+                    let data_ptr = libc::CMSG_DATA(cmsg) as *const libc::sockaddr_in6;
+                    let sin6 = std::ptr::read_unaligned(data_ptr);
+                    out.orig_dst = Some(std::net::SocketAddr::new(
+                        std::net::IpAddr::V6(std::net::Ipv6Addr::from(sin6.sin6_addr.s6_addr)),
+                        u16::from_be(sin6.sin6_port),
+                    ));
+                }
+            }
+            cmsg = libc::CMSG_NXTHDR(msg, cmsg);
+        }
+    }
+    out
+}
+
+/// Pre-formatted `IP_PKTINFO` / `IPV6_PKTINFO` ancillary block for a UDP
+/// session whose captured local reply-source address is immutable.
+///
+/// Built once when the session first captures its local destination address,
+/// avoiding per-reply cmsg zeroing and `cmsghdr` formatting on every single
+/// datagram sent back to the client.
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy)]
+#[repr(C)]
+pub struct PrebuiltPktinfoCmsg {
+    _align: [libc::cmsghdr; 0],
+    bytes: [u8; SEND_CMSG_BUF_LEN],
+    len: usize,
+}
+
+#[cfg(target_os = "linux")]
+impl PrebuiltPktinfoCmsg {
+    /// Pre-format an `IP_PKTINFO` or `IPV6_PKTINFO` control message matching
+    /// `local`. Returns `None` if the platform's cmsg space exceeds the stack
+    /// buffer (cannot happen on Linux).
+    pub fn new(local: PktinfoLocal) -> Option<Self> {
+        let send_ifindex = local.send_ifindex();
+        let pktinfo_space = match local.ip {
+            std::net::IpAddr::V4(_) => unsafe {
+                libc::CMSG_SPACE(std::mem::size_of::<libc::in_pktinfo>() as u32) as usize
+            },
+            std::net::IpAddr::V6(_) => unsafe {
+                libc::CMSG_SPACE(std::mem::size_of::<libc::in6_pktinfo>() as u32) as usize
+            },
+        };
+        if pktinfo_space > SEND_CMSG_BUF_LEN {
+            return None;
+        }
+        let mut out = Self {
+            _align: [],
+            bytes: [0u8; SEND_CMSG_BUF_LEN],
+            len: pktinfo_space,
+        };
+        let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+        msg.msg_control = out.bytes.as_mut_ptr() as *mut libc::c_void;
+        msg.msg_controllen = pktinfo_space;
+        let cmsg = unsafe { libc::CMSG_FIRSTHDR(&msg) };
+        if cmsg.is_null() {
+            return None;
+        }
+        match local.ip {
+            std::net::IpAddr::V4(v4) => unsafe {
+                (*cmsg).cmsg_level = libc::IPPROTO_IP;
+                (*cmsg).cmsg_type = libc::IP_PKTINFO;
+                (*cmsg).cmsg_len =
+                    libc::CMSG_LEN(std::mem::size_of::<libc::in_pktinfo>() as u32) as usize;
+                let pi = libc::in_pktinfo {
+                    ipi_ifindex: send_ifindex as libc::c_int,
+                    ipi_spec_dst: libc::in_addr {
+                        s_addr: u32::from(v4).to_be(),
+                    },
+                    ipi_addr: libc::in_addr { s_addr: 0 },
+                };
+                std::ptr::copy_nonoverlapping(
+                    &pi as *const libc::in_pktinfo as *const u8,
+                    libc::CMSG_DATA(cmsg),
+                    std::mem::size_of::<libc::in_pktinfo>(),
+                );
+            },
+            std::net::IpAddr::V6(v6) => unsafe {
+                (*cmsg).cmsg_level = libc::IPPROTO_IPV6;
+                (*cmsg).cmsg_type = libc::IPV6_PKTINFO;
+                (*cmsg).cmsg_len =
+                    libc::CMSG_LEN(std::mem::size_of::<libc::in6_pktinfo>() as u32) as usize;
+                let pi = libc::in6_pktinfo {
+                    ipi6_addr: libc::in6_addr {
+                        s6_addr: v6.octets(),
+                    },
+                    ipi6_ifindex: send_ifindex,
+                };
+                std::ptr::copy_nonoverlapping(
+                    &pi as *const libc::in6_pktinfo as *const u8,
+                    libc::CMSG_DATA(cmsg),
+                    std::mem::size_of::<libc::in6_pktinfo>(),
+                );
+            },
+        }
+        Some(out)
+    }
+}
+
+/// Send a single UDP datagram directly to `dest` without copying the payload or
+/// rebuilding ancillary data. Uses `sendmsg(2)` with `pktinfo` when present, or
+/// plain `sendto(2)` when `pktinfo` is `None`. Never attaches `UDP_SEGMENT`.
+#[cfg(target_os = "linux")]
+#[inline]
+pub fn send_with_prebuilt_pktinfo(
+    fd: std::os::unix::io::RawFd,
+    data: &[u8],
+    dest: &libc::sockaddr_storage,
+    dest_len: libc::socklen_t,
+    pktinfo: Option<&PrebuiltPktinfoCmsg>,
+) -> std::io::Result<usize> {
+    let ret = match pktinfo {
+        Some(cmsg) => {
+            let iov = libc::iovec {
+                iov_base: data.as_ptr() as *mut libc::c_void,
+                iov_len: data.len(),
+            };
+            let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+            msg.msg_name = dest as *const libc::sockaddr_storage as *mut libc::c_void;
+            msg.msg_namelen = dest_len;
+            msg.msg_iov = &iov as *const libc::iovec as *mut libc::iovec;
+            msg.msg_iovlen = 1;
+            msg.msg_control = cmsg.bytes.as_ptr() as *mut libc::c_void;
+            msg.msg_controllen = cmsg.len;
+            unsafe { libc::sendmsg(fd, &msg, libc::MSG_DONTWAIT) }
+        }
+        None => unsafe {
+            libc::sendto(
+                fd,
+                data.as_ptr() as *const libc::c_void,
+                data.len(),
+                libc::MSG_DONTWAIT,
+                dest as *const libc::sockaddr_storage as *const libc::sockaddr,
+                dest_len,
+            )
+        },
+    };
+    if ret < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(ret as usize)
+}
+
 /// Send a UDP datagram (or a GSO-batched buffer of same-size datagrams) with
 /// the source address set via `IP_PKTINFO` / `IPV6_PKTINFO` ancillary data.
 ///
@@ -4395,5 +4681,173 @@ mod send_cmsg_buf_tests {
         let buf = SendCmsgBuf::zeroed_for(largest).expect("largest block fits");
         assert!(buf.bytes.iter().all(|byte| *byte == 0));
         assert!(SendCmsgBuf::zeroed_for(SEND_CMSG_BUF_LEN + 1).is_err());
+    }
+
+    /// Dual-stack `[::]` sockets with both `IPV6_RECVPKTINFO` and `IP_PKTINFO`
+    /// enabled receive `IPV6_PKTINFO` (IPv4-mapped) followed by `IP_PKTINFO`
+    /// for IPv4 datagrams. `extract_recv_cmsgs` must preserve the IPv6-mapped
+    /// record so the reply-source family matches the V6-mapped peer address and
+    /// replies sent to `127.0.0.2` originate from `127.0.0.2`.
+    #[test]
+    #[allow(clippy::unnecessary_cast)]
+    fn extract_recv_cmsgs_preserves_v6_pktinfo_on_dual_stack_socket() {
+        use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket};
+        use std::os::fd::AsRawFd;
+
+        let sock = match socket2::Socket::new(
+            socket2::Domain::IPV6,
+            socket2::Type::DGRAM,
+            Some(socket2::Protocol::UDP),
+        ) {
+            Ok(s) => s,
+            Err(e) if super::is_ipv6_unavailable_io_error(&e) => return,
+            Err(e) => panic!("create IPv6 UDP socket: {e}"),
+        };
+        sock.set_only_v6(false).expect("disable IPV6_V6ONLY");
+        match sock.bind(&SocketAddr::from((Ipv6Addr::UNSPECIFIED, 0)).into()) {
+            Ok(()) => {}
+            Err(e) if super::is_ipv6_unavailable_io_error(&e) => return,
+            Err(e) => panic!("bind [::]:0: {e}"),
+        }
+        let server: UdpSocket = sock.into();
+        let port = server.local_addr().expect("local_addr").port();
+        let fd = server.as_raw_fd();
+        super::set_ip_pktinfo(fd).expect("set IP_PKTINFO");
+        super::set_ipv6_recvpktinfo(fd).expect("set IPV6_RECVPKTINFO");
+
+        let client = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind IPv4 client");
+        let target = SocketAddr::from((Ipv4Addr::new(127, 0, 0, 2), port));
+        client.connect(target).expect("connect to 127.0.0.2");
+        client.send(b"ping").expect("send to 127.0.0.2");
+
+        let mut payload = [0u8; 64];
+        let mut iov = libc::iovec {
+            iov_base: payload.as_mut_ptr() as *mut libc::c_void,
+            iov_len: payload.len(),
+        };
+        let mut peer_storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
+        let mut cmsg_buf = [unsafe { std::mem::zeroed::<libc::cmsghdr>() }; 16];
+        let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+        msg.msg_name = &mut peer_storage as *mut _ as *mut libc::c_void;
+        msg.msg_namelen = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+        msg.msg_iov = &mut iov;
+        msg.msg_iovlen = 1;
+        msg.msg_control = cmsg_buf.as_mut_ptr() as *mut libc::c_void;
+        msg.msg_controllen = std::mem::size_of_val(&cmsg_buf) as _;
+
+        let n = unsafe { libc::recvmsg(fd, &mut msg, 0) };
+        assert_eq!(n, 4, "recvmsg failed: {}", std::io::Error::last_os_error());
+        let cmsgs = unsafe { super::extract_recv_cmsgs(&msg, false) };
+        let pktinfo = cmsgs.pktinfo.expect("dual-stack recv must capture pktinfo");
+        assert_eq!(
+            pktinfo.ip,
+            IpAddr::V6(Ipv4Addr::new(127, 0, 0, 2).to_ipv6_mapped()),
+            "must preserve IPv4-mapped IPV6_PKTINFO rather than overwriting with IP_PKTINFO"
+        );
+
+        let prebuilt = super::PrebuiltPktinfoCmsg::new(pktinfo)
+            .expect("PrebuiltPktinfoCmsg must build for mapped IPv6 pktinfo");
+        let sent = super::send_with_prebuilt_pktinfo(
+            fd,
+            b"pong",
+            &peer_storage,
+            msg.msg_namelen,
+            Some(&prebuilt),
+        )
+        .expect("reply with prebuilt pktinfo");
+        assert_eq!(sent, 4);
+
+        client
+            .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+            .expect("set timeout");
+        let mut reply = [0u8; 16];
+        let (rlen, from) = client
+            .recv_from(&mut reply)
+            .expect("connected client must receive reply from 127.0.0.2");
+        assert_eq!(&reply[..rlen], b"pong");
+        assert_eq!(from, target);
+    }
+
+    /// Deterministic in-memory test (runs even on IPv4-only kernels) verifying
+    /// `IPV6_PKTINFO` takes precedence over a trailing `IP_PKTINFO` record.
+    #[test]
+    #[allow(clippy::unnecessary_cast)]
+    fn extract_recv_cmsgs_prefers_v6_pktinfo_over_trailing_v4_pktinfo() {
+        use std::net::{IpAddr, Ipv4Addr};
+
+        let mapped = Ipv4Addr::new(127, 0, 0, 2).to_ipv6_mapped();
+        let mut cmsg_buf = [unsafe { std::mem::zeroed::<libc::cmsghdr>() }; 16];
+        let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+        msg.msg_control = cmsg_buf.as_mut_ptr() as *mut libc::c_void;
+        let v6_space =
+            unsafe { libc::CMSG_SPACE(std::mem::size_of::<libc::in6_pktinfo>() as u32) as usize };
+        let v4_space =
+            unsafe { libc::CMSG_SPACE(std::mem::size_of::<libc::in_pktinfo>() as u32) as usize };
+        msg.msg_controllen = (v6_space + v4_space) as _;
+
+        unsafe {
+            let c1 = libc::CMSG_FIRSTHDR(&msg);
+            assert!(!c1.is_null());
+            (*c1).cmsg_level = libc::IPPROTO_IPV6;
+            (*c1).cmsg_type = libc::IPV6_PKTINFO;
+            (*c1).cmsg_len = libc::CMSG_LEN(std::mem::size_of::<libc::in6_pktinfo>() as u32) as _;
+            let pi6 = libc::in6_pktinfo {
+                ipi6_addr: libc::in6_addr {
+                    s6_addr: mapped.octets(),
+                },
+                ipi6_ifindex: 7,
+            };
+            std::ptr::copy_nonoverlapping(
+                &pi6 as *const libc::in6_pktinfo as *const u8,
+                libc::CMSG_DATA(c1),
+                std::mem::size_of::<libc::in6_pktinfo>(),
+            );
+
+            let c2 = libc::CMSG_NXTHDR(&msg, c1);
+            assert!(!c2.is_null());
+            (*c2).cmsg_level = libc::IPPROTO_IP;
+            (*c2).cmsg_type = libc::IP_PKTINFO;
+            (*c2).cmsg_len = libc::CMSG_LEN(std::mem::size_of::<libc::in_pktinfo>() as u32) as _;
+            let pi4 = libc::in_pktinfo {
+                ipi_ifindex: 7,
+                ipi_spec_dst: libc::in_addr {
+                    s_addr: u32::from(Ipv4Addr::new(127, 0, 0, 2)).to_be(),
+                },
+                ipi_addr: libc::in_addr { s_addr: 0 },
+            };
+            std::ptr::copy_nonoverlapping(
+                &pi4 as *const libc::in_pktinfo as *const u8,
+                libc::CMSG_DATA(c2),
+                std::mem::size_of::<libc::in_pktinfo>(),
+            );
+        }
+
+        let cmsgs = unsafe { super::extract_recv_cmsgs(&msg, false) };
+        let pktinfo = cmsgs.pktinfo.expect("pktinfo parsed");
+        assert_eq!(pktinfo.ip, IpAddr::V6(mapped));
+        assert_eq!(pktinfo.ifindex, 7);
+    }
+
+    /// Truncated `cmsg_len` values must fail closed (ignored) without reading
+    /// stale or out-of-bounds payload bytes.
+    #[test]
+    #[allow(clippy::unnecessary_cast)]
+    fn extract_recv_cmsgs_rejects_truncated_records() {
+        let mut cmsg_buf = [unsafe { std::mem::zeroed::<libc::cmsghdr>() }; 8];
+        let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+        msg.msg_control = cmsg_buf.as_mut_ptr() as *mut libc::c_void;
+        msg.msg_controllen = std::mem::size_of_val(&cmsg_buf);
+
+        // Forge a truncated IP_PKTINFO record (header only, zero payload bytes).
+        unsafe {
+            let hdr = libc::CMSG_FIRSTHDR(&msg);
+            assert!(!hdr.is_null());
+            (*hdr).cmsg_level = libc::IPPROTO_IP;
+            (*hdr).cmsg_type = libc::IP_PKTINFO;
+            (*hdr).cmsg_len = libc::CMSG_LEN(0) as _;
+            msg.msg_controllen = libc::CMSG_SPACE(0) as _;
+        }
+        let cmsgs = unsafe { super::extract_recv_cmsgs(&msg, true) };
+        assert_eq!(cmsgs, super::RecvCmsgs::default());
     }
 }

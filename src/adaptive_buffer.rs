@@ -22,6 +22,7 @@
 use dashmap::DashMap;
 use std::cell::Cell;
 use std::collections::HashSet;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::config::db_backend::{namespaced_runtime_key, write_namespaced_runtime_key};
@@ -168,6 +169,50 @@ fn with_namespaced_key<R>(namespace: &str, proxy_id: &str, f: impl FnOnce(&str) 
 
 // ── Public tracker ──────────────────────────────────────────────────────────
 
+/// Lock-free handle to a single `(namespace, proxy_id)` entry in
+/// [`AdaptiveBufferTracker`].
+///
+/// Acquired once at listener or session setup so the UDP hot path reads and
+/// updates the per-proxy EWMA with a direct atomic operation instead of
+/// taking a shared `DashMap` shard read lock on every reply datagram.
+#[derive(Clone)]
+pub struct ProxyAdaptiveHandle {
+    state: Arc<ProxyBufferState>,
+    alpha_fp: u64,
+    default_batch_limit: usize,
+    batch_enabled: bool,
+}
+
+impl ProxyAdaptiveHandle {
+    /// Returns the recommended UDP batch limit for this proxy without touching
+    /// the `DashMap` or thread-local key scratch buffer.
+    #[inline]
+    pub fn get_batch_limit(&self) -> usize {
+        if !self.batch_enabled {
+            return self.default_batch_limit;
+        }
+        let ewma = self.state.dgram_ewma.load(Ordering::Relaxed);
+        if ewma == UNSET {
+            return self.default_batch_limit;
+        }
+        let tier = select_tier(ewma, &BATCH_TIER_THRESHOLDS);
+        BATCH_TIER_LIMITS[tier]
+    }
+
+    /// Record datagrams drained in one UDP batch cycle directly on the cached
+    /// per-proxy state.
+    #[inline]
+    pub fn record_batch_cycle(&self, datagrams_drained: u64) {
+        if !self.batch_enabled {
+            return;
+        }
+        update_ewma(&self.state.dgram_ewma, datagrams_drained, self.alpha_fp);
+        self.state
+            .dgram_sample_count
+            .fetch_add(1, Ordering::Relaxed);
+    }
+}
+
 /// Adaptive buffer and batch limit tracker.
 ///
 /// Maintains per-proxy EWMA of bytes-per-connection and datagrams-per-batch-cycle,
@@ -175,7 +220,7 @@ fn with_namespaced_key<R>(namespace: &str, proxy_id: &str, f: impl FnOnce(&str) 
 pub struct AdaptiveBufferTracker {
     /// Per-proxy state, keyed by the namespace-qualified `namespace|id` runtime
     /// key so same-id proxies in different namespaces stay isolated.
-    state: DashMap<String, ProxyBufferState>,
+    state: DashMap<String, Arc<ProxyBufferState>>,
     /// EWMA alpha as fixed-point (e.g., 300 = 0.3).
     alpha_fp: u64,
     /// Minimum buffer size (floor).
@@ -272,8 +317,29 @@ impl AdaptiveBufferTracker {
             let entry = self
                 .state
                 .entry(namespaced_runtime_key(namespace, proxy_id))
-                .or_insert_with(ProxyBufferState::new);
+                .or_insert_with(|| Arc::new(ProxyBufferState::new()));
             update(&entry);
+        }
+    }
+
+    /// Acquire a lock-free handle to the per-proxy EWMA state for
+    /// `(namespace, proxy_id)`, creating the entry on first sight.
+    pub fn proxy_handle(&self, namespace: &str, proxy_id: &str) -> ProxyAdaptiveHandle {
+        let state = with_namespaced_key(namespace, proxy_id, |key| {
+            self.state.get(key).map(|entry| Arc::clone(&entry))
+        })
+        .unwrap_or_else(|| {
+            let entry = self
+                .state
+                .entry(namespaced_runtime_key(namespace, proxy_id))
+                .or_insert_with(|| Arc::new(ProxyBufferState::new()));
+            Arc::clone(&entry)
+        });
+        ProxyAdaptiveHandle {
+            state,
+            alpha_fp: self.alpha_fp,
+            default_batch_limit: self.default_batch_limit,
+            batch_enabled: self.batch_enabled,
         }
     }
 

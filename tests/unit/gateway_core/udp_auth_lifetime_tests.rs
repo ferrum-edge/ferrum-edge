@@ -1666,26 +1666,37 @@ fn the_client_to_backend_authorization_gate_stays_on_the_hot_path_budget() {
     }
 }
 
-/// The backend reply direction arms ONE timer, outside its receive loop.
+/// The backend reply direction arms ONE timer, outside its receive loops.
 #[test]
 fn the_reply_task_arms_its_authorization_timer_once() {
     let create_session = body_of("async fn create_session(");
     let arm_at = create_session
         .find("let mut reply_authorization_deadline")
         .expect("the reply task's authorization arm");
+    let linux_loop_at = create_session[arm_at..]
+        .find("'reply_linux: loop {")
+        .expect("the labeled Linux plain-UDP reply receive loop");
     let loop_at = create_session[arm_at..]
-        .find("\n        'reply: loop {")
+        .find("'reply: loop {")
         .expect("the labeled reply receive loop");
     assert!(
-        loop_at > 0,
-        "the deadline must be armed BEFORE the receive loop, so no per-datagram timer is \
+        linux_loop_at > 0 && loop_at > 0,
+        "the deadline must be armed BEFORE every receive loop, so no per-datagram timer is \
          registered"
     );
-    let receive_loop = &create_session[arm_at + loop_at..];
+    let all_receive_loops = &create_session[arm_at + linux_loop_at..];
     assert!(
-        !receive_loop.contains("tokio::time::sleep_until("),
-        "the receive loop must not re-arm a timer per datagram"
+        !all_receive_loops.contains("tokio::time::sleep_until("),
+        "no receive loop may re-arm a timer per datagram"
     );
+    let linux_receive_loop = &create_session[arm_at + linux_loop_at..arm_at + loop_at];
+    assert!(
+        linux_receive_loop.contains("biased;")
+            && linux_receive_loop.contains("reply_authorization_deadline.as_mut()"),
+        "the Linux plain-UDP receive loop must race sock.readable() behind the biased \
+         authorization deadline"
+    );
+    let receive_loop = &create_session[arm_at + loop_at..];
     assert_eq!(
         receive_loop
             .matches("udp_reply_recv_until_stop_or_expiry(")
@@ -2045,37 +2056,44 @@ fn client_facing_sends_are_raced_against_the_authorization_plan() {
         .next()
         .expect("direct_send_to_client body");
     assert!(
-        linux_direct.contains("udp_frontend_send_until_expiry("),
-        "the Linux send_to fallback must race the client send"
-    );
-    assert!(
-        linux_direct.contains("frontend.send_to(data, client_addr)"),
-        "the Linux family-mismatch fallback still uses send_to under the race"
+        linux_direct.contains("frontend.try_send_to(data, client_addr)"),
+        "the Linux family-mismatch fallback must use non-blocking try_send_to with post-wait revalidation"
     );
     assert!(
         linux_direct.contains("udp_frontend_writable_until_expiry("),
-        "the Linux pktinfo WouldBlock path must race writable()"
+        "the Linux direct-send WouldBlock paths must race writable() against authorization expiry"
     );
-    let writable_wait = linux_direct
-        .find("udp_frontend_writable_until_expiry(")
-        .expect("writable race");
-    let would_block = linux_direct
-        .find("ErrorKind::WouldBlock")
-        .expect("WouldBlock path");
+    let try_send = linux_direct
+        .find("frontend.try_send_to(data, client_addr)")
+        .expect("try_send_to fallback");
+    assert!(
+        linux_direct[..try_send].contains("udp_reply_expired_at_commit(authorization)"),
+        "the try_send_to fallback must be preceded by an authorization recheck"
+    );
     let syscall = linux_direct
         .find("send_with_pktinfo(")
         .expect("the pktinfo syscall");
     assert!(
-        linux_direct[..syscall].contains("udp_reply_expired_at_commit(authorization)"),
+        linux_direct[try_send..syscall].contains("udp_reply_expired_at_commit(authorization)"),
         "the pktinfo syscall must be preceded by an authorization recheck"
     );
+    let pktinfo_would_block = linux_direct[syscall..]
+        .find("ErrorKind::WouldBlock")
+        .expect("pktinfo WouldBlock path");
+    let pktinfo_writable_wait = linux_direct[syscall..]
+        .find("udp_frontend_writable_until_expiry(")
+        .expect("pktinfo writable race");
     assert!(
-        writable_wait > would_block,
+        pktinfo_writable_wait > pktinfo_would_block,
         "writable wait is the authorization-owned helper, not a bare frontend.writable().await"
     );
     assert!(
         !linux_direct.contains("frontend.writable().await"),
         "writable() must not be awaited outside the authorization race"
+    );
+    assert!(
+        !linux_direct.contains("frontend.send_to(data, client_addr).await"),
+        "send_to must not be awaited unguarded"
     );
 
     let dtls_inner = body_of("async fn handle_dtls_client_inner(");

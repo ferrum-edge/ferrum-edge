@@ -161,10 +161,38 @@ fn publish_session_request_budget(session: &UdpSession, request_size: u64) {
     }
 }
 
-/// Metrics for a single UDP proxy listener.
+const UDP_TRAFFIC_COUNTER_SHARDS: usize = 16;
+
 #[derive(Default)]
+struct UdpTrafficShard {
+    datagrams: AtomicU64,
+    bytes: AtomicU64,
+}
+
+static NEXT_UDP_TRAFFIC_SHARD: AtomicUsize = AtomicUsize::new(0);
+
+#[inline]
+fn udp_traffic_shard() -> usize {
+    thread_local! {
+        static SHARD: usize =
+            NEXT_UDP_TRAFFIC_SHARD.fetch_add(1, Ordering::Relaxed)
+                & (UDP_TRAFFIC_COUNTER_SHARDS - 1);
+    }
+    SHARD.with(|&shard| shard)
+}
+
+/// Metrics for a single UDP proxy listener.
 pub struct UdpProxyMetrics {
     pub active_sessions: AtomicU64,
+    /// Bumped with `Release` whenever a session is removed from the listener's
+    /// session table so the recv loop's local session cache sweeps expired
+    /// `Arc<UdpSession>` pins at the start of its next batch without per-packet
+    /// overhead.
+    session_eviction_epoch: AtomicU64,
+    /// Coalesced wakeup fired on session eviction so an otherwise quiet
+    /// listener promptly drops cached expired `Arc<UdpSession>` pins (and their
+    /// backend socket FDs) instead of retaining them until the next datagram.
+    session_eviction_notify: tokio::sync::Notify,
     /// DTLS demux peers tracked by the frontend DTLS server. Includes peers
     /// that have not completed the handshake yet.
     pub dtls_demux_sessions: Arc<AtomicU64>,
@@ -173,8 +201,10 @@ pub struct UdpProxyMetrics {
     // admin metric. Operators read UDP traffic through the stream transaction
     // summaries and `ferrum_stream_*` metrics instead.
     pub total_sessions: AtomicU64,
-    pub datagrams_out: AtomicU64,
-    pub bytes_out: AtomicU64,
+    /// Cache-line-padded sharded datagram/byte counters eliminating cross-core
+    /// atomic contention across concurrent per-session reply tasks and the
+    /// listener recv loop.
+    traffic_out: [crossbeam_utils::CachePadded<UdpTrafficShard>; UDP_TRAFFIC_COUNTER_SHARDS],
     /// Client→backend datagrams dropped because a session's bounded
     /// `on_udp_datagram` ingress queue was full or closed. Fail-closed:
     /// overload never bypasses required hooks.
@@ -225,6 +255,32 @@ pub struct UdpProxyMetrics {
     pub per_ip_rejections: AtomicU64,
 }
 
+impl Default for UdpProxyMetrics {
+    fn default() -> Self {
+        Self {
+            active_sessions: AtomicU64::new(0),
+            session_eviction_epoch: AtomicU64::new(0),
+            session_eviction_notify: tokio::sync::Notify::new(),
+            dtls_demux_sessions: Arc::new(AtomicU64::new(0)),
+            total_sessions: AtomicU64::new(0),
+            traffic_out: std::array::from_fn(|_| {
+                crossbeam_utils::CachePadded::new(UdpTrafficShard::default())
+            }),
+            hook_ingress_drops: AtomicU64::new(0),
+            hook_ingress_queued_bytes: AtomicUsize::new(0),
+            egress_queue_drops: AtomicU64::new(0),
+            egress_handoffs: AtomicU64::new(0),
+            egress_send_errors: AtomicU64::new(0),
+            egress_queued_bytes: AtomicUsize::new(0),
+            client_address_metadata_drops: Arc::new(AtomicU64::new(0)),
+            client_address_metadata_warn:
+                crate::util::atomic_log_rate_limiter::AtomicLogRateLimiter::default(),
+            per_ip_admission: crate::proxy::PerIpStreamAdmission::default(),
+            per_ip_rejections: AtomicU64::new(0),
+        }
+    }
+}
+
 impl UdpProxyMetrics {
     /// Build listener metrics carrying the gateway-wide per-source-IP session
     /// admission handle. Observability counters remain listener-local.
@@ -233,6 +289,37 @@ impl UdpProxyMetrics {
             per_ip_admission,
             ..Default::default()
         }
+    }
+
+    /// Record settled outbound datagrams and bytes into the calling thread's
+    /// cache-line-padded shard.
+    #[inline]
+    pub fn record_datagrams_out(&self, datagrams: u64, bytes: u64) {
+        let shard = &self.traffic_out[udp_traffic_shard()];
+        shard.datagrams.fetch_add(datagrams, Ordering::Relaxed);
+        shard.bytes.fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    /// Sum settled outbound datagrams across all shards.
+    pub fn datagrams_out(&self) -> u64 {
+        self.traffic_out
+            .iter()
+            .map(|shard| shard.datagrams.load(Ordering::Relaxed))
+            .fold(0u64, u64::wrapping_add)
+    }
+
+    /// Sum settled outbound bytes across all shards.
+    pub fn bytes_out(&self) -> u64 {
+        self.traffic_out
+            .iter()
+            .map(|shard| shard.bytes.load(Ordering::Relaxed))
+            .fold(0u64, u64::wrapping_add)
+    }
+
+    #[inline]
+    fn note_session_evicted(&self) {
+        self.session_eviction_epoch.fetch_add(1, Ordering::Release);
+        self.session_eviction_notify.notify_one();
     }
 }
 
@@ -254,22 +341,75 @@ fn record_udp_per_ip_rejection(metrics: &UdpProxyMetrics, proxy_id: &str, listen
     }
 }
 
+/// Connected plain-UDP backend socket wrapper.
+///
+/// On Unix, [`Self::try_send`] issues a direct non-blocking `libc::send(2)`
+/// without touching Tokio's `ScheduledIo` readiness word, eliminating
+/// cross-core cache-line bouncing between ingress `try_send` and the reply
+/// task's `epoll` `READABLE` updates while preserving exact `WouldBlock` and
+/// async `send` behavior.
+#[derive(Clone)]
+struct UdpBackendSocket(Arc<UdpSocket>);
+
+impl UdpBackendSocket {
+    #[inline]
+    fn try_send(&self, data: &[u8]) -> std::io::Result<usize> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::io::AsRawFd;
+            let ret = unsafe {
+                libc::send(
+                    self.0.as_raw_fd(),
+                    data.as_ptr() as *const libc::c_void,
+                    data.len(),
+                    libc::MSG_DONTWAIT,
+                )
+            };
+            if ret >= 0 {
+                Ok(ret as usize)
+            } else {
+                Err(std::io::Error::last_os_error())
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            self.0.try_send(data)
+        }
+    }
+
+    #[inline]
+    async fn send(&self, data: &[u8]) -> std::io::Result<usize> {
+        self.0.send(data).await
+    }
+}
+
 /// A UDP session tracking a single client's connection to a backend.
+///
+/// `#[repr(C)]` packs every hot ingress-path field into the opening cache lines
+/// (keeping ~100+ active sessions resident in L1D), isolates cross-core
+/// `response_budget_remaining` and reply-side `bytes_received` onto independent
+/// `CachePadded` lines to prevent false sharing, and relegates cold
+/// disconnect/teardown metadata to the tail.
+#[repr(C)]
 struct UdpSession {
+    // ── Hot ingress cache lines (read-mostly + ingress-only) ────────────────
     /// Plain UDP backend socket. `None` when using DTLS (traffic goes through `dtls_conn`).
-    backend_socket: Option<Arc<UdpSocket>>,
+    backend_socket: Option<UdpBackendSocket>,
     /// DTLS connection wrapping the backend socket (set when `backend_scheme == Dtls`).
     dtls_conn: Option<Arc<crate::dtls::DtlsConnection>>,
+    /// Datagrams this session's egress writer owns: queued in the channel plus
+    /// the one whose send is in flight. NON-ZERO IS THE FIFO FENCE — while the
+    /// writer owns anything, the listener's `try_send` fast path must queue
+    /// behind it, or a later datagram would overtake an earlier one on the wire.
+    egress_inflight: AtomicUsize,
     /// Last packet activity on a process-monotonic clock (coarse millis).
     /// Never derived from wall/UTC time — NTP corrections must not freeze or
     /// prematurely fire idle expiry.
     last_activity: AtomicU64,
-    /// Session creation on the same monotonic clock used by `last_activity`.
-    /// `duration_ms` in disconnect summaries is `disconnected − created` on
-    /// this clock; wall timestamps are stored separately for rendering.
-    created_at: AtomicU64,
-    /// Civil/UTC connect time for human-readable `timestamp_connected` only.
-    connected_wall_at: chrono::DateTime<chrono::Utc>,
+    bytes_sent: AtomicU64,
+    datagram_plugins: Arc<[Arc<dyn Plugin>]>,
+    /// Copied from the proxy at session admission. `None` skips the guard.
+    amplification_factor: Option<f32>,
     /// Set to `true` by the idle-cleanup task immediately before the
     /// session is removed from the session map. The recv-loop
     /// `last_client` fast path checks this flag and falls through to
@@ -280,24 +420,20 @@ struct UdpSession {
     /// the cache holds them, which silently bypasses the configured
     /// `udp_idle_timeout_seconds`.
     expired: std::sync::atomic::AtomicBool,
-    bytes_sent: AtomicU64,
-    bytes_received: AtomicU64,
-    /// Remaining backend→client payload-byte budget. Each policy-admitted
-    /// client datagram **accrues** its per-request budget onto this slot
-    /// (saturating, capped at a fixed multiple of one request's budget) and
-    /// every response datagram charges it, so an in-flight reply is charged
-    /// against the budget its request earned rather than a later request's.
-    /// Lives on the session (not the backend) so weighted multi-backend
-    /// selection cannot reset or multiply the budget.
-    response_budget_remaining: AtomicU64,
-    /// Copied from the proxy at session admission. `None` skips the guard.
-    amplification_factor: Option<f32>,
-    /// Backend target for logging (e.g., "10.0.2.10:5353").
-    backend_target: String,
-    /// DNS-resolved IP address of the backend for logging.
-    backend_resolved_ip: String,
-    /// SNI hostname extracted from the first DTLS ClientHello during passthrough mode.
-    sni_hostname: Option<String>,
+    /// Set by idle cleanup before [`Self::stop_notify`] so the reply task can
+    /// observe stop either via this flag (register-then-check) or via the
+    /// permit stored by [`signal_udp_reply_task_stop`]. Also observed by the
+    /// hook-ingress worker (flag only — that worker must not wait on
+    /// [`Self::stop_notify`]).
+    stop_reply_task: std::sync::atomic::AtomicBool,
+    /// Set by teardown so a late datagram cannot respawn an egress writer for a
+    /// session that is already being retired.
+    egress_closed: std::sync::atomic::AtomicBool,
+    /// Authenticated forwarded client this session was admitted with, when the
+    /// listener runs the datagram client-address gate. Later datagrams from the
+    /// same socket peer must carry the same value; a different one is dropped
+    /// rather than silently attributed to this session's identity.
+    forwarded_client: Option<SocketAddr>,
     /// Local destination IP captured from IP(v6)_PKTINFO cmsg on the first
     /// inbound datagram that exposes one. Used as the reply source address on
     /// send so the kernel can skip the routing-table lookup and return traffic
@@ -320,6 +456,41 @@ struct UdpSession {
     /// removal, and policy-only updates therefore cannot keep relaying under
     /// stale evidence.
     node_waypoint_source: Option<NodeWaypointUdpSessionSource>,
+    /// Absolute authorization lifetime of the credential that admitted this
+    /// plain-UDP session, plus the once-only settlement latch shared with the
+    /// post-admission setup stages (issue #3816).
+    ///
+    /// `None` for an unauthenticated session — no principal was admitted, so
+    /// there is no authorization lifetime to bound, and every datagram path
+    /// below short-circuits without reading a clock.
+    authorization: Option<UdpSessionAuthorization>,
+
+    // ── Cache-line isolated cross-core / reply-side atomics ─────────────────
+    /// Remaining backend→client payload-byte budget. Each policy-admitted
+    /// client datagram **accrues** its per-request budget onto this slot
+    /// (saturating, capped at a fixed multiple of one request's budget) and
+    /// every response datagram charges it, so an in-flight reply is charged
+    /// against the budget its request earned rather than a later request's.
+    /// Lives on the session (not the backend) so weighted multi-backend
+    /// selection cannot reset or multiply the budget.
+    /// Cache-line padded to prevent false sharing with read-mostly session
+    /// metadata and ingress-only counters.
+    response_budget_remaining: crossbeam_utils::CachePadded<AtomicU64>,
+    bytes_received: crossbeam_utils::CachePadded<AtomicU64>,
+
+    // ── Cold metadata, hooks, and teardown state ────────────────────────────
+    /// Session creation on the same monotonic clock used by `last_activity`.
+    /// `duration_ms` in disconnect summaries is `disconnected − created` on
+    /// this clock; wall timestamps are stored separately for rendering.
+    created_at: AtomicU64,
+    /// Civil/UTC connect time for human-readable `timestamp_connected` only.
+    connected_wall_at: chrono::DateTime<chrono::Utc>,
+    /// Backend target for logging (e.g., "10.0.2.10:5353").
+    backend_target: String,
+    /// DNS-resolved IP address of the backend for logging.
+    backend_resolved_ip: String,
+    /// SNI hostname extracted from the first DTLS ClientHello during passthrough mode.
+    sni_hostname: Option<String>,
     /// Identified consumer username (gateway Consumer or external identity) resolved
     /// during `on_stream_connect`. Carried to `on_stream_disconnect` for logging.
     consumer_username: Option<String>,
@@ -338,18 +509,12 @@ struct UdpSession {
     correlation_ids: CorrelationIdState,
     /// Plugins and proxy metadata resolved from the RequestEpoch used to create this session.
     plugins: Arc<Vec<Arc<dyn Plugin>>>,
-    datagram_plugins: Arc<[Arc<dyn Plugin>]>,
     /// Ends this session when its proxy's datagram-hook policy changes after
     /// admission. `None` only for directly constructed test sessions.
     datagram_policy_fence: Option<UdpDatagramPolicyFence>,
     datagram_client_ip: Arc<str>,
     /// Typed form of `datagram_client_ip`, computed once at admission.
     datagram_client_addr: IpAddr,
-    /// Authenticated forwarded client this session was admitted with, when the
-    /// listener runs the datagram client-address gate. Later datagrams from the
-    /// same socket peer must carry the same value; a different one is dropped
-    /// rather than silently attributed to this session's identity.
-    forwarded_client: Option<SocketAddr>,
     datagram_proxy_id: Arc<str>,
     datagram_proxy_name: Option<Arc<str>>,
     /// Nature of the per-datagram payloads this (plain-UDP-frontend) session
@@ -365,12 +530,6 @@ struct UdpSession {
     backend_scheme: BackendScheme,
     listen_port: u16,
     idle_timeout_ms: u64,
-    /// Set by idle cleanup before [`Self::stop_notify`] so the reply task can
-    /// observe stop either via this flag (register-then-check) or via the
-    /// permit stored by [`signal_udp_reply_task_stop`]. Also observed by the
-    /// hook-ingress worker (flag only — that worker must not wait on
-    /// [`Self::stop_notify`]).
-    stop_reply_task: std::sync::atomic::AtomicBool,
     /// Per-session **reply-task** stop wake. Signaled with `Notify::notify_one`
     /// (permit storing) so a store+notify cannot be lost if the reply task has
     /// not yet registered a waiter between loop-top checks. Dedicated to the
@@ -429,25 +588,9 @@ struct UdpSession {
     /// UDP session never allocates the channel and never spawns the task.
     /// Taken by teardown so the worker observes channel close promptly.
     egress_tx: std::sync::Mutex<Option<mpsc::Sender<UdpEgressDatagram>>>,
-    /// Datagrams this session's egress writer owns: queued in the channel plus
-    /// the one whose send is in flight. NON-ZERO IS THE FIFO FENCE — while the
-    /// writer owns anything, the listener's `try_send` fast path must queue
-    /// behind it, or a later datagram would overtake an earlier one on the wire.
-    egress_inflight: AtomicUsize,
     /// Payload bytes this session's egress writer owns, charged at admission
     /// and released when the datagram leaves the writer.
     egress_queued_bytes: AtomicUsize,
-    /// Set by teardown so a late datagram cannot respawn an egress writer for a
-    /// session that is already being retired.
-    egress_closed: std::sync::atomic::AtomicBool,
-    /// Absolute authorization lifetime of the credential that admitted this
-    /// plain-UDP session, plus the once-only settlement latch shared with the
-    /// post-admission setup stages (issue #3816).
-    ///
-    /// `None` for an unauthenticated session — no principal was admitted, so
-    /// there is no authorization lifetime to bound, and every datagram path
-    /// below short-circuits without reading a clock.
-    authorization: Option<UdpSessionAuthorization>,
 }
 
 /// The admitted plain-UDP session's absolute authorization plan and its
@@ -916,6 +1059,140 @@ where
     }
 }
 
+/// Number of sets in the listener-local 2-way set-associative session cache
+/// (256 sets × 2 ways = 512 entries, ~36 KiB, fits in L1D cache). Eliminates
+/// DashMap shard locking and per-datagram `Arc` refcount atomics across
+/// concurrent UDP clients while checking `expired` on every lookup and sweeping
+/// evicted pins whenever `UdpProxyMetrics::session_eviction_epoch` advances.
+const UDP_SESSION_CACHE_SETS: usize = 256;
+
+#[derive(Default)]
+struct UdpSessionCacheSet {
+    ways: [Option<(UdpSessionKey, Arc<UdpSession>)>; 2],
+    next_victim: u8,
+}
+
+struct UdpSessionLocalCache {
+    sets: Box<[UdpSessionCacheSet]>,
+}
+
+impl UdpSessionLocalCache {
+    fn new() -> Self {
+        let mut sets = Vec::with_capacity(UDP_SESSION_CACHE_SETS);
+        for _ in 0..UDP_SESSION_CACHE_SETS {
+            sets.push(UdpSessionCacheSet::default());
+        }
+        Self {
+            sets: sets.into_boxed_slice(),
+        }
+    }
+
+    #[inline]
+    fn set_index(key: &UdpSessionKey) -> usize {
+        let ip_mix = match key.client.ip() {
+            IpAddr::V4(v4) => u32::from(v4) as u64,
+            IpAddr::V6(v6) => {
+                let s = v6.segments();
+                ((s[0] as u64) << 48)
+                    ^ ((s[5] as u64) << 32)
+                    ^ ((s[6] as u64) << 16)
+                    ^ (s[7] as u64)
+            }
+        };
+        let port = key.client.port() as u64;
+        let dst_mix = match key.destination {
+            None => 0,
+            Some(IpAddr::V4(v4)) => u32::from(v4) as u64,
+            Some(IpAddr::V6(v6)) => {
+                let s = v6.segments();
+                ((s[6] as u64) << 16) ^ (s[7] as u64)
+            }
+        };
+        let mut h = ip_mix
+            ^ port.wrapping_mul(0x9e37_79b9_7f4a_7c15)
+            ^ dst_mix.wrapping_mul(0x517c_c1b7_2722_0a95)
+            ^ key.listener_generation;
+        h ^= h >> 30;
+        h = h.wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        h ^= h >> 27;
+        (h as usize) & (UDP_SESSION_CACHE_SETS - 1)
+    }
+
+    /// Locate a live cached session and return its `(set_idx, way_idx)` slot
+    /// indices without cloning/dropping an `Arc` or holding a mutable borrow
+    /// across a miss fallback. Clears expired entries immediately.
+    #[inline]
+    fn find_live(&mut self, key: &UdpSessionKey) -> Option<(usize, usize)> {
+        let set_idx = Self::set_index(key);
+        let set = &mut self.sets[set_idx];
+        for (way_idx, slot) in set.ways.iter_mut().enumerate() {
+            let matches = matches!(slot, Some((cached_key, _)) if cached_key == key);
+            if matches {
+                let is_expired = slot
+                    .as_ref()
+                    .is_some_and(|(_, s)| s.expired.load(Ordering::Acquire));
+                if is_expired {
+                    udp_count!(LastClientExpired, 1);
+                    *slot = None;
+                    return None;
+                }
+                return Some((set_idx, way_idx));
+            }
+        }
+        None
+    }
+
+    /// Borrow the session at `(set_idx, way_idx)` returned by [`Self::find_live`].
+    #[inline]
+    fn get_slot(&self, set_idx: usize, way_idx: usize) -> &Arc<UdpSession> {
+        &self.sets[set_idx].ways[way_idx]
+            .as_ref()
+            .expect("live slot index from find_live")
+            .1
+    }
+
+    /// Insert a session resolved from `sessions` and return a direct borrow.
+    #[inline]
+    fn insert(&mut self, key: UdpSessionKey, session: Arc<UdpSession>) -> &Arc<UdpSession> {
+        let set = &mut self.sets[Self::set_index(&key)];
+        let idx = if set.ways[0].is_none() {
+            0
+        } else if set.ways[1].is_none() {
+            1
+        } else {
+            let v = (set.next_victim & 1) as usize;
+            set.next_victim ^= 1;
+            v
+        };
+        set.ways[idx] = Some((key, session));
+        &set.ways[idx].as_ref().unwrap().1
+    }
+
+    /// Remove a session key (e.g., after NodeWaypoint source revocation).
+    fn remove(&mut self, key: &UdpSessionKey) {
+        let set = &mut self.sets[Self::set_index(key)];
+        for slot in &mut set.ways {
+            if matches!(slot, Some((cached_key, _)) if cached_key == key) {
+                *slot = None;
+            }
+        }
+    }
+
+    /// Drop any expired `Arc<UdpSession>` pins after a session eviction epoch bump.
+    fn sweep_expired(&mut self) {
+        for set in self.sets.iter_mut() {
+            for slot in &mut set.ways {
+                if slot
+                    .as_ref()
+                    .is_some_and(|(_, s)| s.expired.load(Ordering::Acquire))
+                {
+                    *slot = None;
+                }
+            }
+        }
+    }
+}
+
 /// Resolve a live `last_client` cache hit, clearing the entry when the cached
 /// session has been marked expired.
 ///
@@ -1121,6 +1398,15 @@ impl PendingSessionTable {
         self.len.load(Ordering::Relaxed)
     }
 
+    /// Fast empty check using `Acquire` ordering paired with `AcqRel`
+    /// increments before insert and decrements after removal. When `true`,
+    /// no pending gate exists and the hot path can skip hashing and acquiring
+    /// a DashMap write lock on `pending_sessions`.
+    #[inline]
+    fn is_empty(&self) -> bool {
+        self.len.load(Ordering::Acquire) == 0
+    }
+
     fn get_mut(
         &self,
         key: &UdpSessionKey,
@@ -1131,7 +1417,7 @@ impl PendingSessionTable {
     fn remove(&self, key: &UdpSessionKey) -> Option<(UdpSessionKey, PendingDatagramQueue)> {
         let removed = self.map.remove(key);
         if removed.is_some() {
-            self.len.fetch_sub(1, Ordering::Relaxed);
+            self.len.fetch_sub(1, Ordering::AcqRel);
         }
         removed
     }
@@ -1414,8 +1700,7 @@ fn spawn_session_hook_ingress_worker(
                 );
                 continue;
             }
-            metrics.datagrams_out.fetch_add(1, Ordering::Relaxed);
-            metrics.bytes_out.fetch_add(len as u64, Ordering::Relaxed);
+            metrics.record_datagrams_out(1, len as u64);
         }
 
         // Drain any residual so queued-byte accounting cannot leak if the
@@ -1726,8 +2011,7 @@ fn spawn_session_egress_writer<F, Fut>(
                 Ok(()) => {
                     udp_count!(EgressSent, 1);
                     udp_count!(EgressSentBytes, len);
-                    metrics.datagrams_out.fetch_add(1, Ordering::Relaxed);
-                    metrics.bytes_out.fetch_add(len as u64, Ordering::Relaxed);
+                    metrics.record_datagrams_out(1, len as u64);
                 }
                 Err(e) => {
                     udp_count!(EgressSendError, 1);
@@ -2067,7 +2351,7 @@ fn try_insert_pending_session_gate(
             );
             // Counted while the vacant entry still holds the shard lock, so a
             // concurrent removal can never decrement before this increment.
-            pending_sessions.len.fetch_add(1, Ordering::Relaxed);
+            pending_sessions.len.fetch_add(1, Ordering::AcqRel);
             vacant.insert(PendingDatagramQueue {
                 forwarded_client,
                 ..Default::default()
@@ -2132,7 +2416,7 @@ fn take_pending_datagrams(
             if occupied.get().datagrams.is_empty() {
                 udp_count!(PendingEmptyRemove, 1);
                 occupied.remove();
-                pending_sessions.len.fetch_sub(1, Ordering::Relaxed);
+                pending_sessions.len.fetch_sub(1, Ordering::AcqRel);
                 None
             } else {
                 let queue = occupied.get_mut();
@@ -2965,15 +3249,111 @@ fn flush_gso_batch(
 /// absolute authorization plan. After `writable()` reports readiness the plan
 /// is re-read immediately before the pktinfo syscall so expiry wins over send
 /// readiness at that boundary too.
+/// Termination reason surfaced by a reply-side commit boundary check.
+///
+/// Enforced before every mid-burst flush, fallback direct send, and post-wait
+/// retry so buffered or suspended replies can never cross session stop,
+/// shutdown, NodeWaypoint source/destination revocation, or credential expiry.
+#[cfg(target_os = "linux")]
+enum UdpReplyCommitStop {
+    Stopped,
+    AuthorizationExpired(crate::proxy::auth_lifetime::StreamAuthTermination),
+    PolicyRejected(String),
+}
+
+/// Lock-free check for whether a shutdown `watch::Receiver<bool>` has fired.
+///
+/// Uses `has_changed()` (a single atomic state load in Tokio, acquiring no
+/// `RwLock`) on the common unchanged (`false`) path, falling back to
+/// `borrow()` only after the sender actually publishes a new value. Treating
+/// a closed channel (`Err`) as triggered matches `udp_reply_shutdown_cancel`.
+#[cfg(target_os = "linux")]
+#[inline]
+fn shutdown_watch_triggered(rx: &watch::Receiver<bool>) -> bool {
+    match rx.has_changed() {
+        Ok(false) => false,
+        Ok(true) => *rx.borrow(),
+        Err(_) => true,
+    }
+}
+
+/// Shared commit-boundary & cancellation guard passed into Linux reply batching
+/// and direct-send fallback helpers.
+///
+/// Reuses the caller's single pinned `stop_notified` future so `notify_one()`
+/// on `UdpSession::stop_notify` can never be diverted to a second waiter.
+#[cfg(target_os = "linux")]
+struct UdpReplyCommitGuard<'a, 'b> {
+    session: &'a UdpSession,
+    client_addr: SocketAddr,
+    proxy_id: &'a str,
+    authorization: Option<crate::proxy::auth_lifetime::StreamAuthDeadline>,
+    stop_notified: std::pin::Pin<&'a mut tokio::sync::futures::Notified<'b>>,
+    listener_shutdown: &'a mut watch::Receiver<bool>,
+    global_shutdown: &'a mut Option<watch::Receiver<bool>>,
+}
+
+#[cfg(target_os = "linux")]
+impl UdpReplyCommitGuard<'_, '_> {
+    #[inline]
+    fn check_policy(&self) -> Option<UdpReplyCommitStop> {
+        if self.session.stop_reply_task.load(Ordering::Acquire)
+            || shutdown_watch_triggered(self.listener_shutdown)
+            || self
+                .global_shutdown
+                .as_ref()
+                .is_some_and(shutdown_watch_triggered)
+        {
+            return Some(UdpReplyCommitStop::Stopped);
+        }
+        if let Some(source) = self.session.node_waypoint_source.as_ref()
+            && let Err(refusal) = source.revalidate(source.ingress_ifindex, self.client_addr.ip())
+        {
+            source.scoping.index.warn_refusal(
+                self.proxy_id,
+                &udp_session_client_ip(self.client_addr),
+                refusal,
+            );
+            self.session.expired.store(true, Ordering::Release);
+            return Some(UdpReplyCommitStop::PolicyRejected(format!(
+                "NodeWaypoint UDP source attribution no longer valid ({})",
+                refusal.as_str()
+            )));
+        }
+        if let Err(error) = self.session.revalidate_destination() {
+            return Some(UdpReplyCommitStop::PolicyRejected(error.to_string()));
+        }
+        None
+    }
+
+    #[inline]
+    fn check_commit(&self) -> Option<UdpReplyCommitStop> {
+        if let Some(stop) = self.check_policy() {
+            return Some(stop);
+        }
+        if let Some(termination) = udp_reply_expired_at_commit(self.authorization) {
+            return Some(UdpReplyCommitStop::AuthorizationExpired(termination));
+        }
+        None
+    }
+}
+
+#[cfg(target_os = "linux")]
+enum UdpDirectSendOutcome {
+    Sent(std::io::Result<usize>),
+    Stop(UdpReplyCommitStop),
+}
+
 #[cfg(target_os = "linux")]
 async fn direct_send_to_client(
     frontend: &UdpSocket,
     data: &[u8],
     client_addr: SocketAddr,
     local: Option<crate::socket_opts::PktinfoLocal>,
-    authorization: Option<crate::proxy::auth_lifetime::StreamAuthDeadline>,
-) -> UdpFrontendSendOutcome<std::io::Result<usize>> {
+    commit_guard: &mut UdpReplyCommitGuard<'_, '_>,
+) -> UdpDirectSendOutcome {
     use std::os::unix::io::AsRawFd;
+    let authorization = commit_guard.authorization;
     // Only honor the local source when its address family matches the
     // destination — mirrors `flush_gso_batch` / `SendMmsgBatch::push_with_local`.
     let effective_local = match (local.map(|l| l.ip), client_addr) {
@@ -2983,25 +3363,81 @@ async fn direct_send_to_client(
         _ => None,
     };
     let Some(local) = effective_local else {
-        return udp_frontend_send_until_expiry(
-            authorization,
-            udp_direct!(frontend.send_to(data, client_addr)),
-        )
-        .await;
+        loop {
+            if let Some(stop) = commit_guard.check_policy() {
+                return UdpDirectSendOutcome::Stop(stop);
+            }
+            if let Some(termination) = udp_reply_expired_at_commit(authorization) {
+                return UdpDirectSendOutcome::Stop(UdpReplyCommitStop::AuthorizationExpired(
+                    termination,
+                ));
+            }
+            let result = frontend.try_send_to(data, client_addr);
+            #[cfg(feature = "bench-udp-profile")]
+            {
+                crate::udp_profile::batch_count(
+                    crate::udp_profile::Direction::Reply,
+                    BatchField::DirectCalls,
+                    1,
+                );
+                crate::udp_profile::direct_outcome(&result);
+            }
+            match result {
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    let shutdown_cancel = udp_reply_shutdown_cancel(
+                        commit_guard.listener_shutdown,
+                        commit_guard.global_shutdown,
+                    );
+                    tokio::pin!(shutdown_cancel);
+                    let outcome = tokio::select! {
+                        biased;
+                        () = commit_guard.stop_notified.as_mut() => {
+                            return UdpDirectSendOutcome::Stop(UdpReplyCommitStop::Stopped);
+                        }
+                        () = &mut shutdown_cancel => {
+                            return UdpDirectSendOutcome::Stop(UdpReplyCommitStop::Stopped);
+                        }
+                        outcome = udp_frontend_writable_until_expiry(
+                            authorization,
+                            frontend.writable(),
+                        ) => outcome,
+                    };
+                    match outcome {
+                        UdpFrontendSendOutcome::AuthorizationExpired(termination) => {
+                            return UdpDirectSendOutcome::Stop(
+                                UdpReplyCommitStop::AuthorizationExpired(termination),
+                            );
+                        }
+                        UdpFrontendSendOutcome::Sent(Err(e)) => {
+                            return UdpDirectSendOutcome::Sent(Err(e));
+                        }
+                        UdpFrontendSendOutcome::Sent(Ok(())) => {}
+                    }
+                }
+                other => return UdpDirectSendOutcome::Sent(other),
+            }
+        }
     };
     let (dest, dest_len) = super::udp_batch::std_to_sockaddr_storage(client_addr);
     loop {
-        if let Some(termination) = udp_reply_expired_at_commit(authorization) {
-            return UdpFrontendSendOutcome::AuthorizationExpired(termination);
+        if let Some(stop) = commit_guard.check_policy() {
+            return UdpDirectSendOutcome::Stop(stop);
         }
-        let result = crate::socket_opts::send_with_pktinfo(
-            frontend.as_raw_fd(),
-            data,
-            local,
-            &dest,
-            dest_len,
-            None,
-        );
+        if let Some(termination) = udp_reply_expired_at_commit(authorization) {
+            return UdpDirectSendOutcome::Stop(UdpReplyCommitStop::AuthorizationExpired(
+                termination,
+            ));
+        }
+        let result = frontend.try_io(tokio::io::Interest::WRITABLE, || {
+            crate::socket_opts::send_with_pktinfo(
+                frontend.as_raw_fd(),
+                data,
+                local,
+                &dest,
+                dest_len,
+                None,
+            )
+        });
         #[cfg(feature = "bench-udp-profile")]
         {
             crate::udp_profile::batch_count(
@@ -3013,17 +3449,34 @@ async fn direct_send_to_client(
         }
         match result {
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                match udp_frontend_writable_until_expiry(authorization, frontend.writable()).await {
+                let shutdown_cancel = udp_reply_shutdown_cancel(
+                    commit_guard.listener_shutdown,
+                    commit_guard.global_shutdown,
+                );
+                tokio::pin!(shutdown_cancel);
+                let outcome = tokio::select! {
+                    biased;
+                    () = commit_guard.stop_notified.as_mut() => {
+                        return UdpDirectSendOutcome::Stop(UdpReplyCommitStop::Stopped);
+                    }
+                    () = &mut shutdown_cancel => {
+                        return UdpDirectSendOutcome::Stop(UdpReplyCommitStop::Stopped);
+                    }
+                    outcome = udp_frontend_writable_until_expiry(authorization, frontend.writable()) => outcome,
+                };
+                match outcome {
                     UdpFrontendSendOutcome::AuthorizationExpired(termination) => {
-                        return UdpFrontendSendOutcome::AuthorizationExpired(termination);
+                        return UdpDirectSendOutcome::Stop(
+                            UdpReplyCommitStop::AuthorizationExpired(termination),
+                        );
                     }
                     UdpFrontendSendOutcome::Sent(Err(e)) => {
-                        return UdpFrontendSendOutcome::Sent(Err(e));
+                        return UdpDirectSendOutcome::Sent(Err(e));
                     }
                     UdpFrontendSendOutcome::Sent(Ok(())) => {}
                 }
             }
-            other => return UdpFrontendSendOutcome::Sent(other),
+            other => return UdpDirectSendOutcome::Sent(other),
         }
     }
 }
@@ -3067,11 +3520,9 @@ fn flush_sendmmsg_best_effort(
 /// Direct-send a reply datagram that the batched paths cannot represent
 /// (GSO-incompatible, sendmmsg-oversized, or post-flush refusal).
 ///
-/// Rechecks the admitted absolute authorization plan immediately before the
-/// client send so a prior `await` (hook, batch flush) cannot even enter the
-/// escape hatch after expiry. The send itself is then owned by the same plan
-/// (`send_to` / `writable` cannot emit after the deadline). Returns the
-/// bounded termination when the send must not happen.
+/// Enforces stop, shutdown, NodeWaypoint source/destination revalidation, and
+/// the admitted absolute authorization plan immediately before the client send
+/// and across any writability wait.
 #[cfg(target_os = "linux")]
 #[allow(clippy::too_many_arguments)]
 async fn direct_send_reply_or_drop(
@@ -3082,10 +3533,10 @@ async fn direct_send_reply_or_drop(
     proxy_id: &str,
     reason: &str,
     send_drops: &mut UdpReplySendDrops,
-    authorization: Option<crate::proxy::auth_lifetime::StreamAuthDeadline>,
-) -> Option<crate::proxy::auth_lifetime::StreamAuthTermination> {
-    if let Some(termination) = udp_reply_expired_at_commit(authorization) {
-        return Some(termination);
+    commit_guard: &mut UdpReplyCommitGuard<'_, '_>,
+) -> Option<UdpReplyCommitStop> {
+    if let Some(stop) = commit_guard.check_commit() {
+        return Some(stop);
     }
     debug!(
         proxy_id = %proxy_id,
@@ -3094,9 +3545,9 @@ async fn direct_send_reply_or_drop(
         reason,
         "UDP reply using direct-send escape hatch"
     );
-    match direct_send_to_client(frontend, data, client_addr, local_ip, authorization).await {
-        UdpFrontendSendOutcome::AuthorizationExpired(termination) => Some(termination),
-        UdpFrontendSendOutcome::Sent(Err(e)) => {
+    match direct_send_to_client(frontend, data, client_addr, local_ip, commit_guard).await {
+        UdpDirectSendOutcome::Stop(stop) => Some(stop),
+        UdpDirectSendOutcome::Sent(Err(e)) => {
             send_drops.record_datagram(data.len());
             warn!(
                 proxy_id = %proxy_id,
@@ -3107,7 +3558,7 @@ async fn direct_send_reply_or_drop(
             );
             None
         }
-        UdpFrontendSendOutcome::Sent(Ok(_)) => None,
+        UdpDirectSendOutcome::Sent(Ok(_)) => None,
     }
 }
 
@@ -3115,9 +3566,8 @@ async fn direct_send_reply_or_drop(
 /// `Oversized` (datagram larger than the lazy sendmmsg slot) or a stubborn
 /// post-flush `Full`.
 ///
-/// Rechecks the admitted absolute plan immediately before every flush or
-/// fallback send. Returns the bounded termination when queued payloads must
-/// be discarded rather than sent.
+/// Enforces stop, NodeWaypoint source/destination ownership, and authorization
+/// deadline immediately before every flush or fallback send.
 #[cfg(target_os = "linux")]
 #[allow(clippy::too_many_arguments)]
 async fn enqueue_sendmmsg_or_direct(
@@ -3128,23 +3578,23 @@ async fn enqueue_sendmmsg_or_direct(
     local_ip: Option<crate::socket_opts::PktinfoLocal>,
     proxy_id: &str,
     send_drops: &mut UdpReplySendDrops,
-    authorization: Option<crate::proxy::auth_lifetime::StreamAuthDeadline>,
-) -> Option<crate::proxy::auth_lifetime::StreamAuthTermination> {
+    commit_guard: &mut UdpReplyCommitGuard<'_, '_>,
+) -> Option<UdpReplyCommitStop> {
     use super::udp_batch::SendMmsgPushResult;
     use std::os::unix::io::AsRawFd;
 
-    if let Some(termination) = udp_reply_expired_at_commit(authorization) {
-        return Some(termination);
-    }
-
+    // Pure in-memory buffering (`Queued`) requires no commit check here: the
+    // caller already validated policy/expiry before queuing, and the eventual
+    // flush validates right before the syscall. Every actual flush or direct
+    // send path below checks `commit_guard.check_commit()` immediately prior.
     match send_batch.push_with_local(data, client_addr, local_ip) {
         SendMmsgPushResult::Queued => None,
         SendMmsgPushResult::Oversized => {
             // Preserve backend reply order: an oversized direct send must not
             // overtake ordinary datagrams already queued in sendmmsg.
             while !send_batch.is_empty() {
-                if let Some(termination) = udp_reply_expired_at_commit(authorization) {
-                    return Some(termination);
+                if let Some(stop) = commit_guard.check_commit() {
+                    return Some(stop);
                 }
                 if flush_sendmmsg_best_effort(send_batch, frontend.as_raw_fd(), send_drops).is_err()
                 {
@@ -3159,13 +3609,13 @@ async fn enqueue_sendmmsg_or_direct(
                 proxy_id,
                 "sendmmsg_oversized",
                 send_drops,
-                authorization,
+                commit_guard,
             )
             .await
         }
         SendMmsgPushResult::Full => {
-            if let Some(termination) = udp_reply_expired_at_commit(authorization) {
-                return Some(termination);
+            if let Some(stop) = commit_guard.check_commit() {
+                return Some(stop);
             }
             let _ = flush_sendmmsg_best_effort(send_batch, frontend.as_raw_fd(), send_drops);
             match send_batch.push_with_local(data, client_addr, local_ip) {
@@ -3179,7 +3629,7 @@ async fn enqueue_sendmmsg_or_direct(
                         proxy_id,
                         "sendmmsg_oversized",
                         send_drops,
-                        authorization,
+                        commit_guard,
                     )
                     .await
                 }
@@ -3194,7 +3644,7 @@ async fn enqueue_sendmmsg_or_direct(
                         proxy_id,
                         "sendmmsg_post_flush_full",
                         send_drops,
-                        authorization,
+                        commit_guard,
                     )
                     .await
                 }
@@ -3215,13 +3665,13 @@ async fn drain_gso_to_sendmmsg_or_direct(
     local_ip: Option<crate::socket_opts::PktinfoLocal>,
     proxy_id: &str,
     send_drops: &mut UdpReplySendDrops,
-    authorization: Option<crate::proxy::auth_lifetime::StreamAuthDeadline>,
-) -> Option<crate::proxy::auth_lifetime::StreamAuthTermination> {
+    commit_guard: &mut UdpReplyCommitGuard<'_, '_>,
+) -> Option<UdpReplyCommitStop> {
     use std::os::unix::io::AsRawFd;
 
     loop {
-        if let Some(termination) = udp_reply_expired_at_commit(authorization) {
-            return Some(termination);
+        if let Some(stop) = commit_guard.check_commit() {
+            return Some(stop);
         }
         gso_batch.drain_to_sendmmsg(send_batch, client_addr, local_ip);
         if gso_batch.is_empty() {
@@ -3230,7 +3680,7 @@ async fn drain_gso_to_sendmmsg_or_direct(
         if send_batch.is_empty() {
             // Stuck on an oversized front segment — escape via direct-send.
             let dgram = gso_batch.take_front_datagram()?;
-            if let Some(termination) = direct_send_reply_or_drop(
+            if let Some(stop) = direct_send_reply_or_drop(
                 frontend,
                 &dgram,
                 client_addr,
@@ -3238,16 +3688,20 @@ async fn drain_gso_to_sendmmsg_or_direct(
                 proxy_id,
                 "gso_drain_sendmmsg_oversized",
                 send_drops,
-                authorization,
+                commit_guard,
             )
             .await
             {
-                return Some(termination);
+                // This segment was popped from `gso_batch` before cancellation;
+                // account for it in `send_drops` so settlement does not count
+                // an unsent canceled datagram as transmitted.
+                send_drops.record_datagram(dgram.len());
+                return Some(stop);
             }
             continue;
         }
-        if let Some(termination) = udp_reply_expired_at_commit(authorization) {
-            return Some(termination);
+        if let Some(stop) = commit_guard.check_commit() {
+            return Some(stop);
         }
         let _ = flush_sendmmsg_best_effort(send_batch, frontend.as_raw_fd(), send_drops);
     }
@@ -3257,19 +3711,8 @@ async fn drain_gso_to_sendmmsg_or_direct(
 /// flush and retry, and on GSO socket failure drain the buffered datagrams
 /// through the sendmmsg fallback.
 ///
-/// This collapses three near-identical GSO→sendmmsg fallback blocks that
-/// previously existed inline in `create_session`. Centralising it means the
-/// "post-flush push dropped the datagram" silent-drop guard only has to be
-/// fixed in one place.
-///
-/// `gso_failed` is set to `true` if we have to abandon GSO for this session.
-/// The caller must stop calling this helper after that and drive `send_batch`
-/// directly.
-///
-/// Rechecks the admitted absolute plan immediately before every flush or
-/// fallback send so a payload queued before expiry is discarded rather than
-/// flushed afterwards. Returns the bounded termination when the caller must
-/// abandon the reply loop.
+/// Enforces stop, NodeWaypoint source/destination ownership, and authorization
+/// deadline immediately before every flush or fallback send.
 #[cfg(target_os = "linux")]
 #[allow(clippy::too_many_arguments)]
 async fn try_gso_send_or_fallback(
@@ -3282,17 +3725,17 @@ async fn try_gso_send_or_fallback(
     proxy_id: &str,
     local_ip: Option<crate::socket_opts::PktinfoLocal>,
     send_drops: &mut UdpReplySendDrops,
-    authorization: Option<crate::proxy::auth_lifetime::StreamAuthDeadline>,
-) -> Option<crate::proxy::auth_lifetime::StreamAuthTermination> {
-    if let Some(termination) = udp_reply_expired_at_commit(authorization) {
-        return Some(termination);
-    }
+    commit_guard: &mut UdpReplyCommitGuard<'_, '_>,
+) -> Option<UdpReplyCommitStop> {
+    // Pure in-memory buffering (`gso_batch.push`) requires no commit check here:
+    // the caller validated policy/expiry before queuing, and every actual flush
+    // or fallback send below enforces `commit_guard.check_commit()`.
     if gso_batch.push(data) {
         return None;
     }
     // Batch full or size-mismatch — flush current batch and try once more.
-    if let Some(termination) = udp_reply_expired_at_commit(authorization) {
-        return Some(termination);
+    if let Some(stop) = commit_guard.check_commit() {
+        return Some(stop);
     }
     match flush_gso_batch(gso_batch, frontend, client_addr, local_ip) {
         Ok(_) => {
@@ -3309,7 +3752,7 @@ async fn try_gso_send_or_fallback(
                     proxy_id,
                     "gso_post_flush_refused",
                     send_drops,
-                    authorization,
+                    commit_guard,
                 )
                 .await;
             }
@@ -3324,7 +3767,7 @@ async fn try_gso_send_or_fallback(
                 e
             );
             *gso_failed = true;
-            if let Some(termination) = drain_gso_to_sendmmsg_or_direct(
+            if let Some(stop) = drain_gso_to_sendmmsg_or_direct(
                 gso_batch,
                 send_batch,
                 frontend,
@@ -3332,11 +3775,11 @@ async fn try_gso_send_or_fallback(
                 local_ip,
                 proxy_id,
                 send_drops,
-                authorization,
+                commit_guard,
             )
             .await
             {
-                return Some(termination);
+                return Some(stop);
             }
             // Now push the current datagram (or direct-send if oversized/full).
             enqueue_sendmmsg_or_direct(
@@ -3347,7 +3790,7 @@ async fn try_gso_send_or_fallback(
                 local_ip,
                 proxy_id,
                 send_drops,
-                authorization,
+                commit_guard,
             )
             .await
         }
@@ -3914,6 +4357,14 @@ pub async fn start_udp_listener_holding_port(
     // not an optimization — reporting the listener as started while it can only
     // fail closed is a black hole that looks healthy. Ordinary (non-scoped) UDP
     // listeners are untouched and keep the best-effort behaviour below.
+    // Apply Linux socket optimizations on the frontend UDP socket.
+    // Track whether IP(v6)_PKTINFO was activated via EITHER mandatory
+    // NodeWaypoint ingress capture OR optional `udp_pktinfo_enabled` so
+    // disabling the optional flag never disables NodeWaypoint's required
+    // cmsg receive path.
+    #[cfg(target_os = "linux")]
+    let mut pktinfo_active = false;
+
     if node_waypoint_udp_source.is_some() || node_waypoint_udp_destinations.is_some() {
         let local = frontend_socket.local_addr().unwrap_or(addr);
         #[cfg(target_os = "linux")]
@@ -3924,13 +4375,19 @@ pub async fn start_udp_listener_holding_port(
         #[cfg(not(target_os = "linux"))]
         let fd = 0;
         match crate::socket_opts::enable_ingress_pktinfo(fd, local) {
-            Ok(families) => info!(
-                proxy_id = %proxy_id,
-                port = port,
-                families = ?families,
-                "NodeWaypoint scoped UDP listener armed ingress-interface capture for every family \
-                 it serves"
-            ),
+            Ok(families) => {
+                #[cfg(target_os = "linux")]
+                {
+                    pktinfo_active = true;
+                }
+                info!(
+                    proxy_id = %proxy_id,
+                    port = port,
+                    families = ?families,
+                    "NodeWaypoint scoped UDP listener armed ingress-interface capture for every family \
+                     it serves"
+                );
+            }
             Err(error) => {
                 error!(
                     proxy_id = %proxy_id,
@@ -3947,9 +4404,6 @@ pub async fn start_udp_listener_holding_port(
         }
     }
 
-    // Apply Linux socket optimizations on the frontend UDP socket.
-    #[cfg(target_os = "linux")]
-    let mut pktinfo_active = false;
     #[cfg(target_os = "linux")]
     {
         use std::os::unix::io::AsRawFd;
@@ -3985,8 +4439,9 @@ pub async fn start_udp_listener_holding_port(
             // socket returns ENOPROTOOPT for IPV6_RECVPKTINFO which is fine.
             let v4_ok = crate::socket_opts::set_ip_pktinfo(fd).is_ok();
             let v6_ok = crate::socket_opts::set_ipv6_recvpktinfo(fd).is_ok();
-            pktinfo_active = v4_ok || v6_ok;
-            if pktinfo_active {
+            let optional_ok = v4_ok || v6_ok;
+            pktinfo_active |= optional_ok;
+            if optional_ok {
                 info!(
                     proxy_id = %proxy_id,
                     port = port,
@@ -4052,11 +4507,36 @@ pub async fn start_udp_listener_holding_port(
     );
 
     let mut buf = vec![0u8; MAX_UDP_DATAGRAM_SIZE];
-    let mut shutdown_rx = shutdown;
+    let shutdown_rx = shutdown;
     // Optional gateway-wide shutdown — fires on SIGTERM/SIGINT regardless of
     // per-listener config-driven removal. We watch BOTH so the recv loop
     // exits promptly during graceful drain.
-    let mut global_shutdown_rx = global_shutdown;
+    let global_shutdown_rx = global_shutdown;
+
+    // Register listener & global shutdown futures ONCE outside the main recv
+    // loop so every wakeup avoids re-registering/dropping `watch::Changed`
+    // waiters on the shared shutdown channels.
+    let mut loop_shutdown_rx = shutdown_rx.clone();
+    let mut loop_global_shutdown_rx = global_shutdown_rx.clone();
+    if *loop_shutdown_rx.borrow()
+        || loop_global_shutdown_rx
+            .as_ref()
+            .is_some_and(|rx| *rx.borrow())
+    {
+        info!(proxy_id = %proxy_id, "UDP proxy listener shutting down on port {}", port);
+        return Ok(());
+    }
+    let listener_shutdown_fut = loop_shutdown_rx.changed();
+    tokio::pin!(listener_shutdown_fut);
+    let global_shutdown_fut = async {
+        match loop_global_shutdown_rx.as_mut() {
+            Some(rx) => {
+                let _ = rx.changed().await;
+            }
+            None => std::future::pending::<()>().await,
+        }
+    };
+    tokio::pin!(global_shutdown_fut);
 
     // Pre-allocate recvmmsg batch buffers (Linux only). On non-Linux, this is a no-op stub.
     // `false`: plain UDP proxy listeners never enable `IP_RECVORIGDSTADDR`, so
@@ -4070,10 +4550,17 @@ pub async fn start_udp_listener_holding_port(
     #[cfg(not(target_os = "linux"))]
     let _ = recvmmsg_batch_size; // suppress unused variable warning
 
-    // Hot-path cache: skip DashMap lookup when consecutive datagrams share the
-    // same client, destination, namespaced owner, and listener generation
-    // (very common in streaming UDP protocols).
-    let mut last_client: Option<(UdpSessionKey, Arc<UdpSession>)> = None;
+    // Hot-path listener-local session cache (256 sets × 2 ways = 512 entries):
+    // skips DashMap shard locks and per-datagram Arc refcount atomics across
+    // concurrent UDP clients. Expired entries are cleared on access, swept when
+    // `metrics.session_eviction_epoch` advances on incoming traffic, and also
+    // swept proactively on a quiet listener via `session_eviction_notify`.
+    let mut session_cache = UdpSessionLocalCache::new();
+    let eviction_notified = metrics.session_eviction_notify.notified();
+    tokio::pin!(eviction_notified);
+    eviction_notified.as_mut().enable();
+    let mut local_eviction_epoch: u64 = metrics.session_eviction_epoch.load(Ordering::Acquire);
+    let adaptive_handle = adaptive_buffer.proxy_handle(&proxy_namespace, &proxy_id);
     // Spawn generation of THIS bound socket. Folded into every session key so a
     // session can never outlive the listener that created it. Adding or removing
     // an unrelated same-port Service republishes the route table without
@@ -4094,6 +4581,15 @@ pub async fn start_udp_listener_holding_port(
 
     loop {
         tokio::select! {
+            biased;
+            _ = &mut listener_shutdown_fut => {
+                info!(proxy_id = %proxy_id, "UDP proxy listener shutting down on port {}", port);
+                return Ok(());
+            }
+            _ = &mut global_shutdown_fut => {
+                info!(proxy_id = %proxy_id, "UDP proxy listener shutting down on port {} (global SIGTERM)", port);
+                return Ok(());
+            }
             ready = frontend_socket.readable(), if pktinfo_primary => {
                 if let Err(e) = ready {
                     udp_count!(ReadinessError, 1);
@@ -4104,10 +4600,16 @@ pub async fn start_udp_listener_holding_port(
                 udp_count!(ReadinessReady, 1);
                 #[cfg(target_os = "linux")]
                 {
+                    let eviction_epoch = metrics.session_eviction_epoch.load(Ordering::Acquire);
+                    if eviction_epoch != local_eviction_epoch {
+                        session_cache.sweep_expired();
+                        local_eviction_epoch = eviction_epoch;
+                    }
                     let mut batch_dgrams_in: u64 = 0;
                     let mut batch_dgrams_out: u64 = 0;
                     let mut batch_bytes_out: u64 = 0;
-                    let batch_limit = adaptive_buffer.get_batch_limit(&proxy_namespace, &proxy_id);
+                    let now_ms = coarse_epoch_millis();
+                    let batch_limit = adaptive_handle.get_batch_limit();
                     use std::os::fd::AsRawFd;
                     // One admission decision per batch: overload shedding and
                     // the #3726 stale-configuration fence are both process-level
@@ -4119,12 +4621,32 @@ pub async fn start_udp_listener_holding_port(
                     'drain: while total_drained < batch_limit {
                         let max_this_call =
                             (batch_limit - total_drained).min(recv_batch.capacity());
-                        match udp_drain!(
-                            false,
-                            frontend_socket.try_io(tokio::io::Interest::READABLE, || {
-                                recv_batch.recv(fd, max_this_call)
-                            })
-                        ) {
+                        let mut received: usize = 0;
+                        let mut drained_to_eagain = false;
+                        match udp_drain!(false, {
+                            let io_res =
+                                frontend_socket.try_io(tokio::io::Interest::READABLE, || {
+                                    match recv_batch.recv(fd, max_this_call) {
+                                        Ok(1) if max_this_call > 1 => {
+                                            received = 1;
+                                            drained_to_eagain = true;
+                                            Err(std::io::Error::from(
+                                                std::io::ErrorKind::WouldBlock,
+                                            ))
+                                        }
+                                        Ok(n) => {
+                                            received = n;
+                                            Ok(())
+                                        }
+                                        Err(e) => Err(e),
+                                    }
+                                });
+                            if received > 0 {
+                                Ok(received)
+                            } else {
+                                io_res.map(|()| 0)
+                            }
+                        }) {
                             Ok(n) if n > 0 => {
                                 for i in 0..n {
                                     let (data, addr2) = recv_batch.datagram(i);
@@ -4179,7 +4701,7 @@ pub async fn start_udp_listener_holding_port(
                                                     tls_ca_bundle_path.as_deref(),
                                                     &backend_dtls_config_cache,
                                                     max_sessions,
-                                                    &mut last_client,
+                                                    &mut session_cache,
                                                     &mut batch_dgrams_out,
                                                     &mut batch_bytes_out,
                                                     port,
@@ -4197,8 +4719,8 @@ pub async fn start_udp_listener_holding_port(
                                                     destinations,
                                                     listener_generation,
                                                     datagram_client_address.as_ref(),
-                                                )
-                                                .await;
+                                                    now_ms,
+                                                );
                                                 if let Err(e) = result {
                                                     debug!(proxy_id = %proxy_id, client = %udp_client_log_addr(addr2), "UDP forward error: {}", e);
                                                 }
@@ -4227,7 +4749,7 @@ pub async fn start_udp_listener_holding_port(
                                         tls_ca_bundle_path.as_deref(),
                                         &backend_dtls_config_cache,
                                         max_sessions,
-                                        &mut last_client,
+                                        &mut session_cache,
                                         &mut batch_dgrams_out,
                                         &mut batch_bytes_out,
                                         port,
@@ -4245,28 +4767,32 @@ pub async fn start_udp_listener_holding_port(
                                         destinations,
                                         listener_generation,
                                         datagram_client_address.as_ref(),
-                                    )
-                                    .await;
+                                        now_ms,
+                                    );
                                     if let Err(e) = result {
                                         debug!(proxy_id = %proxy_id, client = %udp_client_log_addr(addr2), "UDP forward error: {}", e);
                                     }
                                 }
                                 total_drained += n;
+                                if drained_to_eagain {
+                                    break 'drain;
+                                }
                             }
                             _ => break 'drain, // WouldBlock or error — socket drained
                         }
                     }
 
                     if batch_dgrams_in > 0 {
-                        adaptive_buffer.record_batch_cycle(
-                            &proxy_namespace,
-                            &proxy_id,
-                            batch_dgrams_in,
-                        );
-                        udp_count!(ListenerCounterUpdates, 2);
-                        metrics.datagrams_out.fetch_add(batch_dgrams_out, Ordering::Relaxed);
-                        metrics.bytes_out.fetch_add(batch_bytes_out, Ordering::Relaxed);
+                        adaptive_handle.record_batch_cycle(batch_dgrams_in);
+                        if batch_dgrams_out > 0 {
+                            udp_count!(ListenerCounterUpdates, 2);
+                            metrics.record_datagrams_out(batch_dgrams_out, batch_bytes_out);
+                        }
                     }
+                    // Charge Tokio cooperative budget on every receive cycle so
+                    // continuous short or full batches cannot starve sibling
+                    // reply tasks, timers, or shutdown.
+                    tokio::task::coop::consume_budget().await;
                 }
             }
             result = frontend_socket.recv_from(&mut buf), if !pktinfo_primary => {
@@ -4277,6 +4803,13 @@ pub async fn start_udp_listener_holding_port(
                         continue;
                     }
                 };
+
+                let eviction_epoch = metrics.session_eviction_epoch.load(Ordering::Acquire);
+                if eviction_epoch != local_eviction_epoch {
+                    session_cache.sweep_expired();
+                    local_eviction_epoch = eviction_epoch;
+                }
+                let now_ms = coarse_epoch_millis();
 
                 // Reject datagrams from new clients under critical overload, or
                 // while the DP's applied CP configuration is stale beyond its
@@ -4323,7 +4856,7 @@ pub async fn start_udp_listener_holding_port(
                     tls_ca_bundle_path.as_deref(),
                     &backend_dtls_config_cache,
                     max_sessions,
-                    &mut last_client,
+                    &mut session_cache,
                     &mut batch_dgrams_out,
                     &mut batch_bytes_out,
                     port,
@@ -4341,8 +4874,8 @@ pub async fn start_udp_listener_holding_port(
                     destinations,
                     listener_generation,
                     datagram_client_address.as_ref(),
-                )
-                .await;
+                    now_ms,
+                );
                 if let Err(e) = result {
                     debug!(
                         proxy_id = %proxy_id,
@@ -4355,7 +4888,7 @@ pub async fn start_udp_listener_holding_port(
                 // Drain additional pending datagrams without yielding to the runtime.
                 // On Linux, uses recvmmsg to batch multiple datagrams per syscall.
                 // On other platforms, falls back to individual try_recv_from calls.
-                let batch_limit = adaptive_buffer.get_batch_limit(&proxy_namespace, &proxy_id);
+                let batch_limit = adaptive_handle.get_batch_limit();
 
                 #[cfg(target_os = "linux")]
                 {
@@ -4433,7 +4966,7 @@ pub async fn start_udp_listener_holding_port(
                                                     tls_ca_bundle_path.as_deref(),
                                                     &backend_dtls_config_cache,
                                                     max_sessions,
-                                                    &mut last_client,
+                                                    &mut session_cache,
                                                     &mut batch_dgrams_out,
                                                     &mut batch_bytes_out,
                                                     port,
@@ -4451,8 +4984,8 @@ pub async fn start_udp_listener_holding_port(
                                                     destinations,
                                                     listener_generation,
                                                     datagram_client_address.as_ref(),
-                                                )
-                                                .await;
+                                                    now_ms,
+                                                );
                                                 if let Err(e) = result {
                                                     debug!(proxy_id = %proxy_id, client = %udp_client_log_addr(addr2), "UDP forward error: {}", e);
                                                 }
@@ -4481,7 +5014,7 @@ pub async fn start_udp_listener_holding_port(
                                         tls_ca_bundle_path.as_deref(),
                                         &backend_dtls_config_cache,
                                         max_sessions,
-                                        &mut last_client,
+                                        &mut session_cache,
                                         &mut batch_dgrams_out,
                                         &mut batch_bytes_out,
                                         port,
@@ -4499,8 +5032,8 @@ pub async fn start_udp_listener_holding_port(
                                         destinations,
                                         listener_generation,
                                         datagram_client_address.as_ref(),
-                                    )
-                                    .await;
+                                        now_ms,
+                                    );
                                     if let Err(e) = result {
                                         debug!(proxy_id = %proxy_id, client = %udp_client_log_addr(addr2), "UDP forward error: {}", e);
                                     }
@@ -4557,7 +5090,7 @@ pub async fn start_udp_listener_holding_port(
                                     tls_ca_bundle_path.as_deref(),
                                     &backend_dtls_config_cache,
                                     max_sessions,
-                                    &mut last_client,
+                                    &mut session_cache,
                                     &mut batch_dgrams_out,
                                     &mut batch_bytes_out,
                                     port,
@@ -4575,8 +5108,8 @@ pub async fn start_udp_listener_holding_port(
                                     destinations,
                                     listener_generation,
                                     datagram_client_address.as_ref(),
-                                )
-                                .await;
+                                    now_ms,
+                                );
                                 if let Err(e) = result {
                                     debug!(proxy_id = %proxy_id, client = %udp_client_log_addr(addr2), "UDP forward error: {}", e);
                                 }
@@ -4587,25 +5120,33 @@ pub async fn start_udp_listener_holding_port(
                 }
 
                 // Record batch cycle for adaptive batch limit tuning.
-                adaptive_buffer.record_batch_cycle(&proxy_namespace, &proxy_id, batch_dgrams_in);
+                adaptive_handle.record_batch_cycle(batch_dgrams_in);
 
                 // Flush batched metrics to atomics once.
-                udp_count!(ListenerCounterUpdates, 2);
-                metrics.datagrams_out.fetch_add(batch_dgrams_out, Ordering::Relaxed);
-                metrics.bytes_out.fetch_add(batch_bytes_out, Ordering::Relaxed);
-            }
-            _ = shutdown_rx.changed() => {
-                info!(proxy_id = %proxy_id, "UDP proxy listener shutting down on port {}", port);
-                return Ok(());
-            }
-            _ = async {
-                match global_shutdown_rx.as_mut() {
-                    Some(rx) => { let _ = rx.changed().await; }
-                    None => std::future::pending::<()>().await,
+                if batch_dgrams_out > 0 {
+                    udp_count!(ListenerCounterUpdates, 2);
+                    metrics.record_datagrams_out(batch_dgrams_out, batch_bytes_out);
                 }
-            } => {
-                info!(proxy_id = %proxy_id, "UDP proxy listener shutting down on port {} (global SIGTERM)", port);
-                return Ok(());
+            }
+            // Quiet-listener cache sweep: when sessions expire or tear down
+            // while no frontend traffic is arriving, drop their cached
+            // `Arc<UdpSession>` pins promptly so backend sockets close
+            // immediately instead of waiting for the next incoming datagram.
+            () = &mut eviction_notified => {
+                let eviction_epoch = metrics.session_eviction_epoch.load(Ordering::Acquire);
+                if eviction_epoch != local_eviction_epoch {
+                    session_cache.sweep_expired();
+                    local_eviction_epoch = eviction_epoch;
+                }
+                eviction_notified.set(metrics.session_eviction_notify.notified());
+                eviction_notified.as_mut().enable();
+                // Re-check after re-arming so an eviction racing the sweep
+                // cannot leave a dead session pinned.
+                let recheck_epoch = metrics.session_eviction_epoch.load(Ordering::Acquire);
+                if recheck_epoch != local_eviction_epoch {
+                    session_cache.sweep_expired();
+                    local_eviction_epoch = recheck_epoch;
+                }
             }
         }
     }
@@ -4613,11 +5154,12 @@ pub async fn start_udp_listener_holding_port(
 
 /// Process a single datagram: resolve session, forward to backend, update batch counters.
 ///
-/// Uses `last_client` as a hot-path cache to avoid DashMap lookups when consecutive
-/// datagrams share the same client, destination, namespaced owner, and listener
-/// generation.
+/// Synchronous (zero `.await` points) so the tight `recvmmsg` drain loop avoids
+/// per-datagram Future state-machine overhead. Uses `session_cache` (a
+/// listener-local 2-way set-associative cache) to avoid DashMap locks and
+/// `Arc` refcount atomics across concurrent UDP clients.
 #[allow(clippy::too_many_arguments)]
-async fn process_datagram(
+fn process_datagram(
     data: &[u8],
     client_addr: SocketAddr,
     proxy_id: &str,
@@ -4633,7 +5175,7 @@ async fn process_datagram(
     tls_ca_bundle_path: Option<&str>,
     backend_dtls_config_cache: &BackendDtlsConfigCache,
     max_sessions: usize,
-    last_client: &mut Option<(UdpSessionKey, Arc<UdpSession>)>,
+    session_cache: &mut UdpSessionLocalCache,
     batch_dgrams_out: &mut u64,
     batch_bytes_out: &mut u64,
     listen_port: u16,
@@ -4656,6 +5198,7 @@ async fn process_datagram(
     >,
     listener_generation: u64,
     datagram_client_address: Option<&Arc<DatagramClientAddressGate>>,
+    now_ms: u64,
 ) -> Result<(), anyhow::Error> {
     // Client-address metadata boundary (issue #3289). When the listener runs
     // the gate, the envelope is stripped here — once, before any session
@@ -4715,7 +5258,14 @@ async fn process_datagram(
         None => (proxy_namespace, proxy_id),
     };
 
-    if let Some(mut pending) = udp_lookup!(PendingLookup, pending_sessions.get_mut(&session_key)) {
+    if let Some(mut pending) = udp_lookup!(
+        PendingLookup,
+        if pending_sessions.is_empty() {
+            None
+        } else {
+            pending_sessions.get_mut(&session_key)
+        }
+    ) {
         // A follow-up datagram must belong to the same client the in-flight
         // setup was started for. Queueing a different forwarded client here
         // would hand its payload to a session admitted under another identity.
@@ -4740,111 +5290,111 @@ async fn process_datagram(
         return Ok(());
     }
 
-    // Fast path: check last-client cache before hitting DashMap.
-    // Skip (and clear) the cache when the cached session has been flagged
-    // expired by the idle-cleanup task — that path removes the session from
-    // the map but the recv-loop's `Arc` keeps it alive, so without clearing
-    // we'd pin the backend socket/session on a quiet listener and keep
-    // forwarding through a session the cleanup task already declared dead.
-    let existing_session = udp_lookup!(
-        LastClientLookup,
-        take_udp_last_client_if_live(last_client, &session_key, |cached_session| {
-            cached_session
-                .expired
-                .load(std::sync::atomic::Ordering::Acquire)
-        })
-    )
-    .or_else(|| {
-        udp_lookup!(
-            EstablishedLookup,
-            sessions.get(&session_key).map(|entry| {
-                #[cfg(feature = "bench-udp-profile")]
-                if entry.expired.load(Ordering::Acquire) {
-                    udp_count!(EstablishedExpired, 1);
+    // Fast path: check listener-local 2-way session cache before hitting DashMap.
+    // Clears the slot when the cached session has been flagged expired by idle
+    // cleanup or reply-task teardown so stale sessions never outlive expiry.
+    let cache_hit = udp_lookup!(LastClientLookup, session_cache.find_live(&session_key));
+    let session: &Arc<UdpSession> = match cache_hit {
+        Some((set_idx, way_idx)) => session_cache.get_slot(set_idx, way_idx),
+        None => {
+            let from_map = udp_lookup!(
+                EstablishedLookup,
+                sessions.get(&session_key).map(|entry| {
+                    #[cfg(feature = "bench-udp-profile")]
+                    if entry.expired.load(Ordering::Acquire) {
+                        udp_count!(EstablishedExpired, 1);
+                    }
+                    entry.value().clone()
+                })
+            );
+            let Some(found) = from_map else {
+                // Recheck the overload / stale-CP admission fence on a map miss
+                // so a datagram that raced established-session removal cannot
+                // slip into new-session setup while new sources are refused.
+                if refuse_new_udp_source(overload) {
+                    return Ok(());
                 }
-                entry.value().clone()
-            })
-        )
-    });
-
-    let Some(session) = existing_session else {
-        // Cheap flood shield: when the active-session cap is already full, drop a
-        // new-source datagram before creating a pending gate, spawning setup, or
-        // running first-datagram plugin + mesh checks — the post-admission
-        // `reserve_udp_session_slot` would reject it anyway. This is a
-        // non-consuming read (no slot reserved), so admitted flows still reserve
-        // their slot after passing policy. Without it, a spoofed-source flood
-        // against a maxed-out listener would spawn tasks and execute policy
-        // hooks for traffic certain to be dropped.
-        if udp_active_session_cap_reached(metrics, max_sessions) {
-            return Err(anyhow::anyhow!(
-                "UDP session limit reached ({}), dropping datagram",
-                max_sessions
-            ));
-        }
-        if !udp_timed!(
-            PendingRaceGate,
-            try_insert_pending_session_gate(
-                pending_sessions,
-                &session_key,
-                max_sessions,
-                identity.forwarded,
-            )
-        )? {
-            // Defensive: a gate appeared after the check at the top of this
-            // function (not expected — the recv loop is a single task). Treat
-            // this datagram as a follow-up for the in-flight setup, subject to
-            // the same forwarded-client agreement as the ordinary queue path.
-            if let Some(mut pending) =
-                udp_lookup!(PendingRaceLookup, pending_sessions.get_mut(&session_key))
-            {
-                if pending.forwarded_client == identity.forwarded {
-                    let _ = pending.push_bounded(data, local_addr.map(|local| local.ifindex));
-                } else {
-                    drop(pending);
-                    record_client_address_metadata_drop(
-                        metrics,
-                        proxy_id,
-                        listen_port,
-                        client_addr,
-                        &DatagramMetadataError::ForwardedClientChanged,
-                    );
+                // Cheap flood shield: when the active-session cap is already full, drop a
+                // new-source datagram before creating a pending gate, spawning setup, or
+                // running first-datagram plugin + mesh checks — the post-admission
+                // `reserve_udp_session_slot` would reject it anyway. This is a
+                // non-consuming read (no slot reserved), so admitted flows still reserve
+                // their slot after passing policy. Without it, a spoofed-source flood
+                // against a maxed-out listener would spawn tasks and execute policy
+                // hooks for traffic certain to be dropped.
+                if udp_active_session_cap_reached(metrics, max_sessions) {
+                    return Err(anyhow::anyhow!(
+                        "UDP session limit reached ({}), dropping datagram",
+                        max_sessions
+                    ));
                 }
-            }
-            return Ok(());
+                if !udp_timed!(
+                    PendingRaceGate,
+                    try_insert_pending_session_gate(
+                        pending_sessions,
+                        &session_key,
+                        max_sessions,
+                        identity.forwarded,
+                    )
+                )? {
+                    // Defensive: a gate appeared after the check at the top of this
+                    // function (not expected — the recv loop is a single task). Treat
+                    // this datagram as a follow-up for the in-flight setup, subject to
+                    // the same forwarded-client agreement as the ordinary queue path.
+                    if let Some(mut pending) =
+                        udp_lookup!(PendingRaceLookup, pending_sessions.get_mut(&session_key))
+                    {
+                        if pending.forwarded_client == identity.forwarded {
+                            let _ =
+                                pending.push_bounded(data, local_addr.map(|local| local.ifindex));
+                        } else {
+                            drop(pending);
+                            record_client_address_metadata_drop(
+                                metrics,
+                                proxy_id,
+                                listen_port,
+                                client_addr,
+                                &DatagramMetadataError::ForwardedClientChanged,
+                            );
+                        }
+                    }
+                    return Ok(());
+                }
+                spawn_new_session_datagram(
+                    data.to_vec(),
+                    identity,
+                    proxy_id.to_string(),
+                    proxy_namespace.to_string(),
+                    Arc::clone(request_epoch),
+                    Arc::clone(health_checker),
+                    dns_cache.clone(),
+                    Arc::clone(frontend_socket),
+                    Arc::clone(sessions),
+                    Arc::clone(pending_sessions),
+                    Arc::clone(metrics),
+                    tls_no_verify,
+                    tls_ca_bundle_path.map(str::to_owned),
+                    Arc::clone(backend_dtls_config_cache),
+                    listen_port,
+                    Arc::clone(circuit_breaker_cache),
+                    Arc::clone(crls),
+                    sni_proxy_ids.map(|ids| ids.to_vec()),
+                    Arc::clone(adaptive_buffer),
+                    udp_gso_enabled,
+                    local_addr,
+                    listener_shutdown.clone(),
+                    global_shutdown.cloned(),
+                    Arc::clone(overload),
+                    Arc::clone(mesh_outbound_enforcement),
+                    node_waypoint_udp_source.cloned(),
+                    destinations.cloned(),
+                    max_sessions,
+                    session_key,
+                );
+                return Ok(());
+            };
+            session_cache.insert(session_key.clone(), found)
         }
-        spawn_new_session_datagram(
-            data.to_vec(),
-            identity,
-            proxy_id.to_string(),
-            proxy_namespace.to_string(),
-            Arc::clone(request_epoch),
-            Arc::clone(health_checker),
-            dns_cache.clone(),
-            Arc::clone(frontend_socket),
-            Arc::clone(sessions),
-            Arc::clone(pending_sessions),
-            Arc::clone(metrics),
-            tls_no_verify,
-            tls_ca_bundle_path.map(str::to_owned),
-            Arc::clone(backend_dtls_config_cache),
-            listen_port,
-            Arc::clone(circuit_breaker_cache),
-            Arc::clone(crls),
-            sni_proxy_ids.map(|ids| ids.to_vec()),
-            Arc::clone(adaptive_buffer),
-            udp_gso_enabled,
-            local_addr,
-            listener_shutdown.clone(),
-            global_shutdown.cloned(),
-            Arc::clone(overload),
-            Arc::clone(mesh_outbound_enforcement),
-            node_waypoint_udp_source.cloned(),
-            destinations.cloned(),
-            max_sessions,
-            session_key,
-        );
-        return Ok(());
     };
 
     // Re-authorize an established NodeWaypoint session on EVERY datagram
@@ -4886,7 +5436,7 @@ async fn process_datagram(
         // `remove_if` miss and leak all three lifecycle accounts.
         signal_udp_reply_task_stop(&session.stop_reply_task, session.stop_notify.as_ref());
         session.close_hook_ingress();
-        *last_client = None;
+        session_cache.remove(&session_key);
         return Err(anyhow::anyhow!(
             "NodeWaypoint UDP source attribution no longer valid for this session ({}); \
              dropping datagram and closing the session",
@@ -4909,19 +5459,6 @@ async fn process_datagram(
         return Ok(());
     }
 
-    if !session.datagram_plugins.is_empty() {
-        // Decouple potentially I/O-bound `on_udp_datagram` hooks from the
-        // shared listener recv/drain loop: enqueue onto this session's
-        // bounded ingress worker (fail closed on overload). Per-session
-        // FIFO preserves client ordering without one task per datagram.
-        if let Some(la) = local_addr {
-            let _ = session.local_addr.set(la);
-        }
-        *last_client = Some((session_key, session.clone()));
-        let _ = enqueue_session_hook_datagram(&session, data, metrics);
-        return Ok(());
-    }
-
     // Record the per-datagram local (destination) address on the session the
     // first time the kernel exposes one. `OnceLock::set` is a no-op if already
     // set, so this is cheap on subsequent datagrams.
@@ -4929,14 +5466,20 @@ async fn process_datagram(
         let _ = session.local_addr.set(la);
     }
 
-    // Update cache for next datagram.
-    *last_client = Some((session_key, session.clone()));
+    if !session.datagram_plugins.is_empty() {
+        // Decouple potentially I/O-bound `on_udp_datagram` hooks from the
+        // shared listener recv/drain loop: enqueue onto this session's
+        // bounded ingress worker (fail closed on overload). Per-session
+        // FIFO preserves client ordering without one task per datagram.
+        let _ = enqueue_session_hook_datagram(session, data, metrics);
+        return Ok(());
+    }
 
     // The shared receive/drain loop never awaits a backend send (issue #5045):
     // an uncongested plain-UDP datagram is written straight from the borrowed
     // receive buffer, and a stalled one is handed to this session's bounded
     // writer so the stall is scoped to its own client.
-    match forward_client_datagram_without_blocking(&session, data, metrics, client_addr) {
+    match forward_client_datagram_without_blocking(session, data, metrics, client_addr, now_ms) {
         UdpEgressAdmission::Sent => {
             *batch_dgrams_out += 1;
             *batch_bytes_out += data.len() as u64;
@@ -5457,10 +6000,7 @@ async fn process_new_session_datagram(
     }
 
     forward_client_datagram_to_backend(&session, &data).await?;
-    metrics.datagrams_out.fetch_add(1, Ordering::Relaxed);
-    metrics
-        .bytes_out
-        .fetch_add(data.len() as u64, Ordering::Relaxed);
+    metrics.record_datagrams_out(1, data.len() as u64);
 
     // Drain follow-up datagrams that arrived while setup ran, in arrival
     // order, then atomically remove the pending gate. Each drained datagram
@@ -5561,10 +6101,7 @@ async fn process_new_session_datagram(
                 );
                 continue;
             }
-            metrics.datagrams_out.fetch_add(1, Ordering::Relaxed);
-            metrics
-                .bytes_out
-                .fetch_add(dgram.data.len() as u64, Ordering::Relaxed);
+            metrics.record_datagrams_out(1, dgram.data.len() as u64);
         }
     }
     // The loop only ends when `take_pending_datagrams` found the queue empty
@@ -5619,6 +6156,7 @@ fn forward_client_datagram_without_blocking(
     data: &[u8],
     metrics: &Arc<UdpProxyMetrics>,
     client_addr: SocketAddr,
+    now_ms: u64,
 ) -> UdpEgressAdmission {
     // A shared listener stays bound while its Service routes republish. The
     // admission-time route is not a lifetime capability: fail closed before
@@ -5658,9 +6196,9 @@ fn forward_client_datagram_without_blocking(
             udp_count!(BorrowedSendBytes, sent);
             udp_count!(FastActivityStores, 1);
             udp_count!(FastByteAdds, 1);
-            session
-                .last_activity
-                .store(coarse_epoch_millis(), Ordering::Relaxed);
+            if session.last_activity.load(Ordering::Relaxed) < now_ms {
+                session.last_activity.fetch_max(now_ms, Ordering::Relaxed);
+            }
             session
                 .bytes_sent
                 .fetch_add(data.len() as u64, Ordering::Relaxed);
@@ -7331,6 +7869,7 @@ fn settle_udp_reply_task_exit(
     sessions.remove_if(session_key, |_, v| Arc::ptr_eq(v, session))?;
     session.release_session_guards();
     metrics.active_sessions.fetch_sub(1, Ordering::Relaxed);
+    metrics.note_session_evicted();
     Some(match disconnect_error {
         Some((message, error_class, cause, direction)) => (
             Some(message),
@@ -7374,6 +7913,7 @@ fn release_idle_udp_session(session: &UdpSession, metrics: &UdpProxyMetrics) {
     session.close_hook_ingress();
     session.release_session_guards();
     metrics.active_sessions.fetch_sub(1, Ordering::Relaxed);
+    metrics.note_session_evicted();
 }
 
 /// Outcome of one authorization-bounded backend-reply receive.
@@ -8450,10 +8990,7 @@ async fn handle_dtls_client_inner(
                 Err(DtlsRelayInterrupt::AuthorizationExpired(_)) => break,
             }
 
-            metrics_fwd.datagrams_out.fetch_add(1, Ordering::Relaxed);
-            metrics_fwd
-                .bytes_out
-                .fetch_add(len as u64, Ordering::Relaxed);
+            metrics_fwd.record_datagrams_out(1, len as u64);
             bytes_sent_fwd.fetch_add(len as u64, Ordering::Relaxed);
             maybe_touch_udp_idle_activity(activity_fwd.as_ref(), coarse_epoch_millis(), true, true);
         }
@@ -8649,10 +9186,7 @@ async fn handle_dtls_client_inner(
                 UdpFrontendSendOutcome::Sent(Ok(())) => {}
             }
 
-            metrics_rev.datagrams_out.fetch_add(1, Ordering::Relaxed);
-            metrics_rev
-                .bytes_out
-                .fetch_add(len as u64, Ordering::Relaxed);
+            metrics_rev.record_datagrams_out(1, len as u64);
             bytes_received_rev.fetch_add(len as u64, Ordering::Relaxed);
             maybe_touch_udp_idle_activity(activity_rev.as_ref(), coarse_epoch_millis(), true, true);
         }
@@ -9211,6 +9745,10 @@ async fn create_session(
     if let Some(source) = node_waypoint_source.as_ref()
         && let Err(refusal) = source.revalidate(source.ingress_ifindex, client_addr.ip())
     {
+        lb_setup_failure.disarm();
+        if let Some(dtls) = dtls_conn {
+            dtls.close().await;
+        }
         source
             .scoping
             .index
@@ -9223,6 +9761,10 @@ async fn create_session(
     if let Some(destination) = node_waypoint_destination.as_ref()
         && let Err(refusal) = destination.revalidate()
     {
+        lb_setup_failure.disarm();
+        if let Some(dtls) = dtls_conn {
+            dtls.close().await;
+        }
         destination.router.warn_refusal(proxy_id, refusal);
         return Err(anyhow::anyhow!(
             "NodeWaypoint UDP destination ownership changed during session setup ({})",
@@ -9249,18 +9791,18 @@ async fn create_session(
         crate::udp_amplification::record_policy_unlimited();
     }
     let session = Arc::new(UdpSession {
-        backend_socket: backend_socket.clone(),
+        backend_socket: backend_socket.clone().map(UdpBackendSocket),
         dtls_conn: dtls_conn.clone(),
         last_activity: AtomicU64::new(now),
         created_at: AtomicU64::new(now),
         connected_wall_at,
         expired: std::sync::atomic::AtomicBool::new(false),
         bytes_sent: AtomicU64::new(0),
-        bytes_received: AtomicU64::new(0),
+        bytes_received: crossbeam_utils::CachePadded::new(AtomicU64::new(0)),
         // Start without credit: the first datagram, like every follow-up, earns
         // its budget in forward_client_datagram_commit before the backend send.
         // Seeding it here as well would grant the first request twice.
-        response_budget_remaining: AtomicU64::new(0),
+        response_budget_remaining: crossbeam_utils::CachePadded::new(AtomicU64::new(0)),
         amplification_factor: proxy.udp_max_response_amplification_factor,
         backend_target: format!("{}:{}", backend_host, backend_port),
         backend_resolved_ip: resolved_ip.to_string(),
@@ -9326,6 +9868,21 @@ async fn create_session(
         }),
     });
 
+    // Recheck the overload / stale-CP admission fence at the exact publication
+    // boundary (before launching any hook worker or inserting into `sessions`)
+    // so an async setup that crossed into overload or stale CP state cannot
+    // publish a new session. Disarm `lb_setup_failure` because gateway
+    // admission refusal is not a backend fault.
+    if refuse_new_udp_source(overload) {
+        lb_setup_failure.disarm();
+        if let Some(dtls) = dtls_conn {
+            dtls.close().await;
+        }
+        return Err(anyhow::anyhow!(
+            "UDP session refused before publication: overload or stale configuration"
+        ));
+    }
+
     if let Some(rx) = hook_ingress_rx {
         spawn_session_hook_ingress_worker(
             Arc::clone(&session),
@@ -9363,7 +9920,8 @@ async fn create_session(
     let reply_proxy_namespace = proxy_namespace.clone();
     let reply_backend_scheme = backend_scheme;
     let reply_amplification_factor = proxy.udp_max_response_amplification_factor;
-    let reply_adaptive_buffer = adaptive_buffer.clone();
+    let reply_adaptive_handle =
+        adaptive_buffer.proxy_handle(&reply_proxy_namespace, &reply_proxy_id);
     let reply_datagram_plugins = Arc::clone(&datagram_plugins);
     let reply_dgram_client_ip = Arc::clone(&datagram_client_ip);
     let reply_dgram_proxy_id = Arc::clone(&datagram_proxy_id);
@@ -9384,8 +9942,6 @@ async fn create_session(
     #[cfg(not(target_os = "linux"))]
     let _ = udp_gso_enabled;
     tokio::spawn(async move {
-        let mut buf = vec![0u8; MAX_UDP_DATAGRAM_SIZE];
-
         // Authorization arm for the backend→client direction, armed ONCE here
         // rather than per receive, so no per-datagram timer is registered
         // (issue #3816). An unauthenticated session leaves the arm unpolled:
@@ -9407,425 +9963,343 @@ async fn create_session(
             crate::plugins::DisconnectCause,
             crate::plugins::Direction,
         )> = None;
-        // Pre-allocate sendmmsg batch for batched client replies (Linux only).
+
         #[cfg(target_os = "linux")]
-        let mut send_batch = super::udp_batch::SendMmsgBatch::new(64);
-        #[cfg(all(target_os = "linux", feature = "bench-udp-profile"))]
-        {
-            send_batch.profile_direction = crate::udp_profile::Direction::Reply;
-        }
-        // Pre-allocate GSO batch buffer for concatenating same-size datagrams (Linux only).
-        // GSO is preferred over sendmmsg when available — fewer syscalls for same-size bursts.
+        let handled_linux_plain_udp = !is_dtls && backend_socket.is_some();
+        #[cfg(not(target_os = "linux"))]
+        let handled_linux_plain_udp = false;
+
         #[cfg(target_os = "linux")]
-        let mut gso_batch = super::udp_batch::GsoBatchBuf::new(65535);
-        #[cfg(all(target_os = "linux", feature = "bench-udp-profile"))]
-        {
-            gso_batch.profile_direction = crate::udp_profile::Direction::Reply;
-        }
-        // Track whether GSO send has failed, to avoid retrying on kernels that don't support it.
-        #[cfg(target_os = "linux")]
-        let mut gso_failed = false;
-        'reply: loop {
-            // Listener/global shutdown may already be set. `borrow()` does not
-            // mark the value seen: an already-`true` value breaks here, and an
-            // unchanged one parks the cancel future in `changed()`.
-            if *reply_listener_shutdown.borrow()
+        if handled_linux_plain_udp {
+            let sock = backend_socket
+                .as_ref()
+                .expect("checked backend_socket.is_some()");
+            use std::os::unix::io::AsRawFd;
+
+            const BACKEND_RECV_INITIAL_SLOTS: usize = 2;
+            const BACKEND_RECV_BURST_SLOTS: usize = 4;
+            let backend_fd = sock.as_raw_fd();
+            let frontend_fd = frontend.as_raw_fd();
+            let mut backend_recv =
+                super::udp_batch::BackendRecvBatch::new(BACKEND_RECV_INITIAL_SLOTS);
+            // Prebuild destination sockaddr once for the session's lifetime.
+            let (prebuilt_dest, prebuilt_dest_len) =
+                super::udp_batch::std_to_sockaddr_storage(client_addr);
+            let frontend_bind_ip = frontend
+                .local_addr()
+                .ok()
+                .map(|a| a.ip())
+                .filter(|ip| !ip.is_unspecified());
+            // Cache whether IP(v6)_PKTINFO cmsg is needed on replies for this
+            // session once `reply_session.local_addr` is populated. Always
+            // preserve cmsg for NodeWaypoint sessions and wildcard-bound
+            // non-canonical destinations (including secondary loopback aliases
+            // like 127.0.0.2). Skip redundant cmsg — enabling direct
+            // `sendto(2)` instead of `sendmsg(2)` + kernel `ip_cmsg_send` FIB
+            // validation — when the socket is already bound to `local.ip` or
+            // the flow is canonical loopback `(127.0.0.1, 127.0.0.1)` /
+            // `(::1, ::1)`.
+            let mut pktinfo_resolved = false;
+            let mut session_local_ip: Option<crate::socket_opts::PktinfoLocal> = None;
+            let mut prebuilt_cmsg: Option<crate::socket_opts::PrebuiltPktinfoCmsg> = None;
+            // Lazily allocate GSO and sendmmsg batch buffers ONLY if this
+            // session observes multi-packet backend reply bursts, avoiding
+            // ~82 KiB of upfront working-set overhead per session.
+            let mut send_batch: Option<super::udp_batch::SendMmsgBatch> = None;
+            let mut gso_batch: Option<super::udp_batch::GsoBatchBuf> = None;
+            let mut gso_failed = false;
+
+            // Register per-session stop waiter and listener/global shutdown
+            // cancellation ONCE outside `'reply_linux: loop`. Re-creating and
+            // dropping `watch::Receiver::changed()` on every reply datagram
+            // acquires the shared `watch::Notify` mutex twice per packet across
+            // all concurrent reply tasks (~480k cross-core locks/sec at 120k RPS).
+            let already_shutting_down = *reply_listener_shutdown.borrow()
                 || reply_global_shutdown
                     .as_ref()
-                    .is_some_and(|rx| *rx.borrow())
-            {
-                break;
-            }
+                    .is_some_and(|rx| *rx.borrow());
 
-            // Read from backend — via DTLS (channel-based) or raw UDP
-            // (socket-based). Both paths share `udp_reply_recv_until_stop`
-            // so the register-then-check stop ordering cannot drift from the
-            // deterministic unit tests.
-            let (data_slice, data_vec);
-            let len;
-            if let Some(ref dtls) = reply_dtls {
-                let recv_result = udp_reply_recv_until_stop_or_expiry(
-                    &reply_session.stop_reply_task,
-                    reply_stop_notify.as_ref(),
-                    reply_authorization_plan,
-                    &mut reply_authorization_deadline,
-                    udp_poll!(true, dtls.recv()),
-                    udp_reply_shutdown_cancel(
-                        &mut reply_listener_shutdown,
-                        &mut reply_global_shutdown,
-                    ),
-                )
-                .await;
-                match recv_result {
-                    UdpReplyRecvOutcome::Stopped => break,
-                    UdpReplyRecvOutcome::AuthorizationExpired(termination) => {
-                        // Settle once, discard any payload that never reached
-                        // the client, then fall through to the shared exit
-                        // path: it closes the backend connection, marks this
-                        // generation expired, closes the hook-ingress channel,
-                        // removes only this exact generation, and releases the
-                        // overload guard and active-session count.
-                        reply_session.settle_authorization_expiry(termination);
-                        #[cfg(target_os = "linux")]
-                        {
-                            gso_batch.discard();
-                            send_batch.discard();
-                        }
-                        break 'reply;
-                    }
-                    UdpReplyRecvOutcome::Received(Ok(d)) => {
-                        len = d.len();
-                        data_vec = Some(d);
-                        data_slice = None;
-                    }
-                    UdpReplyRecvOutcome::Received(Err(e)) => {
-                        debug!(
-                            proxy_id = %reply_proxy_id,
-                            client = %udp_client_log_addr(client_addr),
-                            "UDP backend DTLS recv error: {}",
-                            e
-                        );
-                        let error_message = e.to_string();
-                        disconnect_error = Some((
-                            error_message.clone(),
-                            crate::retry::classify_boxed_error(e.as_ref()),
-                            crate::plugins::DisconnectCause::BackendError,
-                            crate::plugins::Direction::BackendToClient,
-                        ));
-                        break;
-                    }
+            if !already_shutting_down {
+                let stop_notified = reply_stop_notify.notified();
+                tokio::pin!(stop_notified);
+                // Register before the stop-flag load (same register-then-check
+                // discipline as `udp_reply_recv_until_stop`).
+                stop_notified.as_mut().enable();
+
+                let mut commit_listener_shutdown = reply_listener_shutdown.clone();
+                let _ = commit_listener_shutdown.borrow_and_update();
+                let mut commit_global_shutdown = reply_global_shutdown.clone();
+                if let Some(ref mut rx) = commit_global_shutdown {
+                    let _ = rx.borrow_and_update();
                 }
-            } else if let Some(ref sock) = backend_socket {
-                let recv_result = udp_reply_recv_until_stop_or_expiry(
-                    &reply_session.stop_reply_task,
-                    reply_stop_notify.as_ref(),
-                    reply_authorization_plan,
-                    &mut reply_authorization_deadline,
-                    udp_poll!(true, sock.recv(&mut buf)),
-                    udp_reply_shutdown_cancel(
-                        &mut reply_listener_shutdown,
-                        &mut reply_global_shutdown,
-                    ),
-                )
-                .await;
-                match recv_result {
-                    UdpReplyRecvOutcome::Stopped => break,
-                    UdpReplyRecvOutcome::AuthorizationExpired(termination) => {
-                        // Same shared exit path as the DTLS-backend arm above.
-                        reply_session.settle_authorization_expiry(termination);
-                        #[cfg(target_os = "linux")]
-                        {
-                            gso_batch.discard();
-                            send_batch.discard();
-                        }
-                        break 'reply;
-                    }
-                    UdpReplyRecvOutcome::Received(Ok(n)) => {
-                        len = n;
-                        data_vec = None;
-                        data_slice = Some(&buf[..n]);
-                    }
-                    UdpReplyRecvOutcome::Received(Err(e)) => {
-                        debug!(
-                            proxy_id = %reply_proxy_id,
-                            client = %udp_client_log_addr(client_addr),
-                            "UDP backend recv error: {}",
-                            e
-                        );
-                        let error_message = e.to_string();
-                        disconnect_error = Some((
-                            error_message.clone(),
-                            crate::retry::classify_boxed_error(&e),
-                            crate::plugins::DisconnectCause::BackendError,
-                            crate::plugins::Direction::BackendToClient,
-                        ));
-                        break;
-                    }
-                }
-            } else {
-                break;
-            };
-
-            let send_data = if let Some(ref d) = data_vec {
-                d.as_slice()
-            } else if let Some(d) = data_slice {
-                d
-            } else {
-                break;
-            };
-
-            // A backend reply can outlive the client datagram that created the
-            // session. Revalidate before EVERY reply so pod deletion, identity
-            // rotation, or interface/address reuse cannot deliver stale-session
-            // data to a new workload that inherited the peer tuple.
-            if let Some(source) = reply_session.node_waypoint_source.as_ref()
-                && let Err(refusal) = source.revalidate(source.ingress_ifindex, client_addr.ip())
-            {
-                source.scoping.index.warn_refusal(
-                    &reply_proxy_id,
-                    &udp_session_client_ip(client_addr),
-                    refusal,
+                let shutdown_cancel = udp_reply_shutdown_cancel(
+                    &mut reply_listener_shutdown,
+                    &mut reply_global_shutdown,
                 );
-                reply_session.expired.store(true, Ordering::Release);
-                disconnect_error = Some((
-                    format!(
-                        "NodeWaypoint UDP source attribution no longer valid ({})",
-                        refusal.as_str()
-                    ),
-                    crate::retry::ErrorClass::DispatchPolicyRejected,
-                    crate::plugins::DisconnectCause::RecvError,
-                    crate::plugins::Direction::BackendToClient,
-                ));
-                break;
-            }
-            if let Err(error) = reply_session.revalidate_destination() {
-                disconnect_error = Some((
-                    error.to_string(),
-                    crate::retry::ErrorClass::DispatchPolicyRejected,
-                    crate::plugins::DisconnectCause::RecvError,
-                    crate::plugins::Direction::BackendToClient,
-                ));
-                break;
-            }
-            // Recheck immediately after the receive returns, before any
-            // processing or client send: a datagram that won the receive race
-            // just before expiry must not be forwarded once the credential no
-            // longer authorizes the session.
-            if let Some(termination) = udp_reply_expired_at_commit(reply_authorization_plan) {
-                reply_session.settle_authorization_expiry(termination);
-                #[cfg(target_os = "linux")]
-                {
-                    gso_batch.discard();
-                    send_batch.discard();
-                }
-                break 'reply;
-            }
+                tokio::pin!(shutdown_cancel);
 
-            // Amplification factor check: drop backend responses that exceed
-            // the remaining per-request byte budget (cumulative across replies).
-            if !admit_udp_response(
-                &reply_session.response_budget_remaining,
-                reply_amplification_factor,
-                len as u64,
-                &reply_proxy_id,
-                reply_listen_port,
-            ) {
-                continue; // Drop this response datagram, continue receiving
-            }
-
-            // Run backend→client per-datagram plugin hooks raced against the
-            // same absolute plan. A hook that stays pending past the deadline
-            // is cancelled immediately; the payload is not delivered.
-            if !reply_datagram_plugins.is_empty() {
-                let ctx = UdpDatagramContext {
-                    client_ip: reply_dgram_client_ip.clone(),
-                    client_ip_addr: reply_session.datagram_client_addr,
-                    proxy_id: reply_dgram_proxy_id.clone(),
-                    proxy_name: reply_dgram_proxy_name.clone(),
-                    listen_port: reply_listen_port,
-                    datagram_size: len,
-                    direction: UdpDatagramDirection::BackendToClient,
-                    payload: send_data,
-                    payload_kind: reply_session.datagram_payload_kind,
-                    metadata_sink: Some(UdpMetadataSink::new(&reply_session.metadata)),
-                    admission_datagram: false,
-                };
-                match udp_reply_commit_after_backend_hooks(
-                    reply_datagram_plugins.as_ref(),
-                    &ctx,
-                    reply_authorization_plan,
-                )
-                .await
-                {
-                    UdpReplyDatagramCommit::Drop => continue, // Silent drop
-                    UdpReplyDatagramCommit::AuthorizationExpired(termination) => {
-                        reply_session.settle_authorization_expiry(termination);
-                        #[cfg(target_os = "linux")]
-                        {
-                            gso_batch.discard();
-                            send_batch.discard();
-                        }
-                        break 'reply;
+                'reply_linux: loop {
+                    if reply_session.stop_reply_task.load(Ordering::Acquire) {
+                        break 'reply_linux;
                     }
-                    UdpReplyDatagramCommit::Commit => {}
-                }
-            } else if let Some(termination) = udp_reply_expired_at_commit(reply_authorization_plan)
-            {
-                reply_session.settle_authorization_expiry(termination);
-                #[cfg(target_os = "linux")]
-                {
-                    gso_batch.discard();
-                    send_batch.discard();
-                }
-                break 'reply;
-            }
+                    if let Some(plan) = reply_authorization_plan
+                        && tokio::time::Instant::now() >= plan.at
+                    {
+                        reply_session.settle_authorization_expiry(plan.termination);
+                        if let Some(ref mut g) = gso_batch {
+                            g.discard();
+                        }
+                        if let Some(ref mut s) = send_batch {
+                            s.discard();
+                        }
+                        break 'reply_linux;
+                    }
 
-            // Response hooks may await arbitrary I/O. Revalidate at the last
-            // boundary before the client send so churn cannot deliver a stale
-            // reply to a workload that inherited the peer tuple.
-            if let Some(source) = reply_session.node_waypoint_source.as_ref()
-                && let Err(refusal) = source.revalidate(source.ingress_ifindex, client_addr.ip())
-            {
-                source.scoping.index.warn_refusal(
-                    &reply_proxy_id,
-                    &udp_session_client_ip(client_addr),
-                    refusal,
-                );
-                reply_session.expired.store(true, Ordering::Release);
-                disconnect_error = Some((
-                    format!(
-                        "NodeWaypoint UDP source attribution changed while response policy hooks \
-                         ran ({})",
-                        refusal.as_str()
-                    ),
-                    crate::retry::ErrorClass::DispatchPolicyRejected,
-                    crate::plugins::DisconnectCause::RecvError,
-                    crate::plugins::Direction::BackendToClient,
-                ));
-                break;
-            }
-            if let Err(error) = reply_session.revalidate_destination() {
-                disconnect_error = Some((
-                    error.to_string(),
-                    crate::retry::ErrorClass::DispatchPolicyRejected,
-                    crate::plugins::DisconnectCause::RecvError,
-                    crate::plugins::Direction::BackendToClient,
-                ));
-                break;
-            }
+                    let ready_res: Result<tokio::io::Ready, std::io::Error> = tokio::select! {
+                        biased;
+                        () = reply_authorization_deadline.as_mut(), if reply_authorization_plan.is_some() => {
+                            let plan = reply_authorization_plan.expect("guarded by if");
+                            reply_session.settle_authorization_expiry(plan.termination);
+                            if let Some(ref mut g) = gso_batch {
+                                g.discard();
+                            }
+                            if let Some(ref mut s) = send_batch {
+                                s.discard();
+                            }
+                            break 'reply_linux;
+                        }
+                        () = &mut stop_notified => break 'reply_linux,
+                        () = &mut shutdown_cancel => break 'reply_linux,
+                        ready = udp_poll!(
+                            true,
+                            sock.ready(
+                                tokio::io::Interest::READABLE | tokio::io::Interest::ERROR
+                            )
+                        ) => ready,
+                    };
+                    let ready_flags = match ready_res {
+                        Ok(r) => r,
+                        Err(e) => {
+                            debug!(
+                                proxy_id = %reply_proxy_id,
+                                client = %udp_client_log_addr(client_addr),
+                                "UDP backend readable error: {}",
+                                e
+                            );
+                            let error_message = e.to_string();
+                            disconnect_error = Some((
+                                error_message,
+                                crate::retry::classify_boxed_error(&e),
+                                crate::plugins::DisconnectCause::BackendError,
+                                crate::plugins::Direction::BackendToClient,
+                            ));
+                            break 'reply_linux;
+                        }
+                    };
 
-            // Batch-local counters for this recv burst.
-            let mut batch_dgrams: u64 = 1;
-            let mut batch_bytes: u64 = len as u64;
-            let mut batch_bytes_received: u64 = len as u64;
-            let now = coarse_epoch_millis();
-            #[cfg(target_os = "linux")]
-            let mut send_drops = UdpReplySendDrops::default();
+                    // Charge cooperative budget once per ready cycle before any
+                    // drop/error/send branch so a continuously ready backend
+                    // (including amplification- or hook-dropped bursts) can
+                    // never monopolize a Tokio worker thread.
+                    tokio::task::coop::consume_budget().await;
 
-            // --- Batched send path (Linux, plain UDP only) ---
-            // When GSO is available, concatenate same-size datagrams into a single
-            // sendmsg+UDP_SEGMENT call. Falls back to sendmmsg if GSO is disabled
-            // or has failed on this socket.
-            #[cfg(target_os = "linux")]
-            let send_batched = !is_dtls;
-            #[cfg(not(target_os = "linux"))]
-            let send_batched = false;
+                    // Handle `EPOLLERR` explicitly BEFORE `try_io(READABLE)`:
+                    // Tokio's `ERROR` readiness bit is sticky and `try_io(READABLE)`
+                    // never clears it (returning `WouldBlock` without running the
+                    // closure when `READABLE` is unset). Clearing `ERROR` via
+                    // `try_io(ERROR)` and reading `SO_ERROR` via `take_error()`
+                    // prevents infinite spins on ICMP errors (`ECONNREFUSED`) and
+                    // immediately tears down unreachable backend sessions.
+                    if ready_flags.is_error() {
+                        let _ = sock.try_io(tokio::io::Interest::ERROR, || {
+                            Err::<(), _>(std::io::Error::from(std::io::ErrorKind::WouldBlock))
+                        });
+                        match sock.take_error() {
+                            Ok(Some(e)) | Err(e) => {
+                                debug!(
+                                    proxy_id = %reply_proxy_id,
+                                    client = %udp_client_log_addr(client_addr),
+                                    "UDP backend socket error: {}",
+                                    e
+                                );
+                                disconnect_error = Some((
+                                    e.to_string(),
+                                    crate::retry::classify_boxed_error(&e),
+                                    crate::plugins::DisconnectCause::BackendError,
+                                    crate::plugins::Direction::BackendToClient,
+                                ));
+                                break 'reply_linux;
+                            }
+                            Ok(None) => {
+                                if !ready_flags.is_readable() {
+                                    continue 'reply_linux;
+                                }
+                            }
+                        }
+                    }
 
-            // Snapshot the session's captured local (reply-source) address —
-            // cheap lock-free `OnceLock::get()` — so every sendmsg in this
-            // iteration can attach it as IP(v6)_PKTINFO cmsg and skip the
-            // routing lookup.
-            #[cfg(target_os = "linux")]
-            let session_local_ip: Option<crate::socket_opts::PktinfoLocal> =
-                reply_session.local_addr.get().copied();
+                    // Single recvmmsg(max=recv_max): when 0 < n < recv_max, the
+                    // kernel drained the receive queue inside this syscall, so
+                    // returning WouldBlock to `try_io(READABLE)` clears Tokio's
+                    // cached READABLE bit without a trailing recv() syscall.
+                    // Any concurrent ICMP error triggers `sk_error_report` ->
+                    // `EPOLLERR` independently of `READABLE`, waking the next
+                    // `ready(READABLE | ERROR)` iteration above.
+                    let recv_max = backend_recv.capacity();
+                    let mut received: usize = 0;
+                    let mut drained_to_eagain = false;
+                    let io_res = sock.try_io(tokio::io::Interest::READABLE, || match backend_recv
+                        .recv(backend_fd, recv_max)
+                    {
+                        Ok(n) if n > 0 && n < recv_max => {
+                            received = n;
+                            drained_to_eagain = true;
+                            Err(std::io::Error::from(std::io::ErrorKind::WouldBlock))
+                        }
+                        Ok(n) => {
+                            received = n;
+                            Ok(())
+                        }
+                        Err(e) => Err(e),
+                    });
+                    if received == 0 {
+                        match io_res {
+                            Ok(()) => continue 'reply_linux,
+                            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                                continue 'reply_linux;
+                            }
+                            Err(e) => {
+                                debug!(
+                                    proxy_id = %reply_proxy_id,
+                                    client = %udp_client_log_addr(client_addr),
+                                    "UDP backend recv error: {}",
+                                    e
+                                );
+                                let error_message = e.to_string();
+                                disconnect_error = Some((
+                                    error_message,
+                                    crate::retry::classify_boxed_error(&e),
+                                    crate::plugins::DisconnectCause::BackendError,
+                                    crate::plugins::Direction::BackendToClient,
+                                ));
+                                break 'reply_linux;
+                            }
+                        }
+                    }
 
-            if send_batched {
-                #[cfg(target_os = "linux")]
-                {
-                    if reply_udp_gso && !gso_failed {
-                        if let Some(termination) = try_gso_send_or_fallback(
-                            &mut gso_batch,
-                            &mut send_batch,
-                            &frontend,
-                            client_addr,
-                            send_data,
-                            &mut gso_failed,
-                            &reply_proxy_id,
-                            session_local_ip,
-                            &mut send_drops,
-                            reply_authorization_plan,
-                        )
-                        .await
+                    // Refresh cached pktinfo once the listener captures a local
+                    // destination address for this session.
+                    if !pktinfo_resolved
+                        && let Some(local) = reply_session.local_addr.get().copied()
+                    {
+                        pktinfo_resolved = true;
+                        let is_node_waypoint = reply_session.node_waypoint_source.is_some()
+                            || reply_session.node_waypoint_destination.is_some();
+                        let is_bound_to_local = frontend_bind_ip == Some(local.ip);
+                        let is_canonical_loopback = matches!(
+                            (local.ip, client_addr.ip()),
+                            (IpAddr::V4(l), IpAddr::V4(c))
+                                if l == std::net::Ipv4Addr::LOCALHOST
+                                    && c == std::net::Ipv4Addr::LOCALHOST
+                        ) || matches!(
+                            (local.ip, client_addr.ip()),
+                            (IpAddr::V6(l), IpAddr::V6(c))
+                                if l == std::net::Ipv6Addr::LOCALHOST
+                                    && c == std::net::Ipv6Addr::LOCALHOST
+                        );
+                        if is_node_waypoint || (!is_bound_to_local && !is_canonical_loopback) {
+                            session_local_ip = Some(local);
+                            let matching = matches!(
+                                (local.ip, client_addr),
+                                (IpAddr::V4(_), SocketAddr::V4(_))
+                                    | (IpAddr::V6(_), SocketAddr::V6(_))
+                            );
+                            if matching {
+                                prebuilt_cmsg = crate::socket_opts::PrebuiltPktinfoCmsg::new(local);
+                            }
+                        }
+                    }
+
+                    // Fast path: single-datagram reply already drained to EAGAIN
+                    // (100% of 1-for-1 request/response exchanges). Sends zero-copy
+                    // directly from `backend_recv` without touching GSO/sendmmsg.
+                    if received == 1 && drained_to_eagain {
+                        let send_data = backend_recv.datagram(0);
+                        let len = send_data.len();
+
+                        if let Some(source) = reply_session.node_waypoint_source.as_ref()
+                            && let Err(refusal) =
+                                source.revalidate(source.ingress_ifindex, client_addr.ip())
+                        {
+                            source.scoping.index.warn_refusal(
+                                &reply_proxy_id,
+                                &udp_session_client_ip(client_addr),
+                                refusal,
+                            );
+                            reply_session.expired.store(true, Ordering::Release);
+                            disconnect_error = Some((
+                                format!(
+                                    "NodeWaypoint UDP source attribution no longer valid ({})",
+                                    refusal.as_str()
+                                ),
+                                crate::retry::ErrorClass::DispatchPolicyRejected,
+                                crate::plugins::DisconnectCause::RecvError,
+                                crate::plugins::Direction::BackendToClient,
+                            ));
+                            break 'reply_linux;
+                        }
+                        if let Err(error) = reply_session.revalidate_destination() {
+                            disconnect_error = Some((
+                                error.to_string(),
+                                crate::retry::ErrorClass::DispatchPolicyRejected,
+                                crate::plugins::DisconnectCause::RecvError,
+                                crate::plugins::Direction::BackendToClient,
+                            ));
+                            break 'reply_linux;
+                        }
+                        if let Some(termination) =
+                            udp_reply_expired_at_commit(reply_authorization_plan)
                         {
                             reply_session.settle_authorization_expiry(termination);
-                            gso_batch.discard();
-                            send_batch.discard();
-                            break 'reply;
+                            break 'reply_linux;
                         }
-                    } else if let Some(termination) = enqueue_sendmmsg_or_direct(
-                        &mut send_batch,
-                        &frontend,
-                        client_addr,
-                        send_data,
-                        session_local_ip,
-                        &reply_proxy_id,
-                        &mut send_drops,
-                        reply_authorization_plan,
-                    )
-                    .await
-                    {
-                        reply_session.settle_authorization_expiry(termination);
-                        gso_batch.discard();
-                        send_batch.discard();
-                        break 'reply;
-                    }
-                }
-            } else {
-                // Non-batched path: Linux DTLS-backend replies, and every
-                // non-Linux frontend send. The send future is owned by the
-                // same absolute plan — a pre-send check cannot cover a
-                // pending `send_to`.
-                match udp_frontend_send_until_expiry(
-                    reply_authorization_plan,
-                    udp_direct!(frontend.send_to(send_data, client_addr)),
-                )
-                .await
-                {
-                    UdpFrontendSendOutcome::AuthorizationExpired(termination) => {
-                        reply_session.settle_authorization_expiry(termination);
-                        #[cfg(target_os = "linux")]
-                        {
-                            gso_batch.discard();
-                            send_batch.discard();
+                        if !admit_udp_response(
+                            &reply_session.response_budget_remaining,
+                            reply_amplification_factor,
+                            len as u64,
+                            &reply_proxy_id,
+                            reply_listen_port,
+                        ) {
+                            continue 'reply_linux;
                         }
-                        break 'reply;
-                    }
-                    UdpFrontendSendOutcome::Sent(Err(e)) => {
-                        debug!(
-                            proxy_id = %reply_proxy_id,
-                            client = %udp_client_log_addr(client_addr),
-                            "UDP send to client failed: {}",
-                            e
-                        );
-                        let error_message = e.to_string();
-                        // Client-facing send failure — the backend is healthy, so
-                        // attribute the session teardown to the client recv path.
-                        disconnect_error = Some((
-                            error_message.clone(),
-                            crate::retry::classify_boxed_error(&e),
-                            crate::plugins::DisconnectCause::RecvError,
-                            crate::plugins::Direction::BackendToClient,
-                        ));
-                        break;
-                    }
-                    UdpFrontendSendOutcome::Sent(Ok(_)) => {}
-                }
-            }
-
-            // For plain UDP, drain additional pending replies without yielding.
-            // DTLS reads are channel-based (async only), so skip batching for DTLS backends.
-            if !is_dtls {
-                let Some(ref sock) = backend_socket else {
-                    break;
-                };
-                let batch_limit =
-                    reply_adaptive_buffer.get_batch_limit(&reply_proxy_namespace, &reply_proxy_id);
-                for _ in 0..batch_limit {
-                    // Expiry during/among try_recv processing must stop accepting
-                    // further backend payloads; already-queued client datagrams
-                    // are discarded rather than flushed.
-                    if let Some(termination) = udp_reply_expired_at_commit(reply_authorization_plan)
-                    {
-                        reply_session.settle_authorization_expiry(termination);
-                        #[cfg(target_os = "linux")]
-                        {
-                            gso_batch.discard();
-                            send_batch.discard();
-                        }
-                        break 'reply;
-                    }
-                    match udp_drain!(true, sock.try_recv(&mut buf)) {
-                        Ok(len2) => {
+                        if !reply_datagram_plugins.is_empty() {
+                            let ctx = UdpDatagramContext {
+                                client_ip: reply_dgram_client_ip.clone(),
+                                client_ip_addr: reply_session.datagram_client_addr,
+                                proxy_id: reply_dgram_proxy_id.clone(),
+                                proxy_name: reply_dgram_proxy_name.clone(),
+                                listen_port: reply_listen_port,
+                                datagram_size: len,
+                                direction: UdpDatagramDirection::BackendToClient,
+                                payload: send_data,
+                                payload_kind: reply_session.datagram_payload_kind,
+                                metadata_sink: Some(UdpMetadataSink::new(&reply_session.metadata)),
+                                admission_datagram: false,
+                            };
+                            match udp_reply_commit_after_backend_hooks(
+                                reply_datagram_plugins.as_ref(),
+                                &ctx,
+                                reply_authorization_plan,
+                            )
+                            .await
+                            {
+                                UdpReplyDatagramCommit::Drop => continue 'reply_linux,
+                                UdpReplyDatagramCommit::AuthorizationExpired(termination) => {
+                                    reply_session.settle_authorization_expiry(termination);
+                                    break 'reply_linux;
+                                }
+                                UdpReplyDatagramCommit::Commit => {}
+                            }
                             if let Some(source) = reply_session.node_waypoint_source.as_ref()
                                 && let Err(refusal) =
                                     source.revalidate(source.ingress_ifindex, client_addr.ip())
@@ -9838,14 +10312,15 @@ async fn create_session(
                                 reply_session.expired.store(true, Ordering::Release);
                                 disconnect_error = Some((
                                     format!(
-                                        "NodeWaypoint UDP source attribution no longer valid ({})",
+                                        "NodeWaypoint UDP source attribution changed while response \
+                                     policy hooks ran ({})",
                                         refusal.as_str()
                                     ),
                                     crate::retry::ErrorClass::DispatchPolicyRejected,
                                     crate::plugins::DisconnectCause::RecvError,
                                     crate::plugins::Direction::BackendToClient,
                                 ));
-                                break 'reply;
+                                break 'reply_linux;
                             }
                             if let Err(error) = reply_session.revalidate_destination() {
                                 disconnect_error = Some((
@@ -9854,9 +10329,371 @@ async fn create_session(
                                     crate::plugins::DisconnectCause::RecvError,
                                     crate::plugins::Direction::BackendToClient,
                                 ));
-                                break 'reply;
+                                break 'reply_linux;
                             }
-                            // Amplification check on batched response datagram
+                        }
+
+                        // Final pre-send commit boundary: check stop, lock-free
+                        // shutdown, and authorization expiry right before the
+                        // syscall even after response hooks returned `Commit`
+                        // (the timer wheel can lag under load).
+                        if reply_session.stop_reply_task.load(Ordering::Acquire)
+                            || shutdown_watch_triggered(&commit_listener_shutdown)
+                            || commit_global_shutdown
+                                .as_ref()
+                                .is_some_and(shutdown_watch_triggered)
+                        {
+                            break 'reply_linux;
+                        }
+                        if let Some(termination) =
+                            udp_reply_expired_at_commit(reply_authorization_plan)
+                        {
+                            reply_session.settle_authorization_expiry(termination);
+                            break 'reply_linux;
+                        }
+
+                        let send_res = crate::socket_opts::send_with_prebuilt_pktinfo(
+                            frontend_fd,
+                            send_data,
+                            &prebuilt_dest,
+                            prebuilt_dest_len,
+                            prebuilt_cmsg.as_ref(),
+                        );
+                        #[cfg(feature = "bench-udp-profile")]
+                        {
+                            crate::udp_profile::batch_count(
+                                crate::udp_profile::Direction::Reply,
+                                BatchField::DirectCalls,
+                                1,
+                            );
+                            crate::udp_profile::direct_outcome(&send_res);
+                        }
+                        let mut sent_ok = true;
+                        match send_res {
+                            Ok(_) => {}
+                            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                                // Frontend backpressure retry: run the real send
+                                // inside `try_io(WRITABLE)` so EAGAIN and Tokio's
+                                // tick-guarded readiness clear share ONE atomic
+                                // snapshot (never erasing an intervening EPOLLOUT),
+                                // checking stop/shutdown/policy/expiry before every
+                                // attempt and racing `writable()` against the
+                                // single-armed deadline, stop, and shutdown.
+                                'singleton_retry: loop {
+                                    if reply_session.stop_reply_task.load(Ordering::Acquire)
+                                        || shutdown_watch_triggered(&commit_listener_shutdown)
+                                        || commit_global_shutdown
+                                            .as_ref()
+                                            .is_some_and(shutdown_watch_triggered)
+                                    {
+                                        break 'reply_linux;
+                                    }
+                                    if let Some(source) =
+                                        reply_session.node_waypoint_source.as_ref()
+                                        && let Err(refusal) = source
+                                            .revalidate(source.ingress_ifindex, client_addr.ip())
+                                    {
+                                        source.scoping.index.warn_refusal(
+                                            &reply_proxy_id,
+                                            &udp_session_client_ip(client_addr),
+                                            refusal,
+                                        );
+                                        reply_session.expired.store(true, Ordering::Release);
+                                        disconnect_error = Some((
+                                            format!(
+                                                "NodeWaypoint UDP source attribution no longer valid ({})",
+                                                refusal.as_str()
+                                            ),
+                                            crate::retry::ErrorClass::DispatchPolicyRejected,
+                                            crate::plugins::DisconnectCause::RecvError,
+                                            crate::plugins::Direction::BackendToClient,
+                                        ));
+                                        break 'reply_linux;
+                                    }
+                                    if let Err(error) = reply_session.revalidate_destination() {
+                                        disconnect_error = Some((
+                                            error.to_string(),
+                                            crate::retry::ErrorClass::DispatchPolicyRejected,
+                                            crate::plugins::DisconnectCause::RecvError,
+                                            crate::plugins::Direction::BackendToClient,
+                                        ));
+                                        break 'reply_linux;
+                                    }
+                                    if let Some(termination) =
+                                        udp_reply_expired_at_commit(reply_authorization_plan)
+                                    {
+                                        reply_session.settle_authorization_expiry(termination);
+                                        break 'reply_linux;
+                                    }
+                                    let retry_res =
+                                        frontend.try_io(tokio::io::Interest::WRITABLE, || {
+                                            crate::socket_opts::send_with_prebuilt_pktinfo(
+                                                frontend_fd,
+                                                send_data,
+                                                &prebuilt_dest,
+                                                prebuilt_dest_len,
+                                                prebuilt_cmsg.as_ref(),
+                                            )
+                                        });
+                                    #[cfg(feature = "bench-udp-profile")]
+                                    {
+                                        crate::udp_profile::batch_count(
+                                            crate::udp_profile::Direction::Reply,
+                                            BatchField::DirectCalls,
+                                            1,
+                                        );
+                                        crate::udp_profile::direct_outcome(&retry_res);
+                                    }
+                                    match retry_res {
+                                        Ok(_) => break 'singleton_retry,
+                                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                                            let writable_res = tokio::select! {
+                                                biased;
+                                                () = reply_authorization_deadline.as_mut(), if reply_authorization_plan.is_some() => {
+                                                    let plan = reply_authorization_plan.expect("guarded by if");
+                                                    reply_session.settle_authorization_expiry(plan.termination);
+                                                    break 'reply_linux;
+                                                }
+                                                () = &mut stop_notified => break 'reply_linux,
+                                                () = &mut shutdown_cancel => break 'reply_linux,
+                                                w = frontend.writable() => w,
+                                            };
+                                            if let Err(e) = writable_res {
+                                                debug!(
+                                                    proxy_id = %reply_proxy_id,
+                                                    client = %udp_client_log_addr(client_addr),
+                                                    "UDP frontend writable wait failed: {}",
+                                                    e
+                                                );
+                                                sent_ok = false;
+                                                disconnect_error = Some((
+                                                    e.to_string(),
+                                                    crate::retry::classify_boxed_error(&e),
+                                                    crate::plugins::DisconnectCause::RecvError,
+                                                    crate::plugins::Direction::BackendToClient,
+                                                ));
+                                                break 'singleton_retry;
+                                            }
+                                        }
+                                        Err(e)
+                                            if e.raw_os_error() == Some(libc::EMSGSIZE)
+                                                || len > super::udp_batch::SEND_MMSG_SLOT_SIZE =>
+                                        {
+                                            warn!(
+                                                proxy_id = %reply_proxy_id,
+                                                client = %udp_client_log_addr(client_addr),
+                                                size = len,
+                                                error = %e,
+                                                "UDP singleton direct-send failed for oversized/EMSGSIZE reply; datagram lost"
+                                            );
+                                            sent_ok = false;
+                                            break 'singleton_retry;
+                                        }
+                                        Err(e) => {
+                                            debug!(
+                                                proxy_id = %reply_proxy_id,
+                                                client = %udp_client_log_addr(client_addr),
+                                                "UDP send to client failed: {}",
+                                                e
+                                            );
+                                            sent_ok = false;
+                                            disconnect_error = Some((
+                                                e.to_string(),
+                                                crate::retry::classify_boxed_error(&e),
+                                                crate::plugins::DisconnectCause::RecvError,
+                                                crate::plugins::Direction::BackendToClient,
+                                            ));
+                                            break 'singleton_retry;
+                                        }
+                                    }
+                                }
+                            }
+                            Err(e)
+                                if e.raw_os_error() == Some(libc::EMSGSIZE)
+                                    || len > super::udp_batch::SEND_MMSG_SLOT_SIZE =>
+                            {
+                                warn!(
+                                    proxy_id = %reply_proxy_id,
+                                    client = %udp_client_log_addr(client_addr),
+                                    size = len,
+                                    error = %e,
+                                    "UDP singleton direct-send failed for oversized/EMSGSIZE reply; datagram lost"
+                                );
+                                sent_ok = false;
+                            }
+                            Err(e) => {
+                                debug!(
+                                    proxy_id = %reply_proxy_id,
+                                    client = %udp_client_log_addr(client_addr),
+                                    "UDP send to client failed: {}",
+                                    e
+                                );
+                                sent_ok = false;
+                                disconnect_error = Some((
+                                    e.to_string(),
+                                    crate::retry::classify_boxed_error(&e),
+                                    crate::plugins::DisconnectCause::RecvError,
+                                    crate::plugins::Direction::BackendToClient,
+                                ));
+                            }
+                        }
+
+                        reply_session
+                            .bytes_received
+                            .fetch_add(len as u64, Ordering::Relaxed);
+                        if sent_ok {
+                            let now = coarse_epoch_millis();
+                            udp_count!(ReplyCounterUpdates, 4);
+                            if reply_session.last_activity.load(Ordering::Relaxed) < now {
+                                reply_session
+                                    .last_activity
+                                    .fetch_max(now, Ordering::Relaxed);
+                            }
+                            reply_metrics.record_datagrams_out(1, len as u64);
+                        }
+                        if disconnect_error.is_some() {
+                            break 'reply_linux;
+                        }
+                        continue 'reply_linux;
+                    }
+
+                    // Multi-datagram burst path: lazily grow backend recv slots
+                    // and allocate GSO / sendmmsg batch buffers on first burst.
+                    if backend_recv.capacity() < BACKEND_RECV_BURST_SLOTS {
+                        backend_recv.grow_to(BACKEND_RECV_BURST_SLOTS);
+                    }
+                    let send_batch_ref = send_batch.get_or_insert_with(|| {
+                        #[cfg_attr(not(feature = "bench-udp-profile"), allow(unused_mut))]
+                        let mut b = super::udp_batch::SendMmsgBatch::new(64);
+                        #[cfg(feature = "bench-udp-profile")]
+                        {
+                            b.profile_direction = crate::udp_profile::Direction::Reply;
+                        }
+                        b
+                    });
+                    let gso_batch_ref = gso_batch.get_or_insert_with(|| {
+                        #[cfg_attr(not(feature = "bench-udp-profile"), allow(unused_mut))]
+                        let mut b = super::udp_batch::GsoBatchBuf::new(65535);
+                        #[cfg(feature = "bench-udp-profile")]
+                        {
+                            b.profile_direction = crate::udp_profile::Direction::Reply;
+                        }
+                        b
+                    });
+
+                    let mut batch_dgrams: u64 = 0;
+                    let mut batch_bytes: u64 = 0;
+                    let mut batch_bytes_received: u64 = 0;
+                    let mut send_drops = UdpReplySendDrops::default();
+                    let batch_limit = reply_adaptive_handle.get_batch_limit();
+                    let mut total_drained = received;
+                    let mut cur_received = received;
+                    let mut cur_drained_to_eagain = drained_to_eagain;
+
+                    // Helper to discard unsent queued replies while still
+                    // settling any datagrams already committed by mid-burst
+                    // flushes before an early stop/policy/expiry exit.
+                    let discard_and_settle_committed =
+                        |gso_b: &mut super::udp_batch::GsoBatchBuf,
+                         send_b: &mut super::udp_batch::SendMmsgBatch,
+                         b_dgrams: u64,
+                         b_bytes: u64,
+                         b_bytes_recv: u64,
+                         drops: &UdpReplySendDrops| {
+                            let unsent_gso = gso_b.pending_stats();
+                            let unsent_send = send_b.pending_stats();
+                            gso_b.discard();
+                            send_b.discard();
+                            if b_bytes_recv > 0 {
+                                reply_session
+                                    .bytes_received
+                                    .fetch_add(b_bytes_recv, Ordering::Relaxed);
+                            }
+                            let committed_dgrams = b_dgrams
+                                .saturating_sub(unsent_gso.datagrams as u64)
+                                .saturating_sub(unsent_send.datagrams as u64)
+                                .saturating_sub(drops.datagrams);
+                            let committed_bytes = b_bytes
+                                .saturating_sub(unsent_gso.bytes as u64)
+                                .saturating_sub(unsent_send.bytes as u64)
+                                .saturating_sub(drops.bytes);
+                            if committed_dgrams > 0 {
+                                let now = coarse_epoch_millis();
+                                if reply_session.last_activity.load(Ordering::Relaxed) < now {
+                                    reply_session
+                                        .last_activity
+                                        .fetch_max(now, Ordering::Relaxed);
+                                }
+                                reply_metrics
+                                    .record_datagrams_out(committed_dgrams, committed_bytes);
+                            }
+                        };
+
+                    'burst: loop {
+                        for slot_idx in 0..cur_received {
+                            if let Some(termination) =
+                                udp_reply_expired_at_commit(reply_authorization_plan)
+                            {
+                                reply_session.settle_authorization_expiry(termination);
+                                discard_and_settle_committed(
+                                    gso_batch_ref,
+                                    send_batch_ref,
+                                    batch_dgrams,
+                                    batch_bytes,
+                                    batch_bytes_received,
+                                    &send_drops,
+                                );
+                                break 'reply_linux;
+                            }
+                            let send_data = backend_recv.datagram(slot_idx);
+                            let len2 = send_data.len();
+
+                            if let Some(source) = reply_session.node_waypoint_source.as_ref()
+                                && let Err(refusal) =
+                                    source.revalidate(source.ingress_ifindex, client_addr.ip())
+                            {
+                                source.scoping.index.warn_refusal(
+                                    &reply_proxy_id,
+                                    &udp_session_client_ip(client_addr),
+                                    refusal,
+                                );
+                                reply_session.expired.store(true, Ordering::Release);
+                                discard_and_settle_committed(
+                                    gso_batch_ref,
+                                    send_batch_ref,
+                                    batch_dgrams,
+                                    batch_bytes,
+                                    batch_bytes_received,
+                                    &send_drops,
+                                );
+                                disconnect_error = Some((
+                                    format!(
+                                        "NodeWaypoint UDP source attribution no longer valid ({})",
+                                        refusal.as_str()
+                                    ),
+                                    crate::retry::ErrorClass::DispatchPolicyRejected,
+                                    crate::plugins::DisconnectCause::RecvError,
+                                    crate::plugins::Direction::BackendToClient,
+                                ));
+                                break 'reply_linux;
+                            }
+                            if let Err(error) = reply_session.revalidate_destination() {
+                                discard_and_settle_committed(
+                                    gso_batch_ref,
+                                    send_batch_ref,
+                                    batch_dgrams,
+                                    batch_bytes,
+                                    batch_bytes_received,
+                                    &send_drops,
+                                );
+                                disconnect_error = Some((
+                                    error.to_string(),
+                                    crate::retry::ErrorClass::DispatchPolicyRejected,
+                                    crate::plugins::DisconnectCause::RecvError,
+                                    crate::plugins::Direction::BackendToClient,
+                                ));
+                                break 'reply_linux;
+                            }
                             if !admit_udp_response(
                                 &reply_session.response_budget_remaining,
                                 reply_amplification_factor,
@@ -9864,10 +10701,8 @@ async fn create_session(
                                 &reply_proxy_id,
                                 reply_listen_port,
                             ) {
-                                continue; // Drop oversized / over-budget response
+                                continue;
                             }
-                            // Backend→client plugin hooks on batched datagram,
-                            // raced against the same absolute plan.
                             if !reply_datagram_plugins.is_empty() {
                                 let ctx = UdpDatagramContext {
                                     client_ip: reply_dgram_client_ip.clone(),
@@ -9877,7 +10712,7 @@ async fn create_session(
                                     listen_port: reply_listen_port,
                                     datagram_size: len2,
                                     direction: UdpDatagramDirection::BackendToClient,
-                                    payload: &buf[..len2],
+                                    payload: send_data,
                                     payload_kind: reply_session.datagram_payload_kind,
                                     metadata_sink: Some(UdpMetadataSink::new(
                                         &reply_session.metadata,
@@ -9894,25 +10729,350 @@ async fn create_session(
                                     UdpReplyDatagramCommit::Drop => continue,
                                     UdpReplyDatagramCommit::AuthorizationExpired(termination) => {
                                         reply_session.settle_authorization_expiry(termination);
-                                        #[cfg(target_os = "linux")]
-                                        {
-                                            gso_batch.discard();
-                                            send_batch.discard();
-                                        }
-                                        break 'reply;
+                                        discard_and_settle_committed(
+                                            gso_batch_ref,
+                                            send_batch_ref,
+                                            batch_dgrams,
+                                            batch_bytes,
+                                            batch_bytes_received,
+                                            &send_drops,
+                                        );
+                                        break 'reply_linux;
                                     }
                                     UdpReplyDatagramCommit::Commit => {}
                                 }
-                            } else if let Some(termination) =
-                                udp_reply_expired_at_commit(reply_authorization_plan)
-                            {
-                                reply_session.settle_authorization_expiry(termination);
-                                #[cfg(target_os = "linux")]
+                                if let Some(source) = reply_session.node_waypoint_source.as_ref()
+                                    && let Err(refusal) =
+                                        source.revalidate(source.ingress_ifindex, client_addr.ip())
                                 {
-                                    gso_batch.discard();
-                                    send_batch.discard();
+                                    source.scoping.index.warn_refusal(
+                                        &reply_proxy_id,
+                                        &udp_session_client_ip(client_addr),
+                                        refusal,
+                                    );
+                                    reply_session.expired.store(true, Ordering::Release);
+                                    discard_and_settle_committed(
+                                        gso_batch_ref,
+                                        send_batch_ref,
+                                        batch_dgrams,
+                                        batch_bytes,
+                                        batch_bytes_received,
+                                        &send_drops,
+                                    );
+                                    disconnect_error = Some((
+                                        format!(
+                                            "NodeWaypoint UDP source attribution changed while \
+                                         response policy hooks ran ({})",
+                                            refusal.as_str()
+                                        ),
+                                        crate::retry::ErrorClass::DispatchPolicyRejected,
+                                        crate::plugins::DisconnectCause::RecvError,
+                                        crate::plugins::Direction::BackendToClient,
+                                    ));
+                                    break 'reply_linux;
                                 }
-                                break 'reply;
+                                if let Err(error) = reply_session.revalidate_destination() {
+                                    discard_and_settle_committed(
+                                        gso_batch_ref,
+                                        send_batch_ref,
+                                        batch_dgrams,
+                                        batch_bytes,
+                                        batch_bytes_received,
+                                        &send_drops,
+                                    );
+                                    disconnect_error = Some((
+                                        error.to_string(),
+                                        crate::retry::ErrorClass::DispatchPolicyRejected,
+                                        crate::plugins::DisconnectCause::RecvError,
+                                        crate::plugins::Direction::BackendToClient,
+                                    ));
+                                    break 'reply_linux;
+                                }
+                                if let Some(termination) =
+                                    udp_reply_expired_at_commit(reply_authorization_plan)
+                                {
+                                    reply_session.settle_authorization_expiry(termination);
+                                    discard_and_settle_committed(
+                                        gso_batch_ref,
+                                        send_batch_ref,
+                                        batch_dgrams,
+                                        batch_bytes,
+                                        batch_bytes_received,
+                                        &send_drops,
+                                    );
+                                    break 'reply_linux;
+                                }
+                            }
+
+                            batch_bytes_received += len2 as u64;
+
+                            let mut commit_guard = UdpReplyCommitGuard {
+                                session: &reply_session,
+                                client_addr,
+                                proxy_id: &reply_proxy_id,
+                                authorization: reply_authorization_plan,
+                                stop_notified: stop_notified.as_mut(),
+                                listener_shutdown: &mut commit_listener_shutdown,
+                                global_shutdown: &mut commit_global_shutdown,
+                            };
+                            let enqueue_stop = if reply_udp_gso && !gso_failed {
+                                try_gso_send_or_fallback(
+                                    gso_batch_ref,
+                                    send_batch_ref,
+                                    &frontend,
+                                    client_addr,
+                                    send_data,
+                                    &mut gso_failed,
+                                    &reply_proxy_id,
+                                    session_local_ip,
+                                    &mut send_drops,
+                                    &mut commit_guard,
+                                )
+                                .await
+                            } else {
+                                enqueue_sendmmsg_or_direct(
+                                    send_batch_ref,
+                                    &frontend,
+                                    client_addr,
+                                    send_data,
+                                    session_local_ip,
+                                    &reply_proxy_id,
+                                    &mut send_drops,
+                                    &mut commit_guard,
+                                )
+                                .await
+                            };
+                            if let Some(stop) = enqueue_stop {
+                                match stop {
+                                    UdpReplyCommitStop::Stopped => {}
+                                    UdpReplyCommitStop::AuthorizationExpired(termination) => {
+                                        reply_session.settle_authorization_expiry(termination);
+                                    }
+                                    UdpReplyCommitStop::PolicyRejected(msg) => {
+                                        disconnect_error = Some((
+                                            msg,
+                                            crate::retry::ErrorClass::DispatchPolicyRejected,
+                                            crate::plugins::DisconnectCause::RecvError,
+                                            crate::plugins::Direction::BackendToClient,
+                                        ));
+                                    }
+                                }
+                                discard_and_settle_committed(
+                                    gso_batch_ref,
+                                    send_batch_ref,
+                                    batch_dgrams,
+                                    batch_bytes,
+                                    batch_bytes_received,
+                                    &send_drops,
+                                );
+                                break 'reply_linux;
+                            }
+                            batch_dgrams += 1;
+                            batch_bytes += len2 as u64;
+                        }
+
+                        if cur_drained_to_eagain || total_drained >= batch_limit {
+                            break 'burst;
+                        }
+                        let max_this = (batch_limit - total_drained).min(backend_recv.capacity());
+                        let mut next_n = 0usize;
+                        let mut next_eagain = false;
+                        let drain_res = sock.try_io(tokio::io::Interest::READABLE, || {
+                            match backend_recv.recv(backend_fd, max_this) {
+                                Ok(n) if n > 0 && n < max_this => {
+                                    next_n = n;
+                                    next_eagain = true;
+                                    Err(std::io::Error::from(std::io::ErrorKind::WouldBlock))
+                                }
+                                Ok(n) => {
+                                    next_n = n;
+                                    Ok(())
+                                }
+                                Err(e) => Err(e),
+                            }
+                        });
+                        if next_n == 0 {
+                            if let Err(e) = drain_res
+                                && e.kind() != std::io::ErrorKind::WouldBlock
+                            {
+                                debug!(
+                                    proxy_id = %reply_proxy_id,
+                                    client = %udp_client_log_addr(client_addr),
+                                    "UDP backend drain recv error: {}",
+                                    e
+                                );
+                                disconnect_error = Some((
+                                    e.to_string(),
+                                    crate::retry::classify_boxed_error(&e),
+                                    crate::plugins::DisconnectCause::BackendError,
+                                    crate::plugins::Direction::BackendToClient,
+                                ));
+                            }
+                            break 'burst;
+                        }
+                        total_drained += next_n;
+                        cur_received = next_n;
+                        cur_drained_to_eagain = next_eagain;
+                    }
+
+                    // Final revalidation + flush for the burst: enforce stop,
+                    // lock-free shutdown, NodeWaypoint source + destination
+                    // ownership, and authorization expiry right before emitting
+                    // queued replies.
+                    if reply_session.stop_reply_task.load(Ordering::Acquire)
+                        || shutdown_watch_triggered(&commit_listener_shutdown)
+                        || commit_global_shutdown
+                            .as_ref()
+                            .is_some_and(shutdown_watch_triggered)
+                    {
+                        discard_and_settle_committed(
+                            gso_batch_ref,
+                            send_batch_ref,
+                            batch_dgrams,
+                            batch_bytes,
+                            batch_bytes_received,
+                            &send_drops,
+                        );
+                        break 'reply_linux;
+                    }
+                    if let Some(source) = reply_session.node_waypoint_source.as_ref()
+                        && let Err(refusal) =
+                            source.revalidate(source.ingress_ifindex, client_addr.ip())
+                    {
+                        source.scoping.index.warn_refusal(
+                            &reply_proxy_id,
+                            &udp_session_client_ip(client_addr),
+                            refusal,
+                        );
+                        reply_session.expired.store(true, Ordering::Release);
+                        discard_and_settle_committed(
+                            gso_batch_ref,
+                            send_batch_ref,
+                            batch_dgrams,
+                            batch_bytes,
+                            batch_bytes_received,
+                            &send_drops,
+                        );
+                        disconnect_error = Some((
+                            format!(
+                                "NodeWaypoint UDP source attribution no longer valid ({})",
+                                refusal.as_str()
+                            ),
+                            crate::retry::ErrorClass::DispatchPolicyRejected,
+                            crate::plugins::DisconnectCause::RecvError,
+                            crate::plugins::Direction::BackendToClient,
+                        ));
+                        break 'reply_linux;
+                    }
+                    if let Err(error) = reply_session.revalidate_destination() {
+                        discard_and_settle_committed(
+                            gso_batch_ref,
+                            send_batch_ref,
+                            batch_dgrams,
+                            batch_bytes,
+                            batch_bytes_received,
+                            &send_drops,
+                        );
+                        disconnect_error = Some((
+                            error.to_string(),
+                            crate::retry::ErrorClass::DispatchPolicyRejected,
+                            crate::plugins::DisconnectCause::RecvError,
+                            crate::plugins::Direction::BackendToClient,
+                        ));
+                        break 'reply_linux;
+                    }
+                    if let Some(termination) = udp_reply_expired_at_commit(reply_authorization_plan)
+                    {
+                        reply_session.settle_authorization_expiry(termination);
+                        discard_and_settle_committed(
+                            gso_batch_ref,
+                            send_batch_ref,
+                            batch_dgrams,
+                            batch_bytes,
+                            batch_bytes_received,
+                            &send_drops,
+                        );
+                        break 'reply_linux;
+                    }
+                    if reply_udp_gso && !gso_failed && !gso_batch_ref.is_empty() {
+                        let flush_result = flush_gso_batch(
+                            gso_batch_ref,
+                            &frontend,
+                            client_addr,
+                            session_local_ip,
+                        );
+                        if let Err(e) = flush_result {
+                            debug!(
+                                proxy_id = %reply_proxy_id,
+                                client = %udp_client_log_addr(client_addr),
+                                "GSO flush failed ({}), falling back to sendmmsg",
+                                e
+                            );
+                            gso_failed = true;
+                            let mut commit_guard = UdpReplyCommitGuard {
+                                session: &reply_session,
+                                client_addr,
+                                proxy_id: &reply_proxy_id,
+                                authorization: reply_authorization_plan,
+                                stop_notified: stop_notified.as_mut(),
+                                listener_shutdown: &mut commit_listener_shutdown,
+                                global_shutdown: &mut commit_global_shutdown,
+                            };
+                            if let Some(stop) = drain_gso_to_sendmmsg_or_direct(
+                                gso_batch_ref,
+                                send_batch_ref,
+                                &frontend,
+                                client_addr,
+                                session_local_ip,
+                                &reply_proxy_id,
+                                &mut send_drops,
+                                &mut commit_guard,
+                            )
+                            .await
+                            {
+                                match stop {
+                                    UdpReplyCommitStop::Stopped => {}
+                                    UdpReplyCommitStop::AuthorizationExpired(termination) => {
+                                        reply_session.settle_authorization_expiry(termination);
+                                    }
+                                    UdpReplyCommitStop::PolicyRejected(msg) => {
+                                        disconnect_error = Some((
+                                            msg,
+                                            crate::retry::ErrorClass::DispatchPolicyRejected,
+                                            crate::plugins::DisconnectCause::RecvError,
+                                            crate::plugins::Direction::BackendToClient,
+                                        ));
+                                    }
+                                }
+                                discard_and_settle_committed(
+                                    gso_batch_ref,
+                                    send_batch_ref,
+                                    batch_dgrams,
+                                    batch_bytes,
+                                    batch_bytes_received,
+                                    &send_drops,
+                                );
+                                break 'reply_linux;
+                            }
+                        }
+                    }
+                    if !send_batch_ref.is_empty() {
+                        loop {
+                            if reply_session.stop_reply_task.load(Ordering::Acquire)
+                                || shutdown_watch_triggered(&commit_listener_shutdown)
+                                || commit_global_shutdown
+                                    .as_ref()
+                                    .is_some_and(shutdown_watch_triggered)
+                            {
+                                discard_and_settle_committed(
+                                    gso_batch_ref,
+                                    send_batch_ref,
+                                    batch_dgrams,
+                                    batch_bytes,
+                                    batch_bytes_received,
+                                    &send_drops,
+                                );
+                                break 'reply_linux;
                             }
                             if let Some(source) = reply_session.node_waypoint_source.as_ref()
                                 && let Err(refusal) =
@@ -9924,134 +11084,813 @@ async fn create_session(
                                     refusal,
                                 );
                                 reply_session.expired.store(true, Ordering::Release);
+                                discard_and_settle_committed(
+                                    gso_batch_ref,
+                                    send_batch_ref,
+                                    batch_dgrams,
+                                    batch_bytes,
+                                    batch_bytes_received,
+                                    &send_drops,
+                                );
                                 disconnect_error = Some((
                                     format!(
-                                        "NodeWaypoint UDP source attribution changed while \
-                                         response policy hooks ran ({})",
+                                        "NodeWaypoint UDP source attribution no longer valid ({})",
                                         refusal.as_str()
                                     ),
                                     crate::retry::ErrorClass::DispatchPolicyRejected,
                                     crate::plugins::DisconnectCause::RecvError,
                                     crate::plugins::Direction::BackendToClient,
                                 ));
-                                break 'reply;
+                                break 'reply_linux;
                             }
                             if let Err(error) = reply_session.revalidate_destination() {
+                                discard_and_settle_committed(
+                                    gso_batch_ref,
+                                    send_batch_ref,
+                                    batch_dgrams,
+                                    batch_bytes,
+                                    batch_bytes_received,
+                                    &send_drops,
+                                );
                                 disconnect_error = Some((
                                     error.to_string(),
                                     crate::retry::ErrorClass::DispatchPolicyRejected,
                                     crate::plugins::DisconnectCause::RecvError,
                                     crate::plugins::Direction::BackendToClient,
                                 ));
-                                break 'reply;
+                                break 'reply_linux;
                             }
+                            if let Some(termination) =
+                                udp_reply_expired_at_commit(reply_authorization_plan)
+                            {
+                                reply_session.settle_authorization_expiry(termination);
+                                discard_and_settle_committed(
+                                    gso_batch_ref,
+                                    send_batch_ref,
+                                    batch_dgrams,
+                                    batch_bytes,
+                                    batch_bytes_received,
+                                    &send_drops,
+                                );
+                                break 'reply_linux;
+                            }
+                            match flush_sendmmsg_best_effort(
+                                send_batch_ref,
+                                frontend_fd,
+                                &mut send_drops,
+                            ) {
+                                Ok(_) if send_batch_ref.is_empty() => break,
+                                Ok(_) => continue,
+                                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                                Err(e) if e.raw_os_error() == Some(libc::EMSGSIZE) => {
+                                    warn!(
+                                        proxy_id = %reply_proxy_id,
+                                        client = %udp_client_log_addr(client_addr),
+                                        error = %e,
+                                        "UDP sendmmsg dropped oversized reply (EMSGSIZE); keeping session alive"
+                                    );
+                                    break;
+                                }
+                                Err(e) => {
+                                    debug!(
+                                        proxy_id = %reply_proxy_id,
+                                        client = %udp_client_log_addr(client_addr),
+                                        "UDP sendmmsg to client failed: {}",
+                                        e
+                                    );
+                                    disconnect_error = Some((
+                                        e.to_string(),
+                                        crate::retry::classify_boxed_error(&e),
+                                        crate::plugins::DisconnectCause::RecvError,
+                                        crate::plugins::Direction::BackendToClient,
+                                    ));
+                                    break;
+                                }
+                            }
+                        }
+                    }
 
-                            batch_dgrams += 1;
-                            batch_bytes += len2 as u64;
-                            batch_bytes_received += len2 as u64;
+                    if batch_bytes_received > 0 {
+                        reply_session
+                            .bytes_received
+                            .fetch_add(batch_bytes_received, Ordering::Relaxed);
+                    }
+                    let settled_dgrams = batch_dgrams.saturating_sub(send_drops.datagrams);
+                    let settled_bytes = batch_bytes.saturating_sub(send_drops.bytes);
+                    if settled_dgrams > 0 {
+                        let now = coarse_epoch_millis();
+                        udp_count!(ReplyCounterUpdates, 4);
+                        if reply_session.last_activity.load(Ordering::Relaxed) < now {
+                            reply_session
+                                .last_activity
+                                .fetch_max(now, Ordering::Relaxed);
+                        }
+                        reply_metrics.record_datagrams_out(settled_dgrams, settled_bytes);
+                    }
+                    if disconnect_error.is_some() {
+                        break 'reply_linux;
+                    }
+                }
+            }
+        }
+        if !handled_linux_plain_udp {
+            let mut buf = vec![0u8; MAX_UDP_DATAGRAM_SIZE];
+            // Pre-allocate sendmmsg batch for batched client replies (Linux only).
+            #[cfg(target_os = "linux")]
+            let mut send_batch = super::udp_batch::SendMmsgBatch::new(64);
+            #[cfg(all(target_os = "linux", feature = "bench-udp-profile"))]
+            {
+                send_batch.profile_direction = crate::udp_profile::Direction::Reply;
+            }
+            // Pre-allocate GSO batch buffer for concatenating same-size datagrams (Linux only).
+            // GSO is preferred over sendmmsg when available — fewer syscalls for same-size bursts.
+            #[cfg(target_os = "linux")]
+            let mut gso_batch = super::udp_batch::GsoBatchBuf::new(65535);
+            #[cfg(all(target_os = "linux", feature = "bench-udp-profile"))]
+            {
+                gso_batch.profile_direction = crate::udp_profile::Direction::Reply;
+            }
+            // Track whether GSO send has failed, to avoid retrying on kernels that don't support it.
+            #[cfg(target_os = "linux")]
+            let mut gso_failed = false;
+            'reply: loop {
+                // Listener/global shutdown may already be set. `borrow()` does not
+                // mark the value seen: an already-`true` value breaks here, and an
+                // unchanged one parks the cancel future in `changed()`.
+                if *reply_listener_shutdown.borrow()
+                    || reply_global_shutdown
+                        .as_ref()
+                        .is_some_and(|rx| *rx.borrow())
+                {
+                    break;
+                }
 
-                            if send_batched {
-                                #[cfg(target_os = "linux")]
+                // Read from backend — via DTLS (channel-based) or raw UDP
+                // (socket-based). Both paths share `udp_reply_recv_until_stop`
+                // so the register-then-check stop ordering cannot drift from the
+                // deterministic unit tests.
+                let (data_slice, data_vec);
+                let len;
+                if let Some(ref dtls) = reply_dtls {
+                    let recv_result = udp_reply_recv_until_stop_or_expiry(
+                        &reply_session.stop_reply_task,
+                        reply_stop_notify.as_ref(),
+                        reply_authorization_plan,
+                        &mut reply_authorization_deadline,
+                        udp_poll!(true, dtls.recv()),
+                        udp_reply_shutdown_cancel(
+                            &mut reply_listener_shutdown,
+                            &mut reply_global_shutdown,
+                        ),
+                    )
+                    .await;
+                    match recv_result {
+                        UdpReplyRecvOutcome::Stopped => break,
+                        UdpReplyRecvOutcome::AuthorizationExpired(termination) => {
+                            // Settle once, discard any payload that never reached
+                            // the client, then fall through to the shared exit
+                            // path: it closes the backend connection, marks this
+                            // generation expired, closes the hook-ingress channel,
+                            // removes only this exact generation, and releases the
+                            // overload guard and active-session count.
+                            reply_session.settle_authorization_expiry(termination);
+                            #[cfg(target_os = "linux")]
+                            {
+                                gso_batch.discard();
+                                send_batch.discard();
+                            }
+                            break 'reply;
+                        }
+                        UdpReplyRecvOutcome::Received(Ok(d)) => {
+                            len = d.len();
+                            data_vec = Some(d);
+                            data_slice = None;
+                        }
+                        UdpReplyRecvOutcome::Received(Err(e)) => {
+                            debug!(
+                                proxy_id = %reply_proxy_id,
+                                client = %udp_client_log_addr(client_addr),
+                                "UDP backend DTLS recv error: {}",
+                                e
+                            );
+                            let error_message = e.to_string();
+                            disconnect_error = Some((
+                                error_message.clone(),
+                                crate::retry::classify_boxed_error(e.as_ref()),
+                                crate::plugins::DisconnectCause::BackendError,
+                                crate::plugins::Direction::BackendToClient,
+                            ));
+                            break;
+                        }
+                    }
+                } else if let Some(ref sock) = backend_socket {
+                    let recv_result = udp_reply_recv_until_stop_or_expiry(
+                        &reply_session.stop_reply_task,
+                        reply_stop_notify.as_ref(),
+                        reply_authorization_plan,
+                        &mut reply_authorization_deadline,
+                        udp_poll!(true, sock.recv(&mut buf)),
+                        udp_reply_shutdown_cancel(
+                            &mut reply_listener_shutdown,
+                            &mut reply_global_shutdown,
+                        ),
+                    )
+                    .await;
+                    match recv_result {
+                        UdpReplyRecvOutcome::Stopped => break,
+                        UdpReplyRecvOutcome::AuthorizationExpired(termination) => {
+                            // Same shared exit path as the DTLS-backend arm above.
+                            reply_session.settle_authorization_expiry(termination);
+                            #[cfg(target_os = "linux")]
+                            {
+                                gso_batch.discard();
+                                send_batch.discard();
+                            }
+                            break 'reply;
+                        }
+                        UdpReplyRecvOutcome::Received(Ok(n)) => {
+                            len = n;
+                            data_vec = None;
+                            data_slice = Some(&buf[..n]);
+                        }
+                        UdpReplyRecvOutcome::Received(Err(e)) => {
+                            debug!(
+                                proxy_id = %reply_proxy_id,
+                                client = %udp_client_log_addr(client_addr),
+                                "UDP backend recv error: {}",
+                                e
+                            );
+                            let error_message = e.to_string();
+                            disconnect_error = Some((
+                                error_message.clone(),
+                                crate::retry::classify_boxed_error(&e),
+                                crate::plugins::DisconnectCause::BackendError,
+                                crate::plugins::Direction::BackendToClient,
+                            ));
+                            break;
+                        }
+                    }
+                } else {
+                    break;
+                };
+
+                let send_data = if let Some(ref d) = data_vec {
+                    d.as_slice()
+                } else if let Some(d) = data_slice {
+                    d
+                } else {
+                    break;
+                };
+
+                // A backend reply can outlive the client datagram that created the
+                // session. Revalidate before EVERY reply so pod deletion, identity
+                // rotation, or interface/address reuse cannot deliver stale-session
+                // data to a new workload that inherited the peer tuple.
+                if let Some(source) = reply_session.node_waypoint_source.as_ref()
+                    && let Err(refusal) =
+                        source.revalidate(source.ingress_ifindex, client_addr.ip())
+                {
+                    source.scoping.index.warn_refusal(
+                        &reply_proxy_id,
+                        &udp_session_client_ip(client_addr),
+                        refusal,
+                    );
+                    reply_session.expired.store(true, Ordering::Release);
+                    disconnect_error = Some((
+                        format!(
+                            "NodeWaypoint UDP source attribution no longer valid ({})",
+                            refusal.as_str()
+                        ),
+                        crate::retry::ErrorClass::DispatchPolicyRejected,
+                        crate::plugins::DisconnectCause::RecvError,
+                        crate::plugins::Direction::BackendToClient,
+                    ));
+                    break;
+                }
+                if let Err(error) = reply_session.revalidate_destination() {
+                    disconnect_error = Some((
+                        error.to_string(),
+                        crate::retry::ErrorClass::DispatchPolicyRejected,
+                        crate::plugins::DisconnectCause::RecvError,
+                        crate::plugins::Direction::BackendToClient,
+                    ));
+                    break;
+                }
+                // Recheck immediately after the receive returns, before any
+                // processing or client send: a datagram that won the receive race
+                // just before expiry must not be forwarded once the credential no
+                // longer authorizes the session.
+                if let Some(termination) = udp_reply_expired_at_commit(reply_authorization_plan) {
+                    reply_session.settle_authorization_expiry(termination);
+                    #[cfg(target_os = "linux")]
+                    {
+                        gso_batch.discard();
+                        send_batch.discard();
+                    }
+                    break 'reply;
+                }
+
+                // Amplification factor check: drop backend responses that exceed
+                // the remaining per-request byte budget (cumulative across replies).
+                if !admit_udp_response(
+                    &reply_session.response_budget_remaining,
+                    reply_amplification_factor,
+                    len as u64,
+                    &reply_proxy_id,
+                    reply_listen_port,
+                ) {
+                    continue; // Drop this response datagram, continue receiving
+                }
+
+                // Run backend→client per-datagram plugin hooks raced against the
+                // same absolute plan. A hook that stays pending past the deadline
+                // is cancelled immediately; the payload is not delivered.
+                if !reply_datagram_plugins.is_empty() {
+                    let ctx = UdpDatagramContext {
+                        client_ip: reply_dgram_client_ip.clone(),
+                        client_ip_addr: reply_session.datagram_client_addr,
+                        proxy_id: reply_dgram_proxy_id.clone(),
+                        proxy_name: reply_dgram_proxy_name.clone(),
+                        listen_port: reply_listen_port,
+                        datagram_size: len,
+                        direction: UdpDatagramDirection::BackendToClient,
+                        payload: send_data,
+                        payload_kind: reply_session.datagram_payload_kind,
+                        metadata_sink: Some(UdpMetadataSink::new(&reply_session.metadata)),
+                        admission_datagram: false,
+                    };
+                    match udp_reply_commit_after_backend_hooks(
+                        reply_datagram_plugins.as_ref(),
+                        &ctx,
+                        reply_authorization_plan,
+                    )
+                    .await
+                    {
+                        UdpReplyDatagramCommit::Drop => continue, // Silent drop
+                        UdpReplyDatagramCommit::AuthorizationExpired(termination) => {
+                            reply_session.settle_authorization_expiry(termination);
+                            #[cfg(target_os = "linux")]
+                            {
+                                gso_batch.discard();
+                                send_batch.discard();
+                            }
+                            break 'reply;
+                        }
+                        UdpReplyDatagramCommit::Commit => {}
+                    }
+                } else if let Some(termination) =
+                    udp_reply_expired_at_commit(reply_authorization_plan)
+                {
+                    reply_session.settle_authorization_expiry(termination);
+                    #[cfg(target_os = "linux")]
+                    {
+                        gso_batch.discard();
+                        send_batch.discard();
+                    }
+                    break 'reply;
+                }
+
+                // Response hooks may await arbitrary I/O. Revalidate at the last
+                // boundary before the client send so churn cannot deliver a stale
+                // reply to a workload that inherited the peer tuple.
+                if let Some(source) = reply_session.node_waypoint_source.as_ref()
+                    && let Err(refusal) =
+                        source.revalidate(source.ingress_ifindex, client_addr.ip())
+                {
+                    source.scoping.index.warn_refusal(
+                        &reply_proxy_id,
+                        &udp_session_client_ip(client_addr),
+                        refusal,
+                    );
+                    reply_session.expired.store(true, Ordering::Release);
+                    disconnect_error = Some((
+                        format!(
+                            "NodeWaypoint UDP source attribution changed while response policy hooks \
+                         ran ({})",
+                            refusal.as_str()
+                        ),
+                        crate::retry::ErrorClass::DispatchPolicyRejected,
+                        crate::plugins::DisconnectCause::RecvError,
+                        crate::plugins::Direction::BackendToClient,
+                    ));
+                    break;
+                }
+                if let Err(error) = reply_session.revalidate_destination() {
+                    disconnect_error = Some((
+                        error.to_string(),
+                        crate::retry::ErrorClass::DispatchPolicyRejected,
+                        crate::plugins::DisconnectCause::RecvError,
+                        crate::plugins::Direction::BackendToClient,
+                    ));
+                    break;
+                }
+
+                // Batch-local counters for this recv burst.
+                let mut batch_dgrams: u64 = 1;
+                let mut batch_bytes: u64 = len as u64;
+                let mut batch_bytes_received: u64 = len as u64;
+                let now = coarse_epoch_millis();
+                #[cfg(target_os = "linux")]
+                let mut send_drops = UdpReplySendDrops::default();
+
+                // --- Batched send path (Linux, plain UDP only) ---
+                // When GSO is available, concatenate same-size datagrams into a single
+                // sendmsg+UDP_SEGMENT call. Falls back to sendmmsg if GSO is disabled
+                // or has failed on this socket.
+                #[cfg(target_os = "linux")]
+                let send_batched = !is_dtls;
+                #[cfg(not(target_os = "linux"))]
+                let send_batched = false;
+
+                // Snapshot the session's captured local (reply-source) address —
+                // cheap lock-free `OnceLock::get()` — so every sendmsg in this
+                // iteration can attach it as IP(v6)_PKTINFO cmsg and skip the
+                // routing lookup.
+                #[cfg(target_os = "linux")]
+                let session_local_ip: Option<crate::socket_opts::PktinfoLocal> =
+                    reply_session.local_addr.get().copied();
+
+                if send_batched {
+                    #[cfg(target_os = "linux")]
+                    {
+                        let stop_notified = reply_stop_notify.notified();
+                        tokio::pin!(stop_notified);
+                        stop_notified.as_mut().enable();
+                        let mut commit_guard = UdpReplyCommitGuard {
+                            session: &reply_session,
+                            client_addr,
+                            proxy_id: &reply_proxy_id,
+                            authorization: reply_authorization_plan,
+                            stop_notified: stop_notified.as_mut(),
+                            listener_shutdown: &mut reply_listener_shutdown,
+                            global_shutdown: &mut reply_global_shutdown,
+                        };
+                        let stop = if reply_udp_gso && !gso_failed {
+                            try_gso_send_or_fallback(
+                                &mut gso_batch,
+                                &mut send_batch,
+                                &frontend,
+                                client_addr,
+                                send_data,
+                                &mut gso_failed,
+                                &reply_proxy_id,
+                                session_local_ip,
+                                &mut send_drops,
+                                &mut commit_guard,
+                            )
+                            .await
+                        } else {
+                            enqueue_sendmmsg_or_direct(
+                                &mut send_batch,
+                                &frontend,
+                                client_addr,
+                                send_data,
+                                session_local_ip,
+                                &reply_proxy_id,
+                                &mut send_drops,
+                                &mut commit_guard,
+                            )
+                            .await
+                        };
+                        if let Some(stop) = stop {
+                            match stop {
+                                UdpReplyCommitStop::Stopped => {}
+                                UdpReplyCommitStop::AuthorizationExpired(termination) => {
+                                    reply_session.settle_authorization_expiry(termination);
+                                }
+                                UdpReplyCommitStop::PolicyRejected(msg) => {
+                                    disconnect_error = Some((
+                                        msg,
+                                        crate::retry::ErrorClass::DispatchPolicyRejected,
+                                        crate::plugins::DisconnectCause::RecvError,
+                                        crate::plugins::Direction::BackendToClient,
+                                    ));
+                                }
+                            }
+                            gso_batch.discard();
+                            send_batch.discard();
+                            break 'reply;
+                        }
+                    }
+                } else {
+                    // Non-batched path: Linux DTLS-backend replies, and every
+                    // non-Linux frontend send. The send future is owned by the
+                    // same absolute plan — a pre-send check cannot cover a
+                    // pending `send_to`.
+                    match udp_frontend_send_until_expiry(
+                        reply_authorization_plan,
+                        udp_direct!(frontend.send_to(send_data, client_addr)),
+                    )
+                    .await
+                    {
+                        UdpFrontendSendOutcome::AuthorizationExpired(termination) => {
+                            reply_session.settle_authorization_expiry(termination);
+                            #[cfg(target_os = "linux")]
+                            {
+                                gso_batch.discard();
+                                send_batch.discard();
+                            }
+                            break 'reply;
+                        }
+                        UdpFrontendSendOutcome::Sent(Err(e)) => {
+                            debug!(
+                                proxy_id = %reply_proxy_id,
+                                client = %udp_client_log_addr(client_addr),
+                                "UDP send to client failed: {}",
+                                e
+                            );
+                            let error_message = e.to_string();
+                            // Client-facing send failure — the backend is healthy, so
+                            // attribute the session teardown to the client recv path.
+                            disconnect_error = Some((
+                                error_message.clone(),
+                                crate::retry::classify_boxed_error(&e),
+                                crate::plugins::DisconnectCause::RecvError,
+                                crate::plugins::Direction::BackendToClient,
+                            ));
+                            break;
+                        }
+                        UdpFrontendSendOutcome::Sent(Ok(_)) => {}
+                    }
+                }
+
+                // For plain UDP, drain additional pending replies without yielding.
+                // DTLS reads are channel-based (async only), so skip batching for DTLS backends.
+                if !is_dtls {
+                    let Some(ref sock) = backend_socket else {
+                        break;
+                    };
+                    let batch_limit = reply_adaptive_handle.get_batch_limit();
+                    for _ in 0..batch_limit {
+                        // Expiry during/among try_recv processing must stop accepting
+                        // further backend payloads; already-queued client datagrams
+                        // are discarded rather than flushed.
+                        if let Some(termination) =
+                            udp_reply_expired_at_commit(reply_authorization_plan)
+                        {
+                            reply_session.settle_authorization_expiry(termination);
+                            #[cfg(target_os = "linux")]
+                            {
+                                gso_batch.discard();
+                                send_batch.discard();
+                            }
+                            break 'reply;
+                        }
+                        match udp_drain!(true, sock.try_recv(&mut buf)) {
+                            Ok(len2) => {
+                                if let Some(source) = reply_session.node_waypoint_source.as_ref()
+                                    && let Err(refusal) =
+                                        source.revalidate(source.ingress_ifindex, client_addr.ip())
                                 {
-                                    if reply_udp_gso && !gso_failed {
-                                        if let Some(termination) = try_gso_send_or_fallback(
-                                            &mut gso_batch,
-                                            &mut send_batch,
-                                            &frontend,
-                                            client_addr,
-                                            &buf[..len2],
-                                            &mut gso_failed,
-                                            &reply_proxy_id,
-                                            session_local_ip,
-                                            &mut send_drops,
-                                            reply_authorization_plan,
-                                        )
-                                        .await
-                                        {
-                                            reply_session.settle_authorization_expiry(termination);
-                                            gso_batch.discard();
-                                            send_batch.discard();
-                                            break 'reply;
-                                        }
-                                    } else if let Some(termination) = enqueue_sendmmsg_or_direct(
-                                        &mut send_batch,
-                                        &frontend,
-                                        client_addr,
-                                        &buf[..len2],
-                                        session_local_ip,
+                                    source.scoping.index.warn_refusal(
                                         &reply_proxy_id,
-                                        &mut send_drops,
+                                        &udp_session_client_ip(client_addr),
+                                        refusal,
+                                    );
+                                    reply_session.expired.store(true, Ordering::Release);
+                                    disconnect_error = Some((
+                                        format!(
+                                            "NodeWaypoint UDP source attribution no longer valid ({})",
+                                            refusal.as_str()
+                                        ),
+                                        crate::retry::ErrorClass::DispatchPolicyRejected,
+                                        crate::plugins::DisconnectCause::RecvError,
+                                        crate::plugins::Direction::BackendToClient,
+                                    ));
+                                    break 'reply;
+                                }
+                                if let Err(error) = reply_session.revalidate_destination() {
+                                    disconnect_error = Some((
+                                        error.to_string(),
+                                        crate::retry::ErrorClass::DispatchPolicyRejected,
+                                        crate::plugins::DisconnectCause::RecvError,
+                                        crate::plugins::Direction::BackendToClient,
+                                    ));
+                                    break 'reply;
+                                }
+                                // Amplification check on batched response datagram
+                                if !admit_udp_response(
+                                    &reply_session.response_budget_remaining,
+                                    reply_amplification_factor,
+                                    len2 as u64,
+                                    &reply_proxy_id,
+                                    reply_listen_port,
+                                ) {
+                                    continue; // Drop oversized / over-budget response
+                                }
+                                // Backend→client plugin hooks on batched datagram,
+                                // raced against the same absolute plan.
+                                if !reply_datagram_plugins.is_empty() {
+                                    let ctx = UdpDatagramContext {
+                                        client_ip: reply_dgram_client_ip.clone(),
+                                        client_ip_addr: reply_session.datagram_client_addr,
+                                        proxy_id: reply_dgram_proxy_id.clone(),
+                                        proxy_name: reply_dgram_proxy_name.clone(),
+                                        listen_port: reply_listen_port,
+                                        datagram_size: len2,
+                                        direction: UdpDatagramDirection::BackendToClient,
+                                        payload: &buf[..len2],
+                                        payload_kind: reply_session.datagram_payload_kind,
+                                        metadata_sink: Some(UdpMetadataSink::new(
+                                            &reply_session.metadata,
+                                        )),
+                                        admission_datagram: false,
+                                    };
+                                    match udp_reply_commit_after_backend_hooks(
+                                        reply_datagram_plugins.as_ref(),
+                                        &ctx,
                                         reply_authorization_plan,
                                     )
                                     .await
                                     {
-                                        reply_session.settle_authorization_expiry(termination);
+                                        UdpReplyDatagramCommit::Drop => continue,
+                                        UdpReplyDatagramCommit::AuthorizationExpired(
+                                            termination,
+                                        ) => {
+                                            reply_session.settle_authorization_expiry(termination);
+                                            #[cfg(target_os = "linux")]
+                                            {
+                                                gso_batch.discard();
+                                                send_batch.discard();
+                                            }
+                                            break 'reply;
+                                        }
+                                        UdpReplyDatagramCommit::Commit => {}
+                                    }
+                                } else if let Some(termination) =
+                                    udp_reply_expired_at_commit(reply_authorization_plan)
+                                {
+                                    reply_session.settle_authorization_expiry(termination);
+                                    #[cfg(target_os = "linux")]
+                                    {
                                         gso_batch.discard();
                                         send_batch.discard();
-                                        break 'reply;
                                     }
+                                    break 'reply;
                                 }
-                            } else {
-                                match udp_frontend_send_until_expiry(
-                                    reply_authorization_plan,
-                                    udp_direct!(frontend.send_to(&buf[..len2], client_addr)),
-                                )
-                                .await
+                                if let Some(source) = reply_session.node_waypoint_source.as_ref()
+                                    && let Err(refusal) =
+                                        source.revalidate(source.ingress_ifindex, client_addr.ip())
                                 {
-                                    UdpFrontendSendOutcome::AuthorizationExpired(termination) => {
-                                        reply_session.settle_authorization_expiry(termination);
-                                        #[cfg(target_os = "linux")]
-                                        {
+                                    source.scoping.index.warn_refusal(
+                                        &reply_proxy_id,
+                                        &udp_session_client_ip(client_addr),
+                                        refusal,
+                                    );
+                                    reply_session.expired.store(true, Ordering::Release);
+                                    disconnect_error = Some((
+                                        format!(
+                                            "NodeWaypoint UDP source attribution changed while \
+                                         response policy hooks ran ({})",
+                                            refusal.as_str()
+                                        ),
+                                        crate::retry::ErrorClass::DispatchPolicyRejected,
+                                        crate::plugins::DisconnectCause::RecvError,
+                                        crate::plugins::Direction::BackendToClient,
+                                    ));
+                                    break 'reply;
+                                }
+                                if let Err(error) = reply_session.revalidate_destination() {
+                                    disconnect_error = Some((
+                                        error.to_string(),
+                                        crate::retry::ErrorClass::DispatchPolicyRejected,
+                                        crate::plugins::DisconnectCause::RecvError,
+                                        crate::plugins::Direction::BackendToClient,
+                                    ));
+                                    break 'reply;
+                                }
+
+                                batch_dgrams += 1;
+                                batch_bytes += len2 as u64;
+                                batch_bytes_received += len2 as u64;
+
+                                if send_batched {
+                                    #[cfg(target_os = "linux")]
+                                    {
+                                        let stop_notified = reply_stop_notify.notified();
+                                        tokio::pin!(stop_notified);
+                                        stop_notified.as_mut().enable();
+                                        let mut commit_guard = UdpReplyCommitGuard {
+                                            session: &reply_session,
+                                            client_addr,
+                                            proxy_id: &reply_proxy_id,
+                                            authorization: reply_authorization_plan,
+                                            stop_notified: stop_notified.as_mut(),
+                                            listener_shutdown: &mut reply_listener_shutdown,
+                                            global_shutdown: &mut reply_global_shutdown,
+                                        };
+                                        let stop = if reply_udp_gso && !gso_failed {
+                                            try_gso_send_or_fallback(
+                                                &mut gso_batch,
+                                                &mut send_batch,
+                                                &frontend,
+                                                client_addr,
+                                                &buf[..len2],
+                                                &mut gso_failed,
+                                                &reply_proxy_id,
+                                                session_local_ip,
+                                                &mut send_drops,
+                                                &mut commit_guard,
+                                            )
+                                            .await
+                                        } else {
+                                            enqueue_sendmmsg_or_direct(
+                                                &mut send_batch,
+                                                &frontend,
+                                                client_addr,
+                                                &buf[..len2],
+                                                session_local_ip,
+                                                &reply_proxy_id,
+                                                &mut send_drops,
+                                                &mut commit_guard,
+                                            )
+                                            .await
+                                        };
+                                        if let Some(stop) = stop {
+                                            match stop {
+                                                UdpReplyCommitStop::Stopped => {}
+                                                UdpReplyCommitStop::AuthorizationExpired(
+                                                    termination,
+                                                ) => {
+                                                    reply_session
+                                                        .settle_authorization_expiry(termination);
+                                                }
+                                                UdpReplyCommitStop::PolicyRejected(msg) => {
+                                                    disconnect_error = Some((
+                                                        msg,
+                                                        crate::retry::ErrorClass::DispatchPolicyRejected,
+                                                        crate::plugins::DisconnectCause::RecvError,
+                                                        crate::plugins::Direction::BackendToClient,
+                                                    ));
+                                                }
+                                            }
                                             gso_batch.discard();
                                             send_batch.discard();
+                                            break 'reply;
                                         }
-                                        break 'reply;
                                     }
-                                    UdpFrontendSendOutcome::Sent(Ok(_)) => {}
-                                    UdpFrontendSendOutcome::Sent(Err(e)) => {
-                                        debug!(
-                                            proxy_id = %reply_proxy_id,
-                                            client = %udp_client_log_addr(client_addr),
-                                            "UDP send to client failed: {}",
-                                            e
-                                        );
-                                        reply_session.last_activity.store(now, Ordering::Relaxed);
-                                        reply_session
-                                            .bytes_received
-                                            .fetch_add(batch_bytes_received, Ordering::Relaxed);
-                                        reply_metrics
-                                            .datagrams_out
-                                            .fetch_add(batch_dgrams, Ordering::Relaxed);
-                                        reply_metrics
-                                            .bytes_out
-                                            .fetch_add(batch_bytes, Ordering::Relaxed);
-                                        if let Some(ref dtls) = reply_dtls {
-                                            dtls.close().await;
+                                } else {
+                                    match udp_frontend_send_until_expiry(
+                                        reply_authorization_plan,
+                                        udp_direct!(frontend.send_to(&buf[..len2], client_addr)),
+                                    )
+                                    .await
+                                    {
+                                        UdpFrontendSendOutcome::AuthorizationExpired(
+                                            termination,
+                                        ) => {
+                                            reply_session.settle_authorization_expiry(termination);
+                                            #[cfg(target_os = "linux")]
+                                            {
+                                                gso_batch.discard();
+                                                send_batch.discard();
+                                            }
+                                            break 'reply;
                                         }
-                                        // Mark expired BEFORE removal so the recv-loop's
-                                        // `last_client` fast-path cache (which checks only
-                                        // this flag) stops forwarding through the dead
-                                        // session and re-creates one — otherwise a
-                                        // single-client listener is blackholed: datagrams
-                                        // keep flowing into a session whose reply task is
-                                        // gone and which the idle cleaner can no longer
-                                        // see (it is out of the map).
-                                        reply_session
-                                            .expired
-                                            .store(true, std::sync::atomic::Ordering::Release);
-                                        reply_session.close_hook_ingress();
-                                        if reply_sessions
-                                            .remove_if(&session_key, |_, v| {
-                                                Arc::ptr_eq(v, &reply_session)
-                                            })
-                                            .is_some()
-                                        {
-                                            reply_session.release_session_guards();
+                                        UdpFrontendSendOutcome::Sent(Ok(_)) => {}
+                                        UdpFrontendSendOutcome::Sent(Err(e)) => {
+                                            debug!(
+                                                proxy_id = %reply_proxy_id,
+                                                client = %udp_client_log_addr(client_addr),
+                                                "UDP send to client failed: {}",
+                                                e
+                                            );
+                                            reply_session
+                                                .last_activity
+                                                .store(now, Ordering::Relaxed);
+                                            reply_session
+                                                .bytes_received
+                                                .fetch_add(batch_bytes_received, Ordering::Relaxed);
                                             reply_metrics
-                                                .active_sessions
-                                                .fetch_sub(1, Ordering::Relaxed);
-                                            let error_message = e.to_string();
-                                            emit_udp_stream_disconnect(
+                                                .record_datagrams_out(batch_dgrams, batch_bytes);
+                                            if let Some(ref dtls) = reply_dtls {
+                                                dtls.close().await;
+                                            }
+                                            // Mark expired BEFORE removal so the recv-loop's
+                                            // `last_client` fast-path cache (which checks only
+                                            // this flag) stops forwarding through the dead
+                                            // session and re-creates one — otherwise a
+                                            // single-client listener is blackholed: datagrams
+                                            // keep flowing into a session whose reply task is
+                                            // gone and which the idle cleaner can no longer
+                                            // see (it is out of the map).
+                                            reply_session
+                                                .expired
+                                                .store(true, std::sync::atomic::Ordering::Release);
+                                            reply_session.close_hook_ingress();
+                                            if reply_sessions
+                                                .remove_if(&session_key, |_, v| {
+                                                    Arc::ptr_eq(v, &reply_session)
+                                                })
+                                                .is_some()
+                                            {
+                                                reply_session.release_session_guards();
+                                                reply_metrics
+                                                    .active_sessions
+                                                    .fetch_sub(1, Ordering::Relaxed);
+                                                reply_metrics.note_session_evicted();
+                                                let error_message = e.to_string();
+                                                emit_udp_stream_disconnect(
                                                 &reply_plugins,
                                                 UdpDisconnectContext {
                                                     namespace: &reply_proxy_namespace,
@@ -10080,76 +11919,71 @@ async fn create_session(
                                                 },
                                             )
                                             .await;
+                                            }
+                                            return;
                                         }
-                                        return;
                                     }
                                 }
                             }
+                            Err(_) => break, // WouldBlock — socket drained
                         }
-                        Err(_) => break, // WouldBlock — socket drained
                     }
                 }
-            }
 
-            // Flush batched sends after draining all pending replies.
-            #[cfg(target_os = "linux")]
-            if send_batched {
-                // Buffered replies may have waited while the route table was
-                // republished. Revalidate once more at the final syscall
-                // boundary; breaking drops both batches without emitting
-                // traffic under removed or replaced Service ownership.
-                if let Err(error) = reply_session.revalidate_destination() {
-                    disconnect_error = Some((
-                        error.to_string(),
-                        crate::retry::ErrorClass::DispatchPolicyRejected,
-                        crate::plugins::DisconnectCause::RecvError,
-                        crate::plugins::Direction::BackendToClient,
-                    ));
-                    break;
-                }
-                // Recheck immediately before any GSO/sendmmsg flush so a payload
-                // queued before expiry is discarded rather than sent.
-                if let Some(termination) = udp_reply_expired_at_commit(reply_authorization_plan) {
-                    reply_session.settle_authorization_expiry(termination);
-                    gso_batch.discard();
-                    send_batch.discard();
-                    break 'reply;
-                }
-                // Flush GSO batch first (if used).
-                if reply_udp_gso && !gso_failed && !gso_batch.is_empty() {
-                    let flush_result =
-                        flush_gso_batch(&mut gso_batch, &frontend, client_addr, session_local_ip);
-                    if let Err(e) = flush_result {
-                        debug!(
-                            proxy_id = %reply_proxy_id,
-                            client = %udp_client_log_addr(client_addr),
-                            "GSO flush failed ({}), falling back to sendmmsg",
-                            e
-                        );
-                        gso_failed = true;
-                        // Replay all buffered datagrams through sendmmsg /
-                        // direct-send for segments that exceed the slot size.
-                        if let Some(termination) = drain_gso_to_sendmmsg_or_direct(
-                            &mut gso_batch,
-                            &mut send_batch,
-                            &frontend,
-                            client_addr,
-                            session_local_ip,
-                            &reply_proxy_id,
-                            &mut send_drops,
-                            reply_authorization_plan,
-                        )
-                        .await
-                        {
-                            reply_session.settle_authorization_expiry(termination);
-                            gso_batch.discard();
-                            send_batch.discard();
-                            break 'reply;
-                        }
+                // Flush batched sends after draining all pending replies.
+                #[cfg(target_os = "linux")]
+                if send_batched {
+                    // Buffered replies may have waited while hooks ran or the
+                    // route/source tables were republished. Revalidate stop,
+                    // NodeWaypoint source + destination, and authorization
+                    // deadline at the final syscall boundary; discarding both
+                    // batches ensures no queued reply crosses revocation.
+                    if reply_session.stop_reply_task.load(Ordering::Acquire)
+                        || shutdown_watch_triggered(&reply_listener_shutdown)
+                        || reply_global_shutdown
+                            .as_ref()
+                            .is_some_and(shutdown_watch_triggered)
+                    {
+                        gso_batch.discard();
+                        send_batch.discard();
+                        break 'reply;
                     }
-                }
-                // Flush sendmmsg batch (used when GSO is disabled/failed, or GSO drain).
-                if !send_batch.is_empty() {
+                    if let Some(source) = reply_session.node_waypoint_source.as_ref()
+                        && let Err(refusal) =
+                            source.revalidate(source.ingress_ifindex, client_addr.ip())
+                    {
+                        source.scoping.index.warn_refusal(
+                            &reply_proxy_id,
+                            &udp_session_client_ip(client_addr),
+                            refusal,
+                        );
+                        reply_session.expired.store(true, Ordering::Release);
+                        gso_batch.discard();
+                        send_batch.discard();
+                        disconnect_error = Some((
+                            format!(
+                                "NodeWaypoint UDP source attribution no longer valid ({})",
+                                refusal.as_str()
+                            ),
+                            crate::retry::ErrorClass::DispatchPolicyRejected,
+                            crate::plugins::DisconnectCause::RecvError,
+                            crate::plugins::Direction::BackendToClient,
+                        ));
+                        break 'reply;
+                    }
+                    if let Err(error) = reply_session.revalidate_destination() {
+                        gso_batch.discard();
+                        send_batch.discard();
+                        disconnect_error = Some((
+                            error.to_string(),
+                            crate::retry::ErrorClass::DispatchPolicyRejected,
+                            crate::plugins::DisconnectCause::RecvError,
+                            crate::plugins::Direction::BackendToClient,
+                        ));
+                        break 'reply;
+                    }
+                    // Recheck immediately before any GSO/sendmmsg flush so a payload
+                    // queued before expiry is discarded rather than sent.
                     if let Some(termination) = udp_reply_expired_at_commit(reply_authorization_plan)
                     {
                         reply_session.settle_authorization_expiry(termination);
@@ -10157,9 +11991,70 @@ async fn create_session(
                         send_batch.discard();
                         break 'reply;
                     }
-                    use std::os::unix::io::AsRawFd;
-                    let fd = frontend.as_raw_fd();
-                    loop {
+                    // Flush GSO batch first (if used).
+                    if reply_udp_gso && !gso_failed && !gso_batch.is_empty() {
+                        let flush_result = flush_gso_batch(
+                            &mut gso_batch,
+                            &frontend,
+                            client_addr,
+                            session_local_ip,
+                        );
+                        if let Err(e) = flush_result {
+                            debug!(
+                                proxy_id = %reply_proxy_id,
+                                client = %udp_client_log_addr(client_addr),
+                                "GSO flush failed ({}), falling back to sendmmsg",
+                                e
+                            );
+                            gso_failed = true;
+                            // Replay all buffered datagrams through sendmmsg /
+                            // direct-send for segments that exceed the slot size.
+                            let stop_notified = reply_stop_notify.notified();
+                            tokio::pin!(stop_notified);
+                            stop_notified.as_mut().enable();
+                            let mut commit_guard = UdpReplyCommitGuard {
+                                session: &reply_session,
+                                client_addr,
+                                proxy_id: &reply_proxy_id,
+                                authorization: reply_authorization_plan,
+                                stop_notified: stop_notified.as_mut(),
+                                listener_shutdown: &mut reply_listener_shutdown,
+                                global_shutdown: &mut reply_global_shutdown,
+                            };
+                            if let Some(stop) = drain_gso_to_sendmmsg_or_direct(
+                                &mut gso_batch,
+                                &mut send_batch,
+                                &frontend,
+                                client_addr,
+                                session_local_ip,
+                                &reply_proxy_id,
+                                &mut send_drops,
+                                &mut commit_guard,
+                            )
+                            .await
+                            {
+                                match stop {
+                                    UdpReplyCommitStop::Stopped => {}
+                                    UdpReplyCommitStop::AuthorizationExpired(termination) => {
+                                        reply_session.settle_authorization_expiry(termination);
+                                    }
+                                    UdpReplyCommitStop::PolicyRejected(msg) => {
+                                        disconnect_error = Some((
+                                            msg,
+                                            crate::retry::ErrorClass::DispatchPolicyRejected,
+                                            crate::plugins::DisconnectCause::RecvError,
+                                            crate::plugins::Direction::BackendToClient,
+                                        ));
+                                    }
+                                }
+                                gso_batch.discard();
+                                send_batch.discard();
+                                break 'reply;
+                            }
+                        }
+                    }
+                    // Flush sendmmsg batch (used when GSO is disabled/failed, or GSO drain).
+                    if !send_batch.is_empty() {
                         if let Some(termination) =
                             udp_reply_expired_at_commit(reply_authorization_plan)
                         {
@@ -10168,53 +12063,67 @@ async fn create_session(
                             send_batch.discard();
                             break 'reply;
                         }
-                        match flush_sendmmsg_best_effort(&mut send_batch, fd, &mut send_drops) {
-                            Ok(_) if send_batch.is_empty() => break,
-                            Ok(_) => continue, // partial send — retry remaining
-                            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break, // socket full, drop remainder (UDP best-effort)
-                            Err(e) => {
-                                debug!(
-                                    proxy_id = %reply_proxy_id,
-                                    client = %udp_client_log_addr(client_addr),
-                                    "UDP sendmmsg to client failed: {}",
-                                    e
-                                );
-                                let error_message = e.to_string();
-                                // sendmmsg flush targets the frontend socket
-                                // (client), not the backend — client-side.
-                                disconnect_error = Some((
-                                    error_message.clone(),
-                                    crate::retry::classify_boxed_error(&e),
-                                    crate::plugins::DisconnectCause::RecvError,
-                                    crate::plugins::Direction::BackendToClient,
-                                ));
-                                break;
+                        use std::os::unix::io::AsRawFd;
+                        let fd = frontend.as_raw_fd();
+                        loop {
+                            if let Some(termination) =
+                                udp_reply_expired_at_commit(reply_authorization_plan)
+                            {
+                                reply_session.settle_authorization_expiry(termination);
+                                gso_batch.discard();
+                                send_batch.discard();
+                                break 'reply;
+                            }
+                            match flush_sendmmsg_best_effort(&mut send_batch, fd, &mut send_drops) {
+                                Ok(_) if send_batch.is_empty() => break,
+                                Ok(_) => continue, // partial send — retry remaining
+                                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break, // socket full, drop remainder (UDP best-effort)
+                                Err(e) => {
+                                    debug!(
+                                        proxy_id = %reply_proxy_id,
+                                        client = %udp_client_log_addr(client_addr),
+                                        "UDP sendmmsg to client failed: {}",
+                                        e
+                                    );
+                                    let error_message = e.to_string();
+                                    // sendmmsg flush targets the frontend socket
+                                    // (client), not the backend — client-side.
+                                    disconnect_error = Some((
+                                        error_message.clone(),
+                                        crate::retry::classify_boxed_error(&e),
+                                        crate::plugins::DisconnectCause::RecvError,
+                                        crate::plugins::Direction::BackendToClient,
+                                    ));
+                                    break;
+                                }
                             }
                         }
                     }
+                    if disconnect_error.is_some() {
+                        break;
+                    }
                 }
-                if disconnect_error.is_some() {
-                    break;
-                }
-            }
 
-            // Flush batched metrics.
-            udp_count!(ReplyCounterUpdates, 4);
-            reply_session.last_activity.store(now, Ordering::Relaxed);
-            reply_session
-                .bytes_received
-                .fetch_add(batch_bytes_received, Ordering::Relaxed);
-            #[cfg(target_os = "linux")]
-            if send_batched {
-                batch_dgrams = batch_dgrams.saturating_sub(send_drops.datagrams);
-                batch_bytes = batch_bytes.saturating_sub(send_drops.bytes);
+                // Flush batched metrics.
+                udp_count!(ReplyCounterUpdates, 4);
+                reply_session
+                    .bytes_received
+                    .fetch_add(batch_bytes_received, Ordering::Relaxed);
+                #[cfg(target_os = "linux")]
+                if send_batched {
+                    batch_dgrams = batch_dgrams.saturating_sub(send_drops.datagrams);
+                    batch_bytes = batch_bytes.saturating_sub(send_drops.bytes);
+                }
+                if batch_dgrams > 0 {
+                    let activity_now = coarse_epoch_millis();
+                    if reply_session.last_activity.load(Ordering::Relaxed) < activity_now {
+                        reply_session
+                            .last_activity
+                            .fetch_max(activity_now, Ordering::Relaxed);
+                    }
+                    reply_metrics.record_datagrams_out(batch_dgrams, batch_bytes);
+                }
             }
-            reply_metrics
-                .datagrams_out
-                .fetch_add(batch_dgrams, Ordering::Relaxed);
-            reply_metrics
-                .bytes_out
-                .fetch_add(batch_bytes, Ordering::Relaxed);
         }
         // Session's backend receiver exited — remove session.
         let disconnect_error = attribute_udp_reply_task_exit(&reply_session, disconnect_error);
@@ -10609,15 +12518,15 @@ impl UdpAuthorizationSessionProbe {
             .parse()
             .map_err(|e| format!("probe client addr: {e}"))?;
         let session = Arc::new(UdpSession {
-            backend_socket: Some(Arc::new(backend_socket)),
+            backend_socket: Some(UdpBackendSocket(Arc::new(backend_socket))),
             dtls_conn: None,
             last_activity: AtomicU64::new(now),
             created_at: AtomicU64::new(now),
             connected_wall_at: chrono::Utc::now(),
             expired: std::sync::atomic::AtomicBool::new(false),
             bytes_sent: AtomicU64::new(0),
-            bytes_received: AtomicU64::new(0),
-            response_budget_remaining: AtomicU64::new(0),
+            bytes_received: crossbeam_utils::CachePadded::new(AtomicU64::new(0)),
+            response_budget_remaining: crossbeam_utils::CachePadded::new(AtomicU64::new(0)),
             amplification_factor: None,
             backend_target: backend_addr.to_string(),
             backend_resolved_ip: backend_addr.ip().to_string(),
@@ -11010,15 +12919,15 @@ impl UdpEgressWriterProbe {
             .map_err(|e| format!("probe client addr: {e}"))?;
         let now = coarse_epoch_millis();
         let session = Arc::new(UdpSession {
-            backend_socket: Some(Arc::new(backend_socket)),
+            backend_socket: Some(UdpBackendSocket(Arc::new(backend_socket))),
             dtls_conn: None,
             last_activity: AtomicU64::new(now),
             created_at: AtomicU64::new(now),
             connected_wall_at: chrono::Utc::now(),
             expired: std::sync::atomic::AtomicBool::new(false),
             bytes_sent: AtomicU64::new(0),
-            bytes_received: AtomicU64::new(0),
-            response_budget_remaining: AtomicU64::new(0),
+            bytes_received: crossbeam_utils::CachePadded::new(AtomicU64::new(0)),
+            response_budget_remaining: crossbeam_utils::CachePadded::new(AtomicU64::new(0)),
             amplification_factor: factor,
             backend_target: backend_addr.to_string(),
             backend_resolved_ip: backend_addr.ip().to_string(),
@@ -11112,6 +13021,7 @@ impl UdpEgressWriterProbe {
             data,
             &self.metrics,
             self.client_addr,
+            coarse_epoch_millis(),
         ))
     }
 
@@ -11171,12 +13081,12 @@ impl UdpEgressWriterProbe {
 
     /// Listener `datagrams_out`, moved only by a settled send.
     pub fn datagrams_out(&self) -> u64 {
-        self.metrics.datagrams_out.load(Ordering::Relaxed)
+        self.metrics.datagrams_out()
     }
 
     /// Listener `bytes_out`, moved only by a settled send.
     pub fn bytes_out(&self) -> u64 {
-        self.metrics.bytes_out.load(Ordering::Relaxed)
+        self.metrics.bytes_out()
     }
 
     /// Client→backend bytes accounted to this session.
@@ -11286,8 +13196,8 @@ mod tests {
                 .expect("fixed test wall connect time"),
             expired: std::sync::atomic::AtomicBool::new(false),
             bytes_sent: AtomicU64::new(128),
-            bytes_received: AtomicU64::new(256),
-            response_budget_remaining: AtomicU64::new(0),
+            bytes_received: crossbeam_utils::CachePadded::new(AtomicU64::new(256)),
+            response_budget_remaining: crossbeam_utils::CachePadded::new(AtomicU64::new(0)),
             amplification_factor: None,
             backend_target: "10.0.0.50:5353".to_string(),
             backend_resolved_ip: "10.0.0.50".to_string(),
@@ -11342,7 +13252,7 @@ mod tests {
     async fn failed_backend_forward_preserves_activity_and_response_budget() {
         let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
         let mut raw_session = make_udp_session();
-        raw_session.backend_socket = Some(socket);
+        raw_session.backend_socket = Some(super::UdpBackendSocket(socket));
         // A guarded session is what makes the "publish before send" invariant
         // observable: the remaining budget is what the backend→client path
         // charges.
@@ -12293,7 +14203,7 @@ backend_tls_verify_server_cert: false
         let (tx, rx) = tokio::sync::mpsc::channel(super::SESSION_HOOK_INGRESS_MAX_DATAGRAMS);
         let queued_bytes = Arc::new(AtomicUsize::new(0));
         let mut raw = make_udp_session();
-        raw.backend_socket = Some(session_sock);
+        raw.backend_socket = Some(super::UdpBackendSocket(session_sock));
         raw.datagram_plugins = Arc::from([plugin as Arc<dyn Plugin>]);
         raw.hook_ingress_tx = std::sync::Mutex::new(Some(tx));
         raw.hook_ingress_queued_bytes = Arc::clone(&queued_bytes);
@@ -12372,15 +14282,11 @@ backend_tls_verify_server_cert: false
             "stopped worker must release the listener-wide byte budget"
         );
         assert_eq!(
-            metrics.datagrams_out.load(Ordering::Relaxed),
+            metrics.datagrams_out(),
             0,
             "expired/stopped session must not forward post-hook or residual datagrams"
         );
-        assert_eq!(
-            metrics.bytes_out.load(Ordering::Relaxed),
-            0,
-            "no backend bytes after stop"
-        );
+        assert_eq!(metrics.bytes_out(), 0, "no backend bytes after stop");
 
         let mut buf = [0u8; 64];
         assert!(
@@ -12762,8 +14668,8 @@ backend_tls_verify_server_cert: false
             connected_wall_at: chrono::Utc::now(),
             expired: std::sync::atomic::AtomicBool::new(false),
             bytes_sent: AtomicU64::new(0),
-            bytes_received: AtomicU64::new(0),
-            response_budget_remaining: AtomicU64::new(0),
+            bytes_received: crossbeam_utils::CachePadded::new(AtomicU64::new(0)),
+            response_budget_remaining: crossbeam_utils::CachePadded::new(AtomicU64::new(0)),
             amplification_factor: None,
             backend_target: "10.0.0.50:5353".to_string(),
             backend_resolved_ip: "10.0.0.50".to_string(),
