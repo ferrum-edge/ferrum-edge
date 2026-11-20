@@ -9132,6 +9132,18 @@ where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
 {
+    // Local to this single `poll_copy_direction` call: set when the top-up read
+    // loop already observed `Poll::Pending` (and thus registered `cx.waker()`
+    // on `reader`). If `CopyPhase::Writing` finishes synchronously in this same
+    // poll, we flush and park immediately instead of looping back for a
+    // guaranteed duplicate `EAGAIN` `recv()` syscall. Automatically resets if
+    // `poll_write` returns `Poll::Pending`.
+    let mut reader_parked = false;
+    // Cache `coarse_now_ms()` within a single synchronous poll invocation so a
+    // read+write batch that completes in microseconds avoids repeating
+    // `clock_gettime` three times. If `poll_copy_direction` is re-entered after
+    // a `Poll::Pending`, `cached_now` starts as `None` and samples fresh time.
+    let mut cached_now: Option<u64> = None;
     loop {
         match state.phase {
             CopyPhase::Done => return Poll::Ready(Ok(())),
@@ -9183,7 +9195,10 @@ where
                                         state.carried = Some(CarriedRead::Err(e));
                                         break;
                                     }
-                                    Poll::Pending => break,
+                                    Poll::Pending => {
+                                        reader_parked = true;
+                                        break;
+                                    }
                                 }
                                 rounds += 1;
                             }
@@ -9254,17 +9269,20 @@ where
                 }
 
                 // Single clock read for both watermark + idle refresh.
-                let now = coarse_now_ms();
-                if let Some(wm) = read_watermark {
-                    wm.store(now, Ordering::Relaxed);
-                }
-                if let Some(la) = last_activity {
-                    la.store(now, Ordering::Relaxed);
-                }
-                if let Some(wm) = write_watermark {
-                    // Prime the watermark before entering the write loop —
-                    // captures "we have `n` bytes ready to write as of `now`".
-                    wm.store(now, Ordering::Relaxed);
+                if read_watermark.is_some() || last_activity.is_some() || write_watermark.is_some()
+                {
+                    let now = *cached_now.get_or_insert_with(coarse_now_ms);
+                    if let Some(wm) = read_watermark {
+                        wm.store(now, Ordering::Relaxed);
+                    }
+                    if let Some(la) = last_activity {
+                        la.store(now, Ordering::Relaxed);
+                    }
+                    if let Some(wm) = write_watermark {
+                        // Prime the watermark before entering the write loop —
+                        // captures "we have `n` bytes ready to write as of `now`".
+                        wm.store(now, Ordering::Relaxed);
+                    }
                 }
                 state.pos = 0;
                 state.cap = n;
@@ -9300,7 +9318,8 @@ where
                             // direction-tracking path exists to avoid.
                             bytes.fetch_add(nw as u64, Ordering::Relaxed);
                             if let Some(wm) = write_watermark {
-                                wm.store(coarse_now_ms(), Ordering::Relaxed);
+                                let now = *cached_now.get_or_insert_with(coarse_now_ms);
+                                wm.store(now, Ordering::Relaxed);
                             }
                         }
                         Poll::Ready(Err(e)) => {
@@ -9313,15 +9332,34 @@ where
                 // Nothing remains queued in this relay's own buffer, but the
                 // writer may still be holding what it just accepted. Client
                 // silence must not retain the previous write-stall deadline —
-                // and it does not: the reader-pending branch above flushes and
-                // disarms the watermark on the very next loop iteration, so the
-                // deadline is released exactly when the bytes are actually gone
-                // rather than when they were merely handed over.
+                // and it does not: the reader-pending branch above (or the
+                // `reader_parked` fast path below) flushes and disarms the
+                // watermark immediately, so the deadline is released exactly
+                // when the bytes are actually gone rather than when they were
+                // merely handed over.
                 state.pos = 0;
                 state.cap = 0;
                 state.phase = CopyPhase::Reading;
                 if let Some(la) = last_activity {
-                    la.store(coarse_now_ms(), Ordering::Relaxed);
+                    let now = *cached_now.get_or_insert_with(coarse_now_ms);
+                    la.store(now, Ordering::Relaxed);
+                }
+                if reader_parked {
+                    if state.needs_flush {
+                        match writer.as_mut().poll_flush(cx) {
+                            Poll::Ready(Ok(())) => {
+                                state.needs_flush = false;
+                                if let Some(wm) = write_watermark {
+                                    wm.store(u64::MAX, Ordering::Relaxed);
+                                }
+                            }
+                            Poll::Ready(Err(e)) => {
+                                return Poll::Ready(Err((StreamIoSide::Write, e)));
+                            }
+                            Poll::Pending => return Poll::Pending,
+                        }
+                    }
+                    return Poll::Pending;
                 }
             }
         }
