@@ -17,11 +17,6 @@ LAUNCHERS = (
         "gpt-6.2-astra",
         EFFORTS,
     ),
-    (
-        Path(__file__).parents[2] / "luna-agents" / "scripts" / "dispatch-agent.sh",
-        "gpt-6-luna",
-        EFFORTS[:-1],
-    ),
 )
 
 

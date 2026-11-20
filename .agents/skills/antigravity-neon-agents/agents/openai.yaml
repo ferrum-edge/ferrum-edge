@@ -1,0 +1,4 @@
+interface:
+  display_name: "Antigravity Gemini 4 Neon Agents"
+  short_description: "Orchestrate local Antigravity Gemini 4 Neon coding agents"
+  default_prompt: "Use $antigravity-neon-agents to dispatch Antigravity Gemini 4 Neon agents for this Ferrum Edge task."
