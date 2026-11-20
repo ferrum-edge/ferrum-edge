@@ -3146,6 +3146,12 @@ pub(crate) fn route_response_transformer_plugin_for_proxy(
     }
 }
 
+/// The message of the `request_termination` instance the VirtualService
+/// translator attaches to a route whose match cannot be represented. Mesh
+/// slice decode pins a carried termination body to it (issue #7440).
+pub(crate) const VIRTUAL_SERVICE_UNSUPPORTED_MATCH_TERMINATION_MESSAGE: &str =
+    "unsupported Istio VirtualService match predicate";
+
 /// Build a `request_termination` plugin config for a translated route that
 /// cannot safely be represented by Ferrum's current routing dimensions.
 pub(crate) fn request_termination_plugin_for_proxy(

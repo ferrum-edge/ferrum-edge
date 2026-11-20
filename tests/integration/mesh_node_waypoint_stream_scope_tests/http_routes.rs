@@ -2893,13 +2893,13 @@ fn every_malformed_carried_dispatch_instance_rejects_the_slice() {
     }
 }
 
-/// Review follow-up (#7452): the record allowlist covers every carried plugin
-/// kind, so the translator's own records of each kind must still decode. A
-/// header-gated route with request and response header transforms and a CORS
-/// policy carries a dispatch instance, both auto-emitted transformers and a
-/// `cors` instance, and the slice applies on Sidecar and NodeWaypoint.
-#[test]
-fn translator_route_plugin_kinds_decode_on_both_topologies() {
+/// A VirtualService whose carried routes use every plugin kind the translator
+/// attaches. The `/api` route has a header gate, request and response header
+/// transforms, a loopback mirror and a CORS policy: dispatch, both
+/// transformers, `request_mirror` and `cors`. The `/legacy` route has a match
+/// predicate the translator cannot represent, so it gets the unconditional
+/// `request_termination`.
+fn every_route_plugin_kind_config() -> GatewayConfig {
     let mut spec = header_gated_spec();
     spec["http"][0]["headers"] = json!({
         "request": {"set": {"x-request-tag": "mesh"}},
@@ -2909,7 +2909,23 @@ fn translator_route_plugin_kinds_decode_on_both_topologies() {
         "allowOrigins": [{"exact": "https://app.example"}],
         "allowMethods": ["GET"]
     });
-    let config = translated_config(&[virtual_service("decorated", spec)]);
+    spec["http"][0]["mirror"] = json!({"host": "127.0.0.1", "port": {"number": 9000}});
+    spec["http"]
+        .as_array_mut()
+        .expect("http routes")
+        .push(json!({
+            "match": [{"uri": {"prefix": "/legacy"}, "withoutHeaders": {}}],
+            "route": route_to("details")
+        }));
+    translated_config(&[virtual_service("decorated", spec)])
+}
+
+/// Review follow-ups (#7452, #7453): the record and body allowlists cover
+/// every carried plugin kind, so the translator's own records of all six
+/// kinds must still decode, on Sidecar and NodeWaypoint.
+#[test]
+fn translator_route_plugin_kinds_decode_on_both_topologies() {
+    let config = every_route_plugin_kind_config();
     for runtime in [sidecar_runtime_for("details"), node_waypoint_runtime()] {
         let topology = runtime.topology;
         let slice = MeshSlice::from_gateway_config(&config, runtime.mesh_slice_request());
@@ -2923,16 +2939,83 @@ fn translator_route_plugin_kinds_decode_on_both_topologies() {
             "mesh_route_dispatch",
             "request_transformer",
             "response_transformer",
+            "request_termination",
+            "request_mirror",
             "cors",
         ] {
             assert!(
                 kinds.contains(kind),
-                "{topology:?}: the route carries {kind}: {kinds:?}"
+                "{topology:?}: the routes carry {kind}: {kinds:?}"
             );
         }
         prepare_gateway_config_from_mesh_slice(&slice, &runtime).unwrap_or_else(|error| {
             panic!("{topology:?}: the translator's route plugins decode: {error:#}")
         });
+    }
+}
+
+/// Review findings sol F1 / F2 (#7453): the config body of every non-dispatch
+/// kind is pinned at decode to the shape its translator builder emits, and
+/// any deviation rejects the slice on Sidecar and NodeWaypoint. A mirror may
+/// not leave loopback (another host, a cleartext opt-in or a protocol switch).
+/// A termination may not become conditional (a plugin-local trigger) or stop
+/// refusing (another status). A transformer may not carry static rules, and
+/// CORS may not grow a key the translator never sets.
+#[test]
+fn every_non_translator_route_plugin_body_rejects_the_slice() {
+    let config = every_route_plugin_kind_config();
+    type BodyPatch = (&'static str, &'static str, fn(&mut serde_json::Value));
+    let patches: [BodyPatch; 8] = [
+        ("request_mirror", "non-loopback host", |body| {
+            body["mirror_host"] = json!("10.0.0.5");
+        }),
+        ("request_mirror", "cleartext opt-in", |body| {
+            body["mirror_host"] = json!("10.0.0.5");
+            body["allow_plaintext"] = json!(true);
+        }),
+        ("request_mirror", "protocol switch", |body| {
+            body["mirror_protocol"] = json!("https");
+        }),
+        ("request_termination", "conditional trigger", |body| {
+            body["trigger"] = json!({"when": {"match": {"path": {"prefix": ["/never"]}}}});
+        }),
+        ("request_termination", "non-refusing status", |body| {
+            body["status_code"] = json!(200);
+        }),
+        ("request_transformer", "static rules", |body| {
+            body["rules"] =
+                json!([{"operation": "add", "target": "header", "key": "x-a", "value": "1"}]);
+        }),
+        ("response_transformer", "route overrides off", |body| {
+            body["apply_route_overrides"] = json!(false);
+        }),
+        ("cors", "unknown key", |body| {
+            body["allow_private_network"] = json!(true);
+        }),
+    ];
+    for runtime in [sidecar_runtime_for("details"), node_waypoint_runtime()] {
+        let topology = runtime.topology;
+        let slice = MeshSlice::from_gateway_config(&config, runtime.mesh_slice_request());
+        prepare_gateway_config_from_mesh_slice(&slice, &runtime)
+            .unwrap_or_else(|error| panic!("{topology:?}: the valid slice applies: {error:#}"));
+        for (kind, name, patch) in patches {
+            let mut tampered = slice.clone();
+            let mut patched = 0;
+            for plugin in &mut tampered.http_routes.plugin_configs {
+                if plugin["plugin_name"] == json!(kind) {
+                    patch(&mut plugin["config"]);
+                    patched += 1;
+                }
+            }
+            assert_eq!(patched, 1, "{topology:?} {kind} {name}: one record");
+            let error = prepare_gateway_config_from_mesh_slice(&tampered, &runtime)
+                .expect_err("a body the translator does not emit rejects the slice");
+            let rendered = format!("{error:#}");
+            assert!(
+                rendered.contains("carries a config body the translator does not emit"),
+                "{topology:?} {kind} {name}: {rendered}"
+            );
+        }
     }
 }
 

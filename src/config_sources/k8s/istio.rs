@@ -3950,7 +3950,7 @@ fn materialize_route_candidate(
         route_plugins.push(request_termination_plugin_for_proxy(
             &proxy.id,
             namespace,
-            "unsupported Istio VirtualService match predicate",
+            super::VIRTUAL_SERVICE_UNSUPPORTED_MATCH_TERMINATION_MESSAGE,
         ));
     }
 
