@@ -2977,6 +2977,9 @@ const CORS_MAX_AGE_SECS_MAX: u64 = u64::MAX.div_ceil(1000);
 ///   accepted; an unsupported preflight mode; a multi-operator origin; a
 ///   non-string method.
 /// * The mirror port and percentage bounds are covered.
+/// * Review finding sol F1 (#7456): an origin list over the plugin's matcher
+///   count, or a matcher over its byte bound, is refused before any regex is
+///   compiled.
 #[test]
 fn every_non_translator_route_plugin_body_rejects_the_slice() {
     let config = every_route_plugin_kind_config();
@@ -3036,6 +3039,22 @@ fn every_non_translator_route_plugin_body_rejects_the_slice() {
         }),
         ("cors", "non-string method", |body| {
             body["allowed_methods"] = json!([1]);
+        }),
+        // One past the plugin's 64-matcher bound, credentialed with regex
+        // matchers, so the count bound must refuse it before the credential
+        // check would compile each regex (#7456 sol F1).
+        ("cors", "too many origin matchers", |body| {
+            body["allowed_origins"] = serde_json::Value::Array(
+                (0..65)
+                    .map(|index| json!({"regex": format!("https://app{index}\\.example")}))
+                    .collect(),
+            );
+            body["allow_credentials"] = json!(true);
+        }),
+        // One matcher over the plugin's 512-byte bound.
+        ("cors", "oversized origin matcher", |body| {
+            body["allowed_origins"] =
+                json!([{"exact": format!("https://{}.example", "a".repeat(512))}]);
         }),
     ];
     for runtime in [sidecar_runtime_for("details"), node_waypoint_runtime()] {
