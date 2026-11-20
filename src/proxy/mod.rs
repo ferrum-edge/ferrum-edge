@@ -56043,6 +56043,12 @@ async fn proxy_to_backend_direct_h1(
             }
         };
         let reused = checkout.reused();
+        if !replayed_idle_race && let Some(pump) = upload_pump.as_mut() {
+            // Prime any already-buffered client body frame into the bounded
+            // bridge before hyper serializes the request head so `writev`
+            // coalesces headers and body into a single TLS record / write.
+            pump.prime_inline();
+        }
         let send_fut = checkout.sender.try_send_request(backend_req);
         let send_fut =
             h1_send_release::await_h1_response_or_release(send_fut, checkout, |lease, cx| {
@@ -60065,6 +60071,12 @@ where
         output = &mut fut => Ok(output),
         () = pump.backend_write_watermark_expired() => Err(()),
     };
+    // The response-header wait is over, so no observer remains for the
+    // post-EOS kernel send-queue drain watch. Disarming it before
+    // `detach_if_live` lets an already-completed inline pump settle in place
+    // instead of spawning a task that sleeps 100ms to probe `SIOCOUTQ`. An
+    // upload still streaming frames is unaffected and detaches normally.
+    pump.disarm_post_eos_drain();
     pump.detach_if_live();
     raced
 }
@@ -66562,6 +66574,11 @@ async fn proxy_to_backend_http2(
             ),
             None,
         );
+    }
+    // Prime any already-buffered client body frame before handing the request
+    // to hyper's HTTP/2 sender so HEADERS and the first DATA frame can coalesce.
+    if let Some(pump) = upload_pump.as_mut() {
+        pump.prime_inline();
     }
     // Send to backend with read timeout (0 = no timeout)
     let h2_send_fut = sender.send_request(backend_req);

@@ -143,7 +143,7 @@ async fn assert_terminal(
         .expect("one non-clean terminal")
         .expect_err("a source error cannot become clean EOF");
     assert_eq!(
-        source.terminal.load(Ordering::Acquire),
+        source.shared.terminal.load(Ordering::Acquire),
         if expected_cancel {
             PUMP_SOURCE_RESET
         } else {
@@ -389,7 +389,7 @@ async fn dispatcher_cancel_racing_a_client_reset_keeps_the_reset() {
             Some(UploadPumpOutcome::Cancelled)
         );
         assert_eq!(state.releases.load(Ordering::Acquire), 1);
-        assert_eq!(source.terminal.load(Ordering::Acquire), expected);
+        assert_eq!(source.shared.terminal.load(Ordering::Acquire), expected);
 
         let error = std::future::poll_fn(|cx| source.poll_frame(cx))
             .await
@@ -586,5 +586,8 @@ async fn cancelled_pump_behind_a_stalled_backend_keeps_the_clients_reset() {
         Some(UploadPumpOutcome::Cancelled)
     );
     assert_eq!(state.releases.load(Ordering::Acquire), 1);
-    assert_eq!(source.terminal.load(Ordering::Acquire), PUMP_SOURCE_RESET);
+    assert_eq!(
+        source.shared.terminal.load(Ordering::Acquire),
+        PUMP_SOURCE_RESET
+    );
 }
