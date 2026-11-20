@@ -2669,6 +2669,11 @@ fn header_gated_spec() -> serde_json::Value {
 /// NodeWaypoint alike, whether or not it has a `sourceNamespace` condition.
 /// A malformed one rejects the slice update instead of being dropped with a
 /// route the binding refuses or healed by the binding's destination rewrite.
+///
+/// Review finding dsf F1 (#7449 round 2): a valid instance the plugin cache
+/// would never build (disabled, not proxy-scoped, or not listed in its
+/// route's `plugins`) also rejects the slice, since the route would keep
+/// serving without its 404 match gate.
 #[test]
 fn every_malformed_carried_dispatch_instance_rejects_the_slice() {
     let config = translated_config(&[virtual_service("gated", header_gated_spec())]);
@@ -2707,6 +2712,48 @@ fn every_malformed_carried_dispatch_instance_rejects_the_slice() {
             let rendered = format!("{error:#}");
             assert!(
                 rendered.contains("is not a valid `mesh_route_dispatch` configuration"),
+                "{topology:?} {name}: {rendered}"
+            );
+        }
+        for name in ["disabled", "global scope", "unassociated"] {
+            let mut tampered = slice.clone();
+            let mut dispatch_ids = Vec::new();
+            for plugin in &mut tampered.http_routes.plugin_configs {
+                if plugin["plugin_name"] == json!("mesh_route_dispatch") {
+                    match name {
+                        "disabled" => plugin["enabled"] = json!(false),
+                        "global scope" => plugin["scope"] = json!("global"),
+                        _ => {}
+                    }
+                    dispatch_ids.push(plugin["id"].clone());
+                }
+            }
+            assert_eq!(
+                dispatch_ids.len(),
+                1,
+                "{topology:?} {name}: one dispatch instance"
+            );
+            if name == "unassociated" {
+                let mut unlinked = 0;
+                for proxy in &mut tampered.http_routes.proxies {
+                    if let Some(associations) = proxy["plugins"].as_array_mut() {
+                        let before = associations.len();
+                        associations.retain(|association| {
+                            association["plugin_config_id"] != dispatch_ids[0]
+                        });
+                        unlinked += before - associations.len();
+                    }
+                }
+                assert_eq!(
+                    unlinked, 1,
+                    "{topology:?}: the route listed its dispatch instance"
+                );
+            }
+            let error = prepare_gateway_config_from_mesh_slice(&tampered, &runtime)
+                .expect_err("a dispatch instance the cache would not build rejects the slice");
+            let rendered = format!("{error:#}");
+            assert!(
+                rendered.contains("instance its route would not construct"),
                 "{topology:?} {name}: {rendered}"
             );
         }
