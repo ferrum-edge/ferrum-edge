@@ -2154,6 +2154,19 @@ async fn sidecar_dispatched_upstream(
     path: &str,
     headers: &[(&str, &str)],
 ) -> Option<String> {
+    sidecar_dispatch(prepared, listen_path, path, headers)
+        .await
+        .ok()
+}
+
+/// [`sidecar_dispatched_upstream`] with the refusal status: `Err(status)` when
+/// the chain answers the request itself.
+async fn sidecar_dispatch(
+    prepared: &GatewayConfig,
+    listen_path: &str,
+    path: &str,
+    headers: &[(&str, &str)],
+) -> Result<String, u16> {
     let route = carried_route_proxies(prepared)
         .into_iter()
         .find(|proxy| proxy.listen_path.as_deref() == Some(listen_path))
@@ -2189,13 +2202,13 @@ async fn sidecar_dispatched_upstream(
     );
     ctx.headers = request_headers.clone();
     match run_before_proxy_hooks_for_test(&plugins, &mut ctx, &mut request_headers).await {
-        PluginResult::Continue => Some(
-            ctx.route_override_upstream_id
-                .clone()
-                .or_else(|| route.upstream_id.clone())
-                .expect("the route has a destination"),
-        ),
-        _ => None,
+        PluginResult::Continue => Ok(ctx
+            .route_override_upstream_id
+            .clone()
+            .or_else(|| route.upstream_id.clone())
+            .expect("the route has a destination")),
+        PluginResult::Reject { status_code, .. }
+        | PluginResult::RejectBinary { status_code, .. } => Err(status_code),
     }
 }
 
@@ -2347,8 +2360,9 @@ async fn sidecar_source_namespace_keeps_later_rules_and_the_fallback() {
 
 /// Review finding neon F1 (#7443): `reject_unmatched` on a carried dispatch
 /// instance is untrusted slice input. A present non-boolean value fails
-/// closed: once its foreign-namespace rule is removed, the route is refused
-/// instead of having its instance detached and serving the fallback.
+/// closed: the instance is malformed, so the whole slice update is rejected
+/// (sol F1, #7447) instead of the instance being detached to serve the
+/// fallback.
 #[test]
 fn sidecar_source_namespace_fails_closed_on_a_malformed_reject_unmatched() {
     let config = translated_config(&[virtual_service(
@@ -2366,10 +2380,10 @@ fn sidecar_source_namespace_fails_closed_on_a_malformed_reject_unmatched() {
     )]);
     let runtime = sidecar_runtime_for("details");
     for (value, served) in [
-        (json!(false), true),
-        (json!("true"), false),
-        (json!(1), false),
-        (serde_json::Value::Null, false),
+        (json!(false), Some(true)),
+        (json!("true"), None),
+        (json!(1), None),
+        (serde_json::Value::Null, None),
     ] {
         let mut slice = sidecar_slice(&config, &runtime);
         let mut patched = 0;
@@ -2380,11 +2394,14 @@ fn sidecar_source_namespace_fails_closed_on_a_malformed_reject_unmatched() {
             }
         }
         assert_eq!(patched, 1, "the route carries one dispatch instance");
-        let prepared =
-            prepare_gateway_config_from_mesh_slice(&slice, &runtime).expect("slice materializes");
-        let api_served = carried_route_proxies(&prepared)
-            .iter()
-            .any(|proxy| proxy.listen_path.as_deref() == Some("/api"));
+        // `None`: the slice update is rejected and the last generation serves.
+        let api_served = prepare_gateway_config_from_mesh_slice(&slice, &runtime)
+            .ok()
+            .map(|prepared| {
+                carried_route_proxies(&prepared)
+                    .iter()
+                    .any(|proxy| proxy.listen_path.as_deref() == Some("/api"))
+            });
         assert_eq!(api_served, served, "reject_unmatched = {value}");
     }
 }
@@ -2393,7 +2410,8 @@ fn sidecar_source_namespace_fails_closed_on_a_malformed_reject_unmatched() {
 /// dispatch instance is read with the plugin's own parser. A valid object that
 /// omits `reject_unmatched` keeps its default and the route serves its
 /// fallback; an unknown key such as `rejectUnmatched` (which the plugin would
-/// refuse to construct) refuses the route instead of detaching the instance.
+/// refuse to construct) rejects the slice update instead of detaching the
+/// instance.
 #[test]
 fn sidecar_source_namespace_parses_the_dispatch_miss_policy() {
     let config = translated_config(&[virtual_service(
@@ -2410,7 +2428,7 @@ fn sidecar_source_namespace_parses_the_dispatch_miss_policy() {
         }),
     )]);
     let runtime = sidecar_runtime_for("details");
-    for (name, served) in [("omitted", true), ("unknown key", false)] {
+    for (name, served) in [("omitted", Some(true)), ("unknown key", None)] {
         let mut slice = sidecar_slice(&config, &runtime);
         let mut patched = 0;
         for plugin in &mut slice.http_routes.plugin_configs {
@@ -2426,11 +2444,14 @@ fn sidecar_source_namespace_parses_the_dispatch_miss_policy() {
             }
         }
         assert_eq!(patched, 1, "the route carries one dispatch instance");
-        let prepared =
-            prepare_gateway_config_from_mesh_slice(&slice, &runtime).expect("slice materializes");
-        let api_served = carried_route_proxies(&prepared)
-            .iter()
-            .any(|proxy| proxy.listen_path.as_deref() == Some("/api"));
+        // `None`: the slice update is rejected and the last generation serves.
+        let api_served = prepare_gateway_config_from_mesh_slice(&slice, &runtime)
+            .ok()
+            .map(|prepared| {
+                carried_route_proxies(&prepared)
+                    .iter()
+                    .any(|proxy| proxy.listen_path.as_deref() == Some("/api"))
+            });
         assert_eq!(api_served, served, "{name}");
     }
 }
@@ -2534,9 +2555,9 @@ fn data_plane_refuses_a_route_set_reusing_a_proxy_or_upstream_id() {
 
 /// Review findings neon F2 / sol F1 (#7447): an instance with a
 /// `sourceNamespace` condition is validated with the plugin's own constructor
-/// before any rule is removed. A config the plugin would refuse refuses the
-/// carried route, whether filtering would have emptied it (zero port, empty
-/// `sourceNamespace`) or left a valid-looking sibling behind.
+/// before any rule is removed. A config the plugin would refuse rejects the
+/// slice update (sol F1, #7447), whether filtering would have emptied it (zero
+/// port, empty `sourceNamespace`) or left a valid-looking sibling behind.
 #[test]
 fn sidecar_source_namespace_validates_the_dispatch_config_before_filtering() {
     let runtime = sidecar_runtime_for("details");
@@ -2550,11 +2571,14 @@ fn sidecar_source_namespace_validates_the_dispatch_config_before_filtering() {
             }
         }
         assert_eq!(patched, 1, "the route carries one dispatch instance");
-        let prepared =
-            prepare_gateway_config_from_mesh_slice(&slice, &runtime).expect("slice materializes");
-        carried_route_proxies(&prepared)
-            .iter()
-            .any(|proxy| proxy.listen_path.as_deref() == Some("/api"))
+        // `None`: the slice update is rejected and the last generation serves.
+        prepare_gateway_config_from_mesh_slice(&slice, &runtime)
+            .ok()
+            .map(|prepared| {
+                carried_route_proxies(&prepared)
+                    .iter()
+                    .any(|proxy| proxy.listen_path.as_deref() == Some("/api"))
+            })
     };
     let foreign_rule = |config: &mut serde_json::Value| -> usize {
         config["rules"]
@@ -2579,20 +2603,26 @@ fn sidecar_source_namespace_validates_the_dispatch_config_before_filtering() {
             }]
         }),
     )]);
-    assert!(served(&fallback, &|_| {}), "a valid instance is detached");
-    assert!(
-        !served(&fallback, &|config| {
+    assert_eq!(
+        served(&fallback, &|_| {}),
+        Some(true),
+        "a valid instance is detached"
+    );
+    assert_eq!(
+        served(&fallback, &|config| {
             let index = foreign_rule(config);
             config["rules"][index]["match"]["port"] = json!(0);
         }),
-        "a zero port the plugin refuses refuses the route"
+        None,
+        "a zero port the plugin refuses rejects the slice"
     );
-    assert!(
-        !served(&fallback, &|config| {
+    assert_eq!(
+        served(&fallback, &|config| {
             let index = foreign_rule(config);
             config["rules"][index]["match"]["source_namespace"] = json!("");
         }),
-        "an empty sourceNamespace the plugin refuses refuses the route"
+        None,
+        "an empty sourceNamespace the plugin refuses rejects the slice"
     );
 
     // An instance filtering would leave with a valid sibling rule.
@@ -2609,15 +2639,103 @@ fn sidecar_source_namespace_validates_the_dispatch_config_before_filtering() {
             }]
         }),
     )]);
-    assert!(
+    assert_eq!(
         served(&guarded, &|_| {}),
+        Some(true),
         "the valid header sibling keeps it"
     );
-    assert!(
-        !served(&guarded, &|config| {
+    assert_eq!(
+        served(&guarded, &|config| {
             let index = foreign_rule(config);
             config["rules"][index]["match"]["port"] = json!(0);
         }),
+        None,
         "removing the invalid rule must not heal the config"
+    );
+}
+
+fn header_gated_spec() -> serde_json::Value {
+    json!({
+        "hosts": ["reviews.default.svc.cluster.local"],
+        "http": [{
+            "match": [{"uri": {"prefix": "/api"}, "headers": {"x-version": {"exact": "v2"}}}],
+            "route": route_to("ratings")
+        }]
+    })
+}
+
+/// Review findings sol F1 / neon F1 (#7449): every carried dispatch instance
+/// is validated by the plugin constructor at decode, on Sidecar and
+/// NodeWaypoint alike, whether or not it has a `sourceNamespace` condition.
+/// A malformed one rejects the slice update instead of being dropped with a
+/// route the binding refuses or healed by the binding's destination rewrite.
+#[test]
+fn every_malformed_carried_dispatch_instance_rejects_the_slice() {
+    let config = translated_config(&[virtual_service("gated", header_gated_spec())]);
+    type DispatchPatch = (&'static str, fn(&mut serde_json::Value));
+    let patches: [DispatchPatch; 3] = [
+        ("zero port", |config| {
+            config["rules"][0]["match"]["port"] = json!(0);
+        }),
+        ("destination without a port", |config| {
+            config["rules"][0]["destination"]
+                .as_object_mut()
+                .expect("rule destination")
+                .remove("backend_port");
+        }),
+        ("unknown miss-policy key", |config| {
+            config["rejectUnmatched"] = json!(true);
+        }),
+    ];
+    for runtime in [sidecar_runtime_for("details"), node_waypoint_runtime()] {
+        let topology = runtime.topology;
+        let slice = MeshSlice::from_gateway_config(&config, runtime.mesh_slice_request());
+        prepare_gateway_config_from_mesh_slice(&slice, &runtime)
+            .unwrap_or_else(|error| panic!("{topology:?}: the valid slice applies: {error:#}"));
+        for (name, patch) in patches {
+            let mut tampered = slice.clone();
+            let mut patched = 0;
+            for plugin in &mut tampered.http_routes.plugin_configs {
+                if plugin["plugin_name"] == json!("mesh_route_dispatch") {
+                    patch(&mut plugin["config"]);
+                    patched += 1;
+                }
+            }
+            assert_eq!(patched, 1, "{topology:?} {name}: one dispatch instance");
+            let error = prepare_gateway_config_from_mesh_slice(&tampered, &runtime)
+                .expect_err("a malformed dispatch instance rejects the slice update");
+            let rendered = format!("{error:#}");
+            assert!(
+                rendered.contains("is not a valid `mesh_route_dispatch` configuration"),
+                "{topology:?} {name}: {rendered}"
+            );
+        }
+    }
+}
+
+/// Review finding neon F2 (#7449): a `source_namespace` of `null` is an absent
+/// predicate (the plugin reads it as `None`), so a Sidecar keeps the rule and
+/// its header gate instead of deleting it as a foreign-namespace condition.
+#[tokio::test]
+async fn sidecar_source_namespace_null_is_an_absent_predicate() {
+    let config = translated_config(&[virtual_service("gated", header_gated_spec())]);
+    let runtime = sidecar_runtime_for("details");
+    let mut slice = sidecar_slice(&config, &runtime);
+    for plugin in &mut slice.http_routes.plugin_configs {
+        if plugin["plugin_name"] == json!("mesh_route_dispatch") {
+            plugin["config"]["rules"][0]["match"]["source_namespace"] = serde_json::Value::Null;
+        }
+    }
+    let prepared =
+        prepare_gateway_config_from_mesh_slice(&slice, &runtime).expect("slice materializes");
+    assert_eq!(
+        sidecar_dispatch(&prepared, "/api", "/api/users", &[("x-version", "v2")]).await,
+        Ok(SIDECAR_RATINGS.to_string()),
+        "the header rule still dispatches"
+    );
+    assert_eq!(
+        sidecar_dispatch(&prepared, "/api", "/api/users", &[]).await,
+        Err(404),
+        "the header gate still refuses a miss"
     );
 }

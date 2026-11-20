@@ -1744,7 +1744,7 @@ fn prepare_normalized_gateway_config_for_mesh(
     // under the service-port key or dial-port key their dispatch path uses.
     // Topology-aware: Ambient emits HBONE routes; Sidecar emits SVID-mTLS routes.
     materialize_mesh_outbound_proxies(&mut config, runtime, mesh_slice);
-    bind_carried_http_routes_to_node_waypoint_transport(&mut config, runtime, mesh_slice);
+    bind_carried_http_routes_to_node_waypoint_transport(&mut config, runtime, mesh_slice)?;
     // After rebinding, so each candidate names the destination route dispatch
     // actually selects (the Service port's upstream, not its DNS name).
     thread_node_waypoint_route_branches_to_authz(&mut config, runtime);
@@ -4382,6 +4382,26 @@ fn decode_http_route_set(
                      `weighted_splits`"
                 ));
             }
+            // Every carried dispatch instance is validated by the plugin's own
+            // constructor here, once, on every topology, before binding,
+            // `sourceNamespace` filtering or detachment can rewrite or drop it
+            // (issue #7440). Otherwise a malformed instance on a route the
+            // binding refuses would be dropped with the route, handing its
+            // host to the plain Service route (which serves requests the
+            // instance's match gate answers with 404), or have its offending
+            // destination rewritten into a valid one. A refusal rejects the
+            // slice, so the last accepted generation keeps serving. Disabled
+            // and unassociated instances are validated too: nothing later
+            // constructs them.
+            if plugin.plugin_name == "mesh_route_dispatch"
+                && crate::plugins::mesh_route_dispatch::MeshRouteDispatch::new(&plugin.config)
+                    .is_err()
+            {
+                return Err(anyhow::anyhow!(
+                    "Mesh slice HTTP route plugin config {index} is not a valid \
+                     `mesh_route_dispatch` configuration"
+                ));
+            }
             Ok(plugin)
         })
         .collect::<Result<_, _>>()?;
@@ -4673,19 +4693,33 @@ fn destination_rule_originates_tls_for_host(mesh_slice: &MeshSlice, host: &str, 
 /// refused whatever the rule sets, since no rule can apply to a direct
 /// backend ([`wildcard_destination_rule_names_direct_backend`]). Other
 /// external hosts are left as they are.
+///
+/// Refusal versus rejection (issue #7440). Every refusal above, and the
+/// Sidecar ones (a direct or rule destination in another namespace, a route
+/// claiming the local inbound slot, an authority rewrite its destination
+/// cannot route, a route whose `sourceNamespace` conditions all name another
+/// namespace while it serves matched requests only), concerns a well-formed
+/// route this data plane cannot or should not serve: the route is dropped and
+/// its host keeps the materialized Service route. Malformed input never takes
+/// that path, because the Service route would serve requests the carried
+/// route's match gate answers with 404: a carried set with malformed,
+/// duplicate or dangling records, or a dispatch instance the plugin
+/// constructor refuses, fails decode (`decode_http_route_set`, every instance
+/// on every topology, before this binding can drop or rewrite it). The slice
+/// update is rejected and the last accepted generation keeps serving.
 fn bind_carried_http_routes_to_node_waypoint_transport(
     config: &mut GatewayConfig,
     runtime: &MeshRuntimeConfig,
     mesh_slice: &MeshSlice,
-) {
+) -> Result<(), anyhow::Error> {
     if !runtime.topology.serves_virtual_service_http_routes() || mesh_slice.http_routes.is_empty() {
-        return;
+        return Ok(());
     }
     let hosts = CarriedRouteHostIndex::new(mesh_slice, &runtime.cluster_domain);
     let sidecar = runtime.topology == MeshTopology::Sidecar;
     // Routes whose every dispatch rule named another source namespace.
     let source_namespace_refused = if sidecar {
-        resolve_sidecar_carried_route_source_namespaces(config, runtime, mesh_slice)
+        resolve_sidecar_carried_route_source_namespaces(config, runtime, mesh_slice)?
     } else {
         HashSet::new()
     };
@@ -5334,6 +5368,7 @@ fn bind_carried_http_routes_to_node_waypoint_transport(
         // get their Service routes back.
         materialize_mesh_outbound_proxies(config, runtime, mesh_slice);
     }
+    Ok(())
 }
 
 /// Pin the destination Service authority on a Sidecar mesh-mTLS target a
@@ -5617,12 +5652,14 @@ fn clone_sidecar_carried_destination_upstreams(
 /// rules and the route's own destination are kept, and a removed condition
 /// never turns into a broader match. Rule order is kept.
 ///
-/// An instance with a `sourceNamespace` condition is first validated with the
-/// plugin's own constructor (`MeshRouteDispatch::new`), before anything is
-/// changed: a config the plugin would refuse refuses the route as carried, so
-/// filtering can neither hide nor heal it, and a valid object that omits
-/// `reject_unmatched` keeps its default. Instances without such a condition
-/// are left exactly as carried.
+/// Every carried dispatch instance was validated with the plugin's own
+/// constructor (`MeshRouteDispatch::new`) by `decode_http_route_set`, before
+/// binding or filtering: a config the plugin would refuse rejects the whole
+/// slice update, so the last accepted generation keeps serving with the
+/// route's match gate intact, and filtering can neither hide nor heal it. A
+/// valid object that omits `reject_unmatched` keeps its default. A
+/// `source_namespace` of `null` is an absent predicate. Instances without a
+/// `sourceNamespace` condition are left exactly as carried.
 ///
 /// When every rule of an instance is removed (issue #7440):
 /// * with `reject_unmatched` the route serves only matched requests, so it now
@@ -5638,12 +5675,10 @@ fn resolve_sidecar_carried_route_source_namespaces(
     config: &mut GatewayConfig,
     runtime: &MeshRuntimeConfig,
     mesh_slice: &MeshSlice,
-) -> HashSet<(String, String)> {
+) -> Result<HashSet<(String, String)>, anyhow::Error> {
     let local_namespace = authoritative_sidecar_l4_source(runtime, mesh_slice)
         .map(|source| source.namespace.to_string());
     let mut removed = 0usize;
-    // Instances the plugin constructor refuses.
-    let mut malformed = 0usize;
     let mut emptied: HashSet<(String, String)> = HashSet::new();
     // `(namespace, plugin id)` of emptied instances whose route keeps serving
     // its fallback destination.
@@ -5668,7 +5703,7 @@ fn resolve_sidecar_carried_route_source_namespaces(
                 rules.iter().any(|rule| {
                     rule.get("match")
                         .and_then(|criteria| criteria.get("source_namespace"))
-                        .is_some()
+                        .is_some_and(|value| !value.is_null())
                 })
             });
         let Some(proxy_id) = plugin.proxy_id.clone() else {
@@ -5677,20 +5712,21 @@ fn resolve_sidecar_carried_route_source_namespaces(
         if !has_source_namespace {
             continue;
         }
-        // Validate the untrusted slice value with the plugin's own
-        // constructor before anything is touched. A config it would refuse (a
-        // non-boolean or unknown miss-policy key, an empty `source_namespace`,
-        // a zero port, an invalid matcher or transform, ...) refuses the
-        // route as carried: no rule is removed and no instance detached, so
-        // filtering can neither hide nor heal it. A valid object that omits
-        // `reject_unmatched` keeps the plugin default.
+        // The miss policy as the plugin constructs it. `decode_http_route_set`
+        // already validated every carried dispatch instance with this same
+        // constructor before binding started, so a refusal here is
+        // unreachable for decoded input; it still rejects the slice update
+        // (never refuses the route into the Service route, which would serve
+        // requests the instance's match gate answers with 404). A valid object
+        // that omits `reject_unmatched` keeps the plugin default.
         let reject_unmatched =
             match crate::plugins::mesh_route_dispatch::MeshRouteDispatch::new(&plugin.config) {
                 Ok(validated) => validated.rejects_unmatched(),
                 Err(_) => {
-                    malformed += 1;
-                    emptied.insert((plugin.namespace.clone(), proxy_id));
-                    continue;
+                    return Err(anyhow::anyhow!(
+                        "Mesh slice carries a VirtualService route dispatch configuration that \
+                         fails validation"
+                    ));
                 }
             };
         let Some(rules) = plugin
@@ -5708,7 +5744,12 @@ fn resolve_sidecar_carried_route_source_namespaces(
             else {
                 return true;
             };
-            let Some(expected) = criteria.get("source_namespace") else {
+            // `null` is an absent predicate (the plugin deserializes it to
+            // `None`), never a namespace that fails to match.
+            let Some(expected) = criteria
+                .get("source_namespace")
+                .filter(|value| !value.is_null())
+            else {
                 return true;
             };
             let applies = local_namespace
@@ -5753,14 +5794,7 @@ fn resolve_sidecar_carried_route_source_namespaces(
              workload's namespace were removed"
         );
     }
-    if malformed > 0 {
-        warn!(
-            malformed,
-            "Sidecar VirtualService routes refused: their route dispatch configuration fails \
-             validation"
-        );
-    }
-    emptied
+    Ok(emptied)
 }
 
 /// The hosts a carried route answers once
@@ -38835,6 +38869,275 @@ mod tests {
             mesh_authz_label(&proxy_state, "app").as_deref(),
             Some("reviews"),
             "rejected slice must not become the live config; only its remote overlay re-applies onto the accepted slice"
+        );
+
+        shutdown_tx.shutdown();
+        tokio::time::timeout(Duration::from_secs(2), apply_task)
+            .await
+            .expect("apply task should stop")
+            .expect("apply task should join");
+    }
+
+    /// Issue #7440 (sol F1 on #7447, dsf F1 on #7449), through the real apply
+    /// loop: a Sidecar serves a header-gated carried VirtualService route, then
+    /// receives a replacement slice whose dispatch instance the plugin
+    /// constructor refuses. The apply loop must reject the replacement and
+    /// keep the previous generation live, so a request without the header
+    /// still gets the route's 404 instead of reaching the plain Service route.
+    #[tokio::test(flavor = "current_thread")]
+    async fn mesh_runtime_apply_task_keeps_the_gate_when_a_carried_dispatch_is_malformed() {
+        let mut runtime = test_mesh_runtime_config();
+        runtime.workload_spiffe_id = Some("spiffe://cluster.local/ns/default/sa/details".into());
+        runtime.workload_labels = HashMap::from([("app".to_string(), "details".to_string())]);
+
+        let virtual_service: crate::config_sources::k8s::K8sObject =
+            serde_json::from_value(serde_json::json!({
+                "apiVersion": "networking.istio.io/v1",
+                "kind": "VirtualService",
+                "metadata": {"name": "gated", "namespace": "default"},
+                "spec": {
+                    "hosts": ["reviews.default.svc.cluster.local"],
+                    "http": [{
+                        "match": [
+                            {"uri": {"prefix": "/api"}, "sourceNamespace": "other-ns"},
+                            {"uri": {"prefix": "/api"}, "headers": {"x-version": {"exact": "v2"}}}
+                        ],
+                        "route": [{"destination": {
+                            "host": "ratings.default.svc.cluster.local",
+                            "port": {"number": 8080}
+                        }}]
+                    }]
+                }
+            }))
+            .expect("VirtualService object");
+        let mut config = crate::config_sources::k8s::translate_k8s_objects(
+            &[virtual_service],
+            crate::config_sources::k8s::K8sTranslationOptions::new(
+                "default".to_string(),
+                TrustDomain::new("cluster.local").unwrap(),
+            ),
+        )
+        .expect("VirtualService translates")
+        .config;
+        let workloads = vec![
+            workload_with_address("reviews", "reviews", "10.0.0.11"),
+            workload_with_address("ratings", "ratings", "10.0.0.12"),
+            workload_with_address("details", "details", "10.0.0.13"),
+        ];
+        let services = workloads
+            .iter()
+            .map(|workload| MeshService {
+                cluster_ips: Vec::new(),
+                name: workload.service_name.clone(),
+                namespace: "default".to_string(),
+                ports: vec![ServicePort {
+                    port: 8080,
+                    protocol: AppProtocol::Http,
+                    name: Some("http".to_string()),
+                    target_port: None,
+                }],
+                workloads: vec![WorkloadRef {
+                    spiffe_id: workload.spiffe_id.clone(),
+                }],
+                protocol_overrides: HashMap::new(),
+                uid: None,
+                allow_path_parameters: false,
+            })
+            .collect();
+        let mesh = config.mesh.get_or_insert_with(Box::default);
+        mesh.workloads = workloads;
+        mesh.services = services;
+        config.normalize_fields();
+        config.normalize_mesh_fields();
+        let good = MeshSlice {
+            version: "gated-good".to_string(),
+            ..MeshSlice::from_gateway_config(&config, runtime.mesh_slice_request())
+        };
+        assert!(
+            !good.http_routes.is_empty(),
+            "the Sidecar slice carries the route"
+        );
+
+        let mesh_state = MeshRuntimeState::new();
+        let proxy_state = make_test_proxy_state(GatewayConfig::default());
+        let (shutdown_tx, shutdown_rx) =
+            crate::overload::ShutdownSender::channel(std::time::Duration::from_secs(30));
+        let apply_task = start_mesh_slice_apply_task(
+            mesh_state.clone(),
+            proxy_state.clone(),
+            runtime,
+            None,
+            MeshInboundTlsReloadState {
+                server_identity: None,
+                last_snapshot: None,
+                spiffe_bundle_slot: None,
+                runtime_trust_overlay_slot: None,
+                production: false,
+            },
+            shutdown_rx,
+            None,
+            None,
+        );
+
+        // The served /api route and the outcome of one request through its
+        // dispatch chain on the live generation (no peer: outbound capture).
+        let live_gate = |proxy_state: &ProxyState, with_header: bool| {
+            let config = proxy_state.current_config();
+            let route = config
+                .proxies
+                .iter()
+                .find(|proxy| {
+                    config::is_virtual_service_http_route_proxy_id(&proxy.id)
+                        && proxy.listen_path.as_deref() == Some("/api")
+                })
+                .cloned();
+            let plugins: Vec<Arc<dyn crate::plugins::Plugin>> = route
+                .iter()
+                .flat_map(|route| route.plugins.iter())
+                .filter_map(|association| {
+                    config.plugin_configs.iter().find(|plugin| {
+                        plugin.id == association.plugin_config_id
+                            && plugin.plugin_name == "mesh_route_dispatch"
+                    })
+                })
+                .map(|plugin| {
+                    crate::plugins::create_plugin("mesh_route_dispatch", &plugin.config)
+                        .expect("live dispatch config constructs")
+                        .expect("built-in plugin")
+                })
+                .collect();
+            (route, plugins, with_header)
+        };
+        let dispatch = |(route, mut plugins, with_header): (
+            Option<Proxy>,
+            Vec<Arc<dyn crate::plugins::Plugin>>,
+            bool,
+        )| async move {
+            let route = route.expect("the carried /api route is live");
+            crate::_test_support::install_plugin_finalizers_for_test(&mut plugins)
+                .expect("chain assembles");
+            let mut ctx = crate::plugins::RequestContext::new(
+                "127.0.0.1".to_string(),
+                "GET".to_string(),
+                "/api/users".to_string(),
+            );
+            ctx.mesh_direction = Some(MeshTrafficDirection::Outbound);
+            ctx.matched_proxy = Some(Arc::new(route));
+            let mut headers = HashMap::from([(
+                "host".to_string(),
+                "reviews.default.svc.cluster.local".to_string(),
+            )]);
+            if with_header {
+                headers.insert("x-version".to_string(), "v2".to_string());
+            }
+            ctx.headers = headers.clone();
+            match crate::_test_support::run_before_proxy_hooks_for_test(
+                &plugins,
+                &mut ctx,
+                &mut headers,
+            )
+            .await
+            {
+                crate::plugins::PluginResult::Continue => None,
+                crate::plugins::PluginResult::Reject { status_code, .. }
+                | crate::plugins::PluginResult::RejectBinary { status_code, .. } => {
+                    Some(status_code)
+                }
+            }
+        };
+
+        // Generation 1: the good slice becomes live.
+        mesh_state.install_slice(good.clone());
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while live_gate(&proxy_state, false).0.is_none() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the good slice becomes live");
+        assert_eq!(dispatch(live_gate(&proxy_state, true)).await, None);
+        assert_eq!(
+            dispatch(live_gate(&proxy_state, false)).await,
+            Some(404),
+            "a header miss gets the route's 404"
+        );
+        // The live /api route and its dispatch configs, to compare after the
+        // rejected reload.
+        let live_route_state = |proxy_state: &ProxyState| {
+            let config = proxy_state.current_config();
+            let route = config
+                .proxies
+                .iter()
+                .find(|proxy| {
+                    config::is_virtual_service_http_route_proxy_id(&proxy.id)
+                        && proxy.listen_path.as_deref() == Some("/api")
+                })
+                .map(|proxy| (proxy.id.clone(), proxy.upstream_id.clone()));
+            let dispatch_configs: Vec<serde_json::Value> = config
+                .plugin_configs
+                .iter()
+                .filter(|plugin| {
+                    plugin.plugin_name == "mesh_route_dispatch"
+                        && plugin
+                            .proxy_id
+                            .as_deref()
+                            .is_some_and(config::is_virtual_service_http_route_proxy_id)
+                })
+                .map(|plugin| plugin.config.clone())
+                .collect();
+            (route, dispatch_configs)
+        };
+        let live_before = live_route_state(&proxy_state);
+
+        // Generation 2: a replacement whose dispatch instance the plugin
+        // constructor refuses (zero port on the foreign-namespace rule).
+        let mut malformed = good.clone();
+        malformed.version = "gated-malformed".to_string();
+        for plugin in &mut malformed.http_routes.plugin_configs {
+            if plugin["plugin_name"] == serde_json::json!("mesh_route_dispatch") {
+                for rule in plugin["config"]["rules"]
+                    .as_array_mut()
+                    .expect("dispatch rules")
+                {
+                    if rule["match"].get("source_namespace").is_some() {
+                        rule["match"]["port"] = serde_json::json!(0);
+                    }
+                }
+            }
+        }
+        let mut verdicts = mesh_state.subscribe_runtime_verdict();
+        mesh_state.install_slice(malformed);
+        let verdict = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                verdicts
+                    .changed()
+                    .await
+                    .expect("runtime verdict publisher is alive");
+                let latest = verdicts.borrow_and_update().clone();
+                if let Some(verdict) = latest.filter(|verdict| verdict.version == "gated-malformed")
+                {
+                    break verdict;
+                }
+            }
+        })
+        .await
+        .expect("the apply task must judge the malformed slice");
+        assert!(
+            !verdict.outcome.accepted(),
+            "the malformed slice must be rejected, got {:?}",
+            verdict.outcome
+        );
+
+        // The previous generation is still the live one, gate intact.
+        assert_eq!(
+            live_route_state(&proxy_state),
+            live_before,
+            "the rejected slice must not replace the live route or its gate"
+        );
+        assert_eq!(
+            dispatch(live_gate(&proxy_state, false)).await,
+            Some(404),
+            "the header miss still gets 404 after the rejected reload"
         );
 
         shutdown_tx.shutdown();
