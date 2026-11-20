@@ -2679,6 +2679,15 @@ fn header_gated_spec() -> serde_json::Value {
 /// (labels, an API spec id) rejects the slice. Otherwise the route would keep
 /// serving without its 404 match gate. The translator's own record is the
 /// positive case.
+///
+/// Review findings sol F1 / dsf F1 and the id-rule test gap (#7452): the
+/// allowlist covers every carried record, whatever its `plugin_name`. These
+/// also reject the slice:
+/// * a record keeping the reserved dispatch id under another plugin type;
+/// * a dispatch record under a non-canonical `istio-vs-` id, still listed by
+///   its route;
+/// * a dispatch id naming another route than its `proxy_id`;
+/// * an extra, associated record of a kind the translator never attaches.
 #[test]
 fn every_malformed_carried_dispatch_instance_rejects_the_slice() {
     let config = translated_config(&[virtual_service("gated", header_gated_spec())]);
@@ -2764,9 +2773,15 @@ fn every_malformed_carried_dispatch_instance_rejects_the_slice() {
             "priority override",
             "labels",
             "api spec id",
+            "reserved id on another plugin type",
+            "non-canonical id",
+            "id names another route",
+            "foreign plugin kind",
         ] {
             let mut tampered = slice.clone();
             let mut dispatch_ids = Vec::new();
+            let mut renamed: Option<(serde_json::Value, serde_json::Value)> = None;
+            let mut extra: Option<serde_json::Value> = None;
             for plugin in &mut tampered.http_routes.plugin_configs {
                 if plugin["plugin_name"] == json!("mesh_route_dispatch") {
                     match name {
@@ -2782,10 +2797,69 @@ fn every_malformed_carried_dispatch_instance_rejects_the_slice() {
                         "priority override" => plugin["priority_override"] = json!(1),
                         "labels" => plugin["labels"] = json!({"team": "mesh"}),
                         "api spec id" => plugin["api_spec_id"] = json!("spec"),
+                        "reserved id on another plugin type" => {
+                            plugin["plugin_name"] = json!("cors");
+                            plugin["config"] = json!({"allowed_origins": ["https://a.example"]});
+                        }
+                        "non-canonical id" | "id names another route" => {
+                            let proxy_id = plugin["proxy_id"]
+                                .as_str()
+                                .expect("dispatch proxy_id")
+                                .to_string();
+                            let id = if name == "non-canonical id" {
+                                format!("istio-vs-dispatch-{proxy_id}")
+                            } else {
+                                "istio-vs-mrd-istio-vs-elsewhere".to_string()
+                            };
+                            renamed = Some((plugin["id"].clone(), json!(id)));
+                            plugin["id"] = json!(id);
+                        }
+                        "foreign plugin kind" => {
+                            let proxy_id = plugin["proxy_id"]
+                                .as_str()
+                                .expect("dispatch proxy_id")
+                                .to_string();
+                            let mut record = plugin.clone();
+                            record["id"] = json!(format!("istio-vs-extra-{proxy_id}"));
+                            record["plugin_name"] = json!("request_size_limiting");
+                            record["config"] = json!({"max_bytes": 1024});
+                            extra = Some(record);
+                        }
                         _ => {}
                     }
                     dispatch_ids.push(plugin["id"].clone());
                 }
+            }
+            if let Some(record) = extra.take() {
+                let mut linked = 0;
+                for proxy in &mut tampered.http_routes.proxies {
+                    if proxy["id"] == record["proxy_id"] {
+                        proxy["plugins"]
+                            .as_array_mut()
+                            .expect("route plugin associations")
+                            .push(json!({"plugin_config_id": record["id"].clone()}));
+                        linked += 1;
+                    }
+                }
+                assert_eq!(linked, 1, "{topology:?}: the extra record is associated");
+                tampered.http_routes.plugin_configs.push(record);
+            }
+            if let Some((old, new)) = renamed.take() {
+                let mut relinked = 0;
+                for proxy in &mut tampered.http_routes.proxies {
+                    if let Some(associations) = proxy["plugins"].as_array_mut() {
+                        for association in associations {
+                            if association["plugin_config_id"] == old {
+                                association["plugin_config_id"] = new.clone();
+                                relinked += 1;
+                            }
+                        }
+                    }
+                }
+                assert_eq!(
+                    relinked, 1,
+                    "{topology:?} {name}: the route still lists the renamed record"
+                );
             }
             assert_eq!(
                 dispatch_ids.len(),
@@ -2816,6 +2890,49 @@ fn every_malformed_carried_dispatch_instance_rejects_the_slice() {
                 "{topology:?} {name}: {rendered}"
             );
         }
+    }
+}
+
+/// Review follow-up (#7452): the record allowlist covers every carried plugin
+/// kind, so the translator's own records of each kind must still decode. A
+/// header-gated route with request and response header transforms and a CORS
+/// policy carries a dispatch instance, both auto-emitted transformers and a
+/// `cors` instance, and the slice applies on Sidecar and NodeWaypoint.
+#[test]
+fn translator_route_plugin_kinds_decode_on_both_topologies() {
+    let mut spec = header_gated_spec();
+    spec["http"][0]["headers"] = json!({
+        "request": {"set": {"x-request-tag": "mesh"}},
+        "response": {"set": {"x-response-tag": "mesh"}}
+    });
+    spec["http"][0]["corsPolicy"] = json!({
+        "allowOrigins": [{"exact": "https://app.example"}],
+        "allowMethods": ["GET"]
+    });
+    let config = translated_config(&[virtual_service("decorated", spec)]);
+    for runtime in [sidecar_runtime_for("details"), node_waypoint_runtime()] {
+        let topology = runtime.topology;
+        let slice = MeshSlice::from_gateway_config(&config, runtime.mesh_slice_request());
+        let kinds: std::collections::BTreeSet<&str> = slice
+            .http_routes
+            .plugin_configs
+            .iter()
+            .filter_map(|plugin| plugin["plugin_name"].as_str())
+            .collect();
+        for kind in [
+            "mesh_route_dispatch",
+            "request_transformer",
+            "response_transformer",
+            "cors",
+        ] {
+            assert!(
+                kinds.contains(kind),
+                "{topology:?}: the route carries {kind}: {kinds:?}"
+            );
+        }
+        prepare_gateway_config_from_mesh_slice(&slice, &runtime).unwrap_or_else(|error| {
+            panic!("{topology:?}: the translator's route plugins decode: {error:#}")
+        });
     }
 }
 
