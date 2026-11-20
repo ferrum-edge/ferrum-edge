@@ -1718,6 +1718,9 @@ pub unsafe fn extract_recv_cmsgs(msg: &libc::msghdr, parse_orig_dst: bool) -> Re
     const IPV6_RECVORIGDSTADDR: libc::c_int = 74;
 
     let mut out = RecvCmsgs::default();
+    // `msg_controllen` is `usize` on x86_64-unknown-linux-gnu and `socklen_t`
+    // (`u32`) on musl / 32-bit targets; allow the widening cast across targets.
+    #[allow(clippy::unnecessary_cast)]
     let ctrl_len = msg.msg_controllen as usize;
     if ctrl_len < std::mem::size_of::<libc::cmsghdr>() || msg.msg_control.is_null() {
         return out;
@@ -1754,6 +1757,7 @@ pub unsafe fn extract_recv_cmsgs(msg: &libc::msghdr, parse_orig_dst: bool) -> Re
             break;
         }
         unsafe {
+            #[allow(clippy::unnecessary_cast)]
             let cmsg_len = (*cmsg).cmsg_len as usize;
             if cmsg_len < std::mem::size_of::<libc::cmsghdr>() {
                 break;
@@ -4685,19 +4689,26 @@ mod send_cmsg_buf_tests {
     /// record so the reply-source family matches the V6-mapped peer address and
     /// replies sent to `127.0.0.2` originate from `127.0.0.2`.
     #[test]
+    #[allow(clippy::unnecessary_cast)]
     fn extract_recv_cmsgs_preserves_v6_pktinfo_on_dual_stack_socket() {
         use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket};
         use std::os::fd::AsRawFd;
 
-        let sock = socket2::Socket::new(
+        let sock = match socket2::Socket::new(
             socket2::Domain::IPV6,
             socket2::Type::DGRAM,
             Some(socket2::Protocol::UDP),
-        )
-        .expect("create IPv6 UDP socket");
+        ) {
+            Ok(s) => s,
+            Err(e) if super::is_ipv6_unavailable_io_error(&e) => return,
+            Err(e) => panic!("create IPv6 UDP socket: {e}"),
+        };
         sock.set_only_v6(false).expect("disable IPV6_V6ONLY");
-        sock.bind(&SocketAddr::from((Ipv6Addr::UNSPECIFIED, 0)).into())
-            .expect("bind [::]:0");
+        match sock.bind(&SocketAddr::from((Ipv6Addr::UNSPECIFIED, 0)).into()) {
+            Ok(()) => {}
+            Err(e) if super::is_ipv6_unavailable_io_error(&e) => return,
+            Err(e) => panic!("bind [::]:0: {e}"),
+        }
         let server: UdpSocket = sock.into();
         let port = server.local_addr().expect("local_addr").port();
         let fd = server.as_raw_fd();
@@ -4722,7 +4733,7 @@ mod send_cmsg_buf_tests {
         msg.msg_iov = &mut iov;
         msg.msg_iovlen = 1;
         msg.msg_control = cmsg_buf.as_mut_ptr() as *mut libc::c_void;
-        msg.msg_controllen = std::mem::size_of_val(&cmsg_buf);
+        msg.msg_controllen = std::mem::size_of_val(&cmsg_buf) as _;
 
         let n = unsafe { libc::recvmsg(fd, &mut msg, 0) };
         assert_eq!(n, 4, "recvmsg failed: {}", std::io::Error::last_os_error());
@@ -4757,9 +4768,70 @@ mod send_cmsg_buf_tests {
         assert_eq!(from, target);
     }
 
+    /// Deterministic in-memory test (runs even on IPv4-only kernels) verifying
+    /// `IPV6_PKTINFO` takes precedence over a trailing `IP_PKTINFO` record.
+    #[test]
+    #[allow(clippy::unnecessary_cast)]
+    fn extract_recv_cmsgs_prefers_v6_pktinfo_over_trailing_v4_pktinfo() {
+        use std::net::{IpAddr, Ipv4Addr};
+
+        let mapped = Ipv4Addr::new(127, 0, 0, 2).to_ipv6_mapped();
+        let mut cmsg_buf = [unsafe { std::mem::zeroed::<libc::cmsghdr>() }; 16];
+        let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+        msg.msg_control = cmsg_buf.as_mut_ptr() as *mut libc::c_void;
+        let v6_space =
+            unsafe { libc::CMSG_SPACE(std::mem::size_of::<libc::in6_pktinfo>() as u32) as usize };
+        let v4_space =
+            unsafe { libc::CMSG_SPACE(std::mem::size_of::<libc::in_pktinfo>() as u32) as usize };
+        msg.msg_controllen = (v6_space + v4_space) as _;
+
+        unsafe {
+            let c1 = libc::CMSG_FIRSTHDR(&msg);
+            assert!(!c1.is_null());
+            (*c1).cmsg_level = libc::IPPROTO_IPV6;
+            (*c1).cmsg_type = libc::IPV6_PKTINFO;
+            (*c1).cmsg_len = libc::CMSG_LEN(std::mem::size_of::<libc::in6_pktinfo>() as u32) as _;
+            let pi6 = libc::in6_pktinfo {
+                ipi6_addr: libc::in6_addr {
+                    s6_addr: mapped.octets(),
+                },
+                ipi6_ifindex: 7,
+            };
+            std::ptr::copy_nonoverlapping(
+                &pi6 as *const libc::in6_pktinfo as *const u8,
+                libc::CMSG_DATA(c1),
+                std::mem::size_of::<libc::in6_pktinfo>(),
+            );
+
+            let c2 = libc::CMSG_NXTHDR(&msg, c1);
+            assert!(!c2.is_null());
+            (*c2).cmsg_level = libc::IPPROTO_IP;
+            (*c2).cmsg_type = libc::IP_PKTINFO;
+            (*c2).cmsg_len = libc::CMSG_LEN(std::mem::size_of::<libc::in_pktinfo>() as u32) as _;
+            let pi4 = libc::in_pktinfo {
+                ipi_ifindex: 7,
+                ipi_spec_dst: libc::in_addr {
+                    s_addr: u32::from(Ipv4Addr::new(127, 0, 0, 2)).to_be(),
+                },
+                ipi_addr: libc::in_addr { s_addr: 0 },
+            };
+            std::ptr::copy_nonoverlapping(
+                &pi4 as *const libc::in_pktinfo as *const u8,
+                libc::CMSG_DATA(c2),
+                std::mem::size_of::<libc::in_pktinfo>(),
+            );
+        }
+
+        let cmsgs = unsafe { super::extract_recv_cmsgs(&msg, false) };
+        let pktinfo = cmsgs.pktinfo.expect("pktinfo parsed");
+        assert_eq!(pktinfo.ip, IpAddr::V6(mapped));
+        assert_eq!(pktinfo.ifindex, 7);
+    }
+
     /// Truncated `cmsg_len` values must fail closed (ignored) without reading
     /// stale or out-of-bounds payload bytes.
     #[test]
+    #[allow(clippy::unnecessary_cast)]
     fn extract_recv_cmsgs_rejects_truncated_records() {
         let mut cmsg_buf = [unsafe { std::mem::zeroed::<libc::cmsghdr>() }; 8];
         let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };

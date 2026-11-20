@@ -3249,15 +3249,88 @@ fn flush_gso_batch(
 /// absolute authorization plan. After `writable()` reports readiness the plan
 /// is re-read immediately before the pktinfo syscall so expiry wins over send
 /// readiness at that boundary too.
+/// Termination reason surfaced by a reply-side commit boundary check.
+///
+/// Enforced before every mid-burst flush, fallback direct send, and post-wait
+/// retry so buffered or suspended replies can never cross session stop,
+/// shutdown, NodeWaypoint source/destination revocation, or credential expiry.
+#[cfg(target_os = "linux")]
+enum UdpReplyCommitStop {
+    Stopped,
+    AuthorizationExpired(crate::proxy::auth_lifetime::StreamAuthTermination),
+    PolicyRejected(String),
+}
+
+/// Shared commit-boundary & cancellation guard passed into Linux reply batching
+/// and direct-send fallback helpers.
+#[cfg(target_os = "linux")]
+struct UdpReplyCommitGuard<'a> {
+    session: &'a UdpSession,
+    client_addr: SocketAddr,
+    proxy_id: &'a str,
+    authorization: Option<crate::proxy::auth_lifetime::StreamAuthDeadline>,
+    listener_shutdown: &'a mut watch::Receiver<bool>,
+    global_shutdown: &'a mut Option<watch::Receiver<bool>>,
+}
+
+#[cfg(target_os = "linux")]
+impl UdpReplyCommitGuard<'_> {
+    #[inline]
+    fn check_policy(&self) -> Option<UdpReplyCommitStop> {
+        if self.session.stop_reply_task.load(Ordering::Acquire)
+            || *self.listener_shutdown.borrow()
+            || self.global_shutdown.as_ref().is_some_and(|rx| *rx.borrow())
+        {
+            return Some(UdpReplyCommitStop::Stopped);
+        }
+        if let Some(source) = self.session.node_waypoint_source.as_ref()
+            && let Err(refusal) = source.revalidate(source.ingress_ifindex, self.client_addr.ip())
+        {
+            source.scoping.index.warn_refusal(
+                self.proxy_id,
+                &udp_session_client_ip(self.client_addr),
+                refusal,
+            );
+            self.session.expired.store(true, Ordering::Release);
+            return Some(UdpReplyCommitStop::PolicyRejected(format!(
+                "NodeWaypoint UDP source attribution no longer valid ({})",
+                refusal.as_str()
+            )));
+        }
+        if let Err(error) = self.session.revalidate_destination() {
+            return Some(UdpReplyCommitStop::PolicyRejected(error.to_string()));
+        }
+        None
+    }
+
+    #[inline]
+    fn check_commit(&self) -> Option<UdpReplyCommitStop> {
+        if let Some(stop) = self.check_policy() {
+            return Some(stop);
+        }
+        if let Some(termination) = udp_reply_expired_at_commit(self.authorization) {
+            return Some(UdpReplyCommitStop::AuthorizationExpired(termination));
+        }
+        None
+    }
+}
+
+#[cfg(target_os = "linux")]
+enum UdpDirectSendOutcome {
+    Sent(std::io::Result<usize>),
+    Stop(UdpReplyCommitStop),
+}
+
 #[cfg(target_os = "linux")]
 async fn direct_send_to_client(
     frontend: &UdpSocket,
     data: &[u8],
     client_addr: SocketAddr,
     local: Option<crate::socket_opts::PktinfoLocal>,
-    authorization: Option<crate::proxy::auth_lifetime::StreamAuthDeadline>,
-) -> UdpFrontendSendOutcome<std::io::Result<usize>> {
+    commit_guard: &mut UdpReplyCommitGuard<'_>,
+) -> UdpDirectSendOutcome {
     use std::os::unix::io::AsRawFd;
+    let authorization = commit_guard.authorization;
     // Only honor the local source when its address family matches the
     // destination — mirrors `flush_gso_batch` / `SendMmsgBatch::push_with_local`.
     let effective_local = match (local.map(|l| l.ip), client_addr) {
@@ -3267,16 +3340,43 @@ async fn direct_send_to_client(
         _ => None,
     };
     let Some(local) = effective_local else {
-        return udp_frontend_send_until_expiry(
-            authorization,
-            udp_direct!(frontend.send_to(data, client_addr)),
-        )
-        .await;
+        if let Some(stop) = commit_guard.check_commit() {
+            return UdpDirectSendOutcome::Stop(stop);
+        }
+        let stop_notified = commit_guard.session.stop_notify.notified();
+        tokio::pin!(stop_notified);
+        stop_notified.as_mut().enable();
+        if let Some(stop) = commit_guard.check_policy() {
+            return UdpDirectSendOutcome::Stop(stop);
+        }
+        let shutdown_cancel =
+            udp_reply_shutdown_cancel(commit_guard.listener_shutdown, commit_guard.global_shutdown);
+        tokio::pin!(shutdown_cancel);
+        let outcome = tokio::select! {
+            biased;
+            () = &mut stop_notified => return UdpDirectSendOutcome::Stop(UdpReplyCommitStop::Stopped),
+            () = &mut shutdown_cancel => return UdpDirectSendOutcome::Stop(UdpReplyCommitStop::Stopped),
+            outcome = udp_frontend_send_until_expiry(
+                authorization,
+                udp_direct!(frontend.send_to(data, client_addr)),
+            ) => outcome,
+        };
+        return match outcome {
+            UdpFrontendSendOutcome::AuthorizationExpired(termination) => {
+                UdpDirectSendOutcome::Stop(UdpReplyCommitStop::AuthorizationExpired(termination))
+            }
+            UdpFrontendSendOutcome::Sent(res) => UdpDirectSendOutcome::Sent(res),
+        };
     };
     let (dest, dest_len) = super::udp_batch::std_to_sockaddr_storage(client_addr);
     loop {
+        if let Some(stop) = commit_guard.check_policy() {
+            return UdpDirectSendOutcome::Stop(stop);
+        }
         if let Some(termination) = udp_reply_expired_at_commit(authorization) {
-            return UdpFrontendSendOutcome::AuthorizationExpired(termination);
+            return UdpDirectSendOutcome::Stop(UdpReplyCommitStop::AuthorizationExpired(
+                termination,
+            ));
         }
         let result = frontend.try_io(tokio::io::Interest::WRITABLE, || {
             crate::socket_opts::send_with_pktinfo(
@@ -3299,17 +3399,36 @@ async fn direct_send_to_client(
         }
         match result {
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                match udp_frontend_writable_until_expiry(authorization, frontend.writable()).await {
+                let stop_notified = commit_guard.session.stop_notify.notified();
+                tokio::pin!(stop_notified);
+                stop_notified.as_mut().enable();
+                if let Some(stop) = commit_guard.check_policy() {
+                    return UdpDirectSendOutcome::Stop(stop);
+                }
+                let shutdown_cancel = udp_reply_shutdown_cancel(
+                    commit_guard.listener_shutdown,
+                    commit_guard.global_shutdown,
+                );
+                tokio::pin!(shutdown_cancel);
+                let outcome = tokio::select! {
+                    biased;
+                    () = &mut stop_notified => return UdpDirectSendOutcome::Stop(UdpReplyCommitStop::Stopped),
+                    () = &mut shutdown_cancel => return UdpDirectSendOutcome::Stop(UdpReplyCommitStop::Stopped),
+                    outcome = udp_frontend_writable_until_expiry(authorization, frontend.writable()) => outcome,
+                };
+                match outcome {
                     UdpFrontendSendOutcome::AuthorizationExpired(termination) => {
-                        return UdpFrontendSendOutcome::AuthorizationExpired(termination);
+                        return UdpDirectSendOutcome::Stop(
+                            UdpReplyCommitStop::AuthorizationExpired(termination),
+                        );
                     }
                     UdpFrontendSendOutcome::Sent(Err(e)) => {
-                        return UdpFrontendSendOutcome::Sent(Err(e));
+                        return UdpDirectSendOutcome::Sent(Err(e));
                     }
                     UdpFrontendSendOutcome::Sent(Ok(())) => {}
                 }
             }
-            other => return UdpFrontendSendOutcome::Sent(other),
+            other => return UdpDirectSendOutcome::Sent(other),
         }
     }
 }
@@ -3353,11 +3472,9 @@ fn flush_sendmmsg_best_effort(
 /// Direct-send a reply datagram that the batched paths cannot represent
 /// (GSO-incompatible, sendmmsg-oversized, or post-flush refusal).
 ///
-/// Rechecks the admitted absolute authorization plan immediately before the
-/// client send so a prior `await` (hook, batch flush) cannot even enter the
-/// escape hatch after expiry. The send itself is then owned by the same plan
-/// (`send_to` / `writable` cannot emit after the deadline). Returns the
-/// bounded termination when the send must not happen.
+/// Enforces stop, shutdown, NodeWaypoint source/destination revalidation, and
+/// the admitted absolute authorization plan immediately before the client send
+/// and across any writability wait.
 #[cfg(target_os = "linux")]
 #[allow(clippy::too_many_arguments)]
 async fn direct_send_reply_or_drop(
@@ -3368,10 +3485,10 @@ async fn direct_send_reply_or_drop(
     proxy_id: &str,
     reason: &str,
     send_drops: &mut UdpReplySendDrops,
-    authorization: Option<crate::proxy::auth_lifetime::StreamAuthDeadline>,
-) -> Option<crate::proxy::auth_lifetime::StreamAuthTermination> {
-    if let Some(termination) = udp_reply_expired_at_commit(authorization) {
-        return Some(termination);
+    commit_guard: &mut UdpReplyCommitGuard<'_>,
+) -> Option<UdpReplyCommitStop> {
+    if let Some(stop) = commit_guard.check_commit() {
+        return Some(stop);
     }
     debug!(
         proxy_id = %proxy_id,
@@ -3380,9 +3497,9 @@ async fn direct_send_reply_or_drop(
         reason,
         "UDP reply using direct-send escape hatch"
     );
-    match direct_send_to_client(frontend, data, client_addr, local_ip, authorization).await {
-        UdpFrontendSendOutcome::AuthorizationExpired(termination) => Some(termination),
-        UdpFrontendSendOutcome::Sent(Err(e)) => {
+    match direct_send_to_client(frontend, data, client_addr, local_ip, commit_guard).await {
+        UdpDirectSendOutcome::Stop(stop) => Some(stop),
+        UdpDirectSendOutcome::Sent(Err(e)) => {
             send_drops.record_datagram(data.len());
             warn!(
                 proxy_id = %proxy_id,
@@ -3393,7 +3510,7 @@ async fn direct_send_reply_or_drop(
             );
             None
         }
-        UdpFrontendSendOutcome::Sent(Ok(_)) => None,
+        UdpDirectSendOutcome::Sent(Ok(_)) => None,
     }
 }
 
@@ -3401,9 +3518,8 @@ async fn direct_send_reply_or_drop(
 /// `Oversized` (datagram larger than the lazy sendmmsg slot) or a stubborn
 /// post-flush `Full`.
 ///
-/// Rechecks the admitted absolute plan immediately before every flush or
-/// fallback send. Returns the bounded termination when queued payloads must
-/// be discarded rather than sent.
+/// Enforces stop, NodeWaypoint source/destination ownership, and authorization
+/// deadline immediately before every flush or fallback send.
 #[cfg(target_os = "linux")]
 #[allow(clippy::too_many_arguments)]
 async fn enqueue_sendmmsg_or_direct(
@@ -3414,13 +3530,13 @@ async fn enqueue_sendmmsg_or_direct(
     local_ip: Option<crate::socket_opts::PktinfoLocal>,
     proxy_id: &str,
     send_drops: &mut UdpReplySendDrops,
-    authorization: Option<crate::proxy::auth_lifetime::StreamAuthDeadline>,
-) -> Option<crate::proxy::auth_lifetime::StreamAuthTermination> {
+    commit_guard: &mut UdpReplyCommitGuard<'_>,
+) -> Option<UdpReplyCommitStop> {
     use super::udp_batch::SendMmsgPushResult;
     use std::os::unix::io::AsRawFd;
 
-    if let Some(termination) = udp_reply_expired_at_commit(authorization) {
-        return Some(termination);
+    if let Some(stop) = commit_guard.check_commit() {
+        return Some(stop);
     }
 
     match send_batch.push_with_local(data, client_addr, local_ip) {
@@ -3429,8 +3545,8 @@ async fn enqueue_sendmmsg_or_direct(
             // Preserve backend reply order: an oversized direct send must not
             // overtake ordinary datagrams already queued in sendmmsg.
             while !send_batch.is_empty() {
-                if let Some(termination) = udp_reply_expired_at_commit(authorization) {
-                    return Some(termination);
+                if let Some(stop) = commit_guard.check_commit() {
+                    return Some(stop);
                 }
                 if flush_sendmmsg_best_effort(send_batch, frontend.as_raw_fd(), send_drops).is_err()
                 {
@@ -3445,13 +3561,13 @@ async fn enqueue_sendmmsg_or_direct(
                 proxy_id,
                 "sendmmsg_oversized",
                 send_drops,
-                authorization,
+                commit_guard,
             )
             .await
         }
         SendMmsgPushResult::Full => {
-            if let Some(termination) = udp_reply_expired_at_commit(authorization) {
-                return Some(termination);
+            if let Some(stop) = commit_guard.check_commit() {
+                return Some(stop);
             }
             let _ = flush_sendmmsg_best_effort(send_batch, frontend.as_raw_fd(), send_drops);
             match send_batch.push_with_local(data, client_addr, local_ip) {
@@ -3465,7 +3581,7 @@ async fn enqueue_sendmmsg_or_direct(
                         proxy_id,
                         "sendmmsg_oversized",
                         send_drops,
-                        authorization,
+                        commit_guard,
                     )
                     .await
                 }
@@ -3480,7 +3596,7 @@ async fn enqueue_sendmmsg_or_direct(
                         proxy_id,
                         "sendmmsg_post_flush_full",
                         send_drops,
-                        authorization,
+                        commit_guard,
                     )
                     .await
                 }
@@ -3501,13 +3617,13 @@ async fn drain_gso_to_sendmmsg_or_direct(
     local_ip: Option<crate::socket_opts::PktinfoLocal>,
     proxy_id: &str,
     send_drops: &mut UdpReplySendDrops,
-    authorization: Option<crate::proxy::auth_lifetime::StreamAuthDeadline>,
-) -> Option<crate::proxy::auth_lifetime::StreamAuthTermination> {
+    commit_guard: &mut UdpReplyCommitGuard<'_>,
+) -> Option<UdpReplyCommitStop> {
     use std::os::unix::io::AsRawFd;
 
     loop {
-        if let Some(termination) = udp_reply_expired_at_commit(authorization) {
-            return Some(termination);
+        if let Some(stop) = commit_guard.check_commit() {
+            return Some(stop);
         }
         gso_batch.drain_to_sendmmsg(send_batch, client_addr, local_ip);
         if gso_batch.is_empty() {
@@ -3516,7 +3632,7 @@ async fn drain_gso_to_sendmmsg_or_direct(
         if send_batch.is_empty() {
             // Stuck on an oversized front segment — escape via direct-send.
             let dgram = gso_batch.take_front_datagram()?;
-            if let Some(termination) = direct_send_reply_or_drop(
+            if let Some(stop) = direct_send_reply_or_drop(
                 frontend,
                 &dgram,
                 client_addr,
@@ -3524,16 +3640,16 @@ async fn drain_gso_to_sendmmsg_or_direct(
                 proxy_id,
                 "gso_drain_sendmmsg_oversized",
                 send_drops,
-                authorization,
+                commit_guard,
             )
             .await
             {
-                return Some(termination);
+                return Some(stop);
             }
             continue;
         }
-        if let Some(termination) = udp_reply_expired_at_commit(authorization) {
-            return Some(termination);
+        if let Some(stop) = commit_guard.check_commit() {
+            return Some(stop);
         }
         let _ = flush_sendmmsg_best_effort(send_batch, frontend.as_raw_fd(), send_drops);
     }
@@ -3543,19 +3659,8 @@ async fn drain_gso_to_sendmmsg_or_direct(
 /// flush and retry, and on GSO socket failure drain the buffered datagrams
 /// through the sendmmsg fallback.
 ///
-/// This collapses three near-identical GSO→sendmmsg fallback blocks that
-/// previously existed inline in `create_session`. Centralising it means the
-/// "post-flush push dropped the datagram" silent-drop guard only has to be
-/// fixed in one place.
-///
-/// `gso_failed` is set to `true` if we have to abandon GSO for this session.
-/// The caller must stop calling this helper after that and drive `send_batch`
-/// directly.
-///
-/// Rechecks the admitted absolute plan immediately before every flush or
-/// fallback send so a payload queued before expiry is discarded rather than
-/// flushed afterwards. Returns the bounded termination when the caller must
-/// abandon the reply loop.
+/// Enforces stop, NodeWaypoint source/destination ownership, and authorization
+/// deadline immediately before every flush or fallback send.
 #[cfg(target_os = "linux")]
 #[allow(clippy::too_many_arguments)]
 async fn try_gso_send_or_fallback(
@@ -3568,17 +3673,17 @@ async fn try_gso_send_or_fallback(
     proxy_id: &str,
     local_ip: Option<crate::socket_opts::PktinfoLocal>,
     send_drops: &mut UdpReplySendDrops,
-    authorization: Option<crate::proxy::auth_lifetime::StreamAuthDeadline>,
-) -> Option<crate::proxy::auth_lifetime::StreamAuthTermination> {
-    if let Some(termination) = udp_reply_expired_at_commit(authorization) {
-        return Some(termination);
+    commit_guard: &mut UdpReplyCommitGuard<'_>,
+) -> Option<UdpReplyCommitStop> {
+    if let Some(stop) = commit_guard.check_commit() {
+        return Some(stop);
     }
     if gso_batch.push(data) {
         return None;
     }
     // Batch full or size-mismatch — flush current batch and try once more.
-    if let Some(termination) = udp_reply_expired_at_commit(authorization) {
-        return Some(termination);
+    if let Some(stop) = commit_guard.check_commit() {
+        return Some(stop);
     }
     match flush_gso_batch(gso_batch, frontend, client_addr, local_ip) {
         Ok(_) => {
@@ -3595,7 +3700,7 @@ async fn try_gso_send_or_fallback(
                     proxy_id,
                     "gso_post_flush_refused",
                     send_drops,
-                    authorization,
+                    commit_guard,
                 )
                 .await;
             }
@@ -3610,7 +3715,7 @@ async fn try_gso_send_or_fallback(
                 e
             );
             *gso_failed = true;
-            if let Some(termination) = drain_gso_to_sendmmsg_or_direct(
+            if let Some(stop) = drain_gso_to_sendmmsg_or_direct(
                 gso_batch,
                 send_batch,
                 frontend,
@@ -3618,11 +3723,11 @@ async fn try_gso_send_or_fallback(
                 local_ip,
                 proxy_id,
                 send_drops,
-                authorization,
+                commit_guard,
             )
             .await
             {
-                return Some(termination);
+                return Some(stop);
             }
             // Now push the current datagram (or direct-send if oversized/full).
             enqueue_sendmmsg_or_direct(
@@ -3633,7 +3738,7 @@ async fn try_gso_send_or_fallback(
                 local_ip,
                 proxy_id,
                 send_drops,
-                authorization,
+                commit_guard,
             )
             .await
         }
@@ -4433,16 +4538,12 @@ pub async fn start_udp_listener_holding_port(
                 info!(proxy_id = %proxy_id, "UDP proxy listener shutting down on port {} (global SIGTERM)", port);
                 return Ok(());
             }
-            ready = frontend_socket.ready(tokio::io::Interest::READABLE | tokio::io::Interest::ERROR), if pktinfo_primary => {
-                #[cfg_attr(not(target_os = "linux"), allow(unused_variables))]
-                let ready_flags = match ready {
-                    Ok(r) => r,
-                    Err(e) => {
-                        udp_count!(ReadinessError, 1);
-                        warn!(proxy_id = %proxy_id, "UDP readable error: {}", e);
-                        continue;
-                    }
-                };
+            ready = frontend_socket.readable(), if pktinfo_primary => {
+                if let Err(e) = ready {
+                    udp_count!(ReadinessError, 1);
+                    warn!(proxy_id = %proxy_id, "UDP readable error: {}", e);
+                    continue;
+                }
 
                 udp_count!(ReadinessReady, 1);
                 #[cfg(target_os = "linux")]
@@ -4474,7 +4575,7 @@ pub async fn start_udp_listener_holding_port(
                             let io_res =
                                 frontend_socket.try_io(tokio::io::Interest::READABLE, || {
                                     match recv_batch.recv(fd, max_this_call) {
-                                        Ok(1) if max_this_call > 1 && !ready_flags.is_error() => {
+                                        Ok(1) if max_this_call > 1 => {
                                             received = 1;
                                             drained_to_eagain = true;
                                             Err(std::io::Error::from(
@@ -4636,12 +4737,10 @@ pub async fn start_udp_listener_holding_port(
                             metrics.record_datagrams_out(batch_dgrams_out, batch_bytes_out);
                         }
                     }
-                    // Charge Tokio cooperative budget when a full batch was
-                    // drained so a continuously readable frontend socket cannot
-                    // starve sibling reply tasks, timers, or shutdown.
-                    if total_drained >= batch_limit {
-                        tokio::task::coop::consume_budget().await;
-                    }
+                    // Charge Tokio cooperative budget on every receive cycle so
+                    // continuous short or full batches cannot starve sibling
+                    // reply tasks, timers, or shutdown.
+                    tokio::task::coop::consume_budget().await;
                 }
             }
             result = frontend_socket.recv_from(&mut buf), if !pktinfo_primary => {
@@ -9594,6 +9693,10 @@ async fn create_session(
     if let Some(source) = node_waypoint_source.as_ref()
         && let Err(refusal) = source.revalidate(source.ingress_ifindex, client_addr.ip())
     {
+        lb_setup_failure.disarm();
+        if let Some(dtls) = dtls_conn {
+            dtls.close().await;
+        }
         source
             .scoping
             .index
@@ -9606,21 +9709,14 @@ async fn create_session(
     if let Some(destination) = node_waypoint_destination.as_ref()
         && let Err(refusal) = destination.revalidate()
     {
+        lb_setup_failure.disarm();
+        if let Some(dtls) = dtls_conn {
+            dtls.close().await;
+        }
         destination.router.warn_refusal(proxy_id, refusal);
         return Err(anyhow::anyhow!(
             "NodeWaypoint UDP destination ownership changed during session setup ({})",
             refusal.as_str()
-        ));
-    }
-    // Recheck overload / stale-CP admission fence right before session
-    // publication so an async setup that crossed into overload or stale CP
-    // state cannot publish a new session while new sources are blocked.
-    if refuse_new_udp_source(overload) {
-        if let Some(dtls) = dtls_conn {
-            dtls.close().await;
-        }
-        return Err(anyhow::anyhow!(
-            "UDP session refused before publication: overload or stale configuration"
         ));
     }
 
@@ -9719,6 +9815,21 @@ async fn create_session(
             latch: auth_latch.clone(),
         }),
     });
+
+    // Recheck the overload / stale-CP admission fence at the exact publication
+    // boundary (before launching any hook worker or inserting into `sessions`)
+    // so an async setup that crossed into overload or stale CP state cannot
+    // publish a new session. Disarm `lb_setup_failure` because gateway
+    // admission refusal is not a backend fault.
+    if refuse_new_udp_source(overload) {
+        lb_setup_failure.disarm();
+        if let Some(dtls) = dtls_conn {
+            dtls.close().await;
+        }
+        return Err(anyhow::anyhow!(
+            "UDP session refused before publication: overload or stale configuration"
+        ));
+    }
 
     if let Some(rx) = hook_ingress_rx {
         spawn_session_hook_ingress_worker(
@@ -9863,6 +9974,8 @@ async fn create_session(
                 // discipline as `udp_reply_recv_until_stop`).
                 stop_notified.as_mut().enable();
 
+                let mut commit_listener_shutdown = reply_listener_shutdown.clone();
+                let mut commit_global_shutdown = reply_global_shutdown.clone();
                 let shutdown_cancel = udp_reply_shutdown_cancel(
                     &mut reply_listener_shutdown,
                     &mut reply_global_shutdown,
@@ -9928,20 +10041,61 @@ async fn create_session(
                         }
                     };
 
-                    // Single recvmmsg(max=recv_max): when 0 < n < recv_max and
-                    // `EPOLLERR` is not signaled, the kernel drained the queue
-                    // to EAGAIN inside this syscall, so returning WouldBlock to
-                    // `try_io(READABLE)` clears Tokio's cached READABLE bit
-                    // without a trailing recv() syscall (while leaving any
-                    // independent ERROR readiness bit intact). When `is_error()`
-                    // is set we keep draining to observe `ECONNREFUSED` promptly.
+                    // Charge cooperative budget once per ready cycle before any
+                    // drop/error/send branch so a continuously ready backend
+                    // (including amplification- or hook-dropped bursts) can
+                    // never monopolize a Tokio worker thread.
+                    tokio::task::coop::consume_budget().await;
+
+                    // Handle `EPOLLERR` explicitly BEFORE `try_io(READABLE)`:
+                    // Tokio's `ERROR` readiness bit is sticky and `try_io(READABLE)`
+                    // never clears it (returning `WouldBlock` without running the
+                    // closure when `READABLE` is unset). Clearing `ERROR` via
+                    // `try_io(ERROR)` and reading `SO_ERROR` via `take_error()`
+                    // prevents infinite spins on ICMP errors (`ECONNREFUSED`) and
+                    // immediately tears down unreachable backend sessions.
+                    if ready_flags.is_error() {
+                        let _ = sock.try_io(tokio::io::Interest::ERROR, || {
+                            Err::<(), _>(std::io::Error::from(std::io::ErrorKind::WouldBlock))
+                        });
+                        match sock.take_error() {
+                            Ok(Some(e)) | Err(e) => {
+                                debug!(
+                                    proxy_id = %reply_proxy_id,
+                                    client = %udp_client_log_addr(client_addr),
+                                    "UDP backend socket error: {}",
+                                    e
+                                );
+                                disconnect_error = Some((
+                                    e.to_string(),
+                                    crate::retry::classify_boxed_error(&e),
+                                    crate::plugins::DisconnectCause::BackendError,
+                                    crate::plugins::Direction::BackendToClient,
+                                ));
+                                break 'reply_linux;
+                            }
+                            Ok(None) => {
+                                if !ready_flags.is_readable() {
+                                    continue 'reply_linux;
+                                }
+                            }
+                        }
+                    }
+
+                    // Single recvmmsg(max=recv_max): when 0 < n < recv_max, the
+                    // kernel drained the receive queue inside this syscall, so
+                    // returning WouldBlock to `try_io(READABLE)` clears Tokio's
+                    // cached READABLE bit without a trailing recv() syscall.
+                    // Any concurrent ICMP error triggers `sk_error_report` ->
+                    // `EPOLLERR` independently of `READABLE`, waking the next
+                    // `ready(READABLE | ERROR)` iteration above.
                     let recv_max = backend_recv.capacity();
                     let mut received: usize = 0;
                     let mut drained_to_eagain = false;
                     let io_res = sock.try_io(tokio::io::Interest::READABLE, || match backend_recv
                         .recv(backend_fd, recv_max)
                     {
-                        Ok(n) if n > 0 && n < recv_max && !ready_flags.is_error() => {
+                        Ok(n) if n > 0 && n < recv_max => {
                             received = n;
                             drained_to_eagain = true;
                             Err(std::io::Error::from(std::io::ErrorKind::WouldBlock))
@@ -10157,12 +10311,84 @@ async fn create_session(
                         match send_res {
                             Ok(_) => {}
                             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                                // Frontend backpressure retry: use `try_io(WRITABLE)`
-                                // so Tokio clears its cached writable bit on EAGAIN
-                                // (preventing spin loops), race `writable()` against
-                                // the single-armed deadline, stop, and shutdown, and
-                                // revalidate all policy/expiry guards after each wait.
+                                // Frontend backpressure retry: clear Tokio's cached
+                                // WRITABLE bit immediately without a duplicate send
+                                // syscall, enter the cancellation select first, then
+                                // revalidate all policy/expiry guards before retrying
+                                // via `try_io(WRITABLE)`.
+                                let _ = frontend.try_io(tokio::io::Interest::WRITABLE, || {
+                                    Err::<(), _>(std::io::Error::from(
+                                        std::io::ErrorKind::WouldBlock,
+                                    ))
+                                });
                                 'singleton_retry: loop {
+                                    let writable_res = tokio::select! {
+                                        biased;
+                                        () = reply_authorization_deadline.as_mut(), if reply_authorization_plan.is_some() => {
+                                            let plan = reply_authorization_plan.expect("guarded by if");
+                                            reply_session.settle_authorization_expiry(plan.termination);
+                                            break 'reply_linux;
+                                        }
+                                        () = &mut stop_notified => break 'reply_linux,
+                                        () = &mut shutdown_cancel => break 'reply_linux,
+                                        w = frontend.writable() => w,
+                                    };
+                                    if let Err(e) = writable_res {
+                                        debug!(
+                                            proxy_id = %reply_proxy_id,
+                                            client = %udp_client_log_addr(client_addr),
+                                            "UDP frontend writable wait failed: {}",
+                                            e
+                                        );
+                                        sent_ok = false;
+                                        disconnect_error = Some((
+                                            e.to_string(),
+                                            crate::retry::classify_boxed_error(&e),
+                                            crate::plugins::DisconnectCause::RecvError,
+                                            crate::plugins::Direction::BackendToClient,
+                                        ));
+                                        break 'singleton_retry;
+                                    }
+                                    if reply_session.stop_reply_task.load(Ordering::Acquire) {
+                                        break 'reply_linux;
+                                    }
+                                    if let Some(source) =
+                                        reply_session.node_waypoint_source.as_ref()
+                                        && let Err(refusal) = source
+                                            .revalidate(source.ingress_ifindex, client_addr.ip())
+                                    {
+                                        source.scoping.index.warn_refusal(
+                                            &reply_proxy_id,
+                                            &udp_session_client_ip(client_addr),
+                                            refusal,
+                                        );
+                                        reply_session.expired.store(true, Ordering::Release);
+                                        disconnect_error = Some((
+                                            format!(
+                                                "NodeWaypoint UDP source attribution no longer valid ({})",
+                                                refusal.as_str()
+                                            ),
+                                            crate::retry::ErrorClass::DispatchPolicyRejected,
+                                            crate::plugins::DisconnectCause::RecvError,
+                                            crate::plugins::Direction::BackendToClient,
+                                        ));
+                                        break 'reply_linux;
+                                    }
+                                    if let Err(error) = reply_session.revalidate_destination() {
+                                        disconnect_error = Some((
+                                            error.to_string(),
+                                            crate::retry::ErrorClass::DispatchPolicyRejected,
+                                            crate::plugins::DisconnectCause::RecvError,
+                                            crate::plugins::Direction::BackendToClient,
+                                        ));
+                                        break 'reply_linux;
+                                    }
+                                    if let Some(termination) =
+                                        udp_reply_expired_at_commit(reply_authorization_plan)
+                                    {
+                                        reply_session.settle_authorization_expiry(termination);
+                                        break 'reply_linux;
+                                    }
                                     let retry_res =
                                         frontend.try_io(tokio::io::Interest::WRITABLE, || {
                                             crate::socket_opts::send_with_prebuilt_pktinfo(
@@ -10185,81 +10411,7 @@ async fn create_session(
                                     match retry_res {
                                         Ok(_) => break 'singleton_retry,
                                         Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                                            let writable_res = tokio::select! {
-                                                biased;
-                                                () = reply_authorization_deadline.as_mut(), if reply_authorization_plan.is_some() => {
-                                                    let plan = reply_authorization_plan.expect("guarded by if");
-                                                    reply_session.settle_authorization_expiry(plan.termination);
-                                                    break 'reply_linux;
-                                                }
-                                                () = &mut stop_notified => break 'reply_linux,
-                                                () = &mut shutdown_cancel => break 'reply_linux,
-                                                w = frontend.writable() => w,
-                                            };
-                                            if let Err(e) = writable_res {
-                                                debug!(
-                                                    proxy_id = %reply_proxy_id,
-                                                    client = %udp_client_log_addr(client_addr),
-                                                    "UDP frontend writable wait failed: {}",
-                                                    e
-                                                );
-                                                sent_ok = false;
-                                                disconnect_error = Some((
-                                                    e.to_string(),
-                                                    crate::retry::classify_boxed_error(&e),
-                                                    crate::plugins::DisconnectCause::RecvError,
-                                                    crate::plugins::Direction::BackendToClient,
-                                                ));
-                                                break 'singleton_retry;
-                                            }
-                                            if reply_session.stop_reply_task.load(Ordering::Acquire)
-                                            {
-                                                break 'reply_linux;
-                                            }
-                                            if let Some(source) =
-                                                reply_session.node_waypoint_source.as_ref()
-                                                && let Err(refusal) = source.revalidate(
-                                                    source.ingress_ifindex,
-                                                    client_addr.ip(),
-                                                )
-                                            {
-                                                source.scoping.index.warn_refusal(
-                                                    &reply_proxy_id,
-                                                    &udp_session_client_ip(client_addr),
-                                                    refusal,
-                                                );
-                                                reply_session
-                                                    .expired
-                                                    .store(true, Ordering::Release);
-                                                disconnect_error = Some((
-                                                    format!(
-                                                        "NodeWaypoint UDP source attribution no longer valid ({})",
-                                                        refusal.as_str()
-                                                    ),
-                                                    crate::retry::ErrorClass::DispatchPolicyRejected,
-                                                    crate::plugins::DisconnectCause::RecvError,
-                                                    crate::plugins::Direction::BackendToClient,
-                                                ));
-                                                break 'reply_linux;
-                                            }
-                                            if let Err(error) =
-                                                reply_session.revalidate_destination()
-                                            {
-                                                disconnect_error = Some((
-                                                    error.to_string(),
-                                                    crate::retry::ErrorClass::DispatchPolicyRejected,
-                                                    crate::plugins::DisconnectCause::RecvError,
-                                                    crate::plugins::Direction::BackendToClient,
-                                                ));
-                                                break 'reply_linux;
-                                            }
-                                            if let Some(termination) = udp_reply_expired_at_commit(
-                                                reply_authorization_plan,
-                                            ) {
-                                                reply_session
-                                                    .settle_authorization_expiry(termination);
-                                                break 'reply_linux;
-                                            }
+                                            continue 'singleton_retry;
                                         }
                                         Err(e) => {
                                             debug!(
@@ -10313,9 +10465,6 @@ async fn create_session(
                         if disconnect_error.is_some() {
                             break 'reply_linux;
                         }
-                        // Charge cooperative budget so a continuously readable
-                        // backend cannot monopolize a Tokio worker thread.
-                        tokio::task::coop::consume_budget().await;
                         continue 'reply_linux;
                     }
 
@@ -10566,12 +10715,18 @@ async fn create_session(
                                 }
                             }
 
-                            batch_dgrams += 1;
-                            batch_bytes += len2 as u64;
                             batch_bytes_received += len2 as u64;
 
-                            if reply_udp_gso && !gso_failed {
-                                if let Some(termination) = try_gso_send_or_fallback(
+                            let mut commit_guard = UdpReplyCommitGuard {
+                                session: &reply_session,
+                                client_addr,
+                                proxy_id: &reply_proxy_id,
+                                authorization: reply_authorization_plan,
+                                listener_shutdown: &mut commit_listener_shutdown,
+                                global_shutdown: &mut commit_global_shutdown,
+                            };
+                            let enqueue_stop = if reply_udp_gso && !gso_failed {
+                                try_gso_send_or_fallback(
                                     gso_batch_ref,
                                     send_batch_ref,
                                     &frontend,
@@ -10581,34 +10736,37 @@ async fn create_session(
                                     &reply_proxy_id,
                                     session_local_ip,
                                     &mut send_drops,
-                                    reply_authorization_plan,
+                                    &mut commit_guard,
                                 )
                                 .await
-                                {
-                                    reply_session.settle_authorization_expiry(termination);
-                                    discard_and_settle_committed(
-                                        gso_batch_ref,
-                                        send_batch_ref,
-                                        batch_dgrams,
-                                        batch_bytes,
-                                        batch_bytes_received,
-                                        &send_drops,
-                                    );
-                                    break 'reply_linux;
+                            } else {
+                                enqueue_sendmmsg_or_direct(
+                                    send_batch_ref,
+                                    &frontend,
+                                    client_addr,
+                                    send_data,
+                                    session_local_ip,
+                                    &reply_proxy_id,
+                                    &mut send_drops,
+                                    &mut commit_guard,
+                                )
+                                .await
+                            };
+                            if let Some(stop) = enqueue_stop {
+                                match stop {
+                                    UdpReplyCommitStop::Stopped => {}
+                                    UdpReplyCommitStop::AuthorizationExpired(termination) => {
+                                        reply_session.settle_authorization_expiry(termination);
+                                    }
+                                    UdpReplyCommitStop::PolicyRejected(msg) => {
+                                        disconnect_error = Some((
+                                            msg,
+                                            crate::retry::ErrorClass::DispatchPolicyRejected,
+                                            crate::plugins::DisconnectCause::RecvError,
+                                            crate::plugins::Direction::BackendToClient,
+                                        ));
+                                    }
                                 }
-                            } else if let Some(termination) = enqueue_sendmmsg_or_direct(
-                                send_batch_ref,
-                                &frontend,
-                                client_addr,
-                                send_data,
-                                session_local_ip,
-                                &reply_proxy_id,
-                                &mut send_drops,
-                                reply_authorization_plan,
-                            )
-                            .await
-                            {
-                                reply_session.settle_authorization_expiry(termination);
                                 discard_and_settle_committed(
                                     gso_batch_ref,
                                     send_batch_ref,
@@ -10619,6 +10777,8 @@ async fn create_session(
                                 );
                                 break 'reply_linux;
                             }
+                            batch_dgrams += 1;
+                            batch_bytes += len2 as u64;
                         }
 
                         if cur_drained_to_eagain || total_drained >= batch_limit {
@@ -10629,7 +10789,7 @@ async fn create_session(
                         let mut next_eagain = false;
                         let drain_res = sock.try_io(tokio::io::Interest::READABLE, || {
                             match backend_recv.recv(backend_fd, max_this) {
-                                Ok(n) if n > 0 && n < max_this && !ready_flags.is_error() => {
+                                Ok(n) if n > 0 && n < max_this => {
                                     next_n = n;
                                     next_eagain = true;
                                     Err(std::io::Error::from(std::io::ErrorKind::WouldBlock))
@@ -10753,7 +10913,15 @@ async fn create_session(
                                 e
                             );
                             gso_failed = true;
-                            if let Some(termination) = drain_gso_to_sendmmsg_or_direct(
+                            let mut commit_guard = UdpReplyCommitGuard {
+                                session: &reply_session,
+                                client_addr,
+                                proxy_id: &reply_proxy_id,
+                                authorization: reply_authorization_plan,
+                                listener_shutdown: &mut commit_listener_shutdown,
+                                global_shutdown: &mut commit_global_shutdown,
+                            };
+                            if let Some(stop) = drain_gso_to_sendmmsg_or_direct(
                                 gso_batch_ref,
                                 send_batch_ref,
                                 &frontend,
@@ -10761,11 +10929,24 @@ async fn create_session(
                                 session_local_ip,
                                 &reply_proxy_id,
                                 &mut send_drops,
-                                reply_authorization_plan,
+                                &mut commit_guard,
                             )
                             .await
                             {
-                                reply_session.settle_authorization_expiry(termination);
+                                match stop {
+                                    UdpReplyCommitStop::Stopped => {}
+                                    UdpReplyCommitStop::AuthorizationExpired(termination) => {
+                                        reply_session.settle_authorization_expiry(termination);
+                                    }
+                                    UdpReplyCommitStop::PolicyRejected(msg) => {
+                                        disconnect_error = Some((
+                                            msg,
+                                            crate::retry::ErrorClass::DispatchPolicyRejected,
+                                            crate::plugins::DisconnectCause::RecvError,
+                                            crate::plugins::Direction::BackendToClient,
+                                        ));
+                                    }
+                                }
                                 discard_and_settle_committed(
                                     gso_batch_ref,
                                     send_batch_ref,
@@ -10898,9 +11079,6 @@ async fn create_session(
                     if disconnect_error.is_some() {
                         break 'reply_linux;
                     }
-                    // Charge cooperative budget so a continuously readable
-                    // backend cannot monopolize a Tokio worker thread.
-                    tokio::task::coop::consume_budget().await;
                 }
             }
         }
@@ -11224,8 +11402,16 @@ async fn create_session(
                 if send_batched {
                     #[cfg(target_os = "linux")]
                     {
-                        if reply_udp_gso && !gso_failed {
-                            if let Some(termination) = try_gso_send_or_fallback(
+                        let mut commit_guard = UdpReplyCommitGuard {
+                            session: &reply_session,
+                            client_addr,
+                            proxy_id: &reply_proxy_id,
+                            authorization: reply_authorization_plan,
+                            listener_shutdown: &mut reply_listener_shutdown,
+                            global_shutdown: &mut reply_global_shutdown,
+                        };
+                        let stop = if reply_udp_gso && !gso_failed {
+                            try_gso_send_or_fallback(
                                 &mut gso_batch,
                                 &mut send_batch,
                                 &frontend,
@@ -11235,28 +11421,37 @@ async fn create_session(
                                 &reply_proxy_id,
                                 session_local_ip,
                                 &mut send_drops,
-                                reply_authorization_plan,
+                                &mut commit_guard,
                             )
                             .await
-                            {
-                                reply_session.settle_authorization_expiry(termination);
-                                gso_batch.discard();
-                                send_batch.discard();
-                                break 'reply;
+                        } else {
+                            enqueue_sendmmsg_or_direct(
+                                &mut send_batch,
+                                &frontend,
+                                client_addr,
+                                send_data,
+                                session_local_ip,
+                                &reply_proxy_id,
+                                &mut send_drops,
+                                &mut commit_guard,
+                            )
+                            .await
+                        };
+                        if let Some(stop) = stop {
+                            match stop {
+                                UdpReplyCommitStop::Stopped => {}
+                                UdpReplyCommitStop::AuthorizationExpired(termination) => {
+                                    reply_session.settle_authorization_expiry(termination);
+                                }
+                                UdpReplyCommitStop::PolicyRejected(msg) => {
+                                    disconnect_error = Some((
+                                        msg,
+                                        crate::retry::ErrorClass::DispatchPolicyRejected,
+                                        crate::plugins::DisconnectCause::RecvError,
+                                        crate::plugins::Direction::BackendToClient,
+                                    ));
+                                }
                             }
-                        } else if let Some(termination) = enqueue_sendmmsg_or_direct(
-                            &mut send_batch,
-                            &frontend,
-                            client_addr,
-                            send_data,
-                            session_local_ip,
-                            &reply_proxy_id,
-                            &mut send_drops,
-                            reply_authorization_plan,
-                        )
-                        .await
-                        {
-                            reply_session.settle_authorization_expiry(termination);
                             gso_batch.discard();
                             send_batch.discard();
                             break 'reply;
@@ -11457,8 +11652,16 @@ async fn create_session(
                                 if send_batched {
                                     #[cfg(target_os = "linux")]
                                     {
-                                        if reply_udp_gso && !gso_failed {
-                                            if let Some(termination) = try_gso_send_or_fallback(
+                                        let mut commit_guard = UdpReplyCommitGuard {
+                                            session: &reply_session,
+                                            client_addr,
+                                            proxy_id: &reply_proxy_id,
+                                            authorization: reply_authorization_plan,
+                                            listener_shutdown: &mut reply_listener_shutdown,
+                                            global_shutdown: &mut reply_global_shutdown,
+                                        };
+                                        let stop = if reply_udp_gso && !gso_failed {
+                                            try_gso_send_or_fallback(
                                                 &mut gso_batch,
                                                 &mut send_batch,
                                                 &frontend,
@@ -11468,17 +11671,10 @@ async fn create_session(
                                                 &reply_proxy_id,
                                                 session_local_ip,
                                                 &mut send_drops,
-                                                reply_authorization_plan,
+                                                &mut commit_guard,
                                             )
                                             .await
-                                            {
-                                                reply_session
-                                                    .settle_authorization_expiry(termination);
-                                                gso_batch.discard();
-                                                send_batch.discard();
-                                                break 'reply;
-                                            }
-                                        } else if let Some(termination) =
+                                        } else {
                                             enqueue_sendmmsg_or_direct(
                                                 &mut send_batch,
                                                 &frontend,
@@ -11487,11 +11683,28 @@ async fn create_session(
                                                 session_local_ip,
                                                 &reply_proxy_id,
                                                 &mut send_drops,
-                                                reply_authorization_plan,
+                                                &mut commit_guard,
                                             )
                                             .await
-                                        {
-                                            reply_session.settle_authorization_expiry(termination);
+                                        };
+                                        if let Some(stop) = stop {
+                                            match stop {
+                                                UdpReplyCommitStop::Stopped => {}
+                                                UdpReplyCommitStop::AuthorizationExpired(
+                                                    termination,
+                                                ) => {
+                                                    reply_session
+                                                        .settle_authorization_expiry(termination);
+                                                }
+                                                UdpReplyCommitStop::PolicyRejected(msg) => {
+                                                    disconnect_error = Some((
+                                                        msg,
+                                                        crate::retry::ErrorClass::DispatchPolicyRejected,
+                                                        crate::plugins::DisconnectCause::RecvError,
+                                                        crate::plugins::Direction::BackendToClient,
+                                                    ));
+                                                }
+                                            }
                                             gso_batch.discard();
                                             send_batch.discard();
                                             break 'reply;
@@ -11672,7 +11885,15 @@ async fn create_session(
                             gso_failed = true;
                             // Replay all buffered datagrams through sendmmsg /
                             // direct-send for segments that exceed the slot size.
-                            if let Some(termination) = drain_gso_to_sendmmsg_or_direct(
+                            let mut commit_guard = UdpReplyCommitGuard {
+                                session: &reply_session,
+                                client_addr,
+                                proxy_id: &reply_proxy_id,
+                                authorization: reply_authorization_plan,
+                                listener_shutdown: &mut reply_listener_shutdown,
+                                global_shutdown: &mut reply_global_shutdown,
+                            };
+                            if let Some(stop) = drain_gso_to_sendmmsg_or_direct(
                                 &mut gso_batch,
                                 &mut send_batch,
                                 &frontend,
@@ -11680,11 +11901,24 @@ async fn create_session(
                                 session_local_ip,
                                 &reply_proxy_id,
                                 &mut send_drops,
-                                reply_authorization_plan,
+                                &mut commit_guard,
                             )
                             .await
                             {
-                                reply_session.settle_authorization_expiry(termination);
+                                match stop {
+                                    UdpReplyCommitStop::Stopped => {}
+                                    UdpReplyCommitStop::AuthorizationExpired(termination) => {
+                                        reply_session.settle_authorization_expiry(termination);
+                                    }
+                                    UdpReplyCommitStop::PolicyRejected(msg) => {
+                                        disconnect_error = Some((
+                                            msg,
+                                            crate::retry::ErrorClass::DispatchPolicyRejected,
+                                            crate::plugins::DisconnectCause::RecvError,
+                                            crate::plugins::Direction::BackendToClient,
+                                        ));
+                                    }
+                                }
                                 gso_batch.discard();
                                 send_batch.discard();
                                 break 'reply;
@@ -11744,9 +11978,6 @@ async fn create_session(
 
                 // Flush batched metrics.
                 udp_count!(ReplyCounterUpdates, 4);
-                if reply_session.last_activity.load(Ordering::Relaxed) != now {
-                    reply_session.last_activity.store(now, Ordering::Relaxed);
-                }
                 reply_session
                     .bytes_received
                     .fetch_add(batch_bytes_received, Ordering::Relaxed);
@@ -11755,7 +11986,15 @@ async fn create_session(
                     batch_dgrams = batch_dgrams.saturating_sub(send_drops.datagrams);
                     batch_bytes = batch_bytes.saturating_sub(send_drops.bytes);
                 }
-                reply_metrics.record_datagrams_out(batch_dgrams, batch_bytes);
+                if batch_dgrams > 0 {
+                    let activity_now = coarse_epoch_millis();
+                    if reply_session.last_activity.load(Ordering::Relaxed) < activity_now {
+                        reply_session
+                            .last_activity
+                            .fetch_max(activity_now, Ordering::Relaxed);
+                    }
+                    reply_metrics.record_datagrams_out(batch_dgrams, batch_bytes);
+                }
             }
         }
         // Session's backend receiver exited — remove session.

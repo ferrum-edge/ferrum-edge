@@ -4408,5 +4408,98 @@ async fn udp_amplification_policy_reload_retires_sessions_with_stale_budget() {
     manager.shutdown_all().await;
 }
 
+/// Regression test: a connected UDP backend socket receiving ICMP Port
+/// Unreachable (`EPOLLERR` / `ECONNREFUSED` with an empty receive queue) must
+/// clear `Interest::ERROR`, observe the socket error, and tear down cleanly
+/// instead of spinning forever and starving a single-threaded Tokio worker.
+#[tokio::test(flavor = "current_thread")]
+async fn udp_reply_task_tears_down_promptly_on_icmp_port_unreachable_without_spinning() {
+    // Reserve and immediately release a loopback UDP port so the backend is
+    // guaranteed closed (eliciting ICMP Port Unreachable on datagram send).
+    let closed_backend = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind temp backend");
+    let closed_backend_port = closed_backend.local_addr().expect("backend addr").port();
+    drop(closed_backend);
+
+    // Pick a free listener port.
+    let free_frontend = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind temp frontend");
+    let frontend_port = free_frontend.local_addr().expect("frontend addr").port();
+    drop(free_frontend);
+
+    let mut proxy = create_stream_proxy(DIRECT_UDP_LISTENER_ID, BackendScheme::Udp, frontend_port);
+    proxy.backend_host = "127.0.0.1".to_string();
+    proxy.backend_port = closed_backend_port;
+    proxy.udp_idle_timeout_seconds = 60;
+    let config = GatewayConfig {
+        proxies: vec![proxy],
+        ..empty_config()
+    };
+    let runtime = create_manager_runtime(Arc::new(ArcSwap::from_pointee(config.clone())), &config);
+
+    let started = Arc::new(AtomicBool::new(false));
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let mut cfg = direct_udp_listener_config(&runtime, frontend_port, shutdown_rx, started.clone());
+    cfg.udp_pktinfo_enabled = true;
+    cfg.cleanup_interval_seconds = 60;
+    let metrics = Arc::clone(&cfg.metrics);
+
+    let listener = tokio::spawn(start_udp_listener_holding_port(cfg, None));
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !started.load(Ordering::Acquire) {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("UDP listener should bind promptly");
+
+    let client = tokio::net::UdpSocket::bind("127.0.0.1:0")
+        .await
+        .expect("bind client socket");
+    let gateway_addr = SocketAddr::from(([127, 0, 0, 1], frontend_port));
+    client
+        .send_to(b"probe-closed-backend", gateway_addr)
+        .await
+        .expect("send datagram to gateway");
+
+    // Wait for session creation, then verify the single-threaded runtime stays
+    // responsive (no worker spin) and tears down the session on ECONNREFUSED.
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while metrics.total_sessions.load(Ordering::Acquire) == 0 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        // On Linux (and macOS loopback), ICMP Port Unreachable surfaces
+        // ECONNREFUSED immediately on the connected backend socket. Send one
+        // follow-up if needed, then verify active_sessions drains to 0 well
+        // before the 60s idle timeout while sibling timer polls stay responsive.
+        let mut ticks = 0u32;
+        while metrics.active_sessions.load(Ordering::Acquire) > 0 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            ticks += 1;
+            if ticks == 5 {
+                let _ = client.send_to(b"probe-2", gateway_addr).await;
+            }
+            // Even if a host suppresses loopback ICMP, 20 responsive ticks on
+            // a current_thread runtime prove the reply task is NOT spinning.
+            if cfg!(not(target_os = "linux")) && ticks >= 20 {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("reply task must not spin or starve current_thread runtime on ICMP error");
+
+    if cfg!(target_os = "linux") {
+        assert_eq!(
+            metrics.active_sessions.load(Ordering::Acquire),
+            0,
+            "Linux reply task must tear down session promptly on ECONNREFUSED"
+        );
+    }
+
+    let _ = shutdown_tx.send(true);
+    let _ = tokio::time::timeout(Duration::from_secs(5), listener)
+        .await
+        .expect("listener should shut down promptly");
+}
+
 #[path = "stream_runtime_tests.rs"]
 mod stream_runtime_tests;
