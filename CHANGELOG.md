@@ -220,6 +220,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   listeners** (#7423). Sidecar `:15006` and waypoint HBONE `:15008` no longer
   match them. Before, a peer, or a plaintext client under PERMISSIVE, could name
   a routed host and have the proxy dial it onward with its own mesh identity.
+- **A mesh slice whose carried route plugin records are not translator-shaped
+  is rejected at decode** (#7440). Sidecars and NodeWaypoints refuse the whole
+  slice when it carries:
+  - duplicate proxy, upstream or plugin-config ids;
+  - a carried route plugin record of a kind the translator never emits (only
+    `mesh_route_dispatch`, `request_transformer`, `response_transformer`,
+    `request_termination`, `request_mirror` and `cors` are carried), or one
+    whose id, scope, association, `enabled` flag or other fields differ from
+    what the translator builds;
+  - a malformed `mesh_route_dispatch` instance, or one the plugin cache would
+    not build;
+  - a config body outside the translator's shape, including a credentialed
+    non-strict CORS origin, a CORS `max_age` outside the translator's range,
+    more than 64 CORS origin matchers or one over 512 bytes (checked before any
+    origin regex is compiled), and Istio durations beyond the translator's
+    bound.
+
+  Decode validates bodies with the plugins' own constructors and builds no DNS
+  or HTTP clients. A `null` `source_namespace` is treated as absent.
 
 ### Added
 - **Sidecar data planes apply mesh-bound VirtualService `http[]` routes**
@@ -233,7 +252,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `rewrite.authority` naming that destination is forwarded verbatim, and plain
   Service routes are unchanged. The clones share the Service's DestinationRule
   `http2MaxRequests` and `http1MaxPendingRequests` lanes.
-  `match.sourceNamespace` is decided from the Sidecar's own workload namespace.
+  `match.sourceNamespace` is decided per match condition from the Sidecar's own
+  workload namespace: a condition naming another namespace is dropped on its
+  own, and the route keeps its OR siblings, later rules and fallback (#7440).
   Sidecars request the routes with the new
   `MeshSubscribeRequest.sidecar_http_routes` (proto field 10) / xDS
   node-metadata flag. ServiceWaypoint projection and a live weighted-split
