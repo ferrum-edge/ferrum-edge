@@ -4385,6 +4385,18 @@ fn decode_http_route_set(
             Ok(plugin)
         })
         .collect::<Result<_, _>>()?;
+    // Plugin config ids are namespaced resource ids: two records sharing one
+    // (owned by different routes or not) would make every later id-keyed step
+    // (association resolution, Sidecar instance detachment, the plugin cache)
+    // act on both. Refused before any filtering.
+    let mut plugin_config_ids: HashSet<&str> = HashSet::with_capacity(plugin_configs.len());
+    for (index, plugin) in plugin_configs.iter().enumerate() {
+        if !plugin_config_ids.insert(plugin.id.as_str()) {
+            return Err(anyhow::anyhow!(
+                "Mesh slice HTTP route plugin config {index} reuses another plugin config's id"
+            ));
+        }
+    }
     let upstreams: Vec<Upstream> = set
         .upstreams
         .iter()
@@ -5568,9 +5580,12 @@ fn clone_sidecar_carried_destination_upstreams(
 /// uses for L4 routes).
 ///
 /// Istio `match[]` entries are ORed. The translator emits one rule per
-/// in-scope entry that has a non-URI predicate (a URI-only entry emits no
-/// rule: the route's `listen_path` carries it and `reject_unmatched` is off,
-/// so unclaimed requests reach the route's own destination). So
+/// in-scope entry with a non-URI predicate. An unguarded URI-only entry can be
+/// represented by the route's `listen_path` and default destination instead
+/// (it turns `reject_unmatched` off, so unclaimed requests reach the route's
+/// own destination), but a URI-only entry still gets a rule when it needs a
+/// URI guard on a broader listen path or when its `http[]` entry carries
+/// route-local actions (header transforms, fault, rewrite, redirect). So
 /// `sourceNamespace` is decided per rule (one match condition): a
 /// rule naming the local namespace drops the predicate (keeping its other
 /// predicates, or matching every path when it had none), and any other rule,
@@ -5578,6 +5593,11 @@ fn clone_sidecar_carried_destination_upstreams(
 /// is removed, fail-closed. Only that condition goes: its OR siblings, later
 /// rules and the route's own destination are kept, and a removed condition
 /// never turns into a broader match. Rule order is kept.
+///
+/// The instance's miss policy is read from the original config with the
+/// plugin's own parser, so a valid object that omits `reject_unmatched` keeps
+/// its default, while a malformed one (a non-boolean flag, an unknown key)
+/// refuses the route instead of being detached.
 ///
 /// When every rule of an instance is removed (issue #7440):
 /// * with `reject_unmatched` the route serves only matched requests, so it now
@@ -5610,6 +5630,18 @@ fn resolve_sidecar_carried_route_source_namespaces(
         {
             continue;
         }
+        // The miss policy of the instance as the plugin would construct it,
+        // read from the untrusted slice value before any rule is touched: a
+        // valid object that omits `reject_unmatched` keeps its default, and a
+        // config the plugin would refuse (a non-boolean flag, an unknown key
+        // such as `rejectUnmatched`) is `None`, which refuses the route below
+        // instead of detaching the malformed instance.
+        let reject_unmatched =
+            crate::plugins::mesh_route_dispatch::MeshRouteDispatchConfig::from_value(
+                &plugin.config,
+            )
+            .ok()
+            .map(|parsed| parsed.reject_unmatched);
         let Some(rules) = plugin
             .config
             .get_mut("rules")
@@ -5645,18 +5677,12 @@ fn resolve_sidecar_carried_route_source_namespaces(
             && rules.is_empty()
             && let Some(proxy_id) = plugin.proxy_id.clone()
         {
-            // Absent keeps the plugin's default (`false`). The value is
-            // untrusted slice input, so a present non-boolean (which the
-            // plugin would refuse to construct) fails closed: the route is
-            // refused rather than its instance detached.
-            let reject_unmatched = match plugin.config.get("reject_unmatched") {
-                None => false,
-                Some(value) => value.as_bool().unwrap_or(true),
-            };
-            if reject_unmatched {
-                emptied.insert((plugin.namespace.clone(), proxy_id));
-            } else {
+            // Only a well-formed instance that serves unmatched requests is
+            // detached; a matched-only or malformed one refuses the route.
+            if reject_unmatched == Some(false) {
                 detached.insert((plugin.namespace.clone(), plugin.id.clone()));
+            } else {
+                emptied.insert((plugin.namespace.clone(), proxy_id));
             }
         }
     }

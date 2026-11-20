@@ -2388,3 +2388,106 @@ fn sidecar_source_namespace_fails_closed_on_a_malformed_reject_unmatched() {
         assert_eq!(api_served, served, "reject_unmatched = {value}");
     }
 }
+
+/// Review finding sol F2 (#7443 round 2): the miss policy of an emptied
+/// dispatch instance is read with the plugin's own parser. A valid object that
+/// omits `reject_unmatched` keeps its default and the route serves its
+/// fallback; an unknown key such as `rejectUnmatched` (which the plugin would
+/// refuse to construct) refuses the route instead of detaching the instance.
+#[test]
+fn sidecar_source_namespace_parses_the_dispatch_miss_policy() {
+    let config = translated_config(&[virtual_service(
+        "or",
+        json!({
+            "hosts": ["reviews.default.svc.cluster.local"],
+            "http": [{
+                "match": [
+                    {"uri": {"prefix": "/api"}, "sourceNamespace": "other-ns"},
+                    {"uri": {"prefix": "/api"}}
+                ],
+                "route": route_to("ratings")
+            }]
+        }),
+    )]);
+    let runtime = sidecar_runtime_for("details");
+    for (name, served) in [("omitted", true), ("unknown key", false)] {
+        let mut slice = sidecar_slice(&config, &runtime);
+        let mut patched = 0;
+        for plugin in &mut slice.http_routes.plugin_configs {
+            if plugin["plugin_name"] == json!("mesh_route_dispatch") {
+                let object = plugin["config"]
+                    .as_object_mut()
+                    .expect("dispatch config object");
+                object.remove("reject_unmatched");
+                if name == "unknown key" {
+                    object.insert("rejectUnmatched".to_string(), json!(false));
+                }
+                patched += 1;
+            }
+        }
+        assert_eq!(patched, 1, "the route carries one dispatch instance");
+        let prepared =
+            prepare_gateway_config_from_mesh_slice(&slice, &runtime).expect("slice materializes");
+        let api_served = carried_route_proxies(&prepared)
+            .iter()
+            .any(|proxy| proxy.listen_path.as_deref() == Some("/api"));
+        assert_eq!(api_served, served, "{name}");
+    }
+}
+
+/// Review finding sol F1 (#7443 round 2): plugin config ids are namespaced
+/// resource ids, so a carried set in which two routes own records with one id
+/// is refused at decode, before any Sidecar filtering could detach both.
+#[test]
+fn data_plane_refuses_a_route_set_reusing_a_plugin_config_id_across_owners() {
+    let config = translated_config(&[virtual_service(
+        "two",
+        json!({
+            "hosts": ["reviews.default.svc.cluster.local"],
+            "http": [
+                {
+                    "match": [{
+                        "uri": {"prefix": "/a"},
+                        "headers": {"x-version": {"exact": "v2"}}
+                    }],
+                    "route": route_to("ratings")
+                },
+                {
+                    "match": [{
+                        "uri": {"prefix": "/b"},
+                        "headers": {"x-version": {"exact": "v2"}}
+                    }],
+                    "route": route_to("details")
+                }
+            ]
+        }),
+    )]);
+    let runtime = sidecar_runtime_for("details");
+    let slice = sidecar_slice(&config, &runtime);
+    let proxy_ids = carried_ids(&slice.http_routes.proxies);
+    assert_eq!(proxy_ids.len(), 2, "two carried routes");
+    prepare_gateway_config_from_mesh_slice(&slice, &runtime)
+        .expect("the unmodified route set materializes");
+
+    let mut tampered = slice.clone();
+    let first = tampered
+        .http_routes
+        .plugin_configs
+        .iter()
+        .find(|plugin| {
+            plugin["plugin_name"] == json!("mesh_route_dispatch")
+                && plugin["proxy_id"] == json!(proxy_ids[0])
+        })
+        .expect("the first route's dispatch instance")
+        .clone();
+    let mut second_owner = first;
+    second_owner["proxy_id"] = json!(proxy_ids[1]);
+    tampered.http_routes.plugin_configs.push(second_owner);
+    let error = prepare_gateway_config_from_mesh_slice(&tampered, &runtime)
+        .expect_err("a plugin config id owned by two routes refuses the slice");
+    let rendered = format!("{error:#}");
+    assert!(
+        rendered.contains("reuses another plugin config's id"),
+        "{rendered}"
+    );
+}
