@@ -10475,6 +10475,20 @@ async fn create_session(
                                                 break 'singleton_retry;
                                             }
                                         }
+                                        Err(e)
+                                            if e.raw_os_error() == Some(libc::EMSGSIZE)
+                                                || len > super::udp_batch::SEND_MMSG_SLOT_SIZE =>
+                                        {
+                                            warn!(
+                                                proxy_id = %reply_proxy_id,
+                                                client = %udp_client_log_addr(client_addr),
+                                                size = len,
+                                                error = %e,
+                                                "UDP singleton direct-send failed for oversized/EMSGSIZE reply; datagram lost"
+                                            );
+                                            sent_ok = false;
+                                            break 'singleton_retry;
+                                        }
                                         Err(e) => {
                                             debug!(
                                                 proxy_id = %reply_proxy_id,
@@ -10493,6 +10507,19 @@ async fn create_session(
                                         }
                                     }
                                 }
+                            }
+                            Err(e)
+                                if e.raw_os_error() == Some(libc::EMSGSIZE)
+                                    || len > super::udp_batch::SEND_MMSG_SLOT_SIZE =>
+                            {
+                                warn!(
+                                    proxy_id = %reply_proxy_id,
+                                    client = %udp_client_log_addr(client_addr),
+                                    size = len,
+                                    error = %e,
+                                    "UDP singleton direct-send failed for oversized/EMSGSIZE reply; datagram lost"
+                                );
+                                sent_ok = false;
                             }
                             Err(e) => {
                                 debug!(
@@ -11115,6 +11142,15 @@ async fn create_session(
                                 Ok(_) if send_batch_ref.is_empty() => break,
                                 Ok(_) => continue,
                                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                                Err(e) if e.raw_os_error() == Some(libc::EMSGSIZE) => {
+                                    warn!(
+                                        proxy_id = %reply_proxy_id,
+                                        client = %udp_client_log_addr(client_addr),
+                                        error = %e,
+                                        "UDP sendmmsg dropped oversized reply (EMSGSIZE); keeping session alive"
+                                    );
+                                    break;
+                                }
                                 Err(e) => {
                                     debug!(
                                         proxy_id = %reply_proxy_id,
