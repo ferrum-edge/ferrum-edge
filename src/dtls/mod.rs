@@ -627,23 +627,22 @@ pub struct FrontendDtlsConfig {
     pub client_trust: Option<crate::tls::ClientTrustMaterial>,
 }
 
-/// Datagrams drained per `recvmmsg` call on the ingress-interface capture path.
-/// Deliberately smaller than the plain-UDP listener's configurable batch: the
-/// batch preallocates one max-size datagram buffer per slot, and this path only
-/// exists on NodeWaypoint DTLS listeners.
+/// Datagrams drained per `recvmmsg` call in `DtlsServer::run` on Linux.
+/// Deliberately smaller than the plain-UDP listener's configurable batch; the
+/// batch uses `MaybeUninit<u8>` slots so untouched tail pages stay unfaulted.
 #[cfg(target_os = "linux")]
 const DTLS_INGRESS_CAPTURE_BATCH: usize = 16;
 
-/// Datagrams drained per readiness wake-up before the capture loop returns to
-/// its `select!`.
+/// Datagrams drained per readiness wake-up before `DtlsServer::run` yields back
+/// to the Tokio scheduler and re-enters its `select!`.
 ///
-/// `try_io` is a synchronous call that consumes no tokio cooperative budget and
-/// `dispatch_datagram` has no await point, so an unbounded inner drain would
-/// keep a runtime worker thread for exactly as long as a sender can keep the
-/// receive queue non-empty — never observing shutdown and never yielding. The
-/// plain-UDP listener bounds its own drain for the same reason; this is the
-/// DTLS equivalent. Re-entering the outer loop re-arms the shutdown branch and
-/// puts the readiness poll (which does consume coop budget) back in the path.
+/// `readable()` and `try_io()` do not consume Tokio cooperative budget and
+/// `dispatch_datagram` is synchronous, so an unbounded inner drain (or looping
+/// back to `readable()` without yielding) would pin a worker thread whenever
+/// the receive queue stays non-empty — starving session drivers, timers, and
+/// shutdown. After draining up to this bound, the Linux loop explicitly yields
+/// (when the limit was hit) or charges cooperative budget before re-entering
+/// `select!`.
 #[cfg(target_os = "linux")]
 const DTLS_INGRESS_CAPTURE_DRAIN_LIMIT: usize = 256;
 
@@ -1762,7 +1761,8 @@ impl DtlsConnection {
                     armed_timeout = next_timeout;
                     match next_timeout {
                         Some(t) => {
-                            let target = tokio::time::Instant::from_std(t);
+                            let target = tokio::time::Instant::now()
+                                + t.saturating_duration_since(Instant::now());
                             if let Some(sleep) = retransmit_sleep.as_mut().as_pin_mut() {
                                 sleep.reset(target);
                             } else {
@@ -1801,6 +1801,12 @@ impl DtlsConnection {
                     // Application data to send — complete only after encrypt + socket write.
                     Some(pending) = driver_app_rx.recv() => {
                         let PendingAppSend { data, completion } = pending;
+                        if completion.is_closed() {
+                            // Caller dropped its send future before dequeue (e.g.
+                            // authorization expiry or trust withdrawal); discard
+                            // without encrypting or transmitting.
+                            continue;
+                        }
                         let max_plaintext = dtls_buf_config().max_plaintext;
                         if data.len() > max_plaintext {
                             let _ = completion.send(Err(format!(
@@ -1823,6 +1829,10 @@ impl DtlsConnection {
                             None => std::future::pending::<()>().await,
                         }
                     }, if next_timeout.is_some() => {
+                        // Clear `armed_timeout` unconditionally so an early wakeup
+                        // (e.g. paused/mocked Tokio clock ahead of `std::time::Instant`)
+                        // re-arms `retransmit_sleep` instead of spinning on an elapsed timer.
+                        armed_timeout = None;
                         let now = Instant::now();
                         if let Some(t) = next_timeout
                             && now >= t
@@ -2975,6 +2985,10 @@ impl DtlsServer {
             let fd = self.socket.as_raw_fd();
             loop {
                 tokio::select! {
+                    biased;
+                    _ = shutdown_rx.changed() => {
+                        return Ok(());
+                    }
                     ready = self.socket.readable() => {
                         if let Err(e) = ready {
                             if matches!(
@@ -2986,13 +3000,11 @@ impl DtlsServer {
                                     | std::io::ErrorKind::WouldBlock
                             ) {
                                 trace!("DTLS server transient readable error (ignored): {}", e);
+                                tokio::task::coop::consume_budget().await;
                                 continue;
                             }
                             return Err(anyhow::anyhow!("DTLS server recv error: {}", e));
                         }
-                    }
-                    _ = shutdown_rx.changed() => {
-                        return Ok(());
                     }
                 }
                 if *shutdown_rx.borrow() {
@@ -3000,6 +3012,9 @@ impl DtlsServer {
                 }
                 let mut drained: usize = 0;
                 while drained < DTLS_INGRESS_CAPTURE_DRAIN_LIMIT {
+                    if *shutdown_rx.borrow() {
+                        return Ok(());
+                    }
                     let received = self.socket.try_io(tokio::io::Interest::READABLE, || {
                         recv_batch.recv(fd, DTLS_INGRESS_CAPTURE_BATCH)
                     });
@@ -3041,6 +3056,16 @@ impl DtlsServer {
                             return Err(anyhow::anyhow!("DTLS server recvmmsg error: {}", e));
                         }
                     }
+                }
+                // `readable()` and `try_io()` do not consume Tokio cooperative
+                // budget. Yield explicitly whenever a full drain cycle hits the
+                // cap (so session drivers, timers, and shutdown cannot be
+                // starved under sustained traffic or floods), and charge coop
+                // budget on every ready cycle / transient error retry.
+                if drained >= DTLS_INGRESS_CAPTURE_DRAIN_LIMIT {
+                    tokio::task::yield_now().await;
+                } else {
+                    tokio::task::coop::consume_budget().await;
                 }
             }
         }
@@ -3266,6 +3291,9 @@ impl DtlsServer {
         reply_local: Option<crate::socket_opts::PktinfoLocal>,
         forwarded_client: Option<SocketAddr>,
     ) {
+        if *self.shutdown_tx.borrow() {
+            return;
+        }
         if let Some(ref authorize) = self.limits.authorize_new_session
             && !authorize(peer_addr, reply_local.map(|local| local.ifindex))
         {
@@ -3405,13 +3433,12 @@ impl DtlsServer {
         let active_sessions = self.active_sessions.clone();
         let active_session_mirror = self.limits.active_session_mirror.clone();
         let client_cert_verifier = active.client_cert_verifier.clone();
-        let handshake_deadline = self
-            .limits
-            .handshake_timeout
-            .map(|timeout| Instant::now() + timeout);
+        let handshake_timeout = self.limits.handshake_timeout;
+        let handshake_deadline = handshake_timeout.map(|timeout| Instant::now() + timeout);
         let handshake_timeout_warn = self.handshake_timeout_warn.clone();
         let handshake_timeouts = self.handshake_timeouts.clone();
         let udp_port_hold = self.udp_port_hold.clone();
+        let mut server_shutdown_rx = self.shutdown_tx.subscribe();
 
         tokio::spawn(async move {
             // Held for as long as this driver holds `socket`.
@@ -3427,6 +3454,13 @@ impl DtlsServer {
             // at accept handoff below, and by `Drop` on every other exit path
             // (refused handshake, timeout, socket error, task cancellation).
             let mut per_source_ip_guard = per_source_ip_guard;
+
+            // If listener shutdown raced session spawn before `close()` walked
+            // `sessions`, exit before emitting any handshake flight or holding
+            // the socket / port claim past listener teardown.
+            if *server_shutdown_rx.borrow() {
+                return;
+            }
 
             let mut dtls = Dtls::new_auto(config, certificate, Instant::now());
             // Server role (default — is_active=false)
@@ -3497,8 +3531,8 @@ impl DtlsServer {
             let mut armed_timeout: Option<Instant> = None;
             let retransmit_sleep: Option<tokio::time::Sleep> = None;
             tokio::pin!(retransmit_sleep);
-            let handshake_sleep = handshake_deadline
-                .map(|deadline| tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)));
+            let handshake_sleep = handshake_timeout
+                .map(|timeout| tokio::time::sleep_until(tokio::time::Instant::now() + timeout));
             tokio::pin!(handshake_sleep);
 
             loop {
@@ -3522,7 +3556,8 @@ impl DtlsServer {
                     armed_timeout = next_timeout;
                     match next_timeout {
                         Some(t) => {
-                            let target = tokio::time::Instant::from_std(t);
+                            let target = tokio::time::Instant::now()
+                                + t.saturating_duration_since(Instant::now());
                             if let Some(sleep) = retransmit_sleep.as_mut().as_pin_mut() {
                                 sleep.reset(target);
                             } else {
@@ -3644,6 +3679,13 @@ impl DtlsServer {
                         );
                         break;
                     }
+                    _ = server_shutdown_rx.changed() => {
+                        fail_queued_frontend_app_sends(
+                            &mut app_in_rx,
+                            auth_deadline.get(),
+                        );
+                        break;
+                    }
                     // Incoming UDP packet from this client (demuxed by the server)
                     Some(data) = incoming_rx.recv() => {
                         if let Err(e) = dtls.handle_packet(&data) {
@@ -3665,6 +3707,10 @@ impl DtlsServer {
                             None => std::future::pending::<()>().await,
                         }
                     }, if next_timeout.is_some() => {
+                        // Clear `armed_timeout` unconditionally so an early wakeup
+                        // (e.g. paused/mocked Tokio clock ahead of `std::time::Instant`)
+                        // re-arms `retransmit_sleep` instead of spinning on an elapsed timer.
+                        armed_timeout = None;
                         let now = Instant::now();
                         if let Some(t) = next_timeout
                             && now >= t
@@ -3777,6 +3823,7 @@ impl DtlsServer {
                             Output::Connected => {
                                 just_connected = true;
                                 connected = true;
+                                handshake_sleep.set(None);
                                 // Enforce client-certificate authentication as a hard
                                 // requirement. dimpl completes the handshake even when
                                 // the client returns an empty Certificate, so without
@@ -5039,19 +5086,52 @@ mod tests {
             "already-dropped completion receiver must never poll send"
         );
 
-        // Dropping completion receiver mid-send cancels the parked send future.
+        // Dropping completion receiver mid-send deterministically cancels the
+        // parked send future and drops it without completing.
+        struct SignallingPendingSend {
+            polled_tx: Option<oneshot::Sender<()>>,
+            dropped: Arc<std::sync::atomic::AtomicBool>,
+        }
+        impl std::future::Future for SignallingPendingSend {
+            type Output = Result<usize, std::io::Error>;
+            fn poll(
+                mut self: std::pin::Pin<&mut Self>,
+                _cx: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<Self::Output> {
+                if let Some(tx) = self.polled_tx.take() {
+                    let _ = tx.send(());
+                }
+                std::task::Poll::Pending
+            }
+        }
+        impl Drop for SignallingPendingSend {
+            fn drop(&mut self) {
+                self.dropped.store(true, Ordering::SeqCst);
+            }
+        }
+
         let (mut completion_tx, completion_rx) = oneshot::channel::<Result<(), String>>();
+        let (polled_tx, polled_rx) = oneshot::channel::<()>();
+        let send_dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let send_dropped_flag = Arc::clone(&send_dropped);
         let handle = tokio::spawn(async move {
             frontend_app_ciphertext_send_until_expiry(
                 Some(tokio::time::Instant::now() + Duration::from_secs(30)),
                 Some(&mut completion_tx),
-                std::future::pending::<Result<usize, std::io::Error>>(),
+                SignallingPendingSend {
+                    polled_tx: Some(polled_tx),
+                    dropped: send_dropped_flag,
+                },
             )
             .await
         });
-        tokio::task::yield_now().await;
+        polled_rx.await.expect("send future entered Pending");
         drop(completion_rx);
         let outcome = handle.await.expect("join");
         assert_eq!(outcome.unwrap_err(), FrontendAppSendReject::Cancelled);
+        assert!(
+            send_dropped.load(Ordering::SeqCst),
+            "cancelling an in-flight send must drop the pending send future"
+        );
     }
 }
