@@ -5565,13 +5565,30 @@ fn clone_sidecar_carried_destination_upstreams(
 /// SVID: the predicate could never match. The source of every request there
 /// is this Sidecar's own workload, so the predicate is decided here from the
 /// trusted local workload (the same evidence `materialize_sidecar_l4_source_selectors`
-/// uses for L4 routes): a rule naming the local namespace drops the predicate
-/// (keeping its other predicates, or matching every path when it had none),
-/// and any other rule, or every such rule when the local workload is not
-/// unambiguously resolved, is removed, fail-closed. Rule order is kept. A
-/// route left with no dispatch rule applies to no request from this workload,
-/// so it is returned (`(namespace, proxy id)`) for the binding to refuse; its
-/// host then keeps the Service route.
+/// uses for L4 routes).
+///
+/// Istio `match[]` entries are ORed. The translator emits one rule per
+/// in-scope entry that has a non-URI predicate (a URI-only entry emits no
+/// rule: the route's `listen_path` carries it and `reject_unmatched` is off,
+/// so unclaimed requests reach the route's own destination). So
+/// `sourceNamespace` is decided per rule (one match condition): a
+/// rule naming the local namespace drops the predicate (keeping its other
+/// predicates, or matching every path when it had none), and any other rule,
+/// or every such rule when the local workload is not unambiguously resolved,
+/// is removed, fail-closed. Only that condition goes: its OR siblings, later
+/// rules and the route's own destination are kept, and a removed condition
+/// never turns into a broader match. Rule order is kept.
+///
+/// When every rule of an instance is removed (issue #7440):
+/// * with `reject_unmatched` the route serves only matched requests, so it now
+///   applies to no request from this workload: it is returned
+///   (`(namespace, proxy id)`) for the binding to refuse, and its host keeps
+///   the Service route;
+/// * without it the route still has a fallback (a URI-only OR sibling or a
+///   later unconditional `http[]` entry, both served by the route's own
+///   destination), so only the empty instance is removed, from the plugin
+///   configs and from the route's associations (an instance with neither rules
+///   nor weighted splits cannot be constructed).
 fn resolve_sidecar_carried_route_source_namespaces(
     config: &mut GatewayConfig,
     runtime: &MeshRuntimeConfig,
@@ -5581,6 +5598,9 @@ fn resolve_sidecar_carried_route_source_namespaces(
         .map(|source| source.namespace.to_string());
     let mut removed = 0usize;
     let mut emptied: HashSet<(String, String)> = HashSet::new();
+    // `(namespace, plugin id)` of emptied instances whose route keeps serving
+    // its fallback destination.
+    let mut detached: HashSet<(String, String)> = HashSet::new();
     for plugin in &mut config.plugin_configs {
         if plugin.plugin_name != "mesh_route_dispatch"
             || !plugin
@@ -5625,7 +5645,30 @@ fn resolve_sidecar_carried_route_source_namespaces(
             && rules.is_empty()
             && let Some(proxy_id) = plugin.proxy_id.clone()
         {
-            emptied.insert((plugin.namespace.clone(), proxy_id));
+            // Absent keeps the plugin's default (`false`). The value is
+            // untrusted slice input, so a present non-boolean (which the
+            // plugin would refuse to construct) fails closed: the route is
+            // refused rather than its instance detached.
+            let reject_unmatched = match plugin.config.get("reject_unmatched") {
+                None => false,
+                Some(value) => value.as_bool().unwrap_or(true),
+            };
+            if reject_unmatched {
+                emptied.insert((plugin.namespace.clone(), proxy_id));
+            } else {
+                detached.insert((plugin.namespace.clone(), plugin.id.clone()));
+            }
+        }
+    }
+    if !detached.is_empty() {
+        config
+            .plugin_configs
+            .retain(|plugin| !detached.contains(&(plugin.namespace.clone(), plugin.id.clone())));
+        for proxy in &mut config.proxies {
+            let namespace = proxy.namespace.clone();
+            proxy.plugins.retain(|association| {
+                !detached.contains(&(namespace.clone(), association.plugin_config_id.clone()))
+            });
         }
     }
     if removed > 0 {

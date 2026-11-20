@@ -2142,3 +2142,249 @@ async fn sidecar_source_namespace_is_decided_from_the_local_workload() {
         "the host keeps its Service route"
     );
 }
+
+/// The upstream a carried route on `listen_path` dispatches a request for
+/// `path` with `headers` to on a Sidecar's outbound capture leg (no peer
+/// certificate): its `mesh_route_dispatch` instances run through the
+/// production `before_proxy` chain, and a request no rule claims keeps the
+/// route's own destination. `None` when the chain refuses the request.
+async fn sidecar_dispatched_upstream(
+    prepared: &GatewayConfig,
+    listen_path: &str,
+    path: &str,
+    headers: &[(&str, &str)],
+) -> Option<String> {
+    let route = carried_route_proxies(prepared)
+        .into_iter()
+        .find(|proxy| proxy.listen_path.as_deref() == Some(listen_path))
+        .unwrap_or_else(|| panic!("the carried {listen_path} route is served"))
+        .clone();
+    let mut plugins: Vec<Arc<dyn Plugin>> = route
+        .plugins
+        .iter()
+        .filter_map(|association| {
+            prepared.plugin_configs.iter().find(|plugin| {
+                plugin.namespace == route.namespace
+                    && plugin.id == association.plugin_config_id
+                    && plugin.plugin_name == "mesh_route_dispatch"
+            })
+        })
+        .map(|plugin| {
+            create_plugin("mesh_route_dispatch", &plugin.config)
+                .expect("dispatch config constructs")
+                .expect("built-in plugin")
+        })
+        .collect();
+    install_plugin_finalizers_for_test(&mut plugins).expect("chain assembles");
+    let mut ctx = RequestContext::new("127.0.0.1".to_string(), "GET".to_string(), path.to_string());
+    ctx.mesh_direction = Some(MeshTrafficDirection::Outbound);
+    ctx.matched_proxy = Some(Arc::new(route.clone()));
+    let mut request_headers: HashMap<String, String> = headers
+        .iter()
+        .map(|(name, value)| (name.to_string(), value.to_string()))
+        .collect();
+    request_headers.insert(
+        "host".to_string(),
+        "reviews.default.svc.cluster.local".to_string(),
+    );
+    ctx.headers = request_headers.clone();
+    match run_before_proxy_hooks_for_test(&plugins, &mut ctx, &mut request_headers).await {
+        PluginResult::Continue => Some(
+            ctx.route_override_upstream_id
+                .clone()
+                .or_else(|| route.upstream_id.clone())
+                .expect("the route has a destination"),
+        ),
+        _ => None,
+    }
+}
+
+fn route_to(host: &str) -> serde_json::Value {
+    json!([{
+        "destination": {
+            "host": format!("{host}.default.svc.cluster.local"),
+            "port": {"number": 8080}
+        }
+    }])
+}
+
+const SIDECAR_REVIEWS: &str = "__mesh-out-vs-upstream-default-reviews-8080";
+const SIDECAR_RATINGS: &str = "__mesh-out-vs-upstream-default-ratings-8080";
+const SIDECAR_DETAILS: &str = "__mesh-out-vs-upstream-default-details-8080";
+
+/// Issue #7440: a `sourceNamespace` rule naming another namespace is removed
+/// on a Sidecar, but the route keeps its unconditional fallback `http[]`
+/// entry: requests reach the fallback destination, not the plain Service
+/// route. A rule naming the Sidecar's own namespace matches every request.
+#[tokio::test]
+async fn sidecar_source_namespace_keeps_the_fallback_route() {
+    for (source_namespace, expected) in
+        [("other-ns", SIDECAR_REVIEWS), ("default", SIDECAR_RATINGS)]
+    {
+        let config = translated_config(&[virtual_service(
+            "fallback",
+            json!({
+                "hosts": ["reviews.default.svc.cluster.local"],
+                "http": [
+                    {"match": [{"sourceNamespace": source_namespace}], "route": route_to("ratings")},
+                    {"route": route_to("reviews")}
+                ]
+            }),
+        )]);
+        let prepared = prepared_sidecar(&config, &sidecar_runtime_for("details"));
+        assert_eq!(
+            sidecar_dispatched_upstream(&prepared, "/", "/anything", &[])
+                .await
+                .as_deref(),
+            Some(expected),
+            "sourceNamespace {source_namespace}"
+        );
+        assert!(
+            !prepared
+                .proxies
+                .iter()
+                .any(|proxy| proxy.id == "__mesh-outbound-default-reviews-8080"),
+            "sourceNamespace {source_namespace}: the VirtualService still owns the host"
+        );
+    }
+}
+
+/// Issue #7440: ORed `match[]` entries are independent conditions. Removing
+/// the foreign-namespace one keeps its URI-only sibling, so the route still
+/// serves `/api`.
+#[tokio::test]
+async fn sidecar_source_namespace_keeps_a_uri_only_or_sibling() {
+    let config = translated_config(&[virtual_service(
+        "or",
+        json!({
+            "hosts": ["reviews.default.svc.cluster.local"],
+            "http": [{
+                "match": [
+                    {"uri": {"prefix": "/api"}, "sourceNamespace": "other-ns"},
+                    {"uri": {"prefix": "/api"}}
+                ],
+                "route": route_to("ratings")
+            }]
+        }),
+    )]);
+    let prepared = prepared_sidecar(&config, &sidecar_runtime_for("details"));
+    assert_eq!(
+        sidecar_dispatched_upstream(&prepared, "/api", "/api/users", &[])
+            .await
+            .as_deref(),
+        Some(SIDECAR_RATINGS),
+        "the URI-only sibling still routes /api"
+    );
+    prepared
+        .validate_unique_listen_paths()
+        .expect("the generation stays valid");
+}
+
+/// Issue #7440: a rule whose every ORed condition names another namespace is
+/// removed whole, and the later fallback still serves; a removed condition
+/// never widens into a match.
+#[tokio::test]
+async fn sidecar_source_namespace_rule_with_only_foreign_conditions_falls_back() {
+    let config = translated_config(&[virtual_service(
+        "foreign",
+        json!({
+            "hosts": ["reviews.default.svc.cluster.local"],
+            "http": [
+                {
+                    "match": [{"sourceNamespace": "team-a"}, {"sourceNamespace": "team-b"}],
+                    "route": route_to("ratings")
+                },
+                {"route": route_to("reviews")}
+            ]
+        }),
+    )]);
+    let prepared = prepared_sidecar(&config, &sidecar_runtime_for("details"));
+    for path in ["/", "/api/users"] {
+        assert_eq!(
+            sidecar_dispatched_upstream(&prepared, "/", path, &[])
+                .await
+                .as_deref(),
+            Some(SIDECAR_REVIEWS),
+            "{path}: only the fallback applies"
+        );
+    }
+}
+
+/// Issue #7440: removing a foreign-namespace rule keeps the rules after it
+/// and the fallback, in order.
+#[tokio::test]
+async fn sidecar_source_namespace_keeps_later_rules_and_the_fallback() {
+    let config = translated_config(&[virtual_service(
+        "ordered",
+        json!({
+            "hosts": ["reviews.default.svc.cluster.local"],
+            "http": [
+                {"match": [{"sourceNamespace": "other-ns"}], "route": route_to("ratings")},
+                {
+                    "match": [{"headers": {"x-version": {"exact": "v2"}}}],
+                    "route": route_to("details")
+                },
+                {"route": route_to("reviews")}
+            ]
+        }),
+    )]);
+    let prepared = prepared_sidecar(&config, &sidecar_runtime_for("details"));
+    assert_eq!(
+        sidecar_dispatched_upstream(&prepared, "/", "/", &[("x-version", "v2")])
+            .await
+            .as_deref(),
+        Some(SIDECAR_DETAILS),
+        "the later header rule still matches"
+    );
+    assert_eq!(
+        sidecar_dispatched_upstream(&prepared, "/", "/", &[])
+            .await
+            .as_deref(),
+        Some(SIDECAR_REVIEWS),
+        "an unmatched request takes the fallback, never the removed rule"
+    );
+}
+
+/// Review finding neon F1 (#7443): `reject_unmatched` on a carried dispatch
+/// instance is untrusted slice input. A present non-boolean value fails
+/// closed: once its foreign-namespace rule is removed, the route is refused
+/// instead of having its instance detached and serving the fallback.
+#[test]
+fn sidecar_source_namespace_fails_closed_on_a_malformed_reject_unmatched() {
+    let config = translated_config(&[virtual_service(
+        "or",
+        json!({
+            "hosts": ["reviews.default.svc.cluster.local"],
+            "http": [{
+                "match": [
+                    {"uri": {"prefix": "/api"}, "sourceNamespace": "other-ns"},
+                    {"uri": {"prefix": "/api"}}
+                ],
+                "route": route_to("ratings")
+            }]
+        }),
+    )]);
+    let runtime = sidecar_runtime_for("details");
+    for (value, served) in [
+        (json!(false), true),
+        (json!("true"), false),
+        (json!(1), false),
+        (serde_json::Value::Null, false),
+    ] {
+        let mut slice = sidecar_slice(&config, &runtime);
+        let mut patched = 0;
+        for plugin in &mut slice.http_routes.plugin_configs {
+            if plugin["plugin_name"] == json!("mesh_route_dispatch") {
+                plugin["config"]["reject_unmatched"] = value.clone();
+                patched += 1;
+            }
+        }
+        assert_eq!(patched, 1, "the route carries one dispatch instance");
+        let prepared =
+            prepare_gateway_config_from_mesh_slice(&slice, &runtime).expect("slice materializes");
+        let api_served = carried_route_proxies(&prepared)
+            .iter()
+            .any(|proxy| proxy.listen_path.as_deref() == Some("/api"));
+        assert_eq!(api_served, served, "reject_unmatched = {value}");
+    }
+}

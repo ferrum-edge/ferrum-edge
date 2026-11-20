@@ -65,9 +65,12 @@ mirrors, exactly as on a NodeWaypoint.
   not model is refused, and the host keeps its Service route. So is a route that
   claims the Sidecar's own inbound route (same path and host); the inbound route
   is always kept.
-- `match.sourceNamespace` is decided from the Sidecar's own workload. Rules
-  naming another namespace are removed, and a route left with no rule is
-  refused.
+- `match.sourceNamespace` is decided from the Sidecar's own workload, per
+  `match[]` condition. A condition naming another namespace is removed on its
+  own, and its OR siblings, later rules and the route's unconditional fallback
+  keep applying. A route is refused only when no condition and no fallback
+  remain, that is, when every condition was removed and the route serves
+  matched requests only (issue #7440).
 - A carried route presents its selected destination Service
   (`<service>.<namespace>.svc:<port>`) as the `:authority`, and the client Host
   rides `x-forwarded-host`. An explicit `rewrite.authority` that names that
