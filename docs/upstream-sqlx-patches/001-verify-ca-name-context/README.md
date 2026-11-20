@@ -107,8 +107,8 @@ The same fixtures cover retained trust through rejected reloads and fresh
 connections (#5535). Unit coverage pins EnvConfig-to-driver mode mapping for
 database, CP, and migrate consumers and primary/failover/replica URLs, and
 `EnvConfig::validate` refuses `FERRUM_DB_TLS_MODE=verify-ca` with no
-configured CA, which under exclusive-CA semantics would leave an empty trust
-store.
+configured CA: the store would then be the bundled public roots, and with the
+hostname check waived that authenticates no particular server.
 
 ## Retirement
 

@@ -13829,10 +13829,11 @@ fn required_utf8_text_column(row: &AnyRow, column: &str) -> Result<String, anyho
     match row.try_get::<String, _>(column) {
         Ok(value) => Ok(value),
         Err(text_error) => {
-            // sqlx Any maps MySQL TEXT-family wire types (including
-            // MEDIUMTEXT) to its generic BLOB type. Decode those bytes
-            // explicitly, but still reject invalid UTF-8 rather than hiding a
-            // corrupt JSON/config value behind a default.
+            // SQLx 0.8's Any driver mapped MySQL TEXT-family wire types
+            // (including MEDIUMTEXT) to its generic BLOB type; 0.9 reports a
+            // non-binary collation as text. Accept bytes too, but still
+            // reject invalid UTF-8 rather than hiding a corrupt JSON/config
+            // value behind a default.
             let bytes: Vec<u8> = row.try_get(column).map_err(|blob_error| {
                 anyhow::anyhow!(
                     "column `{column}` could not be decoded as SQL text ({text_error}) \
@@ -13883,8 +13884,8 @@ fn optional_utf8_text_column(row: &AnyRow, column: &str) -> Result<Option<String
                 .map(Some)
                 .map_err(|error| anyhow::anyhow!("column `{column}` is not valid UTF-8: {error}")),
             Err(blob_opt_error) => {
-                // Some MySQL/sqlx-Any paths surface non-NULL TEXT-family values
-                // as a bare BLOB rather than Option<BLOB>.
+                // Some MySQL/sqlx-Any paths (SQLx 0.8) surfaced non-NULL
+                // TEXT-family values as a bare BLOB rather than Option<BLOB>.
                 let bytes: Vec<u8> = row.try_get(column).map_err(|blob_error| {
                     anyhow::anyhow!(
                         "column `{column}` could not be decoded as optional SQL text \

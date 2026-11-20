@@ -820,8 +820,9 @@ impl MigrationRunner {
 
     /// Ensure the `_ferrum_migrations` tracking table exists.
     ///
-    /// MySQL's `TEXT` type is reported as `BLOB` by the `Any` driver, which
-    /// prevents `try_get::<String>()`. Use `VARCHAR` for MySQL compatibility.
+    /// SQLx 0.8's `Any` driver reported MySQL `TEXT` as `BLOB`, which
+    /// prevented `try_get::<String>()`; 0.9 reports it as text. The table keeps
+    /// `VARCHAR` columns for MySQL.
     async fn ensure_tracking_table(
         &self,
         connection: &mut AnyConnection,
