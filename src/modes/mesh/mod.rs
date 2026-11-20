@@ -1744,7 +1744,7 @@ fn prepare_normalized_gateway_config_for_mesh(
     // under the service-port key or dial-port key their dispatch path uses.
     // Topology-aware: Ambient emits HBONE routes; Sidecar emits SVID-mTLS routes.
     materialize_mesh_outbound_proxies(&mut config, runtime, mesh_slice);
-    bind_carried_http_routes_to_node_waypoint_transport(&mut config, runtime, mesh_slice);
+    bind_carried_http_routes_to_node_waypoint_transport(&mut config, runtime, mesh_slice)?;
     // After rebinding, so each candidate names the destination route dispatch
     // actually selects (the Service port's upstream, not its DNS name).
     thread_node_waypoint_route_branches_to_authz(&mut config, runtime);
@@ -4673,19 +4673,34 @@ fn destination_rule_originates_tls_for_host(mesh_slice: &MeshSlice, host: &str, 
 /// refused whatever the rule sets, since no rule can apply to a direct
 /// backend ([`wildcard_destination_rule_names_direct_backend`]). Other
 /// external hosts are left as they are.
+///
+/// Refusal versus rejection (issue #7440). Every refusal above, and the
+/// Sidecar ones (a direct or rule destination in another namespace, a route
+/// claiming the local inbound slot, an authority rewrite its destination
+/// cannot route, a route whose `sourceNamespace` conditions all name another
+/// namespace while it serves matched requests only), concerns a well-formed
+/// route this data plane cannot or should not serve: the route is dropped and
+/// its host keeps the materialized Service route. Malformed input never takes
+/// that path, because the Service route would serve requests the carried
+/// route's match gate answers with 404: a carried set with malformed,
+/// duplicate or dangling records fails decode (`decode_http_route_set`), and a
+/// carried dispatch instance the plugin constructor refuses fails here
+/// (`resolve_sidecar_carried_route_source_namespaces`) or when the plugin
+/// cache builds the generation. Either way the slice update is rejected and
+/// the last accepted generation keeps serving.
 fn bind_carried_http_routes_to_node_waypoint_transport(
     config: &mut GatewayConfig,
     runtime: &MeshRuntimeConfig,
     mesh_slice: &MeshSlice,
-) {
+) -> Result<(), anyhow::Error> {
     if !runtime.topology.serves_virtual_service_http_routes() || mesh_slice.http_routes.is_empty() {
-        return;
+        return Ok(());
     }
     let hosts = CarriedRouteHostIndex::new(mesh_slice, &runtime.cluster_domain);
     let sidecar = runtime.topology == MeshTopology::Sidecar;
     // Routes whose every dispatch rule named another source namespace.
     let source_namespace_refused = if sidecar {
-        resolve_sidecar_carried_route_source_namespaces(config, runtime, mesh_slice)
+        resolve_sidecar_carried_route_source_namespaces(config, runtime, mesh_slice)?
     } else {
         HashSet::new()
     };
@@ -5334,6 +5349,7 @@ fn bind_carried_http_routes_to_node_waypoint_transport(
         // get their Service routes back.
         materialize_mesh_outbound_proxies(config, runtime, mesh_slice);
     }
+    Ok(())
 }
 
 /// Pin the destination Service authority on a Sidecar mesh-mTLS target a
@@ -5619,10 +5635,13 @@ fn clone_sidecar_carried_destination_upstreams(
 ///
 /// An instance with a `sourceNamespace` condition is first validated with the
 /// plugin's own constructor (`MeshRouteDispatch::new`), before anything is
-/// changed: a config the plugin would refuse refuses the route as carried, so
-/// filtering can neither hide nor heal it, and a valid object that omits
-/// `reject_unmatched` keeps its default. Instances without such a condition
-/// are left exactly as carried.
+/// changed: a config the plugin would refuse is malformed input and rejects
+/// the whole slice update (`Err`), so the last accepted generation keeps
+/// serving with the route's match gate intact and filtering can neither hide
+/// nor heal it; a valid object that omits `reject_unmatched` keeps its
+/// default. Instances without such a condition are left exactly as carried
+/// (the plugin cache refuses a malformed one when the generation is built,
+/// with the same outcome).
 ///
 /// When every rule of an instance is removed (issue #7440):
 /// * with `reject_unmatched` the route serves only matched requests, so it now
@@ -5638,12 +5657,10 @@ fn resolve_sidecar_carried_route_source_namespaces(
     config: &mut GatewayConfig,
     runtime: &MeshRuntimeConfig,
     mesh_slice: &MeshSlice,
-) -> HashSet<(String, String)> {
+) -> Result<HashSet<(String, String)>, anyhow::Error> {
     let local_namespace = authoritative_sidecar_l4_source(runtime, mesh_slice)
         .map(|source| source.namespace.to_string());
     let mut removed = 0usize;
-    // Instances the plugin constructor refuses.
-    let mut malformed = 0usize;
     let mut emptied: HashSet<(String, String)> = HashSet::new();
     // `(namespace, plugin id)` of emptied instances whose route keeps serving
     // its fallback destination.
@@ -5680,17 +5697,22 @@ fn resolve_sidecar_carried_route_source_namespaces(
         // Validate the untrusted slice value with the plugin's own
         // constructor before anything is touched. A config it would refuse (a
         // non-boolean or unknown miss-policy key, an empty `source_namespace`,
-        // a zero port, an invalid matcher or transform, ...) refuses the
-        // route as carried: no rule is removed and no instance detached, so
-        // filtering can neither hide nor heal it. A valid object that omits
-        // `reject_unmatched` keeps the plugin default.
+        // a zero port, an invalid matcher or transform, ...) is malformed
+        // input, not an out-of-scope route: it rejects the whole slice update,
+        // so the last accepted generation keeps serving with the route's match
+        // gate intact (refusing just this route would hand its host to the
+        // Service route, which serves requests the gate answers with 404).
+        // Nothing is removed or detached first, so filtering can neither hide
+        // nor heal it. A valid object that omits `reject_unmatched` keeps the
+        // plugin default.
         let reject_unmatched =
             match crate::plugins::mesh_route_dispatch::MeshRouteDispatch::new(&plugin.config) {
                 Ok(validated) => validated.rejects_unmatched(),
                 Err(_) => {
-                    malformed += 1;
-                    emptied.insert((plugin.namespace.clone(), proxy_id));
-                    continue;
+                    return Err(anyhow::anyhow!(
+                        "Mesh slice carries a VirtualService route dispatch configuration that \
+                         fails validation"
+                    ));
                 }
             };
         let Some(rules) = plugin
@@ -5753,14 +5775,7 @@ fn resolve_sidecar_carried_route_source_namespaces(
              workload's namespace were removed"
         );
     }
-    if malformed > 0 {
-        warn!(
-            malformed,
-            "Sidecar VirtualService routes refused: their route dispatch configuration fails \
-             validation"
-        );
-    }
-    emptied
+    Ok(emptied)
 }
 
 /// The hosts a carried route answers once
