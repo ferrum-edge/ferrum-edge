@@ -5645,11 +5645,14 @@ fn resolve_sidecar_carried_route_source_namespaces(
             && rules.is_empty()
             && let Some(proxy_id) = plugin.proxy_id.clone()
         {
-            let reject_unmatched = plugin
-                .config
-                .get("reject_unmatched")
-                .and_then(serde_json::Value::as_bool)
-                .unwrap_or(false);
+            // Absent keeps the plugin's default (`false`). The value is
+            // untrusted slice input, so a present non-boolean (which the
+            // plugin would refuse to construct) fails closed: the route is
+            // refused rather than its instance detached.
+            let reject_unmatched = match plugin.config.get("reject_unmatched") {
+                None => false,
+                Some(value) => value.as_bool().unwrap_or(true),
+            };
             if reject_unmatched {
                 emptied.insert((plugin.namespace.clone(), proxy_id));
             } else {

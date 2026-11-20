@@ -2344,3 +2344,47 @@ async fn sidecar_source_namespace_keeps_later_rules_and_the_fallback() {
         "an unmatched request takes the fallback, never the removed rule"
     );
 }
+
+/// Review finding neon F1 (#7443): `reject_unmatched` on a carried dispatch
+/// instance is untrusted slice input. A present non-boolean value fails
+/// closed: once its foreign-namespace rule is removed, the route is refused
+/// instead of having its instance detached and serving the fallback.
+#[test]
+fn sidecar_source_namespace_fails_closed_on_a_malformed_reject_unmatched() {
+    let config = translated_config(&[virtual_service(
+        "or",
+        json!({
+            "hosts": ["reviews.default.svc.cluster.local"],
+            "http": [{
+                "match": [
+                    {"uri": {"prefix": "/api"}, "sourceNamespace": "other-ns"},
+                    {"uri": {"prefix": "/api"}}
+                ],
+                "route": route_to("ratings")
+            }]
+        }),
+    )]);
+    let runtime = sidecar_runtime_for("details");
+    for (value, served) in [
+        (json!(false), true),
+        (json!("true"), false),
+        (json!(1), false),
+        (serde_json::Value::Null, false),
+    ] {
+        let mut slice = sidecar_slice(&config, &runtime);
+        let mut patched = 0;
+        for plugin in &mut slice.http_routes.plugin_configs {
+            if plugin["plugin_name"] == json!("mesh_route_dispatch") {
+                plugin["config"]["reject_unmatched"] = value.clone();
+                patched += 1;
+            }
+        }
+        assert_eq!(patched, 1, "the route carries one dispatch instance");
+        let prepared =
+            prepare_gateway_config_from_mesh_slice(&slice, &runtime).expect("slice materializes");
+        let api_served = carried_route_proxies(&prepared)
+            .iter()
+            .any(|proxy| proxy.listen_path.as_deref() == Some("/api"));
+        assert_eq!(api_served, served, "reject_unmatched = {value}");
+    }
+}
