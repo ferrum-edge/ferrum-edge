@@ -26257,9 +26257,11 @@ components:
             post_login_default_path:
               type: [string, "null"]
               minLength: 1
-              pattern: '^[^\x00-\x1F\x7F\\]*$'
+              allOf:
+                - pattern: '[^\u0009-\u000D\u0020\u0085\u00A0\u1680\u2000-\u200A\u2028\u2029\u202F\u205F\u3000]'
+                - pattern: '^[^\x00-\x1F\x7F\\]*$'
               default: /
-              description: Redirect target when no trusted original URL exists. Emitted verbatim as Location, so it must not contain ASCII control characters or a backslash.
+              description: Redirect target when no trusted original URL exists. Surrounding whitespace is trimmed and a whitespace-only value is rejected. Emitted verbatim as Location, so it must not contain ASCII control characters or a backslash.
 
     JwtAuthConfig:
       type: object

@@ -36,8 +36,15 @@ supplied: the host is lowercased, an explicit default port is dropped, dot
 segments are resolved, and characters such as spaces and non-ASCII are
 percent-encoded. A target containing an ASCII control character or a
 backslash, in absolute or path-relative form, is refused and lands on
-`behavior.post_login_default_path`. A `post_login_default_path` that contains an
-ASCII control character or a backslash is now rejected at config validation.
+`behavior.post_login_default_path`. The target is now judged when the login
+starts, and only an accepted target whose normalized form fits 2048 bytes is
+kept in the pending-login cookie; anything else is recorded as "use the default
+path". As a result, an oversized target now lands on `post_login_default_path`
+as configured, instead of on that path rebuilt as an absolute URL on the
+login request's host, and a refused target can no longer make the login
+challenge fail with `503`. The callback still re-checks the stored target. A
+`post_login_default_path` that contains an ASCII control character or a
+backslash, or only whitespace, is rejected at config validation.
 
 **Operator action:** none for ordinary deep links. Tests or tooling that
 compare the post-login `Location` byte-for-byte with the original target may
