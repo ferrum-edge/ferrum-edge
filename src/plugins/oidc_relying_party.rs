@@ -1423,11 +1423,7 @@ impl OidcRelyingParty {
             rp_initiated_logout: optional_behavior_bool(behavior_obj, "rp_initiated_logout")?
                 .unwrap_or(true),
             post_login_redirect_param,
-            post_login_default_path: optional_behavior_string(
-                behavior_obj,
-                "post_login_default_path",
-            )?
-            .unwrap_or_else(|| "/".to_string()),
+            post_login_default_path: parse_post_login_default_path(behavior_obj)?,
             trusted_redirect_hosts,
         });
 
@@ -2660,10 +2656,10 @@ impl OidcRelyingParty {
         let state = random_b64(32)?;
         let code_verifier = random_b64(64)?;
         let nonce = random_b64(32)?;
-        let original_url = bounded_original_url(ctx, &self.behavior);
+        let original_url = self.pending_flow_original_url(ctx);
         let now = chrono::Utc::now().timestamp();
         let expires_at_unix = now.saturating_add(self.behavior.state_ttl.as_secs() as i64);
-        let payload = PendingFlowPayload {
+        let mut payload = PendingFlowPayload {
             version: PENDING_FLOW_PAYLOAD_VERSION,
             context_id: self.session.context_id.clone(),
             state: state.clone(),
@@ -2672,6 +2668,15 @@ impl OidcRelyingParty {
             original_url,
             expires_at_unix,
         };
+        // A post-login target is optional: when it would push the sealed
+        // cookie past `session.max_cookie_bytes`, record the empty marker
+        // (the callback then uses `post_login_default_path`) instead of
+        // failing the challenge (GHSA-6rwj-gc4r-3jm9). Only a marker-only
+        // payload that still does not fit, or a real serialization/sealing
+        // failure, reaches the error path below.
+        if !payload.original_url.is_empty() && !self.pending_flow_fits_cookie_budget(&payload) {
+            payload.original_url.clear();
+        }
         let sealed_cookie = self.seal_pending_flow(&payload)?;
         let sealed_binding_hash: [u8; 32] = Sha256::digest(sealed_cookie.as_bytes());
         let flow = FlowState {
@@ -2719,6 +2724,16 @@ impl OidcRelyingParty {
             }
         }
         Some(url.to_string())
+    }
+
+    /// Whether `payload` serializes and its sealed, encoded form stays within
+    /// `session.max_cookie_bytes`. `encoded_session_cookie_len` is an upper
+    /// bound on the unpadded encoding the codec emits, so a payload that fits
+    /// here also passes the codec's own cap.
+    fn pending_flow_fits_cookie_budget(&self, payload: &PendingFlowPayload) -> bool {
+        serde_json::to_vec(payload).is_ok_and(|bytes| {
+            encoded_session_cookie_len(bytes.len()) <= self.session.max_cookie_bytes
+        })
     }
 
     fn seal_pending_flow(&self, payload: &PendingFlowPayload) -> Result<String, String> {
@@ -3238,7 +3253,21 @@ impl OidcRelyingParty {
         }
     }
 
-    /// Decide where the browser lands after a successful callback.
+    /// Decide where the browser lands after a successful callback: the
+    /// trusted target recorded in the pending flow, else
+    /// `behavior.post_login_default_path`.
+    ///
+    /// The stored target is re-validated here, not trusted because it was
+    /// sealed, so pending flows issued before a policy or version change are
+    /// judged by the current rules. An empty stored target (recorded when the
+    /// challenge's target was refused or too large) always falls back.
+    fn sanitize_redirect(&self, original: &str) -> String {
+        self.trusted_redirect_target(original)
+            .unwrap_or_else(|| self.behavior.post_login_default_path.clone())
+    }
+
+    /// The canonical post-login target for `original`, or `None` when it is
+    /// not a trusted target.
     ///
     /// A target is trusted only as an origin, not just a host name (MUSE-6):
     /// it must use the same scheme as `redirect_uri` (so an `https` login can
@@ -3247,16 +3276,18 @@ impl OidcRelyingParty {
     /// an entry without a port admits only the scheme's default port, and
     /// `host:port` admits exactly that port (`host:443` is the same origin as
     /// `host` under `https`). The `redirect_uri`'s own origin is always in that
-    /// list (added at construction). Anything else lands on
-    /// `behavior.post_login_default_path`.
-    fn sanitize_redirect(&self, original: &str) -> String {
-        let fallback = || self.behavior.post_login_default_path.clone();
-        let Ok(parsed) = Url::parse(original) else {
-            return fallback();
-        };
-        let Some(host) = parsed.host_str() else {
-            return fallback();
-        };
+    /// list (added at construction).
+    ///
+    /// The value returned is the parser's canonical serialization of the URL
+    /// that was validated, never the raw input (GHSA-6rwj-gc4r-3jm9), and a
+    /// raw input carrying ASCII control characters or a backslash is refused
+    /// before parsing because the WHATWG parser silently rewrites both.
+    fn trusted_redirect_target(&self, original: &str) -> Option<String> {
+        if !is_unambiguous_redirect_text(original) {
+            return None;
+        }
+        let parsed = Url::parse(original).ok()?;
+        let host = parsed.host_str()?;
         let callback_scheme = Url::parse(&self.provider.redirect_uri)
             .map(|callback| callback.scheme().to_string())
             .unwrap_or_default();
@@ -3264,18 +3295,34 @@ impl OidcRelyingParty {
             || !parsed.username().is_empty()
             || parsed.password().is_some()
         {
-            return fallback();
+            return None;
         }
         // Same `host:effective-port` form the allowlist was normalized to.
-        let Some(port) = parsed.port_or_known_default() else {
-            return fallback();
-        };
+        let port = parsed.port_or_known_default()?;
         let authority = format!("{host}:{port}");
-        if self.behavior.trusted_redirect_hosts.contains(&authority) {
-            original.to_string()
-        } else {
-            fallback()
+        if !self.behavior.trusted_redirect_hosts.contains(&authority) {
+            return None;
         }
+        // Emit exactly the URL that was judged. The serialization is ASCII
+        // with no controls, but verify it is a header value anyway so a
+        // `Location` can never be silently dropped downstream.
+        let canonical = String::from(parsed);
+        let header_safe = http::HeaderValue::from_str(&canonical).is_ok();
+        header_safe.then_some(canonical)
+    }
+
+    /// The post-login target sealed into the pending flow: the canonical
+    /// trusted target when it fits `MAX_PENDING_FLOW_ORIGINAL_URL_BYTES`, else
+    /// the empty marker that resolves to `behavior.post_login_default_path`
+    /// at the callback (`create_flow` also falls back to the marker when the
+    /// target would exceed the encoded cookie budget). Refused text is never sealed, so hostile redirect
+    /// parameters cannot inflate the correlation cookie past its budget, and
+    /// the fallback stays the configured (relative) default path rather than
+    /// an absolute URL on the challenge's authority (GHSA-6rwj-gc4r-3jm9).
+    fn pending_flow_original_url(&self, ctx: &RequestContext) -> String {
+        self.trusted_redirect_target(&original_url(ctx, &self.behavior))
+            .filter(|target| target.len() <= MAX_PENDING_FLOW_ORIGINAL_URL_BYTES)
+            .unwrap_or_default()
     }
 }
 
@@ -4403,6 +4450,31 @@ fn optional_behavior_string(
     Ok(Some(raw.trim().to_string()))
 }
 
+/// Whether redirect text is free of ASCII control characters and backslashes
+/// (GHSA-6rwj-gc4r-3jm9). WHATWG URL parsing strips tab/CR/LF and reads `\`
+/// as `/` in special schemes, so text containing either can be judged as a
+/// different URL than an RFC 3986 client or header validator sees.
+fn is_unambiguous_redirect_text(value: &str) -> bool {
+    !value
+        .bytes()
+        .any(|byte| byte < 0x20 || byte == 0x7f || byte == b'\\')
+}
+
+/// `behavior.post_login_default_path` reaches `Location` verbatim, so it must
+/// be valid header text: refuse control characters and backslashes in the
+/// supplied value (before trimming, matching the schema pattern).
+fn parse_post_login_default_path(config: Option<&Map<String, Value>>) -> Result<String, String> {
+    if let Some(raw) = config
+        .and_then(|cfg| cfg.get("post_login_default_path"))
+        .and_then(Value::as_str)
+        && !is_unambiguous_redirect_text(raw)
+    {
+        return Err("oidc_relying_party: `behavior.post_login_default_path` must not contain ASCII control characters or a backslash".to_string());
+    }
+    Ok(optional_behavior_string(config, "post_login_default_path")?
+        .unwrap_or_else(|| "/".to_string()))
+}
+
 fn parse_behavior_string_array(
     config: Option<&Map<String, Value>>,
     field: &str,
@@ -5119,7 +5191,16 @@ fn original_url(ctx: &RequestContext, behavior: &BehaviorConfig) -> String {
     if let Some(param) = &behavior.post_login_redirect_param
         && let Some(value) = ctx.query_params.get(param)
     {
-        if value.starts_with('/') && !value.starts_with("//") {
+        // A path-relative value resolves against the current host. `//` and
+        // `/\` (which special-scheme parsing reads as `//`) are
+        // scheme-relative, not paths; they and any value carrying control
+        // characters or a backslash pass through unresolved so
+        // `sanitize_redirect` refuses them (GHSA-6rwj-gc4r-3jm9).
+        if value.starts_with('/')
+            && !value.starts_with("//")
+            && !value.starts_with("/\\")
+            && is_unambiguous_redirect_text(value)
+        {
             let scheme = frontend_scheme(ctx);
             let host = request_host(ctx);
             return format!("{scheme}://{host}{value}");
@@ -5134,23 +5215,6 @@ fn original_url(ctx: &RequestContext, behavior: &BehaviorConfig) -> String {
         original.push_str(raw_query);
     }
     original
-}
-
-/// Cap the URL sealed into the pending-flow cookie so cookie/size bounds stay
-/// honest under hostile redirect parameters.
-fn bounded_original_url(ctx: &RequestContext, behavior: &BehaviorConfig) -> String {
-    let original = original_url(ctx, behavior);
-    if original.len() <= MAX_PENDING_FLOW_ORIGINAL_URL_BYTES {
-        return original;
-    }
-    let scheme = frontend_scheme(ctx);
-    let host = request_host(ctx);
-    let fallback = format!("{scheme}://{host}{}", behavior.post_login_default_path);
-    if fallback.len() <= MAX_PENDING_FLOW_ORIGINAL_URL_BYTES {
-        fallback
-    } else {
-        behavior.post_login_default_path.clone()
-    }
 }
 
 fn frontend_scheme(ctx: &RequestContext) -> &str {

@@ -4433,6 +4433,14 @@ async fn handle_admin_request_inner(
             if let Some(resp) = require_admin_role(&auth, AdminRole::Admin) {
                 return Ok(resp);
             }
+            // This arm returns before the shared `If-Match` refusal below, so
+            // it applies the same fail-closed contract itself: a create never
+            // evaluates `If-Match`, so it refuses the header instead of
+            // ignoring it (issue #7439).
+            if req.headers().contains_key(hyper::header::IF_MATCH) {
+                drop(req.into_body());
+                return Ok(if_match_unsupported_response());
+            }
             return api_specs::handlers::handle_post_api_spec(req, &state, &auth, &namespace).await;
         }
         (Method::PUT, ["api-specs", id]) => {
@@ -4475,6 +4483,14 @@ async fn handle_admin_request_inner(
         (Method::DELETE, ["api-specs", id]) => {
             if let Some(resp) = require_admin_role(&auth, AdminRole::Admin) {
                 return Ok(resp);
+            }
+            // The cascade delete is unconditional and returns before the shared
+            // `If-Match` refusal below. Refuse the header here so a client that
+            // sends the spec's `ETag` never believes the delete was conditional
+            // (issue #7439).
+            if req.headers().contains_key(hyper::header::IF_MATCH) {
+                drop(req.into_body());
+                return Ok(if_match_unsupported_response());
             }
             if let Err(e) = crate::config::types::validate_resource_id(id) {
                 return Ok(json_response(StatusCode::BAD_REQUEST, &json!({"error": e})));
@@ -4610,10 +4626,7 @@ async fn handle_admin_request_inner(
             return Ok(resp);
         }
         drop(req.into_body());
-        return Ok(json_response(
-            StatusCode::BAD_REQUEST,
-            &json!({"error": IF_MATCH_UNSUPPORTED_MESSAGE}),
-        ));
+        return Ok(if_match_unsupported_response());
     }
 
     let body_bytes = match body_consuming_route_role(&method, segments_peek.as_slice()) {
@@ -7459,6 +7472,14 @@ const DATABASE_OPERATION_FAILED_MESSAGE: &str = "Database unavailable — operat
 pub(crate) const IF_MATCH_UNSUPPORTED_MESSAGE: &str = "If-Match is only supported on PUT and \
      DELETE of /proxies/{id}, /upstreams/{id}, /consumers/{id}, /plugins/config/{id}, on the \
      /consumers/{id}/credentials/{type}[/{index}] mutations, and on POST /restore";
+
+/// `400` for a mutating route that does not evaluate `If-Match`.
+fn if_match_unsupported_response() -> Response<Full<Bytes>> {
+    json_response(
+        StatusCode::BAD_REQUEST,
+        &json!({"error": IF_MATCH_UNSUPPORTED_MESSAGE}),
+    )
+}
 
 /// Routes that evaluate `If-Match` (see `preconditions`). Every other mutating
 /// route refuses the header instead of ignoring it.
