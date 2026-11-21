@@ -38,7 +38,8 @@ own requirement whichever instance claimed the request first, so a stricter
 instance behind a more permissive one on the same endpoint (a smaller
 `detection.max_request_body_size`, for example) now refuses what it cannot
 classify itself, and an Agent Card call a sibling claimed as a non-card
-operation is refused with `-32001` (`a2a.error: operation_class_changed`). Such
+operation, or claimed without rewriting Agent Cards, is refused with `-32001`
+(`a2a.error: operation_class_changed`). Such
 POSTs are buffered whatever their original media type. Before,
 only a deny-capable policy made the plugin fail closed on a body it could not
 classify; otherwise the request was forwarded unclaimed, and an Agent Card call

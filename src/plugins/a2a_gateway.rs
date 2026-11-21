@@ -1127,6 +1127,7 @@ impl A2aGateway {
             owner: self.instance_id,
             binding: detection.binding.as_str(),
             is_agent_card: detection.is_agent_card,
+            rewrites_agent_card: self.discovery.rewrite_agent_card_urls,
             streaming: detection.streaming_hint,
             grpc_card_schema: detection.grpc_card_schema,
             public_base,
@@ -1281,15 +1282,18 @@ impl A2aGateway {
     }
 
     /// Whether this instance's JSON-RPC Agent Card call is about to be answered
-    /// under a SIBLING instance's non-card response handling.
+    /// by a SIBLING instance's response handling that will not rewrite it.
     ///
-    /// The claim is first-wins, so a sibling that claimed the request as a
-    /// non-card operation (another binding over an overlapping scope, or a
-    /// representation that changed after its admission) owns a response phase
-    /// that buffers and rewrites no card, and this instance's own rewrite can
-    /// never apply. With rewriting enabled such a card call is refused rather
-    /// than served with the backend's URLs (GHSA-q25c-76f4-fp7h).
-    fn card_call_owned_without_card_handling(
+    /// The claim is first-wins, so the sibling that owns it decides the response
+    /// phase and this instance's own rewrite can never apply. That handling
+    /// rewrites no card when the sibling claimed the request as a non-card
+    /// operation (another binding over an overlapping scope, or a
+    /// representation that changed after its admission), or when the sibling
+    /// does not rewrite Agent Cards at all. With rewriting enabled such a card
+    /// call is refused rather than served with the backend's URLs
+    /// (GHSA-q25c-76f4-fp7h). A sibling that claimed it as a card and rewrites
+    /// cards answers it under its own configuration.
+    fn card_call_owned_without_card_rewrite(
         &self,
         ctx: &RequestContext,
         detection: &A2aDetection,
@@ -1297,10 +1301,10 @@ impl A2aGateway {
         self.rewrite_requires_jsonrpc_classification()
             && detection.binding == A2aBinding::JsonRpc
             && detection.is_agent_card
-            && ctx
-                .a2a_gateway_claim
-                .as_deref()
-                .is_some_and(|claim| claim.owner != self.instance_id && !claim.is_agent_card)
+            && ctx.a2a_gateway_claim.as_deref().is_some_and(|claim| {
+                claim.owner != self.instance_id
+                    && !(claim.is_agent_card && claim.rewrites_agent_card)
+            })
     }
 
     /// Whether the final backend-visible request-body hook can change any
@@ -1674,8 +1678,9 @@ impl A2aGateway {
             }
             // A sibling instance owns this request's response phase, so the
             // handling it set up is what the response gets: a card call it did
-            // not claim as one would be served with the backend's URLs.
-            Some(_) => self.card_call_owned_without_card_handling(ctx, detection),
+            // not claim as one, or claimed without rewriting cards, would be
+            // served with the backend's URLs.
+            Some(_) => self.card_call_owned_without_card_rewrite(ctx, detection),
             // Nothing classified the request at arrival, so no response
             // handling and no public origin exist for it: a card that only
             // appears now would be served with the backend's URLs.
@@ -2088,7 +2093,7 @@ impl Plugin for A2aGateway {
         if let Some(terminal) = self.jsonrpc_policy_terminal(ctx, &detection) {
             return terminal;
         }
-        if self.card_call_owned_without_card_handling(ctx, &detection) {
+        if self.card_call_owned_without_card_rewrite(ctx, &detection) {
             if self.observability.emit_metadata {
                 ctx.metadata
                     .insert("a2a.policy_decision".to_string(), "deny".to_string());
@@ -2098,7 +2103,7 @@ impl Plugin for A2aGateway {
                 );
             }
             warn_sampled!(
-                "Refusing an A2A Agent Card call a sibling instance claimed as a non-card operation"
+                "Refusing an A2A Agent Card call a sibling instance owns without rewriting it"
             );
             return reclassified_jsonrpc_response(&detection);
         }

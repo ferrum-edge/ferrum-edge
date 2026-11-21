@@ -8297,3 +8297,96 @@ async fn case_variant_envelope_members_are_ambiguous_when_classification_is_requ
         Some("message/send")
     );
 }
+
+/// First-wins ownership means only the owner's response handling applies. A
+/// card call owned by a sibling that does not rewrite Agent Cards would reach
+/// the client with the backend's URLs, so a rewriting JSON-RPC instance refuses
+/// it at arrival and at the final body; a rewriting owner answers it as usual.
+#[tokio::test]
+async fn card_call_owned_by_a_non_rewriting_sibling_is_refused_by_a_rewriting_instance() {
+    let card_call = json!({"jsonrpc": "2.0", "id": "req-card", "method": "agent/getCard"});
+    let card_response = json!({
+        "jsonrpc": "2.0",
+        "id": "req-card",
+        "result": {"name": "planner", "url": "https://planner.internal/a2a"}
+    })
+    .to_string();
+    let rewriting = plugin(json!({}));
+
+    // Non-rewriting owner first: it claims the card call as a card, and the
+    // rewriting instance refuses what that owner would serve un-rewritten.
+    let passthrough = plugin(json!({"discovery": {"rewrite_agent_card_urls": false}}));
+    let (mut ctx, mut headers) = jsonrpc_ctx(card_call.clone());
+    assert!(matches!(
+        passthrough.before_proxy(&mut ctx, &mut headers).await,
+        PluginResult::Continue
+    ));
+    let PluginResult::Reject {
+        status_code, body, ..
+    } = rewriting.before_proxy(&mut ctx, &mut headers).await
+    else {
+        panic!("a card call a non-rewriting sibling owns must be refused");
+    };
+    assert_eq!(status_code, 200);
+    let body: Value = serde_json::from_str(&body).expect("refusal is JSON");
+    assert_eq!(body["id"], "req-card");
+    assert_eq!(body["error"]["code"], -32001);
+    assert_eq!(body["error"]["data"]["method"], "agent/getCard");
+    assert_eq!(
+        ctx.metadata.get("a2a.error").map(String::as_str),
+        Some("operation_class_changed")
+    );
+
+    // The final-body check applies the same rule to a card call it sees owned
+    // by the non-rewriting sibling.
+    let (mut ctx, mut headers) = jsonrpc_ctx(card_call.clone());
+    assert!(matches!(
+        passthrough.before_proxy(&mut ctx, &mut headers).await,
+        PluginResult::Continue
+    ));
+    let dispatched = card_call.to_string();
+    assert!(matches!(
+        rewriting
+            .on_final_request_body_with_context(&mut ctx, &headers, dispatched.as_bytes())
+            .await,
+        PluginResult::Reject { .. }
+    ));
+
+    // Rewriting owner first: the second rewriting instance defers to it, at
+    // arrival and at the final body, and the owner rewrites the card.
+    let owner = plugin(json!({}));
+    let (mut ctx, mut headers) = jsonrpc_ctx(card_call.clone());
+    for instance in [&owner, &rewriting] {
+        assert!(matches!(
+            instance.before_proxy(&mut ctx, &mut headers).await,
+            PluginResult::Continue
+        ));
+    }
+    for instance in [&owner, &rewriting] {
+        assert!(matches!(
+            instance
+                .on_final_request_body_with_context(&mut ctx, &headers, dispatched.as_bytes())
+                .await,
+            PluginResult::Continue
+        ));
+    }
+    assert!(owner.should_buffer_response_body(&ctx));
+    assert!(!rewriting.should_buffer_response_body(&ctx));
+    let mut response_headers =
+        HashMap::from([("content-type".to_string(), "application/json".to_string())]);
+    let rewritten =
+        expect_http_card_rewrite(&owner, &mut ctx, &mut response_headers, &card_response).await;
+    assert_eq!(
+        rewritten["result"]["url"],
+        "https://gateway.example.com/a2a"
+    );
+
+    // A non-rewriting instance itself never refuses on this account.
+    let (mut ctx, mut headers) = jsonrpc_ctx(card_call.clone());
+    for instance in [&owner, &passthrough] {
+        assert!(matches!(
+            instance.before_proxy(&mut ctx, &mut headers).await,
+            PluginResult::Continue
+        ));
+    }
+}
