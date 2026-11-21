@@ -673,13 +673,10 @@ fn logged_summary_field(logs: &str, proxy_id: &str, key: &str) -> Vec<Value> {
 /// decoded frame stream: a `grpc-web-text` upload is not read as native
 /// length prefixes, and a binary upload's trailer frame is not a message.
 /// `response_body_mode: buffer` reaches the arm that collects without request
-/// body hooks. The "hooks" routes reach the arm that runs them: a monitor-mode
-/// `waf` with a never-matching `body_text` rule buffers every framed gRPC-Web
-/// `+json` upload (it reads framed RPC streams as their messages) and runs its
-/// final request-body hook without ever refusing. A `request_transformer` body
-/// rule rides the same routes; it declines framed `+json` on media type (frames
-/// are never one JSON document, GHSA-pq95-952r-2x32), so it neither buffers
-/// nor rewrites the upload and the backend still receives the client's bytes.
+/// body hooks. A `request_transformer` body rule reaches the arm that runs
+/// them: it buffers every `+json` upload (framed gRPC-Web included) and then
+/// declines the transform when the frames fail the JSON document parse, so
+/// the backend still receives the client's bytes.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore]
 async fn grpc_web_passthrough_buffered_uploads_count_decoded_request_messages() {
@@ -717,35 +714,9 @@ async fn grpc_web_passthrough_buffered_uploads_count_decoded_request_messages() 
         }
         for (mode, backend_port) in [("bin", binary_json_port), ("text", text_json_port)] {
             let hooks_id = format!("count-hooks-{mode}-{suffix}");
-            let waf_id = format!("{hooks_id}-waf");
             let transformer_id = format!("{hooks_id}-transformer");
-            let hooks_plugins = json!([
-                { "plugin_config_id": waf_id },
-                { "plugin_config_id": transformer_id },
-            ]);
+            let hooks_plugins = json!([{ "plugin_config_id": transformer_id }]);
             proxies.push(route(&hooks_id, backend_port, hooks_plugins));
-            // Forces buffered dispatch with request body hooks; monitor mode
-            // and a marker the uploads never carry mean it never refuses.
-            plugin_configs.push(json!({
-                "id": waf_id,
-                "plugin_name": "waf",
-                "config": {
-                    "mode": "monitor",
-                    "include_default_rules": false,
-                    "custom_rules": [{
-                        "id": "PASSTHROUGH-BODY-HOOK",
-                        "category": "custom",
-                        "severity": "low",
-                        "target": "body_text",
-                        "match_kind": "contains",
-                        "pattern": "never-present-passthrough-marker",
-                        "action": "monitor",
-                    }],
-                },
-                "scope": "proxy",
-                "proxy_id": hooks_id,
-                "enabled": true,
-            }));
             plugin_configs.push(json!({
                 "id": transformer_id,
                 "plugin_name": "request_transformer",
@@ -793,8 +764,7 @@ async fn grpc_web_passthrough_buffered_uploads_count_decoded_request_messages() 
     let binary = passthrough_upload();
     let text = BASE64.encode(&binary).into_bytes();
 
-    // The hooks arm uploads `+json` gRPC-Web, which the WAF scans as JSON and
-    // therefore buffers.
+    // The hooks arm uploads `+json` gRPC-Web so the body rule buffers it.
     let arms = [
         (
             "buf",

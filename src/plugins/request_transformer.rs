@@ -99,8 +99,9 @@
 //! channel: it records its own instance id on a private `RequestContext` field
 //! and the same instance's `on_final_request_body_with_context` returns the
 //! rejection. Only an instance with enabled body rules screens;
-//! header/query-only instances never do, and framed gRPC `+json` is declined
-//! on media type before screening.
+//! header/query-only instances never do, and a framed gRPC `+json` upload the
+//! client declared skips screening only when its bytes do not start like a
+//! JSON document.
 //!
 //! ## Non-application signal
 //!
@@ -1056,15 +1057,21 @@ impl RequestTransformer {
         // Only transform JSON bodies. When Content-Type is absent, attempt
         // JSON parse anyway — the body_transform helper short-circuits on
         // parse failure, so the cost is one failed parse per non-JSON request.
-        // Framed gRPC `+json` carries length-prefixed frames, never one JSON
-        // document, so it is declined here, before the duplicate-member screen
-        // could hash or scan it (GHSA-pq95-952r-2x32) — but only when the
-        // client's own wire media type proves the framing (`wire_framed`): a
-        // header rule that relabels a bare JSON upload must not exempt it.
         if let Some(ct) = content_type
-            && !request_media_type_admits_body_rules(ct, wire_framed)
+            && !body_transform::is_json_content_type(ct)
         {
             return BodyPass::Skipped(BODY_SKIPPED_NON_JSON_CONTENT_TYPE);
+        }
+        // Framed gRPC / gRPC-Web `+json` carries length-prefixed frames, never
+        // one JSON document, so it skips the duplicate-member screen (which
+        // would otherwise hash or scan it) and keeps the parse-error outcome it
+        // always had (GHSA-pq95-952r-2x32). Neither a label nor the client's
+        // own declaration is proof of framing on its own, so the skip needs
+        // both: the client's wire `Content-Type` declared framed gRPC
+        // (`wire_framed`) AND the bytes do not even start like a JSON document.
+        // A bare JSON body under a framed label is screened and transformed.
+        if wire_framed && !body_looks_like_json_document(body) {
+            return BodyPass::Skipped(body_transform::BodyRulesSkipReason::ParseError.as_str());
         }
         let outcome = match memo {
             Some(memo) => {
@@ -1081,24 +1088,29 @@ impl RequestTransformer {
     }
 }
 
-/// Whether an effective request `Content-Type` is one the JSON body rules act
-/// on: a JSON document type, unless it is framed gRPC / gRPC-Web `+json` AND
-/// the client's wire request proved that framing (`wire_framed`, from
-/// [`request_wire_declares_framed_grpc`]). The label alone is mutable — a
-/// header rule can relabel a bare JSON upload as `application/grpc+json` — so
-/// it never exempts a body by itself (GHSA-pq95-952r-2x32). The body
-/// transform, the per-request buffering vote, the header-time skip reason, and
-/// integrity-header retirement all use this one predicate.
-fn request_media_type_admits_body_rules(content_type: &str, wire_framed: bool) -> bool {
-    body_transform::is_json_content_type(content_type)
-        && !(wire_framed && body_transform::is_framed_grpc_content_type(content_type))
+/// Whether `body` starts like a JSON document: after one optional UTF-8 BOM
+/// and leading JSON whitespace, the first byte can begin a JSON value
+/// (`{ [ " - 0-9 t f n`). A gRPC / gRPC-Web frame starts with its flag byte
+/// (binary) or base64 text, neither of which can.
+fn body_looks_like_json_document(body: &[u8]) -> bool {
+    body_transform::strip_utf8_bom(body)
+        .iter()
+        .copied()
+        .find(|byte| !matches!(byte, b' ' | b'\t' | b'\n' | b'\r'))
+        .is_some_and(|byte| {
+            matches!(
+                byte,
+                b'{' | b'[' | b'"' | b'-' | b'0'..=b'9' | b't' | b'f' | b'n'
+            )
+        })
 }
 
 /// Whether the client's own request declared a framed gRPC / gRPC-Web media
 /// type: exactly one `Content-Type` field line in the immutable retained wire
 /// headers, and that value is a framed gRPC type. A context without retained
 /// wire headers, or with several `Content-Type` lines, proves nothing and keeps
-/// the body eligible for the JSON body rules.
+/// the body eligible for the JSON body rules. This alone never exempts a body:
+/// see [`body_looks_like_json_document`].
 pub(crate) fn request_wire_declares_framed_grpc(ctx: &RequestContext) -> bool {
     let mut values = ctx.raw_header_value_bytes("content-type");
     match (values.next(), values.next()) {
@@ -1143,7 +1155,7 @@ pub(crate) fn is_body_bound_request_integrity_header(name: &str) -> bool {
 /// Whether request-transformer body rules may replace the bytes of a request
 /// with these FINAL outbound headers: the body is not proven empty and the
 /// effective `Content-Type` is absent or a JSON document type (framed gRPC
-/// `+json` the client's wire request proved can never parse as one document).
+/// `+json` can never parse as one document).
 ///
 /// The method is deliberately NOT consulted: an HTTP/2 or HTTP/3 `GET` may
 /// carry DATA without `Content-Length`, and the body pass buffers and rewrites
@@ -1163,13 +1175,13 @@ pub(crate) fn request_body_rules_may_rewrite(
             .next()
             .is_some_and(|length| length.trim_ascii() == b"0")
         && client_lengths.next().is_none();
-    let wire_framed = request_wire_declares_framed_grpc(ctx);
     !client_framing_proves_empty
         && headers
             .get("content-type")
             .map(String::as_str)
             .is_none_or(|content_type| {
-                request_media_type_admits_body_rules(content_type, wire_framed)
+                body_transform::is_json_content_type(content_type)
+                    && !body_transform::is_framed_grpc_content_type(content_type)
             })
 }
 
@@ -1177,18 +1189,15 @@ pub(crate) fn request_body_rules_may_rewrite(
 /// when streaming skips the body hook. Reconsider only this provisional reason
 /// on deferred header passes; a body hook's parse/no-rule outcome remains
 /// authoritative. Post-body egress overlays must not call this function.
-///
-/// `wire_framed` is [`request_wire_declares_framed_grpc`] for the request.
 pub(crate) fn record_body_rule_header_skip(
     method: &str,
     headers: &HashMap<String, String>,
-    wire_framed: bool,
     metadata: &mut MetadataMap,
 ) {
     let skipped = crate::proxy::request_may_have_body(method, headers)
-        && headers.get("content-type").is_some_and(|content_type| {
-            !request_media_type_admits_body_rules(content_type, wire_framed)
-        });
+        && headers
+            .get("content-type")
+            .is_some_and(|content_type| !body_transform::is_json_content_type(content_type));
     let previous = metadata.get(BODY_SKIPPED_METADATA_KEY).map(String::as_str);
     if skipped {
         if previous.is_none() {
@@ -1315,11 +1324,9 @@ impl Plugin for RequestTransformer {
         // The condition is the EXACT negation of what `transform_request_body`
         // declines on media type: a DECLARED non-JSON type is released; an
         // ABSENT `Content-Type` keeps the buffered path because the transform
-        // still attempts a JSON parse for it. Framed gRPC `+json` is released
-        // too when the client's wire request declared it: the transform
-        // declines it on media type, because frames are never one JSON document
-        // the rules could rewrite. A label only a header rule added keeps the
-        // body buffered and eligible.
+        // still attempts a JSON parse for it. Framed gRPC `+json` satisfies
+        // `is_json_content_type` and so also stays buffered, matching the
+        // transform, which declines it only after inspecting the bytes.
         //
         // Safe against a header rewrite that changes eligibility: proxy core
         // (and the H3 path) re-evaluates `final_request_body_requirements`
@@ -1330,10 +1337,9 @@ impl Plugin for RequestTransformer {
         if !self.rules_enabled || self.body_rules.is_empty() {
             return false;
         }
-        let wire_framed = request_wire_declares_framed_grpc(ctx);
         ctx.headers
             .get("content-type")
-            .is_none_or(|ct| request_media_type_admits_body_rules(ct, wire_framed))
+            .is_none_or(|ct| body_transform::is_json_content_type(ct))
     }
 
     async fn before_proxy(
@@ -1498,11 +1504,13 @@ impl Plugin for RequestTransformer {
     /// Runs after every request-body transform on the same context the
     /// transform used, on every dispatch ladder, before backend egress. Only
     /// the instance that produced the refusal consumes it, at its own position
-    /// in the chain. The refusal is marked as a gateway request-representation
-    /// terminal — the same typed provenance the shared request representation
-    /// gate's `400` carries, handed back from the H1/H2 hook clone — so
-    /// response-side policy (a route response-size ceiling, response body
-    /// rules) publishes it as written instead of re-deciding it.
+    /// in the chain, so the request never reaches a backend. The refusal is
+    /// marked as a gateway request-representation terminal — the same typed
+    /// provenance the shared request representation gate's `400` carries,
+    /// handed back from the H1/H2 hook clone — which the synthetic reject
+    /// finalizer publishes as written. On the ordinary deferred H1/H2 dispatch,
+    /// response-side policy may still reshape the refusal's status or body;
+    /// that path always fails closed.
     async fn on_final_request_body_with_context(
         &self,
         ctx: &mut RequestContext,

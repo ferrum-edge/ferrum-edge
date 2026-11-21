@@ -2381,10 +2381,6 @@ fn upload_ctx(content_type: Option<&str>) -> RequestContext {
         ctx.headers
             .insert("content-type".to_string(), content_type.to_string());
     }
-    // The client sent exactly these headers: retain them as the immutable wire
-    // view the framed-gRPC exemption is decided from.
-    let wire = ctx.headers.clone();
-    retain_client_wire_headers(&mut ctx, &wire);
     ctx
 }
 
@@ -2405,10 +2401,6 @@ fn declared_non_json_uploads_release_request_buffering() {
         "text/plain; charset=utf-8",
         "application/grpc",
         "application/grpc-web+proto",
-        // Framed gRPC `+json` carries frames, never one JSON document, so the
-        // transform declines it on media type and the upload streams.
-        "application/grpc+json",
-        "application/grpc-web+json",
     ] {
         let ctx = upload_ctx(Some(content_type));
         assert!(
@@ -2426,6 +2418,10 @@ fn json_and_untyped_uploads_keep_request_buffering() {
         "application/json",
         "application/json; charset=utf-8",
         "application/merge-patch+json",
+        // Framed gRPC `+json` satisfies `is_json_content_type`, so it stays
+        // buffered exactly as the transform treats it: declined only after it
+        // has seen the bytes.
+        "application/grpc+json",
     ] {
         let ctx = upload_ctx(Some(content_type));
         assert!(
@@ -4220,12 +4216,13 @@ async fn ambiguous_body_refusal_is_a_gateway_representation_terminal() {
     assert!(!gateway_representation_response_selected_for_test(&ctx));
 }
 
-/// Framed gRPC `+json` is declined on media type before the duplicate-member
-/// screen: frames are never one JSON document, so even a frame payload that
-/// repeats a member (or a body above the screen memo's threshold) is neither
-/// screened nor refused, and the upload is released from buffering.
+/// Genuine framed gRPC `+json` uploads the client declared skip the
+/// duplicate-member screen: frames never start like a JSON document, so even a
+/// frame payload that repeats a member (or a body above the screen memo's
+/// threshold) is neither screened nor refused, keeps the `parse_error` outcome
+/// it always had, and stays on the buffered path as before.
 #[tokio::test]
-async fn framed_grpc_json_requests_are_not_screened_or_buffered() {
+async fn framed_grpc_json_requests_skip_screening() {
     use ferrum_edge::plugins::request_transformer::BODY_SKIPPED_METADATA_KEY;
 
     let plugin = privileged_field_stripper();
@@ -4235,45 +4232,92 @@ async fn framed_grpc_json_requests_are_not_screened_or_buffered() {
     framed.extend_from_slice(message);
     let mut large = framed.clone();
     large.resize(8192, b' ');
+    use base64::Engine;
+    let text = base64::engine::general_purpose::STANDARD
+        .encode(&framed)
+        .into_bytes();
 
+    for (content_type, body) in [
+        ("application/grpc+json", &framed),
+        ("application/grpc+json", &large),
+        ("application/grpc-web+json", &framed),
+        ("application/grpc-web-text+json", &text),
+    ] {
+        assert!(
+            plugin.should_buffer_request_body(&upload_ctx(Some(content_type))),
+            "{content_type}: the buffering vote is unchanged"
+        );
+        let headers = HashMap::from([("content-type".to_string(), content_type.to_string())]);
+        let mut ctx = post_ctx();
+        retain_client_wire_headers(&mut ctx, &headers);
+        assert!(
+            plugin
+                .transform_request_body_with_context(&mut ctx, body, Some(content_type), &headers)
+                .await
+                .is_none()
+        );
+        assert_eq!(
+            ctx.metadata
+                .get(BODY_SKIPPED_METADATA_KEY)
+                .map(String::as_str),
+            Some("parse_error"),
+            "{content_type}"
+        );
+        assert!(matches!(
+            plugin
+                .on_final_request_body_with_context(&mut ctx, &headers, body)
+                .await,
+            ferrum_edge::plugins::PluginResult::Continue
+        ));
+    }
+}
+
+/// A client's own framed `+json` declaration is not proof of framing: a bare
+/// JSON body under it (BOM and leading whitespace included) is transformed when
+/// unambiguous and refused when it repeats a member.
+#[tokio::test]
+async fn client_labelled_framed_json_with_a_bare_json_body_is_still_governed() {
+    let plugin = privileged_field_stripper();
     for content_type in [
         "application/grpc+json",
         "application/grpc-web+json",
         "application/grpc-web-text+json",
     ] {
-        assert!(
-            !plugin.should_buffer_request_body(&upload_ctx(Some(content_type))),
-            "{content_type}: the transform declines framing, so the upload streams"
-        );
         let headers = HashMap::from([("content-type".to_string(), content_type.to_string())]);
-        for body in [&framed, &large] {
+        for clean in [
+            br#"{"user":{"role":"admin","name":"a"}}"#.to_vec(),
+            bom(b" \n\t{\"user\":{\"role\":\"admin\",\"name\":\"a\"}}"),
+        ] {
             let mut ctx = post_ctx();
             retain_client_wire_headers(&mut ctx, &headers);
-            assert!(
-                plugin
-                    .transform_request_body_with_context(
-                        &mut ctx,
-                        body,
-                        Some(content_type),
-                        &headers
-                    )
-                    .await
-                    .is_none()
-            );
-            assert_eq!(
-                ctx.metadata
-                    .get(BODY_SKIPPED_METADATA_KEY)
-                    .map(String::as_str),
-                Some("non_json_content_type"),
-                "{content_type}"
-            );
-            assert!(matches!(
-                plugin
-                    .on_final_request_body_with_context(&mut ctx, &headers, body)
-                    .await,
-                ferrum_edge::plugins::PluginResult::Continue
-            ));
+            let rewritten = plugin
+                .transform_request_body_with_context(&mut ctx, &clean, Some(content_type), &headers)
+                .await
+                .unwrap_or_else(|| panic!("{content_type}: a bare JSON body must be rewritten"));
+            let rewritten: serde_json::Value = serde_json::from_slice(&rewritten).unwrap();
+            assert_eq!(rewritten, json!({"user": {"name": "a"}}), "{content_type}");
         }
+
+        let mut ctx = post_ctx();
+        retain_client_wire_headers(&mut ctx, &headers);
+        let ambiguous = br#"{"user":{"role":"admin"},"user":{}}"#;
+        assert!(
+            plugin
+                .transform_request_body_with_context(
+                    &mut ctx,
+                    ambiguous,
+                    Some(content_type),
+                    &headers
+                )
+                .await
+                .is_none()
+        );
+        assert_ambiguous_body_rejected(
+            &plugin
+                .on_final_request_body_with_context(&mut ctx, &headers, ambiguous)
+                .await,
+            content_type,
+        );
     }
 }
 
