@@ -3596,3 +3596,137 @@ fn discovery_refresh_interval_is_bounded_and_requires_discovery() {
         "unexpected error: {error}"
     );
 }
+
+// ── Semicolon-aliased query tokens (issue #6579, GHSA-c259-vchc-3vgr) ──────
+//
+// The shared `token_extract` helpers give `oauth2_introspection` the same
+// contract as `key_auth`: a `from_params` token that also rides behind a `;`
+// sub-parameter is refused before any introspection call, marked for policy
+// redaction, and (with `forward_original_token: false`) stripped even when
+// another mechanism authenticates the request.
+
+const AMBIGUOUS_QUERY_TOKEN_BODY: &str = r#"{"error":"Ambiguous token query parameter"}"#;
+
+fn query_only_introspection(forward_original_token: bool) -> Oauth2Introspection {
+    // The endpoint is never dialed: every request below is decided before
+    // introspection.
+    Oauth2Introspection::new(
+        &json!({
+            "providers": [{
+                "introspection_endpoint": "http://127.0.0.1:8181/introspect",
+                "client_auth": {"method": "none"},
+                "from_params": ["access_token"],
+                "forward_original_token": forward_original_token
+            }]
+        }),
+        PluginHttpClient::default(),
+    )
+    .unwrap()
+}
+
+fn ctx_with_raw_query(raw_query: &str) -> RequestContext {
+    let mut ctx = RequestContext::new("127.0.0.1".into(), "GET".into(), "/test".into());
+    ctx.set_raw_query_string(raw_query.to_string());
+    ctx.materialize_query_params();
+    ctx
+}
+
+#[tokio::test]
+async fn semicolon_aliased_query_token_is_refused_in_single_auth() {
+    let plugin = Arc::new(query_only_introspection(false));
+    let auth_plugins: Vec<Arc<dyn Plugin>> = vec![plugin.clone()];
+    let consumer_index = ConsumerIndex::new(&[create_test_consumer()]);
+    for raw_query in [
+        // Only the alias carries the token: it must not reach introspection.
+        "carrier=;access_token=opaque-token",
+        // An ordinary occurrence beside a different aliased value.
+        "access_token=opaque-token&carrier=;access_token=other-token",
+        // The `;` sits in the NAME, so Ferrum's name is `access_token;x`.
+        "access_token;x=1&carrier=1",
+        // Percent-encoded sub-pair name.
+        "carrier=;access%5Ftoken=opaque-token",
+    ] {
+        let mut ctx = ctx_with_raw_query(raw_query);
+        assert_reject_body(
+            plugin.authenticate(&mut ctx, &consumer_index).await,
+            AMBIGUOUS_QUERY_TOKEN_BODY,
+        );
+        assert!(ctx.identified_consumer.is_none(), "{raw_query}");
+        assert!(ctx.authenticated_identity.is_none(), "{raw_query}");
+
+        let mut ctx = ctx_with_raw_query(raw_query);
+        let (status, _, _) =
+            run_authentication_phase(AuthMode::Single, &auth_plugins, &mut ctx, &consumer_index)
+                .await
+                .expect("an ambiguous query token must be rejected");
+        assert_eq!(status, 401, "{raw_query}");
+        assert!(ctx.identified_consumer.is_none(), "{raw_query}");
+    }
+}
+
+/// Another mechanism wins a multi-auth chain before `oauth2_introspection`
+/// runs while the query token rides only behind a `;`. Discovery runs for
+/// every auth instance before the chain short-circuits, so the alias is
+/// marked for policy redaction and, because the provider does not forward the
+/// original token, removed from the forwarded query.
+#[tokio::test]
+async fn semicolon_aliased_query_token_is_hidden_when_another_mechanism_wins() {
+    let introspection = Arc::new(query_only_introspection(false));
+    let key_auth = Arc::new(KeyAuth::new(&json!({})).expect("valid key auth config"));
+    let auth_plugins: Vec<Arc<dyn Plugin>> = vec![key_auth.clone(), introspection.clone()];
+    let consumer_index = ConsumerIndex::new(&[create_test_consumer()]);
+    let mut ctx = ctx_with_raw_query("carrier=;access_token=opaque-token&keep=1");
+    ctx.headers
+        .insert("x-api-key".to_string(), "test-api-key".to_string());
+    assert!(!ctx.query_params.contains_key("access_token"));
+
+    assert!(
+        run_authentication_phase(AuthMode::Multi, &auth_plugins, &mut ctx, &consumer_index)
+            .await
+            .is_none()
+    );
+    assert_eq!(ctx.auth_method, Some("key_auth"));
+    assert_eq!(
+        ctx.metadata
+            .get("auth.query_credential_param.access_token")
+            .map(String::as_str),
+        Some("true"),
+        "the alias must be marked so delegated-policy payloads redact it"
+    );
+    assert_eq!(
+        ctx.metadata
+            .get("auth.strip_query_param.access_token")
+            .map(String::as_str),
+        Some("true")
+    );
+
+    let mut headers = ctx.headers.clone();
+    assert_continue(key_auth.before_proxy(&mut ctx, &mut headers).await);
+    assert_continue(introspection.before_proxy(&mut ctx, &mut headers).await);
+    let forwarded = ferrum_edge::_test_support::effective_backend_query_string_for_test(&ctx);
+    assert_eq!(forwarded, "keep=1");
+    assert!(!forwarded.contains("opaque-token"));
+}
+
+#[tokio::test]
+async fn semicolon_aliased_query_token_respects_forward_original_token() {
+    let plugin = query_only_introspection(true);
+    let raw_query = "carrier=;access_token=opaque-token&keep=1";
+    let mut ctx = ctx_with_raw_query(raw_query);
+    plugin.mark_query_credentials_for_redaction(&mut ctx);
+    // Policy redaction still applies; forwarding is the operator's choice.
+    assert_eq!(
+        ctx.metadata
+            .get("auth.query_credential_param.access_token")
+            .map(String::as_str),
+        Some("true")
+    );
+    assert!(
+        !ctx.metadata
+            .contains_key("auth.strip_query_param.access_token")
+    );
+    assert_eq!(
+        ferrum_edge::_test_support::effective_backend_query_string_for_test(&ctx),
+        raw_query
+    );
+}

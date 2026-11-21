@@ -1805,3 +1805,165 @@ async fn correctly_signed_token_with_unsupported_crit_header_rejects() {
         assert!(ctx.identified_consumer.is_none());
     }
 }
+
+// ── Semicolon-aliased query tokens (issue #6579, GHSA-c259-vchc-3vgr) ──────
+//
+// `jwt_auth` applies the same contract as `key_auth`: a `query:<name>` token
+// that also rides behind a `;` sub-parameter is refused, marked for policy
+// redaction, and (with `hide_credentials`) stripped even when another
+// mechanism authenticates the request.
+
+const AMBIGUOUS_QUERY_TOKEN_BODY: &str = r#"{"error":"Ambiguous token query parameter"}"#;
+
+fn context_with_raw_query(raw_query: &str) -> RequestContext {
+    let mut ctx = make_ctx();
+    ctx.set_raw_query_string(raw_query.to_string());
+    ctx.materialize_query_params();
+    ctx
+}
+
+#[tokio::test]
+async fn semicolon_aliased_query_token_is_refused_in_single_auth() {
+    let plugin = std::sync::Arc::new(JwtAuth::new(&json!({"token_lookup": "query:jwt"})).unwrap());
+    let auth_plugins: Vec<std::sync::Arc<dyn Plugin>> = vec![plugin.clone()];
+    let consumer_index = ConsumerIndex::new(&[create_test_consumer()]);
+    let token = create_jwt_token(
+        &json!({"sub": "testuser"}),
+        "test-jwt-secret-0123456789abcdefghij",
+    );
+    for raw_query in [
+        // Only the alias carries the (valid) token: it must not authenticate.
+        format!("carrier=;jwt={token}"),
+        // A valid ordinary occurrence beside a different aliased value.
+        format!("jwt={token}&carrier=;jwt=other.jwt.value"),
+        // The `;` sits in the NAME, so Ferrum's name is `jwt;x`.
+        "jwt;x=1&carrier=1".to_string(),
+        // Percent-encoded sub-pair name.
+        format!("carrier=;j%77t={token}"),
+    ] {
+        let mut ctx = context_with_raw_query(&raw_query);
+        assert_reject_body(
+            plugin.authenticate(&mut ctx, &consumer_index).await,
+            AMBIGUOUS_QUERY_TOKEN_BODY,
+        );
+        assert!(ctx.identified_consumer.is_none(), "{raw_query}");
+
+        let mut ctx = context_with_raw_query(&raw_query);
+        let (status, _, _) = ferrum_edge::proxy::run_authentication_phase(
+            ferrum_edge::config::types::AuthMode::Single,
+            &auth_plugins,
+            &mut ctx,
+            &consumer_index,
+        )
+        .await
+        .expect("an ambiguous query token must be rejected");
+        assert_eq!(status, 401, "{raw_query}");
+        assert!(ctx.identified_consumer.is_none(), "{raw_query}");
+    }
+}
+
+#[tokio::test]
+async fn semicolon_inside_a_query_value_is_not_a_token_alias() {
+    let plugin = JwtAuth::new(&json!({"token_lookup": "query:jwt"})).unwrap();
+    let consumer_index = ConsumerIndex::new(&[create_test_consumer()]);
+    let token = create_jwt_token(
+        &json!({"sub": "testuser"}),
+        "test-jwt-secret-0123456789abcdefghij",
+    );
+    let mut ctx = context_with_raw_query(&format!("jwt={token}&carrier=a;b=c"));
+    assert_continue(plugin.authenticate(&mut ctx, &consumer_index).await);
+    assert!(ctx.identified_consumer.is_some());
+}
+
+/// Another mechanism wins a multi-auth chain before `jwt_auth` runs while the
+/// custom query token rides only behind a `;`. Discovery runs for every auth
+/// instance before the chain short-circuits, and `before_proxy` runs for every
+/// plugin, so the alias is marked for policy redaction AND stripped.
+#[tokio::test]
+async fn semicolon_aliased_query_token_is_hidden_when_another_mechanism_wins() {
+    let jwt_plugin = std::sync::Arc::new(
+        JwtAuth::new(&json!({
+            "token_lookup": "query:tenant_jwt",
+            "hide_credentials": true
+        }))
+        .unwrap(),
+    );
+    let key_plugin = std::sync::Arc::new(
+        ferrum_edge::plugins::key_auth::KeyAuth::new(&json!({})).expect("valid key auth config"),
+    );
+    let auth_plugins: Vec<std::sync::Arc<dyn Plugin>> =
+        vec![key_plugin.clone(), jwt_plugin.clone()];
+    let consumer_index = ConsumerIndex::new(&[create_test_consumer()]);
+    let mut ctx = context_with_raw_query("carrier=;tenant_jwt=aliased.jwt.value&keep=1");
+    ctx.headers
+        .insert("x-api-key".to_string(), "test-api-key".to_string());
+    assert!(
+        !ctx.query_params.contains_key("tenant_jwt"),
+        "Ferrum's `&`-only parser does not see the alias as the configured name"
+    );
+
+    assert!(
+        ferrum_edge::proxy::run_authentication_phase(
+            ferrum_edge::config::types::AuthMode::Multi,
+            &auth_plugins,
+            &mut ctx,
+            &consumer_index,
+        )
+        .await
+        .is_none()
+    );
+    assert_eq!(ctx.auth_method, Some("key_auth"));
+    assert_eq!(
+        ctx.metadata
+            .get("auth.query_credential_param.tenant_jwt")
+            .map(String::as_str),
+        Some("true"),
+        "the alias must be marked so delegated-policy payloads redact it"
+    );
+
+    let mut backend_headers = ctx.headers.clone();
+    assert_continue(
+        key_plugin
+            .before_proxy(&mut ctx, &mut backend_headers)
+            .await,
+    );
+    assert_continue(
+        jwt_plugin
+            .before_proxy(&mut ctx, &mut backend_headers)
+            .await,
+    );
+    assert_eq!(
+        ctx.metadata
+            .get("auth.strip_query_param.tenant_jwt")
+            .map(String::as_str),
+        Some("true")
+    );
+    let forwarded = ferrum_edge::_test_support::effective_backend_query_string_for_test(&ctx);
+    assert_eq!(forwarded, "keep=1");
+    assert!(!forwarded.contains("aliased.jwt.value"));
+}
+
+#[tokio::test]
+async fn semicolon_aliased_query_token_respects_default_forwarding() {
+    let plugin = JwtAuth::new(&json!({"token_lookup": "query:tenant_jwt"})).unwrap();
+    let raw_query = "carrier=;tenant_jwt=aliased.jwt.value&keep=1";
+    let mut ctx = context_with_raw_query(raw_query);
+    plugin.mark_query_credentials_for_redaction(&mut ctx);
+    // Policy redaction still applies; forwarding is the operator's choice.
+    assert_eq!(
+        ctx.metadata
+            .get("auth.query_credential_param.tenant_jwt")
+            .map(String::as_str),
+        Some("true")
+    );
+    let mut headers = HashMap::new();
+    assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+    assert!(
+        !ctx.metadata
+            .contains_key("auth.strip_query_param.tenant_jwt")
+    );
+    assert_eq!(
+        ferrum_edge::_test_support::effective_backend_query_string_for_test(&ctx),
+        raw_query
+    );
+}

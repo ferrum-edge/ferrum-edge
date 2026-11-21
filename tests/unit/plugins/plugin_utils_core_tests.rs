@@ -13,7 +13,8 @@ use ferrum_edge::plugins::utils::jwt_verifier::{
 };
 use ferrum_edge::plugins::utils::query::{
     CanonicalQuery, OrderedQuery, QueryAmbiguity, canonical_query_for_policy,
-    has_conflicting_duplicate_among, semicolon_sub_pair_names,
+    has_conflicting_duplicate_among, query_has_semicolon_credential_alias,
+    semicolon_sub_pair_names,
 };
 use ferrum_edge::plugins::utils::scope_role_check::{ScopeRoleRequirements, check};
 use ferrum_edge::plugins::utils::socket_host::parse_socket_host;
@@ -26,7 +27,8 @@ use ferrum_edge::plugins::utils::sse::{
 };
 use ferrum_edge::plugins::utils::token_extract::{
     TokenHeaderLocation, TokenLocation, TokenLocationExtract, extract_authorization_bearer,
-    extract_from_location,
+    extract_from_location, mark_present_query_credential_locations,
+    mark_provider_query_credential_locations,
 };
 use ferrum_edge::startup::render_startup_error;
 use ferrum_edge::util::unknown_keys::reject_unknown_keys;
@@ -1208,6 +1210,139 @@ fn token_extract_non_materialized_custom_header_is_invalid_not_missing() {
         TokenLocationExtract::Credential(ExtractedCredential::InvalidFormat(body))
             if body == r#"{"error":"Invalid token"}"#
     ));
+}
+
+// --- Semicolon-aliased query credentials (issue #6579, GHSA-c259-vchc-3vgr).
+
+#[test]
+fn semicolon_credential_alias_detects_sub_pair_spellings_only() {
+    for raw_query in [
+        "carrier=;access_token=t",
+        "carrier=1;access_token=t&keep=1",
+        // The `;` sits in the NAME, so Ferrum's name is `access_token;x`.
+        "access_token;x=1&carrier=1",
+        // Percent-encoded and form-decoded sub-pair names.
+        "carrier=;access%5Ftoken=t",
+        "access_token=t&carrier=;access_token=other",
+    ] {
+        assert!(
+            query_has_semicolon_credential_alias(Some(raw_query), "access_token"),
+            "{raw_query}"
+        );
+    }
+    assert!(query_has_semicolon_credential_alias(
+        Some("carrier=;private+key=t"),
+        "private key"
+    ));
+    for raw_query in [
+        "access_token=t",
+        // A `;` inside the credential's own value is that value, not an alias.
+        "access_token=t;x=1",
+        "access_token=t&carrier=a;b=c",
+        // `%3B` is content, never a separator.
+        "carrier=a%3Baccess_token%3Dt",
+    ] {
+        assert!(
+            !query_has_semicolon_credential_alias(Some(raw_query), "access_token"),
+            "{raw_query}"
+        );
+    }
+    assert!(!query_has_semicolon_credential_alias(None, "access_token"));
+}
+
+fn materialized_ctx_for(raw_query: &str) -> RequestContext {
+    let mut ctx = ctx_for(raw_query);
+    ctx.materialize_query_params();
+    ctx
+}
+
+#[test]
+fn token_extract_semicolon_aliased_query_token_is_invalid_not_missing() {
+    let location = TokenLocation::QueryParam("access_token".to_string());
+    for raw_query in [
+        "carrier=;access_token=aliased-token",
+        // The ordinary occurrence must not mask a different aliased value.
+        "access_token=plain-token&carrier=;access_token=aliased-token",
+    ] {
+        let ctx = materialized_ctx_for(raw_query);
+        assert!(
+            matches!(
+                extract_from_location(&location, &ctx),
+                TokenLocationExtract::Credential(ExtractedCredential::InvalidFormat(body))
+                    if body == r#"{"error":"Ambiguous token query parameter"}"#
+            ),
+            "{raw_query}"
+        );
+    }
+
+    let ctx = materialized_ctx_for("access_token=plain-token&carrier=a;b=c");
+    assert!(matches!(
+        extract_from_location(&location, &ctx),
+        TokenLocationExtract::Credential(ExtractedCredential::BearerToken(token))
+            if token == "plain-token"
+    ));
+}
+
+#[test]
+fn token_extract_marks_semicolon_aliased_query_token_for_redaction_and_strip() {
+    let locations = [TokenLocation::QueryParam("access_token".to_string())];
+
+    // Redaction-only marking never changes the forwarded query.
+    let mut ctx = materialized_ctx_for("carrier=;access_token=aliased-token&keep=1");
+    mark_present_query_credential_locations(&mut ctx, &locations);
+    assert_eq!(
+        ctx.metadata
+            .get("auth.query_credential_param.access_token")
+            .map(String::as_str),
+        Some("true")
+    );
+    assert!(
+        !ctx.metadata
+            .contains_key("auth.strip_query_param.access_token")
+    );
+
+    // A provider that forwards the original token keeps the alias.
+    let mut ctx = materialized_ctx_for("carrier=;access_token=aliased-token&keep=1");
+    mark_provider_query_credential_locations(&mut ctx, &locations, true);
+    assert!(
+        ctx.metadata
+            .contains_key("auth.query_credential_param.access_token")
+    );
+    assert!(
+        !ctx.metadata
+            .contains_key("auth.strip_query_param.access_token")
+    );
+
+    // `forward_original_token: false` marks the alias for removal.
+    let mut ctx = materialized_ctx_for("carrier=;access_token=aliased-token&keep=1");
+    mark_provider_query_credential_locations(&mut ctx, &locations, false);
+    assert!(
+        ctx.metadata
+            .contains_key("auth.query_credential_param.access_token")
+    );
+    assert_eq!(
+        ctx.metadata
+            .get("auth.strip_query_param.access_token")
+            .map(String::as_str),
+        Some("true")
+    );
+    assert_eq!(
+        ferrum_edge::_test_support::effective_backend_query_string_for_test(&ctx),
+        "keep=1"
+    );
+
+    // An ordinary (non-aliased) token keeps its accept-time strip contract:
+    // discovery marks it for redaction only.
+    let mut ctx = materialized_ctx_for("access_token=plain-token&keep=1");
+    mark_provider_query_credential_locations(&mut ctx, &locations, false);
+    assert!(
+        ctx.metadata
+            .contains_key("auth.query_credential_param.access_token")
+    );
+    assert!(
+        !ctx.metadata
+            .contains_key("auth.strip_query_param.access_token")
+    );
 }
 
 // --- H1/H2/H3 parity.
