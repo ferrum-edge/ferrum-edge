@@ -42,13 +42,27 @@ billed under its bare identity, sharing a row with any Consumer or other
 provider that used the same string. A Consumer whose username begins with
 `external:` is now always reported in its `~sha256:` digest form.
 
-**Operator action:** update invoicing and reconciliation that maps
-`/charges` consumer keys or ClickHouse `consumer_id` values for external
-principals to customers: match the `external:` key (or its identity suffix
-together with the mechanism and authority) instead of the bare identity.
-Existing ClickHouse rows and Prometheus series recorded before the upgrade keep
-their old bare-identity values; after the upgrade, external principals start
-new rows and series. Transaction log output (`consumer_username`) is unchanged.
+**Treat the upgrade as a billing boundary.** Rows recorded before it — ClickHouse
+rows, Prometheus series, and charge events still pending in the sink spool,
+which replay with their original bytes after the upgrade — are keyed on the bare
+display identity and are not realm-qualified. A pre-upgrade bare value can even
+coincide with a post-upgrade key: a Consumer whose username was literally
+`external:jwks_auth:<64 hex>:alice` billed under that string before the upgrade,
+while after it the same string identifies the external principal and the
+Consumer moves to its digest form. Because the shipped ClickHouse rollups group
+by `consumer_id` without the realm, keep the two eras separately attributable
+for the first realm-qualified rollout — for example ship it with a new
+`pricing_version` (part of every rollup key) or write it to a new table — and
+let pending spool rows drain before reconciling across the boundary.
+
+**Operator action:** update invoicing and reconciliation that maps `/charges`
+consumer keys or ClickHouse `consumer_id` values for external principals to
+customers: match the `external:` key (or its identity suffix together with the
+mechanism and authority) instead of the bare identity. External rows are
+qualified by the realm authority the mechanism commits; `soap_ws_security`
+currently commits none, so its principals are qualified by mechanism only
+(`external:soap_ws_security:-:<identity>`). Transaction log output
+(`consumer_username`) is unchanged.
 
 ### EastWestGateway passthrough legs now follow DestinationRules (#7424)
 

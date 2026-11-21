@@ -1944,10 +1944,16 @@ keys a billing row:
 
 `<mechanism>` is the authentication plugin that verified the identity and
 `<authority>` is the opaque 64-hex digest of the verifying authority (issuer,
-key source, directory) for mechanisms that accept more than one; either is `-`
-when absent (for example a stream connection, which carries no realm). Two
+key source, directory) that the mechanism commits with the identity; either is
+`-` when absent (for example a stream connection, which carries no realm). Two
 providers that issue the same subject therefore bill two rows, and neither
-shares the Consumer's row. A value above 512 bytes, or one containing the
+shares the Consumer's row. External rows are only as fine-grained as the
+committed realm: `soap_ws_security` currently commits no authority, so its
+principals are qualified by mechanism only
+(`external:soap_ws_security:-:<identity>`), and two SAML issuers trusted by one
+instance share a row for the same subject. Rows recorded before this keying
+took effect carry bare display identities; see the upgrade guide for the
+cutover. A value above 512 bytes, or one containing the
 `~sha256:` marker, uses the collision-resistant digest form described below
 (external keys hash under a separate domain from Consumer usernames). A
 Consumer whose username itself begins with `external:` is always given its
