@@ -741,6 +741,22 @@ impl A2aGateway {
                 inspection_failed: true,
             });
         }
+        // Agent Card rewriting depends on the arrival-time classification just
+        // as a deny policy does: an unclaimed request gets no buffering, no
+        // admitted public origin, and no rewrite, so the backend's card would be
+        // served with its internal URLs (GHSA-q25c-76f4-fp7h). The JSON-RPC
+        // endpoint carries its operation in the body, so a POST there that
+        // nothing above could classify — a body that is not a JSON document,
+        // carries no envelope, was not buffered, or was sent with a non-JSON
+        // media type a lenient server may still parse — cannot prove that it
+        // is not an Agent Card call and fails closed. Under a deny-capable
+        // policy the in-scope fallback above already refused it.
+        if self.jsonrpc_requires_classification()
+            && ctx.method.eq_ignore_ascii_case("POST")
+            && ctx.path == self.endpoint.path
+        {
+            return self.jsonrpc_inspection_failed_detection(false);
+        }
         None
     }
 
@@ -796,21 +812,27 @@ impl A2aGateway {
                 max_request_body_size = self.detection.max_request_body_size,
                 "Skipping A2A JSON-RPC detection because request body exceeds plugin detection limit"
             );
-            if self.policy_requires_inspection() {
+            if self.jsonrpc_requires_classification() {
                 return Some(oversized_jsonrpc_detection());
             }
             return None;
         }
+        // A UTF-8 byte order mark is not JSON, but lenient servers skip it and
+        // execute the envelope behind it, so classification reads past it
+        // rather than leaving a BOM-prefixed call unclassified. The bytes
+        // forwarded are unchanged.
+        let body = strip_json_bom(body);
         // Duplicate member names make the classified envelope and the
         // forwarded bytes two different documents: `serde_json` keeps the LAST
         // `method` while a first-key-wins A2A server executes the FIRST, so
         // `{"method":"tasks/cancel","method":"message/send"}` would be policed
         // as `message/send` (GHSA-c78j-5w9p-cpq6, GHSA-49cr-v28q-9hgp). Such a
         // body, a singleton or a batch, cannot be classified: under a policy
-        // that can deny it fails closed, otherwise it is left unclassified.
-        // A batch refusal is still a batch answering every request member
-        // (JSON-RPC 2.0 section 6), like the unclassifiable-batch path below.
-        // Malformed JSON is not ambiguous and keeps its own handling below.
+        // that can deny, or with Agent Card rewriting enabled, it fails closed;
+        // otherwise it is left unclassified. A batch refusal is still a batch
+        // answering every request member (JSON-RPC 2.0 section 6), like the
+        // unclassifiable-batch path below. Malformed JSON is not ambiguous and
+        // keeps its own handling below.
         if json_dup_keys::slice_ambiguity(body).is_some() {
             warn_sampled!(
                 body_size = body.len(),
@@ -839,6 +861,10 @@ impl A2aGateway {
             );
             return Some(detection);
         }
+        // A body that is not a JSON document is left to the caller: the
+        // arrival-time fallbacks in `maybe_detect` refuse it whenever
+        // classification is required, and the final-body hook refuses it
+        // through `final_jsonrpc_class_unprovable`.
         let value: Value = serde_json::from_slice(body).ok()?;
         if let Some(batch) = value.as_array() {
             return self.detect_jsonrpc_batch(ctx, batch, headers);
@@ -846,10 +872,11 @@ impl A2aGateway {
         match self.detect_jsonrpc_value(&value, headers) {
             Some(detection) => Some(detection),
             // A body that carries a JSON-RPC `method` but is not a well-formed
-            // 2.0 request (wrong/absent `jsonrpc`, etc.) must not slip past a
-            // deny policy via a malformed envelope. Fail closed here exactly as
+            // 2.0 request (wrong/absent `jsonrpc`, etc.), or names a method
+            // this classifier does not recognize, must not slip past a deny
+            // policy or the Agent Card rewrite. Fail closed here exactly as
             // batch members do below. Other unrecognized payloads are handled
-            // by the in-scope fallback in `maybe_detect`.
+            // by the fallbacks in `maybe_detect`.
             None if value.get("method").is_some() => {
                 self.jsonrpc_inspection_failed_detection(false)
             }
@@ -874,6 +901,13 @@ impl A2aGateway {
         let mut first_detection = None;
         for item in batch {
             let Some(mut detection) = self.detect_jsonrpc_value(item, headers) else {
+                // One unrecognized member leaves the whole batch unclassified.
+                // When classification is required (a deny-capable policy, or
+                // Agent Card rewriting) the batch is refused here; otherwise
+                // the `?` deliberately drops any member classified so far,
+                // because no refusal and no Agent Card rewrite depends on it
+                // (GHSA-q25c-76f4-fp7h: a card member beside an unknown one
+                // must never be dispatched unclaimed while rewriting is on).
                 let mut detection = self.jsonrpc_inspection_failed_detection(true)?;
                 detection.jsonrpc_batch_ids = Some(batch_ids);
                 return Some(detection);
@@ -946,23 +980,27 @@ impl A2aGateway {
         })
     }
 
+    /// The refusal-bound detection for a JSON-RPC request whose operation set
+    /// cannot be proven, or `None` when this instance does not need it proven
+    /// (see [`A2aGateway::jsonrpc_requires_classification`]).
     fn jsonrpc_inspection_failed_detection(
         &self,
         jsonrpc_batch_response: bool,
     ) -> Option<A2aDetection> {
-        self.policy_requires_inspection().then(|| A2aDetection {
-            binding: A2aBinding::JsonRpc,
-            method: "unknown".to_string(),
-            jsonrpc_id: None,
-            jsonrpc_batch_response,
-            jsonrpc_batch_ids: None,
-            task_id_hint: None,
-            streaming_hint: false,
-            is_agent_card: false,
-            grpc_card_schema: None,
-            oversized_body: false,
-            inspection_failed: true,
-        })
+        self.jsonrpc_requires_classification()
+            .then(|| A2aDetection {
+                binding: A2aBinding::JsonRpc,
+                method: "unknown".to_string(),
+                jsonrpc_id: None,
+                jsonrpc_batch_response,
+                jsonrpc_batch_ids: None,
+                task_id_hint: None,
+                streaming_hint: false,
+                is_agent_card: false,
+                grpc_card_schema: None,
+                oversized_body: false,
+                inspection_failed: true,
+            })
     }
 
     fn detect_rest(&self, ctx: &RequestContext) -> Option<A2aDetection> {
@@ -1153,6 +1191,21 @@ impl A2aGateway {
                 .any(|entry| entry.action == PolicyAction::Deny || entry.grant.is_some())
     }
 
+    /// Whether a JSON-RPC request this instance cannot classify must fail
+    /// closed rather than pass unclaimed.
+    ///
+    /// Two things depend on the classification. A deny-capable policy cannot
+    /// prove an unclassified request avoids a denied operation. Agent Card
+    /// rewriting cannot rewrite a card it never claimed: an unclaimed request
+    /// gets no response buffering and no admitted public origin, so a card call
+    /// hidden in an oversized, duplicate-member, malformed, or mixed-batch body
+    /// would be answered with the backend's internal URLs
+    /// (GHSA-q25c-76f4-fp7h). Only with neither does an unclassifiable
+    /// JSON-RPC body keep passing through transparently.
+    fn jsonrpc_requires_classification(&self) -> bool {
+        self.policy_requires_inspection() || self.discovery.rewrite_agent_card_urls
+    }
+
     /// Whether the final backend-visible request-body hook can change any
     /// outcome for this instance: a policy that can deny re-decides there, and
     /// Agent Card rewriting or response metadata depends on the operation class
@@ -1160,9 +1213,7 @@ impl A2aGateway {
     fn final_request_body_recheck_applies(&self) -> bool {
         self.enabled
             && self.detection.bindings.contains(&A2aBinding::JsonRpc)
-            && (self.policy_requires_inspection()
-                || self.discovery.rewrite_agent_card_urls
-                || self.observability.emit_metadata)
+            && (self.jsonrpc_requires_classification() || self.observability.emit_metadata)
     }
 
     fn rest_suffix<'a>(&self, path: &'a str) -> Option<&'a str> {
@@ -1471,7 +1522,7 @@ impl A2aGateway {
         ctx: &mut RequestContext,
         detection: &A2aDetection,
     ) -> Option<PluginResult> {
-        if detection.oversized_body && self.policy_requires_inspection() {
+        if detection.oversized_body && self.jsonrpc_requires_classification() {
             if self.observability.emit_metadata {
                 ctx.metadata
                     .insert("a2a.policy_decision".to_string(), "deny".to_string());
@@ -1482,7 +1533,7 @@ impl A2aGateway {
             }
             return Some(oversized_jsonrpc_response(detection));
         }
-        if detection.inspection_failed && self.policy_requires_inspection() {
+        if detection.inspection_failed && self.jsonrpc_requires_classification() {
             if self.observability.emit_metadata {
                 ctx.metadata
                     .insert("a2a.policy_decision".to_string(), "deny".to_string());
@@ -1553,19 +1604,31 @@ impl A2aGateway {
     /// parseable singleton this classifier simply does not recognize (for
     /// example an unknown method) is not covered: it carries no Agent Card or
     /// streaming operation the response phase acts on.
+    ///
+    /// A request NOTHING claimed at arrival is covered too while classification
+    /// is required: no response handling or public origin exists for it, so an
+    /// unreadable body that a lenient server may still execute as an Agent Card
+    /// call is refused (GHSA-q25c-76f4-fp7h). Arrival already refuses every
+    /// unclassifiable endpoint `POST` in that case, so this is the backstop for
+    /// a request that reaches the final body without that decision. A request
+    /// a sibling instance claimed is that instance's to decide.
     fn final_jsonrpc_class_unprovable(
         &self,
         ctx: &RequestContext,
         headers: &HashMap<String, String>,
         body: &[u8],
     ) -> Option<FinalClassUnprovable> {
-        if !(self.discovery.rewrite_agent_card_urls || self.observability.emit_metadata) {
+        if !(self.jsonrpc_requires_classification() || self.observability.emit_metadata) {
             return None;
         }
-        if !self
-            .claim(ctx)
-            .is_some_and(|claim| claim.binding == A2aBinding::JsonRpc.as_str())
-        {
+        let covered = match ctx.a2a_gateway_claim.as_deref() {
+            Some(claim) if claim.owner == self.instance_id => {
+                claim.binding == A2aBinding::JsonRpc.as_str()
+            }
+            Some(_) => false,
+            None => self.jsonrpc_requires_classification(),
+        };
+        if !covered {
             return None;
         }
         if !ctx.method.eq_ignore_ascii_case("POST")
@@ -1579,6 +1642,8 @@ impl A2aGateway {
         {
             return Some(FinalClassUnprovable::Oversized);
         }
+        // The same BOM-stripped view `detect_jsonrpc_body` classifies.
+        let body = strip_json_bom(body);
         // Bounded by the detection ceiling just checked; parses without
         // building a tree.
         if serde_json::from_slice::<serde::de::IgnoredAny>(body).is_err() {
@@ -1631,7 +1696,9 @@ impl Plugin for A2aGateway {
 
     /// A deny policy refuses REST-binding paths by method, and a WebSocket
     /// upgrade to such a path would skip this plugin, so it gates admission.
-    /// An observability-only configuration refuses nothing.
+    /// Without one nothing a WebSocket upgrade can carry is refused: the Agent
+    /// Card classification rule (`jsonrpc_requires_classification`) governs
+    /// JSON-RPC `POST`s only.
     fn gates_request_admission(&self) -> bool {
         self.enabled && self.policy_requires_inspection()
     }
@@ -4995,6 +5062,18 @@ fn origin_response_is_still_encoded(ctx: &RequestContext) -> bool {
 fn origin_response_is_fragment(ctx: &RequestContext) -> bool {
     ctx.metadata
         .contains_key(crate::proxy::ORIGIN_FRAGMENT_RESPONSE_METADATA_KEY)
+}
+
+/// The JSON-RPC request body with one leading UTF-8 byte order mark removed.
+///
+/// `serde_json` rejects a BOM-prefixed document, while lenient A2A servers skip
+/// the mark and execute the envelope behind it, so classification reads the
+/// same document the backend will. Only the classification view is stripped;
+/// the forwarded bytes and the byte-identity comparison against the admitted
+/// body stay raw. Mirrors `ai_tool_governor` / `ai_semantic_firewall`.
+fn strip_json_bom(body: &[u8]) -> &[u8] {
+    body.strip_prefix(b"\xEF\xBB\xBF".as_slice())
+        .unwrap_or(body)
 }
 
 fn content_type_is_json(headers: &HashMap<String, String>) -> bool {

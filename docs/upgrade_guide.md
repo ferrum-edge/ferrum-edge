@@ -28,6 +28,40 @@ applied by editing the file (see [File Mode](#file-mode-ferrum_modefile)).
 
 ## Upgrading to the next release (unreleased)
 
+### `a2a_gateway` refuses unclassifiable JSON-RPC while Agent Card rewriting is on (GHSA-q25c-76f4-fp7h)
+
+With `discovery.rewrite_agent_card_urls` enabled (the default), every
+`POST endpoint.path` request must now be classified as JSON-RPC at arrival, even
+under the default `allow` policy. Before, only a deny-capable policy made the
+plugin fail closed on a body it could not classify; otherwise the request was
+forwarded unclaimed, and an Agent Card call inside it was answered with the
+backend's un-rewritten internal URLs.
+
+What is now refused when rewriting is on:
+
+- a body over `detection.max_request_body_size` (default 1 MiB): HTTP `413`,
+  JSON-RPC `-32013`, `a2a.error: request_body_too_large`;
+- a duplicate-member body, a batch with a member the plugin does not
+  recognize, an empty batch, a method-bearing body that is not a well-formed
+  JSON-RPC 2.0 request, an unknown method sent without the version header, a
+  body that is not a JSON document or has no JSON-RPC envelope, and a POST with
+  a non-JSON media type: JSON-RPC `-32001`,
+  `a2a.error: request_body_uninspectable` (a batch is answered per member).
+
+A body with a leading UTF-8 byte order mark is now classified on the bytes
+after the mark under every configuration, instead of being treated as
+unparseable. The forwarded bytes are unchanged.
+
+**Operator action:** if JSON-RPC bodies legitimately exceed 1 MiB (inline file
+parts, for example), raise `detection.max_request_body_size` or set it to `0`.
+Clients that call non-A2A methods on the endpoint should send the version header
+(`detection.allow_unknown_methods_with_version_header` defaults to `true`). To
+keep the previous transparent passthrough of unrecognized JSON-RPC, set
+`discovery.rewrite_agent_card_urls: false` and configure no deny-capable policy.
+Deployments with a deny-capable policy already failed closed at arrival; for
+them only BOM handling changes, plus a final-body refusal when a later
+transform leaves an admitted body that is no longer a JSON document.
+
 ### EastWestGateway passthrough legs now follow DestinationRules (#7424)
 
 An EastWestGateway data plane now applies DestinationRules to its

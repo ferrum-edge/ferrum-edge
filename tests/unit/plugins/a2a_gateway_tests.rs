@@ -981,10 +981,13 @@ async fn oversized_jsonrpc_body_fails_closed_when_policy_can_deny() {
 
 #[tokio::test]
 async fn oversized_jsonrpc_body_continues_when_policy_cannot_deny() {
+    // Transparent passthrough needs both: no deny-capable policy AND no Agent
+    // Card rewriting (GHSA-q25c-76f4-fp7h covers the rewriting half).
     let plugin = plugin(json!({
         "detection": {
             "max_request_body_size": 16
-        }
+        },
+        "discovery": {"rewrite_agent_card_urls": false}
     }));
     let body = json!({
         "jsonrpc": "2.0",
@@ -6689,11 +6692,17 @@ async fn final_body_reclassified_from_a_stream_into_an_agent_card_is_refused() {
 #[tokio::test]
 async fn final_body_that_becomes_an_agent_card_without_arrival_classification_is_refused() {
     let gateway = plugin(json!({}));
-    let (mut ctx, mut headers) = jsonrpc_ctx(json!({"hello": "world"}));
+    // With rewriting on, an envelope-less body at the JSON-RPC endpoint is
+    // itself refused at arrival (GHSA-q25c-76f4-fp7h), so the final-body
+    // backstop is exercised on a request this instance never classified.
+    let (mut arrival, mut arrival_headers) = jsonrpc_ctx(json!({"hello": "world"}));
     assert!(matches!(
-        gateway.before_proxy(&mut ctx, &mut headers).await,
-        PluginResult::Continue
+        gateway
+            .before_proxy(&mut arrival, &mut arrival_headers)
+            .await,
+        PluginResult::Reject { .. }
     ));
+    let (mut ctx, headers) = jsonrpc_ctx(json!({"hello": "world"}));
     assert!(!ctx.metadata.contains_key("a2a.method"));
     let dispatched = json!({"jsonrpc": "2.0", "id": 7, "method": "agent/getCard"}).to_string();
     assert!(matches!(
@@ -7204,7 +7213,10 @@ async fn admitted_request_whose_final_body_is_unreadable_is_refused() {
 /// configuration keep passing.
 #[tokio::test]
 async fn unclassified_oversized_request_is_not_refused_at_the_final_body() {
-    let gateway = plugin(json!({"detection": {"max_request_body_size": 64}}));
+    let gateway = plugin(json!({
+        "detection": {"max_request_body_size": 64},
+        "discovery": {"rewrite_agent_card_urls": false}
+    }));
     let large = json!({
         "jsonrpc": "2.0",
         "id": "req-1",
@@ -7409,8 +7421,9 @@ async fn duplicate_member_jsonrpc_body_fails_closed_under_deny_policy() {
 }
 
 /// A transform that introduces a duplicate member after admission is refused
-/// on the final backend-visible body, under a deny policy and (as an
-/// unprovable operation class) without one.
+/// on the final backend-visible body: as uninspectable under a deny policy or
+/// Agent Card rewriting, and as an unprovable operation class under a
+/// metadata-only configuration.
 #[tokio::test]
 async fn duplicate_member_final_jsonrpc_body_is_refused() {
     let dispatched = r#"{"jsonrpc":"2.0","id":"req-1","method":"tasks/cancel","method":"tasks/get","params":{"id":"t"}}"#;
@@ -7419,7 +7432,11 @@ async fn duplicate_member_final_jsonrpc_body_is_refused() {
             json!({"policy": {"methods": {"tasks/cancel": {"action": "deny"}}}}),
             "request_body_uninspectable",
         ),
-        (json!({}), "operation_class_unprovable"),
+        (json!({}), "request_body_uninspectable"),
+        (
+            json!({"discovery": {"rewrite_agent_card_urls": false}}),
+            "operation_class_unprovable",
+        ),
     ] {
         let gateway = plugin(config);
         let (mut ctx, mut headers) = jsonrpc_ctx(json!({
@@ -7483,12 +7500,12 @@ async fn duplicate_member_final_jsonrpc_batch_is_refused_as_a_batch() {
     }
 }
 
-/// Without a policy that can deny, a duplicate-member body is left
-/// unclassified (as an oversized one is) rather than classified as its last
-/// `method`.
+/// Without a policy that can deny and without Agent Card rewriting, a
+/// duplicate-member body is left unclassified (as an oversized one is) rather
+/// than classified as its last `method`.
 #[tokio::test]
 async fn duplicate_member_jsonrpc_body_is_unclassified_without_deny_policy() {
-    let gateway = plugin(json!({}));
+    let gateway = plugin(json!({"discovery": {"rewrite_agent_card_urls": false}}));
     let (mut ctx, mut headers) = jsonrpc_ctx_with_raw_body(
         r#"{"jsonrpc":"2.0","id":1,"method":"tasks/cancel","method":"tasks/get","params":{"id":"t"}}"#
             .to_string(),
@@ -7498,4 +7515,348 @@ async fn duplicate_member_jsonrpc_body_is_unclassified_without_deny_policy() {
         PluginResult::Continue
     ));
     assert!(!ctx.metadata.contains_key("a2a.method"));
+}
+
+// ── GHSA-q25c-76f4-fp7h: Agent Card rewriting requires classification ─────
+
+/// The refusal every unprovable JSON-RPC request receives while Agent Card
+/// rewriting is on: the plugin's existing uninspectable-body error.
+fn assert_uninspectable_refusal(result: PluginResult, ctx: &RequestContext, label: &str) -> Value {
+    let PluginResult::Reject {
+        status_code, body, ..
+    } = result
+    else {
+        panic!("{label}: must be refused rather than dispatched unclaimed");
+    };
+    assert_eq!(status_code, 200, "{label}");
+    assert_eq!(
+        ctx.metadata.get("a2a.error").map(String::as_str),
+        Some("request_body_uninspectable"),
+        "{label}"
+    );
+    assert_eq!(
+        ctx.metadata.get("a2a.policy_decision").map(String::as_str),
+        Some("deny"),
+        "{label}"
+    );
+    serde_json::from_str(&body).expect("refusal is JSON")
+}
+
+/// An Agent Card call beside an unrecognized member used to make the whole
+/// batch unclassified, which under the default allow policy dispatched the
+/// card call with no claim and so no rewrite.
+#[tokio::test]
+async fn rewrite_enabled_mixed_batch_with_an_agent_card_never_passes_unclaimed() {
+    let gateway = plugin(json!({}));
+    let batch = json!([
+        {"jsonrpc": "2.0", "id": 1, "method": "agent/getCard"},
+        {"jsonrpc": "2.0", "id": 2, "method": "vendor/ping"}
+    ]);
+    let (mut ctx, mut headers) = jsonrpc_ctx(batch.clone());
+    let result = gateway.before_proxy(&mut ctx, &mut headers).await;
+    let body = assert_uninspectable_refusal(result, &ctx, "mixed batch");
+    let responses = body.as_array().expect("a batch refusal is a batch");
+    assert_eq!(responses.len(), 2);
+    assert_eq!(responses[0]["id"], 1);
+    assert_eq!(responses[1]["id"], 2);
+    for response in responses {
+        assert_eq!(response["error"]["code"], -32001);
+        assert_eq!(response["error"]["data"]["method"], "unknown");
+    }
+
+    // A client that opts the unknown member in through the version header gets
+    // it classified, so the card member is claimed and its response rewritten.
+    let (mut ctx, mut headers) = jsonrpc_ctx(batch);
+    headers.insert("a2a-version".to_string(), "0.3.0".to_string());
+    assert!(matches!(
+        gateway.before_proxy(&mut ctx, &mut headers).await,
+        PluginResult::Continue
+    ));
+    assert_eq!(
+        ctx.metadata.get("a2a.method").map(String::as_str),
+        Some("agent/getCard")
+    );
+    assert!(gateway.should_buffer_response_body(&ctx));
+}
+
+#[tokio::test]
+async fn rewrite_enabled_duplicate_member_body_never_passes_unclaimed() {
+    let gateway = plugin(json!({}));
+    let (mut ctx, mut headers) = jsonrpc_ctx_with_raw_body(
+        r#"{"jsonrpc":"2.0","id":1,"method":"agent/getCard","method":"tasks/get","params":{"id":"t"}}"#
+            .to_string(),
+    );
+    let result = gateway.before_proxy(&mut ctx, &mut headers).await;
+    let body = assert_uninspectable_refusal(result, &ctx, "duplicate-member singleton");
+    assert!(!body.is_array());
+    assert_eq!(body["error"]["code"], -32001);
+    assert_eq!(body["error"]["data"]["method"], "unknown");
+
+    let (mut ctx, mut headers) = jsonrpc_ctx_with_raw_body(
+        r#"[{"jsonrpc":"2.0","id":1,"method":"tasks/get","params":{"id":"t"}},{"jsonrpc":"2.0","id":2,"method":"agent/getCard","method":"tasks/get"}]"#
+            .to_string(),
+    );
+    let result = gateway.before_proxy(&mut ctx, &mut headers).await;
+    let body = assert_uninspectable_refusal(result, &ctx, "duplicate-member batch");
+    let responses = body.as_array().expect("a batch refusal is a batch");
+    assert_eq!(responses.len(), 2);
+    assert_eq!(responses[0]["id"], 1);
+    assert_eq!(responses[1]["id"], 2);
+}
+
+#[tokio::test]
+async fn rewrite_enabled_oversized_body_never_passes_unclaimed() {
+    let gateway = plugin(json!({"detection": {"max_request_body_size": 64}}));
+    let body = json!({
+        "jsonrpc": "2.0",
+        "id": "x".repeat(128),
+        "method": "agent/getCard"
+    })
+    .to_string();
+    assert!(body.len() > 64);
+    let (mut ctx, mut headers) = jsonrpc_ctx_with_raw_body(body);
+    let PluginResult::Reject {
+        status_code, body, ..
+    } = gateway.before_proxy(&mut ctx, &mut headers).await
+    else {
+        panic!("an oversized JSON-RPC body must not be dispatched unclaimed");
+    };
+    assert_eq!(status_code, 413);
+    let body: Value = serde_json::from_str(&body).expect("refusal is JSON");
+    assert_eq!(body["error"]["code"], -32013);
+    assert_eq!(body["error"]["data"]["method"], "unknown");
+    assert_eq!(
+        ctx.metadata.get("a2a.error").map(String::as_str),
+        Some("request_body_too_large")
+    );
+}
+
+/// A lenient server skips a UTF-8 BOM and executes the envelope behind it, so
+/// the gateway classifies that same envelope instead of leaving it unclaimed.
+#[tokio::test]
+async fn bom_prefixed_jsonrpc_body_is_classified_behind_the_mark() {
+    let gateway = plugin(json!({}));
+    let card_call = json!({"jsonrpc": "2.0", "id": "req-card", "method": "agent/getCard"});
+    let (mut ctx, mut headers) = jsonrpc_ctx_with_raw_body(format!("\u{feff}{card_call}"));
+    assert!(matches!(
+        gateway.before_proxy(&mut ctx, &mut headers).await,
+        PluginResult::Continue
+    ));
+    assert_eq!(
+        ctx.metadata.get("a2a.method").map(String::as_str),
+        Some("agent/getCard")
+    );
+    assert!(gateway.should_buffer_response_body(&ctx));
+    let mut response_headers =
+        HashMap::from([("content-type".to_string(), "application/json".to_string())]);
+    let response = json!({
+        "jsonrpc": "2.0",
+        "id": "req-card",
+        "result": {"name": "planner", "url": "https://planner.internal/a2a"}
+    })
+    .to_string();
+    let rewritten =
+        expect_http_card_rewrite(&gateway, &mut ctx, &mut response_headers, &response).await;
+    assert_eq!(
+        rewritten["result"]["url"],
+        "https://gateway.example.com/a2a"
+    );
+
+    // The same BOM-stripped view decides a deny policy, with or without
+    // rewriting.
+    let deny = plugin(json!({
+        "discovery": {"rewrite_agent_card_urls": false},
+        "policy": {"methods": {"tasks/cancel": {"action": "deny"}}}
+    }));
+    let cancel =
+        json!({"jsonrpc": "2.0", "id": 9, "method": "tasks/cancel", "params": {"id": "t"}});
+    let (mut ctx, mut headers) = jsonrpc_ctx_with_raw_body(format!("\u{feff}{cancel}"));
+    let PluginResult::Reject { body, .. } = deny.before_proxy(&mut ctx, &mut headers).await else {
+        panic!("a BOM-prefixed denied method must be refused");
+    };
+    let body: Value = serde_json::from_str(&body).expect("refusal is JSON");
+    assert_eq!(body["id"], 9);
+    assert_eq!(body["error"]["data"]["method"], "tasks/cancel");
+
+    // A BOM-prefixed duplicate-member body is still screened as ambiguous.
+    let (mut ctx, mut headers) = jsonrpc_ctx_with_raw_body(
+        "\u{feff}{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"agent/getCard\",\"method\":\"tasks/get\"}"
+            .to_string(),
+    );
+    let result = gateway.before_proxy(&mut ctx, &mut headers).await;
+    assert_uninspectable_refusal(result, &ctx, "BOM-prefixed duplicate-member body");
+}
+
+/// Every other POST to the JSON-RPC endpoint the classifier cannot read is
+/// refused while rewriting is on, because a lenient (or case-insensitive)
+/// server may still execute an Agent Card call from it.
+#[tokio::test]
+async fn rewrite_enabled_unclassifiable_endpoint_posts_fail_closed() {
+    let gateway = plugin(json!({}));
+    for (label, content_type, body) in [
+        ("not JSON", "application/json", "not-json".to_string()),
+        (
+            "lenient trailing comma",
+            "application/json",
+            r#"{"jsonrpc":"2.0","id":1,"method":"agent/getCard",}"#.to_string(),
+        ),
+        (
+            "case-variant member name",
+            "application/json",
+            r#"{"jsonrpc":"2.0","id":1,"METHOD":"agent/getCard"}"#.to_string(),
+        ),
+        (
+            "malformed envelope",
+            "application/json",
+            r#"{"id":1,"method":"agent/getCard"}"#.to_string(),
+        ),
+        (
+            "unknown method without the version header",
+            "application/json",
+            r#"{"jsonrpc":"2.0","id":1,"method":"vendor/getCard"}"#.to_string(),
+        ),
+        ("empty batch", "application/json", "[]".to_string()),
+        (
+            "non-JSON media type",
+            "text/plain",
+            r#"{"jsonrpc":"2.0","id":1,"method":"agent/getCard"}"#.to_string(),
+        ),
+    ] {
+        let (mut ctx, _) = jsonrpc_ctx_with_raw_body(body);
+        ctx.headers
+            .insert("content-type".to_string(), content_type.to_string());
+        let mut headers = ctx.headers.clone();
+        let result = gateway.before_proxy(&mut ctx, &mut headers).await;
+        let body = assert_uninspectable_refusal(result, &ctx, label);
+        assert_eq!(body["error"]["code"], -32001, "{label}");
+        assert_eq!(body["error"]["data"]["method"], "unknown", "{label}");
+    }
+
+    // Outside the JSON-RPC endpoint nothing changes.
+    for (method, path) in [("POST", "/other"), ("GET", "/a2a")] {
+        let (mut ctx, mut headers) = rest_ctx(method, path);
+        assert!(
+            matches!(
+                gateway.before_proxy(&mut ctx, &mut headers).await,
+                PluginResult::Continue
+            ),
+            "{method} {path}"
+        );
+    }
+}
+
+/// With rewriting off and no deny-capable policy, unrecognized JSON-RPC keeps
+/// passing through transparently and unclaimed.
+#[tokio::test]
+async fn rewrite_disabled_without_deny_policy_keeps_unclassified_jsonrpc_passthrough() {
+    let gateway = plugin(json!({
+        "detection": {"max_request_body_size": 256},
+        "discovery": {"rewrite_agent_card_urls": false}
+    }));
+    for (label, content_type, body) in [
+        (
+            "mixed batch",
+            "application/json",
+            json!([
+                {"jsonrpc": "2.0", "id": 1, "method": "agent/getCard"},
+                {"jsonrpc": "2.0", "id": 2, "method": "vendor/ping"}
+            ])
+            .to_string(),
+        ),
+        (
+            "duplicate member",
+            "application/json",
+            r#"{"jsonrpc":"2.0","id":1,"method":"agent/getCard","method":"tasks/get"}"#.to_string(),
+        ),
+        (
+            "oversized",
+            "application/json",
+            json!({"jsonrpc": "2.0", "id": "x".repeat(512), "method": "agent/getCard"}).to_string(),
+        ),
+        ("not JSON", "application/json", "not-json".to_string()),
+        (
+            "unknown method",
+            "application/json",
+            r#"{"jsonrpc":"2.0","id":1,"method":"vendor/ping"}"#.to_string(),
+        ),
+        ("empty batch", "application/json", "[]".to_string()),
+        (
+            "non-JSON media type",
+            "text/plain",
+            r#"{"jsonrpc":"2.0","id":1,"method":"agent/getCard"}"#.to_string(),
+        ),
+    ] {
+        let (mut ctx, _) = jsonrpc_ctx_with_raw_body(body);
+        ctx.headers
+            .insert("content-type".to_string(), content_type.to_string());
+        let mut headers = ctx.headers.clone();
+        assert!(
+            matches!(
+                gateway.before_proxy(&mut ctx, &mut headers).await,
+                PluginResult::Continue
+            ),
+            "{label}"
+        );
+        assert!(!ctx.metadata.contains_key("a2a.method"), "{label}");
+        assert!(!ctx.metadata.contains_key("a2a.error"), "{label}");
+        assert!(!gateway.should_buffer_response_body(&ctx), "{label}");
+    }
+}
+
+/// The final-body backstop covers a request nothing classified at arrival:
+/// an unreadable final body is refused while rewriting is on, and still passes
+/// for a metadata-only configuration.
+#[tokio::test]
+async fn rewrite_enabled_unreadable_final_body_of_an_unclaimed_request_is_refused() {
+    let dispatched = r#"{"jsonrpc":"2.0","id":1,"method":"agent/getCard",}"#;
+    let gateway = plugin(json!({}));
+    let (mut ctx, headers) = jsonrpc_ctx(json!({"jsonrpc": "2.0", "id": 1, "method": "tasks/get"}));
+    let PluginResult::Reject {
+        status_code, body, ..
+    } = gateway
+        .on_final_request_body_with_context(&mut ctx, &headers, dispatched.as_bytes())
+        .await
+    else {
+        panic!("an unreadable final body with no arrival claim must be refused");
+    };
+    assert_eq!(status_code, 200);
+    let body: Value = serde_json::from_str(&body).expect("refusal is JSON");
+    assert_eq!(body["error"]["code"], -32001);
+    assert_eq!(
+        ctx.metadata.get("a2a.error").map(String::as_str),
+        Some("operation_class_unprovable")
+    );
+
+    let metadata_only = plugin(json!({"discovery": {"rewrite_agent_card_urls": false}}));
+    let (mut ctx, headers) = jsonrpc_ctx(json!({"jsonrpc": "2.0", "id": 1, "method": "tasks/get"}));
+    assert!(matches!(
+        metadata_only
+            .on_final_request_body_with_context(&mut ctx, &headers, dispatched.as_bytes())
+            .await,
+        PluginResult::Continue
+    ));
+}
+
+/// With the JSON-RPC binding disabled nothing at the endpoint is classified,
+/// so an Agent Card call there must be refused rather than forwarded unclaimed
+/// while rewriting is on.
+#[tokio::test]
+async fn rewrite_enabled_endpoint_post_with_jsonrpc_binding_disabled_fails_closed() {
+    let gateway = plugin(json!({"detection": {"bindings": ["rest", "grpc"]}}));
+    let (mut ctx, mut headers) =
+        jsonrpc_ctx(json!({"jsonrpc": "2.0", "id": 1, "method": "agent/getCard"}));
+    let result = gateway.before_proxy(&mut ctx, &mut headers).await;
+    let body = assert_uninspectable_refusal(result, &ctx, "JSON-RPC binding disabled");
+    assert_eq!(body["error"]["code"], -32001);
+
+    let passthrough = plugin(json!({
+        "detection": {"bindings": ["rest", "grpc"]},
+        "discovery": {"rewrite_agent_card_urls": false}
+    }));
+    let (mut ctx, mut headers) =
+        jsonrpc_ctx(json!({"jsonrpc": "2.0", "id": 1, "method": "agent/getCard"}));
+    assert!(matches!(
+        passthrough.before_proxy(&mut ctx, &mut headers).await,
+        PluginResult::Continue
+    ));
 }
