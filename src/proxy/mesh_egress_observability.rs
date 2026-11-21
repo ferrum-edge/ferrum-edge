@@ -313,6 +313,7 @@ impl CapturedMeshEgressLifecycle {
             proxy_name: self.proxy_name.clone(),
             client_ip: self.client_ip.clone(),
             consumer_username: stream_ctx.effective_identity().map(str::to_owned),
+            principal_origin: stream_ctx.principal_origin(),
             auth_method: stream_ctx.auth_method,
             backend_target: self.backend_target.clone(),
             backend_resolved_ip: None,

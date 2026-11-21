@@ -33,6 +33,7 @@ fn per_event_summary(request_id: &str) -> TransactionSummary {
         timestamp_received: "2026-05-23T00:00:00Z".to_string(),
         client_ip: "127.0.0.1".to_string(),
         consumer_username: Some("it-consumer".to_string()),
+        principal_origin: Some(ferrum_edge::plugins::utils::principal::PrincipalOrigin::Consumer),
         auth_method: None,
         http_method: "GET".to_string(),
         request_path: "/it".to_string(),
@@ -223,6 +224,7 @@ async fn clickhouse_insert_round_trip_when_configured() {
         timestamp_received: "2026-05-23T00:00:00Z".to_string(),
         client_ip: "127.0.0.1".to_string(),
         consumer_username: Some("it-consumer".to_string()),
+        principal_origin: Some(ferrum_edge::plugins::utils::principal::PrincipalOrigin::Consumer),
         auth_method: None,
         http_method: "GET".to_string(),
         request_path: "/it".to_string(),
@@ -1210,4 +1212,154 @@ async fn failed_export_settles_once_only_after_spool_write_with_unchanged_identi
     assert_eq!(rows[0]["charge_total"], posted["charge_total"]);
     assert_eq!(rows[0]["call_count"], 1);
     assert_eq!(sink_metric("per_event_persisted_total"), persisted + 1);
+}
+
+// --- GHSA-q9vj-rf66-3j58: both chargeback exporters key on the principal ---
+
+/// A request context whose principal is committed through the shared
+/// authentication boundary: a mapped Consumer when `consumer` is true, else
+/// an unmapped `jwks_auth` identity verified by `authority`.
+fn committed_principal_context(
+    identity: &str,
+    consumer: bool,
+    authority: Option<[u8; 32]>,
+) -> ferrum_edge::plugins::RequestContext {
+    use ferrum_edge::plugins::utils::auth_attempt::AuthenticationAttempt;
+    use ferrum_edge::plugins::utils::auth_flow::{VerifyOutcome, commit_authentication_attempt};
+
+    let mut ctx = ferrum_edge::plugins::RequestContext::new(
+        "127.0.0.1".to_string(),
+        "GET".to_string(),
+        "/it".to_string(),
+    );
+    let mut attempt = AuthenticationAttempt::new();
+    if let Some(authority) = authority {
+        attempt.stage_identity_realm_authority(authority);
+    }
+    let (outcome, mechanism) = if consumer {
+        let consumer: ferrum_edge::config::types::Consumer =
+            serde_json::from_value(json!({"id": "it-alice", "username": identity}))
+                .expect("consumer");
+        (
+            VerifyOutcome::success(Some(std::sync::Arc::new(consumer)), None, None),
+            "key_auth",
+        )
+    } else {
+        (
+            VerifyOutcome::success(None, Some(identity.to_string()), None),
+            "jwks_auth",
+        )
+    };
+    let committed = commit_authentication_attempt(&mut ctx, attempt, outcome, mechanism, true)
+        .expect("principal commits");
+    assert!(committed, "the principal must be committed");
+    assert_eq!(ctx.effective_identity(), Some(identity));
+    ctx
+}
+
+#[tokio::test]
+#[serial_test::serial(api_chargeback_sink_active_sink)]
+async fn consumer_and_two_jwks_providers_never_share_a_billing_row_in_either_exporter() {
+    use ferrum_edge::plugins::api_chargeback::{ApiChargeback, global_registry};
+
+    const PROXY_ID: &str = "it-principal-rows-ghsa-q9vj";
+    let authority_a = [0x3a; 32];
+    let authority_b = [0x4b; 32];
+    let contexts = [
+        committed_principal_context("alice", true, None),
+        committed_principal_context("alice", false, Some(authority_a)),
+        committed_principal_context("alice", false, Some(authority_b)),
+    ];
+    let summaries = contexts.each_ref().map(|ctx| {
+        let mut summary = per_event_summary("it-principal");
+        summary.proxy_id = Some(PROXY_ID.to_string());
+        summary.consumer_username = ctx.effective_identity().map(str::to_owned);
+        summary.principal_origin = ctx.principal_origin();
+        summary
+    });
+    let expected: std::collections::BTreeSet<String> = [
+        "alice".to_string(),
+        format!("external:jwks_auth:{}:alice", hex::encode(authority_a)),
+        format!("external:jwks_auth:{}:alice", hex::encode(authority_b)),
+    ]
+    .into_iter()
+    .collect();
+
+    // api_chargeback: `/charges` rows.
+    let chargeback = ApiChargeback::new(
+        &json!({"pricing_tiers": [{"status_codes": [200], "price_per_call": 0.25}]}),
+        "ferrum",
+    )
+    .expect("api_chargeback");
+    for summary in &summaries {
+        chargeback.log(summary).await;
+    }
+    let rendered: Value =
+        serde_json::from_str(&global_registry().render_json_uncached().expect("render"))
+            .expect("charges JSON");
+    let charged: std::collections::BTreeSet<String> = rendered["consumers"]
+        .as_object()
+        .expect("consumers map")
+        .iter()
+        .filter(|(_, row)| row["proxies"].get(PROXY_ID).is_some())
+        .map(|(consumer, _)| consumer.clone())
+        .collect();
+    assert_eq!(
+        charged, expected,
+        "/charges must render three disjoint rows"
+    );
+
+    // api_chargeback_sink: exported `consumer_id`s.
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&server)
+        .await;
+    let temp = tempfile::tempdir().unwrap();
+    let sink = ApiChargebackSink::new(
+        &json!({
+            "clickhouse": {
+                "url": server.uri(),
+                "database": "ferrum",
+                "table": "charges_raw",
+                "timeout_ms": 2000
+            },
+            "batch": {"size": 1, "flush_interval_ms": 10, "buffer_capacity": 10},
+            "retry": {"max_attempts": 1, "initial_delay_ms": 1, "max_delay_ms": 1, "jitter": false},
+            "spool": {"enabled": false, "dir": temp.path().to_string_lossy().to_string()},
+            "pricing_tiers": [{"status_codes": [200], "price_per_call": 0.25}],
+            "pricing_version": "it-chargeback-sink",
+            "currency": "USD"
+        }),
+        PluginHttpClient::default(),
+        "ferrum",
+    )
+    .expect("api_chargeback_sink");
+    sink.start_background_tasks()
+        .expect("chargeback integration requires start_background_tasks");
+    sink.commit_background_tasks();
+    for summary in &summaries {
+        sink.log(summary).await;
+    }
+    let requests = wait_for_post_requests(&server, 3).await;
+    let exported: std::collections::BTreeSet<String> = requests
+        .iter()
+        .flat_map(|request| {
+            String::from_utf8(request.body.clone())
+                .expect("JSONEachRow body is UTF-8")
+                .lines()
+                .filter(|line| !line.trim().is_empty())
+                .map(|line| {
+                    serde_json::from_str::<Value>(line).expect("charge row")["consumer_id"]
+                        .as_str()
+                        .expect("consumer_id")
+                        .to_string()
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    assert_eq!(
+        exported, expected,
+        "the sink must export three disjoint consumer_ids"
+    );
 }

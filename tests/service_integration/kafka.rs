@@ -38,6 +38,7 @@ fn summary(path: &str, client_ip: &str) -> TransactionSummary {
         timestamp_received: Utc::now().to_rfc3339(),
         client_ip: client_ip.to_string(),
         consumer_username: None,
+        principal_origin: None,
         auth_method: None,
         http_method: "GET".to_string(),
         request_path: path.to_string(),

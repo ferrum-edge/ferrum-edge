@@ -37,6 +37,7 @@ fn summary() -> TransactionSummary {
         timestamp_received: Utc::now().to_rfc3339(),
         client_ip: "203.0.113.10".to_string(),
         consumer_username: None,
+        principal_origin: None,
         auth_method: None,
         http_method: "GET".to_string(),
         request_path: "/kafka-broker-test".to_string(),

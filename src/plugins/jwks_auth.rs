@@ -62,10 +62,11 @@ use super::utils::replay_partition::PartitionHasher;
 use super::utils::response_body::read_response_body_bounded;
 use super::utils::scope_role_check::{self, ScopeRoleRequirements};
 use super::utils::token_extract::{
-    STRIP_QUERY_PARAM_METADATA_PREFIX, TokenHeaderLocation, TokenLocation, TokenLocationExtract,
-    extract_authorization_bearer, extract_authorization_dpop, extract_from_location,
-    mark_present_query_credential_locations, provider_locations_extract_token,
-    push_stripped_credential_header_names, stage_original_token_stripping as stage_token_stripping,
+    AMBIGUOUS_QUERY_TOKEN_BODY, STRIP_QUERY_PARAM_METADATA_PREFIX, TokenHeaderLocation,
+    TokenLocation, TokenLocationExtract, extract_authorization_bearer, extract_authorization_dpop,
+    extract_from_location, mark_provider_query_credential_locations,
+    provider_locations_extract_token, push_stripped_credential_header_names,
+    query_locations_have_semicolon_alias, stage_original_token_stripping as stage_token_stripping,
 };
 use super::{JwtAuthAttributeValue, PluginResult, RequestContext};
 
@@ -170,6 +171,11 @@ pub struct JwksAuth {
     claim_header_destinations: ClaimHeaderDestinations,
     strip_authorization_on_success: bool,
     has_custom_query_token_locations: bool,
+    /// Some provider has a query token location and does not forward the
+    /// original token, so this instance may strip a query parameter (an
+    /// accepted token, or a `;` alias marked during discovery) before the
+    /// backend request (GHSA-c259-vchc-3vgr).
+    strips_query_tokens: bool,
     /// Providers that may accept an access token presented under the RFC 9449
     /// `DPoP` authorization scheme (§7.1).
     ///
@@ -1071,6 +1077,13 @@ impl JwksAuth {
                         .iter()
                         .any(|location| matches!(location, TokenLocation::Header(_))))
         });
+        let strips_query_tokens = providers.iter().any(|provider| {
+            !provider.forward_original_token
+                && provider
+                    .token_locations
+                    .iter()
+                    .any(|location| matches!(location, TokenLocation::QueryParam(_)))
+        });
         let has_custom_query_token_locations = providers.iter().any(|provider| {
             provider
                 .token_locations
@@ -1170,6 +1183,7 @@ impl JwksAuth {
             claim_header_destinations,
             strip_authorization_on_success,
             has_custom_query_token_locations,
+            strips_query_tokens,
             dpop_authorization_scheme_providers,
             sender_constrained_issuers,
             advertised_challenge,
@@ -1830,6 +1844,23 @@ impl JwksAuth {
     }
 
     fn extract_jwks_credential(&self, ctx: &RequestContext) -> JwksExtractedCredential {
+        // A `;`-aliased query token at ANY configured query location is
+        // terminal for this instance, before any header, `Authorization`, or
+        // fallback source is read (issue #6579, GHSA-c259-vchc-3vgr): a valid
+        // token elsewhere must not mask a credential Ferrum and a
+        // `;`-splitting backend read differently. With this rule, an
+        // accepted token can never leave an aliased copy behind for
+        // accepted-token stripping to miss.
+        if self.has_custom_query_token_locations
+            && query_locations_have_semicolon_alias(
+                ctx,
+                self.providers
+                    .iter()
+                    .flat_map(|provider| provider.token_locations.iter()),
+            )
+        {
+            return JwksExtractedCredential::InvalidFormat(AMBIGUOUS_QUERY_TOKEN_BODY.to_string());
+        }
         let mut first_invalid_format: Option<String> = None;
         for (idx, provider) in self.providers.iter().enumerate() {
             if provider.token_locations.is_empty() {
@@ -2138,14 +2169,29 @@ impl super::Plugin for JwksAuth {
         self.authenticate_request(ctx).await
     }
 
+    /// Mark every present query token location — in the decoded map or behind
+    /// a `;` sub-parameter — for policy redaction. A provider that does not
+    /// forward the original token also marks a `;` alias for removal here,
+    /// before multi-auth can stop at another mechanism (GHSA-c259-vchc-3vgr).
     fn mark_query_credentials_for_redaction(&self, ctx: &mut RequestContext) {
         for provider in &self.providers {
-            mark_present_query_credential_locations(ctx, &provider.token_locations);
+            mark_provider_query_credential_locations(
+                ctx,
+                &provider.token_locations,
+                provider.forward_original_token,
+            );
         }
     }
 
     fn request_headers_to_redact(&self) -> &[String] {
         &self.request_headers_to_redact
+    }
+
+    /// A provider that does not forward the original token strips its query
+    /// token locations: the accepted token on success, and a `;` alias from
+    /// the pre-authentication discovery hook, whichever mechanism wins.
+    fn modifies_request_query(&self) -> bool {
+        self.strips_query_tokens
     }
 
     fn modifies_request_headers(&self) -> bool {

@@ -58,6 +58,7 @@ fn make_summary(
         timestamp_received: "2025-01-01T00:00:00Z".to_string(),
         client_ip: "127.0.0.1".to_string(),
         consumer_username: consumer.map(|c| c.to_string()),
+        principal_origin: Some(ferrum_edge::plugins::utils::principal::PrincipalOrigin::Consumer),
         auth_method: None,
         http_method: "GET".to_string(),
         request_path: "/test".to_string(),
@@ -138,6 +139,7 @@ fn make_stream_summary(
         proxy_name: Some(proxy_name.to_string()),
         client_ip: "127.0.0.1".to_string(),
         consumer_username: consumer.map(|c| c.to_string()),
+        principal_origin: Some(ferrum_edge::plugins::utils::principal::PrincipalOrigin::Consumer),
         auth_method: None,
         backend_target: "127.0.0.1:9000".to_string(),
         backend_resolved_ip: None,
@@ -3423,6 +3425,9 @@ async fn test_reload_overlap_old_stream_disconnect_after_new_websocket_stays_par
             io_side: None,
             error_class: None,
             consumer_username: Some(CONSUMER.to_string()),
+            principal_origin: Some(
+                ferrum_edge::plugins::utils::principal::PrincipalOrigin::Consumer,
+            ),
             auth_method: None,
             metadata: ferrum_edge::plugins::MetadataMap::default(),
             proxy_lifecycle_generation: Some(2),
@@ -3576,6 +3581,9 @@ async fn test_effective_chain_records_each_protocol_path_exactly_once() {
             io_side: None,
             error_class: None,
             consumer_username: Some(CONSUMER.to_string()),
+            principal_origin: Some(
+                ferrum_edge::plugins::utils::principal::PrincipalOrigin::Consumer,
+            ),
             auth_method: None,
             metadata: ferrum_edge::plugins::MetadataMap::default(),
             proxy_lifecycle_generation: None,
@@ -6845,4 +6853,912 @@ async fn test_unattached_chargeback_definition_needs_no_registry_reservation() {
             .iter()
             .all(|plugin| plugin.name() != "api_chargeback")
     );
+}
+
+// --- GHSA-q9vj-rf66-3j58: billing rows key on the principal, not its display string ---
+
+/// Verifying-authority digests of two `jwks_auth` providers that both issue
+/// the subject `alice`.
+const PROVIDER_A_AUTHORITY: [u8; 32] = [0xa1; 32];
+const PROVIDER_B_AUTHORITY: [u8; 32] = [0xb2; 32];
+
+fn external_alice_key(authority: [u8; 32]) -> String {
+    format!("external:jwks_auth:{}:alice", hex::encode(authority))
+}
+
+/// A mapped Consumer `alice` and unmapped `jwks_auth` principals `alice` from
+/// two providers, each committed exactly as the authentication boundary
+/// leaves it. All three share the display identity `alice`.
+fn alice_principal_contexts() -> [ferrum_edge::plugins::RequestContext; 3] {
+    let consumer = super::plugin_utils::consumer_context("alice");
+    let mut provider_a = super::plugin_utils::create_test_context();
+    super::plugin_utils::commit_external_identity_with_authority(
+        &mut provider_a,
+        "alice",
+        "jwks_auth",
+        Some(PROVIDER_A_AUTHORITY),
+    );
+    let mut provider_b = super::plugin_utils::create_test_context();
+    super::plugin_utils::commit_external_identity_with_authority(
+        &mut provider_b,
+        "alice",
+        "jwks_auth",
+        Some(PROVIDER_B_AUTHORITY),
+    );
+    for ctx in [&consumer, &provider_a, &provider_b] {
+        assert_eq!(ctx.effective_identity(), Some("alice"));
+    }
+    [consumer, provider_a, provider_b]
+}
+
+/// The summary a production builder stamps from `ctx`: the display identity
+/// plus its recorded principal origin.
+fn principal_summary(
+    proxy_id: &str,
+    ctx: &ferrum_edge::plugins::RequestContext,
+) -> TransactionSummary {
+    let mut summary = make_summary(proxy_id, "Principal API", ctx.effective_identity(), 200);
+    summary.principal_origin = ctx.principal_origin();
+    summary
+}
+
+fn billed_consumers_for_proxy(proxy_id: &str) -> HashMap<String, u64> {
+    global_registry()
+        .entries
+        .iter()
+        .filter(|entry| entry.proxy_id.as_ref() == proxy_id)
+        .map(|entry| {
+            (
+                entry.consumer.to_string(),
+                entry.call_count.load(Ordering::Relaxed),
+            )
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn test_consumer_and_external_principals_from_two_jwks_providers_bill_three_rows() {
+    const PROXY_ID: &str = "principal-rows-ghsa-q9vj";
+    let plugin = ApiChargeback::new(
+        &json!({"pricing_tiers": [{"status_codes": [200], "price_per_call": 1.0}]}),
+        "ferrum",
+    )
+    .unwrap();
+    let [consumer, provider_a, provider_b] = alice_principal_contexts();
+
+    plugin.log(&principal_summary(PROXY_ID, &consumer)).await;
+    for _ in 0..2 {
+        plugin.log(&principal_summary(PROXY_ID, &provider_a)).await;
+    }
+    for _ in 0..3 {
+        plugin.log(&principal_summary(PROXY_ID, &provider_b)).await;
+    }
+
+    let provider_a_key = external_alice_key(PROVIDER_A_AUTHORITY);
+    let provider_b_key = external_alice_key(PROVIDER_B_AUTHORITY);
+    assert_eq!(
+        billed_consumers_for_proxy(PROXY_ID),
+        HashMap::from([
+            ("alice".to_string(), 1),
+            (provider_a_key.clone(), 2),
+            (provider_b_key.clone(), 3),
+        ]),
+        "the mapped Consumer keeps its bare row and each provider bills its own row"
+    );
+
+    // The `/charges` JSON document exposes the same three disjoint rows.
+    let rendered: serde_json::Value =
+        serde_json::from_str(&global_registry().render_json_uncached().unwrap()).unwrap();
+    let consumers = rendered["consumers"].as_object().expect("consumers map");
+    for key in ["alice", provider_a_key.as_str(), provider_b_key.as_str()] {
+        assert!(
+            consumers
+                .get(key)
+                .and_then(|row| row["proxies"].get(PROXY_ID))
+                .is_some(),
+            "/charges must render a `{key}` row for {PROXY_ID}: {rendered}"
+        );
+    }
+
+    // And the Prometheus exposition labels them apart.
+    let prometheus = global_registry().render_prometheus_uncached().unwrap();
+    for key in ["alice", provider_a_key.as_str(), provider_b_key.as_str()] {
+        assert!(
+            prometheus.contains(&format!(
+                "ferrum_api_chargeable_calls_total{{consumer=\"{key}\",proxy_id=\"{PROXY_ID}\""
+            )),
+            "Prometheus /charges must carry a `{key}` series"
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_stream_external_principal_never_shares_a_consumer_stream_row() {
+    const PROXY_ID: &str = "principal-stream-rows-ghsa-q9vj";
+    let plugin = ApiChargeback::new(
+        &json!({"stream_connection_pricing": {"price_per_connection": 0.5}}),
+        "ferrum",
+    )
+    .unwrap();
+    let consumer = make_stream_summary(PROXY_ID, "Stream", Some("alice"), "tcp", 10, 20);
+    let mut external = make_stream_summary(PROXY_ID, "Stream", Some("alice"), "tcp", 10, 20);
+    external.principal_origin =
+        Some(ferrum_edge::plugins::utils::principal::PrincipalOrigin::External { realm: None });
+
+    plugin.on_stream_disconnect(&consumer).await;
+    plugin.on_stream_disconnect(&external).await;
+
+    assert_eq!(
+        billed_consumers_for_proxy(PROXY_ID),
+        HashMap::from([
+            ("alice".to_string(), 1),
+            ("external:-:-:alice".to_string(), 1),
+        ])
+    );
+}
+
+#[tokio::test]
+async fn test_websocket_bandwidth_bills_the_external_principal_row() {
+    const PROXY_ID: &str = "principal-ws-rows-ghsa-q9vj";
+    let plugin = ApiChargeback::new(
+        &json!({"bandwidth_pricing": {"price_per_byte_sent": 0.001}}),
+        "ferrum",
+    )
+    .unwrap();
+    let [consumer, provider_a, _] = alice_principal_contexts();
+    for ctx in [&consumer, &provider_a] {
+        let mut ws = super::plugin_utils::create_test_ws_disconnect_context();
+        ws.proxy_id = PROXY_ID.to_string();
+        ws.bytes_client_to_backend = 100;
+        ws.consumer_username = ctx.effective_identity().map(str::to_owned);
+        ws.principal_origin = ctx.principal_origin();
+        plugin.on_ws_disconnect(&ws).await;
+    }
+
+    let rows = billed_consumers_for_proxy(PROXY_ID);
+    assert_eq!(rows.len(), 2, "{rows:?}");
+    assert!(rows.contains_key("alice"));
+    assert!(rows.contains_key(&external_alice_key(PROVIDER_A_AUTHORITY)));
+}
+
+/// A summary whose builder recorded no origin is never billed as a Consumer.
+#[tokio::test]
+async fn test_summary_without_principal_origin_fails_closed_to_external_row() {
+    const PROXY_ID: &str = "principal-origin-missing-ghsa-q9vj";
+    let plugin = ApiChargeback::new(
+        &json!({"pricing_tiers": [{"status_codes": [200], "price_per_call": 1.0}]}),
+        "ferrum",
+    )
+    .unwrap();
+    let mut summary = make_summary(PROXY_ID, "Principal API", Some("alice"), 200);
+    summary.principal_origin = None;
+    plugin.log(&summary).await;
+
+    assert_eq!(
+        billed_consumers_for_proxy(PROXY_ID),
+        HashMap::from([("external:-:-:alice".to_string(), 1)])
+    );
+}
+
+#[test]
+fn test_principal_billing_identity_classes_are_disjoint() {
+    use ferrum_edge::plugins::chargeback::{
+        billing_principal, owned_principal_billing_identity, principal_billing_identity,
+        with_principal_billing_identity,
+    };
+    use ferrum_edge::plugins::utils::auth_flow::ExternalIdentityRealm;
+    use ferrum_edge::plugins::utils::principal::{Principal, PrincipalOrigin};
+
+    const BOUND: usize = 512;
+    /// An unmapped principal verified by `jwks_auth` provider A.
+    fn external(identity: &str) -> Principal<'_> {
+        Principal::External {
+            identity,
+            realm: Some(ExternalIdentityRealm::new(
+                "jwks_auth",
+                Some(PROVIDER_A_AUTHORITY),
+            )),
+        }
+    }
+    /// The bounded billing identity, checked on both the owned and the
+    /// per-thread paths.
+    fn identity_of(principal: Principal<'_>) -> String {
+        let owned = principal_billing_identity(principal, BOUND).into_owned();
+        let pooled = with_principal_billing_identity(principal, BOUND, str::to_owned);
+        assert_eq!(
+            owned, pooled,
+            "the per-thread path must agree with the owned path for {principal:?}"
+        );
+        assert_eq!(
+            owned_principal_billing_identity(principal, BOUND),
+            owned,
+            "the event-owned path must agree with the owned path for {principal:?}"
+        );
+        assert!(owned.len() <= BOUND, "{owned}");
+        assert_ne!(owned, OVERFLOW_CONSUMER_SENTINEL);
+        owned
+    }
+
+    // Consumer rows are unchanged; external rows are the namespaced key.
+    assert_eq!(identity_of(Principal::Consumer("alice")), "alice");
+    let external_alice = identity_of(external("alice"));
+    assert_eq!(external_alice, external_alice_key(PROVIDER_A_AUTHORITY));
+
+    // A Consumer cannot spell an external principal's row.
+    let spelled = identity_of(Principal::Consumer(&external_alice));
+    assert_ne!(spelled, external_alice);
+    assert!(spelled.contains("~sha256:"), "{spelled}");
+
+    // Marker-bearing values are digested under disjoint domains, so the same
+    // bytes presented as a Consumer and as an external identity stay apart.
+    let marker = "bob~sha256:0000";
+    let consumer_marker = identity_of(Principal::Consumer(marker));
+    let external_marker = identity_of(external(marker));
+    assert!(consumer_marker.contains("~sha256:"));
+    assert!(external_marker.contains("~sha256:"));
+    assert_ne!(consumer_marker, external_marker);
+
+    // Oversized external identities keep a digest of their complete key.
+    let long_a = format!("{}a", "x".repeat(600));
+    let long_b = format!("{}b", "x".repeat(600));
+    assert_ne!(
+        identity_of(external(long_a.as_str())),
+        identity_of(external(long_b.as_str()))
+    );
+
+    // A Consumer whose username is the complete canonical key of an external
+    // principal whose key must itself be digested (marker-bearing, or over
+    // the bound): both sides hash the very same text, so only the digest
+    // domains keep them apart.
+    let long_subject = "y".repeat(500);
+    for subject in ["bob~sha256:0000", long_subject.as_str()] {
+        let canonical_key = external(subject).key();
+        let external_side = identity_of(external(subject));
+        let consumer_side = identity_of(Principal::Consumer(&canonical_key));
+        for side in [&external_side, &consumer_side] {
+            assert!(side.contains("~sha256:"), "{side}");
+            assert!(side.len() <= BOUND, "{side}");
+        }
+        assert_ne!(
+            external_side, consumer_side,
+            "equal hashed text must still yield distinct rows"
+        );
+    }
+
+    // Owned and per-thread paths agree at every bound, including a prefix
+    // cut that lands inside a multi-byte character and a bound too small for
+    // any prefix.
+    let wide = "é".repeat(400);
+    for bound in [40usize, 80, 81, 512] {
+        for principal in [
+            Principal::Consumer(wide.as_str()),
+            Principal::Consumer(&external_alice),
+            external(wide.as_str()),
+            external("alice"),
+        ] {
+            let owned = principal_billing_identity(principal, bound).into_owned();
+            let pooled = with_principal_billing_identity(principal, bound, str::to_owned);
+            assert_eq!(owned, pooled, "bound {bound}: {principal:?}");
+            assert_eq!(
+                owned_principal_billing_identity(principal, bound),
+                owned,
+                "bound {bound}: {principal:?}"
+            );
+            assert!(owned.len() <= bound, "bound {bound}: {owned}");
+        }
+    }
+    identity_of(Principal::Consumer(&"z".repeat(600)));
+
+    // A custom mechanism name can complete the digest marker at its trailing
+    // separator; every path must still digest that key the same way.
+    for mechanism in ["partner~sha256", "partner~sha256:x"] {
+        let custom = Principal::External {
+            identity: "alice",
+            realm: Some(ExternalIdentityRealm::new(mechanism, None)),
+        };
+        let custom_identity = identity_of(custom);
+        assert!(custom_identity.contains("~sha256:"), "{custom_identity}");
+    }
+
+    // Inputs larger than the per-thread buffer retains take the plain owned
+    // path and still agree byte for byte.
+    let huge = "h".repeat(8192);
+    identity_of(external(huge.as_str()));
+    identity_of(Principal::Consumer(huge.as_str()));
+
+    // The overflow sentinel itself is never reproduced by a real principal.
+    identity_of(Principal::Consumer(OVERFLOW_CONSUMER_SENTINEL));
+    identity_of(external(OVERFLOW_CONSUMER_SENTINEL));
+
+    // Summary entry point: empty identities are not billed, a missing origin
+    // fails closed to an external principal, and a recorded origin is kept.
+    assert_eq!(
+        billing_principal(Some(""), Some(PrincipalOrigin::Consumer)),
+        None
+    );
+    assert_eq!(
+        billing_principal(None, Some(PrincipalOrigin::Consumer)),
+        None
+    );
+    assert_eq!(
+        billing_principal(Some("alice"), None),
+        Some(Principal::External {
+            identity: "alice",
+            realm: None
+        })
+    );
+    assert_eq!(
+        billing_principal(Some("alice"), Some(PrincipalOrigin::Consumer)),
+        Some(Principal::Consumer("alice"))
+    );
+}
+
+/// The origin is provenance only: it never reaches transaction-log output,
+/// and the WebSocket session-end projection keeps it for billing.
+#[test]
+fn test_principal_origin_is_not_serialized_and_survives_ws_session_end_projection() {
+    let [_, provider_a, _] = alice_principal_contexts();
+    let summary = principal_summary("principal-serialize-ghsa-q9vj", &provider_a);
+    assert!(summary.principal_origin.is_some());
+    let rendered = serde_json::to_string(&summary).unwrap();
+    assert!(!rendered.contains("principal_origin"), "{rendered}");
+    assert!(!rendered.contains("external:"), "{rendered}");
+
+    let mut stream = make_stream_summary("s", "S", Some("alice"), "tcp", 1, 1);
+    stream.principal_origin =
+        Some(ferrum_edge::plugins::utils::principal::PrincipalOrigin::Consumer);
+    let rendered = serde_json::to_string(&stream).unwrap();
+    assert!(!rendered.contains("principal_origin"), "{rendered}");
+
+    let mut ws = super::plugin_utils::create_test_ws_disconnect_context();
+    ws.principal_origin = provider_a.principal_origin();
+    assert_eq!(
+        ws.session_end_summary().principal_origin,
+        provider_a.principal_origin()
+    );
+}
+
+/// Struct types whose literals carry a principal's display identity into a
+/// summary, or into a context a summary is later built from.
+const PRINCIPAL_CARRIERS: &[&str] = &[
+    "TransactionSummary",
+    "StreamTransactionSummary",
+    "WsDisconnectContext",
+    "WsSessionMeta",
+    "UdpSession",
+    "UdpSetupAttribution",
+    "DtlsDisconnectContext",
+];
+
+/// GHSA-q9vj-rf66-3j58 parity guard: every carrier literal in `src/` that
+/// sets `consumer_username` must record that identity's origin beside it,
+/// from the same source, and may leave the origin `None` only when there is
+/// no identity. The exporter tests above project the origin by hand, so this
+/// is what catches a builder (HTTP, gRPC, H3, WebSocket, stream, UDP/DTLS,
+/// mesh, abort, HBONE, …) that drops it. See
+/// [`principal_origin_violations`] for the accepted pairings.
+#[test]
+fn every_summary_builder_records_principal_origin_beside_consumer_username() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut files = Vec::new();
+    collect_rust_sources(&root.join("src"), &mut files);
+    assert!(!files.is_empty(), "src/ must contain Rust sources");
+
+    let mut inspected = 0usize;
+    let mut violations = Vec::new();
+    for path in files {
+        let source = std::fs::read_to_string(&path).expect("read source");
+        let relative = path
+            .strip_prefix(root)
+            .unwrap_or(&path)
+            .display()
+            .to_string();
+        let (found, file_violations) = principal_origin_violations(&relative, &source);
+        inspected += found;
+        violations.extend(file_violations);
+    }
+    assert!(
+        inspected >= 30,
+        "the guard must actually find the summary builders (found {inspected})"
+    );
+    assert!(
+        violations.is_empty(),
+        "summary builders must record principal_origin beside consumer_username:\n{}",
+        violations.join("\n")
+    );
+}
+
+/// The guard must reject the regressions it exists for, including through
+/// shorthand locals (the TCP disconnect builder's shape) and a comment between
+/// the type name and its brace.
+#[test]
+fn principal_origin_guard_rejects_lost_or_mismatched_origins() {
+    const TCP_STYLE: &str = r#"
+fn build(stream_ctx: &StreamConnectionContext, plugins: &[u8]) -> StreamTransactionSummary {
+    let (consumer_username, principal_origin) = if !plugins.is_empty() {
+        stream_ctx.summary_identity()
+    } else {
+        (None, None)
+    };
+    StreamTransactionSummary {
+        namespace: String::new(),
+        consumer_username,
+        principal_origin,
+        auth_method: None,
+    }
+}
+"#;
+    let check = |source: &str| principal_origin_violations("fixture.rs", source);
+
+    assert_eq!(
+        check(TCP_STYLE),
+        (1, Vec::new()),
+        "the paired builder passes"
+    );
+
+    // The origin local cleared while the identity local survives.
+    let cleared = TCP_STYLE.replace(
+        "let (consumer_username, principal_origin) = if !plugins.is_empty() {\n        stream_ctx.summary_identity()\n    } else {\n        (None, None)\n    };",
+        "let consumer_username = stream_ctx.effective_identity().map(str::to_owned);\n    let principal_origin = None;",
+    );
+    assert_ne!(cleared, TCP_STYLE, "fixture rewrite must apply");
+    let (found, violations) = check(cleared.as_str());
+    assert_eq!(found, 1);
+    assert_eq!(violations.len(), 1, "{violations:?}");
+
+    // A literal `None` origin beside a carried identity.
+    let none_origin = TCP_STYLE.replace(
+        "        principal_origin,\n",
+        "        principal_origin: None,\n",
+    );
+    assert_eq!(check(none_origin.as_str()).1.len(), 1);
+
+    // A conditional whose fallback branch keeps the identity but drops the
+    // origin.
+    let lossy_fallback = TCP_STYLE.replace(
+        "        (None, None)\n",
+        "        (stream_ctx.effective_identity().map(str::to_owned), None)\n",
+    );
+    assert_ne!(lossy_fallback, TCP_STYLE, "fixture rewrite must apply");
+    let (found, violations) = check(lossy_fallback.as_str());
+    assert_eq!(found, 1);
+    assert_eq!(violations.len(), 1, "{violations:?}");
+
+    // The same lossy fallback held in a local and returned from the branch.
+    let fallback_local = TCP_STYLE
+        .replace(
+            "    let (consumer_username, principal_origin) = if !plugins.is_empty() {\n",
+            "    let fallback = (stream_ctx.effective_identity().map(str::to_owned), None);\n    let (consumer_username, principal_origin) = if !plugins.is_empty() {\n",
+        )
+        .replace("        (None, None)\n", "        fallback\n");
+    assert!(
+        fallback_local.contains("let fallback") && fallback_local.contains("        fallback\n"),
+        "fixture rewrite must apply"
+    );
+    let (found, violations) = check(fallback_local.as_str());
+    assert_eq!(found, 1);
+    assert_eq!(violations.len(), 1, "{violations:?}");
+
+    // A missing origin behind a comment between the type name and its brace.
+    let commented = r#"
+fn build(ctx: &RequestContext) -> TransactionSummary {
+    TransactionSummary /* terminal record */
+    {
+        consumer_username: ctx.effective_identity().map(str::to_owned),
+        ..TransactionSummary::default()
+    }
+}
+"#;
+    let (found, violations) = check(commented);
+    assert_eq!(
+        found, 1,
+        "a comment before the brace must not hide the literal"
+    );
+    assert_eq!(violations.len(), 1, "{violations:?}");
+
+    // Identity and origin from different sources.
+    let mismatched = r#"
+fn build(ctx: &RequestContext, other: &RequestContext) -> TransactionSummary {
+    TransactionSummary {
+        consumer_username: ctx.effective_identity().map(str::to_owned),
+        principal_origin: other.principal_origin(),
+        ..TransactionSummary::default()
+    }
+}
+fn carry(session: &Meta, other: &Meta) -> WsDisconnectContext {
+    WsDisconnectContext {
+        consumer_username: session.consumer_username.clone(),
+        principal_origin: other.principal_origin,
+    }
+}
+fn hardcode(stream_ctx: &StreamConnectionContext) -> StreamTransactionSummary {
+    let consumer_username = stream_ctx.effective_identity().map(str::to_owned);
+    StreamTransactionSummary {
+        consumer_username,
+        principal_origin: Some(PrincipalOrigin::Consumer),
+    }
+}
+"#;
+    let (found, violations) = check(mismatched);
+    assert_eq!(found, 3);
+    assert_eq!(violations.len(), 3, "{violations:?}");
+}
+
+/// `(inspected, violations)` for one source file. Values are compared with
+/// whitespace removed. Accepted pairings for a literal that sets
+/// `consumer_username`:
+///
+/// - both `None`;
+/// - `X.effective_identity().map(str::to_owned)` with `X.principal_origin()`;
+/// - a carried `X.consumer_username` (optionally `.clone()`) with
+///   `X.principal_origin`;
+/// - a local (or shorthand) identity bound together with the origin local by
+///   the nearest preceding `let (identity, origin) = …` in the same function,
+///   whose initializer is exactly one of [`PAIRED_IDENTITY_INITIALIZERS`];
+/// - an origin derived from the identity value itself (`identity.…`), as the
+///   crate's own test-session helpers do;
+/// - a literal fixture identity (`Some(…)`) with a non-`None` origin.
+///
+/// Everything else, including a missing origin, is a violation.
+fn principal_origin_violations(relative: &str, source: &str) -> (usize, Vec<String>) {
+    let code = blank_strings_and_comments(source);
+    let is_ident = |value: &str| {
+        !value.is_empty()
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+    };
+    let mut inspected = 0usize;
+    let mut violations = Vec::new();
+    for (offset, body) in carrier_literals(&code, PRINCIPAL_CARRIERS) {
+        let fields = top_level_fields(body);
+        let Some(consumer) = fields.get("consumer_username") else {
+            continue;
+        };
+        inspected += 1;
+        let line = code[..offset].matches('\n').count() + 1;
+        let location = format!("{relative}:{line}");
+        let Some(origin) = fields.get("principal_origin") else {
+            violations.push(format!(
+                "{location}: sets consumer_username without principal_origin"
+            ));
+            continue;
+        };
+        let accepted = if origin == "None" || consumer == "None" {
+            origin == "None" && consumer == "None"
+        } else if let Some(receiver) =
+            consumer.strip_suffix(".effective_identity().map(str::to_owned)")
+        {
+            origin.as_str() == format!("{receiver}.principal_origin()")
+        } else if let Some(receiver) = consumer
+            .strip_suffix(".consumer_username.clone()")
+            .or_else(|| consumer.strip_suffix(".consumer_username"))
+        {
+            origin.as_str() == format!("{receiver}.principal_origin")
+        } else {
+            let local = consumer
+                .strip_suffix(".clone()")
+                .unwrap_or(consumer.as_str());
+            if !is_ident(local) {
+                consumer.starts_with("Some(")
+            } else if origin.starts_with(&format!("{local}.")) {
+                true
+            } else {
+                is_ident(origin.as_str())
+                    && nearest_let_binding(&code[..offset], local).is_some_and(
+                        |(pattern, initializer)| {
+                            pattern == format!("({local},{origin})")
+                                && PAIRED_IDENTITY_INITIALIZERS.contains(&initializer.as_str())
+                        },
+                    )
+            }
+        };
+        if !accepted {
+            violations.push(format!(
+                "{location}: consumer_username `{consumer}` is not paired with principal_origin `{origin}` from the same source"
+            ));
+        }
+    }
+    (inspected, violations)
+}
+
+/// The only `let (identity, origin) = …` initializers (whitespace removed) the
+/// guard accepts for a shorthand/local pair: exactly the forms the TCP, DTLS,
+/// and UDP-session builders use, each of which yields `summary_identity()` or
+/// `(None, None)` on every branch. A new builder shape must be added here
+/// deliberately, after review.
+const PAIRED_IDENTITY_INITIALIZERS: &[&str] = &[
+    "stream_ctx.summary_identity()",
+    "if!plugins.is_empty(){stream_ctx.summary_identity()}else{(None,None)}",
+    "ifhandler_has_plugins{stream_ctx.summary_identity()}else{(None,None)}",
+];
+
+/// The `(pattern, initializer)` of the last `let` before the end of `code`,
+/// within the enclosing function, whose pattern binds `local` (whitespace and
+/// `mut` removed from the pattern).
+fn nearest_let_binding(code: &str, local: &str) -> Option<(String, String)> {
+    let scope_start = code.rfind("fn ").unwrap_or(0);
+    let scope = &code[scope_start..];
+    let bytes = scope.as_bytes();
+    let is_ident = |byte: u8| byte.is_ascii_alphanumeric() || byte == b'_';
+    let mut found = None;
+    let mut from = 0;
+    while let Some(at) = scope[from..].find("let") {
+        let start = from + at;
+        from = start + 3;
+        if (start > 0 && is_ident(bytes[start - 1]))
+            || bytes.get(start + 3).is_some_and(|&byte| is_ident(byte))
+        {
+            continue;
+        }
+        let rest = &scope[start + 3..];
+        let Some(equals) = rest
+            .char_indices()
+            .find(|&(index, c)| {
+                c == '=' && !matches!(rest.as_bytes().get(index + 1), Some(b'=' | b'>'))
+            })
+            .map(|(index, _)| index)
+        else {
+            continue;
+        };
+        let pattern: String = rest[..equals]
+            .split_whitespace()
+            .filter(|token| *token != "mut")
+            .collect::<String>()
+            .replace("(mut", "(")
+            .replace(",mut", ",");
+        let simple = pattern.split(':').next().unwrap_or("").to_string();
+        let binds = if pattern.starts_with('(') && pattern.ends_with(')') {
+            pattern[1..pattern.len() - 1]
+                .split(',')
+                .any(|element| element == local)
+        } else {
+            simple == local
+        };
+        if !binds {
+            continue;
+        }
+        let initializer = &rest[equals + 1..];
+        let mut depth = 0i32;
+        let end = initializer
+            .char_indices()
+            .find(|&(_, c)| {
+                match c {
+                    '(' | '[' | '{' => depth += 1,
+                    ')' | ']' | '}' => depth -= 1,
+                    ';' if depth == 0 => return true,
+                    _ => {}
+                }
+                false
+            })
+            .map_or(initializer.len(), |(index, _)| index);
+        let pattern = if pattern.starts_with('(') {
+            pattern
+        } else {
+            simple
+        };
+        found = Some((
+            pattern,
+            initializer[..end].split_whitespace().collect::<String>(),
+        ));
+    }
+    found
+}
+
+fn collect_rust_sources(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+    let mut entries: Vec<_> = std::fs::read_dir(dir)
+        .expect("read source dir")
+        .flatten()
+        .map(|entry| entry.path())
+        .collect();
+    entries.sort();
+    for path in entries {
+        if path.is_dir() {
+            collect_rust_sources(&path, out);
+        } else if path.extension().and_then(|ext| ext.to_str()) == Some("rs") {
+            out.push(path);
+        }
+    }
+}
+
+/// Replace string/char literal contents and comments with spaces (newlines
+/// kept) so brace and comma structure can be scanned without a parser.
+fn blank_strings_and_comments(source: &str) -> String {
+    let bytes = source.as_bytes();
+    let mut out = bytes.to_vec();
+    let is_ident = |byte: u8| byte.is_ascii_alphanumeric() || byte == b'_';
+    let blank = |out: &mut Vec<u8>, from: usize, to: usize| {
+        let to = to.min(bytes.len());
+        if from >= to {
+            return;
+        }
+        for byte in &mut out[from..to] {
+            if *byte != b'\n' {
+                *byte = b' ';
+            }
+        }
+    };
+    let mut i = 0;
+    while i < bytes.len() {
+        let previous_is_ident = i > 0 && is_ident(bytes[i - 1]);
+        if bytes[i..].starts_with(b"//") {
+            let end = bytes[i..]
+                .iter()
+                .position(|&byte| byte == b'\n')
+                .map_or(bytes.len(), |at| i + at);
+            blank(&mut out, i, end);
+            i = end;
+            continue;
+        }
+        if bytes[i..].starts_with(b"/*") {
+            let end = source[i + 2..]
+                .find("*/")
+                .map_or(bytes.len(), |at| i + 2 + at + 2);
+            blank(&mut out, i, end);
+            i = end;
+            continue;
+        }
+        let raw_start = if !previous_is_ident && bytes[i] == b'r' {
+            Some(i + 1)
+        } else if !previous_is_ident && bytes[i] == b'b' && bytes.get(i + 1) == Some(&b'r') {
+            Some(i + 2)
+        } else {
+            None
+        };
+        if let Some(start) = raw_start {
+            let hashes = bytes[start..]
+                .iter()
+                .take_while(|&&byte| byte == b'#')
+                .count();
+            if bytes.get(start + hashes) == Some(&b'"') {
+                let mut closing = vec![b'"'];
+                closing.resize(hashes + 1, b'#');
+                let body = start + hashes + 1;
+                let end = bytes[body..]
+                    .windows(closing.len())
+                    .position(|window| window == closing.as_slice())
+                    .map_or(bytes.len(), |at| body + at + closing.len());
+                blank(&mut out, body, end.saturating_sub(closing.len()));
+                i = end;
+                continue;
+            }
+        }
+        if bytes[i] == b'"' {
+            let mut j = i + 1;
+            while j < bytes.len() && bytes[j] != b'"' {
+                j += if bytes[j] == b'\\' { 2 } else { 1 };
+            }
+            blank(&mut out, i + 1, j);
+            i = j + 1;
+            continue;
+        }
+        if bytes[i] == b'\'' {
+            // Char/byte literal; a lone quote is a lifetime or label.
+            let end = if bytes.get(i + 1) == Some(&b'\\') {
+                bytes[i + 2..]
+                    .iter()
+                    .position(|&byte| byte == b'\'')
+                    .map(|at| i + 2 + at)
+            } else {
+                (i + 2..(i + 6).min(bytes.len()))
+                    .find(|&at| bytes[at] == b'\'')
+                    .filter(|&at| {
+                        std::str::from_utf8(&bytes[i + 1..at])
+                            .is_ok_and(|text| text.chars().count() == 1)
+                    })
+            };
+            if let Some(end) = end {
+                blank(&mut out, i + 1, end);
+                i = end + 1;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// `(offset, body)` of each struct literal of a carrier type: the type's name
+/// (optionally path-qualified) directly followed by `{`, excluding struct,
+/// impl, and function-signature positions.
+fn carrier_literals<'a>(code: &'a str, carriers: &[&str]) -> Vec<(usize, &'a str)> {
+    let bytes = code.as_bytes();
+    let is_ident = |byte: u8| byte.is_ascii_alphanumeric() || byte == b'_';
+    let mut literals = Vec::new();
+    for carrier in carriers {
+        let mut from = 0;
+        while let Some(at) = code[from..].find(carrier) {
+            let start = from + at;
+            let end = start + carrier.len();
+            from = end;
+            if start > 0 && is_ident(bytes[start - 1]) {
+                continue;
+            }
+            let rest = &code[end..];
+            let trimmed = rest.trim_start();
+            // Any whitespace (a blanked comment included) may precede the
+            // brace.
+            if !trimmed.starts_with('{') {
+                continue;
+            }
+            let path_start = code[..start]
+                .trim_end_matches(|c: char| c.is_ascii_alphanumeric() || c == '_' || c == ':')
+                .len();
+            let before = code[..path_start].trim_end();
+            if ["struct", "impl", "for", "enum", "->", "trait", "union"]
+                .iter()
+                .any(|keyword| before.ends_with(keyword))
+            {
+                continue;
+            }
+            let open = end + (rest.len() - trimmed.len());
+            let mut depth = 0usize;
+            let mut close = None;
+            for (index, byte) in bytes.iter().enumerate().skip(open) {
+                match *byte {
+                    b'{' => depth += 1,
+                    b'}' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            close = Some(index);
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            if let Some(close) = close {
+                literals.push((start, &code[open + 1..close]));
+            }
+        }
+    }
+    literals
+}
+
+/// Top-level `field: value` pairs of a struct-literal body (shorthand fields
+/// map to their own name), with whitespace removed from values.
+fn top_level_fields(body: &str) -> HashMap<String, String> {
+    let mut segments = Vec::new();
+    let mut depth = 0i32;
+    let mut segment_start = 0;
+    for (index, byte) in body.bytes().enumerate() {
+        match byte {
+            b'(' | b'[' | b'{' => depth += 1,
+            b')' | b']' | b'}' => depth -= 1,
+            b',' if depth == 0 => {
+                segments.push(&body[segment_start..index]);
+                segment_start = index + 1;
+            }
+            _ => {}
+        }
+    }
+    segments.push(&body[segment_start..]);
+    let mut fields = HashMap::new();
+    for segment in segments {
+        let segment = segment.trim();
+        if segment.is_empty() || segment.starts_with("..") {
+            continue;
+        }
+        let name_len = segment
+            .bytes()
+            .take_while(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
+            .count();
+        if name_len == 0 {
+            continue;
+        }
+        let (name, rest) = segment.split_at(name_len);
+        let rest = rest.trim_start();
+        let value = if rest.is_empty() {
+            name.to_string()
+        } else if let Some(value) = rest
+            .strip_prefix(':')
+            .filter(|value| !value.starts_with(':'))
+        {
+            value.split_whitespace().collect::<String>()
+        } else {
+            continue;
+        };
+        fields.insert(name.to_string(), value);
+    }
+    fields
 }

@@ -1621,6 +1621,11 @@ pub struct WsDisconnectContext {
     /// Consumer identity associated with the upgrade (copied from
     /// the originating `RequestContext`).
     pub consumer_username: Option<String>,
+    /// Namespace (mapped Consumer or external principal and its realm) of
+    /// `consumer_username`, from the originating `RequestContext`. Billing
+    /// keys on it rather than on the display string (GHSA-q9vj-rf66-3j58).
+    #[doc(hidden)]
+    pub principal_origin: Option<utils::principal::PrincipalOrigin>,
     /// Authentication mechanism that succeeded for the upgrade request.
     pub auth_method: Option<&'static str>,
     /// Correlation ID / tracing metadata inherited from the upgrade request.
@@ -1672,6 +1677,7 @@ impl WsDisconnectContext {
             timestamp_received: self.timestamp_connected.clone(),
             client_ip: self.client_ip.clone(),
             consumer_username: self.consumer_username.clone(),
+            principal_origin: self.principal_origin,
             auth_method: self.auth_method,
             http_method: self.http_method.clone(),
             request_path: self.request_path.clone(),
@@ -8155,6 +8161,24 @@ impl RequestContext {
             .or_else(|| meaningful_identity(self.authenticated_identity.as_deref()))
     }
 
+    /// Namespace of [`Self::effective_identity`]: a mapped Consumer, or an
+    /// unmapped external principal with its committed realm. Transaction
+    /// summaries record it beside `consumer_username` so billing never keys on
+    /// the collapsed display string (GHSA-q9vj-rf66-3j58).
+    pub fn principal_origin(&self) -> Option<utils::principal::PrincipalOrigin> {
+        utils::principal::PrincipalOrigin::of_request(self)
+    }
+
+    /// The summary's `(consumer_username, principal_origin)` pair, taken
+    /// together so a builder that binds them to locals cannot carry one
+    /// without the other.
+    pub fn summary_identity(&self) -> (Option<String>, Option<utils::principal::PrincipalOrigin>) {
+        (
+            self.effective_identity().map(str::to_owned),
+            self.principal_origin(),
+        )
+    }
+
     /// Verified realm of the committed external identity, if one was committed
     /// through the authentication boundary. See
     /// [`utils::auth_flow::ExternalIdentityRealm`].
@@ -10117,6 +10141,14 @@ pub struct TransactionSummary {
     /// pipeline.
     #[doc(hidden)]
     pub ai_usage_export: Option<AiUsageExport>,
+    /// Namespace of `consumer_username`: a mapped Consumer, or an unmapped
+    /// external principal with the realm that verified it. `None` when the
+    /// summary has no principal (or a builder did not record one, which
+    /// billing treats as an external principal with no realm). Not serialized,
+    /// so log output and schemas are unchanged; `api_chargeback` and
+    /// `api_chargeback_sink` key billing rows on it (GHSA-q9vj-rf66-3j58).
+    #[doc(hidden)]
+    pub principal_origin: Option<utils::principal::PrincipalOrigin>,
     /// Ownership generation captured at HTTP/gRPC/WebSocket admission. Not
     /// serialized; used by `proxy_alerts` to reject samples from a prior
     /// delete→recreate incarnation of the same proxy ID.
@@ -11090,6 +11122,22 @@ impl StreamConnectionContext {
             .or_else(|| meaningful_identity(self.authenticated_identity.as_deref()))
     }
 
+    /// Namespace of [`Self::effective_identity`] (see
+    /// [`RequestContext::principal_origin`]); stream connections carry no
+    /// committed realm.
+    pub fn principal_origin(&self) -> Option<utils::principal::PrincipalOrigin> {
+        utils::principal::PrincipalOrigin::of_stream(self)
+    }
+
+    /// The stream summary's `(consumer_username, principal_origin)` pair (see
+    /// [`RequestContext::summary_identity`]).
+    pub fn summary_identity(&self) -> (Option<String>, Option<utils::principal::PrincipalOrigin>) {
+        (
+            self.effective_identity().map(str::to_owned),
+            self.principal_origin(),
+        )
+    }
+
     /// Contribute an authorization deadline observed by an admitting stream
     /// authentication mechanism (issue #3816).
     ///
@@ -11322,6 +11370,12 @@ pub struct StreamTransactionSummary {
     /// `None` when no authentication plugin identified the client.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub consumer_username: Option<String>,
+    /// Namespace of `consumer_username` (mapped Consumer or external
+    /// principal); see `TransactionSummary::principal_origin`. Not serialized
+    /// (GHSA-q9vj-rf66-3j58).
+    #[doc(hidden)]
+    #[serde(skip)]
+    pub principal_origin: Option<utils::principal::PrincipalOrigin>,
     /// Authentication mechanism that succeeded for this stream connection.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub auth_method: Option<&'static str>,

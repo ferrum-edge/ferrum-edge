@@ -373,6 +373,7 @@ fn grpc_summary(proxy_id: &str, grpc_status: &str) -> TransactionSummary {
     let mut summary = TransactionSummary {
         namespace: "ferrum".to_string(),
         consumer_username: Some("alice".to_string()),
+        principal_origin: Some(ferrum_edge::plugins::utils::principal::PrincipalOrigin::Consumer),
         proxy_id: Some(proxy_id.to_string()),
         proxy_name: Some("gRPC API".to_string()),
         response_status_code: 200,
@@ -398,6 +399,7 @@ fn http_summary_with_dims(
     let mut summary = TransactionSummary {
         namespace: "ferrum".to_string(),
         consumer_username: Some("alice".to_string()),
+        principal_origin: Some(ferrum_edge::plugins::utils::principal::PrincipalOrigin::Consumer),
         proxy_id: Some(proxy_id.to_string()),
         proxy_name: Some(proxy_name.to_string()),
         response_status_code: status,
@@ -2974,6 +2976,9 @@ async fn websocket_disconnect_exports_bandwidth_charge() {
             io_side: None,
             error_class: None,
             consumer_username: Some("alice".to_string()),
+            principal_origin: Some(
+                ferrum_edge::plugins::utils::principal::PrincipalOrigin::Consumer,
+            ),
             auth_method: None,
             connection_id: 0,
             metadata: Default::default(),
@@ -3008,6 +3013,9 @@ async fn connect_method_is_not_classified_as_websocket() {
         .log(&TransactionSummary {
             namespace: "ferrum".to_string(),
             consumer_username: Some("alice".to_string()),
+            principal_origin: Some(
+                ferrum_edge::plugins::utils::principal::PrincipalOrigin::Consumer,
+            ),
             http_method: "CONNECT".to_string(),
             proxy_id: Some("proxy-a".to_string()),
             proxy_name: Some("Proxy A".to_string()),
@@ -5451,6 +5459,7 @@ fn billable_summary(request_id: &str) -> TransactionSummary {
     let mut summary = TransactionSummary {
         namespace: "ferrum".to_string(),
         consumer_username: Some("alice".to_string()),
+        principal_origin: Some(ferrum_edge::plugins::utils::principal::PrincipalOrigin::Consumer),
         proxy_id: Some("proxy-a".to_string()),
         proxy_name: Some("Payments".to_string()),
         response_status_code: 200,
@@ -15793,4 +15802,193 @@ fn spool_fault_injection_and_hooks_exist_only_with_test_support() {
              takes no lock"
         );
     }
+}
+
+// --- GHSA-q9vj-rf66-3j58: `consumer_id` is the principal, not its display string ---
+
+const PROVIDER_A_AUTHORITY: [u8; 32] = [0xa1; 32];
+const PROVIDER_B_AUTHORITY: [u8; 32] = [0xb2; 32];
+
+fn external_alice_consumer_id(authority: [u8; 32]) -> String {
+    format!("external:jwks_auth:{}:alice", hex::encode(authority))
+}
+
+/// The billable summaries of a mapped Consumer `alice` and of unmapped
+/// `jwks_auth` principals `alice` from two providers, each stamped from a
+/// context committed through the authentication boundary exactly as the
+/// production summary builders stamp it.
+fn alice_principal_summaries() -> [TransactionSummary; 3] {
+    let consumer = super::plugin_utils::consumer_context("alice");
+    let mut provider_a = super::plugin_utils::create_test_context();
+    super::plugin_utils::commit_external_identity_with_authority(
+        &mut provider_a,
+        "alice",
+        "jwks_auth",
+        Some(PROVIDER_A_AUTHORITY),
+    );
+    let mut provider_b = super::plugin_utils::create_test_context();
+    super::plugin_utils::commit_external_identity_with_authority(
+        &mut provider_b,
+        "alice",
+        "jwks_auth",
+        Some(PROVIDER_B_AUTHORITY),
+    );
+    [&consumer, &provider_a, &provider_b].map(|ctx| {
+        let mut summary = billable_summary("principal-row");
+        summary.consumer_username = ctx.effective_identity().map(str::to_owned);
+        summary.principal_origin = ctx.principal_origin();
+        assert_eq!(summary.consumer_username.as_deref(), Some("alice"));
+        summary
+    })
+}
+
+fn expected_alice_consumer_ids() -> std::collections::BTreeSet<String> {
+    std::collections::BTreeSet::from([
+        "alice".to_string(),
+        external_alice_consumer_id(PROVIDER_A_AUTHORITY),
+        external_alice_consumer_id(PROVIDER_B_AUTHORITY),
+    ])
+}
+
+#[tokio::test]
+#[serial_test::serial(api_chargeback_sink_active_sink)]
+async fn per_event_exports_bill_consumer_and_two_jwks_providers_to_three_consumer_ids() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&server)
+        .await;
+
+    let temp = tempfile::tempdir().unwrap();
+    let mut config = valid_config(temp.path());
+    config["clickhouse"]["url"] = json!(server.uri());
+    config["batch"]["size"] = json!(1);
+    let plugin = ApiChargebackSink::new(&config, PluginHttpClient::default(), "ferrum").unwrap();
+    plugin.start_background_tasks().expect("chargeback start");
+    plugin.commit_background_tasks();
+
+    for summary in alice_principal_summaries() {
+        plugin.log(&summary).await;
+    }
+
+    let requests = wait_for_requests(&server, 3).await;
+    let consumer_ids: std::collections::BTreeSet<String> = requests
+        .iter()
+        .flat_map(|request| {
+            String::from_utf8(request.body.clone())
+                .expect("JSONEachRow body is UTF-8")
+                .lines()
+                .filter(|line| !line.trim().is_empty())
+                .map(|line| {
+                    let row: Value = serde_json::from_str(line).expect("charge event row");
+                    row["consumer_id"]
+                        .as_str()
+                        .expect("consumer_id string")
+                        .to_string()
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    assert_eq!(
+        consumer_ids,
+        expected_alice_consumer_ids(),
+        "a mapped Consumer and each provider's principal must export disjoint consumer_ids"
+    );
+}
+
+/// Rows exported to a test-owned ClickHouse mock, deduplicated by `event_id`
+/// (the snapshot hand-off and a later spool replay deliver the same event).
+fn exported_rows_by_event_id(requests: &[Request]) -> std::collections::BTreeMap<String, Value> {
+    let mut rows = std::collections::BTreeMap::new();
+    for request in requests {
+        let body = String::from_utf8(request.body.clone()).expect("JSONEachRow body is UTF-8");
+        for line in body.lines().filter(|line| !line.trim().is_empty()) {
+            let row: Value = serde_json::from_str(line).expect("charge event row");
+            let event_id = row["event_id"].as_str().expect("event_id").to_string();
+            rows.insert(event_id, row);
+        }
+    }
+    rows
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial_test::serial(api_chargeback_sink_active_sink)]
+async fn snapshot_rows_bill_consumer_and_two_jwks_providers_to_three_consumer_ids() {
+    use ferrum_edge::_test_support::api_chargeback_sink_emit_snapshot_tick_for_test;
+
+    // Verified through a test-owned ClickHouse mock rather than the spool
+    // directory, which the replay worker may claim (rename) at any time.
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&server)
+        .await;
+
+    let temp = tempfile::tempdir().unwrap();
+    let spool_dir = temp.path().join("principal-snapshot-spool");
+    fs::create_dir_all(&spool_dir).unwrap();
+    let mut config = valid_config(&spool_dir);
+    config["mode"] = json!("snapshot");
+    config["clickhouse"]["url"] = json!(server.uri());
+    config["batch"]["size"] = json!(1);
+    config["batch"]["flush_interval_ms"] = json!(50);
+    config["snapshot"] = json!({
+        "interval_secs": 3600,
+        "cleanup_interval_secs": 3600,
+        "stale_entry_ttl_secs": 7200
+    });
+    let plugin = ApiChargebackSink::new(&config, PluginHttpClient::default(), "ferrum")
+        .expect("construct snapshot sink");
+    plugin
+        .start_background_tasks()
+        .expect("start snapshot sink");
+    plugin.commit_background_tasks();
+
+    let [consumer, provider_a, provider_b] = alice_principal_summaries();
+    plugin.log(&consumer).await;
+    for _ in 0..2 {
+        plugin.log(&provider_a).await;
+    }
+    for _ in 0..3 {
+        plugin.log(&provider_b).await;
+    }
+
+    assert_eq!(
+        api_chargeback_sink_emit_snapshot_tick_for_test(&plugin),
+        Some(Ok(3)),
+        "three principals must accumulate into three snapshot identities"
+    );
+
+    let mut rows = std::collections::BTreeMap::new();
+    for _ in 0..400 {
+        rows = exported_rows_by_event_id(&server.received_requests().await.unwrap_or_default());
+        if rows.len() >= 3 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert_eq!(rows.len(), 3, "exactly three snapshot rows: {rows:?}");
+    let mut calls_by_consumer = std::collections::BTreeMap::new();
+    for row in rows.values() {
+        assert!(
+            row["snapshot_id"].as_str().is_some_and(|id| !id.is_empty()),
+            "a snapshot delta carries its snapshot_id: {row}"
+        );
+        calls_by_consumer.insert(
+            row["consumer_id"]
+                .as_str()
+                .expect("consumer_id")
+                .to_string(),
+            row["call_count"].as_u64().expect("call_count"),
+        );
+    }
+    assert_eq!(
+        calls_by_consumer,
+        std::collections::BTreeMap::from([
+            ("alice".to_string(), 1),
+            (external_alice_consumer_id(PROVIDER_A_AUTHORITY), 2),
+            (external_alice_consumer_id(PROVIDER_B_AUTHORITY), 3),
+        ])
+    );
+    drop(plugin);
 }

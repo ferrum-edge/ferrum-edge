@@ -274,6 +274,7 @@ fn disconnect_context_with_id(
         io_side: None,
         error_class: None,
         consumer_username: None,
+        principal_origin: None,
         auth_method: None,
         metadata: metadata.into_iter().collect(),
     }

@@ -81,6 +81,7 @@ fn test_ws_disconnect_context() -> WsDisconnectContext {
         io_side: None,
         error_class: None,
         consumer_username: Some("alice".to_string()),
+        principal_origin: Some(ferrum_edge::plugins::utils::principal::PrincipalOrigin::Consumer),
         auth_method: None,
         connection_id: 0,
         metadata: metadata.into_iter().collect(),

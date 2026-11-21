@@ -4431,3 +4431,160 @@ async fn relabelled_bom_json_upload_retires_stale_integrity_headers() {
     let rewritten: serde_json::Value = serde_json::from_slice(&rewritten).unwrap();
     assert_eq!(rewritten, json!({"keep": 1}));
 }
+
+/// GHSA-c259-vchc-3vgr: the outbound strip removes a whole `&` segment whose
+/// `;` sub-pair names an auth-marked credential, so a template reading that
+/// carrier must not copy the embedded credential into another field. The
+/// mark comes from a real auth discovery hook.
+#[tokio::test]
+async fn query_template_never_copies_a_carrier_embedding_a_marked_alias() {
+    use ferrum_edge::plugins::request_transformer::RULE_SKIPPED_METADATA_KEY;
+
+    let jwt = ferrum_edge::plugins::jwt_auth::JwtAuth::new(&json!({
+        "token_lookup": "query:tenant_jwt",
+        "hide_credentials": true
+    }))
+    .unwrap();
+    for (operation, target) in [("update", "header"), ("add", "query")] {
+        let plugin = RequestTransformer::new(&json!({
+            "rules": [{"operation": operation, "target": target, "key": "x-copied", "value": "$(query.carrier)"}]
+        }))
+        .unwrap();
+        let mut ctx = make_ctx();
+        ctx.set_raw_query_string("carrier=;tenant_jwt=aliased-secret&page=1".to_string());
+        ctx.materialize_query_params();
+        jwt.mark_query_credentials_for_redaction(&mut ctx);
+        assert!(
+            ctx.metadata
+                .contains_key("auth.strip_query_param.tenant_jwt")
+        );
+
+        let mut headers: HashMap<String, String> = HashMap::new();
+        plugin.before_proxy(&mut ctx, &mut headers).await;
+        assert!(!headers.contains_key("x-copied"), "{target}");
+        assert_eq!(
+            ctx.metadata
+                .get(RULE_SKIPPED_METADATA_KEY)
+                .map(String::as_str),
+            Some("template_unresolved"),
+            "{target}"
+        );
+        let forwarded = ferrum_edge::_test_support::effective_backend_query_string_for_test(&ctx);
+        assert!(
+            !forwarded.contains("aliased-secret"),
+            "{target}: {forwarded}"
+        );
+        assert!(!forwarded.contains("x-copied"), "{target}: {forwarded}");
+    }
+
+    // An unmarked `;` inside a carrier value still resolves.
+    let plugin = RequestTransformer::new(&json!({
+        "rules": [{"operation": "update", "target": "header", "key": "x-copied", "value": "$(query.carrier)"}]
+    }))
+    .unwrap();
+    let mut ctx = make_ctx();
+    ctx.set_raw_query_string("carrier=a;b=c&page=1".to_string());
+    ctx.materialize_query_params();
+    jwt.mark_query_credentials_for_redaction(&mut ctx);
+    let mut headers: HashMap<String, String> = HashMap::new();
+    plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert_eq!(headers.get("x-copied").map(String::as_str), Some("a;b=c"));
+}
+
+/// A blocked carrier occurrence keeps last-occurrence-wins semantics: it
+/// retires an earlier clean occurrence (the template is unresolved), while a
+/// later clean occurrence still wins. The outer name is compared decoded.
+#[tokio::test]
+async fn query_template_blocked_carrier_keeps_last_occurrence_semantics() {
+    use ferrum_edge::plugins::request_transformer::RULE_SKIPPED_METADATA_KEY;
+
+    let jwt = ferrum_edge::plugins::jwt_auth::JwtAuth::new(&json!({
+        "token_lookup": "query:tenant_jwt",
+        "hide_credentials": true
+    }))
+    .unwrap();
+    let plugin = RequestTransformer::new(&json!({
+        "rules": [{"operation": "update", "target": "header", "key": "x-copied", "value": "$(query.carrier)"}]
+    }))
+    .unwrap();
+    for (raw_query, expected) in [
+        ("carrier=plain&carrier=;tenant_jwt=aliased-secret", None),
+        (
+            "carrier=;tenant_jwt=aliased-secret&carrier=plain",
+            Some("plain"),
+        ),
+        ("carrier=plain&c%61rrier=;tenant_jwt=aliased-secret", None),
+        (
+            "c%61rrier=;tenant_jwt=aliased-secret&carrier=plain",
+            Some("plain"),
+        ),
+    ] {
+        let mut ctx = make_ctx();
+        ctx.set_raw_query_string(raw_query.to_string());
+        ctx.materialize_query_params();
+        jwt.mark_query_credentials_for_redaction(&mut ctx);
+        let mut headers: HashMap<String, String> = HashMap::new();
+        plugin.before_proxy(&mut ctx, &mut headers).await;
+        assert_eq!(
+            headers.get("x-copied").map(String::as_str),
+            expected,
+            "{raw_query}"
+        );
+        if expected.is_none() {
+            assert_eq!(
+                ctx.metadata
+                    .get(RULE_SKIPPED_METADATA_KEY)
+                    .map(String::as_str),
+                Some("template_unresolved"),
+                "{raw_query}"
+            );
+        }
+    }
+}
+
+/// GHSA-c259-vchc-3vgr: the template snapshot uses the outbound strip's own
+/// raw / percent-decoded / form-decoded name rule for top-level names as well
+/// as `;` sub-pairs. With the literal escaped configured name
+/// `workspace%2Dslot`, a top-level occurrence under that raw spelling is the
+/// marked credential, so `$(query.workspace-slot)` must not copy it.
+#[tokio::test]
+async fn query_template_never_copies_a_raw_spelling_marked_credential() {
+    use ferrum_edge::plugins::request_transformer::RULE_SKIPPED_METADATA_KEY;
+
+    let jwt = ferrum_edge::plugins::jwt_auth::JwtAuth::new(&json!({
+        "token_lookup": "query:workspace%2Dslot",
+        "hide_credentials": true
+    }))
+    .unwrap();
+    for (operation, target) in [("update", "header"), ("add", "query")] {
+        let plugin = RequestTransformer::new(&json!({
+            "rules": [{"operation": operation, "target": target, "key": "x-copied", "value": "$(query.workspace-slot)"}]
+        }))
+        .unwrap();
+        let mut ctx = make_ctx();
+        ctx.set_raw_query_string(
+            "carrier=;workspace%2Dslot=raw-secret&workspace%2Dslot=raw-secret&page=1".to_string(),
+        );
+        ctx.materialize_query_params();
+        jwt.mark_query_credentials_for_redaction(&mut ctx);
+        assert!(
+            ctx.metadata
+                .contains_key("auth.strip_query_param.workspace%2Dslot")
+        );
+
+        let mut headers: HashMap<String, String> = HashMap::new();
+        plugin.before_proxy(&mut ctx, &mut headers).await;
+        assert!(!headers.contains_key("x-copied"), "{target}");
+        if target == "header" {
+            assert_eq!(
+                ctx.metadata
+                    .get(RULE_SKIPPED_METADATA_KEY)
+                    .map(String::as_str),
+                Some("template_unresolved")
+            );
+        }
+        let forwarded = ferrum_edge::_test_support::effective_backend_query_string_for_test(&ctx);
+        assert!(!forwarded.contains("raw-secret"), "{target}: {forwarded}");
+        assert!(!forwarded.contains("x-copied"), "{target}: {forwarded}");
+    }
+}

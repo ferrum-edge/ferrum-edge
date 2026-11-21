@@ -2357,6 +2357,19 @@ paths:
         Overlapping pricing generations collapse under that authoritative
         current name.
 
+        The `consumer` key (JSON `consumers` map key and Prometheus `consumer`
+        label) is the authenticated principal's billing identity: a mapped
+        Consumer's username unchanged, or
+        `external:<mechanism>:<authority>:<identity>` for an unmapped external
+        principal (`<authority>` is an opaque 64-hex verifying-authority digest,
+        `-` when absent). A Consumer and same-named external principals from
+        distinct mechanisms or authorities therefore never share a row
+        (GHSA-q9vj-rf66-3j58). The `external:` prefix is reserved: a Consumer
+        whose username begins with it is reported in digest form. Oversized or
+        `~sha256:`-bearing values also use the `<prefix>~sha256:<64 hex>`
+        digest form. Rows recorded before this keying took effect carry bare
+        display identities and are not realm-qualified.
+
         **Multi-node deployments**: Each gateway node accumulates charges independently.
         In CP/DP topologies, scrape every DP node and aggregate externally.
       tags: [Metrics]

@@ -182,6 +182,35 @@ identity to land in another principal's row. The original of a digested value
 must be resolved at the identity provider; the gateway does not retain
 oversized credential-derived identities.
 
+**`consumer_id` is the principal, not the display name (GHSA-q9vj-rf66-3j58).**
+The transaction summary's `consumer_username` is the same string for a mapped
+Consumer `alice` and for an unmapped external principal `alice` verified by any
+external mechanism or provider, so it is never the billing key. A mapped
+Consumer's `consumer_id` is its username, unchanged. An unmapped external
+principal's is its namespaced key
+`external:<mechanism>:<authority>:<identity>`, where `<mechanism>` is the
+authentication plugin that verified it (for example `jwks_auth`) and
+`<authority>` is the opaque 64-hex digest of the verifying authority for
+mechanisms that accept more than one; either is `-` when absent (stream
+connections carry no realm). Two providers that issue the same subject
+therefore export two `consumer_id` values, and neither equals the Consumer's.
+An oversized or marker-bearing external key is stored in the digest form above,
+hashed under a separate domain from Consumer usernames, and a Consumer whose
+username itself begins with `external:` is always stored in digest form so it
+can never spell an external principal's `consumer_id`. `api_chargeback` keys its
+`/charges` rows the same way. External `consumer_id`s are only as fine-grained
+as the realm the mechanism commits: `soap_ws_security` currently commits no
+authority, so its principals are qualified by mechanism only
+(`external:soap_ws_security:-:<identity>`).
+
+Rows exported before this keying took effect — including rows still pending in
+the spool, which replay with their original bytes — carry bare display
+identities and are not realm-qualified, and a pre-upgrade bare value can equal a
+post-upgrade key. The shipped rollups group by `consumer_id` without the realm,
+so keep the eras separately attributable for the first realm-qualified rollout
+(a new `pricing_version`, which every rollup key includes, or a new table); see
+the upgrade guide.
+
 Delta emission, last-emitted bookkeeping, and stale-entry cleanup all use this
 same key. Display-name changes (consumer or proxy rename on reload) and
 distinct routes or protocols therefore produce separate snapshot rows instead of

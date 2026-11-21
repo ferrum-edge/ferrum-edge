@@ -1929,6 +1929,36 @@ Charges accumulate in-memory and are exposed via the admin `/charges` endpoint
 in both Prometheus text and JSON formats for external billing system
 integration.
 
+**Billing identity (GHSA-q9vj-rf66-3j58):** a row's `consumer` (the JSON
+`consumers` key and the Prometheus `consumer` label) is the authenticated
+*principal*, not the display string logged as `consumer_username`. That display
+string is the same for a mapped Consumer `alice` and for an unmapped external
+principal `alice` from any `jwks_auth` / `oidc_relying_party` /
+`oauth2_introspection` / `ldap_auth` / `soap_ws_security` provider, so it never
+keys a billing row:
+
+| Principal | Billing identity |
+|-----------|------------------|
+| Mapped gateway Consumer | its username, unchanged (for example `alice`) |
+| Unmapped external principal | `external:<mechanism>:<authority>:<identity>` — the same namespaced key per-caller limiters use, for example `external:jwks_auth:<64 hex>:alice` |
+
+`<mechanism>` is the authentication plugin that verified the identity and
+`<authority>` is the opaque 64-hex digest of the verifying authority (issuer,
+key source, directory) that the mechanism commits with the identity; either is
+`-` when absent (for example a stream connection, which carries no realm). Two
+providers that issue the same subject therefore bill two rows, and neither
+shares the Consumer's row. External rows are only as fine-grained as the
+committed realm: `soap_ws_security` currently commits no authority, so its
+principals are qualified by mechanism only
+(`external:soap_ws_security:-:<identity>`), and two SAML issuers trusted by one
+instance share a row for the same subject. Rows recorded before this keying
+took effect carry bare display identities; see the upgrade guide for the
+cutover. A value above 512 bytes, or one containing the
+`~sha256:` marker, uses the collision-resistant digest form described below
+(external keys hash under a separate domain from Consumer usernames). A
+Consumer whose username itself begins with `external:` is always given its
+digest form so it can never spell an external principal's row.
+
 **Exactly-once accounting:** the `/charges` registry is one
 process-global accumulator. After ordinary scope merging, each proxy may retain
 at most one effective `api_chargeback` instance. Two proxy-scoped configs, two
@@ -1990,7 +2020,8 @@ billing-identity class (`~sha256:` marker, non-hex suffix), so
 `bounded_billing_identity` can never return it for a real authenticated claim
 or operator-configured Consumer username — including one equal to the
 human-looking label `__cardinality_overflow__` or to the sentinel string
-itself.
+itself — and no external principal's `external:` billing identity can equal
+it either.
 Already-admitted rows keep accumulating normally and capacity is recovered
 by ordinary `stale_entry_ttl_seconds` eviction, subject to the collection
 contract below. Admission pressure is exported
@@ -2270,6 +2301,14 @@ under `/metrics`. See
 [plugins/api_chargeback_sink.md](plugins/api_chargeback_sink.md) for DDL,
 configuration, OpenAPI/runtime admission layers, spool sizing, replay, the
 ownership/claim protocol, and reconciliation guidance.
+
+Each row's `consumer_id` is the principal's billing identity, exactly as
+`api_chargeback` forms its `consumer` key (see
+[Billing identity](#api_chargeback)): a mapped Consumer's username unchanged,
+and `external:<mechanism>:<authority>:<identity>` for an unmapped external
+principal, so a Consumer and same-named external principals from distinct
+mechanisms or authorities never share a `consumer_id` or a snapshot row
+(GHSA-q9vj-rf66-3j58).
 
 `include_request_id` and `include_trace_id` (both Boolean, default `true`)
 control whether the exported row carries the transaction's `request_id` and
@@ -2698,6 +2737,20 @@ When a provider sets `require_dpop`, the access token may be presented either as
 
 Claim values are auto-detected as space-delimited strings (OAuth2 standard), JSON arrays, or nested objects via dot-notation paths.
 Claim header fan-out refuses reserved hop-by-hop, authorization, host, and consumer identity headers.
+
+**`;` sub-parameter aliases (`from_params`).** A request whose configured
+`from_params` name also appears as a `;`-separated sub-parameter
+(`?carrier=;access_token=...`, matched by raw spelling or any percent/form
+decoding, and including a name such as `access_token;x`) is ambiguous and is
+refused with `401` `{"error":"Ambiguous token query parameter"}`, the same
+contract as [`key_auth`](#key_auth). An alias at any provider's query location
+is terminal for the whole instance: it is checked before any header,
+`Authorization: Bearer` / `DPoP`, or default-location fallback is read, so a
+valid token elsewhere never masks it. The alias is always marked for policy
+redaction, and for a provider with `forward_original_token: false` the whole
+carrying `&` segment is removed from the forwarded query even when another
+mechanism authenticates the request.
+
 Unknown top-level, provider, and custom-header-location fields are rejected so misspelled authentication controls cannot silently fail open. For each remote or managed provider, `jwks_refresh_interval_secs` must not exceed its effective `jwks_max_stale_seconds`. Shared stores use both the minimum refresh interval and the minimum maximum-stale value requested by active consumers. A newly added stricter consumer takes effect immediately; full or incremental publication deterministically reconciles the exact minima, so removing the strict consumer may relax policy without replacing the store or resetting key age. Discovery-backed reloads retain the last validated URI/store until rediscovery produces a usable replacement, but discovery success alone never refreshes key trust. A discovery-backed provider is never frozen into the publication snapshot; its current store is tracked only through a generation-owned contribution that rediscovery repoints, so a superseded `jwks_uri` leaves the active set (and readiness) as soon as the provider stops using it unless another consumer still does. A store an OIDC discovery task resolves *after* its generation was published joins the active refresh/maximum-stale arbitration and the trust aggregate at that moment rather than at the next reload, and leaves it when that generation retires or repoints to a different URI; a staged generation that is never published contributes nothing to readiness or metrics.
 
 Remote discovery documents are capped at 128 KiB and JWKS responses at 1 MiB/256 keys, with bounded key components. A valid non-empty JWKS atomically replaces the key map, refreshes the monotonic trust deadline, clears failure state, and can restore authentication after expiry. Empty 200 responses, malformed or oversized bodies, non-2xx status, and transport/DNS/TLS/timeout failures retain last-known-good material only for the finite grace window and use a bounded accelerated retry cadence; after the deadline, verification refuses the retained material without deleting diagnostic/recovery state. JWKs are accepted for signature verification only when `use` is absent or `sig` and `key_ops` is absent or includes `verify`; contradictory operation metadata is rejected. The JWK `alg` parameter is honoured per RFC 7517 §4.4: a key that declares an `alg` is admitted only when that value names a supported signature algorithm for its key type — `RS256`/`RS384`/`RS512`/`PS256`/`PS384`/`PS512` for RSA, `ES256`/`ES384` matching the key's `crv` for EC, and `EdDSA` for an `OKP` key with `crv: Ed25519` — and verification is then bound to exactly that algorithm, so a PSS key never verifies a PKCS#1 v1.5 token and vice versa. Keys declaring an encryption algorithm (`RSA-OAEP`, `RSA-OAEP-256`, `RSA1_5`), a key-agreement algorithm or curve (`ECDH-ES`, `X25519`, `X448`), `Ed448`, or an `alg` that contradicts the key type or curve are skipped as unsupported rather than silently treated as RS256/curve-derived verification keys. A key with no `alg` defaults to RS256 for RSA (an RSASSA-PSS issuer must publish `alg: PS256`/`PS384`/`PS512`), a curve-derived algorithm for EC, and `EdDSA` for Ed25519. Ed25519 public keys must be exactly 32 bytes, and `OKP` keys are skipped while FIPS mode is enforced. RSA signing keys must carry a modulus of at least 2048 bits; weaker keys are skipped rather than trusted. Signing keys without a non-empty `kid` are unusable, and a JWKS with duplicate usable `kid` values is rejected rather than choosing one by response order.
@@ -2815,6 +2868,19 @@ Each provider owns independent entry-count, normalized-per-entry, and aggregate 
 Active cache entries retain only the prevalidated authorization outcome, canonical identity/display values, and rendered values for configured `claim_headers`; unrelated introspection JSON members are discarded after the request. Admission reserves count and bytes before publication. A fixed 16-ticket second-chance eviction pass reclaims expired or cold entries without scanning the map or allocating proportional workspace; recently used entries get one protected pass. Contended, oversized, or saturated admissions skip caching while the valid provider result continues through normal authorization. Reloaded generations own their cache reservations and eviction indexes until the last in-flight reference drops.
 
 Authorization fallback never fans a token across providers by default. Explicit `Authorization: Bearer` locations and the implicit Authorization fallback are treated as the same routing source and both match the Bearer scheme case-insensitively. Multi-provider configurations should use distinct `from_headers` or `from_params` locations as deterministic routing hints. Without shared-trust opt-in, the first matching routing hint selects exactly one provider even if a client repeats the same token in another provider location. Set `allow_provider_fanout: true` only for providers inside one shared trust boundary. When `forward_original_token: false`, every configured occurrence of the accepted token is stripped from headers and query parameters before proxying while unrelated credentials are preserved.
+
+**`;` sub-parameter aliases (`from_params`).** A request whose configured
+`from_params` name also appears as a `;`-separated sub-parameter
+(`?carrier=;access_token=...`, matched by raw spelling or any percent/form
+decoding, and including a name such as `access_token;x`) is ambiguous and is
+refused with `401` `{"error":"Ambiguous token query parameter"}` before any
+introspection call, the same contract as [`key_auth`](#key_auth). An alias at
+any provider's query location is terminal for the whole instance: it is
+checked before any header or `Authorization` fallback is read, so a valid
+token elsewhere never masks it. The alias is always marked for policy
+redaction, and for a provider with `forward_original_token: false` the whole
+carrying `&` segment is removed from the forwarded query even when another
+mechanism authenticates the request.
 
 Ordinary bearer tokens are supported, and with `providers[].accept_mtls_bound_tokens: true` so are RFC 8705 certificate-bound tokens: an active response whose `cnf` is exactly one non-empty `x5t#S256` member is admitted only when the request arrived over frontend mTLS with a client certificate whose base64url SHA-256 DER thumbprint matches (see [Frontend TLS](frontend_tls.md)); a missing or different certificate is a `401` with `Bearer error="invalid_token"` and the body `{"error":"mTLS binding mismatch"}`. The binding is retained with the cached result and re-verified on every request, including cache hits, before any scope or role decision is revealed. Every other confirmation — DPoP `jkt`, `jwk`, a `cnf` with additional or unknown members, or any `cnf` while the flag is off — and every non-Bearer `token_type` (including `DPoP`) fail closed with a `401`, because this plugin does not validate DPoP proofs. A JSON `null` `cnf` or `token_type` is read as omitted. Missing or non-Boolean `active` members, oversized/malformed responses, provider transport failures, and non-success provider responses are treated as dependency failures and return `503`; only explicit `active: false` is negative-cached and returned as `401`.
 
@@ -3035,6 +3101,17 @@ Authenticates requests using HMAC-signed (HS256 by default, or HS384 / HS512) JW
 | `leeway_secs` | u64 | `0` | Clock leeway for time-based JWT claims; max `300` |
 | `algorithm` | String | `HS256` | HMAC algorithm every token on this instance must use: `HS256`, `HS384`, or `HS512`. Pinned by configuration and never taken from the token header; a token whose header names any other algorithm (another HMAC size, `none`, or an asymmetric algorithm) is rejected. RSA/EC/JWKS verification belongs to `jwks_auth` |
 | `hide_credentials` | Boolean | `false` | Remove the token-bearing location before proxying an authenticated request, including when another mechanism wins a multi-auth chain (the `key_auth` contract). For `header:Authorization` only a `Bearer` value is removed, so another scheme's credential on a shared route is left alone. Defaults to `false` so backends that re-verify the JWT keep receiving it; enable it whenever the backend does not need the token, and especially with a `query:<name>` lookup, where the token otherwise reaches backend access logs inside the URL |
+
+**`;` sub-parameter aliases (`query:<name>` lookups).** `jwt_auth` applies the
+[`key_auth` contract](#key_auth): a request whose configured query name also
+appears as a `;`-separated sub-parameter (`?carrier=;token=...`, matched by raw
+spelling or any percent/form decoding, and including a name such as
+`token;x`) is ambiguous and is refused with `401`
+`{"error":"Ambiguous token query parameter"}` — the alias never authenticates,
+whichever spelling holds a valid token. When another mechanism authenticates
+the request instead, the alias is still marked for policy redaction and, with
+`hide_credentials: true`, the whole carrying `&` segment is removed from the
+forwarded query. A `;` inside a value is part of that value, not an alias.
 
 Registered claims are validated for shape as well as value. A present `iss` must be exactly one string (RFC 7519 §4.1.1): an array, object, number, boolean, or null `iss` is rejected with the generic `401` even when one array element matches a configured issuer, and even when no issuer is configured. `exp` is an RFC 7519 §2 NumericDate — a JSON number that may carry a fractional part — so a conforming fractional expiry bounds the authenticated stream exactly like an integer one; fractional `exp` seconds truncate toward the past, so the enforced expiry is never later than the one the token states. `nbf` presence and validation are delegated to the JWT validation layer, which decides them on its own terms; Ferrum does not normalize a fractional `nbf`.
 

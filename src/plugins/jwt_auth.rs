@@ -23,6 +23,12 @@
 //! Supports `"header:<name>"` and `"query:<name>"` extraction modes. With
 //! `hide_credentials: true` the token-bearing header (for `Authorization`, only
 //! a `Bearer` value) or query parameter is removed before backend forwarding.
+//!
+//! A `query:<name>` token that also appears as a `;`-separated sub-parameter
+//! (`?carrier=;token=...`) is ambiguous and refused (`401`), and the sub-pair
+//! is still marked for policy redaction and, with `hide_credentials`, for
+//! removal, so a chain won by another mechanism cannot forward it
+//! (GHSA-c259-vchc-3vgr, the `key_auth` issue #6579 contract).
 
 use std::collections::HashSet;
 
@@ -41,8 +47,10 @@ use crate::fips::backend::rand::{SecureRandom, SystemRandom};
 use super::utils::auth_flow::{self, AuthMechanism, ExtractedCredential, VerifyOutcome};
 use super::utils::header_extract::{ConfiguredHeaderLookup, lookup_configured_header};
 use super::utils::jwt_verifier::{audience_claim_is_acceptable, issuer_claim_is_single_string};
+use super::utils::query::query_has_semicolon_credential_alias;
 use super::utils::token_extract::{
-    STRIP_QUERY_PARAM_METADATA_PREFIX, bearer_credential_from_authorization_value,
+    AMBIGUOUS_QUERY_TOKEN_BODY, STRIP_QUERY_PARAM_METADATA_PREFIX,
+    bearer_credential_from_authorization_value,
 };
 use super::{RequestContext, strip_auth_scheme};
 
@@ -245,10 +253,21 @@ impl JwtAuth {
                     )
                 }
             }
-            TokenLookup::Query(param_name) => match ctx.query_params.get(param_name.as_str()) {
-                Some(token) => ExtractedCredential::BearerToken(token.clone()),
-                None => ExtractedCredential::Missing,
-            },
+            TokenLookup::Query(param_name) => {
+                // A `;`-aliased spelling is ambiguous between Ferrum's
+                // `&`-only parser and a `;`-splitting backend, so it is
+                // refused rather than skipped (issue #6579,
+                // GHSA-c259-vchc-3vgr).
+                if query_has_semicolon_credential_alias(ctx.raw_query_string(), param_name) {
+                    return ExtractedCredential::InvalidFormat(
+                        AMBIGUOUS_QUERY_TOKEN_BODY.to_string(),
+                    );
+                }
+                match ctx.query_params.get(param_name.as_str()) {
+                    Some(token) => ExtractedCredential::BearerToken(token.clone()),
+                    None => ExtractedCredential::Missing,
+                }
+            }
         }
     }
 }
@@ -412,9 +431,15 @@ auth_flow::impl_auth_plugin!(
     crate::plugins::HTTP_FAMILY_PROTOCOLS,
     auth_flow::run_auth;
 
+    /// Mark the configured query token — in the decoded map or behind a `;`
+    /// — for policy redaction and, with `hide_credentials`, for removal from
+    /// the forwarded query. Runs for every auth instance before the chain can
+    /// short-circuit, so a sub-pair spelling is hidden even when another
+    /// mechanism authenticates the request (the same contract as `key_auth`).
     fn mark_query_credentials_for_redaction(&self, ctx: &mut crate::plugins::RequestContext) {
         if let TokenLookup::Query(name) = &self.token_lookup
-            && ctx.query_params.contains_key(name)
+            && (ctx.query_params.contains_key(name)
+                || query_has_semicolon_credential_alias(ctx.raw_query_string(), name))
         {
             crate::plugins::utils::token_extract::mark_query_credential_metadata(ctx, name);
             if self.hide_credentials
@@ -475,7 +500,9 @@ auth_flow::impl_auth_plugin!(
                 }
             }
             TokenLookup::Query(name) => {
-                if ctx.query_params.remove(name.as_str()).is_some()
+                let sub_pair_alias =
+                    query_has_semicolon_credential_alias(ctx.raw_query_string(), name);
+                if (ctx.query_params.remove(name.as_str()).is_some() || sub_pair_alias)
                     && let Some(metadata_key) = &self.strip_query_metadata_key
                 {
                     ctx.metadata

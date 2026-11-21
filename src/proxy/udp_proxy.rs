@@ -494,6 +494,9 @@ struct UdpSession {
     /// Identified consumer username (gateway Consumer or external identity) resolved
     /// during `on_stream_connect`. Carried to `on_stream_disconnect` for logging.
     consumer_username: Option<String>,
+    /// Namespace of `consumer_username`, carried to the disconnect summary for
+    /// billing (GHSA-q9vj-rf66-3j58).
+    principal_origin: Option<crate::plugins::utils::principal::PrincipalOrigin>,
     /// Authentication mechanism that succeeded, carried to `on_stream_disconnect`.
     auth_method: Option<&'static str>,
     /// Plugin metadata from on_stream_connect, carried to on_stream_disconnect.
@@ -2812,6 +2815,7 @@ fn build_udp_stream_summary(context: UdpDisconnectContext<'_>) -> StreamTransact
         // peer), so connect and disconnect records agree.
         client_ip: context.session.datagram_client_ip.to_string(),
         consumer_username: context.session.consumer_username.clone(),
+        principal_origin: context.session.principal_origin,
         auth_method: context.session.auth_method,
         backend_target: context.session.backend_target.clone(),
         backend_resolved_ip: Some(context.session.backend_resolved_ip.clone()),
@@ -2896,6 +2900,7 @@ struct UdpSetupAttribution {
     /// on a session-owned disconnect summary.
     plugin_trigger_decisions: crate::plugins::StreamTriggerDecisions,
     consumer_username: Option<String>,
+    principal_origin: Option<crate::plugins::utils::principal::PrincipalOrigin>,
     auth_method: Option<&'static str>,
     sni_hostname: Option<String>,
     metadata: crate::plugins::MetadataMap,
@@ -2923,6 +2928,7 @@ impl UdpSetupProgress {
             proxy_lifecycle_generation: stream_ctx.proxy_lifecycle_generation,
             plugin_trigger_decisions: stream_ctx.plugin_trigger_decisions(),
             consumer_username: stream_ctx.effective_identity().map(str::to_owned),
+            principal_origin: stream_ctx.principal_origin(),
             auth_method: stream_ctx.auth_method,
             sni_hostname: stream_ctx.sni_hostname.clone(),
             metadata: stream_ctx.snapshot_summary_metadata(),
@@ -2995,6 +3001,7 @@ impl UdpSetupProgress {
                 proxy_name: attribution.proxy_name.clone(),
                 client_ip: context.client_ip.to_string(),
                 consumer_username: attribution.consumer_username.clone(),
+                principal_origin: attribution.principal_origin,
                 auth_method: attribution.auth_method,
                 backend_target: selected_backend_target
                     .unwrap_or_else(|| attribution.configured_backend_target.clone()),
@@ -3029,6 +3036,7 @@ impl UdpSetupProgress {
                 proxy_name: None,
                 client_ip: context.client_ip.to_string(),
                 consumer_username: None,
+                principal_origin: None,
                 auth_method: None,
                 backend_target: String::new(),
                 backend_resolved_ip: None,
@@ -3150,6 +3158,7 @@ struct DtlsDisconnectContext<'a> {
     /// the summary's `client_ip`, matching what `on_stream_connect` saw.
     resolved_client: SocketAddr,
     consumer_username: Option<String>,
+    principal_origin: Option<crate::plugins::utils::principal::PrincipalOrigin>,
     auth_method: Option<&'static str>,
     backend_target: &'a str,
     backend_resolved_ip: Option<&'a str>,
@@ -3191,6 +3200,7 @@ fn build_dtls_stream_summary(context: DtlsDisconnectContext<'_>) -> StreamTransa
         proxy_name: context.proxy_name.map(|name| name.to_string()),
         client_ip: crate::util::client_identity::canonical_ip_string(context.resolved_client.ip()),
         consumer_username: context.consumer_username,
+        principal_origin: context.principal_origin,
         auth_method: context.auth_method,
         backend_target: context.backend_target.to_string(),
         backend_resolved_ip: context.backend_resolved_ip.map(str::to_string),
@@ -6958,11 +6968,12 @@ async fn start_dtls_frontend_listener(
                         crate::overload::ConnectionGuard::new(&handler_overload);
 
                     let handler_has_plugins = !plugins.is_empty();
-                    let handler_consumer_username = if handler_has_plugins {
-                        stream_ctx.effective_identity().map(str::to_owned)
-                    } else {
-                        None
-                    };
+                    let (handler_consumer_username, handler_principal_origin) =
+                        if handler_has_plugins {
+                            stream_ctx.summary_identity()
+                        } else {
+                            (None, None)
+                        };
                     let handler_auth_method = stream_ctx.auth_method;
                     let handler_proxy_lifecycle_generation = stream_ctx.proxy_lifecycle_generation;
                     // Preserve the accepted connection's SNI across the session
@@ -7087,6 +7098,7 @@ async fn start_dtls_frontend_listener(
                             proxy_lifecycle_generation: handler_proxy_lifecycle_generation,
                             resolved_client: identity.resolved(),
                             consumer_username: handler_consumer_username.clone(),
+                            principal_origin: handler_principal_origin,
                             auth_method: handler_auth_method,
                             backend_target: &result.backend.backend_target,
                             backend_resolved_ip: result.backend.backend_resolved_ip.as_deref(),
@@ -9774,7 +9786,7 @@ async fn create_session(
 
     let now = coarse_epoch_millis();
     let connected_wall_at = chrono::Utc::now();
-    let consumer_username = stream_ctx.effective_identity().map(str::to_owned);
+    let (consumer_username, principal_origin) = stream_ctx.summary_identity();
     let auth_method = stream_ctx.auth_method;
     let datagram_client_ip = Arc::clone(&client_ip);
     let datagram_proxy_id: Arc<str> = Arc::from(proxy_id);
@@ -9808,6 +9820,7 @@ async fn create_session(
         backend_resolved_ip: resolved_ip.to_string(),
         sni_hostname: stream_ctx.sni_hostname.clone(),
         consumer_username,
+        principal_origin,
         auth_method,
         metadata: std::sync::Mutex::new(metadata),
         plugin_trigger_decisions: stream_ctx.plugin_trigger_decisions(),
@@ -12532,6 +12545,7 @@ impl UdpAuthorizationSessionProbe {
             backend_resolved_ip: backend_addr.ip().to_string(),
             sni_hostname: None,
             consumer_username: Some("probe-consumer".to_string()),
+            principal_origin: Some(crate::plugins::utils::principal::PrincipalOrigin::Consumer),
             auth_method: Some("key_auth"),
             metadata: std::sync::Mutex::new(crate::plugins::MetadataMap::default()),
             plugin_trigger_decisions: Default::default(),
@@ -12933,6 +12947,7 @@ impl UdpEgressWriterProbe {
             backend_resolved_ip: backend_addr.ip().to_string(),
             sni_hostname: None,
             consumer_username: None,
+            principal_origin: None,
             auth_method: None,
             metadata: std::sync::Mutex::new(crate::plugins::MetadataMap::default()),
             plugin_trigger_decisions: Default::default(),
@@ -13203,6 +13218,7 @@ mod tests {
             backend_resolved_ip: "10.0.0.50".to_string(),
             sni_hostname: None,
             consumer_username: None,
+            principal_origin: None,
             auth_method: None,
             metadata: std::sync::Mutex::new(crate::plugins::MetadataMap::from_iter([(
                 "request_id".to_string(),
@@ -13416,6 +13432,7 @@ backend_tls_verify_server_cert: false
             proxy_lifecycle_generation: None,
             resolved_client: client_addr,
             consumer_username: Some("alice".to_string()),
+            principal_origin: Some(crate::plugins::utils::principal::PrincipalOrigin::Consumer),
             auth_method: None,
             backend_target: "10.0.0.60:7443",
             backend_resolved_ip: Some("10.0.0.60"),
@@ -13483,6 +13500,7 @@ backend_tls_verify_server_cert: false
             proxy_lifecycle_generation: None,
             resolved_client: client_addr,
             consumer_username: Some("alice".to_string()),
+            principal_origin: Some(crate::plugins::utils::principal::PrincipalOrigin::Consumer),
             auth_method: Some("mtls_auth"),
             backend_target: "10.0.0.60:7443",
             backend_resolved_ip: Some("10.0.0.60"),
@@ -13708,6 +13726,7 @@ backend_tls_verify_server_cert: false
             proxy_lifecycle_generation: None,
             resolved_client: "127.0.0.1:54000".parse().unwrap(),
             consumer_username: None,
+            principal_origin: None,
             auth_method: None,
             backend_target: "10.0.0.60:7443",
             backend_resolved_ip: None,
@@ -13757,6 +13776,7 @@ backend_tls_verify_server_cert: false
             proxy_lifecycle_generation: None,
             resolved_client: "127.0.0.1:54000".parse().unwrap(),
             consumer_username: None,
+            principal_origin: None,
             auth_method: None,
             backend_target: "10.0.0.60:7443",
             backend_resolved_ip: Some("10.0.0.60"),
@@ -13806,6 +13826,7 @@ backend_tls_verify_server_cert: false
             proxy_lifecycle_generation: None,
             resolved_client: "127.0.0.1:54000".parse().unwrap(),
             consumer_username: None,
+            principal_origin: None,
             auth_method: None,
             backend_target: "10.0.0.60:7443",
             backend_resolved_ip: None,
@@ -14675,6 +14696,7 @@ backend_tls_verify_server_cert: false
             backend_resolved_ip: "10.0.0.50".to_string(),
             sni_hostname: None,
             consumer_username: None,
+            principal_origin: None,
             auth_method: None,
             metadata: std::sync::Mutex::new(crate::plugins::MetadataMap::default()),
             correlation_ids: Default::default(),

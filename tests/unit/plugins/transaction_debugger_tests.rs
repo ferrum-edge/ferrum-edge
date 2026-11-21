@@ -559,6 +559,7 @@ fn stream_summary() -> StreamTransactionSummary {
         proxy_name: Some("TCP Test".to_string()),
         client_ip: "127.0.0.1".to_string(),
         consumer_username: Some("alice".to_string()),
+        principal_origin: Some(ferrum_edge::plugins::utils::principal::PrincipalOrigin::Consumer),
         auth_method: Some("mtls_auth"),
         backend_target: "127.0.0.1:9000".to_string(),
         backend_resolved_ip: Some("127.0.0.1".to_string()),
@@ -604,6 +605,7 @@ fn websocket_summary() -> WsDisconnectContext {
         io_side: None,
         error_class: None,
         consumer_username: Some("alice".to_string()),
+        principal_origin: Some(ferrum_edge::plugins::utils::principal::PrincipalOrigin::Consumer),
         auth_method: Some("jwt_auth"),
         connection_id: 0,
         metadata: ferrum_edge::plugins::MetadataMap::from_iter([

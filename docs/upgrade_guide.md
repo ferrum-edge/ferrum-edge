@@ -28,6 +28,30 @@ applied by editing the file (see [File Mode](#file-mode-ferrum_modefile)).
 
 ## Upgrading to the next release (unreleased)
 
+### `;`-aliased query tokens are refused by `jwt_auth`, `jwks_auth`, and `oauth2_introspection` (GHSA-c259-vchc-3vgr)
+
+`jwt_auth` (`token_lookup: query:<name>`), `jwks_auth`, and
+`oauth2_introspection` (`providers[].from_params`) now apply the `key_auth`
+issue #6579 contract to query token locations. A request whose configured query
+name also appears as a `;`-separated sub-parameter (`?carrier=;token=...`, or a
+name such as `token;x`) is refused with `401`
+`{"error":"Ambiguous token query parameter"}` instead of being treated as
+carrying no token. For `jwks_auth` and `oauth2_introspection` an alias at any
+provider's query location is terminal for the whole instance, even when a
+valid token is also present in a header or `Authorization`. The alias is also
+marked for OPA and `request_mirror` redaction (including a raw spelling such as
+`workspace%2Dslot`, for a top-level occurrence as well as an alias), a copy of
+its value under another query name is withheld from `request_mirror`, a
+`request_transformer` `$(query.<name>)` template never copies a pair the
+credential strip removes, and it is removed from the forwarded query —
+including when another mechanism authenticates the request — under
+`jwt_auth` `hide_credentials: true` or a provider's
+`forward_original_token: false`.
+
+**Operator action:** none for ordinary clients. A client that sent a query
+token alongside a `;` sub-parameter of the same name must send the token as a
+normal `&`-separated parameter (or percent-encode a literal `;` as `%3B`).
+
 ### `access_control` external-identity rules can bind the verifying authority (GHSA-r378-r7j8-2qm3)
 
 `allowed_external_identities` and `disallowed_external_identities` entries accept
@@ -102,6 +126,42 @@ an east-west gateway, mesh-wide root-namespace wildcards (`*`,
 load-balancing and outlier settings now also shape cross-cluster traffic
 entering through the gateway. A rule meant only for in-cluster clients can be
 narrowed with `exportTo` so it is not visible to the gateway's namespace.
+
+### Chargeback rows for external principals are realm-qualified (GHSA-q9vj-rf66-3j58)
+
+`api_chargeback` (`/charges`) and `api_chargeback_sink` (`consumer_id`) now key
+billing rows on the authenticated principal rather than on the logged
+`consumer_username` display string. A mapped gateway Consumer's row is
+unchanged. An unmapped external principal (`jwks_auth`, `oidc_relying_party`,
+`oauth2_introspection`, `ldap_auth`, `soap_ws_security`, or an external stream
+identity) is now reported as `external:<mechanism>:<authority>:<identity>`, for
+example `external:jwks_auth:<64 hex>:alice`, where `<authority>` is the opaque
+verifying-authority digest (`-` when absent). Previously such a principal was
+billed under its bare identity, sharing a row with any Consumer or other
+provider that used the same string. A Consumer whose username begins with
+`external:` is now always reported in its `~sha256:` digest form.
+
+**Treat the upgrade as a billing boundary.** Rows recorded before it — ClickHouse
+rows, Prometheus series, and charge events still pending in the sink spool,
+which replay with their original bytes after the upgrade — are keyed on the bare
+display identity and are not realm-qualified. A pre-upgrade bare value can even
+coincide with a post-upgrade key: a Consumer whose username was literally
+`external:jwks_auth:<64 hex>:alice` billed under that string before the upgrade,
+while after it the same string identifies the external principal and the
+Consumer moves to its digest form. Because the shipped ClickHouse rollups group
+by `consumer_id` without the realm, keep the two eras separately attributable
+for the first realm-qualified rollout — for example ship it with a new
+`pricing_version` (part of every rollup key) or write it to a new table — and
+let pending spool rows drain before reconciling across the boundary.
+
+**Operator action:** update invoicing and reconciliation that maps `/charges`
+consumer keys or ClickHouse `consumer_id` values for external principals to
+customers: match the `external:` key (or its identity suffix together with the
+mechanism and authority) instead of the bare identity. External rows are
+qualified by the realm authority the mechanism commits; `soap_ws_security`
+currently commits none, so its principals are qualified by mechanism only
+(`external:soap_ws_security:-:<identity>`). Transaction log output
+(`consumer_username`) is unchanged.
 
 ### Sidecar VirtualService HTTP routes (#7423)
 

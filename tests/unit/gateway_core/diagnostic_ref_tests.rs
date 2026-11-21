@@ -109,6 +109,7 @@ fn summary(status: u16, class: Option<ErrorClass>) -> TransactionSummary {
         timestamp_received: "2026-09-27T00:00:00Z".to_string(),
         client_ip: "203.0.113.7".to_string(),
         consumer_username: Some("alice".to_string()),
+        principal_origin: Some(ferrum_edge::plugins::utils::principal::PrincipalOrigin::Consumer),
         auth_method: None,
         http_method: "POST".to_string(),
         request_path: "/orders/secret-path?token=abc".to_string(),

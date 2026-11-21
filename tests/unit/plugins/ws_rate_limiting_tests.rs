@@ -1352,6 +1352,7 @@ fn ws_disconnect_ctx(connection_id: u64) -> WsDisconnectContext {
         io_side: None,
         error_class: None,
         consumer_username: None,
+        principal_origin: None,
         auth_method: None,
         connection_id,
         metadata: ferrum_edge::plugins::MetadataMap::default(),

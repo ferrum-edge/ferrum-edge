@@ -666,6 +666,7 @@ async fn test_log_and_stream_hooks_enqueue_without_panic() {
         proxy_name: None,
         client_ip: "10.0.0.1".to_string(),
         consumer_username: None,
+        principal_origin: None,
         auth_method: None,
         backend_target: "10.0.0.2:443".to_string(),
         backend_resolved_ip: None,
@@ -898,6 +899,7 @@ async fn test_persists_http_and_stream_rows_against_sqlite() {
                     client_ip.to_string()
                 },
                 consumer_username: None,
+                principal_origin: None,
                 auth_method: None,
                 backend_target: "192.0.2.20:5432".to_string(),
                 backend_resolved_ip: None,
