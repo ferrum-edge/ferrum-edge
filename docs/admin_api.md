@@ -1711,9 +1711,16 @@ curl -X PUT -H "Authorization: Bearer $TOKEN" -H "If-Match: $ETAG" \
   precondition described below. Opt-in deployment removal and spec replacement
   use the separate [deployment authority profile](deployment_mutations.md).
   `If-Match` on any other mutating route (including
-  `POST` creates, `/batch`, and `/gateway-trust-bundles/{id}`, which keeps its
-  own body `revision` contract) is `400` rather than applied unconditionally.
-  A request that would be `404` without the header is still `404`.
+  `POST` creates, `POST /api-specs`, `DELETE /api-specs/{id}` even with the
+  `ETag` from `GET /api-specs/{id}`, `/batch`, and `/gateway-trust-bundles/{id}`,
+  which keeps its own body `revision` contract) is `400` rather than applied
+  unconditionally.
+  When a well-formed row precondition is evaluated and the target resource
+  (the Consumer, for the credential sub-routes, whose index is checked after
+  the tag) does not exist, the response is still `404`. A route that does not evaluate the
+  header (including all three `/api-specs` mutations, whose `PUT` accepts only
+  the deployment profile) refuses it before any lookup, so a missing ID is
+  `400` there, and the refusal also precedes the read-only `403`.
 - **Namespace restore precondition.** `GET /backup?conditional=true` returns
   an `ETag` equal to `conditional.namespace_etag` for the complete coherent
   namespace state. Send that tag as `If-Match` to `POST /restore?confirm=true`
@@ -1921,7 +1928,7 @@ A custom plugin (a plugin name with no built-in schema entry) cannot be classifi
 
 `GET /backup` remains `admin`-only and intentionally exports raw configuration: backups must stay restorable.
 
-For Redis-backed plugins (`rate_limiting`, `ai_rate_limiter`, `ws_rate_limiting`, `udp_rate_limiting`, `request_deduplication`, `graphql`, `grpc_method_router`, `ai_semantic_cache`) the same projection covers two more secrets. `redis_integrity_key` — the HMAC-SHA256 secret that authenticates `ai_semantic_cache` Redis envelopes — is replaced wholesale by `[REDACTED]`, as is any other key whose normalized (delimiter-stripped lowercase) name contains `integritykey` (so `redis_integrity_key`, `redisIntegrityKey`, and `redisintegritykey` match); disclosure would let a reader forge an envelope the gateway replays as a cache hit. `redis_url` (including delimiter-stripped forms such as `redisUrl`, `redis-url`, and `redisurl`) is *not* wholesale-redacted, because its scheme, host, port, and database number are the diagnostics an operator needs: userinfo is replaced and stripped query/fragment components get `[REDACTED_QUERY]` and `[REDACTED_FRAGMENT]` markers. For example, `redis://user:pass@cache.internal:6379/3?token=secret#private` projects as `redis://redacted@cache.internal:6379/3?[REDACTED_QUERY]#[REDACTED_FRAGMENT]`, while a query-free URL with userinfo projects as `redis://redacted@cache.internal:6379/3`. A `redis_url` value that cannot be parsed as a URL, or that uses any scheme other than `redis`/`rediss`, fails closed to `[REDACTED]`. The separate `redis_password` field is already covered by the existing password matcher; `redis_username` is not secret material and stays visible. Because full `admin` reads stay raw, rotating either secret by read-modify-write still works.
+For Redis-backed plugins (`rate_limiting`, `ai_rate_limiter`, `ws_rate_limiting`, `udp_rate_limiting`, `request_deduplication`, `graphql`, `grpc_method_router`, `ai_semantic_cache`, and the shared replay caches of `jwks_auth`, `hmac_auth`, and `soap_ws_security`) the same projection covers two more secrets. `redis_integrity_key` — the HMAC-SHA256 secret that authenticates `ai_semantic_cache` Redis envelopes — is replaced wholesale by `[REDACTED]`, as is any other key whose normalized (delimiter-stripped lowercase) name contains `integritykey` (so `redis_integrity_key`, `redisIntegrityKey`, and `redisintegritykey` match); disclosure would let a reader forge an envelope the gateway replays as a cache hit. `redis_url` (including delimiter-stripped forms such as `redisUrl`, `redis-url`, and `redisurl`) is *not* wholesale-redacted, because its scheme, host, port, and database number are the diagnostics an operator needs: userinfo is replaced and stripped query/fragment components get `[REDACTED_QUERY]` and `[REDACTED_FRAGMENT]` markers. For example, `redis://user:pass@cache.internal:6379/3?token=secret#private` projects as `redis://redacted@cache.internal:6379/3?[REDACTED_QUERY]#[REDACTED_FRAGMENT]`, while a query-free URL with userinfo projects as `redis://redacted@cache.internal:6379/3`. A `redis_url` value that cannot be parsed as a URL, or that uses any scheme other than `redis`/`rediss`, fails closed to `[REDACTED]`. The separate `redis_password` field is already covered by the existing password matcher; `redis_username` is not secret material and stays visible. Because full `admin` reads stay raw, rotating either secret by read-modify-write still works.
 
 ## Upstreams
 

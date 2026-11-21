@@ -943,3 +943,49 @@ fn export_fingerprints_request_mirror_path() {
     assert_eq!(mirror["mirror_protocol"], "https");
     assert!(!export.to_string().contains("mirror-path-must-not-leak"));
 }
+
+/// `/config/export` fingerprints `redis_url` on `jwks_auth`, `hmac_auth` and
+/// `soap_ws_security` exactly as it does on `rate_limiting` (issue #7438).
+#[test]
+fn export_fingerprints_redis_url_on_every_redis_backed_builtin() {
+    let redis_url = format!("redis://:{REDIS_PASSWORD}@cache.internal:6379/2");
+    let plugins = [
+        "rate_limiting",
+        "jwks_auth",
+        "hmac_auth",
+        "soap_ws_security",
+    ];
+    let plugin_configs: Vec<Value> = plugins
+        .iter()
+        .map(|name| {
+            json!({
+                "id": format!("{name}-redis"),
+                "plugin_name": name,
+                "scope": "global",
+                "enabled": false,
+                "config": {"redis_url": redis_url, "sync_mode": "redis"},
+                "created_at": STAMP,
+                "updated_at": STAMP
+            })
+        })
+        .collect();
+    let config: GatewayConfig = serde_json::from_value(json!({
+        "version": "1",
+        "proxies": [],
+        "plugin_configs": plugin_configs,
+    }))
+    .expect("fixture deserializes");
+    let export = export(config, ADMIN_SECRET);
+    assert!(
+        !export.to_string().contains(REDIS_PASSWORD),
+        "export disclosed the Redis password"
+    );
+    for name in plugins {
+        let exported = &plugin(&export, &format!("{name}-redis"))["config"];
+        assert!(
+            is_fingerprint(&exported["redis_url"]),
+            "{name}.redis_url must be fingerprinted like rate_limiting: {exported}"
+        );
+        assert_eq!(exported["sync_mode"], "redis");
+    }
+}
