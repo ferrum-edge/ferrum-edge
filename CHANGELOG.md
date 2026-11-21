@@ -278,7 +278,8 @@ gateways, control planes, custom plugins, charts or contract consumers.
 - Fixed GHSA-q9vj-rf66-3j58: `api_chargeback` (`/charges`) and
   `api_chargeback_sink` key billing rows on the authenticated principal. An
   unmapped external principal is reported as
-  `external:<mechanism>:<authority>:<identity>` (`-` for a missing authority;
+  `external:<mechanism>:<authority>:<identity>` (`-` for a missing mechanism or
+  authority, as in `external:-:-:alice` for an external stream identity;
   an oversized or marker-bearing key is given its `~sha256:` digest form), so
   external principals no longer share a row with a Consumer that uses the same
   string and are distinguished by mechanism and authority (#7466).
@@ -1142,9 +1143,10 @@ gateways, control planes, custom plugins, charts or contract consumers.
   - Records already in the store are not touched, but one that holds no usable
     key now fails closed once a consumer references it.
 - **BREAKING — ConfigSync protocol revision 5** (issue #7233). `MeshConfig` gained
-  `virtual_service_http_routes` and `MeshSlice` gained `http_routes`, so the
-  ConfigSync build identity moves to `configsync.r5`; a CP and DP from
-  different builds refuse each other at `Subscribe`.
+  `virtual_service_http_routes` and `MeshSlice` gained `http_routes`, which
+  moved the ConfigSync build identity to `configsync.r5`; 0.9.21 ships
+  revision 6 (`configsync.r6`, issue #7417). A CP and DP from different builds
+  refuse each other at `Subscribe`.
 - **BREAKING:** (issue #7417) `ai_prompt_shield` in `content` / `all` scan modes refuses
   (reject/redact, 400 `ambiguous_json`) or records (warn) request bodies with
   duplicate JSON member names. (#7417)

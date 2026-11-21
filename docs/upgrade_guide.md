@@ -151,11 +151,13 @@ narrowed with `exportTo` so it is not visible to the gateway's namespace.
 `api_chargeback` (`/charges`) and `api_chargeback_sink` (`consumer_id`) now key
 billing rows on the authenticated principal rather than on the logged
 `consumer_username` display string. A mapped gateway Consumer's row is
-unchanged. An unmapped external principal (`jwks_auth`, `oidc_relying_party`,
+unchanged, except for a username that begins with `external:` (see below). An unmapped external principal (`jwks_auth`, `oidc_relying_party`,
 `oauth2_introspection`, `ldap_auth`, `soap_ws_security`, or an external stream
 identity) is now reported as `external:<mechanism>:<authority>:<identity>`, for
 example `external:jwks_auth:<64 hex>:alice`, where `<authority>` is the opaque
-verifying-authority digest (`-` when absent); like a Consumer username, an
+verifying-authority digest. A missing mechanism or authority is written as
+`-`; a principal with no realm, such as an external stream identity, has `-` in
+both positions (`external:-:-:alice`). Like a Consumer username, an
 oversized or marker-bearing key is reported in its `~sha256:` digest form.
 Previously such a principal was
 billed under its bare identity, sharing a row with any Consumer or other
@@ -888,8 +890,9 @@ upgrading:
 - no `selector`, or one with no labels: `scope: {kind: namespace, namespace: <policy namespace>}`;
 - a labelled `selector`: `scope: {kind: workload_selector, selector: {labels: ..., namespace: <policy namespace>}}`.
 
-Policies translated from Istio `PeerAuthentication` objects need no change. The
-ConfigSync protocol revision is 5 (revision 4 introduced this shape), so a CP
+Policies translated from Istio `PeerAuthentication` objects need no change.
+Revision 4 of the ConfigSync protocol introduced this shape, and 0.9.21 ships
+revision 6 (see [ConfigSync revision 6](#configsync-revision-6-7417)), so a CP
 and DP from different builds refuse each other at `Subscribe` and never
 exchange the earlier form.
 
