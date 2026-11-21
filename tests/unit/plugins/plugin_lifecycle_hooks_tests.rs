@@ -36,15 +36,24 @@ const GATED_HOOKS: &[(&str, &str)] = &[
     ("after_proxy", "AFTER_PROXY"),
     ("log", "LOG"),
     ("log_with_mesh_key", "LOG"),
+    (
+        "on_response_stream_terminated",
+        "ON_RESPONSE_STREAM_TERMINATED",
+    ),
 ];
 
-const ALL_FLAGS: &[&str] = &["ON_REQUEST_RECEIVED", "BEFORE_PROXY", "AFTER_PROXY", "LOG"];
+const ALL_FLAGS: &[&str] = &[
+    "ON_REQUEST_RECEIVED",
+    "BEFORE_PROXY",
+    "AFTER_PROXY",
+    "LOG",
+    "ON_RESPONSE_STREAM_TERMINATED",
+];
 
-/// Registered built-ins whose implementation overrides all four hooks, so a
+/// Registered built-ins whose implementation overrides every gated hook, so a
 /// runtime `PluginHooks::ALL` is their exact declaration rather than a
 /// missing one.
-const BUILTINS_IMPLEMENTING_EVERY_GATED_HOOK: &[&str] =
-    &["otel_tracing", "transaction_debugger", "workload_metrics"];
+const BUILTINS_IMPLEMENTING_EVERY_GATED_HOOK: &[&str] = &[];
 
 struct PluginImplBlock {
     label: String,
@@ -371,6 +380,7 @@ fn a_plugin_without_a_declaration_keeps_every_hook() {
         PluginHooks::BEFORE_PROXY,
         PluginHooks::AFTER_PROXY,
         PluginHooks::LOG,
+        PluginHooks::ON_RESPONSE_STREAM_TERMINATED,
     ] {
         assert!(PluginHooks::ALL.contains(flag));
         assert!(!PluginHooks::NONE.contains(flag));

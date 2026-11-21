@@ -172,7 +172,10 @@ pub async fn run_response_stream_termination_hooks(
     crate::plugins::wait_for_response_stream_inspector(ctx).await;
     for deferred in [false, true] {
         for plugin in plugins.iter().filter(|plugin| {
-            plugin.defers_response_stream_termination_until_after_peers() == deferred
+            plugin
+                .lifecycle_hooks()
+                .contains(crate::plugins::PluginHooks::ON_RESPONSE_STREAM_TERMINATED)
+                && plugin.defers_response_stream_termination_until_after_peers() == deferred
         }) {
             plugin
                 .on_response_stream_terminated(ctx, response_status, outcome)
@@ -188,7 +191,7 @@ pub async fn run_response_stream_termination_hooks(
 /// Single-fire: the first call to [`fire`](Self::fire) wins; subsequent
 /// calls (e.g. a Drop safety net running after an explicit fire) are no-ops.
 pub struct DeferredTransactionLogger {
-    state: Mutex<Option<Captured>>,
+    state: Captured,
     fired: AtomicBool,
     /// Set when the response this logger was attached to never reached the
     /// transport (a response-builder failure replaced it), so the terminal
@@ -200,15 +203,15 @@ pub struct DeferredTransactionLogger {
     delivery: Option<crate::observability_delivery::OwnedDeliveryLifecycle>,
 }
 
-/// What the logger captured at header commit. Held inside a [`Mutex`] so
-/// [`fire`](DeferredTransactionLogger::fire) can `take()` it. After the first
-/// fire the slot is `None`, but the `fired` CAS already prevents a second fire
-/// so the `None` state is only visible to no-op callers.
+/// What the logger captured at header commit. The full variant sits behind a
+/// [`Mutex`] so [`fire`](DeferredTransactionLogger::fire) can move the owned
+/// summary and context into the spawned delivery task; the compact variant is
+/// lock-free and guarded solely by the single-fire [`AtomicBool`] CAS.
 enum Captured {
     /// A full summary, the plugin chain, and a context clone: everything a
     /// plugin `log` / termination hook / mirror can ask for. Boxed so the
     /// compact variant's allocation is not sized for it.
-    Full(Box<LogState>),
+    Full(Mutex<Option<Box<LogState>>>),
     /// Runtime-metrics accounting alone, for a response no plugin observes.
     Compact(CompactTerminal),
 }
@@ -353,7 +356,7 @@ impl DeferredTransactionLogger {
     ) -> Arc<Self> {
         let request_protocol_is_grpc = request_protocol_is_grpc(&summary.metadata, &ctx);
         Arc::new(Self {
-            state: Mutex::new(Some(Captured::Full(Box::new(LogState {
+            state: Captured::Full(Mutex::new(Some(Box::new(LogState {
                 summary,
                 plugins,
                 ctx,
@@ -369,29 +372,31 @@ impl DeferredTransactionLogger {
     }
 
     /// Build a logger that records only the runtime-metrics terminal
-    /// accounting, for a streaming response with **no plugin** on the proxy.
+    /// accounting, for a streaming response with **no terminal consumer**
+    /// (no plugin declaring `LOG` / `ON_RESPONSE_STREAM_TERMINATED` / stream
+    /// hooks, no mirror, and no diagnostic detail capture).
     ///
-    /// Without a plugin there is no `log`, no response-stream termination
+    /// Without a consumer there is no `log`, no response-stream termination
     /// hook, no inspector, and no mirror to serve, so the full path's
-    /// `TransactionSummary`, `RequestContext` clone, and spawned delivery task
+    /// `TransactionSummary`, `RequestContext` move, and spawned delivery task
     /// would exist only to reach
     /// [`RuntimeMetrics::record_transaction`](crate::runtime_metrics::RuntimeMetrics::record_transaction).
     /// This captures exactly the fields that call reads and records them
     /// synchronously at the terminal — the recording is a handful of atomic
-    /// increments, so it needs no task — through the same single-fire latch
-    /// and Drop safety net, so client disconnects and body errors are counted
-    /// exactly once, exactly as the full path counts them.
+    /// increments, so it needs no task and no mutex — through the same
+    /// single-fire latch and Drop safety net, so client disconnects and body
+    /// errors are counted exactly once, exactly as the full path counts them.
     ///
     /// `grpc` is the request's protocol classification at header commit
     /// (see [`crate::runtime_metrics::terminal_metadata_is_grpc`]);
     /// `error_class` is the response's class as the summary would carry it.
     pub fn compact(proxy_id: String, grpc: bool, error_class: Option<ErrorClass>) -> Arc<Self> {
         Arc::new(Self {
-            state: Mutex::new(Some(Captured::Compact(CompactTerminal {
+            state: Captured::Compact(CompactTerminal {
                 proxy_id,
                 grpc,
                 error_class,
-            }))),
+            }),
             fired: AtomicBool::new(false),
             response_not_handed_off: AtomicBool::new(false),
             #[cfg(test)]
@@ -428,7 +433,7 @@ impl DeferredTransactionLogger {
         request_protocol_is_grpc: bool,
     ) -> Arc<Self> {
         Arc::new(Self {
-            state: Mutex::new(Some(Captured::Full(Box::new(LogState {
+            state: Captured::Full(Mutex::new(Some(Box::new(LogState {
                 summary,
                 plugins,
                 ctx,
@@ -452,14 +457,14 @@ impl DeferredTransactionLogger {
         self: Arc<Self>,
         latch: Option<Arc<DirectH2BytesLatch>>,
     ) -> Arc<Self> {
-        if let Some(latch) = latch {
-            let mut guard = match self.state.lock() {
+        if let Some(latch) = latch
+            && let Captured::Full(mutex) = &self.state
+        {
+            let mut guard = match mutex.lock() {
                 Ok(guard) => guard,
                 Err(poisoned) => poisoned.into_inner(),
             };
-            // A compact terminal records no byte counts, so it has nothing to
-            // wait for.
-            if let Some(Captured::Full(state)) = guard.as_mut() {
+            if let Some(state) = guard.as_deref_mut() {
                 state.request_bytes_latch = Some(latch);
             }
         }
@@ -513,20 +518,24 @@ impl DeferredTransactionLogger {
     }
 
     fn fire_once(&self, outcome: BodyOutcome, response_status_override: Option<u16>) {
-        let state = match self.state.lock() {
-            Ok(mut guard) => guard.take(),
-            // A poisoned mutex means another thread panicked while holding
-            // the guard. The state is still valid data, so recover it and
-            // proceed — losing a log entry is worse than propagating poison.
-            Err(poisoned) => poisoned.into_inner().take(),
-        };
-        let state = match state {
-            Some(Captured::Full(state)) => *state,
-            Some(Captured::Compact(terminal)) => {
+        let state = match &self.state {
+            Captured::Compact(terminal) => {
                 terminal.record(&outcome);
                 return;
             }
-            None => return,
+            Captured::Full(mutex) => {
+                let taken = match mutex.lock() {
+                    Ok(mut guard) => guard.take(),
+                    // A poisoned mutex means another thread panicked while holding
+                    // the guard. The state is still valid data, so recover it and
+                    // proceed — losing a log entry is worse than propagating poison.
+                    Err(poisoned) => poisoned.into_inner().take(),
+                };
+                match taken {
+                    Some(state) => *state,
+                    None => return,
+                }
+            }
         };
         let LogState {
             mut summary,
@@ -692,7 +701,7 @@ impl DeferredTransactionLogger {
     ) -> Arc<Self> {
         let request_protocol_is_grpc = request_protocol_is_grpc(&summary.metadata, &ctx);
         Arc::new(Self {
-            state: Mutex::new(Some(Captured::Full(Box::new(LogState {
+            state: Captured::Full(Mutex::new(Some(Box::new(LogState {
                 summary,
                 plugins,
                 ctx,

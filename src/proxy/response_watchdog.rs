@@ -165,19 +165,19 @@
 //! target reaches it.
 
 use std::pin::Pin;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::{Arc, Mutex, Weak};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
 use bytes::Bytes;
 use http_body::Frame;
 use http_body_util::BodyExt;
-use tokio::sync::mpsc;
+use tokio::sync::{Notify, mpsc};
 
 use crate::proxy::auth_lifetime::{
-    AuthorizationConnectionCloser, StreamAuthDeadline, StreamAuthProtocolFamily,
-    StreamAuthTermination, StreamAuthTerminationLatch,
+    AuthorizationConnectionCloser, AuthorizationConnectionCloserInner, StreamAuthDeadline,
+    StreamAuthProtocolFamily, StreamAuthTermination, StreamAuthTerminationLatch,
 };
 use crate::proxy::body::ProxyBodyError;
 
@@ -398,8 +398,18 @@ impl Drop for AbortPumpOnDrop {
 /// the one event that proves settlement — hyper dropping the response body —
 /// while the pump's streaming phase still ends promptly on its own when its
 /// receiver goes away (`Sender::closed`).
+/// What a [`ResponsePumpGuard`] owns: either a per-stream frame-relaying pump
+/// task, or a registration in the connection's shared settled-body watchdog
+/// hub (which reuses at most one idle timer task across every settled response
+/// on that TCP/TLS connection). Held solely for its `Drop` semantics.
+#[allow(dead_code)]
+enum ResponsePumpOwnership {
+    Task(AbortPumpOnDrop),
+    Settled(SettledWatchdogGuard),
+}
+
 pub(crate) struct ResponsePumpGuard {
-    _pump: AbortPumpOnDrop,
+    _ownership: ResponsePumpOwnership,
     /// `true` for a frame-relaying pump; `false` for the close-only watchdog
     /// of a response settled from memory ([`rpc_deadline_settled_watchdog`]).
     relays_frames: bool,
@@ -424,6 +434,275 @@ impl ResponsePumpGuard {
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+enum SettledEntryPhase {
+    WaitingDeadline,
+    WaitingCloseGrace(tokio::time::Instant),
+    Done,
+}
+
+struct SettledWatchdogEntry {
+    id: u64,
+    deadline_at: tokio::time::Instant,
+    owner: AuthorizationTerminalOwner,
+    fired: Arc<AtomicBool>,
+    accounting: Option<AuthorizationAccounting>,
+    phase: SettledEntryPhase,
+}
+
+struct SettledWatchdogState {
+    entries: Vec<SettledWatchdogEntry>,
+    next_id: u64,
+    armed_wake_at: Option<tokio::time::Instant>,
+    task_running: bool,
+    closed: bool,
+}
+
+/// Per-connection reusable timer hub for settled responses whose upstream
+/// already reached its terminal before the response body was built.
+///
+/// Spawns at most one background task per client connection and keeps its
+/// armed sleep undisturbed whenever a new response's deadline is at or after
+/// the currently armed wake time — so keep-alive connections serving thousands
+/// of authenticated or deadline-bearing request/response exchanges pay zero
+/// per-request `tokio::spawn`, zero `mpsc::channel`, and zero timer-wheel
+/// churn while preserving identical deadline expiry, latch accounting, and
+/// `TRANSPORT_CLOSE_GRACE` connection closure for stalled clients.
+pub(crate) struct SettledWatchdogHub {
+    state: Mutex<SettledWatchdogState>,
+    notify: Arc<Notify>,
+}
+
+impl std::fmt::Debug for SettledWatchdogHub {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SettledWatchdogHub").finish_non_exhaustive()
+    }
+}
+
+impl SettledWatchdogHub {
+    pub(crate) fn new() -> Self {
+        Self {
+            state: Mutex::new(SettledWatchdogState {
+                entries: Vec::new(),
+                next_id: 1,
+                armed_wake_at: None,
+                task_running: false,
+                closed: false,
+            }),
+            notify: Arc::new(Notify::new()),
+        }
+    }
+
+    pub(crate) fn shutdown(&self) {
+        let mut guard = match self.state.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        guard.closed = true;
+        guard.entries.clear();
+        drop(guard);
+        self.notify.notify_one();
+    }
+
+    fn register(
+        closer: &AuthorizationConnectionCloser,
+        owner: AuthorizationTerminalOwner,
+        fired: Arc<AtomicBool>,
+        accounting: Option<AuthorizationAccounting>,
+    ) -> SettledWatchdogGuard {
+        let deadline_at = owner.0.deadline_at;
+        let inner = closer.inner();
+        let hub = inner.settled_watchdog_hub();
+        let (id, should_spawn, should_notify) = {
+            let mut guard = match hub.state.lock() {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            let id = guard.next_id;
+            guard.next_id = guard.next_id.wrapping_add(1).max(1);
+            guard.entries.push(SettledWatchdogEntry {
+                id,
+                deadline_at,
+                owner,
+                fired,
+                accounting,
+                phase: SettledEntryPhase::WaitingDeadline,
+            });
+            if !guard.task_running && !guard.closed {
+                guard.task_running = true;
+                guard.armed_wake_at = Some(deadline_at);
+                (id, true, false)
+            } else if guard.armed_wake_at.is_none_or(|armed| deadline_at < armed) {
+                guard.armed_wake_at = Some(deadline_at);
+                (id, false, true)
+            } else {
+                (id, false, false)
+            }
+        };
+        if should_spawn {
+            if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                let weak = Arc::downgrade(inner);
+                let notify = Arc::clone(&hub.notify);
+                handle.spawn(run_settled_watchdog_hub(weak, notify));
+            } else {
+                let mut guard = match hub.state.lock() {
+                    Ok(guard) => guard,
+                    Err(poisoned) => poisoned.into_inner(),
+                };
+                guard.task_running = false;
+                guard.armed_wake_at = None;
+            }
+        } else if should_notify {
+            hub.notify.notify_one();
+        }
+        SettledWatchdogGuard {
+            closer: Arc::clone(inner),
+            id,
+        }
+    }
+}
+
+/// Deregisters one settled response from its connection's [`SettledWatchdogHub`]
+/// when the client-facing `ProxyBody` drops.
+pub(crate) struct SettledWatchdogGuard {
+    closer: Arc<AuthorizationConnectionCloserInner>,
+    id: u64,
+}
+
+impl Drop for SettledWatchdogGuard {
+    fn drop(&mut self) {
+        let hub = self.closer.settled_watchdog_hub();
+        let mut guard = match hub.state.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if let Some(pos) = guard.entries.iter().position(|e| e.id == self.id) {
+            guard.entries.swap_remove(pos);
+        }
+    }
+}
+
+async fn run_settled_watchdog_hub(
+    weak: Weak<AuthorizationConnectionCloserInner>,
+    notify: Arc<Notify>,
+) {
+    loop {
+        // Register the notification waiter BEFORE inspecting state under the
+        // mutex so no concurrent `register` or `shutdown` wakeup can be missed.
+        let notified = notify.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+
+        let next_sleep_at = {
+            let Some(inner) = weak.upgrade() else {
+                return;
+            };
+            let hub = inner.settled_watchdog_hub();
+            let mut guard = match hub.state.lock() {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            if guard.closed {
+                guard.task_running = false;
+                guard.armed_wake_at = None;
+                return;
+            }
+            let now = tokio::time::Instant::now();
+            let mut earliest: Option<tokio::time::Instant> = None;
+            let mut should_close = false;
+            for entry in &mut guard.entries {
+                match entry.phase {
+                    SettledEntryPhase::WaitingDeadline => {
+                        if now >= entry.deadline_at {
+                            if entry.owner.claim_authorization_expiry()
+                                == AuthorizationTerminalOwnership::AuthorizationExpiry
+                            {
+                                entry.fired.store(true, Ordering::Release);
+                                if let Some(accounting) = entry.accounting.as_ref() {
+                                    accounting.record();
+                                }
+                                let close_at = now + TRANSPORT_CLOSE_GRACE;
+                                entry.phase = SettledEntryPhase::WaitingCloseGrace(close_at);
+                                earliest = Some(earliest.map_or(close_at, |e| e.min(close_at)));
+                            } else {
+                                // The response claimed its own completion first: it keeps
+                                // its terminal and its connection, however late the client
+                                // drains it.
+                                entry.phase = SettledEntryPhase::Done;
+                            }
+                        } else {
+                            earliest = Some(
+                                earliest.map_or(entry.deadline_at, |e| e.min(entry.deadline_at)),
+                            );
+                        }
+                    }
+                    SettledEntryPhase::WaitingCloseGrace(close_at) => {
+                        if now >= close_at {
+                            should_close = true;
+                            entry.phase = SettledEntryPhase::Done;
+                        } else {
+                            earliest = Some(earliest.map_or(close_at, |e| e.min(close_at)));
+                        }
+                    }
+                    SettledEntryPhase::Done => {}
+                }
+            }
+            guard
+                .entries
+                .retain(|entry| !matches!(entry.phase, SettledEntryPhase::Done));
+            if should_close {
+                inner.request_close();
+            }
+            match earliest {
+                Some(at) => {
+                    guard.armed_wake_at = Some(at);
+                    at
+                }
+                None => {
+                    guard.armed_wake_at = None;
+                    guard.task_running = false;
+                    return;
+                }
+            }
+        };
+
+        // `inner` is dropped BEFORE awaiting so the task holds only `Weak`
+        // while parked; closing the TCP connection triggers `Drop` on
+        // `AuthorizationConnectionCloserInner`, which calls `hub.shutdown()`
+        // and wakes `notified` immediately.
+        tokio::select! {
+            biased;
+            () = &mut notified => continue,
+            () = tokio::time::sleep_until(next_sleep_at) => continue,
+        }
+    }
+}
+
+/// Register a settled authenticated response whose upstream already reached its
+/// terminal before the response body was built. Keeps the pump's expiry,
+/// authorization-latch accounting, and `TRANSPORT_CLOSE_GRACE` connection close
+/// on the connection's reusable watchdog hub without spawning a per-request
+/// task or channel.
+pub(crate) fn auth_deadline_settled_watchdog(
+    owner: AuthorizationTerminalOwner,
+    deadline: StreamAuthDeadline,
+    family: StreamAuthProtocolFamily,
+    latch: StreamAuthTerminationLatch,
+    fired: Arc<AtomicBool>,
+    closer: &AuthorizationConnectionCloser,
+) -> SettledWatchdogGuard {
+    SettledWatchdogHub::register(
+        closer,
+        owner,
+        fired,
+        Some(AuthorizationAccounting {
+            termination: deadline.termination,
+            family,
+            latch,
+        }),
+    )
+}
+
 /// The close-only watchdog for a client-RPC-deadline response whose upstream
 /// reached its terminal before the response was built, so its frames are
 /// served from memory instead of through the pump (issue #6904).
@@ -436,29 +715,15 @@ impl ResponsePumpGuard {
 /// the pump's outcome for a client that stops reading, so request, per-IP,
 /// admission and load-balancer accounting cannot outlive the deadline at the
 /// client's discretion. Held by the client-facing body like the pump's guard:
-/// hyper dropping that body aborts it.
+/// hyper dropping that body deregisters it.
 pub(crate) fn rpc_deadline_settled_watchdog(
     owner: AuthorizationTerminalOwner,
     fired: Arc<AtomicBool>,
     closer: AuthorizationConnectionCloser,
 ) -> ResponsePumpGuard {
-    let deadline_at = owner.0.deadline_at;
-    let handle = tokio::spawn(async move {
-        tokio::time::sleep_until(deadline_at).await;
-        if owner.claim_authorization_expiry() != AuthorizationTerminalOwnership::AuthorizationExpiry
-        {
-            // The response claimed its own completion first: it keeps its
-            // terminal and its connection, however late the client drains it.
-            return;
-        }
-        fired.store(true, Ordering::Release);
-        tokio::time::sleep(TRANSPORT_CLOSE_GRACE).await;
-        // Reaching this line proves the client has not drained the terminal:
-        // hyper dropping the client-facing body would have aborted this task.
-        closer.request_close();
-    });
+    let guard = SettledWatchdogHub::register(&closer, owner, fired, None);
     ResponsePumpGuard {
-        _pump: AbortPumpOnDrop(handle),
+        _ownership: ResponsePumpOwnership::Settled(guard),
         relays_frames: false,
         earlier: None,
     }
@@ -748,7 +1013,7 @@ impl AuthorizationCancellableBody {
         (
             body,
             ResponsePumpGuard {
-                _pump: pump,
+                _ownership: ResponsePumpOwnership::Task(pump),
                 relays_frames: true,
                 earlier: None,
             },

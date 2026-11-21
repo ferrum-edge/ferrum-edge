@@ -1400,6 +1400,39 @@ where
         write_timeout_ms,
         WriteWatermarkArm::Consumer,
         require_end_stream,
+        true,
+    )
+}
+
+/// Move a client request body into a gateway-owned upload pump that stays
+/// inline at install even when an authorization plan is armed.
+///
+/// Used ONLY by `proxy_to_backend_direct_h1`, whose pre-dispatch phases
+/// (`direct_h1_bounded_checkout`, `direct_h1_handoff_gate`) are already
+/// bounded by the same absolute authorization deadline, whose send phase
+/// drives the inline pump concurrently through
+/// `await_upload_write_watermark_first_disarming_post_eos`, and which calls
+/// `prime_inline()` immediately before handoff so hyper's `writev` coalesces
+/// request headers and body into one write / TLS record. If the upload is
+/// still live when the response head arrives (or if the handle drops while
+/// streaming), `UploadPumpJoin` detaches it onto its own task as usual.
+pub(crate) fn spawn_upload_pump_inline_for_direct_h1<B>(
+    body: B,
+    plan: Option<&RequestAuthLifetimePlan>,
+    write_timeout_ms: u64,
+    require_end_stream: bool,
+) -> (UploadPumpSource, UploadPumpJoin)
+where
+    B: http_body::Body<Data = Bytes> + Send + Unpin + 'static,
+    B::Error: Into<BoxError> + Send,
+{
+    spawn_upload_pump_with_write_start(
+        body,
+        plan,
+        write_timeout_ms,
+        WriteWatermarkArm::Consumer,
+        require_end_stream,
+        false,
     )
 }
 
@@ -1428,6 +1461,7 @@ where
         write_timeout_ms,
         WriteWatermarkArm::Dispatcher,
         require_end_stream,
+        true,
     )
 }
 
@@ -1454,6 +1488,7 @@ fn spawn_upload_pump_with_write_start<B>(
     write_timeout_ms: u64,
     arm: WriteWatermarkArm,
     require_end_stream: bool,
+    detach_auth_at_install: bool,
 ) -> (UploadPumpSource, UploadPumpJoin)
 where
     B: http_body::Body<Data = Bytes> + Send + Unpin + 'static,
@@ -1473,17 +1508,17 @@ where
         socket: side.socket,
     }));
     let mut join = controls.join(pump);
-    // An authorization lifetime is absolute and armed right now, and the
-    // dispatcher installing it may still be inside a pre-dispatch wait that
-    // polls nothing else (pool acquisition, admission). It needs its own task
-    // from the start. A watermark-only pump has nothing due before the
-    // dispatcher's race starts polling it (see the module docs).
+    // An authorization lifetime is absolute and armed right now, and dispatchers
+    // that do not bound pre-dispatch waits by the same deadline need the pump on
+    // its own task from the start. A watermark-only pump (or `direct_h1`, which
+    // bounds checkout and handoff with the same deadline and drives the pump
+    // inline) stays inline until handoff completes.
     //
     // A pump with nothing to enforce at all is a plain relay: no watermark race
     // will ever drive it, so inline it would relay nothing. Production never
     // installs one (`UploadSource::install_pump` returns early), but the join
     // contract must not depend on that.
-    if auth_armed || write_timeout_ms == 0 {
+    if (auth_armed && detach_auth_at_install) || (!auth_armed && write_timeout_ms == 0) {
         join.detach(&drain_diagnostics::PUMP_DETACHED_AT_INSTALL);
     }
     (
@@ -1727,10 +1762,10 @@ where
     // Absolute and armed once when a credential admitted the stream. Relayed
     // DATA, gRPC messages, and trailers never refresh it, and it is owned by
     // THIS pump, so it fires regardless of what the backend transport is doing.
-    // A pump with no plan builds no timer at all.
-    let expiry = plan
-        .as_ref()
-        .map(|(deadline, _, _)| tokio::time::sleep_until(deadline.at));
+    // Created lazily only when the pump actually awaits (`Pending`), while the
+    // loop checks `Instant::now() >= deadline.at` synchronously up front so
+    // already-buffered uploads avoid timer-wheel churn on the fast path.
+    let expiry: Option<tokio::time::Sleep> = None;
     tokio::pin!(expiry);
     // Per-reserve idle bound. Lazily created and reset only when the bridge
     // channel is actually full while the watermark is armed, avoiding per-frame
@@ -1795,6 +1830,11 @@ where
                 break 'pump UploadPumpOutcome::ConsumerGone;
             }
             Err(tokio::sync::mpsc::error::TrySendError::Full(())) => {
+                if expiry.is_none()
+                    && let Some((deadline, _, _)) = plan.as_ref()
+                {
+                    expiry.set(Some(tokio::time::sleep_until(deadline.at)));
+                }
                 if write_armed
                     && let Some(at) = tokio::time::Instant::now().checked_add(write_idle_dur)
                 {
@@ -1837,50 +1877,78 @@ where
                 }
             }
         };
-        let frame = 'frame: loop {
-            let next = tokio::select! {
-                biased;
-                () = &mut cancel_notified => break 'pump UploadPumpOutcome::Cancelled,
-                () = optional_sleep_elapsed(expiry.as_mut()) => {
-                    if let Some((deadline, family, latch)) = plan.as_ref() {
-                        latch.record_once(deadline.termination, *family);
+        // Fast path: cancellation and authorization deadline were just checked
+        // above; poll the client body synchronously with a no-op waker first so
+        // an already-buffered frame (e.g. a 10 KiB POST primed via
+        // `prime_inline()`) crosses the bridge without entering `select!` or
+        // arming timers.
+        let mut ready_frame: Option<Option<Result<Frame<Bytes>, B::Error>>> = None;
+        {
+            let mut noop_cx = Context::from_waker(std::task::Waker::noop());
+            loop {
+                match Pin::new(&mut body).poll_frame(&mut noop_cx) {
+                    Poll::Ready(Some(Ok(frame)))
+                        if frame.data_ref().is_some_and(|data| data.is_empty()) => {}
+                    Poll::Ready(next) => {
+                        ready_frame = Some(next);
+                        break;
                     }
-                    break 'pump UploadPumpOutcome::AuthorizationExpired;
+                    Poll::Pending => break,
                 }
-                () = &mut write_armed_notified, if write_configured && !write_armed => {
-                    write_armed = true;
+            }
+        }
+        let frame = match ready_frame {
+            Some(next) => next,
+            None => 'frame: loop {
+                if expiry.is_none()
+                    && let Some((deadline, _, _)) = plan.as_ref()
+                {
+                    expiry.set(Some(tokio::time::sleep_until(deadline.at)));
+                }
+                let next = tokio::select! {
+                    biased;
+                    () = &mut cancel_notified => break 'pump UploadPumpOutcome::Cancelled,
+                    () = optional_sleep_elapsed(expiry.as_mut()) => {
+                        if let Some((deadline, family, latch)) = plan.as_ref() {
+                            latch.record_once(deadline.termination, *family);
+                        }
+                        break 'pump UploadPumpOutcome::AuthorizationExpired;
+                    }
+                    () = &mut write_armed_notified, if write_configured && !write_armed => {
+                        write_armed = true;
+                        continue 'frame;
+                    }
+                    // The transport released the body while this pump was waiting
+                    // on the client — parked on a slow client, not on the bridge.
+                    // With a permit already in hand `reserve()` cannot report the
+                    // close, so watch for it here; otherwise a pump could sit on a
+                    // client that never sends another byte, owning that body, for
+                    // a transport that is long gone. Same terminals as the
+                    // `reserve()` error above.
+                    () = sender.closed() => {
+                        drop(permit);
+                        if shared.terminal_code() == PUMP_CONSUMER_DONE {
+                            break 'pump UploadPumpOutcome::Completed;
+                        }
+                        break 'pump UploadPumpOutcome::ConsumerGone;
+                    }
+                    frame = http_body_util::BodyExt::frame(&mut body) => frame,
+                };
+                // A zero-length DATA frame carries no HTTP message content: an H2
+                // client's END_STREAM often arrives as one, after the last payload
+                // frame. Relaying it would make the H2 transport send an empty DATA
+                // frame without END_STREAM (the bridge cannot know yet that the
+                // body ended), and peers bound those per connection — h2 >= 0.4.16
+                // answers the 101st with GOAWAY(ENHANCE_YOUR_CALM), failing every
+                // stream on that backend connection (issue #5588). Keep the permit
+                // and read on; the end of stream is still relayed as `None`.
+                if let Some(Ok(frame)) = &next
+                    && frame.data_ref().is_some_and(|data| data.is_empty())
+                {
                     continue 'frame;
                 }
-                // The transport released the body while this pump was waiting
-                // on the client — parked on a slow client, not on the bridge.
-                // With a permit already in hand `reserve()` cannot report the
-                // close, so watch for it here; otherwise a pump could sit on a
-                // client that never sends another byte, owning that body, for
-                // a transport that is long gone. Same terminals as the
-                // `reserve()` error above.
-                () = sender.closed() => {
-                    drop(permit);
-                    if shared.terminal_code() == PUMP_CONSUMER_DONE {
-                        break 'pump UploadPumpOutcome::Completed;
-                    }
-                    break 'pump UploadPumpOutcome::ConsumerGone;
-                }
-                frame = http_body_util::BodyExt::frame(&mut body) => frame,
-            };
-            // A zero-length DATA frame carries no HTTP message content: an H2
-            // client's END_STREAM often arrives as one, after the last payload
-            // frame. Relaying it would make the H2 transport send an empty DATA
-            // frame without END_STREAM (the bridge cannot know yet that the
-            // body ended), and peers bound those per connection — h2 >= 0.4.16
-            // answers the 101st with GOAWAY(ENHANCE_YOUR_CALM), failing every
-            // stream on that backend connection (issue #5588). Keep the permit
-            // and read on; the end of stream is still relayed as `None`.
-            if let Some(Ok(frame)) = &next
-                && frame.data_ref().is_some_and(|data| data.is_empty())
-            {
-                continue 'frame;
-            }
-            break next;
+                break next;
+            },
         };
         match frame {
             // Inspect the ORIGINAL source before EOF becomes Completed and
@@ -1893,6 +1961,22 @@ where
             Some(Ok(frame)) => {
                 let last = http_body::Body::is_end_stream(&body);
                 permit.send(BridgedFrame { frame, last });
+                // For unauthenticated single-frame uploads whose client body is
+                // already at EOF (`last == true`), probe EOF immediately so we
+                // release `body` and avoid a wasted Full-channel iteration.
+                // Authenticated uploads deliberately keep waiting on the next
+                // reserve so a frame still sitting unconsumed in the bridge
+                // remains subject to `expiry` if the credential expires before
+                // the transport takes it.
+                if last && plan.is_none() {
+                    let mut noop_cx = Context::from_waker(std::task::Waker::noop());
+                    if matches!(
+                        Pin::new(&mut body).poll_frame(&mut noop_cx),
+                        Poll::Ready(None)
+                    ) {
+                        break 'pump UploadPumpOutcome::Completed;
+                    }
+                }
             }
             Some(Err(error)) => {
                 let error: BoxError = error.into();

@@ -410,6 +410,10 @@ auth_flow::impl_auth_plugin!(
             .any(|location| matches!(location, KeyLocation::Query { .. }))
     }
 
+    fn supports_request_header_passthrough(&self) -> bool {
+        !self.requires_decoded_query_params()
+    }
+
     fn lifecycle_hooks(&self) -> crate::plugins::PluginHooks {
         crate::plugins::PluginHooks::BEFORE_PROXY
     }

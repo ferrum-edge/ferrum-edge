@@ -2673,7 +2673,7 @@ pub struct RequestContext {
     /// request path reads it back to decide the pre-commitment terminal.
     /// Carries the bounded class only, never credential material.
     pub(crate) authorization_termination_latch:
-        crate::proxy::auth_lifetime::StreamAuthTerminationLatch,
+        std::sync::OnceLock<crate::proxy::auth_lifetime::StreamAuthTerminationLatch>,
     /// Transport-level close signal for the client connection this request
     /// arrived on (issue #3815).
     ///
@@ -3439,7 +3439,8 @@ pub struct RequestContext {
     /// Set once a sidecar mesh-mTLS, HBONE, or Unix-socket dispatcher proved
     /// the client abandoned its upload before the backend response head
     /// (issue #6776). Read into the terminal summary's `client_disconnected`.
-    pub(crate) proven_client_upload_abort: crate::proxy::upload_pump::ProvenClientUploadAbort,
+    pub(crate) proven_client_upload_abort:
+        std::sync::OnceLock<crate::proxy::upload_pump::ProvenClientUploadAbort>,
     /// Receivers for mirror response metadata from every dispatched
     /// `request_mirror` instance on this request.
     ///
@@ -4798,6 +4799,15 @@ impl RequestContext {
     }
 
     pub fn new(client_ip: String, method: String, path: String) -> Self {
+        Self::new_with_start_time(client_ip, method, path, std::time::Instant::now())
+    }
+
+    pub(crate) fn new_with_start_time(
+        client_ip: String,
+        method: String,
+        path: String,
+        start_time: std::time::Instant,
+    ) -> Self {
         Self {
             direct_client_ip: client_ip.clone(),
             client_ip,
@@ -4838,8 +4848,7 @@ impl RequestContext {
             auth_method: None,
             credential_deadline_at: None,
             authorization_termination: None,
-            authorization_termination_latch:
-                crate::proxy::auth_lifetime::StreamAuthTerminationLatch::default(),
+            authorization_termination_latch: std::sync::OnceLock::new(),
             authorization_connection_closer: None,
             websocket_shutdown_rx: None,
             client_trust_session: None,
@@ -4849,7 +4858,7 @@ impl RequestContext {
             grpc_deadline_initialized: false,
             grpc_deadline_had_valid_client_timeout: false,
             request_body_integrity_retirement: false,
-            grpc_deadline_received_at: tokio::time::Instant::now(),
+            grpc_deadline_received_at: tokio::time::Instant::from_std(start_time),
             grpc_deadline_budget_ms: None,
             grpc_deadline_policy_budget_ms: None,
             grpc_deadline_ceiling_ms: None,
@@ -4950,7 +4959,7 @@ impl RequestContext {
             peer_spiffe_certificate_principal: false,
             plugin_http_call_ns: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             reject_hook_execution_ns: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            proven_client_upload_abort: Default::default(),
+            proven_client_upload_abort: std::sync::OnceLock::new(),
             mirror_result_rxs: Vec::new(),
             request_mirror_admissions: request_mirror::RequestMirrorAdmissions::default(),
             hmac_prebuffer_state: hmac_auth::HmacPrebufferState::default(),
@@ -5360,9 +5369,22 @@ impl RequestContext {
     ) -> bool {
         let won = self
             .authorization_termination_latch
+            .get_or_init(crate::proxy::auth_lifetime::StreamAuthTerminationLatch::default)
             .record_once(termination, family);
         self.latch_authorization_termination(termination);
         won
+    }
+
+    /// Observe whether an authorization termination has already been recorded on
+    /// this request's latch without allocating a latch on unauthenticated
+    /// requests.
+    #[inline]
+    pub(crate) fn observed_authorization_termination(
+        &self,
+    ) -> Option<crate::proxy::auth_lifetime::StreamAuthTermination> {
+        self.authorization_termination_latch
+            .get()
+            .and_then(crate::proxy::auth_lifetime::StreamAuthTerminationLatch::observed)
     }
 
     /// Clone this request's shared authorization-lifetime termination latch for
@@ -5370,21 +5392,28 @@ impl RequestContext {
     pub(crate) fn authorization_termination_latch(
         &self,
     ) -> crate::proxy::auth_lifetime::StreamAuthTerminationLatch {
-        self.authorization_termination_latch.clone()
+        self.authorization_termination_latch
+            .get_or_init(crate::proxy::auth_lifetime::StreamAuthTerminationLatch::default)
+            .clone()
     }
 
     /// Record that a dispatcher proved the client abandoned its upload before
     /// the backend response head (issue #6776).
     pub(crate) fn record_proven_client_upload_abort(&self) {
-        self.proven_client_upload_abort.record();
+        self.proven_client_upload_abort
+            .get_or_init(crate::proxy::upload_pump::ProvenClientUploadAbort::default)
+            .record();
     }
 
     /// Whether a dispatcher proved the client abandoned its upload before the
     /// backend response head (issue #6776). Not derived from the
     /// `ClientDisconnect` class, which authorization and client-deadline
     /// terminals also carry.
+    #[inline]
     pub(crate) fn proven_client_upload_abort(&self) -> bool {
-        self.proven_client_upload_abort.observed()
+        self.proven_client_upload_abort
+            .get()
+            .is_some_and(crate::proxy::upload_pump::ProvenClientUploadAbort::observed)
     }
 
     /// The latched authorization-lifetime termination class, if this request's
@@ -7668,6 +7697,41 @@ impl RequestContext {
     pub(crate) fn set_request_header_passthrough_proxy_hops(&mut self, hops: Option<u8>) {
         if let Some(passthrough) = self.request_header_passthrough.as_mut() {
             passthrough.set_proxy_hops(hops);
+        }
+    }
+
+    /// Record wire credential header names stripped by passthrough-safe auth
+    /// plugins (`hide_credentials`) on a passthrough request.
+    #[inline]
+    pub(crate) fn set_request_header_passthrough_stripped_headers(
+        &mut self,
+        stripped: Arc<Vec<String>>,
+    ) {
+        if let Some(passthrough) = self.request_header_passthrough.as_mut() {
+            passthrough.set_stripped_headers(stripped);
+        }
+    }
+
+    /// Apply gateway-asserted headers (`x-consumer-username`,
+    /// `x-consumer-custom-id`, `x-authenticated-identity`, `x-geo-country`)
+    /// directly onto the active passthrough overlay without materializing
+    /// `ctx.headers`. Returns `false` if any value is not representable as an
+    /// unchanged wire `HeaderValue`, signaling the caller to fall back to
+    /// `end_request_header_passthrough()`.
+    #[inline]
+    pub(crate) fn try_apply_request_header_passthrough_gateway_assertions(&mut self) -> bool {
+        let username = self.backend_consumer_username().map(str::to_owned);
+        let custom_id = self.backend_consumer_custom_id().map(str::to_owned);
+        let identity = self.backend_authenticated_identity().map(str::to_owned);
+        let geo_country = self.backend_geo_country().map(str::to_owned);
+        match self.request_header_passthrough.as_mut() {
+            Some(passthrough) => passthrough.try_set_gateway_assertions(
+                username.as_deref(),
+                custom_id.as_deref(),
+                identity.as_deref(),
+                geo_country.as_deref(),
+            ),
+            None => false,
         }
     }
 
@@ -11748,9 +11812,15 @@ impl PluginHooks {
     /// [`Plugin::log`] or [`Plugin::log_with_mesh_key`] (whose default calls
     /// `log`).
     pub const LOG: Self = Self(1 << 3);
+    /// [`Plugin::on_response_stream_terminated`].
+    pub const ON_RESPONSE_STREAM_TERMINATED: Self = Self(1 << 4);
     /// Every hook: the default for custom and undeclared plugins.
     pub const ALL: Self = Self(
-        Self::ON_REQUEST_RECEIVED.0 | Self::BEFORE_PROXY.0 | Self::AFTER_PROXY.0 | Self::LOG.0,
+        Self::ON_REQUEST_RECEIVED.0
+            | Self::BEFORE_PROXY.0
+            | Self::AFTER_PROXY.0
+            | Self::LOG.0
+            | Self::ON_RESPONSE_STREAM_TERMINATED.0,
     );
 
     /// The union of two declarations, usable in `const` context.
@@ -12092,6 +12162,17 @@ pub trait Plugin: Any + Send + Sync {
     /// `authenticate`, `authorize`, or the pre-`before_proxy` body
     /// normalization must be declared too (issue #6008).
     fn modifies_request_headers(&self) -> bool {
+        false
+    }
+
+    /// Returns `true` when this plugin never reads `ctx.headers` (inspecting
+    /// `ctx.raw_headers` instead), does not mutate query parameters, and its
+    /// only `before_proxy` header mutation (when `modifies_request_headers()`
+    /// is `true`) is stripping `request_headers_to_redact()`. Chains composed
+    /// solely of such plugins can stay on the zero-allocation
+    /// `RequestHeaderPassthrough` lane instead of materializing and cloning
+    /// `HashMap<String, String>`.
+    fn supports_request_header_passthrough(&self) -> bool {
         false
     }
 

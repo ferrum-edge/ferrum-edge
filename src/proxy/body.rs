@@ -34,6 +34,7 @@ use crate::proxy::auth_lifetime::AUTHORIZATION_EXPIRED_GRPC_STATUS_HEADER;
 use crate::proxy::auth_lifetime::AuthorizationConnectionCloser;
 use crate::proxy::response_watchdog::{
     AuthorizationCancellableBody, AuthorizationTerminalOwner, ResponsePumpGuard,
+    SettledWatchdogGuard,
 };
 
 /// Authorization-lifetime state carried on a client-visible response body.
@@ -139,6 +140,11 @@ pub struct ProxyBody {
     /// the bounded termination class instead of a generic transport timeout.
     /// Carries no token, claim, identity, or absolute expiry.
     stream_auth_deadline: Option<StreamAuthDeadlineState>,
+    /// Registration on the client connection's reusable settled-body watchdog
+    /// hub when `with_authorization_deadline` settled a complete response from
+    /// memory without spawning a per-request pump task. Dropped when hyper
+    /// finishes or abandons this client-facing response body.
+    auth_settled_watchdog: Option<SettledWatchdogGuard>,
     /// Set by the streaming gRPC-Web adapter immediately before it yields the
     /// terminal body-framed trailer. The outer body uses this to finish
     /// deferred logging and backend outcome classification with the real gRPC
@@ -918,6 +924,7 @@ impl ProxyBody {
             client_grpc_deadline_pump: None,
             route_request_deadline_fired: None,
             stream_auth_deadline: None,
+            auth_settled_watchdog: None,
             grpc_web_terminal_status: None,
             grpc_web_passthrough_status: None,
             logger: None,
@@ -967,6 +974,7 @@ impl ProxyBody {
             client_grpc_deadline_pump: None,
             route_request_deadline_fired: None,
             stream_auth_deadline: None,
+            auth_settled_watchdog: None,
             grpc_web_terminal_status: None,
             grpc_web_passthrough_status: None,
             logger: None,
@@ -1035,6 +1043,7 @@ impl ProxyBody {
         let mut inner = self;
         let client_grpc_deadline = inner.client_grpc_deadline.clone();
         let stream_auth_deadline = inner.stream_auth_deadline.clone();
+        let auth_settled_watchdog = inner.auth_settled_watchdog.take();
         let logger = inner.logger.take();
         let backend_admission_permits = inner._backend_admission_permits.take();
         let backend_admission_outcome = inner.backend_admission_outcome.take();
@@ -1058,6 +1067,7 @@ impl ProxyBody {
         body.backend_dispatch_outcome = backend_dispatch_outcome;
         body.client_grpc_deadline = client_grpc_deadline;
         body.stream_auth_deadline = stream_auth_deadline;
+        body.auth_settled_watchdog = auth_settled_watchdog;
         body.grpc_web_terminal_status = Some(terminal_status);
         body.logger = logger;
         body
@@ -1089,6 +1099,7 @@ impl ProxyBody {
         inner.grpc_scanner = None;
         let client_grpc_deadline = inner.client_grpc_deadline.clone();
         let stream_auth_deadline = inner.stream_auth_deadline.clone();
+        let auth_settled_watchdog = inner.auth_settled_watchdog.take();
         let logger = inner.logger.take();
         let backend_admission_permits = inner._backend_admission_permits.take();
         let backend_admission_outcome = inner.backend_admission_outcome.take();
@@ -1115,6 +1126,7 @@ impl ProxyBody {
         body.backend_dispatch_outcome = backend_dispatch_outcome;
         body.client_grpc_deadline = client_grpc_deadline;
         body.stream_auth_deadline = stream_auth_deadline;
+        body.auth_settled_watchdog = auth_settled_watchdog;
         body.grpc_web_terminal_status = Some(terminal_status);
         body.grpc_web_passthrough_status = Some(observed_status);
         body.logger = logger;
@@ -1665,55 +1677,43 @@ impl ProxyBody {
         let auth_latch = auth_latch.unwrap_or_default();
         let placeholder = ProxyBodyKind::Full(Full::default());
         let previous = std::mem::replace(&mut self.kind, placeholder);
-        self.kind = match previous {
-            ProxyBodyKind::Stream(body) => {
-                let guarded = crate::proxy::response_watchdog::AuthorizationCancellableBody::new(
-                    body,
-                    deadline,
-                    family,
-                    auth_latch.clone(),
-                    Arc::clone(&fired),
-                    closer,
-                );
-                let owner = guarded.terminal_owner();
-                let bounded = TotalDeadlineBody::with_terminal(
-                    guarded,
-                    // No timer here: the shared CAS settles this bound.
-                    None,
-                    deadline_frame,
-                    Arc::clone(&fired),
-                    terminal,
-                    Some(auth_latch),
-                )
-                .with_authorization_terminal_owner(owner)
-                .reporting_terminal_emission(Arc::clone(&terminal_emitted));
-                ProxyBodyKind::Stream(Box::pin(bounded))
-            }
-            ProxyBodyKind::Tracked(body) => {
-                let guarded = crate::proxy::response_watchdog::AuthorizationCancellableBody::new(
-                    body,
-                    deadline,
-                    family,
-                    auth_latch.clone(),
-                    Arc::clone(&fired),
-                    closer,
-                );
-                let owner = guarded.terminal_owner();
-                let bounded = TotalDeadlineBody::with_terminal(
-                    guarded,
-                    // No timer here: the shared CAS settles this bound.
-                    None,
-                    deadline_frame,
-                    Arc::clone(&fired),
-                    terminal,
-                    Some(auth_latch),
-                )
-                .with_authorization_terminal_owner(owner)
-                .reporting_terminal_emission(Arc::clone(&terminal_emitted));
-                ProxyBodyKind::Stream(Box::pin(bounded))
-            }
-            full @ ProxyBodyKind::Full(_) => full,
+        let (kind, settled_watchdog, clean_backend_eof, backend_errored) = match previous {
+            ProxyBodyKind::Stream(body) => wrap_authorization_deadline_body(
+                body,
+                deadline,
+                family,
+                auth_latch,
+                Arc::clone(&fired),
+                Arc::clone(&terminal_emitted),
+                deadline_frame,
+                terminal,
+                closer,
+            ),
+            ProxyBodyKind::Tracked(body) => wrap_authorization_deadline_body(
+                body,
+                deadline,
+                family,
+                auth_latch,
+                Arc::clone(&fired),
+                Arc::clone(&terminal_emitted),
+                deadline_frame,
+                terminal,
+                closer,
+            ),
+            full @ ProxyBodyKind::Full(_) => (full, None, false, false),
         };
+        if clean_backend_eof {
+            if let Some(lease) = self.pooled_backend_lease.take() {
+                lease.release_on_clean_eof();
+            }
+        } else if backend_errored {
+            // The backend stream ended with an error during read-ahead; drop
+            // the exclusive connection lease now so the physical connection is
+            // retired fail-closed immediately.
+            drop(self.pooled_backend_lease.take());
+        }
+        self.kind = kind;
+        self.auth_settled_watchdog = settled_watchdog;
         if matches!(self.kind, ProxyBodyKind::Stream(_)) {
             self.stream_auth_deadline = Some(StreamAuthDeadlineState {
                 fired,
@@ -1798,6 +1798,7 @@ impl ProxyBody {
             client_grpc_deadline_pump: None,
             route_request_deadline_fired: None,
             stream_auth_deadline: None,
+            auth_settled_watchdog: None,
             grpc_web_terminal_status: None,
             grpc_web_passthrough_status: None,
             logger: None,
@@ -2887,8 +2888,13 @@ impl UploadSource {
         require_end_stream: bool,
     ) -> (Self, Option<crate::proxy::upload_pump::UploadPumpJoin>) {
         let mut source = UploadSource::Direct(incoming);
-        let join =
-            source.install_pump_with_write_start(auth, write_timeout_ms, true, require_end_stream);
+        let join = source.install_pump_with_write_start(
+            auth,
+            write_timeout_ms,
+            true,
+            require_end_stream,
+            true,
+        );
         (source, join)
     }
 
@@ -3008,7 +3014,16 @@ impl UploadSource {
         write_timeout_ms: u64,
         require_end_stream: bool,
     ) -> Option<crate::proxy::upload_pump::UploadPumpJoin> {
-        self.install_pump_with_write_start(plan, write_timeout_ms, false, require_end_stream)
+        self.install_pump_with_write_start(plan, write_timeout_ms, false, require_end_stream, true)
+    }
+
+    fn install_pump_inline_auth(
+        &mut self,
+        plan: Option<&crate::proxy::RequestAuthLifetimePlan>,
+        write_timeout_ms: u64,
+        require_end_stream: bool,
+    ) -> Option<crate::proxy::upload_pump::UploadPumpJoin> {
+        self.install_pump_with_write_start(plan, write_timeout_ms, false, require_end_stream, false)
     }
 
     fn install_pump_with_write_start(
@@ -3017,6 +3032,7 @@ impl UploadSource {
         write_timeout_ms: u64,
         defer_write_start: bool,
         require_end_stream: bool,
+        detach_auth_at_install: bool,
     ) -> Option<crate::proxy::upload_pump::UploadPumpJoin> {
         if plan.is_none() && write_timeout_ms == 0 {
             return None;
@@ -3025,6 +3041,13 @@ impl UploadSource {
             UploadSource::Direct(incoming) if !http_body::Body::is_end_stream(&incoming) => {
                 let (source, join) = if defer_write_start {
                     crate::proxy::upload_pump::spawn_upload_pump_with_deferred_write(
+                        incoming,
+                        plan,
+                        write_timeout_ms,
+                        require_end_stream,
+                    )
+                } else if !detach_auth_at_install {
+                    crate::proxy::upload_pump::spawn_upload_pump_inline_for_direct_h1(
                         incoming,
                         plan,
                         write_timeout_ms,
@@ -3360,6 +3383,18 @@ impl SizeLimitedIncoming {
         let join = self
             .inner
             .install_pump(plan, write_timeout_ms, self.require_end_stream);
+        (self, join)
+    }
+
+    #[must_use]
+    pub(crate) fn with_gateway_upload_pump_inline_for_direct_h1(
+        mut self,
+        plan: Option<&crate::proxy::RequestAuthLifetimePlan>,
+        write_timeout_ms: u64,
+    ) -> (Self, Option<crate::proxy::upload_pump::UploadPumpJoin>) {
+        let join =
+            self.inner
+                .install_pump_inline_auth(plan, write_timeout_ms, self.require_end_stream);
         (self, join)
     }
 
@@ -4023,6 +4058,18 @@ impl CountingIncoming {
         let join = self
             .inner
             .install_pump(plan, write_timeout_ms, self.require_end_stream);
+        (self, join)
+    }
+
+    #[must_use]
+    pub(crate) fn with_gateway_upload_pump_inline_for_direct_h1(
+        mut self,
+        plan: Option<&crate::proxy::RequestAuthLifetimePlan>,
+        write_timeout_ms: u64,
+    ) -> (Self, Option<crate::proxy::upload_pump::UploadPumpJoin>) {
+        let join =
+            self.inner
+                .install_pump_inline_auth(plan, write_timeout_ms, self.require_end_stream);
         (self, join)
     }
 
@@ -5954,8 +6001,8 @@ where
     fn size_hint(&self) -> http_body::SizeHint {
         if self.done {
             http_body::SizeHint::with_exact(0)
-        } else if (self.deadline.is_some() && !self.deadline_only_errors())
-            || self.authorization_terminal.is_some()
+        } else if (self.deadline.is_some() || self.authorization_terminal.is_some())
+            && !self.deadline_only_errors()
         {
             // The deadline may replace the remaining body with native trailers
             // or a differently-sized gRPC-Web terminal DATA frame. Do not let
@@ -5964,11 +6011,12 @@ where
             // bound lives here or in the gateway-owned pump.
             http_body::SizeHint::default()
         } else {
-            // No deadline, or one whose only terminal is a transport error (the
-            // route request deadline): that terminal adds no bytes, so the
-            // inner hint stays exact and a known length keeps its framing. A
-            // cut then ends the body short of the advertised length, which
-            // every client detects as an incomplete response.
+            // No deadline, or one whose only terminal is a transport error
+            // (ordinary HTTP/SSE authorization or route request deadline): that
+            // terminal adds no bytes, so the inner hint stays exact and a known
+            // length keeps its framing. A cut then ends the body short of the
+            // advertised length, which every client detects as an incomplete
+            // response.
             self.inner
                 .as_ref()
                 .map(http_body::Body::size_hint)
@@ -6108,6 +6156,10 @@ struct ReadAheadBody<B> {
     completion: Option<AuthorizationTerminalOwner>,
     /// Whether this body won the completion claim.
     completion_claimed: bool,
+    /// Exact remaining DATA byte count for settled HTTP responses whose
+    /// upstream already had an exact `SizeHint` and no trailers, so HTTP/1.1
+    /// preserves `Content-Length` framing. `None` for gRPC / unknown length.
+    remaining_exact_bytes: Option<u64>,
 }
 
 impl<B> ReadAheadBody<B> {
@@ -6123,6 +6175,7 @@ impl<B> ReadAheadBody<B> {
             finished: false,
             completion: None,
             completion_claimed: false,
+            remaining_exact_bytes: None,
         }
     }
 
@@ -6133,8 +6186,20 @@ impl<B> ReadAheadBody<B> {
         terminal_error: Option<BoxError>,
         owner: AuthorizationTerminalOwner,
     ) -> Self {
+        Self::settled_with_exact_bytes(frames, terminal_error, owner, None)
+    }
+
+    /// Same as [`Self::settled`], optionally preserving an exact remaining
+    /// `SizeHint` for settled non-trailer HTTP responses.
+    fn settled_with_exact_bytes(
+        frames: VecDeque<Frame<Bytes>>,
+        terminal_error: Option<BoxError>,
+        owner: AuthorizationTerminalOwner,
+        remaining_exact_bytes: Option<u64>,
+    ) -> Self {
         let mut body = Self::new(frames, terminal_error, None);
         body.completion = Some(owner);
+        body.remaining_exact_bytes = remaining_exact_bytes;
         body.claim_completion_when_due();
         body
     }
@@ -6178,6 +6243,11 @@ where
             return Poll::Ready(None);
         }
         if let Some(frame) = this.frames.pop_front() {
+            if let Some(data) = frame.data_ref()
+                && let Some(remaining) = this.remaining_exact_bytes.as_mut()
+            {
+                *remaining = remaining.saturating_sub(data.len() as u64);
+            }
             if frame.is_trailers() && this.inner.is_none() {
                 this.finished = true;
             }
@@ -6210,11 +6280,146 @@ where
         self.finished
     }
 
-    /// Unknown, exactly as the pump reports it: hyper must not derive a
-    /// `Content-Length` for a gRPC response from bytes read ahead.
     fn size_hint(&self) -> http_body::SizeHint {
-        http_body::SizeHint::default()
+        match self.remaining_exact_bytes {
+            Some(remaining) => http_body::SizeHint::with_exact(remaining),
+            None => http_body::SizeHint::default(),
+        }
     }
+}
+
+/// Wrap an authenticated streaming response body under `deadline`.
+///
+/// Mirrors [`client_grpc_deadline_body`] (issue #6904): when a client
+/// connection closer is present and the bound has not yet elapsed, reads ahead
+/// any frames the upstream already has ready without blocking (up to
+/// `CLIENT_RPC_READ_AHEAD_MAX_FRAMES` / `CLIENT_RPC_READ_AHEAD_MAX_BYTES`).
+/// When the upstream has already reached its terminal, the backend body is
+/// dropped immediately and the frames are served from memory under the same
+/// [`AuthorizationTerminalOwner`] completion rule, registering at most one
+/// entry on the connection's reusable settled-body watchdog hub (zero
+/// per-request `tokio::spawn`, zero `mpsc::channel`, zero cross-task hop, and
+/// exact `Content-Length` preserved for HTTP/1.1). Otherwise the body moves into
+/// the gateway-owned [`AuthorizationCancellableBody`] pump with any read-ahead
+/// frames delivered first.
+#[allow(clippy::too_many_arguments)]
+fn wrap_authorization_deadline_body<B>(
+    mut body: B,
+    deadline: crate::proxy::auth_lifetime::StreamAuthDeadline,
+    family: crate::proxy::auth_lifetime::StreamAuthProtocolFamily,
+    auth_latch: crate::proxy::auth_lifetime::StreamAuthTerminationLatch,
+    fired: Arc<AtomicBool>,
+    terminal_emitted: Arc<AtomicBool>,
+    deadline_frame: Option<Frame<Bytes>>,
+    terminal: DeadlineTerminal,
+    closer: Option<crate::proxy::auth_lifetime::AuthorizationConnectionCloser>,
+) -> (ProxyBodyKind, Option<SettledWatchdogGuard>, bool, bool)
+where
+    B: http_body::Body<Data = Bytes, Error = ProxyBodyError> + Send + Unpin + 'static,
+{
+    if let Some(closer_ref) = closer.as_ref()
+        && tokio::time::Instant::now() < deadline.at
+    {
+        let original_exact = http_body::Body::size_hint(&body).exact();
+        let (frames, end) = read_ahead_ready_frames(&mut body);
+        if let ReadAheadEnd::Complete(terminal_error) = end {
+            let clean_eof = terminal_error.is_none()
+                && (!frames.back().is_some_and(Frame::is_trailers)
+                    || http_body::Body::is_end_stream(&body));
+            let errored = terminal_error.is_some();
+            let exact_bytes = if matches!(
+                family,
+                crate::proxy::auth_lifetime::StreamAuthProtocolFamily::Http
+            ) && terminal_error.is_none()
+                && !frames.iter().any(Frame::is_trailers)
+                && let Some(expected) = original_exact
+            {
+                let total: u64 = frames
+                    .iter()
+                    .filter_map(|f| f.data_ref().map(|d| d.len() as u64))
+                    .sum();
+                (total == expected).then_some(total)
+            } else {
+                None
+            };
+            let owner = AuthorizationTerminalOwner::new(deadline.at);
+            let settled = ReadAheadBody::<B>::settled_with_exact_bytes(
+                frames,
+                terminal_error,
+                owner.clone(),
+                exact_bytes,
+            );
+            drop(body);
+            let watchdog = (!settled.completion_claimed()).then(|| {
+                crate::proxy::response_watchdog::auth_deadline_settled_watchdog(
+                    owner.clone(),
+                    deadline,
+                    family,
+                    auth_latch.clone(),
+                    Arc::clone(&fired),
+                    closer_ref,
+                )
+            });
+            let bounded = TotalDeadlineBody::with_terminal(
+                settled,
+                None,
+                deadline_frame,
+                fired,
+                terminal,
+                Some(auth_latch),
+            )
+            .with_authorization_terminal_owner(owner)
+            .reporting_terminal_emission(terminal_emitted);
+            return (
+                ProxyBodyKind::Stream(Box::pin(bounded)),
+                watchdog,
+                clean_eof,
+                errored,
+            );
+        }
+        let owned = ReadAheadBody::new(frames, None, Some(body));
+        let guarded = AuthorizationCancellableBody::new(
+            owned,
+            deadline,
+            family,
+            auth_latch.clone(),
+            Arc::clone(&fired),
+            closer,
+        );
+        let owner = guarded.terminal_owner();
+        let bounded = TotalDeadlineBody::with_terminal(
+            guarded,
+            None,
+            deadline_frame,
+            fired,
+            terminal,
+            Some(auth_latch),
+        )
+        .with_authorization_terminal_owner(owner)
+        .reporting_terminal_emission(terminal_emitted);
+        return (ProxyBodyKind::Stream(Box::pin(bounded)), None, false, false);
+    }
+
+    let guarded = AuthorizationCancellableBody::new(
+        body,
+        deadline,
+        family,
+        auth_latch.clone(),
+        Arc::clone(&fired),
+        closer,
+    );
+    let owner = guarded.terminal_owner();
+    let bounded = TotalDeadlineBody::with_terminal(
+        guarded,
+        None,
+        deadline_frame,
+        fired,
+        terminal,
+        Some(auth_latch),
+    )
+    .with_authorization_terminal_owner(owner)
+    .reporting_terminal_emission(terminal_emitted);
+    (ProxyBodyKind::Stream(Box::pin(bounded)), None, false, false)
 }
 
 /// Wrap `body` in the client RPC deadline terminal adapter (`DEADLINE_EXCEEDED`
