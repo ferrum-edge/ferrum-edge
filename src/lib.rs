@@ -18903,6 +18903,9 @@ pub mod _test_support {
         })
     }
 
+    /// Sorted wire `(lowercase-name, raw-bytes)` pairs used by header-parity tests.
+    pub type WireHeaderList = Vec<(String, Vec<u8>)>;
+
     /// Compare the deferred `HeaderMap` streaming response-header lane against
     /// the materialized `HashMap` round-trip. Returns `None` when
     /// `response_headers_passthrough_eligible` rejects `raw`.
@@ -18911,7 +18914,7 @@ pub mod _test_support {
         status: u16,
         via: Option<&str>,
         alt_svc: Option<&str>,
-    ) -> Option<(Vec<(String, Vec<u8>)>, Vec<(String, Vec<u8>)>)> {
+    ) -> Option<(WireHeaderList, WireHeaderList)> {
         use crate::proxy::headers::{
             ClientResponseFraming, apply_sanitized_response_headers,
             response_headers_passthrough_eligible, sanitize_client_response_header_map_for_wire,

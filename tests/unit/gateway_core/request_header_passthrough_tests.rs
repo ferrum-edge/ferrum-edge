@@ -12,8 +12,8 @@ use ferrum_edge::_test_support::{
     RequestHeaderPassthroughProbe, request_header_passthrough_overlay_probe_for_test,
     request_header_passthrough_probe_for_test, response_header_passthrough_parity_for_test,
 };
-use ferrum_edge::config::types::{GatewayConfig, PluginScope, ProxyProtocol};
-use ferrum_edge::plugins::create_plugin;
+use ferrum_edge::config::types::{GatewayConfig, PluginScope};
+use ferrum_edge::plugins::{ProxyProtocol, create_plugin};
 use ferrum_edge::{PluginCache, PluginCapabilities};
 use http::{HeaderMap, HeaderName, HeaderValue};
 use serde_json::json;
