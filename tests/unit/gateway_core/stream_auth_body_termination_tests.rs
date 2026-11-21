@@ -1666,34 +1666,25 @@ async fn inner_route_deadline_is_not_erased_by_outer_authorization_read_ahead() 
     // Advance past the 5s route deadline (still well before the 60s auth deadline).
     tokio::time::sleep(Duration::from_secs(6)).await;
 
-    // Drain until error or EOF: the 5s route deadline MUST fire rather than
-    // being erased by eager read-ahead draining both frames at construction.
-    let mut saw_route_timeout = false;
-    while let Some(res) = body.frame().await {
-        if let Err(err) = res {
-            if err.to_string().contains("route request timeout") {
-                saw_route_timeout = true;
-            }
-            break;
-        }
-    }
+    // The VERY FIRST poll after the 5s route deadline expires must return the
+    // route request timeout — never delivering a frame queued by the outer
+    // authorization pump ahead of the deadline.
+    let err = body
+        .frame()
+        .await
+        .expect("expired route-timed body must yield a terminal")
+        .expect_err("first poll after route deadline expiry must fail with route request timeout");
     assert!(
-        saw_route_timeout,
-        "outer authorization wrapper must not read ahead past an inner route request deadline"
+        err.to_string().contains("route request timeout"),
+        "expected route request timeout on first poll, got: {err}"
     );
     assert_eq!(latch.observed(), None);
 }
 
 #[test]
-fn cloned_request_context_shares_lazy_authorization_and_upload_abort_latches() {
-    let (auth_shared, abort_shared) =
-        ferrum_edge::_test_support::cloned_request_context_shares_lazy_latches_for_test();
+fn cloned_request_context_shares_lazy_authorization_latch() {
     assert!(
-        auth_shared,
+        ferrum_edge::_test_support::cloned_request_context_shares_lazy_auth_latch_for_test(),
         "cloning RequestContext before latch init must still share the authorization latch"
-    );
-    assert!(
-        abort_shared,
-        "cloning RequestContext before latch init must still share the upload-abort latch"
     );
 }

@@ -5629,16 +5629,17 @@ fn project_log_metadata(
     ctx: &RequestContext,
     mut metadata: crate::plugins::MetadataMap,
 ) -> crate::plugins::MetadataMap {
-    metadata
-        .entry("ferrum.frontend_scheme".to_string())
-        .or_insert_with(|| {
+    if !metadata.contains_key("ferrum.frontend_scheme") {
+        metadata.insert(
+            "ferrum.frontend_scheme".to_string(),
             if ctx.request_is_secure {
                 "https"
             } else {
                 "http"
             }
-            .to_string()
-        });
+            .to_string(),
+        );
+    }
     // Detached uploads publish through the shared latch. Import its bounded
     // class even when no response relay copied it into the request context.
     if let Some(termination) = ctx.observed_authorization_termination() {
@@ -46059,6 +46060,8 @@ async fn handle_proxy_request_inner(
                     .await
                     .is_err()
                 {
+                    direct_pooled_backend_lease = None;
+                    response_headers_deferred = false;
                     result = client_grpc_deadline_exceeded_response_for_request(
                         &ctx,
                         &ctx.request_headers_view(owned_proxy_headers_ref),
@@ -46074,6 +46077,8 @@ async fn handle_proxy_request_inner(
                     // The attempt that led into this backoff was already
                     // charged above; the deadline expired in the gateway's own
                     // backoff, so the terminal is health-neutral.
+                    direct_pooled_backend_lease = None;
+                    response_headers_deferred = false;
                     result = route_request_timeout_response(
                         result.backend_resolved_ip.clone(),
                         retry::ErrorClass::DispatchPolicyRejected,
@@ -46166,6 +46171,8 @@ async fn handle_proxy_request_inner(
                     target_port = current_target.as_deref().map(|target| target.port).unwrap_or(0),
                     "Unix-socket retry target cannot be dispatched by the network retry planner; failing closed"
                 );
+                direct_pooled_backend_lease = None;
+                response_headers_deferred = false;
                 result = if is_grpc_request {
                     mesh_grpc_unavailable_response(
                         None,
@@ -46239,6 +46246,8 @@ async fn handle_proxy_request_inner(
                 // or pass-through gRPC-Web over HBONE) must fail closed with a
                 // Trailers-Only UNAVAILABLE, never a JSON 502 the client cannot
                 // parse. Plain HTTP keeps the Bad Gateway shape.
+                direct_pooled_backend_lease = None;
+                response_headers_deferred = false;
                 result = if is_grpc_request {
                     mesh_grpc_unavailable_response(
                         None,
@@ -46292,6 +46301,8 @@ async fn handle_proxy_request_inner(
                     reason,
                     "Mesh retry target cannot be dispatched securely; failing closed"
                 );
+                direct_pooled_backend_lease = None;
+                response_headers_deferred = false;
                 result = if is_grpc_request {
                     mesh_grpc_unavailable_response(
                         None,
@@ -46334,6 +46345,8 @@ async fn handle_proxy_request_inner(
             if (request_uses_grpc_content_type || grpc_request_is_web_translated)
                 && !retry_dispatch_mesh_mtls
             {
+                direct_pooled_backend_lease = None;
+                response_headers_deferred = false;
                 result = mesh_grpc_unavailable_response(
                     None,
                     "mesh gRPC retry cannot switch into the direct gRPC transport",
@@ -47995,14 +48008,16 @@ async fn handle_proxy_request_inner(
     // recorded synchronously below. Only an error class produces any counter at
     // all; a clean buffered response with no consumer records nothing, exactly
     // as it did when no summary was built for it either.
-    let buffered_terminal_outcome_only =
-        terminal_summary_has_no_consumer && !body_will_stream && backend_error_class.is_some();
+    let effective_terminal_error_class = ctx.response_policy_error_class(backend_error_class);
+    let buffered_terminal_outcome_only = terminal_summary_has_no_consumer
+        && !body_will_stream
+        && effective_terminal_error_class.is_some();
     let needs_transaction_summary = !compact_terminal_only
         && !buffered_terminal_outcome_only
         && (has_terminal_plugin_consumer
             || !ctx.mirror_result_rxs.is_empty()
             || body_will_stream
-            || backend_error_class.is_some()
+            || effective_terminal_error_class.is_some()
             || diagnostic_detail_wanted);
     // A streaming terminal's summary is captured here, at header commit, but
     // its logger is built at the very end of this function: the logger owns a
@@ -48016,7 +48031,7 @@ async fn handle_proxy_request_inner(
                 crate::proxy::deferred_log::DeferredTransactionLogger::compact(
                     proxy.id.clone(),
                     crate::runtime_metrics::terminal_metadata_is_grpc(&ctx.metadata),
-                    ctx.response_policy_error_class(backend_error_class),
+                    effective_terminal_error_class,
                 ),
             )
         } else if needs_transaction_summary {
@@ -48200,7 +48215,7 @@ async fn handle_proxy_request_inner(
                     crate::runtime_metrics::TerminalOutcome {
                         proxy_id: Some(proxy.id.as_str()),
                         grpc: crate::runtime_metrics::terminal_metadata_is_grpc(&ctx.metadata),
-                        error_class: ctx.response_policy_error_class(backend_error_class),
+                        error_class: effective_terminal_error_class,
                         body_error_class: None,
                         client_disconnected: ctx.proven_client_upload_abort(),
                     },
@@ -48306,9 +48321,15 @@ async fn handle_proxy_request_inner(
     // selection and the large-H2 passthrough use `trusted_backend_content_length`
     // captured before `after_proxy`.
     let declared_streaming_content_length = if response_headers_deferred {
-        (!headers_mod::status_forbids_response_body(response_status))
-            .then_some(trusted_backend_content_length)
-            .flatten()
+        match &response_body {
+            ResponseBody::StreamingH2(resp) => {
+                headers_mod::preserved_response_content_length_from_header_map(
+                    resp.headers(),
+                    response_status,
+                )
+            }
+            _ => None,
+        }
     } else {
         headers_mod::preserved_response_content_length(&response_headers, response_status)
     };

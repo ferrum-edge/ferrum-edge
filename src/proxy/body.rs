@@ -133,6 +133,10 @@ pub struct ProxyBody {
     /// backend: deferred backend accounting stays health-neutral, while the
     /// deferred logger keeps the timeout class and records no disconnect.
     route_request_deadline_fired: Option<Arc<AtomicBool>>,
+    /// Absolute deadline instant installed by [`Self::with_route_request_deadline`],
+    /// retained so an outer authorization wrapper can enforce an earlier route
+    /// deadline at dequeue before yielding any pump-queued frame.
+    route_request_deadline_at: Option<tokio::time::Instant>,
     /// Set by the authorization-lifetime wrapper when the accepted credential's
     /// deadline (or the finite authenticated-stream maximum) fired. Deferred
     /// backend accounting treats it exactly like a client-chosen expiry —
@@ -923,6 +927,7 @@ impl ProxyBody {
             client_grpc_deadline: None,
             client_grpc_deadline_pump: None,
             route_request_deadline_fired: None,
+            route_request_deadline_at: None,
             stream_auth_deadline: None,
             auth_settled_watchdog: None,
             grpc_web_terminal_status: None,
@@ -973,6 +978,7 @@ impl ProxyBody {
             client_grpc_deadline: None,
             client_grpc_deadline_pump: None,
             route_request_deadline_fired: None,
+            route_request_deadline_at: None,
             stream_auth_deadline: None,
             auth_settled_watchdog: None,
             grpc_web_terminal_status: None,
@@ -1509,6 +1515,7 @@ impl ProxyBody {
             full @ ProxyBodyKind::Full(_) => full,
         };
         self.route_request_deadline_fired = Some(fired);
+        self.route_request_deadline_at = Some(deadline);
         self
     }
 
@@ -1682,6 +1689,11 @@ impl ProxyBody {
         // earlier deadline and close grace.
         let allow_read_ahead =
             self.client_grpc_deadline.is_none() && self.route_request_deadline_fired.is_none();
+        let inner_route_deadline = self
+            .route_request_deadline_at
+            .zip(self.route_request_deadline_fired.as_ref())
+            .filter(|(route_at, _)| *route_at < deadline.at)
+            .map(|(route_at, fired)| (route_at, Arc::clone(fired)));
         let placeholder = ProxyBodyKind::Full(Full::default());
         let previous = std::mem::replace(&mut self.kind, placeholder);
         let (kind, settled_watchdog, clean_backend_eof, backend_errored) = match previous {
@@ -1696,6 +1708,7 @@ impl ProxyBody {
                 terminal,
                 closer,
                 allow_read_ahead,
+                inner_route_deadline,
             ),
             ProxyBodyKind::Tracked(body) => wrap_authorization_deadline_body(
                 body,
@@ -1708,6 +1721,7 @@ impl ProxyBody {
                 terminal,
                 closer,
                 allow_read_ahead,
+                inner_route_deadline,
             ),
             full @ ProxyBodyKind::Full(_) => (full, None, false, false),
         };
@@ -1806,6 +1820,7 @@ impl ProxyBody {
             client_grpc_deadline: None,
             client_grpc_deadline_pump: None,
             route_request_deadline_fired: None,
+            route_request_deadline_at: None,
             stream_auth_deadline: None,
             auth_settled_watchdog: None,
             grpc_web_terminal_status: None,
@@ -5676,6 +5691,10 @@ struct TotalDeadlineBody<B> {
     /// this adapter settles the shared CAS itself — see
     /// `crate::proxy::response_watchdog`.
     authorization_terminal: Option<AuthorizationTerminalOwner>,
+    /// Optional earlier inner route request deadline (`route_at < auth_at`)
+    /// enforced at dequeue before releasing any frame queued by the outer
+    /// authorization pump, preserving health-neutral route-timeout accounting.
+    inner_route_deadline: Option<(tokio::time::Instant, Arc<AtomicBool>)>,
     saw_data: bool,
     done: bool,
 }
@@ -5791,6 +5810,7 @@ impl<B> TotalDeadlineBody<B> {
             terminal,
             auth_latch,
             authorization_terminal: None,
+            inner_route_deadline: None,
             saw_data: false,
             done: false,
         }
@@ -5813,6 +5833,14 @@ impl<B> TotalDeadlineBody<B> {
     /// polling task before the terminal is returned, and by nothing else.
     fn reporting_terminal_emission(mut self, flag: Arc<AtomicBool>) -> Self {
         self.terminal_emitted = Some(flag);
+        self
+    }
+
+    fn with_inner_route_deadline(
+        mut self,
+        route_deadline: Option<(tokio::time::Instant, Arc<AtomicBool>)>,
+    ) -> Self {
+        self.inner_route_deadline = route_deadline;
         self
     }
 
@@ -5914,6 +5942,30 @@ where
         let this = self.get_mut();
         if this.done {
             return Poll::Ready(None);
+        }
+        // If an earlier inner route request deadline has already elapsed,
+        // enforce it at dequeue before yielding any frame the outer
+        // authorization pump queued ahead of the deadline.
+        if let Some((route_at, route_fired)) = this.inner_route_deadline.as_ref()
+            && tokio::time::Instant::now() >= *route_at
+            && !this
+                .authorization_terminal
+                .as_ref()
+                .is_some_and(AuthorizationTerminalOwner::expiry_claimed)
+        {
+            this.done = true;
+            this.deadline = None;
+            this.inner.take();
+            route_fired.store(true, Ordering::Release);
+            let msg = if this.saw_data {
+                DeadlineTerminal::ROUTE_REQUEST_TIMEOUT.post_data_message
+            } else {
+                DeadlineTerminal::ROUTE_REQUEST_TIMEOUT.pre_data_message
+            };
+            return Poll::Ready(Some(Err(Box::new(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                msg,
+            )) as BoxError)));
         }
         // The AUTHORIZATION regime settles through the ONE shared terminal
         // owner, ahead of the inner body. `observe()` claims the bound itself
@@ -6323,6 +6375,7 @@ fn wrap_authorization_deadline_body<B>(
     terminal: DeadlineTerminal,
     closer: Option<crate::proxy::auth_lifetime::AuthorizationConnectionCloser>,
     allow_read_ahead: bool,
+    inner_route_deadline: Option<(tokio::time::Instant, Arc<AtomicBool>)>,
 ) -> (ProxyBodyKind, Option<SettledWatchdogGuard>, bool, bool)
 where
     B: http_body::Body<Data = Bytes, Error = ProxyBodyError> + Send + Unpin + 'static,
@@ -6429,6 +6482,7 @@ where
         Some(auth_latch),
     )
     .with_authorization_terminal_owner(owner)
+    .with_inner_route_deadline(inner_route_deadline)
     .reporting_terminal_emission(terminal_emitted);
     (ProxyBodyKind::Stream(Box::pin(bounded)), None, false, false)
 }

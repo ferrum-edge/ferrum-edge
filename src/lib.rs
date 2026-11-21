@@ -18971,9 +18971,25 @@ pub mod _test_support {
         Some((sorted(materialized_resp.headers()), sorted(&deferred)))
     }
 
-    /// Prove that cloning a `RequestContext` before either lazy latch is
-    /// initialized still shares the exact same underlying handles.
-    pub fn cloned_request_context_shares_lazy_latches_for_test() -> (bool, bool) {
+    /// Compare `preserved_response_content_length` (materialized map) against
+    /// `preserved_response_content_length_from_header_map` (deferred lane) for
+    /// the same backend header block and status.
+    pub fn preserved_response_content_length_parity_for_test(
+        raw: http::HeaderMap,
+        status: u16,
+    ) -> (Option<u64>, Option<u64>) {
+        let mut map = std::collections::HashMap::new();
+        crate::proxy::collect_hyper_response_headers(&raw, &mut map);
+        let materialized = crate::proxy::headers::preserved_response_content_length(&map, status);
+        let deferred =
+            crate::proxy::headers::preserved_response_content_length_from_header_map(&raw, status);
+        (materialized, deferred)
+    }
+
+    /// Prove that cloning a `RequestContext` before its lazy
+    /// `StreamAuthTerminationLatch` is initialized still shares the exact same
+    /// underlying `Arc`-backed handle.
+    pub fn cloned_request_context_shares_lazy_auth_latch_for_test() -> bool {
         use crate::proxy::auth_lifetime::{StreamAuthProtocolFamily, StreamAuthTermination};
 
         let ctx = crate::plugins::RequestContext::new(
@@ -18986,12 +19002,7 @@ pub mod _test_support {
             StreamAuthTermination::CredentialExpired,
             StreamAuthProtocolFamily::Http,
         );
-        cloned.record_proven_client_upload_abort();
-        (
-            ctx.observed_authorization_termination()
-                == Some(StreamAuthTermination::CredentialExpired),
-            ctx.proven_client_upload_abort(),
-        )
+        ctx.observed_authorization_termination() == Some(StreamAuthTermination::CredentialExpired)
     }
 
     /// Canonical declared `Content-Length` from a comma-folded header map.

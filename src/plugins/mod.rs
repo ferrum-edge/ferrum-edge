@@ -2454,11 +2454,12 @@ impl From<&RequestContext> for HboneReuseContext {
     }
 }
 
-/// Lazily-allocated shared latch (`OnceLock<T>`).
+/// Lazily-allocated shared handle (`OnceLock<T>`).
 ///
-/// Hot-path requests that never touch the latch pay zero heap allocations,
-/// while cloning initializes the cell on `&self` first so the original and
-/// every clone always share the exact same underlying handle.
+/// Hot-path requests that never touch an `Arc`-backed latch pay zero heap
+/// allocations, while cloning initializes the cell on `&self` first so both
+/// the original and every clone share the exact same handle (preserving
+/// `T::clone` sharing semantics).
 #[derive(Debug)]
 pub(crate) struct LazyShared<T>(std::sync::OnceLock<T>);
 
@@ -3473,8 +3474,7 @@ pub struct RequestContext {
     /// Set once a sidecar mesh-mTLS, HBONE, or Unix-socket dispatcher proved
     /// the client abandoned its upload before the backend response head
     /// (issue #6776). Read into the terminal summary's `client_disconnected`.
-    pub(crate) proven_client_upload_abort:
-        LazyShared<crate::proxy::upload_pump::ProvenClientUploadAbort>,
+    pub(crate) proven_client_upload_abort: crate::proxy::upload_pump::ProvenClientUploadAbort,
     /// Receivers for mirror response metadata from every dispatched
     /// `request_mirror` instance on this request.
     ///
@@ -4984,7 +4984,8 @@ impl RequestContext {
             peer_spiffe_certificate_principal: false,
             plugin_http_call_ns: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             reject_hook_execution_ns: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            proven_client_upload_abort: LazyShared::new(),
+            proven_client_upload_abort: crate::proxy::upload_pump::ProvenClientUploadAbort::default(
+            ),
             mirror_result_rxs: Vec::new(),
             request_mirror_admissions: request_mirror::RequestMirrorAdmissions::default(),
             hmac_prebuffer_state: hmac_auth::HmacPrebufferState::default(),
@@ -5425,9 +5426,7 @@ impl RequestContext {
     /// Record that a dispatcher proved the client abandoned its upload before
     /// the backend response head (issue #6776).
     pub(crate) fn record_proven_client_upload_abort(&self) {
-        self.proven_client_upload_abort
-            .get_or_init(crate::proxy::upload_pump::ProvenClientUploadAbort::default)
-            .record();
+        self.proven_client_upload_abort.record();
     }
 
     /// Whether a dispatcher proved the client abandoned its upload before the
@@ -5436,9 +5435,7 @@ impl RequestContext {
     /// terminals also carry.
     #[inline]
     pub(crate) fn proven_client_upload_abort(&self) -> bool {
-        self.proven_client_upload_abort
-            .get()
-            .is_some_and(crate::proxy::upload_pump::ProvenClientUploadAbort::observed)
+        self.proven_client_upload_abort.observed()
     }
 
     /// The latched authorization-lifetime termination class, if this request's

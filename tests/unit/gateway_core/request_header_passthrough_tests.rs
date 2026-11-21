@@ -9,8 +9,9 @@
 //! materialized path.
 
 use ferrum_edge::_test_support::{
-    RequestHeaderPassthroughProbe, request_header_passthrough_overlay_probe_for_test,
-    request_header_passthrough_probe_for_test, response_header_passthrough_parity_for_test,
+    RequestHeaderPassthroughProbe, preserved_response_content_length_parity_for_test,
+    request_header_passthrough_overlay_probe_for_test, request_header_passthrough_probe_for_test,
+    response_header_passthrough_parity_for_test,
 };
 use ferrum_edge::config::types::{GatewayConfig, PluginScope};
 use ferrum_edge::plugins::{ProxyProtocol, create_plugin};
@@ -406,16 +407,16 @@ fn key_auth_passthrough_eligibility_rules() {
         "header:Host needs materialized H2 Host backfill before lookup"
     );
 
-    let anon_key_auth = create_plugin(
+    let visible_key_auth = create_plugin(
         "key_auth",
         &json!({
             "key_location": "header:X-API-Key",
-            "anonymous_consumer": "anon"
+            "hide_credentials": false
         }),
     )
-    .expect("anonymous key_auth builds")
+    .expect("hide_credentials=false key_auth builds")
     .expect("key_auth is registered");
-    assert!(anon_key_auth.supports_request_header_passthrough());
+    assert!(visible_key_auth.supports_request_header_passthrough());
 
     let proxy = make_proxy("bench-key-auth", "/api", vec!["key-auth-1"]);
     let plugin_cfg = make_plugin_config_with_json(
@@ -520,5 +521,31 @@ fn deferred_response_header_lane_matches_materialized_wire_headers() {
             None,
         )
         .is_none()
+    );
+
+    // Comma-folded Content-Length ("42, 42"), signed "+42", and 204 responses
+    // must produce identical declared-length decisions on both lanes.
+    assert_eq!(
+        preserved_response_content_length_parity_for_test(
+            block(&[("content-length", b"42, 42")]),
+            200,
+        ),
+        (None, None),
+        "comma-folded Content-Length must be rejected on both materialized and deferred lanes"
+    );
+    assert_eq!(
+        preserved_response_content_length_parity_for_test(
+            block(&[("content-length", b"+42")]),
+            200,
+        ),
+        (None, None),
+    );
+    assert_eq!(
+        preserved_response_content_length_parity_for_test(block(&[("content-length", b"42")]), 200),
+        (Some(42), Some(42)),
+    );
+    assert_eq!(
+        preserved_response_content_length_parity_for_test(block(&[("content-length", b"42")]), 204),
+        (None, None),
     );
 }

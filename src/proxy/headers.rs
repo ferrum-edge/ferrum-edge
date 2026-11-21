@@ -1968,6 +1968,29 @@ pub fn preserved_response_content_length(
     found
 }
 
+/// `http::HeaderMap` counterpart to [`preserved_response_content_length`] for
+/// the deferred streaming response-header lane. Applies the exact same
+/// single-header, `is_wire_valid_content_length` predicate so comma-folded
+/// values (`"42, 42"`), signed values, or duplicates return `None` identically.
+pub(crate) fn preserved_response_content_length_from_header_map(
+    headers: &http::HeaderMap,
+    status: u16,
+) -> Option<u64> {
+    if status_forbids_response_body(status) {
+        return None;
+    }
+    let mut iter = headers.get_all(http::header::CONTENT_LENGTH).iter();
+    let first = iter.next()?;
+    if iter.next().is_some() {
+        return None;
+    }
+    let trimmed = first.to_str().ok()?.trim();
+    if !is_wire_valid_content_length(trimmed) {
+        return None;
+    }
+    trimmed.parse::<u64>().ok()
+}
+
 fn set_content_length_header(headers: &mut std::collections::HashMap<String, String>, len: u64) {
     // Hot path: exactly one lowercase canonical Content-Length whose untrimmed
     // decimal value already matches the trusted length — preserve existing
