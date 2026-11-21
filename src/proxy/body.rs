@@ -2216,10 +2216,14 @@ impl http_body::Body for ProxyBody {
                 // termination hooks so plugin-side breakers can do the same.
                 // Read only on this error arm, so the frame hot path pays
                 // nothing for it.
-                let route_policy_cut = this
-                    .route_request_deadline_fired
-                    .as_ref()
-                    .is_some_and(|flag| flag.load(Ordering::Acquire));
+                // An authorization terminal that won ownership over a racing
+                // inner route deadline supersedes `route_policy_cut`, so hooks
+                // never observe both outcomes for the same stream.
+                let route_policy_cut = auth_deadline_termination.is_none()
+                    && this
+                        .route_request_deadline_fired
+                        .as_ref()
+                        .is_some_and(|flag| flag.load(Ordering::Acquire));
                 if let Some(logger) = this.logger.take() {
                     let bytes = this.bytes_streamed.load(Ordering::Relaxed);
                     let grpc_status = if auth_deadline_termination.is_some() {
