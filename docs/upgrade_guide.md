@@ -28,6 +28,25 @@ applied by editing the file (see [File Mode](#file-mode-ferrum_modefile)).
 
 ## Upgrading to the next release (unreleased)
 
+### `;`-aliased query tokens are refused by `jwt_auth`, `jwks_auth`, and `oauth2_introspection` (GHSA-c259-vchc-3vgr)
+
+`jwt_auth` (`token_lookup: query:<name>`), `jwks_auth`, and
+`oauth2_introspection` (`providers[].from_params`) now apply the `key_auth`
+issue #6579 contract to query token locations. A request whose configured query
+name also appears as a `;`-separated sub-parameter (`?carrier=;token=...`, or a
+name such as `token;x`) is refused with `401`
+`{"error":"Ambiguous token query parameter"}` instead of being treated as
+carrying no token (for `jwks_auth` and `oauth2_introspection`, when no other
+configured location yields a token). The alias is also marked for OPA and
+`request_mirror` redaction, and it is removed from the forwarded query —
+including when another mechanism authenticates the request — under
+`jwt_auth` `hide_credentials: true` or a provider's
+`forward_original_token: false`.
+
+**Operator action:** none for ordinary clients. A client that sent a query
+token alongside a `;` sub-parameter of the same name must send the token as a
+normal `&`-separated parameter (or percent-encode a literal `;` as `%3B`).
+
 ### EastWestGateway passthrough legs now follow DestinationRules (#7424)
 
 An EastWestGateway data plane now applies DestinationRules to its
