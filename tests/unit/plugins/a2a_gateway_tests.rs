@@ -7988,7 +7988,12 @@ async fn rewriting_instance_enforces_its_own_classification_behind_a_non_rewriti
         owner.before_proxy(&mut ctx, &mut headers).await,
         PluginResult::Continue
     ));
-    let result = rewriting.before_proxy(&mut ctx, &mut headers).await;
+    // This body exceeds the 64-byte ceiling above, so use a default-limit
+    // rewriting instance to reach the case-variant screen itself.
+    let rewriting_default_limit = plugin(json!({}));
+    let result = rewriting_default_limit
+        .before_proxy(&mut ctx, &mut headers)
+        .await;
     assert_uninspectable_refusal(result, &ctx, "case-variant behind a silent owner");
 
     // A post-admission transform into an Agent Card: the silent owner skips the
