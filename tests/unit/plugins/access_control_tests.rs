@@ -11,7 +11,9 @@ use serde_json::json;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use super::plugin_utils::{assert_continue, assert_reject, create_test_context};
+use super::plugin_utils::{
+    assert_continue, assert_reject, commit_external_identity_with_authority, create_test_context,
+};
 
 fn create_stream_context(
     consumer: Option<Arc<Consumer>>,
@@ -1264,7 +1266,7 @@ fn test_access_control_external_identity_rule_validation() {
         ),
         (
             json!({"disallowed_external_identities": [{"identity": "alice", "realm": "x"}]}),
-            "accept only `identity` and `mechanism`",
+            "accept only `identity`, `mechanism`, and `authority`",
         ),
     ] {
         let err = match AccessControl::new(&config) {
@@ -1273,6 +1275,458 @@ fn test_access_control_external_identity_rule_validation() {
         };
         assert!(err.contains(fragment), "got: {err} for {config}");
     }
+}
+
+// ---- External-identity rules scoped to the verifying authority (GHSA-r378-r7j8-2qm3) ----
+
+const AUTHORITY_A: [u8; 32] = [0xa1; 32];
+const AUTHORITY_B: [u8; 32] = [0xb2; 32];
+
+/// A request whose external identity was committed through the shared
+/// authentication boundary under `mechanism` with `authority` as the verifying
+/// authority digest (`None` for a mechanism that commits no authority).
+fn external_identity_context_with_authority(
+    identity: &str,
+    mechanism: &'static str,
+    authority: Option<[u8; 32]>,
+) -> ferrum_edge::plugins::RequestContext {
+    let mut ctx = create_test_context();
+    commit_external_identity_with_authority(&mut ctx, identity, mechanism, authority);
+    let realm = ctx
+        .authenticated_identity_realm()
+        .expect("a committed external identity carries its realm");
+    assert_eq!(realm.mechanism(), mechanism);
+    assert_eq!(realm.authority().copied(), authority);
+    ctx
+}
+
+/// A request carrying `identity` with no verified realm (set without the
+/// authentication commit boundary).
+fn unknown_realm_context(identity: &str) -> ferrum_edge::plugins::RequestContext {
+    let mut ctx = create_test_context();
+    ctx.identified_consumer = None;
+    ctx.authenticated_identity = Some(identity.to_string());
+    ctx
+}
+
+#[test]
+fn test_access_control_external_identity_authority_admission() {
+    let lower = hex::encode(AUTHORITY_A);
+    let upper = hex::encode_upper(AUTHORITY_A);
+    for config in [
+        json!({"allowed_external_identities": [{"identity": "alice", "authority": lower}]}),
+        // Same spellings as the plugin-trigger `external_identity_authority`
+        // predicate: hex is compared case-insensitively.
+        json!({"allowed_external_identities": [{"identity": "alice", "authority": upper}]}),
+        json!({
+            "allowed_external_identities": [
+                {"identity": "alice", "mechanism": "jwks_auth", "authority": lower},
+                {"identity": "alice", "mechanism": "jwks_auth", "authority": hex::encode(AUTHORITY_B)}
+            ]
+        }),
+        json!({
+            "allow_authenticated_identity": true,
+            "disallowed_external_identities": [
+                {"identity": "alice", "mechanism": "oauth2_introspection", "authority": lower}
+            ]
+        }),
+    ] {
+        assert!(
+            AccessControl::new(&config).is_ok(),
+            "config should be accepted: {config}"
+        );
+        assert!(
+            ferrum_edge::plugins::validate_plugin_config("access_control", &config).is_ok(),
+            "config should pass plugin validation: {config}"
+        );
+    }
+
+    let canary = "c0ffee".repeat(10);
+    for field in [
+        "allowed_external_identities",
+        "disallowed_external_identities",
+    ] {
+        for authority in [
+            json!(lower[..63].to_string()),
+            json!(format!("{lower}0")),
+            json!(format!("0x{}", &lower[..62])),
+            json!(format!("{}zz", &lower[..62])),
+            json!(format!("{canary}gggg")),
+            json!(""),
+            json!(7),
+            json!(null),
+            json!([lower.clone()]),
+            json!({"digest": lower.clone()}),
+        ] {
+            let mut config = json!({});
+            config[field] = json!([{"identity": "alice", "authority": authority}]);
+            if field == "disallowed_external_identities" {
+                config["allow_authenticated_identity"] = json!(true);
+            }
+            let err = match AccessControl::new(&config) {
+                Ok(_) => panic!("config should be rejected: {config}"),
+                Err(err) => err,
+            };
+            assert!(
+                err.contains("`authority` must be a 64-character hex realm authority digest"),
+                "got: {err} for {config}"
+            );
+            assert!(err.contains(field), "got: {err} for {config}");
+            assert!(!err.contains("c0ffee"), "leaked supplied value: {err}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn test_access_control_external_allow_entry_is_scoped_to_its_authority() {
+    let plugin = AccessControl::new(&json!({
+        "allowed_external_identities": [{
+            "identity": "ops-admin",
+            "mechanism": "jwks_auth",
+            "authority": hex::encode(AUTHORITY_A)
+        }]
+    }))
+    .unwrap();
+
+    let mut provider_a =
+        external_identity_context_with_authority("ops-admin", "jwks_auth", Some(AUTHORITY_A));
+    assert_continue(plugin.authorize(&mut provider_a).await);
+
+    // The same subject verified by a second provider of the same mechanism is
+    // a different principal.
+    let mut provider_b =
+        external_identity_context_with_authority("ops-admin", "jwks_auth", Some(AUTHORITY_B));
+    assert_reject(plugin.authorize(&mut provider_b).await, Some(403));
+
+    // An authority-scoped allow entry fails closed when the realm committed no
+    // authority, when there is no realm at all, and for another mechanism.
+    let mut no_authority = external_identity_context_with_authority("ops-admin", "jwks_auth", None);
+    assert_reject(plugin.authorize(&mut no_authority).await, Some(403));
+    let mut unknown_realm = unknown_realm_context("ops-admin");
+    assert_reject(plugin.authorize(&mut unknown_realm).await, Some(403));
+    let mut other_mechanism =
+        external_identity_context_with_authority("ops-admin", "ldap_auth", Some(AUTHORITY_A));
+    assert_reject(plugin.authorize(&mut other_mechanism).await, Some(403));
+
+    // An authority-only entry is bound by the digest alone.
+    let plugin = AccessControl::new(&json!({
+        "allowed_external_identities": [{
+            "identity": "ops-admin",
+            "authority": hex::encode_upper(AUTHORITY_A)
+        }]
+    }))
+    .unwrap();
+    let mut provider_a =
+        external_identity_context_with_authority("ops-admin", "jwks_auth", Some(AUTHORITY_A));
+    assert_continue(plugin.authorize(&mut provider_a).await);
+    let mut provider_b =
+        external_identity_context_with_authority("ops-admin", "jwks_auth", Some(AUTHORITY_B));
+    assert_reject(plugin.authorize(&mut provider_b).await, Some(403));
+    let mut no_authority = external_identity_context_with_authority("ops-admin", "jwks_auth", None);
+    assert_reject(plugin.authorize(&mut no_authority).await, Some(403));
+}
+
+#[tokio::test]
+async fn test_access_control_external_allow_entries_for_several_authorities_merge() {
+    let plugin = AccessControl::new(&json!({
+        "allowed_external_identities": [
+            {"identity": "ops-admin", "authority": hex::encode(AUTHORITY_A)},
+            {"identity": "ops-admin", "authority": hex::encode(AUTHORITY_B)}
+        ]
+    }))
+    .unwrap();
+
+    for authority in [AUTHORITY_A, AUTHORITY_B] {
+        let mut ctx =
+            external_identity_context_with_authority("ops-admin", "jwks_auth", Some(authority));
+        assert_continue(plugin.authorize(&mut ctx).await);
+    }
+    let mut third =
+        external_identity_context_with_authority("ops-admin", "jwks_auth", Some([0xc3; 32]));
+    assert_reject(plugin.authorize(&mut third).await, Some(403));
+
+    // A rule without `authority` for the same identity keeps today's
+    // mechanism-wide meaning alongside authority-scoped entries.
+    let plugin = AccessControl::new(&json!({
+        "allowed_external_identities": [
+            {"identity": "ops-admin", "authority": hex::encode(AUTHORITY_A)},
+            {"identity": "ops-admin", "mechanism": "ldap_auth"}
+        ]
+    }))
+    .unwrap();
+    let mut ldap = external_identity_context_with_authority("ops-admin", "ldap_auth", None);
+    assert_continue(plugin.authorize(&mut ldap).await);
+    let mut provider_b =
+        external_identity_context_with_authority("ops-admin", "jwks_auth", Some(AUTHORITY_B));
+    assert_reject(plugin.authorize(&mut provider_b).await, Some(403));
+}
+
+#[tokio::test]
+async fn test_access_control_external_deny_entry_scoped_to_authority_fails_closed() {
+    let plugin = AccessControl::new(&json!({
+        "allow_authenticated_identity": true,
+        "disallowed_external_identities": [{
+            "identity": "ops-admin",
+            "authority": hex::encode(AUTHORITY_A)
+        }]
+    }))
+    .unwrap();
+
+    let mut provider_a =
+        external_identity_context_with_authority("ops-admin", "jwks_auth", Some(AUTHORITY_A));
+    assert_reject(plugin.authorize(&mut provider_a).await, Some(403));
+
+    // A different committed authority is definitively another principal.
+    let mut provider_b =
+        external_identity_context_with_authority("ops-admin", "jwks_auth", Some(AUTHORITY_B));
+    assert_continue(plugin.authorize(&mut provider_b).await);
+
+    // No committed authority, or no realm at all: the deny entry cannot rule
+    // out that this is the principal it revokes, so it matches.
+    let mut no_authority = external_identity_context_with_authority("ops-admin", "jwks_auth", None);
+    assert_reject(plugin.authorize(&mut no_authority).await, Some(403));
+    let mut unknown_realm = unknown_realm_context("ops-admin");
+    assert_reject(plugin.authorize(&mut unknown_realm).await, Some(403));
+
+    // Other identities are untouched.
+    let mut other = external_identity_context_with_authority("svc", "jwks_auth", Some(AUTHORITY_A));
+    assert_continue(plugin.authorize(&mut other).await);
+
+    // With `mechanism` too, a realm from another mechanism is definitively
+    // another principal, even when it committed no authority.
+    let plugin = AccessControl::new(&json!({
+        "allow_authenticated_identity": true,
+        "disallowed_external_identities": [{
+            "identity": "ops-admin",
+            "mechanism": "jwks_auth",
+            "authority": hex::encode(AUTHORITY_A)
+        }]
+    }))
+    .unwrap();
+    let mut ldap = external_identity_context_with_authority("ops-admin", "ldap_auth", None);
+    assert_continue(plugin.authorize(&mut ldap).await);
+    let mut jwks_no_authority =
+        external_identity_context_with_authority("ops-admin", "jwks_auth", None);
+    assert_reject(plugin.authorize(&mut jwks_no_authority).await, Some(403));
+    let mut provider_b =
+        external_identity_context_with_authority("ops-admin", "jwks_auth", Some(AUTHORITY_B));
+    assert_continue(plugin.authorize(&mut provider_b).await);
+}
+
+#[tokio::test]
+async fn test_access_control_stream_identity_and_authority_scoped_rules() {
+    let allow = AccessControl::new(&json!({
+        "allowed_external_identities": [{"identity": "svc", "authority": hex::encode(AUTHORITY_A)}]
+    }))
+    .unwrap();
+    let mut ctx = create_stream_context(None);
+    ctx.authenticated_identity = Some("svc".to_string());
+    assert_reject(allow.on_stream_connect(&mut ctx).await, Some(403));
+
+    let deny = AccessControl::new(&json!({
+        "allow_authenticated_identity": true,
+        "disallowed_external_identities": [{"identity": "svc", "authority": hex::encode(AUTHORITY_A)}]
+    }))
+    .unwrap();
+    let mut ctx = create_stream_context(None);
+    ctx.authenticated_identity = Some("svc".to_string());
+    assert_reject(deny.on_stream_connect(&mut ctx).await, Some(403));
+}
+
+const ISSUER_A: &str = "https://issuer-a.example";
+const ISSUER_B: &str = "https://issuer-b.example";
+
+/// One `jwks_auth` instance accepting two issuers with distinct signing keys,
+/// as on a route that federates an internal and a partner identity provider.
+fn two_issuer_jwks_auth() -> ferrum_edge::plugins::jwks_auth::JwksAuth {
+    use super::jwks_auth_support::build_rsa_jwks_from_pem_with_kid;
+    let key_a = include_bytes!("../../../tests/fixtures/test_rsa_public.pem");
+    let key_b = include_bytes!("../../../tests/fixtures/test_rsa_public_other.pem");
+    let jwks_a = build_rsa_jwks_from_pem_with_kid(key_a, "issuer-a");
+    let jwks_b = build_rsa_jwks_from_pem_with_kid(key_b, "issuer-b");
+    ferrum_edge::plugins::jwks_auth::JwksAuth::new(
+        &json!({
+            "providers": [
+                { "issuer": ISSUER_A, "jwks": jwks_a.to_string() },
+                { "issuer": ISSUER_B, "jwks": jwks_b.to_string() }
+            ]
+        }),
+        ferrum_edge::plugins::PluginHttpClient::default(),
+    )
+    .expect("two-issuer jwks_auth")
+}
+
+/// Authenticate `subject` from `issuer` through `jwks_auth` with no Consumer
+/// mapping, exactly as the authentication phase does before `access_control`.
+async fn authenticate_via_jwks_issuer(
+    auth: &ferrum_edge::plugins::jwks_auth::JwksAuth,
+    issuer: &str,
+    subject: &str,
+) -> ferrum_edge::plugins::RequestContext {
+    let (private_key, kid): (&[u8], &str) = if issuer == ISSUER_B {
+        (
+            include_bytes!("../../../tests/fixtures/test_rsa_private_other.pem"),
+            "issuer-b",
+        )
+    } else {
+        (
+            include_bytes!("../../../tests/fixtures/test_rsa_private.pem"),
+            "issuer-a",
+        )
+    };
+    let token = super::jwks_auth_support::create_rs256_token_with_kid(
+        &json!({ "iss": issuer, "sub": subject }),
+        private_key,
+        kid,
+    );
+    let mut ctx = create_test_context();
+    ctx.identified_consumer = None;
+    ctx.authenticated_identity = None;
+    ctx.headers
+        .retain(|name, _| !name.eq_ignore_ascii_case("authorization"));
+    ctx.headers
+        .insert("authorization".to_string(), format!("Bearer {token}"));
+    let result = auth
+        .authenticate(&mut ctx, &ferrum_edge::ConsumerIndex::new(&[]))
+        .await;
+    assert_continue(result);
+    assert!(ctx.identified_consumer.is_none());
+    assert_eq!(ctx.authenticated_identity.as_deref(), Some(subject));
+    ctx
+}
+
+/// The committed realm authority digest of an authenticated request, in the
+/// lowercase-hex form `opa` reports as `input.consumer.realm.authority`.
+fn committed_authority_hex(ctx: &ferrum_edge::plugins::RequestContext) -> String {
+    let realm = ctx
+        .authenticated_identity_realm()
+        .expect("an authenticated external identity carries its realm");
+    hex::encode(
+        realm
+            .authority()
+            .expect("a multi-provider mechanism commits an authority"),
+    )
+}
+
+/// Two `jwks_auth` providers on one route issue the same subject. A
+/// mechanism-only rule cannot tell them apart; an authority-scoped allow rule
+/// admits only the provider it names and answers `403` for the other, and an
+/// authority-scoped deny rule revokes only that provider's principal.
+#[tokio::test]
+async fn test_access_control_two_jwks_providers_same_subject_bound_by_authority() {
+    let auth = two_issuer_jwks_auth();
+    let mut corp = authenticate_via_jwks_issuer(&auth, ISSUER_A, "ops-admin").await;
+    let mut partner = authenticate_via_jwks_issuer(&auth, ISSUER_B, "ops-admin").await;
+    let corp_authority = committed_authority_hex(&corp);
+    let partner_authority = committed_authority_hex(&partner);
+    assert_ne!(
+        corp_authority, partner_authority,
+        "two providers of one mechanism commit different authorities"
+    );
+
+    // Mechanism-only scoping (the rule shape without `authority`) admits both.
+    let mechanism_only = AccessControl::new(&json!({
+        "allowed_external_identities": [{"identity": "ops-admin", "mechanism": "jwks_auth"}]
+    }))
+    .unwrap();
+    assert_continue(mechanism_only.authorize(&mut corp).await);
+    assert_continue(mechanism_only.authorize(&mut partner).await);
+
+    let bound = AccessControl::new(&json!({
+        "allowed_external_identities": [{
+            "identity": "ops-admin",
+            "mechanism": "jwks_auth",
+            "authority": corp_authority
+        }]
+    }))
+    .unwrap();
+    assert_continue(bound.authorize(&mut corp).await);
+    let rejected = bound.authorize(&mut partner).await;
+    assert_reject(rejected, Some(403));
+
+    let revoked = AccessControl::new(&json!({
+        "allow_authenticated_identity": true,
+        "disallowed_external_identities": [{
+            "identity": "ops-admin",
+            "authority": partner_authority
+        }]
+    }))
+    .unwrap();
+    assert_continue(revoked.authorize(&mut corp).await);
+    assert_reject(revoked.authorize(&mut partner).await, Some(403));
+}
+
+async fn introspection_server_for(subject: &str) -> wiremock::MockServer {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/introspect"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "active": true,
+            "username": subject,
+            "sub": subject
+        })))
+        .mount(&server)
+        .await;
+    server
+}
+
+/// Authenticate a bearer token through one `oauth2_introspection` authority
+/// whose endpoint vouches for `subject`, with no Consumer mapping.
+async fn authenticate_via_introspection(
+    server: &wiremock::MockServer,
+    subject: &str,
+) -> ferrum_edge::plugins::RequestContext {
+    let plugin = ferrum_edge::plugins::oauth2_introspection::Oauth2Introspection::new(
+        &json!({
+            "providers": [{
+                "introspection_endpoint": format!("{}/introspect", server.uri()),
+                "client_auth": {"method": "none"}
+            }]
+        }),
+        ferrum_edge::plugins::PluginHttpClient::default(),
+    )
+    .expect("oauth2_introspection");
+    let mut ctx = create_test_context();
+    ctx.identified_consumer = None;
+    ctx.authenticated_identity = None;
+    ctx.headers
+        .retain(|name, _| !name.eq_ignore_ascii_case("authorization"));
+    ctx.headers.insert(
+        "authorization".to_string(),
+        "Bearer opaque-token".to_string(),
+    );
+    let result = plugin
+        .authenticate(&mut ctx, &ferrum_edge::ConsumerIndex::new(&[]))
+        .await;
+    assert_continue(result);
+    assert!(ctx.identified_consumer.is_none());
+    assert_eq!(ctx.authenticated_identity.as_deref(), Some(subject));
+    ctx
+}
+
+/// The same subject vouched for by two introspection authorities: an
+/// authority-scoped allow rule admits only the authority it names.
+#[tokio::test]
+async fn test_access_control_two_introspection_authorities_same_subject_bound_by_authority() {
+    let first = introspection_server_for("ops-admin").await;
+    let second = introspection_server_for("ops-admin").await;
+    let mut from_first = authenticate_via_introspection(&first, "ops-admin").await;
+    let mut from_second = authenticate_via_introspection(&second, "ops-admin").await;
+    let first_authority = committed_authority_hex(&from_first);
+    assert_ne!(first_authority, committed_authority_hex(&from_second));
+
+    let bound = AccessControl::new(&json!({
+        "allowed_external_identities": [{
+            "identity": "ops-admin",
+            "mechanism": "oauth2_introspection",
+            "authority": first_authority
+        }]
+    }))
+    .unwrap();
+    assert_continue(bound.authorize(&mut from_first).await);
+    assert_reject(bound.authorize(&mut from_second).await, Some(403));
 }
 
 // ---- Consumer rename referential integrity ----

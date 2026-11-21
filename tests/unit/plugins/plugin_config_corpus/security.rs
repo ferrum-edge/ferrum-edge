@@ -214,7 +214,12 @@ pub(super) fn contract(name: &str) -> Option<PluginConfigContract> {
         .with_free_form_objects(&["set"]),
         "access_control" => PluginConfigContract::closed(vec![json!({
             "allowed_external_identities": [
-                { "identity": "alice@example.com", "mechanism": "jwks_auth" }
+                { "identity": "alice@example.com", "mechanism": "jwks_auth" },
+                {
+                    "identity": "ops-admin",
+                    "mechanism": "jwks_auth",
+                    "authority": "3f9c3f9c3f9c3f9c3f9c3f9c3f9c3f9c3f9c3f9c3f9c3f9c3f9c3f9c3f9c3f9c"
+                }
             ],
             "disallowed_external_identities": [{ "identity": "mallory@example.com" }]
         })]),
