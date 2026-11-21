@@ -738,6 +738,138 @@ async fn if_match_on_a_route_that_does_not_evaluate_it_is_refused() {
     assert_eq!(batch.status, 400, "{}", batch.body);
 }
 
+fn if_match_spec_document(id: &str) -> Value {
+    json!({
+        "openapi": "3.0.3", "info": {"title": id, "version": "1"},
+        "paths": {"/items": {"get": {"responses": {"200": {"description": "OK"}}}}},
+        "x-ferrum-proxy": {"id": id, "listen_path": format!("/{id}"),
+            "backend_host": "backend.example.com", "backend_port": 8080}
+    })
+}
+
+/// `POST /api-specs` and the cascading `DELETE /api-specs/{id}` dispatch before
+/// the shared `If-Match` refusal, so they refuse the header themselves instead
+/// of creating or deleting unconditionally, including when the header is the
+/// strong `ETag` from `GET /api-specs/{id}` (issue #7439). The role gate still
+/// answers first for a non-admin caller.
+#[tokio::test]
+async fn api_spec_create_and_delete_refuse_if_match_without_writing() {
+    let (_dir, base, _shutdown) = serve().await;
+    let imported = send(
+        Method::POST,
+        &base,
+        "/api-specs",
+        &admin_token(),
+        None,
+        Some(&if_match_spec_document("spec-held")),
+    )
+    .await;
+    assert_eq!(imported.status, 201, "{}", imported.body);
+    let spec_id = imported.body["id"].as_str().unwrap().to_string();
+    let spec_path = format!("/api-specs/{spec_id}");
+    let read = get(&base, &spec_path).await;
+    assert_eq!(read.status, 200, "{}", read.body);
+    let spec_etag = read.etag.expect("GET /api-specs/{id} returns an ETag");
+
+    let operator = token_with_role(JWT_SECRET, "operator");
+    for header in [spec_etag.as_str(), "*", r#""row-token""#, "unquoted"] {
+        let created = send(
+            Method::POST,
+            &base,
+            "/api-specs",
+            &admin_token(),
+            Some(header),
+            Some(&if_match_spec_document("spec-refused")),
+        )
+        .await;
+        assert_eq!(
+            created.status, 400,
+            "POST If-Match {header}: {}",
+            created.body
+        );
+        assert!(
+            created.body["error"]
+                .as_str()
+                .is_some_and(|error| error.starts_with("If-Match is only supported")),
+            "POST If-Match {header}: {}",
+            created.body
+        );
+
+        let deleted = send(
+            Method::DELETE,
+            &base,
+            &spec_path,
+            &admin_token(),
+            Some(header),
+            None,
+        )
+        .await;
+        assert_eq!(
+            deleted.status, 400,
+            "DELETE If-Match {header}: {}",
+            deleted.body
+        );
+        assert!(
+            deleted.body["error"]
+                .as_str()
+                .is_some_and(|error| error.starts_with("If-Match is only supported")),
+            "DELETE If-Match {header}: {}",
+            deleted.body
+        );
+
+        for (method, path, body) in [
+            (
+                Method::POST,
+                "/api-specs",
+                Some(if_match_spec_document("spec-operator")),
+            ),
+            (Method::DELETE, spec_path.as_str(), None),
+        ] {
+            let forbidden = send(
+                method.clone(),
+                &base,
+                path,
+                &operator,
+                Some(header),
+                body.as_ref(),
+            )
+            .await;
+            assert_eq!(
+                forbidden.status, 403,
+                "{method} {path} as operator with If-Match {header}: {}",
+                forbidden.body
+            );
+        }
+    }
+
+    // Nothing was created or deleted.
+    let listed = get(&base, "/api-specs").await;
+    assert_eq!(listed.status, 200, "{}", listed.body);
+    let items = listed.body["items"].as_array().expect("items array");
+    assert_eq!(items.len(), 1, "{}", listed.body);
+    assert_eq!(items[0]["id"], spec_id.as_str());
+    assert_eq!(get(&base, &spec_path).await.status, 200);
+    assert_eq!(get(&base, "/proxies/spec-held").await.status, 200);
+    for refused in ["spec-refused", "spec-operator"] {
+        assert_eq!(get(&base, &format!("/proxies/{refused}")).await.status, 404);
+    }
+
+    // Without the header the delete is still the documented unconditional
+    // cascade.
+    let deleted = send(
+        Method::DELETE,
+        &base,
+        &spec_path,
+        &admin_token(),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(deleted.status, 204, "{}", deleted.body);
+    assert_eq!(get(&base, &spec_path).await.status, 404);
+    assert_eq!(get(&base, "/proxies/spec-held").await.status, 404);
+}
+
 // Fixture credential values for the credential sub-route tests (issue #7393).
 const ENTRY_A: &str = "fixture-entry-a-0123456789abcdef";
 const ENTRY_B: &str = "fixture-entry-b-0123456789abcdef";
