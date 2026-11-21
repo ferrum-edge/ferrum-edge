@@ -4379,3 +4379,55 @@ async fn relabelled_bare_json_upload_is_not_exempted_as_framed_grpc() {
         );
     }
 }
+
+/// Integrity-field retirement follows rewrite eligibility: a header rule that
+/// relabels a digest-bearing JSON upload as framed gRPC-Web does not stop the
+/// body rules from rewriting it (a BOM-prefixed document included), so its
+/// stale digests must not reach the backend beside the rewritten bytes. A
+/// client-declared framed upload keeps its fields
+/// (`integrity_headers_survive_when_body_rules_cannot_rewrite`).
+#[tokio::test]
+async fn relabelled_bom_json_upload_retires_stale_integrity_headers() {
+    let relabel = RequestTransformer::new(&json!({"rules": [
+        {"operation": "update", "target": "header", "key": "content-type",
+         "value": "application/grpc-web+json"}
+    ]}))
+    .unwrap();
+    let body_plugin = RequestTransformer::new(&json!({
+        "rules": [{"operation": "remove", "target": "body", "key": "debug"}]
+    }))
+    .unwrap();
+
+    let mut ctx = post_ctx();
+    let outbound = run_chain_then_retire(
+        &[&relabel, &body_plugin],
+        &mut ctx,
+        integrity_headers(Some("application/json")),
+    )
+    .await
+    .expect("the relabelled upload's stale digests must be retired");
+    for field in ["content-digest", "repr-digest", "digest", "content-md5"] {
+        assert!(
+            !outbound.keys().any(|name| name.eq_ignore_ascii_case(field)),
+            "{field} must be retired: {outbound:?}"
+        );
+    }
+    assert_eq!(outbound.get("x-keep").map(String::as_str), Some("1"));
+    assert_eq!(
+        outbound.get("content-type").map(String::as_str),
+        Some("application/grpc-web+json")
+    );
+
+    // And the transform does rewrite that representation.
+    let rewritten = body_plugin
+        .transform_request_body_with_context(
+            &mut ctx,
+            &bom(br#"{"debug":true,"keep":1}"#),
+            Some("application/grpc-web+json"),
+            &outbound,
+        )
+        .await
+        .expect("the relabelled BOM-prefixed JSON body is rewritten");
+    let rewritten: serde_json::Value = serde_json::from_slice(&rewritten).unwrap();
+    assert_eq!(rewritten, json!({"keep": 1}));
+}

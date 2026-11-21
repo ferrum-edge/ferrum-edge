@@ -1154,8 +1154,11 @@ pub(crate) fn is_body_bound_request_integrity_header(name: &str) -> bool {
 
 /// Whether request-transformer body rules may replace the bytes of a request
 /// with these FINAL outbound headers: the body is not proven empty and the
-/// effective `Content-Type` is absent or a JSON document type (framed gRPC
-/// `+json` can never parse as one document).
+/// effective `Content-Type` is absent or a JSON document type. A framed gRPC
+/// `+json` label is exempt only when the client's own wire `Content-Type`
+/// declared that framing ([`request_wire_declares_framed_grpc`]): a header rule
+/// that relabels a JSON upload does not stop the transform from rewriting it
+/// (GHSA-pq95-952r-2x32), so its stale integrity fields must still be retired.
 ///
 /// The method is deliberately NOT consulted: an HTTP/2 or HTTP/3 `GET` may
 /// carry DATA without `Content-Length`, and the body pass buffers and rewrites
@@ -1181,7 +1184,8 @@ pub(crate) fn request_body_rules_may_rewrite(
             .map(String::as_str)
             .is_none_or(|content_type| {
                 body_transform::is_json_content_type(content_type)
-                    && !body_transform::is_framed_grpc_content_type(content_type)
+                    && !(body_transform::is_framed_grpc_content_type(content_type)
+                        && request_wire_declares_framed_grpc(ctx))
             })
 }
 
