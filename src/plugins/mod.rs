@@ -2353,6 +2353,12 @@ pub(crate) struct A2aGatewayClaim {
     /// and refuses a change of response-shaping operation class the response
     /// phase above was not set up for.
     pub(crate) classified_request_body: Option<bytes::Bytes>,
+    /// Whether the configured A2A version header was present when that
+    /// JSON-RPC classification was decided. An unknown method is classifiable
+    /// only with it, so the byte-identity shortcut above also requires the
+    /// finalized headers to still carry it when it was present at arrival
+    /// (GHSA-q25c-76f4-fp7h).
+    pub(crate) classified_with_version_header: bool,
 }
 
 /// Lifecycle of an Agent Card rewrite `a2a_gateway` claimed on the response path

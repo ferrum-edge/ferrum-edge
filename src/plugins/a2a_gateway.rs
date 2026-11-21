@@ -1123,6 +1123,8 @@ impl A2aGateway {
         } else {
             None
         };
+        let classified_with_version_header = detection.binding == A2aBinding::JsonRpc
+            && header_value(headers, &self.detection.version_header).is_some();
         ctx.claim_a2a_gateway(A2aGatewayClaim {
             owner: self.instance_id,
             binding: detection.binding.as_str(),
@@ -1134,6 +1136,7 @@ impl A2aGateway {
             card_rewrite: None,
             card_body_replaced: false,
             classified_request_body,
+            classified_with_version_header,
         });
 
         if !self.observability.emit_metadata {
@@ -1279,6 +1282,22 @@ impl A2aGateway {
                         .any(|canonical| is_case_variant_of(key, canonical))
                 })
             })
+    }
+
+    /// Whether the finalized headers still satisfy the header inputs the
+    /// arrival-time JSON-RPC classification read: a JSON media type, and the
+    /// version header when it was present (an unknown method is classifiable
+    /// only with it). A header-only transform after admission that breaks
+    /// either must not ride the byte-identity shortcut past the full final
+    /// check (GHSA-q25c-76f4-fp7h).
+    fn final_headers_preserve_classification(
+        &self,
+        claim: &A2aGatewayClaim,
+        headers: &HashMap<String, String>,
+    ) -> bool {
+        content_type_is_json(headers)
+            && (!claim.classified_with_version_header
+                || header_value(headers, &self.detection.version_header).is_some())
     }
 
     /// Whether this instance's JSON-RPC Agent Card call is about to be answered
@@ -2419,13 +2438,16 @@ impl Plugin for A2aGateway {
         // representation gate decoded a content coding for this request.
         let decoded_view = ctx.inspectable_final_request_body_owned();
         let body: &[u8] = decoded_view.as_deref().unwrap_or(body);
-        if self
-            .claim(ctx)
-            .and_then(|claim| claim.classified_request_body.as_deref())
-            .is_some_and(|classified| classified == body)
-        {
+        if self.claim(ctx).is_some_and(|claim| {
+            claim
+                .classified_request_body
+                .as_deref()
+                .is_some_and(|classified| classified == body)
+                && self.final_headers_preserve_classification(claim, headers)
+        }) {
             // The exact bytes `before_proxy` classified and admitted, under the
-            // same instance configuration and request identity.
+            // same instance configuration, request identity, and the header
+            // inputs that classification read.
             return PluginResult::Continue;
         }
         let Some(detection) = self.detect_jsonrpc_body(ctx, headers, body) else {

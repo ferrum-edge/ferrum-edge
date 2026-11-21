@@ -8390,3 +8390,61 @@ async fn card_call_owned_by_a_non_rewriting_sibling_is_refused_by_a_rewriting_in
         ));
     }
 }
+
+/// The byte-identity shortcut in the final hook applies only while the
+/// finalized headers still satisfy what the arrival classification read. A
+/// header-only transform after admission that relabels the media type, or
+/// drops the version header an unknown method was admitted under, falls
+/// through to the full final check with the very same bytes.
+#[tokio::test]
+async fn byte_identical_final_body_with_changed_classification_headers_is_rechecked() {
+    let gateway = plugin(json!({}));
+
+    // Content-Type relabelled to text/plain, bytes unchanged.
+    let arrival = json!({"jsonrpc": "2.0", "id": 1, "method": "tasks/get"});
+    let (mut ctx, mut headers) = jsonrpc_ctx(arrival.clone());
+    assert!(matches!(
+        gateway.before_proxy(&mut ctx, &mut headers).await,
+        PluginResult::Continue
+    ));
+    let same_bytes = arrival.to_string();
+    headers.insert("content-type".to_string(), "text/plain".to_string());
+    let PluginResult::Reject { body, .. } = gateway
+        .on_final_request_body_with_context(&mut ctx, &headers, same_bytes.as_bytes())
+        .await
+    else {
+        panic!("a media type relabelled to non-JSON must not ride the byte-identity shortcut");
+    };
+    let body: Value = serde_json::from_str(&body).expect("refusal is JSON");
+    assert_eq!(body["error"]["code"], -32001);
+    assert_eq!(
+        ctx.metadata.get("a2a.error").map(String::as_str),
+        Some("operation_class_unprovable")
+    );
+
+    // Version header removed for a vendor method admitted only because of it.
+    let vendor = json!({"jsonrpc": "2.0", "id": 2, "method": "vendor/ping"});
+    let (mut ctx, mut headers) = jsonrpc_ctx(vendor.clone());
+    headers.insert("a2a-version".to_string(), "0.3.0".to_string());
+    assert!(matches!(
+        gateway.before_proxy(&mut ctx, &mut headers).await,
+        PluginResult::Continue
+    ));
+    assert_eq!(
+        ctx.metadata.get("a2a.method").map(String::as_str),
+        Some("unknown")
+    );
+    let same_bytes = vendor.to_string();
+    // With the header still present the shortcut applies unchanged.
+    assert!(matches!(
+        gateway
+            .on_final_request_body_with_context(&mut ctx, &headers, same_bytes.as_bytes())
+            .await,
+        PluginResult::Continue
+    ));
+    headers.remove("a2a-version");
+    let result = gateway
+        .on_final_request_body_with_context(&mut ctx, &headers, same_bytes.as_bytes())
+        .await;
+    assert_uninspectable_refusal(result, &ctx, "version header removed after admission");
+}

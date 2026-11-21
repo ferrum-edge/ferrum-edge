@@ -122,7 +122,9 @@ it carries no JSON-RPC envelope — for a request claimed by this instance, by a
 sibling, or by none. Raise
 `detection.max_request_body_size` (or set it to `0`) if transforms legitimately
 grow bodies past it. A finalized body byte-identical to the one
-classified at arrival is not re-parsed, and an instance with no deny rule, no
+classified at arrival is not re-parsed while the finalized headers still carry
+a JSON media type and, when it was present at arrival, the version header; a
+header-only change to either re-runs the full check. An instance with no deny rule, no
 card rewriting, and no metadata skips the final-body hook entirely.
 
 **Per-consumer method grants.** An `allow` entry in `policy.methods` may carry
