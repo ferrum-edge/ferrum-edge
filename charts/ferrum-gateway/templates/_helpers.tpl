@@ -759,6 +759,20 @@ Validation: fail render on missing/unsafe configuration.
 {{- if (.Values.k8sController | default dict).enabled -}}
 {{- fail "k8sController.enabled=true is not supported on the ferrum-gateway chart: this chart does not render the ClusterRole the in-cluster Kubernetes CRD controller needs (core namespace/service/secret/configmap/endpointslice watches 403-retry for the life of the process without it). Use the ferrum-mesh chart (charts/ferrum-mesh, controlPlane.rbac) instead. Leave k8sController.enabled=false (the default) so mode=cp renders FERRUM_K8S_CONTROLLER_ENABLED=false and FERRUM_K8S_POD_DISCOVERY_ENABLED=false." -}}
 {{- end -}}
+{{/* Issue #7426: Kubernetes refuses an autoscaling/v2 HPA whose maxReplicas
+     is below minReplicas, and allows minReplicas=0 only with an Object or
+     External metric. hpa.yaml emits only Resource (cpu/memory) metrics, so an
+     enabled HPA needs 1 <= minReplicas <= maxReplicas. */}}
+{{- if .Values.autoscaling.enabled -}}
+{{- $minReplicas := .Values.autoscaling.minReplicas | int -}}
+{{- $maxReplicas := .Values.autoscaling.maxReplicas | int -}}
+{{- if lt $minReplicas 1 -}}
+{{- fail (printf "autoscaling.minReplicas=%d is invalid with autoscaling.enabled=true: the chart's HorizontalPodAutoscaler uses only Resource (cpu/memory) metrics, and Kubernetes allows scale-to-zero only with Object or External metrics. Set autoscaling.minReplicas to at least 1." $minReplicas) -}}
+{{- end -}}
+{{- if lt $maxReplicas $minReplicas -}}
+{{- fail (printf "autoscaling.maxReplicas=%d is below autoscaling.minReplicas=%d; Kubernetes rejects a HorizontalPodAutoscaler whose maxReplicas is less than minReplicas. Set autoscaling.maxReplicas >= autoscaling.minReplicas." $maxReplicas $minReplicas) -}}
+{{- end -}}
+{{- end -}}
 {{/* A generic secretFileMount emits <name>_FILE. Most chart-managed variables
      are also rendered directly, which gives the external-secret resolver two
      providers for the same base and aborts startup. Only the three first-class

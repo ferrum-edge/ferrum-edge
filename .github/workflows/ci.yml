@@ -4920,6 +4920,40 @@ jobs:
             exit 1
           fi
           grep -Fq 'name: FERRUM_FILE_CONFIG_PATH' "$RUNNER_TEMP/ferrum-gateway-helm-results/file-rendered.yaml"
+          # Issue #7426: an enabled HPA must be admissible. The chart emits only
+          # Resource metrics, so scale-to-zero and inverted bounds fail the
+          # render (naming the offending setting) before a manifest exists.
+          for hpa_case in \
+            'zero-min|autoscaling.minReplicas=0|autoscaling.minReplicas=0' \
+            'inverted|autoscaling.minReplicas=6,autoscaling.maxReplicas=3|autoscaling.maxReplicas=3 is below autoscaling.minReplicas=6'; do
+            IFS='|' read -r hpa_name hpa_set hpa_expect <<< "$hpa_case"
+            if helm template ferrum ./charts/ferrum-gateway --namespace ferrum \
+              --set "autoscaling.enabled=true,${hpa_set}" \
+              > "$RUNNER_TEMP/ferrum-gateway-helm-results/hpa-${hpa_name}.out" \
+              2> "$RUNNER_TEMP/ferrum-gateway-helm-results/hpa-${hpa_name}.err"; then
+              echo "::error title=Inadmissible gateway HPA rendered::autoscaling ${hpa_set} must fail the render"
+              exit 1
+            fi
+            grep -Fq "$hpa_expect" "$RUNNER_TEMP/ferrum-gateway-helm-results/hpa-${hpa_name}.err"
+          done
+          helm template ferrum ./charts/ferrum-gateway --namespace ferrum \
+            --set autoscaling.enabled=true,autoscaling.minReplicas=1,autoscaling.maxReplicas=1 \
+            --show-only templates/hpa.yaml \
+            > "$RUNNER_TEMP/ferrum-gateway-helm-results/hpa-equal-one.yaml"
+          grep -Fq 'minReplicas: 1' "$RUNNER_TEMP/ferrum-gateway-helm-results/hpa-equal-one.yaml"
+          grep -Fq 'maxReplicas: 1' "$RUNNER_TEMP/ferrum-gateway-helm-results/hpa-equal-one.yaml"
+          helm template ferrum ./charts/ferrum-gateway --namespace ferrum \
+            --set autoscaling.enabled=true \
+            > "$RUNNER_TEMP/ferrum-gateway-helm-results/hpa-defaults.yaml"
+          grep -Fq 'kind: HorizontalPodAutoscaler' "$RUNNER_TEMP/ferrum-gateway-helm-results/hpa-defaults.yaml"
+          grep -Fq 'minReplicas: 2' "$RUNNER_TEMP/ferrum-gateway-helm-results/hpa-defaults.yaml"
+          grep -Fq 'maxReplicas: 10' "$RUNNER_TEMP/ferrum-gateway-helm-results/hpa-defaults.yaml"
+          # Disabled autoscaling renders the Deployment and no HPA.
+          grep -Fq 'kind: Deployment' "$RUNNER_TEMP/ferrum-gateway-helm-results/file-rendered.yaml"
+          if grep -Fq 'kind: HorizontalPodAutoscaler' "$RUNNER_TEMP/ferrum-gateway-helm-results/file-rendered.yaml"; then
+            echo "::error title=Gateway HPA rendered with autoscaling disabled::autoscaling.enabled=false must not render an HPA"
+            exit 1
+          fi
           # image.pullSecrets is a list of Secret NAMES (strings). The schema
           # used to declare object items, so the documented string form was
           # rejected outright and the schema-valid object form rendered
