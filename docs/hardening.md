@@ -16,7 +16,9 @@ Companion documents:
 > the `v0.9.x` channel (see the [Releases
 > page](https://github.com/ferrum-edge/ferrum-edge/releases) for the current
 > tag). The latest published release is **v0.9.20** (see the
-> [changelog](../CHANGELOG.md#0920---2026-11-02)). Read
+> [changelog](../CHANGELOG.md#0920---2026-11-02)). **v0.9.21** is the current
+> release candidate (see the
+> [changelog](../CHANGELOG.md#0921---2026-11-21)). Read
 > [support_policy.md](support_policy.md) before treating any item here as a
 > stability commitment.
 >

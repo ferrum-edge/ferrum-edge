@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.21] - 2026-11-21
+
+This patch release follows published 0.9.20. It fixes security advisories in
+the authentication, `access_control`, `oidc_relying_party`, chargeback,
+`a2a_gateway`, transformer and AI plugins, the Admin API and the mesh. Sidecar
+and NodeWaypoint data planes now apply mesh VirtualService HTTP routes, the
+data plane applies wildcard DestinationRules, refused enforcing Istio security
+resources fail closed, configuration fields that nothing read are removed, and
+the `ferrum-mesh` chart drops its standalone mesh CA component. Many changes
+refuse configuration or traffic that 0.9.20 accepted. The `V001` baseline
+checksum changes, so PostgreSQL, MySQL and SQLite build-out databases must be
+rebuilt, and the ConfigSync protocol revision is now 6, so control planes and
+data planes must be upgraded together. Read
+[Upgrading to 0.9.21](docs/upgrade_guide.md#upgrading-to-0921) before updating
+gateways, control planes, custom plugins, charts or contract consumers.
+
 ### Security
 - **SQLx 0.9.1 retires two advisory exceptions.** The database layer now
   resolves `libsqlite3-sys` 0.40.0 (bundled SQLite >= 3.54.0), which fixes
@@ -174,8 +190,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Fixed GHSA-49cr-v28q-9hgp: `a2a_gateway`, `ai_semantic_firewall`,
   `ai_prompt_shield` (all scan modes) and `ai_rate_limiter` now screen governed
   JSON bodies for duplicate object member names with the shared `json_dup_keys`
-  scanner before evaluating policy, so a first-key-wins backend can no longer
-  act on a member the gateway never judged.
+  scanner before evaluating policy. A duplicate-member body is no longer judged
+  on one member while a first-key-wins backend acts on another: each plugin
+  refuses it by default or, where configured to (`ai_prompt_shield`
+  `action: warn`; `ai_semantic_firewall` with `fail_on_uninspectable_body:
+  false`, `on_error: allow` or `warn`, or `mode: dry_run`), records it as
+  ambiguous or uninspectable and lets it through.
 - Fixed GHSA-rxwj-x6c6-f4j5: Consumer-username lists and per-caller rate-limit
   state no longer match or share state with an unmapped external identity
   (`jwks_auth`, `ldap_auth`, `oauth2_introspection`, `oidc_relying_party`,
@@ -239,6 +259,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
   Decode validates bodies with the plugins' own constructors and builds no DNS
   or HTTP clients. A `null` `source_namespace` is treated as absent.
+- Fixed GHSA-c259-vchc-3vgr: `jwt_auth` (`token_lookup: query:<name>`),
+  `jwks_auth` and `oauth2_introspection` (`providers[].from_params`) now apply
+  the `key_auth` `;`-alias query contract (issue #6579). A request whose
+  configured token query name also appears as a `;`-separated sub-parameter now
+  gets the token plugin's `401` `Ambiguous token query parameter` rejection
+  instead of being treated as carrying no token (another mechanism can still
+  authenticate the request in multi-auth mode). The alias is redacted for OPA
+  and `request_mirror`, and is removed from the forwarded query when
+  credentials are hidden (#7464).
+- Fixed GHSA-r378-r7j8-2qm3: `access_control` `allowed_external_identities` and
+  `disallowed_external_identities` entries accept an optional `authority`, the
+  verifying realm's authority digest, so an entry can be scoped by verifying
+  realm. A `mechanism`-only entry still matches an equal subject from every
+  provider of that mechanism on the route; see the upgrade guide for the
+  matching rules, including providers that share a digest (#7465).
+- Fixed GHSA-6rwj-gc4r-3jm9: `oidc_relying_party` sends an accepted post-login
+  target in the normalized form it validated, and refuses a target that
+  contains an ASCII control character or a backslash, which lands on
+  `behavior.post_login_default_path`. The target is judged when the login
+  starts and re-checked at the callback (#7467).
+- Fixed GHSA-q9vj-rf66-3j58: `api_chargeback` (`/charges`) and
+  `api_chargeback_sink` key billing rows on the authenticated principal. An
+  unmapped external principal is reported as
+  `external:<mechanism>:<authority>:<identity>` (`-` for a missing mechanism or
+  authority, as in `external:-:-:alice` for an external stream identity;
+  an oversized or marker-bearing key is given its `~sha256:` digest form), so
+  external principals no longer share a row with a Consumer that uses the same
+  string and are distinguished by mechanism and authority (#7466).
+- Fixed GHSA-q25c-76f4-fp7h: with `discovery.rewrite_agent_card_urls` on (the
+  default) and the `jsonrpc` binding served, `a2a_gateway` refuses a
+  `POST endpoint.path` request it cannot classify as JSON-RPC instead of
+  forwarding it unclaimed, so an Agent Card call can no longer return the
+  backend's un-rewritten internal URLs (#7468).
+- Fixed GHSA-pq95-952r-2x32: `request_transformer` and `response_transformer`
+  instances with JSON body rules refuse a body with duplicate object member
+  names (`400` for a request, `502` for a backend response). Before, a repeated
+  member collapsed to its last value and the rules ran against that value,
+  which a first-key-wins next hop could read differently. Body rules also strip one
+  leading UTF-8 byte order mark from a request body before parsing; a
+  BOM-prefixed backend response under a body policy is still refused by the
+  shared response representation gate (#7469).
 
 ### Added
 - **Sidecar data planes apply mesh-bound VirtualService `http[]` routes**
@@ -830,9 +891,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   under Helm's default Kubernetes version (1.20.0), which is not a real
   cluster. An explicit `--kube-version` below 1.29 still fails, as in
   ferrum-mesh (issue #7299).
-- `openapi.yaml` `info.version` now tracks the crate version (0.9.20,
-  previously frozen at 0.2.0); a unit test keeps them equal, and releases bump
-  both (#7304).
+- `openapi.yaml` `info.version` now tracks the crate version (previously
+  frozen at 0.2.0); a unit test keeps them equal, and releases bump both
+  (#7304).
 - `mesh_authz`, `workload_metrics` and the injected
   `_effective_mesh_authz_baggage_gates` share one `MeshTrustedHboneAssertors`
   OpenAPI schema. It now matches the runtime parser: Unicode whitespace is
@@ -1086,10 +1147,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Records already in the store are not touched, but one that holds no usable
     key now fails closed once a consumer references it.
 - **BREAKING — ConfigSync protocol revision 5** (issue #7233). `MeshConfig` gained
-  `virtual_service_http_routes` and `MeshSlice` gained `http_routes`, so the
-  ConfigSync build identity moves to `configsync.r5`; a CP and DP from
-  different builds refuse each other at `Subscribe`.
-- **BREAKING:** (issue #7417) `ai_prompt_shield` in `content` / `all` scan modes refuses
+  `virtual_service_http_routes` and `MeshSlice` gained `http_routes`, which
+  moved the ConfigSync build identity to `configsync.r5`; 0.9.21 ships
+  revision 6 (`configsync.r6`, issue #7417). A CP and DP from different builds
+  refuse each other at `Subscribe`.
+- **BREAKING:** (issue #7417) `ai_prompt_shield` in `content` / `all` / `mcp_arguments` scan modes refuses
   (reject/redact, 400 `ambiguous_json`) or records (warn) request bodies with
   duplicate JSON member names. (#7417)
 - **BREAKING:** (issue #7417) ConfigSync protocol revision is now 6 (new plugin-trigger
@@ -1100,8 +1162,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `fail_on_uninspectable_body`). (#7417)
 - **BREAKING:** (issue #7417) `a2a_gateway` refuses JSON-RPC bodies with duplicate member
   names under a policy that can deny (`-32001`,
-  `a2a.error=request_body_uninspectable`) and leaves them unclassified
-  otherwise. (#7417)
+  `a2a.error=request_body_uninspectable`) and, after GHSA-q25c-76f4-fp7h
+  (#7468), also whenever Agent Card rewriting is on for an instance serving the
+  `jsonrpc` binding; otherwise it leaves them unclassified. (#7417)
 - **BREAKING:** (issue #7417) `ai_rate_limiter` treats request bodies with duplicate member
   names as unparseable (refused with 400 while `model_limits` is set). (#7417)
 - **BREAKING:** (issue #7417) WAF `global_exemptions.consumers` and rule
@@ -1120,7 +1183,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and an external host a wildcard rule asked to dial over TLS went out in
   plaintext. Wildcards now apply on Sidecar, Ambient, ServiceWaypoint,
   NodeWaypoint and EgressGateway upstreams (EastWestGateway SNI-passthrough
-  Service upstreams stay ungoverned by any DestinationRule, as before). Per
+  Service upstreams follow DestinationRules too, without TLS origination; see
+  #7424). Per
   destination host the winner is the most specific lookup tier (client, then
   target service, then root namespace), then the most specific host (an exact
   host or Service alias beats any wildcard, a longer suffix beats a shorter
@@ -2841,6 +2905,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `openapi.yaml` spells its 14 chargeback price `maximum` bounds as `1.0e+288`.
   YAML 1.1 resolvers (libyaml/Psych, PyYAML) read the signless `1.0e288` as a
   string (#7408).
+- `POST /api-specs` and `DELETE /api-specs/{id}` refuse a request that carries
+  `If-Match` with `400`, like other mutating routes that do not evaluate it.
+  Both ignored the header before, so a conditional `DELETE` cascade-deleted the
+  spec and its owned resources unconditionally (#7459, issue #7439).
+- The plugin sensitivity schema classifies root `redis_url` for `jwks_auth`,
+  `hmac_auth` and `soap_ws_security` with the Redis projection the other
+  Redis-backed plugins use (#7460, issue #7438).
+- `ferrum-gateway` chart: with `autoscaling.enabled=true`, the render fails
+  unless `1 <= minReplicas <= autoscaling.maxReplicas`, where `minReplicas` is
+  `autoscaling.minReplicas` or, when that is `null` (omitted from the HPA),
+  Kubernetes' default of `1`, instead of producing a HorizontalPodAutoscaler
+  that Kubernetes refuses (#7461, issue #7426).
 
 ### Performance
 - **The TLS record layer now uses AWS-LC's AES-GCM on the CPUs where it is
@@ -3167,6 +3243,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   with a passive policy. They no longer allocate DashMap's `4 × cores`
   cache-padded shards (about 16 KiB per proxy on 16 cores), so the 1 s passive
   recovery sweep and the `/metrics` walk visit fewer empty shards.
+- **HTTP request-upload pump** (#7448). A completed socket-bound direct
+  HTTP/1.1 or HTTP/2 upload no longer leaves a detached post-EOS drain task behind, an inline pump
+  is primed so already-buffered body frames coalesce with the request headers,
+  and the pump's control state shares one allocation.
+- **DTLS datapath** (#7450). Linux listeners batch ingress with `recvmmsg(2)`,
+  each reply commits through a single `oneshot`, the UDP relay forwards
+  plaintext without its two extra per-datagram clones and session timers are
+  reused.
+- **Plain-UDP ingress and reply datapaths** (#7442) do less per-datagram
+  user-space and kernel work, without adding threads or cross-core hops.
 
 ## [0.9.20] - 2026-11-02
 
@@ -15018,7 +15104,8 @@ published release notes.
   remediate these rows before upgrade; see the
   [Safe Upgrade Guide](docs/upgrade_guide.md#tcp-connection-throttle-validation-hardening).
 
-[Unreleased]: https://github.com/ferrum-edge/ferrum-edge/compare/v0.9.20...HEAD
+[Unreleased]: https://github.com/ferrum-edge/ferrum-edge/compare/v0.9.21...HEAD
+[0.9.21]: https://github.com/ferrum-edge/ferrum-edge/compare/v0.9.20...v0.9.21
 [0.9.20]: https://github.com/ferrum-edge/ferrum-edge/compare/v0.9.19...v0.9.20
 [0.9.19]: https://github.com/ferrum-edge/ferrum-edge/compare/v0.9.17...v0.9.19
 [0.9.18]: https://github.com/ferrum-edge/ferrum-edge/compare/v0.9.17...v0.9.18

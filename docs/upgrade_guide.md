@@ -26,7 +26,25 @@ over production traffic.** File mode has no database; its config format is
 `version: "1"` with no shipped config transforms, so breaking field changes are
 applied by editing the file (see [File Mode](#file-mode-ferrum_modefile)).
 
-## Upgrading to the next release (unreleased)
+Per-release sections below are written when a release is cut. Changes already
+on `main` but not yet released, including breaking ones, are listed under
+`[Unreleased]` in [CHANGELOG.md](../CHANGELOG.md); review that section before
+deploying a build from `main`.
+
+## Upgrading to 0.9.21
+
+0.9.21 was prepared on 2026-11-21 UTC from `main` and follows published
+0.9.20 directly. It collects security-advisory fixes, mesh VirtualService and
+DestinationRule data-plane work, and the removal of configuration that nothing
+read. Many sections below refuse configuration or traffic that 0.9.20
+accepted, so review every section before upgrading. The `V001` baseline
+checksum changes from 0.9.20 (issues #7218 and #7228), so a PostgreSQL, MySQL
+or SQLite database that applied the 0.9.20 baseline is refused on
+migration-history grounds; rebuild it as described in
+[Build-Out database upgrade](#build-out-database-upgrade-postgresql-mysql-sqlite-mongodb).
+CP/DP must run the same build, and the ConfigSync revision is now `6`. The
+matching `contracts-edge-0.9.21` release must be cut from the verified release
+commit; move downstream contract pins when each consumer adopts 0.9.21.
 
 ### `;`-aliased query tokens are refused by `jwt_auth`, `jwks_auth`, and `oauth2_introspection` (GHSA-c259-vchc-3vgr)
 
@@ -34,9 +52,10 @@ applied by editing the file (see [File Mode](#file-mode-ferrum_modefile)).
 `oauth2_introspection` (`providers[].from_params`) now apply the `key_auth`
 issue #6579 contract to query token locations. A request whose configured query
 name also appears as a `;`-separated sub-parameter (`?carrier=;token=...`, or a
-name such as `token;x`) is refused with `401`
-`{"error":"Ambiguous token query parameter"}` instead of being treated as
-carrying no token. For `jwks_auth` and `oauth2_introspection` an alias at any
+name such as `token;x`) gets the token plugin's `401`
+`{"error":"Ambiguous token query parameter"}` rejection instead of being
+treated as carrying no token; in multi-auth mode another configured mechanism
+can still authenticate the request. For `jwks_auth` and `oauth2_introspection` an alias at any
 provider's query location is terminal for the whole instance, even when a
 valid token is also present in a header or `Authorization`. The alias is also
 marked for OPA and `request_mirror` redaction (including a raw spelling such as
@@ -132,11 +151,15 @@ narrowed with `exportTo` so it is not visible to the gateway's namespace.
 `api_chargeback` (`/charges`) and `api_chargeback_sink` (`consumer_id`) now key
 billing rows on the authenticated principal rather than on the logged
 `consumer_username` display string. A mapped gateway Consumer's row is
-unchanged. An unmapped external principal (`jwks_auth`, `oidc_relying_party`,
+unchanged, except for a username that begins with `external:` (see below). An unmapped external principal (`jwks_auth`, `oidc_relying_party`,
 `oauth2_introspection`, `ldap_auth`, `soap_ws_security`, or an external stream
 identity) is now reported as `external:<mechanism>:<authority>:<identity>`, for
 example `external:jwks_auth:<64 hex>:alice`, where `<authority>` is the opaque
-verifying-authority digest (`-` when absent). Previously such a principal was
+verifying-authority digest. A missing mechanism or authority is written as
+`-`; a principal with no realm, such as an external stream identity, has `-` in
+both positions (`external:-:-:alice`). Like a Consumer username, an
+oversized or marker-bearing key is reported in its `~sha256:` digest form.
+Previously such a principal was
 billed under its bare identity, sharing a row with any Consumer or other
 provider that used the same string. A Consumer whose username begins with
 `external:` is now always reported in its `~sha256:` digest form.
@@ -281,7 +304,9 @@ protocol faults still produce the gateway `502`/`504`.
 now screen the body for object member names that repeat, compared after escape
 decoding and at any depth, before applying the rules. A request with such a
 body is refused with `400`; a backend response with one is replaced with a
-`502`. Before, the rules were skipped and the original bytes were forwarded. A
+`502`. Before, a repeated member collapsed to its last value and the rules ran
+against that value, which a first-key-wins next hop could read differently;
+when no rule changed the document the original bytes were forwarded. A
 body with an invalid Unicode surrogate escape, one past the duplicate-key
 scanner's depth (256), token, member, member-name, or size budget, or a
 well-formed document the rule engine cannot materialize (nesting deeper than
@@ -400,10 +425,15 @@ even when it spells a listed username.
 ### Duplicate JSON member names are refused by more plugins (GHSA-49cr-v28q-9hgp, #7417)
 
 `ai_prompt_shield` (every scan mode), `ai_semantic_firewall` (request and
-buffered JSON response), `a2a_gateway` (JSON-RPC, under a deny-capable policy)
-and `ai_rate_limiter` (with `model_limits`) now refuse request bodies whose
-JSON objects repeat a member name, compared after escape decoding and at any
-depth. Clients must send each member once.
+buffered JSON response), `a2a_gateway` (JSON-RPC, under a deny-capable policy
+or, since GHSA-q25c-76f4-fp7h, with Agent Card rewriting on for the `jsonrpc`
+binding) and `ai_rate_limiter` (with `model_limits`) now screen request bodies
+for JSON objects that repeat a member name, compared after escape decoding and
+at any depth. `a2a_gateway` and `ai_rate_limiter` refuse such a body.
+`ai_prompt_shield` refuses it under `reject` / `redact` and records
+`ambiguous_json` under `warn`. `ai_semantic_firewall` treats it as uninspectable,
+so `fail_on_uninspectable_body`, `on_error` and dry-run mode decide whether it
+is refused. Clients must send each member once.
 
 ### ConfigSync revision 6 (#7417)
 
@@ -461,7 +491,9 @@ semantics, so they start governing destinations they used to leave untouched:
 - Mesh-generated upstreams are matched on their logical host only: a Service
   upstream on its FQDN, an EgressGateway ServiceEntry upstream on its
   ServiceEntry host (never its STATIC endpoint addresses). EastWestGateway
-  SNI-passthrough Service upstreams remain ungoverned by DestinationRules.
+  SNI-passthrough Service upstreams are matched on their Service host and never
+  originate TLS; see
+  [EastWestGateway passthrough legs now follow DestinationRules](#eastwestgateway-passthrough-legs-now-follow-destinationrules-7424).
 - Gateways running in the root namespace (`istio-system`): only the root
   namespace's private rules (`exportTo: ["."]`) take precedence over a
   destination owner's rules. Exported root rules are now the mesh-wide default
@@ -862,8 +894,9 @@ upgrading:
 - no `selector`, or one with no labels: `scope: {kind: namespace, namespace: <policy namespace>}`;
 - a labelled `selector`: `scope: {kind: workload_selector, selector: {labels: ..., namespace: <policy namespace>}}`.
 
-Policies translated from Istio `PeerAuthentication` objects need no change. The
-ConfigSync protocol revision is 5 (revision 4 introduced this shape), so a CP
+Policies translated from Istio `PeerAuthentication` objects need no change.
+Revision 4 of the ConfigSync protocol introduced this shape, and 0.9.21 ships
+revision 6 (see [ConfigSync revision 6](#configsync-revision-6-7417)), so a CP
 and DP from different builds refuse each other at `Subscribe` and never
 exchange the earlier form.
 
@@ -1016,8 +1049,9 @@ file-source data planes) to keep namespace-wide identity lists.
 ### NodeWaypoint VirtualService HTTP routes and ConfigSync revision 5 (#7233)
 
 `MeshConfig` gained `virtual_service_http_routes` and `MeshSlice` gained
-`http_routes`, so the ConfigSync protocol revision is now 5: upgrade CPs and
-DPs together. A mesh data plane from an older build refuses slices from a newer
+`http_routes`, which moved the ConfigSync protocol revision to 5 (0.9.21 ships
+revision 6; see [ConfigSync revision 6](#configsync-revision-6-7417)): upgrade
+CPs and DPs together. A mesh data plane from an older build refuses slices from a newer
 control plane (`invalid_slice_json`) and keeps its last-good slice until it is
 upgraded. On NodeWaypoint, mesh-bound VirtualService `http[]` routes in the
 waypoint's namespace now take effect: their in-mesh destinations dial over the
@@ -1086,11 +1120,6 @@ ancestor index gains `amba.host` (the list now carries rules beneath it). With
 refused as effectively universal, so a config that carries one fails
 validation the same way as the matchers listed under PR #6639. Use exact
 origins, or drop credentials for that matcher.
-
-Per-release sections below are written when a release is cut. Changes already
-on `main` but not yet released, including breaking ones, are listed under
-`[Unreleased]` in [CHANGELOG.md](../CHANGELOG.md); review that section before
-deploying a build from `main`.
 
 ## Upgrading to 0.9.20
 

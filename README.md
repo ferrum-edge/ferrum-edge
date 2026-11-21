@@ -582,6 +582,14 @@ at `d96b0292a0f87647f7552f25e0e5ce1b4ae30f8b`. No `contracts-edge-0.9.18` tag
 exists because Edge v0.9.18 was tagged but never published. Earlier contract
 tags remain unchanged.
 
+The **v0.9.21 candidate** follows published v0.9.20 with security-advisory and
+correctness fixes, mesh VirtualService HTTP routes on Sidecar and NodeWaypoint
+data planes, and fail-closed enforcement of refused enforcing Istio security
+resources.
+Its protected production release and the matching `contracts-edge-0.9.21`
+publication must succeed before consumers move their pins. See the
+[upgrade guide](docs/upgrade_guide.md#upgrading-to-0921).
+
 **v0.9.20** follows published v0.9.19 with security and correctness fixes,
 closed plugin and mesh Telemetry configuration, and the strict-client DTLS 1.3
 client-certificate fix. Consumers move their pins to `contracts-edge-0.9.20`
