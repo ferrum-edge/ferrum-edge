@@ -32,9 +32,14 @@ applied by editing the file (see [File Mode](#file-mode-ferrum_modefile)).
 
 With `discovery.rewrite_agent_card_urls` enabled (the default) on an instance
 that serves the `jsonrpc` binding, every `POST endpoint.path` request must now
-be classified as JSON-RPC at arrival, even under the default `allow` policy. A
-request a sibling instance on the same proxy already claimed is left to that
-sibling, and an instance without the `jsonrpc` binding is unaffected. Before,
+be classified as JSON-RPC at arrival, even under the default `allow` policy. An
+instance without the `jsonrpc` binding is unaffected. Each instance enforces its
+own requirement whichever instance claimed the request first, so a stricter
+instance behind a more permissive one on the same endpoint (a smaller
+`detection.max_request_body_size`, for example) now refuses what it cannot
+classify itself, and an Agent Card call a sibling claimed as a non-card
+operation is refused with `-32001` (`a2a.error: operation_class_changed`). Such
+POSTs are buffered whatever their original media type. Before,
 only a deny-capable policy made the plugin fail closed on a body it could not
 classify; otherwise the request was forwarded unclaimed, and an Agent Card call
 inside it was answered with the backend's un-rewritten internal URLs.
@@ -53,8 +58,10 @@ What is now refused when rewriting is on:
 
 Wherever classification is required (rewriting as above, or a deny-capable
 policy), a body with a leading UTF-8 byte order mark is now classified on the
-bytes after the mark instead of being treated as unparseable, and a
-case-variant envelope member is refused like a duplicate one. The forwarded
+bytes after the mark instead of being treated as unparseable, a case-variant
+envelope member is refused like a duplicate one, and a changed final request
+body is refused when its media type is no longer JSON, the classifier's parser
+rejects it, or it carries no JSON-RPC envelope. The forwarded
 bytes are unchanged. A transparent configuration (rewriting off, no deny-capable
 policy) classifies the raw bytes exactly as before.
 
@@ -71,9 +78,8 @@ Clients that call non-A2A methods on the endpoint should send the version header
 keep the previous transparent passthrough of unrecognized JSON-RPC, set
 `discovery.rewrite_agent_card_urls: false` and configure no deny-capable policy.
 Deployments with a deny-capable policy already failed closed at arrival; for
-them only BOM and case-variant member handling change, plus a final-body
-refusal when a later transform leaves an admitted body that is no longer a JSON
-document.
+them only BOM and case-variant member handling, the final-body refusals above,
+and buffering of non-JSON POSTs to the endpoint change.
 
 ### EastWestGateway passthrough legs now follow DestinationRules (#7424)
 
