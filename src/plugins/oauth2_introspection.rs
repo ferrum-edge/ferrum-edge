@@ -47,7 +47,7 @@ use super::utils::scope_role_check::{self, ScopeRoleRequirements};
 use super::utils::session_cookie::contains_unresolved_env_placeholder;
 use super::utils::token_extract::{
     STRIP_QUERY_PARAM_METADATA_PREFIX, TokenHeaderLocation, TokenLocation, TokenLocationExtract,
-    extract_authorization_bearer, extract_from_location, mark_present_query_credential_locations,
+    extract_authorization_bearer, extract_from_location, mark_provider_query_credential_locations,
     push_stripped_credential_header_names,
 };
 use super::{PluginResult, RequestContext, strip_auth_scheme};
@@ -1684,9 +1684,17 @@ impl super::Plugin for Oauth2Introspection {
         self.authenticate_request(ctx, consumer_index).await
     }
 
+    /// Mark every present query token location — in the decoded map or behind
+    /// a `;` sub-parameter — for policy redaction. A provider that does not
+    /// forward the original token also marks a `;` alias for removal here,
+    /// before multi-auth can stop at another mechanism (GHSA-c259-vchc-3vgr).
     fn mark_query_credentials_for_redaction(&self, ctx: &mut RequestContext) {
         for provider in &self.providers {
-            mark_present_query_credential_locations(ctx, &provider.token_locations);
+            mark_provider_query_credential_locations(
+                ctx,
+                &provider.token_locations,
+                provider.forward_original_token,
+            );
         }
     }
 

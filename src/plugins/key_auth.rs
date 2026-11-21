@@ -38,6 +38,7 @@ use super::utils::auth_flow::{
     self, AuthMechanism, CredentialRejection, ExtractedCredential, VerifyOutcome,
 };
 use super::utils::header_extract::{ConfiguredUtf8HeaderLookup, lookup_configured_header_utf8};
+use super::utils::query::query_has_semicolon_credential_alias;
 use super::utils::token_extract::STRIP_QUERY_PARAM_METADATA_PREFIX;
 use super::{PluginResult, RequestContext};
 
@@ -246,43 +247,6 @@ fn utf8_header_lookup_to_key(lookup: ConfiguredUtf8HeaderLookup<'_>) -> KeyLooku
             KeyLookup::InvalidFormat(INVALID_API_KEY_FORMAT_BODY)
         }
     }
-}
-
-/// Whether `raw_query` carries `name` as a `;`-separated sub-parameter that
-/// Ferrum's `&`-only parser does not see as that name (issue #6579 shape):
-/// `carrier=;api_key=k`, or `api_key;x=1` whose Ferrum name is `api_key;x`.
-///
-/// A sub-pair name matches by its raw spelling or by any decoding
-/// [`crate::plugins::utils::query::query_name_decodings`] reports, the same
-/// raw-or-decoded contract the outbound strip uses. The leading sub-pair of a
-/// segment is the segment's own parameter, already represented in the decoded
-/// map, unless the segment's NAME itself holds the `;`. Allocation-free unless
-/// the query contains a raw `;`.
-fn query_has_semicolon_credential_alias(raw_query: Option<&str>, name: &str) -> bool {
-    let Some(raw_query) = raw_query else {
-        return false;
-    };
-    if !raw_query.contains(';') {
-        return false;
-    }
-    raw_query.split('&').any(|segment| {
-        if !segment.contains(';') {
-            return false;
-        }
-        let ferrum_name = segment
-            .split_once('=')
-            .map_or(segment, |(pair_name, _)| pair_name);
-        let skip_leading = usize::from(!ferrum_name.contains(';'));
-        segment.split(';').skip(skip_leading).any(|sub_pair| {
-            let sub_name = sub_pair
-                .split_once('=')
-                .map_or(sub_pair, |(sub_name, _)| sub_name);
-            sub_name == name
-                || crate::plugins::utils::query::query_name_decodings(sub_name)
-                    .iter()
-                    .any(|decoded| decoded == name)
-        })
-    })
 }
 
 /// The shared key verification: blank keys never reach the index.

@@ -64,7 +64,7 @@ use super::utils::scope_role_check::{self, ScopeRoleRequirements};
 use super::utils::token_extract::{
     STRIP_QUERY_PARAM_METADATA_PREFIX, TokenHeaderLocation, TokenLocation, TokenLocationExtract,
     extract_authorization_bearer, extract_authorization_dpop, extract_from_location,
-    mark_present_query_credential_locations, provider_locations_extract_token,
+    mark_provider_query_credential_locations, provider_locations_extract_token,
     push_stripped_credential_header_names, stage_original_token_stripping as stage_token_stripping,
 };
 use super::{JwtAuthAttributeValue, PluginResult, RequestContext};
@@ -2138,9 +2138,17 @@ impl super::Plugin for JwksAuth {
         self.authenticate_request(ctx).await
     }
 
+    /// Mark every present query token location — in the decoded map or behind
+    /// a `;` sub-parameter — for policy redaction. A provider that does not
+    /// forward the original token also marks a `;` alias for removal here,
+    /// before multi-auth can stop at another mechanism (GHSA-c259-vchc-3vgr).
     fn mark_query_credentials_for_redaction(&self, ctx: &mut RequestContext) {
         for provider in &self.providers {
-            mark_present_query_credential_locations(ctx, &provider.token_locations);
+            mark_provider_query_credential_locations(
+                ctx,
+                &provider.token_locations,
+                provider.forward_original_token,
+            );
         }
     }
 
