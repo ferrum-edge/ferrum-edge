@@ -190,8 +190,12 @@ gateways, control planes, custom plugins, charts or contract consumers.
 - Fixed GHSA-49cr-v28q-9hgp: `a2a_gateway`, `ai_semantic_firewall`,
   `ai_prompt_shield` (all scan modes) and `ai_rate_limiter` now screen governed
   JSON bodies for duplicate object member names with the shared `json_dup_keys`
-  scanner before evaluating policy, so a first-key-wins backend can no longer
-  act on a member the gateway never judged.
+  scanner before evaluating policy. A duplicate-member body is no longer judged
+  on one member while a first-key-wins backend acts on another: each plugin
+  refuses it or, where configured to (`ai_prompt_shield` `warn`,
+  `ai_semantic_firewall` without `fail_on_uninspectable_body`, `on_error` or
+  dry-run handling), records it as ambiguous or uninspectable and lets it
+  through.
 - Fixed GHSA-rxwj-x6c6-f4j5: Consumer-username lists and per-caller rate-limit
   state no longer match or share state with an unmapped external identity
   (`jwks_auth`, `ldap_auth`, `oauth2_introspection`, `oidc_relying_party`,
@@ -1147,7 +1151,7 @@ gateways, control planes, custom plugins, charts or contract consumers.
   moved the ConfigSync build identity to `configsync.r5`; 0.9.21 ships
   revision 6 (`configsync.r6`, issue #7417). A CP and DP from different builds
   refuse each other at `Subscribe`.
-- **BREAKING:** (issue #7417) `ai_prompt_shield` in `content` / `all` scan modes refuses
+- **BREAKING:** (issue #7417) `ai_prompt_shield` in `content` / `all` / `mcp_arguments` scan modes refuses
   (reject/redact, 400 `ambiguous_json`) or records (warn) request bodies with
   duplicate JSON member names. (#7417)
 - **BREAKING:** (issue #7417) ConfigSync protocol revision is now 6 (new plugin-trigger

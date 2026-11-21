@@ -427,9 +427,13 @@ even when it spells a listed username.
 `ai_prompt_shield` (every scan mode), `ai_semantic_firewall` (request and
 buffered JSON response), `a2a_gateway` (JSON-RPC, under a deny-capable policy
 or, since GHSA-q25c-76f4-fp7h, with Agent Card rewriting on for the `jsonrpc`
-binding) and `ai_rate_limiter` (with `model_limits`) now refuse request bodies whose
-JSON objects repeat a member name, compared after escape decoding and at any
-depth. Clients must send each member once.
+binding) and `ai_rate_limiter` (with `model_limits`) now screen request bodies
+for JSON objects that repeat a member name, compared after escape decoding and
+at any depth. `a2a_gateway` and `ai_rate_limiter` refuse such a body.
+`ai_prompt_shield` refuses it under `reject` / `redact` and records
+`ambiguous_json` under `warn`. `ai_semantic_firewall` treats it as uninspectable,
+so `fail_on_uninspectable_body`, `on_error` and dry-run mode decide whether it
+is refused. Clients must send each member once.
 
 ### ConfigSync revision 6 (#7417)
 
