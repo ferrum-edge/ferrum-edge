@@ -8949,7 +8949,7 @@ async fn handle_dtls_client_inner(
             }
             let send = async {
                 if let Some(ref dtls) = backend_dtls_write {
-                    dtls.send(&data).await.map_err(|e| e.to_string())
+                    dtls.send_owned(data).await.map_err(|e| e.to_string())
                 } else if let Some(ref sock) = backend_udp_write {
                     sock.send(&data)
                         .await
@@ -9145,7 +9145,7 @@ async fn handle_dtls_client_inner(
                 &b2c_trust,
                 udp_frontend_send_until_expiry(
                     reply_auth_plan,
-                    client_sender.send_committed(&data, reply_auth_plan.map(|plan| plan.at)),
+                    client_sender.send_committed(data, reply_auth_plan.map(|plan| plan.at)),
                 ),
             )
             .await;

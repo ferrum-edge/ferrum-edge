@@ -16513,6 +16513,24 @@ pub mod _test_support {
             .map_err(map_frontend_app_send_reject_for_test)
     }
 
+    /// Race one application-ciphertext send (or a test double) against the
+    /// admitted deadline and the production single-`oneshot` completion sender
+    /// cancellation (`completion.is_closed()` / `closed()`).
+    pub async fn frontend_app_ciphertext_send_with_completion_cancel_for_test<F>(
+        deadline: Option<tokio::time::Instant>,
+        completion: Option<&mut tokio::sync::oneshot::Sender<Result<(), String>>>,
+        send: F,
+    ) -> Result<F::Output, FrontendAppSendRejectForTest>
+    where
+        F: std::future::Future,
+    {
+        crate::dtls::frontend_app_ciphertext_send_with_completion_cancel_for_test(
+            deadline, completion, send,
+        )
+        .await
+        .map_err(map_frontend_app_send_reject_for_test)
+    }
+
     /// Race one post-registration DTLS delivery (plaintext, accept handoff, or
     /// UDP write) against frontend client-trust retirement. Unauthenticated
     /// sessions pass `None` and must not poll a retirement future.

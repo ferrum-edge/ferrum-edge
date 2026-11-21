@@ -107,19 +107,19 @@ async fn fail_pending_app_sends(driver_app_rx: &mut mpsc::Receiver<PendingAppSen
 /// Terminating-frontend application payload waiting for encrypt + UDP write.
 ///
 /// Unlike [`PendingAppSend`] (backend/client-role), this carries the admitted
-/// absolute authorization deadline and a cancel receiver held by the proxy-side
-/// send future. Dropping that future closes `cancel` so a request already in
-/// the channel cannot be encrypted or written later.
+/// absolute authorization deadline alongside the completion sender whose
+/// receiver is held by the proxy-side send future. Dropping that future drops
+/// the completion receiver, immediately closing `completion` so a request
+/// already in the channel cannot be encrypted or written later — without
+/// allocating a second `oneshot` channel per datagram.
 struct FrontendAppSend {
     data: Vec<u8>,
     completion: oneshot::Sender<Result<(), String>>,
-    cancel: oneshot::Receiver<()>,
     deadline: Option<tokio::time::Instant>,
 }
 
 struct InFlightFrontendAppSend {
     completion: oneshot::Sender<Result<(), String>>,
-    cancel: oneshot::Receiver<()>,
     deadline: Option<tokio::time::Instant>,
 }
 
@@ -291,34 +291,72 @@ fn frontend_app_send_cancel_fired(cancel: &mut oneshot::Receiver<()>) -> bool {
     }
 }
 
+/// Cancellation signal for an in-flight terminating-frontend application send.
+///
+/// Production sends observe `completion.is_closed()` / `completion.closed()`
+/// directly on the completion `oneshot::Sender` (saving a second `oneshot`
+/// allocation per datagram), while the unit-test seam keeps driving a
+/// standalone `oneshot::Receiver<()>`.
+pub(crate) trait FrontendSendCancel {
+    fn is_cancelled(&mut self) -> bool;
+    fn wait_cancelled(&mut self) -> impl std::future::Future<Output = ()> + Send + '_;
+}
+
+impl FrontendSendCancel for oneshot::Receiver<()> {
+    #[inline]
+    fn is_cancelled(&mut self) -> bool {
+        frontend_app_send_cancel_fired(self)
+    }
+
+    async fn wait_cancelled(&mut self) {
+        let _ = self.await;
+    }
+}
+
+impl FrontendSendCancel for oneshot::Sender<Result<(), String>> {
+    #[inline]
+    fn is_cancelled(&mut self) -> bool {
+        self.is_closed()
+    }
+
+    async fn wait_cancelled(&mut self) {
+        self.closed().await;
+    }
+}
+
 /// Race one application-ciphertext `send_to` (or a test double) against the
-/// admitted deadline and the proxy-side cancel receiver.
+/// admitted deadline and the proxy-side cancel signal.
 ///
 /// An already-elapsed deadline never polls `send`. Exact-deadline ties fail
 /// closed (`biased`, expiry arm first). If expiry or cancellation wins, `send`
 /// is dropped so it cannot complete afterwards. Unauthenticated sends
 /// (`deadline == None`) await `send` with no timer.
-pub(crate) async fn frontend_app_ciphertext_send_until_expiry<F>(
+pub(crate) async fn frontend_app_ciphertext_send_until_expiry<C, F>(
     deadline: Option<tokio::time::Instant>,
-    mut cancel: Option<&mut oneshot::Receiver<()>>,
+    mut cancel: Option<&mut C>,
     send: F,
 ) -> Result<F::Output, FrontendAppSendReject>
 where
+    C: FrontendSendCancel,
     F: std::future::Future,
 {
     let cancelled = match cancel.as_mut() {
-        Some(cancel) => frontend_app_send_cancel_fired(cancel),
+        Some(cancel) => cancel.is_cancelled(),
         None => false,
     };
-    match admit_frontend_app_send(cancelled, deadline, tokio::time::Instant::now()) {
-        FrontendAppSendAdmit::Reject(reason) => return Err(reason),
-        FrontendAppSendAdmit::Proceed => {}
+    if let Some(at) = deadline {
+        match admit_frontend_app_send(cancelled, Some(at), tokio::time::Instant::now()) {
+            FrontendAppSendAdmit::Reject(reason) => return Err(reason),
+            FrontendAppSendAdmit::Proceed => {}
+        }
+    } else if cancelled {
+        return Err(FrontendAppSendReject::Cancelled);
     }
     match (deadline, cancel) {
         (None, None) => Ok(send.await),
         (None, Some(cancel)) => tokio::select! {
             biased;
-            _ = cancel => Err(FrontendAppSendReject::Cancelled),
+            () = cancel.wait_cancelled() => Err(FrontendAppSendReject::Cancelled),
             result = send => Ok(result),
         },
         (Some(at), None) => tokio::select! {
@@ -329,7 +367,7 @@ where
         (Some(at), Some(cancel)) => tokio::select! {
             biased;
             () = tokio::time::sleep_until(at) => Err(FrontendAppSendReject::Expired),
-            _ = cancel => Err(FrontendAppSendReject::Cancelled),
+            () = cancel.wait_cancelled() => Err(FrontendAppSendReject::Cancelled),
             result = send => Ok(result),
         },
     }
@@ -370,13 +408,14 @@ where
 /// ciphertext write. A withdrawal that is already visible never polls `send`;
 /// one that becomes ready together with the socket write wins the biased race
 /// and drops that write future before it can commit a datagram.
-async fn frontend_app_ciphertext_send_until_expiry_and_trust<F>(
+async fn frontend_app_ciphertext_send_until_expiry_and_trust<C, F>(
     deadline: Option<tokio::time::Instant>,
-    cancel: Option<&mut oneshot::Receiver<()>>,
+    cancel: Option<&mut C>,
     client_trust: Option<&crate::tls::ClientTrustSession>,
     send: F,
 ) -> Result<F::Output, FrontendAppSendReject>
 where
+    C: FrontendSendCancel,
     F: std::future::Future,
 {
     frontend_trust_raced_delivery(
@@ -391,8 +430,8 @@ fn fail_queued_frontend_app_sends(
     session_deadline: Option<tokio::time::Instant>,
 ) {
     let now = tokio::time::Instant::now();
-    while let Ok(mut pending) = app_in_rx.try_recv() {
-        let cancelled = frontend_app_send_cancel_fired(&mut pending.cancel);
+    while let Ok(pending) = app_in_rx.try_recv() {
+        let cancelled = pending.completion.is_closed();
         let deadline = earliest_frontend_app_send_deadline(pending.deadline, session_deadline);
         let reason = shutdown_queued_frontend_app_send(cancelled, deadline, now);
         let _ = pending.completion.send(Err(reason.as_str().to_string()));
@@ -418,7 +457,7 @@ async fn write_connected_frontend_record(
         let deadline = earliest_frontend_app_send_deadline(inflight.deadline, session_deadline);
         match frontend_app_ciphertext_send_until_expiry_and_trust(
             deadline,
-            Some(&mut inflight.cancel),
+            Some(&mut inflight.completion),
             client_trust,
             send_dtls_record(socket, data, peer, reply_local),
         )
@@ -431,7 +470,7 @@ async fn write_connected_frontend_record(
     } else {
         match frontend_app_ciphertext_send_until_expiry_and_trust(
             session_deadline,
-            None,
+            None::<&mut oneshot::Sender<Result<(), String>>>,
             client_trust,
             send_dtls_record(socket, data, peer, reply_local),
         )
@@ -490,6 +529,20 @@ where
     F: std::future::Future,
 {
     frontend_app_ciphertext_send_until_expiry(deadline, cancel, send).await
+}
+
+/// Pin the production single-`oneshot` (`completion.is_closed()` / `closed()`)
+/// ciphertext `send_to` cancellation race for external hosted tests.
+#[allow(dead_code)] // used through library `_test_support`
+pub(crate) async fn frontend_app_ciphertext_send_with_completion_cancel_for_test<F>(
+    deadline: Option<tokio::time::Instant>,
+    completion: Option<&mut oneshot::Sender<Result<(), String>>>,
+    send: F,
+) -> Result<F::Output, FrontendAppSendReject>
+where
+    F: std::future::Future,
+{
+    frontend_app_ciphertext_send_until_expiry(deadline, completion, send).await
 }
 
 /// Pin the post-registration trust-retirement race used for plaintext
@@ -588,25 +641,24 @@ pub struct FrontendDtlsConfig {
     pub client_trust: Option<crate::tls::ClientTrustMaterial>,
 }
 
-/// Datagrams drained per `recvmmsg` call on the ingress-interface capture path.
-/// Deliberately smaller than the plain-UDP listener's configurable batch: the
-/// batch preallocates one max-size datagram buffer per slot, and this path only
-/// exists on NodeWaypoint DTLS listeners.
+/// Datagrams drained per `recvmmsg` call in `DtlsServer::run` on Linux.
+/// Deliberately smaller than the plain-UDP listener's configurable batch; the
+/// batch uses `MaybeUninit<u8>` slots so untouched tail pages stay unfaulted.
 #[cfg(target_os = "linux")]
-const DTLS_INGRESS_CAPTURE_BATCH: usize = 16;
+const DTLS_RECV_BATCH: usize = 16;
 
-/// Datagrams drained per readiness wake-up before the capture loop returns to
-/// its `select!`.
+/// Datagrams drained per readiness wake-up (and cumulative datagrams across
+/// wakes) before `DtlsServer::run` yields back to the Tokio scheduler.
 ///
-/// `try_io` is a synchronous call that consumes no tokio cooperative budget and
-/// `dispatch_datagram` has no await point, so an unbounded inner drain would
-/// keep a runtime worker thread for exactly as long as a sender can keep the
-/// receive queue non-empty — never observing shutdown and never yielding. The
-/// plain-UDP listener bounds its own drain for the same reason; this is the
-/// DTLS equivalent. Re-entering the outer loop re-arms the shutdown branch and
-/// puts the readiness poll (which does consume coop budget) back in the path.
+/// `readable()` and `try_io()` do not consume Tokio cooperative budget and
+/// `dispatch_datagram` is synchronous, so an unbounded inner drain (or looping
+/// back to `readable()` without yielding) would pin a worker thread whenever
+/// the receive queue stays non-empty — starving session drivers, timers, and
+/// shutdown. After draining up to this bound, the Linux loop explicitly yields
+/// whenever cumulative datagrams since the last yield reach this cap (and
+/// charges cooperative budget on shorter ready cycles / transient errors).
 #[cfg(target_os = "linux")]
-const DTLS_INGRESS_CAPTURE_DRAIN_LIMIT: usize = 256;
+const DTLS_RECV_DRAIN_LIMIT: usize = 256;
 
 /// One immutable, accepted frontend DTLS material generation.
 ///
@@ -1714,11 +1766,28 @@ impl DtlsConnection {
             let mut out_buf = vec![0u8; dtls_buf_config().output_buf_size];
             let mut recv_buf = vec![0u8; 65536];
             let mut next_timeout: Option<Instant> = None;
+            let mut armed_timeout: Option<Instant> = None;
+            let retransmit_sleep: Option<tokio::time::Sleep> = None;
+            tokio::pin!(retransmit_sleep);
 
             loop {
-                let sleep_dur = next_timeout
-                    .map(|t| t.saturating_duration_since(Instant::now()))
-                    .unwrap_or(Duration::from_secs(60));
+                if next_timeout != armed_timeout {
+                    armed_timeout = next_timeout;
+                    match next_timeout {
+                        Some(t) => {
+                            let target = tokio::time::Instant::now()
+                                + t.saturating_duration_since(Instant::now());
+                            if let Some(sleep) = retransmit_sleep.as_mut().as_pin_mut() {
+                                sleep.reset(target);
+                            } else {
+                                retransmit_sleep.set(Some(tokio::time::sleep_until(target)));
+                            }
+                        }
+                        None => {
+                            retransmit_sleep.set(None);
+                        }
+                    }
+                }
 
                 let mut pending_completion: Option<oneshot::Sender<Result<(), String>>> = None;
                 let mut fatal_send_error: Option<String> = None;
@@ -1746,6 +1815,12 @@ impl DtlsConnection {
                     // Application data to send — complete only after encrypt + socket write.
                     Some(pending) = driver_app_rx.recv() => {
                         let PendingAppSend { data, completion } = pending;
+                        if completion.is_closed() {
+                            // Caller dropped its send future before dequeue (e.g.
+                            // authorization expiry or trust withdrawal); discard
+                            // without encrypting or transmitting.
+                            continue;
+                        }
                         let max_plaintext = dtls_buf_config().max_plaintext;
                         if data.len() > max_plaintext {
                             let _ = completion.send(Err(format!(
@@ -1761,12 +1836,22 @@ impl DtlsConnection {
                             pending_completion = Some(completion);
                         }
                     }
-                    // Timer fired
-                    _ = tokio::time::sleep(sleep_dur) => {
+                    // Timer fired (only polled when dimpl actually armed a timeout)
+                    _ = async {
+                        match retransmit_sleep.as_mut().as_pin_mut() {
+                            Some(sleep) => sleep.await,
+                            None => std::future::pending::<()>().await,
+                        }
+                    }, if next_timeout.is_some() => {
+                        // Clear `armed_timeout` unconditionally so an early wakeup
+                        // (e.g. paused/mocked Tokio clock ahead of `std::time::Instant`)
+                        // re-arms `retransmit_sleep` instead of spinning on an elapsed timer.
+                        armed_timeout = None;
+                        let now = Instant::now();
                         if let Some(t) = next_timeout
-                            && Instant::now() >= t
+                            && now >= t
                         {
-                            if let Err(e) = dtls.handle_timeout(Instant::now()) {
+                            if let Err(e) = dtls.handle_timeout(now) {
                                 trace!("DTLS handle_timeout error: {}", e);
                                 fatal_send_error =
                                     Some(format!("DTLS handle_timeout error: {e}"));
@@ -1790,31 +1875,49 @@ impl DtlsConnection {
                     let mut drain_round_exhausted = true;
                     for _ in 0..MAX_OUTPUTS_PER_DRAIN {
                         match dtls.poll_output(&mut out_buf) {
-                            Output::Packet(data) => match socket.send(data).await {
-                                Ok(written) if written == data.len() => {
-                                    wrote_ciphertext_datagram = true;
+                            Output::Packet(data) => {
+                                let send_res = match socket.try_send(data) {
+                                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                                        socket.send(data).await
+                                    }
+                                    other => other,
+                                };
+                                match send_res {
+                                    Ok(written) if written == data.len() => {
+                                        wrote_ciphertext_datagram = true;
+                                    }
+                                    Ok(written) => {
+                                        socket_send_error = Some(format!(
+                                            "DTLS UDP send was incomplete: wrote {written} of {} bytes",
+                                            data.len()
+                                        ));
+                                        drain_round_exhausted = false;
+                                        break;
+                                    }
+                                    Err(e) => {
+                                        socket_send_error =
+                                            Some(format!("DTLS UDP send error: {e}"));
+                                        drain_round_exhausted = false;
+                                        break;
+                                    }
                                 }
-                                Ok(written) => {
-                                    socket_send_error = Some(format!(
-                                        "DTLS UDP send was incomplete: wrote {written} of {} bytes",
-                                        data.len()
-                                    ));
-                                    drain_round_exhausted = false;
-                                    break;
-                                }
-                                Err(e) => {
-                                    socket_send_error = Some(format!("DTLS UDP send error: {e}"));
-                                    drain_round_exhausted = false;
-                                    break;
-                                }
-                            },
+                            }
                             Output::Timeout(t) => {
                                 next_timeout = Some(t);
                                 drain_round_exhausted = false;
                                 break;
                             }
                             Output::ApplicationData(data) => {
-                                if driver_app_tx.send(data.to_vec()).await.is_err() {
+                                let send_res = match driver_app_tx.try_send(data.to_vec()) {
+                                    Ok(()) => Ok(()),
+                                    Err(mpsc::error::TrySendError::Full(owned)) => {
+                                        driver_app_tx.send(owned).await
+                                    }
+                                    Err(mpsc::error::TrySendError::Closed(owned)) => {
+                                        Err(mpsc::error::SendError(owned))
+                                    }
+                                };
+                                if send_res.is_err() {
                                     if let Some(completion) = pending_completion.take() {
                                         let _ = completion
                                             .send(Err("DTLS connection closed".to_string()));
@@ -1892,14 +1995,36 @@ impl DtlsConnection {
                 data.len()
             ));
         }
+        self.send_owned(data.to_vec()).await
+    }
+
+    /// Send owned application data through the DTLS tunnel without cloning the
+    /// caller's buffer.
+    pub async fn send_owned(&self, data: Vec<u8>) -> Result<(), anyhow::Error> {
+        let max_plaintext = dtls_buf_config().max_plaintext;
+        if data.len() > max_plaintext {
+            return Err(anyhow::anyhow!(
+                "DTLS plaintext exceeds max_plaintext ({max_plaintext} bytes, got {})",
+                data.len()
+            ));
+        }
         let (completion_tx, completion_rx) = oneshot::channel();
-        self.app_tx
-            .send(PendingAppSend {
-                data: data.to_vec(),
-                completion: completion_tx,
-            })
-            .await
-            .map_err(|_| anyhow::anyhow!("DTLS connection closed"))?;
+        let pending = PendingAppSend {
+            data,
+            completion: completion_tx,
+        };
+        match self.app_tx.try_send(pending) {
+            Ok(()) => {}
+            Err(mpsc::error::TrySendError::Full(pending)) => {
+                self.app_tx
+                    .send(pending)
+                    .await
+                    .map_err(|_| anyhow::anyhow!("DTLS connection closed"))?;
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                return Err(anyhow::anyhow!("DTLS connection closed"));
+            }
+        }
         match completion_rx.await {
             Ok(Ok(())) => Ok(()),
             Ok(Err(error)) => Err(anyhow::anyhow!(error)),
@@ -2559,10 +2684,11 @@ impl DtlsServerSender {
     /// ties fail closed.
     pub async fn send_committed(
         &self,
-        data: &[u8],
+        data: impl Into<Vec<u8>>,
         deadline: Option<tokio::time::Instant>,
     ) -> Result<(), anyhow::Error> {
-        send_frontend_app_committed(&self.app_tx, &self.auth_deadline, data, deadline).await
+        send_frontend_app_committed_owned(&self.app_tx, &self.auth_deadline, data.into(), deadline)
+            .await
     }
 
     /// Close this client's DTLS connection.
@@ -2580,10 +2706,11 @@ impl DtlsServerConn {
     /// Deadline-aware actual-commit send. See [`DtlsServerSender::send_committed`].
     pub async fn send_committed(
         &self,
-        data: &[u8],
+        data: impl Into<Vec<u8>>,
         deadline: Option<tokio::time::Instant>,
     ) -> Result<(), anyhow::Error> {
-        send_frontend_app_committed(&self.app_tx, &self.auth_deadline, data, deadline).await
+        send_frontend_app_committed_owned(&self.app_tx, &self.auth_deadline, data.into(), deadline)
+            .await
     }
 
     /// Receive decrypted application data from this client.
@@ -2620,37 +2747,42 @@ impl DtlsServerConn {
     }
 }
 
-async fn send_frontend_app_committed(
+async fn send_frontend_app_committed_owned(
     app_tx: &mpsc::Sender<FrontendAppSend>,
     auth_deadline: &FrontendSessionAuthDeadline,
-    data: &[u8],
+    data: Vec<u8>,
     deadline: Option<tokio::time::Instant>,
 ) -> Result<(), anyhow::Error> {
     if let Some(at) = deadline {
         auth_deadline.publish(at);
     }
     let effective = earliest_frontend_app_send_deadline(deadline, auth_deadline.get());
-    if matches!(
-        admit_frontend_app_send(false, effective, tokio::time::Instant::now()),
-        FrontendAppSendAdmit::Reject(FrontendAppSendReject::Expired)
-    ) {
+    if let Some(at) = effective
+        && tokio::time::Instant::now() >= at
+    {
         return Err(anyhow::anyhow!(FrontendAppSendReject::Expired.as_str()));
     }
-    let (cancel_tx, cancel_rx) = oneshot::channel();
     let (completion_tx, completion_rx) = oneshot::channel();
-    app_tx
-        .send(FrontendAppSend {
-            data: data.to_vec(),
-            completion: completion_tx,
-            cancel: cancel_rx,
-            deadline,
-        })
-        .await
-        .map_err(|_| anyhow::anyhow!("DTLS server connection closed"))?;
-    // Held for the whole wait: dropping this future (expiry in the proxy
-    // race) closes `cancel` so a request already in the channel cannot be
-    // encrypted or written later.
-    let _cancel_tx = cancel_tx;
+    let pending = FrontendAppSend {
+        data,
+        completion: completion_tx,
+        deadline,
+    };
+    match app_tx.try_send(pending) {
+        Ok(()) => {}
+        Err(mpsc::error::TrySendError::Full(pending)) => {
+            app_tx
+                .send(pending)
+                .await
+                .map_err(|_| anyhow::anyhow!("DTLS server connection closed"))?;
+        }
+        Err(mpsc::error::TrySendError::Closed(_)) => {
+            return Err(anyhow::anyhow!("DTLS server connection closed"));
+        }
+    }
+    // Dropping this future (e.g. expiry in the proxy race) drops
+    // `completion_rx`, which immediately closes `completion_tx` so a request
+    // already in the channel cannot be encrypted or written later.
     match completion_rx.await {
         Ok(Ok(())) => Ok(()),
         Ok(Err(error)) => Err(anyhow::anyhow!(error)),
@@ -2844,152 +2976,161 @@ impl DtlsServer {
     /// Reads UDP datagrams, demuxes by source address, and drives per-client
     /// DTLS state machines. New clients are delivered via `accept()`.
     pub async fn run(&self) -> Result<(), anyhow::Error> {
-        let mut buf = vec![0u8; 65536];
         let mut shutdown_rx = self.shutdown_tx.subscribe();
         if *shutdown_rx.borrow() {
             return Ok(());
         }
-        // Ingress-interface capture (issue #3286) needs cmsg, which
-        // `recv_from`/`recvfrom(2)` does not surface. When it is requested on
-        // Linux the loop drains through the shared `recvmmsg` batch reader
-        // instead — the same reader the plain-UDP listener uses, so there is no
-        // second cmsg parser. Everywhere else the original path is unchanged.
+        // On Linux, always drain incoming datagrams through the shared
+        // `recvmmsg(2)` batch reader so high-throughput DTLS listeners amortize
+        // kernel crossings and avoid per-datagram `tokio::select!` overhead.
+        // `RecvMmsgBatch` uses `MaybeUninit<u8>` slots so untouched tail pages
+        // remain unfaulted. Ingress-interface capture (issue #3286) reads the
+        // per-slot `IP_PKTINFO` / `IPV6_PKTINFO` cmsg from the same batch.
         #[cfg(target_os = "linux")]
-        let ifindex_capture = self.limits.capture_ingress_ifindex;
-        #[cfg(not(target_os = "linux"))]
-        let ifindex_capture = false;
-        // Allocated only for a capture listener: the batch preallocates one
-        // max-size datagram buffer per slot, and every ordinary DTLS listener
-        // stays on the untouched `recv_from` path.
-        #[cfg(target_os = "linux")]
-        let mut recv_batch = ifindex_capture.then(|| {
-            crate::proxy::udp_batch::RecvMmsgBatch::new(
-                DTLS_INGRESS_CAPTURE_BATCH,
+        {
+            use std::os::fd::AsRawFd;
+            let ifindex_capture = self.limits.capture_ingress_ifindex;
+            let mut recv_batch = crate::proxy::udp_batch::RecvMmsgBatch::new(
+                DTLS_RECV_BATCH,
                 // `IP_RECVORIGDSTADDR` is never set on a DTLS frontend socket,
                 // so the orig-dst cmsg scan would always come back empty.
                 false,
-            )
-        });
-        loop {
-            if ifindex_capture {
-                #[cfg(target_os = "linux")]
-                {
-                    use std::os::fd::AsRawFd;
-                    tokio::select! {
-                        ready = self.socket.readable() => {
-                            if let Err(e) = ready {
-                                if matches!(
-                                    e.kind(),
-                                    std::io::ErrorKind::ConnectionReset
-                                        | std::io::ErrorKind::ConnectionRefused
-                                        | std::io::ErrorKind::ConnectionAborted
-                                        | std::io::ErrorKind::Interrupted
-                                        | std::io::ErrorKind::WouldBlock
-                                ) {
-                                    trace!("DTLS server transient readable error (ignored): {}", e);
-                                    continue;
-                                }
-                                return Err(anyhow::anyhow!("DTLS server recv error: {}", e));
-                            }
-                        }
-                        _ = shutdown_rx.changed() => {
-                            return Ok(());
-                        }
-                    }
-                    if *shutdown_rx.borrow() {
+            );
+            let fd = self.socket.as_raw_fd();
+            let mut since_yield: usize = 0;
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = shutdown_rx.changed() => {
                         return Ok(());
                     }
-                    let fd = self.socket.as_raw_fd();
-                    // `ifindex_capture` gated the allocation above, so this is
-                    // always populated here.
-                    let Some(batch) = recv_batch.as_mut() else {
-                        return Ok(());
-                    };
-                    let mut drained: usize = 0;
-                    while drained < DTLS_INGRESS_CAPTURE_DRAIN_LIMIT {
-                        let received = self.socket.try_io(tokio::io::Interest::READABLE, || {
-                            batch.recv(fd, DTLS_INGRESS_CAPTURE_BATCH)
-                        });
-                        match received {
-                            Ok(n) if n > 0 => {
-                                for i in 0..n {
-                                    let (data, peer_addr) = batch.datagram(i);
-                                    // The WHOLE captured local destination is
-                                    // carried forward, not just its interface
-                                    // index: the address half is this session's
-                                    // reply source (the Service ClusterIP on the
-                                    // steered path) and the interface half is
-                                    // its source attribution. An ifindex of 0 is
-                                    // "the kernel reported no interface", which
-                                    // is not usable evidence, so the whole
-                                    // capture is discarded and the datagram
-                                    // fails closed below.
-                                    let reply_local =
-                                        batch.local_addr(i).filter(|local| local.ifindex != 0);
-                                    self.dispatch_datagram(peer_addr, data, reply_local).await;
-                                }
-                                drained += n;
+                    ready = self.socket.readable() => {
+                        if let Err(e) = ready {
+                            if matches!(
+                                e.kind(),
+                                std::io::ErrorKind::ConnectionReset
+                                    | std::io::ErrorKind::ConnectionRefused
+                                    | std::io::ErrorKind::ConnectionAborted
+                                    | std::io::ErrorKind::Interrupted
+                                    | std::io::ErrorKind::WouldBlock
+                            ) {
+                                trace!("DTLS server transient readable error (ignored): {}", e);
+                                tokio::task::coop::consume_budget().await;
+                                continue;
                             }
-                            Ok(_) => break,
-                            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
-                            Err(e)
-                                if matches!(
-                                    e.kind(),
-                                    std::io::ErrorKind::ConnectionReset
-                                        | std::io::ErrorKind::ConnectionRefused
-                                        | std::io::ErrorKind::ConnectionAborted
-                                        | std::io::ErrorKind::Interrupted
-                                ) =>
-                            {
-                                trace!("DTLS server transient recvmmsg error (ignored): {}", e);
-                                break;
-                            }
-                            Err(e) => {
-                                return Err(anyhow::anyhow!("DTLS server recvmmsg error: {}", e));
-                            }
-                        }
-                    }
-                }
-                continue;
-            }
-
-            let (len, peer_addr) = tokio::select! {
-                result = self.socket.recv_from(&mut buf) => {
-                    match result {
-                        Ok(v) => v,
-                        // Transient, per-peer recv errors must not kill the
-                        // single demux loop for every session on the listener.
-                        // Notably, on Windows `recvfrom` on an unconnected UDP
-                        // socket fails with WSAECONNRESET whenever a prior
-                        // `send_to` elicited an ICMP port-unreachable — i.e.,
-                        // any DTLS client that disappears abruptly would
-                        // permanently brick the listener (the caller only logs
-                        // a warn and never restarts this loop).
-                        Err(e) if matches!(
-                            e.kind(),
-                            std::io::ErrorKind::ConnectionReset
-                                | std::io::ErrorKind::ConnectionRefused
-                                | std::io::ErrorKind::ConnectionAborted
-                                | std::io::ErrorKind::Interrupted
-                                | std::io::ErrorKind::WouldBlock
-                        ) => {
-                            trace!("DTLS server transient recv error (ignored): {}", e);
-                            continue;
-                        }
-                        Err(e) => {
                             return Err(anyhow::anyhow!("DTLS server recv error: {}", e));
                         }
                     }
                 }
-                _ = shutdown_rx.changed() => {
+                if *shutdown_rx.borrow() {
                     return Ok(());
                 }
-            };
-            if *shutdown_rx.borrow() {
-                return Ok(());
+                let mut drained: usize = 0;
+                while drained < DTLS_RECV_DRAIN_LIMIT {
+                    if *shutdown_rx.borrow() {
+                        return Ok(());
+                    }
+                    let received = self.socket.try_io(tokio::io::Interest::READABLE, || {
+                        recv_batch.recv(fd, DTLS_RECV_BATCH)
+                    });
+                    match received {
+                        Ok(n) if n > 0 => {
+                            for i in 0..n {
+                                let (data, peer_addr) = recv_batch.datagram(i);
+                                // The WHOLE captured local destination is
+                                // carried forward when `ifindex_capture` is on:
+                                // the address half is this session's reply
+                                // source and the interface half is its source
+                                // attribution. An ifindex of 0 is not usable
+                                // evidence, so it fails closed in
+                                // `dispatch_datagram`.
+                                let reply_local = if ifindex_capture {
+                                    recv_batch.local_addr(i).filter(|local| local.ifindex != 0)
+                                } else {
+                                    None
+                                };
+                                self.dispatch_datagram(peer_addr, data, reply_local);
+                            }
+                            drained += n;
+                        }
+                        Ok(_) => break,
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                        Err(e)
+                            if matches!(
+                                e.kind(),
+                                std::io::ErrorKind::ConnectionReset
+                                    | std::io::ErrorKind::ConnectionRefused
+                                    | std::io::ErrorKind::ConnectionAborted
+                                    | std::io::ErrorKind::Interrupted
+                                    | std::io::ErrorKind::InvalidData
+                            ) =>
+                        {
+                            trace!("DTLS server transient recvmmsg error (ignored): {}", e);
+                            break;
+                        }
+                        Err(e) => {
+                            return Err(anyhow::anyhow!("DTLS server recvmmsg error: {}", e));
+                        }
+                    }
+                }
+                // `readable()` and `try_io()` do not consume Tokio cooperative
+                // budget. Yield explicitly once cumulative datagrams since the
+                // last yield reach `DTLS_RECV_DRAIN_LIMIT` (so session drivers,
+                // timers, and shutdown cannot be starved even across consecutive
+                // sub-cap wakes), and charge coop budget on shorter ready cycles
+                // / transient error retries.
+                since_yield = since_yield.saturating_add(drained);
+                if since_yield >= DTLS_RECV_DRAIN_LIMIT {
+                    since_yield = 0;
+                    tokio::task::yield_now().await;
+                } else {
+                    tokio::task::coop::consume_budget().await;
+                }
             }
+        }
 
-            self.dispatch_datagram(peer_addr, &buf[..len], None).await;
+        #[cfg(not(target_os = "linux"))]
+        {
+            let mut buf = vec![0u8; 65536];
+            loop {
+                let (len, peer_addr) = tokio::select! {
+                    result = self.socket.recv_from(&mut buf) => {
+                        match result {
+                            Ok(v) => v,
+                            // Transient, per-peer recv errors must not kill the
+                            // single demux loop for every session on the listener.
+                            // Notably, on Windows `recvfrom` on an unconnected UDP
+                            // socket fails with WSAECONNRESET whenever a prior
+                            // `send_to` elicited an ICMP port-unreachable — i.e.,
+                            // any DTLS client that disappears abruptly would
+                            // permanently brick the listener (the caller only logs
+                            // a warn and never restarts this loop).
+                            Err(e) if matches!(
+                                e.kind(),
+                                std::io::ErrorKind::ConnectionReset
+                                    | std::io::ErrorKind::ConnectionRefused
+                                    | std::io::ErrorKind::ConnectionAborted
+                                    | std::io::ErrorKind::Interrupted
+                                    | std::io::ErrorKind::WouldBlock
+                            ) => {
+                                trace!("DTLS server transient recv error (ignored): {}", e);
+                                continue;
+                            }
+                            Err(e) => {
+                                return Err(anyhow::anyhow!("DTLS server recv error: {}", e));
+                            }
+                        }
+                    }
+                    _ = shutdown_rx.changed() => {
+                        return Ok(());
+                    }
+                };
+                if *shutdown_rx.borrow() {
+                    return Ok(());
+                }
+
+                self.dispatch_datagram(peer_addr, &buf[..len], None);
+            }
         }
     }
 
@@ -3009,7 +3150,7 @@ impl DtlsServer {
     /// The datagram is borrowed from the receive buffer and the (decoded)
     /// payload is copied exactly once, only when it is delivered to a session
     /// or starts one; refused datagrams allocate nothing (issue #7207).
-    async fn dispatch_datagram(
+    fn dispatch_datagram(
         &self,
         peer_addr: SocketAddr,
         datagram: &[u8],
@@ -3044,21 +3185,13 @@ impl DtlsServer {
             );
             return;
         }
-        // Clone the sender (and demux identity) out of the DashMap guard
-        // before sending. The `Ref` from `sessions.get()` holds a read lock
-        // on the shard; holding it while a `SessionGuard::Drop` on the same
-        // shard needs a write lock to call `sessions.remove_if()` would
-        // deadlock. Capture `generation` with the sender so a Closed cleanup
-        // cannot race-evict a newer session inserted for the same peer.
-        let session = self.sessions.get(&peer_addr).map(|s| {
-            (
-                s.incoming_tx.clone(),
-                s.generation,
-                s.reply_local,
-                s.forwarded_client,
-            )
-        });
-        if let Some((tx, generation, session_local, session_forwarded)) = session {
+        // Dispatch directly through the borrowed DashMap entry on the hot path
+        // (avoiding per-datagram `mpsc::Sender` Arc clone/drop), and release
+        // the shard read guard before any `remove_session` / `spawn_session`
+        // call that requires a write lock on the same shard. Capture
+        // `generation` so a Closed cleanup cannot race-evict a newer session
+        // inserted for the same peer.
+        let existing_outcome = self.sessions.get(&peer_addr).map(|s| {
             // The peer's source ADDRESS is spoofable; neither the interface it
             // entered the host namespace on nor the local destination the
             // kernel delivered it to is. A datagram claiming an established peer
@@ -3071,7 +3204,7 @@ impl DtlsServer {
             // listener carries `None` on both sides and compares equal.
             if !dtls_scoped_capture_admits(
                 self.limits.capture_ingress_ifindex,
-                session_local,
+                s.reply_local,
                 reply_local,
             ) {
                 trace!(
@@ -3079,12 +3212,12 @@ impl DtlsServer {
                     "DTLS: dropping datagram whose ingress interface or local destination does \
                      not match the session's pinned capture"
                 );
-                return;
+                return None;
             }
             // The association was admitted for one authenticated client;
             // a datagram asserting another is refused rather than decrypted
             // under the first client's identity.
-            if session_forwarded != forwarded_client {
+            if s.forwarded_client != forwarded_client {
                 let _ = record_datagram_metadata_refusal(
                     &self.datagram_client_address_warn,
                     self.limits.datagram_client_address_drops.as_deref(),
@@ -3093,7 +3226,7 @@ impl DtlsServer {
                     DatagramMetadataError::ForwardedClientChanged.reason(),
                     crate::proxy::udp_proxy::coarse_epoch_millis(),
                 );
-                return;
+                return None;
             }
             // Existing session — forward packet to its driver. Never
             // `.send().await`: one session whose driver has stalled (its
@@ -3102,7 +3235,13 @@ impl DtlsServer {
             // freezing demux — handshakes, retransmits, everything — for
             // EVERY peer on the listener. Dropping the datagram is correct
             // UDP semantics; DTLS retransmission recovers the loss.
-            match tx.try_send(data.to_vec()) {
+            Some((s.incoming_tx.try_send(data.to_vec()), s.generation))
+        });
+        if let Some(outcome) = existing_outcome {
+            let Some((send_res, generation)) = outcome else {
+                return;
+            };
+            match send_res {
                 Ok(()) => {}
                 Err(mpsc::error::TrySendError::Full(_)) => {
                     trace!(
@@ -3171,6 +3310,9 @@ impl DtlsServer {
         reply_local: Option<crate::socket_opts::PktinfoLocal>,
         forwarded_client: Option<SocketAddr>,
     ) {
+        if *self.shutdown_tx.borrow() {
+            return;
+        }
         if let Some(ref authorize) = self.limits.authorize_new_session
             && !authorize(peer_addr, reply_local.map(|local| local.ifindex))
         {
@@ -3281,6 +3423,23 @@ impl DtlsServer {
                 forwarded_client,
             },
         );
+        // Symmetric fence with `DtlsServer::close()`: `close()` calls
+        // `self.shutdown_tx.send_replace(true)` strictly before walking
+        // `self.sessions` to signal each session's lock-free `shutdown_tx`.
+        // Re-checking `self.shutdown_tx.borrow()` after `insert` guarantees
+        // that any session inserted after `close()` walked its shard observes
+        // `true` here and rolls back cleanly without ever spawning, avoiding
+        // any shared `watch` waiter lock in the per-session hot `select!` loop.
+        if *self.shutdown_tx.borrow() {
+            remove_session(
+                &self.sessions,
+                &self.active_sessions,
+                self.limits.active_session_mirror.as_deref(),
+                &peer_addr,
+                generation,
+            );
+            return;
+        }
 
         // Issue #3857: capture the frontend DTLS client-trust generation BEFORE
         // snapshotting the crypto material this session handshakes with. The
@@ -3313,10 +3472,11 @@ impl DtlsServer {
         let handshake_deadline = self
             .limits
             .handshake_timeout
-            .map(|timeout| Instant::now() + timeout);
+            .map(|timeout| tokio::time::Instant::now() + timeout);
         let handshake_timeout_warn = self.handshake_timeout_warn.clone();
         let handshake_timeouts = self.handshake_timeouts.clone();
         let udp_port_hold = self.udp_port_hold.clone();
+        let server_shutdown_rx = self.shutdown_tx.subscribe();
 
         tokio::spawn(async move {
             // Held for as long as this driver holds `socket`.
@@ -3332,6 +3492,15 @@ impl DtlsServer {
             // at accept handoff below, and by `Drop` on every other exit path
             // (refused handshake, timeout, socket error, task cancellation).
             let mut per_source_ip_guard = per_source_ip_guard;
+
+            // Defense in depth alongside the post-insert check in `spawn_session`:
+            // if listener shutdown arrived before this driver started, exit before
+            // emitting any handshake flight, then drop `server_shutdown_rx` so the
+            // per-packet loop polls only this session's lock-free `shutdown_rx`.
+            if *server_shutdown_rx.borrow() {
+                return;
+            }
+            drop(server_shutdown_rx);
 
             let mut dtls = Dtls::new_auto(config, certificate, Instant::now());
             // Server role (default — is_active=false)
@@ -3399,6 +3568,11 @@ impl DtlsServer {
             // must not emit queued packets after this retirement even when the
             // session authorization deadline has not elapsed.
             let mut retired_by_trust_withdrawal = false;
+            let mut armed_timeout: Option<Instant> = None;
+            let retransmit_sleep: Option<tokio::time::Sleep> = None;
+            tokio::pin!(retransmit_sleep);
+            let handshake_sleep = handshake_deadline.map(tokio::time::sleep_until);
+            tokio::pin!(handshake_sleep);
 
             loop {
                 // Check the handshake deadline at the top of each iteration so
@@ -3406,7 +3580,7 @@ impl DtlsServer {
                 // in the select below.
                 if !connected
                     && let Some(deadline) = handshake_deadline
-                    && Instant::now() >= deadline
+                    && tokio::time::Instant::now() >= deadline
                 {
                     record_dtls_handshake_timeout(
                         &handshake_timeout_warn,
@@ -3417,16 +3591,23 @@ impl DtlsServer {
                     break;
                 }
 
-                let handshake_sleep_dur = if connected {
-                    Duration::from_secs(60)
-                } else {
-                    handshake_deadline
-                        .map(|deadline| deadline.saturating_duration_since(Instant::now()))
-                        .unwrap_or(Duration::from_secs(60))
-                };
-                let sleep_dur = next_timeout
-                    .map(|t| t.saturating_duration_since(Instant::now()))
-                    .unwrap_or(Duration::from_secs(60));
+                if next_timeout != armed_timeout {
+                    armed_timeout = next_timeout;
+                    match next_timeout {
+                        Some(t) => {
+                            let target = tokio::time::Instant::now()
+                                + t.saturating_duration_since(Instant::now());
+                            if let Some(sleep) = retransmit_sleep.as_mut().as_pin_mut() {
+                                sleep.reset(target);
+                            } else {
+                                retransmit_sleep.set(Some(tokio::time::sleep_until(target)));
+                            }
+                        }
+                        None => {
+                            retransmit_sleep.set(None);
+                        }
+                    }
+                }
 
                 let mut in_flight: Option<InFlightFrontendAppSend> = None;
 
@@ -3460,11 +3641,10 @@ impl DtlsServer {
                         let FrontendAppSend {
                             data,
                             completion,
-                            mut cancel,
                             deadline,
                         } = pending;
                         let session_deadline = auth_deadline.get();
-                        let cancelled = frontend_app_send_cancel_fired(&mut cancel);
+                        let cancelled = completion.is_closed();
                         let effective = earliest_frontend_app_send_deadline(
                             deadline,
                             session_deadline,
@@ -3522,7 +3702,6 @@ impl DtlsServer {
                                 } else {
                                     in_flight = Some(InFlightFrontendAppSend {
                                         completion,
-                                        cancel,
                                         deadline: effective,
                                     });
                                 }
@@ -3553,12 +3732,22 @@ impl DtlsServer {
                             }
                         }
                     }
-                    // DTLS retransmit timer
-                    _ = tokio::time::sleep(sleep_dur) => {
+                    // DTLS retransmit timer (only polled when dimpl actually armed a timeout)
+                    _ = async {
+                        match retransmit_sleep.as_mut().as_pin_mut() {
+                            Some(sleep) => sleep.await,
+                            None => std::future::pending::<()>().await,
+                        }
+                    }, if next_timeout.is_some() => {
+                        // Clear `armed_timeout` unconditionally so an early wakeup
+                        // (e.g. paused/mocked Tokio clock ahead of `std::time::Instant`)
+                        // re-arms `retransmit_sleep` instead of spinning on an elapsed timer.
+                        armed_timeout = None;
+                        let now = Instant::now();
                         if let Some(t) = next_timeout
-                            && Instant::now() >= t
+                            && now >= t
                         {
-                            if let Err(e) = dtls.handle_timeout(Instant::now()) {
+                            if let Err(e) = dtls.handle_timeout(now) {
                                 trace!(client = %peer_addr, "DTLS timeout error: {}", e);
                                 break;
                             }
@@ -3567,7 +3756,12 @@ impl DtlsServer {
                     }
                     // Handshake deadline (top-of-loop check is primary;
                     // this is defense in depth).
-                    _ = tokio::time::sleep(handshake_sleep_dur), if !connected && handshake_deadline.is_some() => {
+                    _ = async {
+                        match handshake_sleep.as_mut().as_pin_mut() {
+                            Some(sleep) => sleep.await,
+                            None => std::future::pending::<()>().await,
+                        }
+                    }, if !connected && handshake_deadline.is_some() => {
                         record_dtls_handshake_timeout(
                             &handshake_timeout_warn,
                             &handshake_timeouts,
@@ -3661,6 +3855,7 @@ impl DtlsServer {
                             Output::Connected => {
                                 just_connected = true;
                                 connected = true;
+                                handshake_sleep.set(None);
                                 // Enforce client-certificate authentication as a hard
                                 // requirement. dimpl completes the handshake even when
                                 // the client returns an empty Certificate, so without
@@ -3824,12 +4019,26 @@ impl DtlsServer {
                                     (chain.len() > 1).then(|| Arc::new(chain[1..].to_vec()));
                             }
                             Output::ApplicationData(data) => {
-                                match frontend_trust_raced_delivery(
-                                    client_trust_guard.as_ref().map(|guard| guard.session()),
-                                    app_out_tx.send(data.to_vec()),
-                                )
-                                .await
-                                {
+                                let trust_session =
+                                    client_trust_guard.as_ref().map(|guard| guard.session());
+                                let delivered = if trust_session.is_none() {
+                                    match app_out_tx.try_send(data.to_vec()) {
+                                        Ok(()) => Ok(Ok(())),
+                                        Err(mpsc::error::TrySendError::Full(owned)) => {
+                                            Ok(app_out_tx.send(owned).await)
+                                        }
+                                        Err(mpsc::error::TrySendError::Closed(owned)) => {
+                                            Ok(Err(mpsc::error::SendError(owned)))
+                                        }
+                                    }
+                                } else {
+                                    frontend_trust_raced_delivery(
+                                        trust_session,
+                                        app_out_tx.send(data.to_vec()),
+                                    )
+                                    .await
+                                };
+                                match delivered {
                                     Ok(Ok(())) => {
                                         drain_round_exhausted = false;
                                         break;
@@ -4501,7 +4710,10 @@ async fn send_dtls_record(
     }
     #[cfg(not(target_os = "linux"))]
     let _ = reply_local;
-    socket.send_to(data, peer).await
+    match socket.try_send_to(data, peer) {
+        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => socket.send_to(data, peer).await,
+        other => other,
+    }
 }
 
 /// Drain `poll_output()` and send packets to a specific peer address (for server-side).
