@@ -1423,11 +1423,7 @@ impl OidcRelyingParty {
             rp_initiated_logout: optional_behavior_bool(behavior_obj, "rp_initiated_logout")?
                 .unwrap_or(true),
             post_login_redirect_param,
-            post_login_default_path: optional_behavior_string(
-                behavior_obj,
-                "post_login_default_path",
-            )?
-            .unwrap_or_else(|| "/".to_string()),
+            post_login_default_path: parse_post_login_default_path(behavior_obj)?,
             trusted_redirect_hosts,
         });
 
@@ -3249,8 +3245,16 @@ impl OidcRelyingParty {
     /// `host` under `https`). The `redirect_uri`'s own origin is always in that
     /// list (added at construction). Anything else lands on
     /// `behavior.post_login_default_path`.
+    ///
+    /// The value emitted is the parser's canonical serialization of the URL
+    /// that was validated, never the raw input (GHSA-6rwj-gc4r-3jm9), and a
+    /// raw input carrying ASCII control characters or a backslash is refused
+    /// before parsing because the WHATWG parser silently rewrites both.
     fn sanitize_redirect(&self, original: &str) -> String {
         let fallback = || self.behavior.post_login_default_path.clone();
+        if !is_unambiguous_redirect_text(original) {
+            return fallback();
+        }
         let Ok(parsed) = Url::parse(original) else {
             return fallback();
         };
@@ -3271,8 +3275,15 @@ impl OidcRelyingParty {
             return fallback();
         };
         let authority = format!("{host}:{port}");
-        if self.behavior.trusted_redirect_hosts.contains(&authority) {
-            original.to_string()
+        if !self.behavior.trusted_redirect_hosts.contains(&authority) {
+            return fallback();
+        }
+        // Emit exactly the URL that was judged. The serialization is ASCII
+        // with no controls, but verify it is a header value anyway so a
+        // `Location` can never be silently dropped downstream.
+        let canonical = String::from(parsed);
+        if http::HeaderValue::from_str(&canonical).is_ok() {
+            canonical
         } else {
             fallback()
         }
@@ -4403,6 +4414,31 @@ fn optional_behavior_string(
     Ok(Some(raw.trim().to_string()))
 }
 
+/// Whether redirect text is free of ASCII control characters and backslashes
+/// (GHSA-6rwj-gc4r-3jm9). WHATWG URL parsing strips tab/CR/LF and reads `\`
+/// as `/` in special schemes, so text containing either can be judged as a
+/// different URL than an RFC 3986 client or header validator sees.
+fn is_unambiguous_redirect_text(value: &str) -> bool {
+    !value
+        .bytes()
+        .any(|byte| byte < 0x20 || byte == 0x7f || byte == b'\\')
+}
+
+/// `behavior.post_login_default_path` reaches `Location` verbatim, so it must
+/// be valid header text: refuse control characters and backslashes in the
+/// supplied value (before trimming, matching the schema pattern).
+fn parse_post_login_default_path(config: Option<&Map<String, Value>>) -> Result<String, String> {
+    if let Some(raw) = config
+        .and_then(|cfg| cfg.get("post_login_default_path"))
+        .and_then(Value::as_str)
+        && !is_unambiguous_redirect_text(raw)
+    {
+        return Err("oidc_relying_party: `behavior.post_login_default_path` must not contain ASCII control characters or a backslash".to_string());
+    }
+    Ok(optional_behavior_string(config, "post_login_default_path")?
+        .unwrap_or_else(|| "/".to_string()))
+}
+
 fn parse_behavior_string_array(
     config: Option<&Map<String, Value>>,
     field: &str,
@@ -5119,7 +5155,16 @@ fn original_url(ctx: &RequestContext, behavior: &BehaviorConfig) -> String {
     if let Some(param) = &behavior.post_login_redirect_param
         && let Some(value) = ctx.query_params.get(param)
     {
-        if value.starts_with('/') && !value.starts_with("//") {
+        // A path-relative value resolves against the current host. `//` and
+        // `/\` (which special-scheme parsing reads as `//`) are
+        // scheme-relative, not paths; they and any value carrying control
+        // characters or a backslash pass through unresolved so
+        // `sanitize_redirect` refuses them (GHSA-6rwj-gc4r-3jm9).
+        if value.starts_with('/')
+            && !value.starts_with("//")
+            && !value.starts_with("/\\")
+            && is_unambiguous_redirect_text(value)
+        {
             let scheme = frontend_scheme(ctx);
             let host = request_host(ctx);
             return format!("{scheme}://{host}{value}");

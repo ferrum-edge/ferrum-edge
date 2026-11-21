@@ -4973,6 +4973,26 @@ fn the_config_component_agrees_with_constructor_admission() {
         provider("authorization_params", json!({"prompt": 1})),
         false,
     );
+
+    // GHSA-6rwj-gc4r-3jm9: the default path is emitted verbatim as `Location`.
+    case(
+        "default path",
+        behavior("post_login_default_path", json!("/home?tab=1")),
+        true,
+    );
+    for (label, path) in [
+        ("default path with CR/LF", "/home\r\nx-injected: 1"),
+        ("default path with a tab", "/home\tx"),
+        ("default path with DEL", "/home\u{7f}"),
+        ("default path with a backslash", "/\\evil.example.com"),
+        ("default path with a trailing newline", "/home\n"),
+    ] {
+        case(
+            label,
+            behavior("post_login_default_path", json!(path)),
+            false,
+        );
+    }
 }
 
 fn no_endpoints_with_discovery() -> serde_json::Value {
@@ -6043,17 +6063,20 @@ async fn post_login_redirects_require_a_trusted_origin() {
         (HOST_ONLY, "http://app.example.com/account", "/"),
         (HOST_ONLY, "https://app.example.com:9443/admin", "/"),
         (HOST_ONLY, "https://user@app.example.com/account", "/"),
+        // The emitted Location is the canonical URL that was judged, not the
+        // raw input (GHSA-6rwj-gc4r-3jm9): hosts lowercase.
         (
             HOST_ONLY,
             "https://APP.example.com/account",
-            "https://APP.example.com/account",
+            "https://app.example.com/account",
         ),
         // An explicit default port is the same origin as the bare host, in
-        // both the allowlist entry and the target (PR6833-SOL-4).
+        // both the allowlist entry and the target (PR6833-SOL-4), and the
+        // canonical form omits it.
         (
             HOST_ONLY,
             "https://app.example.com:443/account",
-            "https://app.example.com:443/account",
+            "https://app.example.com/account",
         ),
         (
             DEFAULT_PORT,
@@ -6063,7 +6086,7 @@ async fn post_login_redirects_require_a_trusted_origin() {
         (
             DEFAULT_PORT,
             "https://app.example.com:443/account",
-            "https://app.example.com:443/account",
+            "https://app.example.com/account",
         ),
         (DEFAULT_PORT, "https://app.example.com:8443/account", "/"),
         (
@@ -6103,6 +6126,100 @@ async fn post_login_redirects_require_a_trusted_origin() {
             Some(expected),
             "trusted={trusted:?} rd={target}"
         );
+    }
+}
+
+/// Complete a login whose challenge carried `rd` (already percent-decoded, as
+/// the query parameter map holds it) and return the callback's `Location`.
+/// The default path is `/home` so a fallback is distinguishable from `/`.
+async fn post_login_location_for(rd: &str) -> String {
+    let server = MockServer::start().await;
+    let plugin = callback_plugin_with(&server, |config| {
+        config["behavior"]["post_login_default_path"] = json!("/home");
+    })
+    .await;
+    let mut ctx = html_ctx();
+    ctx.query_params.insert("rd".to_string(), rd.to_string());
+    let challenge = issue_browser_challenge_for_context(&plugin, ctx).await;
+    let id_token = create_rs256_token(
+        &oidc_id_token_claims(&challenge),
+        include_bytes!("../../../tests/fixtures/test_rsa_private.pem"),
+    );
+    mount_token_and_jwks(&server, &id_token).await;
+    let headers = assert_callback_redirect(
+        complete_callback(&plugin, &challenge, "authorization-code").await,
+    );
+    let location = headers
+        .get("location")
+        .cloned()
+        .unwrap_or_else(|| panic!("callback redirect for rd={rd:?} has no Location"));
+    assert!(
+        http::HeaderValue::from_str(&location).is_ok(),
+        "Location for rd={rd:?} is not a valid header value: {location:?}"
+    );
+    location
+}
+
+/// GHSA-6rwj-gc4r-3jm9: redirect targets carrying ASCII control characters or
+/// a backslash are refused outright, in absolute and path-relative form, even
+/// when WHATWG parsing alone would resolve them to a trusted origin.
+#[serial_test::serial(jwks_remote_global_cache)]
+#[tokio::test]
+async fn post_login_redirects_with_controls_or_backslashes_fall_back() {
+    for rd in [
+        // Absolute targets on the trusted origin.
+        "https://app.example.com/account\r\nset-cookie: injected=1",
+        "https://app.example.com/account\n",
+        "https://app.example.com/acc\tount",
+        "https://app.exam\tple.com/account",
+        "https://app.example.com/account\u{7f}",
+        "https://app.example.com/account\u{0}",
+        "https://app.example.com\\@evil.example.com/",
+        "https://app.example.com/\\evil.example.com",
+        "https:\\\\app.example.com/account",
+        // Path-relative and scheme-relative forms.
+        "/\\evil.example.com",
+        "/\\/evil.example.com",
+        "/account\r\nset-cookie: injected=1",
+        "/acc\tount",
+        "/account\\..\\admin",
+        "\\\\evil.example.com",
+        "//evil.example.com",
+    ] {
+        assert_eq!(
+            post_login_location_for(rd).await,
+            "/home",
+            "rd={rd:?} must fall back to post_login_default_path"
+        );
+    }
+}
+
+/// GHSA-6rwj-gc4r-3jm9: an accepted target is emitted as the canonical URL
+/// that was validated, never the raw input, and is always a valid header value.
+#[serial_test::serial(jwks_remote_global_cache)]
+#[tokio::test]
+async fn accepted_post_login_redirects_emit_the_canonical_url() {
+    for (rd, expected) in [
+        (
+            "https://app.example.com/account?tab=1",
+            "https://app.example.com/account?tab=1",
+        ),
+        ("https://APP.Example.COM:443", "https://app.example.com/"),
+        (
+            "https://app.example.com/a b?q=c d#f g",
+            "https://app.example.com/a%20b?q=c%20d#f%20g",
+        ),
+        (
+            "https://app.example.com/caf\u{e9}",
+            "https://app.example.com/caf%C3%A9",
+        ),
+        (
+            "https://app.example.com/orders/../account",
+            "https://app.example.com/account",
+        ),
+        ("/orders?id=7", "https://app.example.com/orders?id=7"),
+    ] {
+        assert_eq!(post_login_location_for(rd).await, expected, "rd={rd:?}");
     }
 }
 
