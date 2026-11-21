@@ -49,7 +49,7 @@ use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use super::chargeback::pricing::{ChargeComputation, PricingConfig, require_finite_charge};
 use super::chargeback::{
     HttpBillingOutcome, billing_principal, http_billing_outcome, is_websocket_handshake,
-    principal_billing_identity, with_principal_billing_identity,
+    owned_principal_billing_identity, principal_billing_identity, with_principal_billing_identity,
 };
 use super::utils::byte_budget::{
     GrowableProcessReservation, JSON_STRING_WORST_CASE_EXPANSION, PayloadMaterializationError,
@@ -3837,7 +3837,7 @@ impl Plugin for ApiChargebackSink {
         }
         self.enqueue(event_from_http_summary(
             summary,
-            principal_billing_identity(principal, MAX_FIELD_LEN).into_owned(),
+            owned_principal_billing_identity(principal, MAX_FIELD_LEN),
             outcome,
             charge,
             &self.config,
@@ -3893,7 +3893,7 @@ impl Plugin for ApiChargebackSink {
         }
         self.enqueue(event_from_stream_summary(
             summary,
-            principal_billing_identity(principal, MAX_FIELD_LEN).into_owned(),
+            owned_principal_billing_identity(principal, MAX_FIELD_LEN),
             charge,
             &self.config,
             &self.node_id,
@@ -3952,7 +3952,7 @@ impl Plugin for ApiChargebackSink {
         }
         self.enqueue(event_from_ws_summary(
             summary,
-            principal_billing_identity(principal, MAX_FIELD_LEN).into_owned(),
+            owned_principal_billing_identity(principal, MAX_FIELD_LEN),
             charge,
             &self.config,
             &self.node_id,

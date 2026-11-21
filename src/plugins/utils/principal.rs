@@ -216,6 +216,24 @@ impl<'a> Principal<'a> {
         }
     }
 
+    /// Byte length of [`Self::push_key`]'s output, computed without building
+    /// it.
+    pub fn key_len(&self) -> usize {
+        match self {
+            Self::Consumer(username) => CONSUMER_KEY_PREFIX.len() + username.len(),
+            Self::External { identity, realm } => {
+                let mechanism = realm
+                    .map(|realm| realm.mechanism())
+                    .unwrap_or(ABSENT_REALM_COMPONENT);
+                let authority_len = realm
+                    .as_ref()
+                    .and_then(|realm| realm.authority())
+                    .map_or(ABSENT_REALM_COMPONENT.len(), |digest| digest.len() * 2);
+                EXTERNAL_KEY_PREFIX.len() + mechanism.len() + authority_len + 2 + identity.len()
+            }
+        }
+    }
+
     /// [`Self::push_key`] into a new `String`.
     pub fn key(&self) -> String {
         let mut key = String::new();

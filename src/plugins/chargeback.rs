@@ -220,6 +220,32 @@ pub fn principal_billing_identity(principal: Principal<'_>, max_len: usize) -> C
     }
 }
 
+/// [`principal_billing_identity`] as an owned `String` built with exactly one
+/// allocation, for a value that is moved into an exported event: a verbatim
+/// Consumer username is copied once, a verbatim external key is built directly
+/// at its exact length, and any digest form is encoded in the per-thread
+/// buffer and copied once. The bytes are identical to
+/// [`principal_billing_identity`].
+pub fn owned_principal_billing_identity(principal: Principal<'_>, max_len: usize) -> String {
+    match principal {
+        Principal::Consumer(username) if !consumer_needs_digest(username, max_len) => {
+            username.to_owned()
+        }
+        // The fixed key components (prefix, compiled-in mechanism, hex or `-`
+        // authority, separators) cannot form the digest marker, so the
+        // identity alone decides whether the marker appears.
+        Principal::External { identity, .. }
+            if principal.key_len() <= max_len
+                && !identity.contains(BILLING_IDENTITY_DIGEST_MARKER) =>
+        {
+            let mut key = String::new();
+            principal.push_key(&mut key);
+            key
+        }
+        _ => with_principal_billing_identity(principal, max_len, str::to_owned),
+    }
+}
+
 /// [`principal_billing_identity`] handed to `f` without allocating once the
 /// per-thread buffer is warm: an in-bound Consumer borrows its username, and
 /// every other form (an external principal's key, and any digest form) is
