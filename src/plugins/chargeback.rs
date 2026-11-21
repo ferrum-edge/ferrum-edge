@@ -238,7 +238,17 @@ pub fn owned_principal_billing_identity(principal: Principal<'_>, max_len: usize
         {
             consumer_billing_identity(username, max_len).into_owned()
         }
-        Principal::External { .. } if principal.key_len() <= max_len => {
+        // Only the identity or a (custom) mechanism name can contain the
+        // marker's `~`: the prefix, hex-or-`-` authority, and separators
+        // cannot. Without a `~` in the mechanism, an in-bound key is verbatim
+        // exactly when its identity is marker-free, so it is built once and
+        // moved. Anything else takes the per-thread encoder below, which
+        // applies the complete-key predicate.
+        Principal::External { identity, realm }
+            if principal.key_len() <= max_len
+                && !identity.contains(BILLING_IDENTITY_DIGEST_MARKER)
+                && !realm.is_some_and(|realm| realm.mechanism().contains('~')) =>
+        {
             let mut key = String::new();
             principal.push_key(&mut key);
             external_billing_identity_from_key(key, max_len)
