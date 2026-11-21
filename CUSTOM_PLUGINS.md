@@ -1386,7 +1386,8 @@ on the caller should use
 `plugins::utils::principal::Principal::with_origin(username, summary.principal_origin)`
 and its `push_key` form instead of the bare display string (GHSA-q9vj-rf66-3j58).
 Code that builds these structs field-by-field must set `principal_origin`
-(`ctx.principal_origin()` from the request or stream context).
+(`ctx.principal_origin()` from the request or stream context, or take both
+fields together with `ctx.summary_identity()`).
 
 ## Stream Transaction Summary
 

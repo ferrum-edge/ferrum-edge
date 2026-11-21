@@ -7059,7 +7059,9 @@ fn test_principal_billing_identity_classes_are_disjoint() {
             )),
         }
     }
-    let identity_of = |principal: Principal<'_>| {
+    /// The bounded billing identity, checked on both the owned and the
+    /// per-thread paths.
+    fn identity_of(principal: Principal<'_>) -> String {
         let owned = principal_billing_identity(principal, BOUND).into_owned();
         let pooled = with_principal_billing_identity(principal, BOUND, str::to_owned);
         assert_eq!(
@@ -7069,7 +7071,7 @@ fn test_principal_billing_identity_classes_are_disjoint() {
         assert!(owned.len() <= BOUND, "{owned}");
         assert_ne!(owned, OVERFLOW_CONSUMER_SENTINEL);
         owned
-    };
+    }
 
     // Consumer rows are unchanged; external rows are the namespaced key.
     assert_eq!(identity_of(Principal::Consumer("alice")), "alice");
@@ -7097,6 +7099,44 @@ fn test_principal_billing_identity_classes_are_disjoint() {
         identity_of(external(long_a.as_str())),
         identity_of(external(long_b.as_str()))
     );
+
+    // A Consumer whose username is the complete canonical key of an external
+    // principal whose key must itself be digested (marker-bearing, or over
+    // the bound): both sides hash the very same text, so only the digest
+    // domains keep them apart.
+    let long_subject = "y".repeat(500);
+    for subject in ["bob~sha256:0000", long_subject.as_str()] {
+        let canonical_key = external(subject).key();
+        let external_side = identity_of(external(subject));
+        let consumer_side = identity_of(Principal::Consumer(&canonical_key));
+        for side in [&external_side, &consumer_side] {
+            assert!(side.contains("~sha256:"), "{side}");
+            assert!(side.len() <= BOUND, "{side}");
+        }
+        assert_ne!(
+            external_side, consumer_side,
+            "equal hashed text must still yield distinct rows"
+        );
+    }
+
+    // Owned and per-thread paths agree at every bound, including a prefix
+    // cut that lands inside a multi-byte character and a bound too small for
+    // any prefix.
+    let wide = "é".repeat(400);
+    for bound in [40usize, 80, 81, 512] {
+        for principal in [
+            Principal::Consumer(wide.as_str()),
+            Principal::Consumer(&external_alice),
+            external(wide.as_str()),
+            external("alice"),
+        ] {
+            let owned = principal_billing_identity(principal, bound).into_owned();
+            let pooled = with_principal_billing_identity(principal, bound, str::to_owned);
+            assert_eq!(owned, pooled, "bound {bound}: {principal:?}");
+            assert!(owned.len() <= bound, "bound {bound}: {owned}");
+        }
+    }
+    identity_of(Principal::Consumer(&"z".repeat(600)));
 
     // The overflow sentinel itself is never reproduced by a real principal.
     identity_of(Principal::Consumer(OVERFLOW_CONSUMER_SENTINEL));
@@ -7150,24 +7190,27 @@ fn test_principal_origin_is_not_serialized_and_survives_ws_session_end_projectio
     );
 }
 
-/// GHSA-q9vj-rf66-3j58 parity guard: every struct literal in `src/` that
-/// carries a principal's display identity into a summary (or into a context a
-/// summary is later built from) must record that identity's origin beside it,
-/// from the same context, and may leave the origin `None` only when there is
+/// Struct types whose literals carry a principal's display identity into a
+/// summary, or into a context a summary is later built from.
+const PRINCIPAL_CARRIERS: &[&str] = &[
+    "TransactionSummary",
+    "StreamTransactionSummary",
+    "WsDisconnectContext",
+    "WsSessionMeta",
+    "UdpSession",
+    "UdpSetupAttribution",
+    "DtlsDisconnectContext",
+];
+
+/// GHSA-q9vj-rf66-3j58 parity guard: every carrier literal in `src/` that
+/// sets `consumer_username` must record that identity's origin beside it,
+/// from the same source, and may leave the origin `None` only when there is
 /// no identity. The exporter tests above project the origin by hand, so this
 /// is what catches a builder (HTTP, gRPC, H3, WebSocket, stream, UDP/DTLS,
-/// mesh, abort, HBONE, …) that drops it.
+/// mesh, abort, HBONE, …) that drops it. See
+/// [`principal_origin_violations`] for the accepted pairings.
 #[test]
 fn every_summary_builder_records_principal_origin_beside_consumer_username() {
-    const CARRIERS: &[&str] = &[
-        "TransactionSummary",
-        "StreamTransactionSummary",
-        "WsDisconnectContext",
-        "WsSessionMeta",
-        "UdpSession",
-        "UdpSetupAttribution",
-        "DtlsDisconnectContext",
-    ];
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
     let mut files = Vec::new();
     collect_rust_sources(&root.join("src"), &mut files);
@@ -7177,42 +7220,14 @@ fn every_summary_builder_records_principal_origin_beside_consumer_username() {
     let mut violations = Vec::new();
     for path in files {
         let source = std::fs::read_to_string(&path).expect("read source");
-        let code = blank_strings_and_comments(&source);
         let relative = path
             .strip_prefix(root)
             .unwrap_or(&path)
             .display()
             .to_string();
-        for (offset, body) in carrier_literals(&code, CARRIERS) {
-            let fields = top_level_fields(body);
-            let Some(consumer) = fields.get("consumer_username") else {
-                continue;
-            };
-            inspected += 1;
-            let line = code[..offset].matches('\n').count() + 1;
-            let location = format!("{relative}:{line}");
-            let Some(origin) = fields.get("principal_origin") else {
-                violations.push(format!(
-                    "{location}: sets consumer_username without principal_origin"
-                ));
-                continue;
-            };
-            if origin == "None" && consumer != "None" {
-                violations.push(format!(
-                    "{location}: carries an identity (`{consumer}`) with principal_origin: None"
-                ));
-            }
-            if let Some(receiver) =
-                consumer.strip_suffix(".effective_identity().map(str::to_owned)")
-            {
-                let expected = format!("{receiver}.principal_origin()");
-                if origin != &expected {
-                    violations.push(format!(
-                        "{location}: identity from `{receiver}` but principal_origin is `{origin}` (expected `{expected}`)"
-                    ));
-                }
-            }
-        }
+        let (found, file_violations) = principal_origin_violations(&relative, &source);
+        inspected += found;
+        violations.extend(file_violations);
     }
     assert!(
         inspected >= 30,
@@ -7223,6 +7238,246 @@ fn every_summary_builder_records_principal_origin_beside_consumer_username() {
         "summary builders must record principal_origin beside consumer_username:\n{}",
         violations.join("\n")
     );
+}
+
+/// The guard must reject the regressions it exists for, including through
+/// shorthand locals (the TCP disconnect builder's shape) and a comment between
+/// the type name and its brace.
+#[test]
+fn principal_origin_guard_rejects_lost_or_mismatched_origins() {
+    const TCP_STYLE: &str = r#"
+fn build(stream_ctx: &StreamConnectionContext, plugins: &[u8]) -> StreamTransactionSummary {
+    let (consumer_username, principal_origin) = if !plugins.is_empty() {
+        stream_ctx.summary_identity()
+    } else {
+        (None, None)
+    };
+    StreamTransactionSummary {
+        namespace: String::new(),
+        consumer_username,
+        principal_origin,
+        auth_method: None,
+    }
+}
+"#;
+    let check = |source: &str| principal_origin_violations("fixture.rs", source);
+
+    assert_eq!(
+        check(TCP_STYLE),
+        (1, Vec::new()),
+        "the paired builder passes"
+    );
+
+    // The origin local cleared while the identity local survives.
+    let cleared = TCP_STYLE.replace(
+        "let (consumer_username, principal_origin) = if !plugins.is_empty() {\n        stream_ctx.summary_identity()\n    } else {\n        (None, None)\n    };",
+        "let consumer_username = stream_ctx.effective_identity().map(str::to_owned);\n    let principal_origin = None;",
+    );
+    assert_ne!(cleared, TCP_STYLE, "fixture rewrite must apply");
+    let (found, violations) = check(&cleared);
+    assert_eq!(found, 1);
+    assert_eq!(violations.len(), 1, "{violations:?}");
+
+    // A literal `None` origin beside a carried identity.
+    let none_origin = TCP_STYLE.replace(
+        "        principal_origin,\n",
+        "        principal_origin: None,\n",
+    );
+    assert_eq!(check(&none_origin).1.len(), 1);
+
+    // A missing origin behind a comment between the type name and its brace.
+    let commented = r#"
+fn build(ctx: &RequestContext) -> TransactionSummary {
+    TransactionSummary /* terminal record */
+    {
+        consumer_username: ctx.effective_identity().map(str::to_owned),
+        ..TransactionSummary::default()
+    }
+}
+"#;
+    let (found, violations) = check(commented);
+    assert_eq!(
+        found, 1,
+        "a comment before the brace must not hide the literal"
+    );
+    assert_eq!(violations.len(), 1, "{violations:?}");
+
+    // Identity and origin from different sources.
+    let mismatched = r#"
+fn build(ctx: &RequestContext, other: &RequestContext) -> TransactionSummary {
+    TransactionSummary {
+        consumer_username: ctx.effective_identity().map(str::to_owned),
+        principal_origin: other.principal_origin(),
+        ..TransactionSummary::default()
+    }
+}
+fn carry(session: &Meta, other: &Meta) -> WsDisconnectContext {
+    WsDisconnectContext {
+        consumer_username: session.consumer_username.clone(),
+        principal_origin: other.principal_origin,
+    }
+}
+fn hardcode(stream_ctx: &StreamConnectionContext) -> StreamTransactionSummary {
+    let consumer_username = stream_ctx.effective_identity().map(str::to_owned);
+    StreamTransactionSummary {
+        consumer_username,
+        principal_origin: Some(PrincipalOrigin::Consumer),
+    }
+}
+"#;
+    let (found, violations) = check(mismatched);
+    assert_eq!(found, 3);
+    assert_eq!(violations.len(), 3, "{violations:?}");
+}
+
+/// `(inspected, violations)` for one source file. Values are compared with
+/// whitespace removed. Accepted pairings for a literal that sets
+/// `consumer_username`:
+///
+/// - both `None`;
+/// - `X.effective_identity().map(str::to_owned)` with `X.principal_origin()`;
+/// - a carried `X.consumer_username` (optionally `.clone()`) with
+///   `X.principal_origin`;
+/// - a local (or shorthand) identity bound together with the origin local by
+///   the nearest preceding `let (identity, origin) = …summary_identity()…` in
+///   the same function;
+/// - an origin derived from the identity value itself (`identity.…`), as the
+///   crate's own test-session helpers do;
+/// - a literal fixture identity (`Some(…)`) with a non-`None` origin.
+///
+/// Everything else, including a missing origin, is a violation.
+fn principal_origin_violations(relative: &str, source: &str) -> (usize, Vec<String>) {
+    let code = blank_strings_and_comments(source);
+    let is_ident = |value: &str| {
+        !value.is_empty()
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+    };
+    let mut inspected = 0usize;
+    let mut violations = Vec::new();
+    for (offset, body) in carrier_literals(&code, PRINCIPAL_CARRIERS) {
+        let fields = top_level_fields(body);
+        let Some(consumer) = fields.get("consumer_username") else {
+            continue;
+        };
+        inspected += 1;
+        let line = code[..offset].matches('\n').count() + 1;
+        let location = format!("{relative}:{line}");
+        let Some(origin) = fields.get("principal_origin") else {
+            violations.push(format!(
+                "{location}: sets consumer_username without principal_origin"
+            ));
+            continue;
+        };
+        let accepted = if origin == "None" || consumer == "None" {
+            origin == "None" && consumer == "None"
+        } else if let Some(receiver) =
+            consumer.strip_suffix(".effective_identity().map(str::to_owned)")
+        {
+            origin == &format!("{receiver}.principal_origin()")
+        } else if let Some(receiver) = consumer
+            .strip_suffix(".consumer_username.clone()")
+            .or_else(|| consumer.strip_suffix(".consumer_username"))
+        {
+            origin == &format!("{receiver}.principal_origin")
+        } else {
+            let local = consumer
+                .strip_suffix(".clone()")
+                .unwrap_or(consumer.as_str());
+            if !is_ident(local) {
+                consumer.starts_with("Some(")
+            } else if origin.starts_with(&format!("{local}.")) {
+                true
+            } else {
+                is_ident(origin.as_str())
+                    && nearest_let_binding(&code[..offset], local).is_some_and(
+                        |(pattern, initializer)| {
+                            pattern == format!("({local},{origin})")
+                                && initializer.contains(".summary_identity()")
+                        },
+                    )
+            }
+        };
+        if !accepted {
+            violations.push(format!(
+                "{location}: consumer_username `{consumer}` is not paired with principal_origin `{origin}` from the same source"
+            ));
+        }
+    }
+    (inspected, violations)
+}
+
+/// The `(pattern, initializer)` of the last `let` before the end of `code`,
+/// within the enclosing function, whose pattern binds `local` (whitespace and
+/// `mut` removed from the pattern).
+fn nearest_let_binding(code: &str, local: &str) -> Option<(String, String)> {
+    let scope_start = code.rfind("fn ").unwrap_or(0);
+    let scope = &code[scope_start..];
+    let bytes = scope.as_bytes();
+    let is_ident = |byte: u8| byte.is_ascii_alphanumeric() || byte == b'_';
+    let mut found = None;
+    let mut from = 0;
+    while let Some(at) = scope[from..].find("let") {
+        let start = from + at;
+        from = start + 3;
+        if (start > 0 && is_ident(bytes[start - 1]))
+            || bytes.get(start + 3).is_some_and(|&byte| is_ident(byte))
+        {
+            continue;
+        }
+        let rest = &scope[start + 3..];
+        let Some(equals) = rest
+            .char_indices()
+            .find(|&(index, c)| {
+                c == '=' && !matches!(rest.as_bytes().get(index + 1), Some(b'=' | b'>'))
+            })
+            .map(|(index, _)| index)
+        else {
+            continue;
+        };
+        let pattern: String = rest[..equals]
+            .split_whitespace()
+            .filter(|token| *token != "mut")
+            .collect::<String>()
+            .replace("(mut", "(")
+            .replace(",mut", ",");
+        let simple = pattern.split(':').next().unwrap_or("").to_string();
+        let binds = if pattern.starts_with('(') && pattern.ends_with(')') {
+            pattern[1..pattern.len() - 1]
+                .split(',')
+                .any(|element| element == local)
+        } else {
+            simple == local
+        };
+        if !binds {
+            continue;
+        }
+        let initializer = &rest[equals + 1..];
+        let mut depth = 0i32;
+        let end = initializer
+            .char_indices()
+            .find(|&(_, c)| {
+                match c {
+                    '(' | '[' | '{' => depth += 1,
+                    ')' | ']' | '}' => depth -= 1,
+                    ';' if depth == 0 => return true,
+                    _ => {}
+                }
+                false
+            })
+            .map_or(initializer.len(), |(index, _)| index);
+        let pattern = if pattern.starts_with('(') {
+            pattern
+        } else {
+            simple
+        };
+        found = Some((
+            pattern,
+            initializer[..end].split_whitespace().collect::<String>(),
+        ));
+    }
+    found
 }
 
 fn collect_rust_sources(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
@@ -7356,7 +7611,9 @@ fn carrier_literals<'a>(code: &'a str, carriers: &[&str]) -> Vec<(usize, &'a str
             }
             let rest = &code[end..];
             let trimmed = rest.trim_start();
-            if !trimmed.starts_with('{') || rest.len() - trimmed.len() > 1 {
+            // Any whitespace (a blanked comment included) may precede the
+            // brace.
+            if !trimmed.starts_with('{') {
                 continue;
             }
             let path_start = code[..start]

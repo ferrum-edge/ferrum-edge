@@ -6968,16 +6968,12 @@ async fn start_dtls_frontend_listener(
                         crate::overload::ConnectionGuard::new(&handler_overload);
 
                     let handler_has_plugins = !plugins.is_empty();
-                    let handler_consumer_username = if handler_has_plugins {
-                        stream_ctx.effective_identity().map(str::to_owned)
-                    } else {
-                        None
-                    };
-                    let handler_principal_origin = if handler_has_plugins {
-                        stream_ctx.principal_origin()
-                    } else {
-                        None
-                    };
+                    let (handler_consumer_username, handler_principal_origin) =
+                        if handler_has_plugins {
+                            stream_ctx.summary_identity()
+                        } else {
+                            (None, None)
+                        };
                     let handler_auth_method = stream_ctx.auth_method;
                     let handler_proxy_lifecycle_generation = stream_ctx.proxy_lifecycle_generation;
                     // Preserve the accepted connection's SNI across the session
@@ -9790,8 +9786,7 @@ async fn create_session(
 
     let now = coarse_epoch_millis();
     let connected_wall_at = chrono::Utc::now();
-    let consumer_username = stream_ctx.effective_identity().map(str::to_owned);
-    let principal_origin = stream_ctx.principal_origin();
+    let (consumer_username, principal_origin) = stream_ctx.summary_identity();
     let auth_method = stream_ctx.auth_method;
     let datagram_client_ip = Arc::clone(&client_ip);
     let datagram_proxy_id: Arc<str> = Arc::from(proxy_id);

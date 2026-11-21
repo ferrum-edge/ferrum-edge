@@ -8140,6 +8140,16 @@ impl RequestContext {
         utils::principal::PrincipalOrigin::of_request(self)
     }
 
+    /// The summary's `(consumer_username, principal_origin)` pair, taken
+    /// together so a builder that binds them to locals cannot carry one
+    /// without the other.
+    pub fn summary_identity(&self) -> (Option<String>, Option<utils::principal::PrincipalOrigin>) {
+        (
+            self.effective_identity().map(str::to_owned),
+            self.principal_origin(),
+        )
+    }
+
     /// Verified realm of the committed external identity, if one was committed
     /// through the authentication boundary. See
     /// [`utils::auth_flow::ExternalIdentityRealm`].
@@ -11088,6 +11098,15 @@ impl StreamConnectionContext {
     /// committed realm.
     pub fn principal_origin(&self) -> Option<utils::principal::PrincipalOrigin> {
         utils::principal::PrincipalOrigin::of_stream(self)
+    }
+
+    /// The stream summary's `(consumer_username, principal_origin)` pair (see
+    /// [`RequestContext::summary_identity`]).
+    pub fn summary_identity(&self) -> (Option<String>, Option<utils::principal::PrincipalOrigin>) {
+        (
+            self.effective_identity().map(str::to_owned),
+            self.principal_origin(),
+        )
     }
 
     /// Contribute an authorization deadline observed by an admitting stream

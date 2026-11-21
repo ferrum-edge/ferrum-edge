@@ -3340,15 +3340,10 @@ async fn run_tcp_accept_loop(
                             connected_wall_at,
                             chrono::Utc::now(),
                         );
-                        let consumer_username = if !plugins.is_empty() {
-                            stream_ctx.effective_identity().map(str::to_owned)
+                        let (consumer_username, principal_origin) = if !plugins.is_empty() {
+                            stream_ctx.summary_identity()
                         } else {
-                            None
-                        };
-                        let principal_origin = if !plugins.is_empty() {
-                            stream_ctx.principal_origin()
-                        } else {
-                            None
+                            (None, None)
                         };
                         let summary = StreamTransactionSummary {
                             namespace: final_proxy_namespace,
