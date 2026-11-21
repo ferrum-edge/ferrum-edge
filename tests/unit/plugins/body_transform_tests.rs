@@ -686,3 +686,30 @@ fn unambiguous_document_is_still_rewritten() {
         other => panic!("an unambiguous document must be rewritten, got {other:?}"),
     }
 }
+
+/// A unique-member document nested between `serde_json`'s 128-level recursion
+/// limit and the duplicate-key screen's 256-level budget is well-formed JSON a
+/// downstream parser may accept, so it must be refused rather than skipped as a
+/// parse error that forwards the original bytes — with or without a BOM.
+#[test]
+fn well_formed_document_serde_cannot_materialize_is_refused() {
+    use ferrum_edge::plugins::utils::body_transform::UNMATERIALIZABLE_JSON_REASON;
+
+    let deep = [
+        br#"{"user":{"role":"admin"},"deep":"#.as_slice(),
+        "[".repeat(200).as_bytes(),
+        "]".repeat(200).as_bytes(),
+        b"}".as_slice(),
+    ]
+    .concat();
+    for body in [deep.clone(), [b"\xEF\xBB\xBF".as_slice(), &deep].concat()] {
+        match apply_request_body_rules(&body, &remove_and_rename_rules()) {
+            RequestBodyRulesOutcome::Ambiguous(reason) => {
+                assert_eq!(reason, UNMATERIALIZABLE_JSON_REASON)
+            }
+            other => {
+                panic!("a well-formed unmaterializable document must be refused, got {other:?}")
+            }
+        }
+    }
+}

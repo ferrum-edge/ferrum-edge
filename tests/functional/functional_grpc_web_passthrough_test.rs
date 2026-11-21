@@ -673,10 +673,11 @@ fn logged_summary_field(logs: &str, proxy_id: &str, key: &str) -> Vec<Value> {
 /// decoded frame stream: a `grpc-web-text` upload is not read as native
 /// length prefixes, and a binary upload's trailer frame is not a message.
 /// `response_body_mode: buffer` reaches the arm that collects without request
-/// body hooks. A `request_transformer` body rule reaches the arm that runs
-/// them: it buffers every `+json` upload (framed gRPC-Web included) and then
-/// declines the transform when the frames fail the JSON document parse, so
-/// the backend still receives the client's bytes.
+/// body hooks. The "hooks" routes carry a `request_transformer` body rule:
+/// framed gRPC-Web `+json` is declined by that rule on media type (frames are
+/// never one JSON document, GHSA-pq95-952r-2x32), so the rule neither buffers
+/// nor rewrites the upload, the backend still receives the client's bytes, and
+/// the message count is unchanged by the body-rule plugin's presence.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore]
 async fn grpc_web_passthrough_buffered_uploads_count_decoded_request_messages() {

@@ -35,15 +35,24 @@ now screen the body for object member names that repeat, compared after escape
 decoding and at any depth, before applying the rules. A request with such a
 body is refused with `400`; a backend response with one is replaced with a
 `502`. Before, the rules were skipped and the original bytes were forwarded. A
-body with an invalid Unicode surrogate escape, or one past the duplicate-key
-scanner's depth (256), token, member, member-name, or size budget, is refused
-the same way. Clients and backends must send each member once.
+body with an invalid Unicode surrogate escape, one past the duplicate-key
+scanner's depth (256), token, member, member-name, or size budget, or a
+well-formed document the rule engine cannot materialize (nesting deeper than
+128 levels, a number outside the `f64` range) is refused the same way. Clients
+and backends must send each member once.
+
+The `response_transformer` presentation-policy digest moved to a new version,
+so Redis-persisted `request_deduplication` replays recorded before the upgrade
+take the superseded-policy path once instead of being served.
 
 Body rules now also strip one leading UTF-8 byte order mark before parsing, so
 they apply to BOM-prefixed request bodies (the backend receives the rewritten
 document without the BOM). A BOM-prefixed backend response under a body policy
 is still refused by the shared response representation gate, as before.
-Instances with only header or query rules are unaffected.
+Framed gRPC and gRPC-Web `+json` uploads are no longer buffered by
+`request_transformer` body rules: the transform declines them on media type
+(`request_transformer.body_skipped=non_json_content_type`, previously
+`parse_error`). Instances with only header or query rules are unaffected.
 
 ### EastWestGateway passthrough legs now follow DestinationRules (#7424)
 

@@ -30,8 +30,10 @@
 //! compared after escape decoding, an invalid surrogate escape, or an exhausted
 //! scan budget) is reported as [`RequestBodyRulesOutcome::Ambiguous`] /
 //! [`BoundedBodyRulesOutcome::Ambiguous`] and the caller must refuse it rather
-//! than forward the original bytes. Bytes that are not JSON at all keep their
-//! existing parse-error handling. The screen runs only on the body-rule path,
+//! than forward the original bytes. So is a document the screen validated as
+//! well-formed but `serde_json` could not materialize (for example nesting
+//! deeper than its recursion limit): see [`UNMATERIALIZABLE_JSON_REASON`].
+//! Bytes that are not JSON at all keep their existing parse-error handling. The screen runs only on the body-rule path,
 //! so an instance without body rules pays nothing.
 
 use std::borrow::Cow;
@@ -54,6 +56,15 @@ const UTF8_BOM: &[u8] = b"\xEF\xBB\xBF";
 pub(crate) fn strip_utf8_bom(body: &[u8]) -> &[u8] {
     body.strip_prefix(UTF8_BOM).unwrap_or(body)
 }
+
+/// Fixed reason for a document the bounded duplicate-member screen validated as
+/// well-formed JSON that `serde_json::Value` still could not materialize — for
+/// example nesting between `serde_json`'s 128-level recursion limit and the
+/// screen's deeper budget, or a number outside `f64` range
+/// (GHSA-pq95-952r-2x32). A downstream parser can accept such a document, so
+/// skipping the rules would forward a targeted field untouched.
+pub const UNMATERIALIZABLE_JSON_REASON: &str =
+    "JSON body is a well-formed document the body rules could not evaluate";
 
 // ── Path parsing ──────────────────────────────────────────────────────────
 
@@ -581,11 +592,11 @@ pub enum RequestBodyRulesOutcome {
     Unchanged,
     /// The body is a JSON document this gateway cannot evaluate faithfully —
     /// duplicate object member names (compared after escape decoding, at any
-    /// depth), an invalid surrogate escape, or a document past the bounded
-    /// screen's budgets (GHSA-pq95-952r-2x32). No rule was applied, and the
+    /// depth), an invalid surrogate escape, a document past the bounded
+    /// screen's budgets, or a well-formed document `serde_json` could not
+    /// materialize ([`UNMATERIALIZABLE_JSON_REASON`]; GHSA-pq95-952r-2x32). No rule was applied, and the
     /// caller must refuse the request instead of forwarding the original bytes.
-    /// The reason is a fixed-cardinality [`json_dup_keys`] string that never
-    /// echoes body bytes.
+    /// The reason is a fixed-cardinality string that never echoes body bytes.
     Ambiguous(&'static str),
 }
 
@@ -740,6 +751,20 @@ fn run_body_rules(
     let mut json: Value = match serde_json::from_slice(body) {
         Ok(v) => v,
         Err(e) => {
+            // Rejection path only. The screen above returns `None` both for a
+            // document it validated in full and for bytes both parsers reject,
+            // so ask the bounded scanner which one this is. A well-formed
+            // document `serde_json` could not materialize (nesting past its
+            // recursion limit, an out-of-range number) is one a downstream
+            // parser may accept: refuse it rather than forward a targeted field
+            // untouched (GHSA-pq95-952r-2x32). Ordinary malformed bytes keep the
+            // parse-error skip.
+            if json_dup_keys::scan(body, &json_dup_keys::GOVERNED_JSON_LIMITS).is_ok() {
+                debug!(
+                    "body_transform: refusing a well-formed JSON body that could not be materialized"
+                );
+                return BodyRulesPass::Ambiguous(UNMATERIALIZABLE_JSON_REASON);
+            }
             debug!("body_transform: failed to parse body as JSON: {}", e);
             return BodyRulesPass::Skipped(BodyRulesSkipReason::ParseError);
         }

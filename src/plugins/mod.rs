@@ -3127,18 +3127,23 @@ pub struct RequestContext {
     /// request metadata cannot spoof or clear the fail-closed decision.
     pub(crate) ai_prompt_compressor_marker_reject_status: Option<u16>,
     /// Final-hook rejection staged by `request_transformer` when its JSON body
-    /// rules met a document whose meaning is parser-dependent (duplicate object
-    /// member names, an invalid surrogate escape, or an exhausted duplicate-key
-    /// screen budget; GHSA-pq95-952r-2x32). `transform_request_body*` has no
-    /// rejection channel, so it latches here and the plugin's
-    /// `on_final_request_body_with_context` refuses the request. Kept private so
-    /// request metadata cannot spoof or clear the fail-closed decision.
-    pub(crate) request_transformer_ambiguous_body_refused: bool,
-    /// Response counterpart of `request_transformer_ambiguous_body_refused`:
-    /// latched by `response_transformer`'s body transform, consumed (and turned
-    /// into a `502`) by its `finalize_client_visible_response_body`, so the
-    /// ambiguous backend bytes are never published (GHSA-pq95-952r-2x32).
-    pub(crate) response_transformer_ambiguous_body_refused: bool,
+    /// rules met a document they cannot evaluate faithfully (duplicate object
+    /// member names, an invalid surrogate escape, an exhausted duplicate-key
+    /// screen budget, or a well-formed document `serde_json` could not
+    /// materialize; GHSA-pq95-952r-2x32). `transform_request_body*` has no
+    /// rejection channel, so it records the PRODUCING instance's private id
+    /// here and only that instance's `on_final_request_body_with_context`
+    /// consumes it and refuses the request: a header-only or disabled sibling
+    /// can neither issue nor swallow another instance's refusal. The first
+    /// producer owns it. Kept private so request metadata cannot spoof or clear
+    /// the fail-closed decision.
+    pub(crate) request_transformer_ambiguous_body_refusal: Option<u64>,
+    /// Response counterpart of `request_transformer_ambiguous_body_refusal`:
+    /// the producing `response_transformer` instance's id, recorded by its body
+    /// transform and consumed (and turned into a `502`) by the same instance's
+    /// `finalize_client_visible_response_body`, so the ambiguous backend bytes
+    /// are never published (GHSA-pq95-952r-2x32).
+    pub(crate) response_transformer_ambiguous_body_refusal: Option<u64>,
     /// Encoding selected by the built-in compression plugin for the response it
     /// will create at the gateway. This is authoritative ownership state for
     /// distinguishing planned gateway compression from an already-encoded
@@ -4888,8 +4893,8 @@ impl RequestContext {
             ai_prompt_compressor_classification_path: None,
             ai_prompt_compressor_wire_stats_started: false,
             ai_prompt_compressor_marker_reject_status: None,
-            request_transformer_ambiguous_body_refused: false,
-            response_transformer_ambiguous_body_refused: false,
+            request_transformer_ambiguous_body_refusal: None,
+            response_transformer_ambiguous_body_refusal: None,
             gateway_response_compression_algorithm: None,
             compression_request_decode_owner: None,
             compression_response_encode_owner: None,
@@ -6649,13 +6654,13 @@ impl RequestContext {
             ),
             // Transferred like the compressor's staged rejection: the body
             // transform and the final hook that consumes it run on this clone.
-            request_transformer_ambiguous_body_refused: std::mem::take(
-                &mut self.request_transformer_ambiguous_body_refused,
+            request_transformer_ambiguous_body_refusal: std::mem::take(
+                &mut self.request_transformer_ambiguous_body_refusal,
             ),
             // Response-side state; the response lifecycle runs on the live
             // context, never on this request-body clone.
-            response_transformer_ambiguous_body_refused: self
-                .response_transformer_ambiguous_body_refused,
+            response_transformer_ambiguous_body_refusal: self
+                .response_transformer_ambiguous_body_refusal,
             gateway_response_compression_algorithm: self.gateway_response_compression_algorithm,
             compression_request_decode_owner: self.compression_request_decode_owner,
             compression_response_encode_owner: self.compression_response_encode_owner,

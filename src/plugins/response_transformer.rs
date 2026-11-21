@@ -126,11 +126,12 @@
 //!
 //! Body rules strip one optional leading UTF-8 BOM and screen the candidate
 //! with the shared duplicate-member scanner before parsing (see
-//! `body_transform`). A backend document whose meaning is parser-dependent
-//! cannot be redacted faithfully: forwarding it would hand a first-key-wins
-//! client the very field a `remove` / `rename` rule targets. The context-aware
-//! transform therefore latches a refusal on a private `RequestContext` field
-//! and returns `None`; this plugin then participates in the authoritative
+//! `body_transform`). A backend document whose meaning is parser-dependent, or
+//! a well-formed one `serde_json` could not materialize, cannot be redacted
+//! faithfully: forwarding it would hand a client the very field a `remove` /
+//! `rename` rule targets. The context-aware transform therefore records its own
+//! instance id on a private `RequestContext` field and returns `None`; the same
+//! instance then participates in the authoritative
 //! `finalize_client_visible_response_body` phase — which runs after every
 //! semantic transform and before anything is published — and replaces the
 //! response with a fixed `502`. The ambiguous bytes are never forwarded.
@@ -145,6 +146,7 @@ use http::header::{HeaderName, HeaderValue};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
+use std::sync::atomic::{AtomicU64, Ordering};
 use tracing::debug;
 
 use super::response_representation::effective_response_media_type;
@@ -238,17 +240,29 @@ pub struct ResponseTransformer {
     /// the gate is now in the config: the two are independent provenance inputs
     /// and the Redis-persisted replay contract binds both.
     static_policy_digest: [u8; 32],
+    /// Process-local identity of this instance. Binds an ambiguous-body refusal
+    /// to the instance whose body rules produced it (GHSA-pq95-952r-2x32), so a
+    /// sibling instance can neither issue nor consume it.
+    instance_id: u64,
 }
+
+/// Source of [`ResponseTransformer::instance_id`].
+static NEXT_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
 
 /// Domain separator and schema version for [`ResponseTransformer`] provenance.
 /// Bumping the version invalidates every previously persisted representation
 /// rather than letting an old digest match new semantics.
-const STATIC_POLICY_DIGEST_DOMAIN: &str = "ferrum.plugin.response_transformer.static.v1";
+///
+/// v2: JSON body rules strip a leading BOM and refuse duplicate-member or
+/// unmaterializable documents (GHSA-pq95-952r-2x32). A replay retained under v1
+/// may hold an unredacted ambiguous body, so it must take the superseded-policy
+/// path instead of being served.
+const STATIC_POLICY_DIGEST_DOMAIN: &str = "ferrum.plugin.response_transformer.static.v2";
 
 /// Fixed client-visible error for a backend response refused because its JSON
 /// body is ambiguous to the configured body rules (GHSA-pq95-952r-2x32). Never
 /// echoes body bytes or the screen's internal reason.
-const AMBIGUOUS_JSON_RESPONSE_ERROR: &str = r#"{"error":"Backend response body contains duplicate JSON object member names or could not be screened for them"}"#;
+const AMBIGUOUS_JSON_RESPONSE_ERROR: &str = r#"{"error":"Backend response body contains duplicate JSON object member names or a JSON document the gateway could not evaluate"}"#;
 
 impl ResponseTransformer {
     /// Apply the configured JSON body rules, serializing the result through a
@@ -799,6 +813,7 @@ impl ResponseTransformer {
             rules_enabled,
             route_override_consumer_only,
             static_policy_digest,
+            instance_id: NEXT_INSTANCE_ID.fetch_add(1, Ordering::Relaxed),
         })
     }
 }
@@ -1453,6 +1468,11 @@ impl Plugin for ResponseTransformer {
         content_type: Option<&str>,
         _response_headers: &HashMap<String, String>,
     ) -> Option<Vec<u8>> {
+        // A refusal this instance recorded for an earlier pass does not
+        // describe these bytes: decide afresh.
+        if ctx.response_transformer_ambiguous_body_refusal == Some(self.instance_id) {
+            ctx.response_transformer_ambiguous_body_refusal = None;
+        }
         // Defense in depth: the shared synthetic path already skips ordinary
         // presentation transforms when `finalized_response_replay` is set.
         // Returning `None` here keeps direct callers from re-mutating a cached
@@ -1488,15 +1508,18 @@ impl Plugin for ResponseTransformer {
             }
             BoundedBodyRulesOutcome::Ambiguous(reason) => {
                 // `None` alone would read as "unchanged" and publish the
-                // ambiguous backend bytes. Latch the refusal on a private field
-                // for `finalize_client_visible_response_body`, which runs after
+                // ambiguous backend bytes. Record this instance as the producer
+                // on a private field for its own
+                // `finalize_client_visible_response_body`, which runs after
                 // every semantic transform and before publication
-                // (GHSA-pq95-952r-2x32).
+                // (GHSA-pq95-952r-2x32). The first producer owns the refusal.
                 debug!(
                     reason,
                     "response_transformer: refusing an ambiguous JSON response body"
                 );
-                ctx.response_transformer_ambiguous_body_refused = true;
+                if ctx.response_transformer_ambiguous_body_refusal.is_none() {
+                    ctx.response_transformer_ambiguous_body_refusal = Some(self.instance_id);
+                }
                 None
             }
         }
@@ -1532,10 +1555,11 @@ impl Plugin for ResponseTransformer {
     }
 
     /// Participate in the authoritative final client-visible body phase only
-    /// for a response this instance's body transform refused as ambiguous
-    /// (GHSA-pq95-952r-2x32), so every other response pays one bool test.
+    /// for a response THIS instance's body transform refused as ambiguous
+    /// (GHSA-pq95-952r-2x32), so every other response pays one comparison and
+    /// a sibling instance never answers for it.
     fn enforces_final_client_visible_response_body(&self, ctx: &RequestContext) -> bool {
-        ctx.response_transformer_ambiguous_body_refused
+        ctx.response_transformer_ambiguous_body_refusal == Some(self.instance_id)
     }
 
     /// Replace a response whose JSON body the transform refused as ambiguous.
@@ -1552,7 +1576,8 @@ impl Plugin for ResponseTransformer {
         _response_headers: &HashMap<String, String>,
         _body: &[u8],
     ) -> PluginResult {
-        if std::mem::take(&mut ctx.response_transformer_ambiguous_body_refused) {
+        if ctx.response_transformer_ambiguous_body_refusal == Some(self.instance_id) {
+            ctx.response_transformer_ambiguous_body_refusal = None;
             return PluginResult::Reject {
                 status_code: 502,
                 body: AMBIGUOUS_JSON_RESPONSE_ERROR.to_string(),

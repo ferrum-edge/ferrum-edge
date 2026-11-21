@@ -3079,11 +3079,32 @@ fn ambiguous_response_bodies() -> Vec<(&'static str, Vec<u8>)> {
         ),
         (
             "escaped duplicate ancestor",
-            br#"{"account":{"ssn":"hunter2"},"account":{"id":1}}"#.to_vec(),
+            br#"{"account":{"ssn":"hunter2"},"\u0061ccount":{"id":1}}"#.to_vec(),
         ),
         (
             "escaped duplicate leaf",
-            br#"{"account":{"ssn":"hunter2","ssn":"x"}}"#.to_vec(),
+            br#"{"account":{"ssn":"hunter2","\u0073sn":"x"}}"#.to_vec(),
+        ),
+        (
+            "well-formed but deeper than serde_json can materialize",
+            [
+                br#"{"account":{"ssn":"hunter2"},"deep":"#.as_slice(),
+                "[".repeat(200).as_bytes(),
+                "]".repeat(200).as_bytes(),
+                b"}".as_slice(),
+            ]
+            .concat(),
+        ),
+        (
+            "BOM-prefixed and deeper than serde_json can materialize",
+            [
+                b"\xEF\xBB\xBF".as_slice(),
+                br#"{"account":{"ssn":"hunter2"},"deep":"#.as_slice(),
+                "[".repeat(200).as_bytes(),
+                "]".repeat(200).as_bytes(),
+                b"}".as_slice(),
+            ]
+            .concat(),
         ),
         (
             "screen depth budget exhausted",
@@ -3281,4 +3302,100 @@ async fn header_only_response_transformer_does_not_screen_bodies() {
             .is_none()
     );
     assert!(!plugin.enforces_final_client_visible_response_body(&ctx));
+}
+
+/// A representation retained (for example a Redis-persisted idempotent replay)
+/// before body rules refused ambiguous documents must no longer match the
+/// current presentation policy, so it takes the superseded-policy path instead
+/// of being served (GHSA-pq95-952r-2x32).
+#[test]
+fn presentation_digest_retires_the_pre_ambiguity_policy_domain() {
+    for config in [
+        json!({"rules": [{"operation": "remove", "target": "body", "key": "account.ssn"}]}),
+        json!({"rules": [{"operation": "add", "target": "header", "key": "x-a", "value": "1"}]}),
+    ] {
+        let current = match ResponseTransformer::new(&config)
+            .unwrap()
+            .response_presentation_policy()
+        {
+            Some(ferrum_edge::plugins::ResponsePresentationPolicy::Static(digest)) => digest,
+            other => panic!("expected a static presentation policy, got {other:?}"),
+        };
+        let previous = ferrum_edge::plugins::utils::policy_digest::static_config_digest(
+            "ferrum.plugin.response_transformer.static.v1",
+            &config,
+        );
+        assert_ne!(
+            current, previous,
+            "replays stored under the pre-fix body-rule semantics must be refused"
+        );
+    }
+}
+
+/// The refusal belongs to the instance whose body rules produced it: a
+/// header-only sibling never enrols in the final phase for it, and the
+/// producer consumes it once.
+#[tokio::test]
+async fn ambiguous_response_refusal_is_bound_to_its_producing_instance() {
+    let header_only = ResponseTransformer::new(&json!({"rules": [
+        {"operation": "add", "target": "header", "key": "x-tagged", "value": "1"}
+    ]}))
+    .unwrap();
+    let producer = sensitive_field_redactor();
+    let headers = json_response_headers();
+    let body = br#"{"account":{"ssn":"hunter2"},"account":{"id":1}}"#;
+
+    let mut ctx = make_ctx();
+    for plugin in [&header_only, &producer] {
+        assert!(
+            plugin
+                .transform_response_body_with_context(
+                    &mut ctx,
+                    body,
+                    Some("application/json"),
+                    &headers
+                )
+                .await
+                .is_none()
+        );
+    }
+    assert!(!header_only.enforces_final_client_visible_response_body(&ctx));
+    assert!(matches!(
+        header_only
+            .finalize_client_visible_response_body(&mut ctx, 200, &headers, body)
+            .await,
+        PluginResult::Continue
+    ));
+    assert!(producer.enforces_final_client_visible_response_body(&ctx));
+    assert!(matches!(
+        producer
+            .finalize_client_visible_response_body(&mut ctx, 200, &headers, body)
+            .await,
+        PluginResult::Reject {
+            status_code: 502,
+            ..
+        }
+    ));
+    assert!(!producer.enforces_final_client_visible_response_body(&ctx));
+
+    // A mixed chain through the real funnel still never publishes the bytes.
+    let plugins: Vec<Arc<dyn Plugin>> = vec![Arc::new(header_only), Arc::new(producer)];
+    let mut ctx = make_ctx();
+    let mut status = 200;
+    let mut headers = json_response_headers();
+    let mut published = bytes::Bytes::from_static(body);
+    stamp_original_response_metadata_for_test(&mut ctx, status, &headers);
+    let (replaced, _) = transform_buffered_response_body_with_deadline_full_for_test(
+        &plugins,
+        &mut ctx,
+        &mut status,
+        &mut headers,
+        &mut published,
+        None,
+        false,
+    )
+    .await;
+    assert!(replaced);
+    assert_eq!(status, 502);
+    assert!(!String::from_utf8_lossy(&published).contains("hunter2"));
 }

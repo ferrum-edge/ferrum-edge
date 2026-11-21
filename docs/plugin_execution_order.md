@@ -637,9 +637,11 @@ output-policy phase between them (`GHSA-62jg-v563-4q23`,
    `body_validator` (response validation), and `ai_response_guard`
    (undischarged-redaction check plus a residual re-detection) decide here.
    `response_transformer` participates only for a response whose JSON body its
-   semantic-stage rules refused as ambiguous (duplicate member names, or a
-   document past the duplicate-key screen's budgets; `GHSA-pq95-952r-2x32`),
-   and replaces it with a `502` so the ambiguous bytes are never published.
+   semantic-stage rules refused as ambiguous (duplicate member names, a
+   document past the duplicate-key screen's budgets, or one the rule engine
+   cannot materialize; `GHSA-pq95-952r-2x32`). Only the instance whose rules
+   refused it participates, and it replaces the response with a `502` so the
+   ambiguous bytes are never published.
    Header policy is NOT decided here — the header map is not final at this point
    on the synthetic lifecycle — it is decided in
    `finalize_client_visible_response_headers` below.

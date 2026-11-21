@@ -2401,6 +2401,10 @@ fn declared_non_json_uploads_release_request_buffering() {
         "text/plain; charset=utf-8",
         "application/grpc",
         "application/grpc-web+proto",
+        // Framed gRPC `+json` carries frames, never one JSON document, so the
+        // transform declines it on media type and the upload streams.
+        "application/grpc+json",
+        "application/grpc-web+json",
     ] {
         let ctx = upload_ctx(Some(content_type));
         assert!(
@@ -2418,10 +2422,6 @@ fn json_and_untyped_uploads_keep_request_buffering() {
         "application/json",
         "application/json; charset=utf-8",
         "application/merge-patch+json",
-        // Framed gRPC `+json` satisfies `is_json_content_type`, so it stays
-        // buffered exactly as the transform treats it: declined only after the
-        // document parse fails.
-        "application/grpc+json",
     ] {
         let ctx = upload_ctx(Some(content_type));
         assert!(
@@ -3749,6 +3749,19 @@ fn bom(document: &[u8]) -> Vec<u8> {
     [b"\xEF\xBB\xBF".as_slice(), document].concat()
 }
 
+/// `prefix` followed by a unique-member subtree nested 200 deep: past
+/// `serde_json`'s 128-level recursion limit, inside the duplicate-key screen's
+/// 256-level budget, so the screen accepts it as well-formed.
+fn deeper_than_serde(prefix: &[u8]) -> Vec<u8> {
+    [
+        prefix,
+        "[".repeat(200).as_bytes(),
+        "]".repeat(200).as_bytes(),
+        b"}".as_slice(),
+    ]
+    .concat()
+}
+
 fn assert_ambiguous_body_rejected(result: &ferrum_edge::plugins::PluginResult, case: &str) {
     match result {
         ferrum_edge::plugins::PluginResult::Reject {
@@ -3780,15 +3793,23 @@ fn ambiguous_request_bodies() -> Vec<(&'static str, Vec<u8>)> {
         ),
         (
             "escaped duplicate ancestor",
-            br#"{"user":{"role":"admin"},"user":{"name":"a"}}"#.to_vec(),
+            br#"{"user":{"role":"admin"},"\u0075ser":{"name":"a"}}"#.to_vec(),
         ),
         (
             "escaped duplicate leaf",
-            br#"{"user":{"role":"admin","role":"viewer"}}"#.to_vec(),
+            br#"{"user":{"role":"admin","\u0072ole":"viewer"}}"#.to_vec(),
         ),
         (
             "unrelated sibling duplicate",
             br#"{"user":{"role":"admin"},"a":1,"a":2}"#.to_vec(),
+        ),
+        (
+            "well-formed but deeper than serde_json can materialize",
+            deeper_than_serde(br#"{"user":{"role":"admin"},"deep":"#),
+        ),
+        (
+            "BOM-prefixed and deeper than serde_json can materialize",
+            bom(&deeper_than_serde(br#"{"user":{"role":"admin"},"deep":"#)),
         ),
         (
             "screen depth budget exhausted",
@@ -4015,4 +4036,238 @@ async fn header_and_query_only_instance_does_not_screen_bodies() {
         "got {result:?}"
     );
     assert_eq!(transformed, body);
+}
+
+/// A final-body policy between two transformer instances, used to prove the
+/// refusal stays at its producer's position in the chain.
+struct FinalBodyBlocker;
+
+#[async_trait::async_trait]
+impl Plugin for FinalBodyBlocker {
+    fn name(&self) -> &str {
+        "final_body_blocker"
+    }
+
+    async fn on_final_request_body_with_context(
+        &self,
+        _ctx: &mut RequestContext,
+        _headers: &HashMap<String, String>,
+        _body: &[u8],
+    ) -> ferrum_edge::plugins::PluginResult {
+        ferrum_edge::plugins::PluginResult::Reject {
+            status_code: 403,
+            body: r#"{"error":"blocked"}"#.to_string(),
+            headers: HashMap::new(),
+        }
+    }
+}
+
+/// The refusal belongs to the instance whose body rules produced it: a
+/// header-only or RTDS-disabled sibling ordered first can neither issue it
+/// (jumping ahead of a policy between them) nor consume it.
+#[tokio::test]
+async fn ambiguous_body_refusal_is_bound_to_its_producing_instance() {
+    let header_only: Arc<dyn Plugin> = Arc::new(
+        RequestTransformer::new(&json!({"rules": [
+            {"operation": "add", "target": "header", "key": "x-tagged", "value": "1"}
+        ]}))
+        .unwrap(),
+    );
+    let disabled: Arc<dyn Plugin> = Arc::new(
+        RequestTransformer::new(&json!({
+            "rules": [{"operation": "remove", "target": "body", "key": "user.role"}],
+            "runtime_overlay_scope": "dup-test",
+            "default_enabled": false
+        }))
+        .unwrap(),
+    );
+    let producer = privileged_field_stripper();
+    let headers = json_request_headers();
+    let body = br#"{"user":{"role":"admin"},"user":{}}"#.to_vec();
+
+    // Direct hook order: siblings answer `Continue` and leave the refusal in
+    // place; only the producer consumes it.
+    let mut ctx = post_ctx();
+    for plugin in [&header_only, &disabled, &producer] {
+        let _ = plugin
+            .transform_request_body_with_context(
+                &mut ctx,
+                &body,
+                Some("application/json"),
+                &headers,
+            )
+            .await;
+    }
+    for sibling in [&header_only, &disabled] {
+        assert!(matches!(
+            sibling
+                .on_final_request_body_with_context(&mut ctx, &headers, &body)
+                .await,
+            ferrum_edge::plugins::PluginResult::Continue
+        ));
+    }
+    assert_ambiguous_body_rejected(
+        &producer
+            .on_final_request_body_with_context(&mut ctx, &headers, &body)
+            .await,
+        "producer",
+    );
+
+    // Chain order: the policy between the siblings and the producer decides
+    // first, so a sibling did not issue the producer's refusal early.
+    let plugins = vec![
+        header_only.clone(),
+        disabled.clone(),
+        Arc::new(FinalBodyBlocker) as Arc<dyn Plugin>,
+        producer.clone(),
+    ];
+    for (stage, result) in [
+        (
+            "H1/H2",
+            ferrum_edge::_test_support::run_buffered_request_body_hook_round_trip_for_test(
+                &plugins,
+                &mut post_ctx(),
+                &headers,
+                body.clone(),
+            )
+            .await
+            .1,
+        ),
+        (
+            "H3",
+            ferrum_edge::_test_support::run_request_body_stage_with_context_for_test(
+                &plugins,
+                &mut post_ctx(),
+                &headers,
+                &body,
+            )
+            .await
+            .1,
+        ),
+    ] {
+        match result {
+            ferrum_edge::plugins::PluginResult::Reject { status_code, .. } => {
+                assert_eq!(
+                    status_code, 403,
+                    "{stage}: the earlier policy decides first"
+                )
+            }
+            other => panic!("{stage}: expected the blocker's rejection, got {other:?}"),
+        }
+    }
+
+    // Without the blocker, the producer still refuses behind its siblings.
+    let plugins = vec![header_only, disabled, producer];
+    let (_, result) =
+        ferrum_edge::_test_support::run_buffered_request_body_hook_round_trip_for_test(
+            &plugins,
+            &mut post_ctx(),
+            &headers,
+            body,
+        )
+        .await;
+    assert_ambiguous_body_rejected(&result, "mixed chain");
+}
+
+/// The refusal carries the typed gateway request-representation terminal
+/// provenance, handed back from the H1/H2 hook clone and set on the live H3
+/// context, so response-side policy (a response size ceiling) cannot rewrite
+/// the `400` into a `502`. An accepted body carries none.
+#[tokio::test]
+async fn ambiguous_body_refusal_is_a_gateway_representation_terminal() {
+    use ferrum_edge::_test_support::gateway_representation_response_selected_for_test;
+
+    let plugins = vec![privileged_field_stripper()];
+    let headers = json_request_headers();
+    let ambiguous = br#"{"user":{"role":"admin"},"user":{}}"#.to_vec();
+
+    let mut ctx = post_ctx();
+    let (_, result) =
+        ferrum_edge::_test_support::run_buffered_request_body_hook_round_trip_for_test(
+            &plugins,
+            &mut ctx,
+            &headers,
+            ambiguous.clone(),
+        )
+        .await;
+    assert_ambiguous_body_rejected(&result, "H1/H2");
+    assert!(gateway_representation_response_selected_for_test(&ctx));
+
+    let mut ctx = post_ctx();
+    let (_, result) = ferrum_edge::_test_support::run_request_body_stage_with_context_for_test(
+        &plugins, &mut ctx, &headers, &ambiguous,
+    )
+    .await;
+    assert_ambiguous_body_rejected(&result, "H3");
+    assert!(gateway_representation_response_selected_for_test(&ctx));
+
+    let mut ctx = post_ctx();
+    let (_, result) = ferrum_edge::_test_support::run_request_body_stage_with_context_for_test(
+        &plugins,
+        &mut ctx,
+        &headers,
+        br#"{"user":{"role":"admin"}}"#,
+    )
+    .await;
+    assert!(matches!(
+        result,
+        ferrum_edge::plugins::PluginResult::Continue
+    ));
+    assert!(!gateway_representation_response_selected_for_test(&ctx));
+}
+
+/// Framed gRPC `+json` is declined on media type before the duplicate-member
+/// screen: frames are never one JSON document, so even a frame payload that
+/// repeats a member (or a body above the screen memo's threshold) is neither
+/// screened nor refused, and the upload is released from buffering.
+#[tokio::test]
+async fn framed_grpc_json_requests_are_not_screened_or_buffered() {
+    use ferrum_edge::plugins::request_transformer::BODY_SKIPPED_METADATA_KEY;
+
+    let plugin = privileged_field_stripper();
+    let message = br#"{"user":{"role":"admin"},"user":{}}"#;
+    let mut framed = vec![0u8];
+    framed.extend_from_slice(&(message.len() as u32).to_be_bytes());
+    framed.extend_from_slice(message);
+    let mut large = framed.clone();
+    large.resize(8192, b' ');
+
+    for content_type in [
+        "application/grpc+json",
+        "application/grpc-web+json",
+        "application/grpc-web-text+json",
+    ] {
+        assert!(
+            !plugin.should_buffer_request_body(&upload_ctx(Some(content_type))),
+            "{content_type}: the transform declines framing, so the upload streams"
+        );
+        let headers = HashMap::from([("content-type".to_string(), content_type.to_string())]);
+        for body in [&framed, &large] {
+            let mut ctx = post_ctx();
+            assert!(
+                plugin
+                    .transform_request_body_with_context(
+                        &mut ctx,
+                        body,
+                        Some(content_type),
+                        &headers
+                    )
+                    .await
+                    .is_none()
+            );
+            assert_eq!(
+                ctx.metadata
+                    .get(BODY_SKIPPED_METADATA_KEY)
+                    .map(String::as_str),
+                Some("non_json_content_type"),
+                "{content_type}"
+            );
+            assert!(matches!(
+                plugin
+                    .on_final_request_body_with_context(&mut ctx, &headers, body)
+                    .await,
+                ferrum_edge::plugins::PluginResult::Continue
+            ));
+        }
+    }
 }
