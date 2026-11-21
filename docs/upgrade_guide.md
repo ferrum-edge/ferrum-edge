@@ -28,6 +28,28 @@ applied by editing the file (see [File Mode](#file-mode-ferrum_modefile)).
 
 ## Upgrading to the next release (unreleased)
 
+### Chargeback rows for external principals are realm-qualified (GHSA-q9vj-rf66-3j58)
+
+`api_chargeback` (`/charges`) and `api_chargeback_sink` (`consumer_id`) now key
+billing rows on the authenticated principal rather than on the logged
+`consumer_username` display string. A mapped gateway Consumer's row is
+unchanged. An unmapped external principal (`jwks_auth`, `oidc_relying_party`,
+`oauth2_introspection`, `ldap_auth`, `soap_ws_security`, or an external stream
+identity) is now reported as `external:<mechanism>:<authority>:<identity>`, for
+example `external:jwks_auth:<64 hex>:alice`, where `<authority>` is the opaque
+verifying-authority digest (`-` when absent). Previously such a principal was
+billed under its bare identity, sharing a row with any Consumer or other
+provider that used the same string. A Consumer whose username begins with
+`external:` is now always reported in its `~sha256:` digest form.
+
+**Operator action:** update invoicing and reconciliation that maps
+`/charges` consumer keys or ClickHouse `consumer_id` values for external
+principals to customers: match the `external:` key (or its identity suffix
+together with the mechanism and authority) instead of the bare identity.
+Existing ClickHouse rows and Prometheus series recorded before the upgrade keep
+their old bare-identity values; after the upgrade, external principals start
+new rows and series. Transaction log output (`consumer_username`) is unchanged.
+
 ### EastWestGateway passthrough legs now follow DestinationRules (#7424)
 
 An EastWestGateway data plane now applies DestinationRules to its

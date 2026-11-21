@@ -1377,6 +1377,17 @@ pub struct TransactionSummary {
 }
 ```
 
+`consumer_username` is a display string: a mapped Consumer and an unmapped
+external principal (for example a `jwks_auth` subject) with the same name
+produce the same value. Every summary also carries a hidden, non-serialized
+`principal_origin` (`Option<PrincipalOrigin>`, on `StreamTransactionSummary`
+and `WsDisconnectContext` too). A plugin that keys per-caller state or billing
+on the caller should use
+`plugins::utils::principal::Principal::with_origin(username, summary.principal_origin)`
+and its `push_key` form instead of the bare display string (GHSA-q9vj-rf66-3j58).
+Code that builds these structs field-by-field must set `principal_origin`
+(`ctx.principal_origin()` from the request or stream context).
+
 ## Stream Transaction Summary
 
 The `StreamTransactionSummary` struct is passed to `on_stream_disconnect` (abbreviated; see `src/plugins/mod.rs`):
