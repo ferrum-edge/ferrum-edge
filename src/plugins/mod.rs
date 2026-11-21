@@ -2317,6 +2317,12 @@ pub(crate) struct A2aGatewayClaim {
     /// Detected binding (`jsonrpc`, `rest`, or `grpc`).
     pub(crate) binding: &'static str,
     pub(crate) is_agent_card: bool,
+    /// Whether the owning instance rewrites Agent Card URLs
+    /// (`discovery.rewrite_agent_card_urls`). A sibling instance that rewrites
+    /// cards refuses a card call this owner would answer un-rewritten, because
+    /// first-wins ownership means only the owner's response handling applies
+    /// (GHSA-q25c-76f4-fp7h).
+    pub(crate) rewrites_agent_card: bool,
     pub(crate) streaming: bool,
     /// `AgentCard` wire layout the matched gRPC service is CONFIGURED to carry,
     /// resolved once at detection so the response path never re-derives a
@@ -2353,6 +2359,12 @@ pub(crate) struct A2aGatewayClaim {
     /// and refuses a change of response-shaping operation class the response
     /// phase above was not set up for.
     pub(crate) classified_request_body: Option<bytes::Bytes>,
+    /// Whether the configured A2A version header was present when that
+    /// JSON-RPC classification was decided. An unknown method is classifiable
+    /// only with it, so the byte-identity shortcut above also requires the
+    /// finalized headers to still carry it when it was present at arrival
+    /// (GHSA-q25c-76f4-fp7h).
+    pub(crate) classified_with_version_header: bool,
 }
 
 /// Lifecycle of an Agent Card rewrite `a2a_gateway` claimed on the response path
