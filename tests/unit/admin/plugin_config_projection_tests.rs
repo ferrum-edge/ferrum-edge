@@ -6,8 +6,8 @@
 //! `tests/integration/admin_audit_rbac_tests.rs`.
 
 use ferrum_edge::admin::plugin_config_projection::{
-    KAFKA_SAFE_PRODUCER_PROPERTIES, PLUGIN_SENSITIVITY_SCHEMAS, PlaceholderSiteRecorder,
-    is_credential_bearing_url_config_key, is_redaction_placeholder,
+    FieldSensitivity, KAFKA_SAFE_PRODUCER_PROPERTIES, PLUGIN_SENSITIVITY_SCHEMAS,
+    PlaceholderSiteRecorder, is_credential_bearing_url_config_key, is_redaction_placeholder,
     is_safe_kafka_producer_property, is_sensitive_plugin_config_key, normalize_config_key,
     project_plugin_config, project_plugin_config_with, project_plugin_trigger_with,
     redact_endpoint_url, sensitivity_rules_for,
@@ -1733,6 +1733,78 @@ fn redis_url_keeps_its_documented_projection_shape() {
             "redis-frag-canary",
         ],
     );
+}
+
+/// Every built-in that builds its Redis client from the plugin config root
+/// (`RedisConfig::from_plugin_config`, directly or through the shared
+/// rate-limit backend) must classify `redis_url` with the Redis rule, so the
+/// schema table that downstream consumers mirror never omits one (issue
+/// #7438: `jwks_auth`, `hmac_auth` and `soap_ws_security` were missing).
+#[test]
+fn every_redis_backed_builtin_classifies_redis_url() {
+    let plugins_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/plugins");
+    let mut redis_backed = Vec::new();
+    for entry in std::fs::read_dir(&plugins_dir).expect("read src/plugins") {
+        let path = entry.expect("dir entry").path();
+        if path.extension().and_then(|ext| ext.to_str()) != Some("rs") {
+            continue;
+        }
+        let source = std::fs::read_to_string(&path).expect("read plugin source");
+        if source.contains("RedisConfig::from_plugin_config(")
+            || source.contains("RateLimitBackend::from_plugin_config_with_policy_identity(")
+        {
+            let stem = path.file_stem().and_then(|s| s.to_str()).unwrap();
+            redis_backed.push(stem.to_string());
+        }
+    }
+    redis_backed.sort();
+    for expected in [
+        "hmac_auth",
+        "jwks_auth",
+        "rate_limiting",
+        "soap_ws_security",
+    ] {
+        assert!(
+            redis_backed.iter().any(|name| name == expected),
+            "source scan no longer finds Redis-backed plugin {expected}: {redis_backed:?}"
+        );
+    }
+    for plugin in &redis_backed {
+        assert!(
+            PLUGIN_SENSITIVITY_SCHEMAS
+                .iter()
+                .any(|(name, _)| *name == plugin.as_str()),
+            "src/plugins/{plugin}.rs builds a Redis client but has no schema entry"
+        );
+        assert!(
+            sensitivity_rules_for(plugin).iter().any(|rule| {
+                rule.path == ["redis_url"] && rule.sensitivity == FieldSensitivity::RedisUrl
+            }),
+            "{plugin} reads root `redis_url` but its sensitivity schema does not classify it"
+        );
+    }
+}
+
+/// `jwks_auth`, `hmac_auth` and `soap_ws_security` project `redis_url`
+/// exactly like `rate_limiting` (issue #7438).
+#[test]
+fn redis_url_projects_identically_on_every_redis_backed_builtin() {
+    for redis_url in [
+        "redis://cacheuser:redis-userinfo-canary@cache.internal:6379/3?token=redis-query-canary",
+        "rediss://cache.internal:6380/1",
+    ] {
+        let config = json!({"redis_url": redis_url, "sync_mode": "redis"});
+        let reference = project("rate_limiting", config.clone());
+        for plugin in ["jwks_auth", "hmac_auth", "soap_ws_security"] {
+            let projected = project(plugin, config.clone());
+            assert_eq!(
+                projected["redis_url"], reference["redis_url"],
+                "{plugin} must project redis_url like rate_limiting"
+            );
+            assert_eq!(projected["sync_mode"], "redis");
+            assert_no_canaries(&projected, &["redis-userinfo-canary", "redis-query-canary"]);
+        }
+    }
 }
 
 #[test]

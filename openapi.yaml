@@ -8497,11 +8497,15 @@ paths:
             Spec document is structurally invalid (bad JSON/YAML, unrecognised
             OpenAPI/Swagger version, or missing/malformed `x-ferrum-*`
             extension). See `ApiSpecParseError.code` for which structural
-            problem fired.
+            problem fired. A request carrying `If-Match` is also refused with
+            400 (`Error` body) before the document is read: a create does not
+            evaluate preconditions, so nothing is written.
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/ApiSpecParseError"
+                anyOf:
+                  - $ref: "#/components/schemas/ApiSpecParseError"
+                  - $ref: "#/components/schemas/Error"
         "401":
           $ref: "#/components/responses/Unauthorized"
         "403":
@@ -8868,6 +8872,11 @@ paths:
         Returns 204 on success, 404 if the spec does not exist, or 422 when the
         prospective deletion fails plugin-graph or restore-snapshot validation.
 
+        The delete is unconditional. A request carrying `If-Match` (including
+        the `ETag` returned by `GET /api-specs/{id}`) is refused with 400 and
+        deletes nothing. The refusal follows the role check but precedes the
+        existence check, so it is 400 even for a spec ID that does not exist.
+
         This mutation requires the `admin` role.
       tags: [API Specs]
       parameters:
@@ -8883,6 +8892,15 @@ paths:
               $ref: "#/components/headers/X-Ferrum-Config-Cursor"
             X-Ferrum-Namespace-Unserved:
               $ref: "#/components/headers/X-Ferrum-Namespace-Unserved"
+        "400":
+          description: |
+            The request carried `If-Match` (refused before any lookup; this
+            delete is unconditional), the spec ID is invalid, or a query
+            parameter such as `apply` is invalid. Nothing is deleted.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
         "401":
           $ref: "#/components/responses/Unauthorized"
         "403":
@@ -26243,7 +26261,7 @@ components:
               items:
                 type: string
                 minLength: 1
-              description: Origins a post-login redirect may target, as `host` (the redirect_uri scheme's default port only) or `host:port`; an explicit default port (`host:443` for https) names the same origin as `host`. Hosts compare case-insensitively; an entry that is not a bare authority (path, query, fragment, or userinfo) is rejected. A target must also use redirect_uri's scheme and carry no userinfo. The redirect_uri's own origin is always trusted; anything else lands on post_login_default_path.
+              description: Origins a post-login redirect may target, as `host` (the redirect_uri scheme's default port only) or `host:port`; an explicit default port (`host:443` for https) names the same origin as `host`. Hosts compare case-insensitively; an entry that is not a bare authority (path, query, fragment, or userinfo) is rejected. A target must also use redirect_uri's scheme and carry no userinfo, and a target containing an ASCII control character or a backslash is refused. An accepted target is emitted in its normalized URL form (for example lowercased host, default port omitted). The redirect_uri's own origin is always trusted; anything else lands on post_login_default_path.
             refresh_skew_secs:
               type: integer
               format: uint64
@@ -26270,7 +26288,11 @@ components:
             post_login_default_path:
               type: [string, "null"]
               minLength: 1
+              allOf:
+                - pattern: '[^\u0009-\u000D\u0020\u0085\u00A0\u1680\u2000-\u200A\u2028\u2029\u202F\u205F\u3000]'
+                - pattern: '^[^\x00-\x1F\x7F\\]*$'
               default: /
+              description: Redirect target when no trusted original URL exists. Surrounding whitespace is trimmed and a whitespace-only value is rejected. Emitted verbatim as Location, so it must not contain ASCII control characters or a backslash.
 
     JwtAuthConfig:
       type: object

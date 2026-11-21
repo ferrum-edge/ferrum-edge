@@ -64,6 +64,28 @@ currently commits none, so its principals are qualified by mechanism only
 (`external:soap_ws_security:-:<identity>`). Transaction log output
 (`consumer_username`) is unchanged.
 
+### `oidc_relying_party` post-login redirects are emitted in canonical form (GHSA-6rwj-gc4r-3jm9)
+
+After a successful OIDC callback, an accepted post-login target is now sent as
+the normalized URL the plugin validated rather than the text the browser
+supplied: the host is lowercased, an explicit default port is dropped, dot
+segments are resolved, and characters such as spaces and non-ASCII are
+percent-encoded. A target containing an ASCII control character or a
+backslash, in absolute or path-relative form, is refused and lands on
+`behavior.post_login_default_path`. The target is now judged when the login
+starts, and only an accepted target whose normalized form fits 2048 bytes is
+kept in the pending-login cookie; anything else is recorded as "use the default
+path". As a result, an oversized target now lands on `post_login_default_path`
+as configured, instead of on that path rebuilt as an absolute URL on the
+login request's host, and a refused target can no longer make the login
+challenge fail with `503`. The callback still re-checks the stored target. A
+`post_login_default_path` that contains an ASCII control character or a
+backslash, or only whitespace, is rejected at config validation.
+
+**Operator action:** none for ordinary deep links. Tests or tooling that
+compare the post-login `Location` byte-for-byte with the original target may
+need to expect the normalized form.
+
 ### EastWestGateway passthrough legs now follow DestinationRules (#7424)
 
 An EastWestGateway data plane now applies DestinationRules to its
