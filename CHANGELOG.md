@@ -192,10 +192,10 @@ gateways, control planes, custom plugins, charts or contract consumers.
   JSON bodies for duplicate object member names with the shared `json_dup_keys`
   scanner before evaluating policy. A duplicate-member body is no longer judged
   on one member while a first-key-wins backend acts on another: each plugin
-  refuses it or, where configured to (`ai_prompt_shield` `warn`,
-  `ai_semantic_firewall` without `fail_on_uninspectable_body`, `on_error` or
-  dry-run handling), records it as ambiguous or uninspectable and lets it
-  through.
+  refuses it by default or, where configured to (`ai_prompt_shield`
+  `action: warn`; `ai_semantic_firewall` with `fail_on_uninspectable_body:
+  false`, `on_error: allow` or `warn`, or `mode: dry_run`), records it as
+  ambiguous or uninspectable and lets it through.
 - Fixed GHSA-rxwj-x6c6-f4j5: Consumer-username lists and per-caller rate-limit
   state no longer match or share state with an unmapped external identity
   (`jwks_auth`, `ldap_auth`, `oauth2_introspection`, `oidc_relying_party`,
