@@ -56015,14 +56015,26 @@ async fn proxy_to_backend_direct_h1(
     let mut checkout = checkout;
     let mut replayed_idle_race = false;
     let (response, checkout) = loop {
+        if !replayed_idle_race
+            && handoff_bound
+                .at
+                .is_none_or(|at| tokio::time::Instant::now() < at)
+            && let Some(pump) = upload_pump.as_mut()
+        {
+            // Prime any already-buffered client body frame into the bounded
+            // bridge before the final handoff gate so `writev` coalesces
+            // headers and body into a single TLS record / write while a
+            // deadline elapsing during priming still fails closed below.
+            pump.prime_inline();
+        }
         // Fail closed BEFORE the handoff (GHSA-xcg4-wj3x-gjj2).
         // `try_send_request` enqueues the request on the connection task
         // synchronously, before the response wait below is ever polled, and the
         // connection driver can put an enqueued request on the wire before a
         // dropped response future cancels it. A bound that elapsed while the
-        // checkout completed therefore refuses here, with nothing enqueued.
-        // The untouched connection never carried this request, so it goes back
-        // to the idle set.
+        // checkout or priming completed therefore refuses here, with nothing
+        // enqueued. The untouched connection never carried this request, so it
+        // goes back to the idle set.
         checkout = match direct_h1_handoff_gate(handoff_bound, checkout) {
             Ok(checkout) => checkout,
             Err(source) => {
@@ -56050,9 +56062,19 @@ async fn proxy_to_backend_direct_h1(
             });
         // Deadline-first, unlike the checkout: the request is already enqueued,
         // so an elapsed bound must win an exact tie with the response head.
-        let bounded = await_upload_write_watermark_first(
+        // Disarm the post-EOS send-queue drain watch whenever this attempt will
+        // not be replayed on a fresh connection, so a completed inline pump
+        // settles in place instead of detaching a 100ms `SIOCOUTQ` probe task.
+        let bounded = await_upload_write_watermark_first_disarming_post_eos(
             crate::plugins::await_deadline_first(handoff_bound.at, send_fut),
             upload_pump.as_mut(),
+            |res| {
+                !matches!(
+                    res,
+                    Ok((Err(try_err), _))
+                        if reused && !replayed_idle_race && try_err.message().is_some()
+                )
+            },
         )
         .await;
         let write_watermark_expired = bounded.is_err();
@@ -60034,12 +60056,34 @@ pub(crate) async fn optional_sleep_elapsed(sleep: std::pin::Pin<&mut Option<toki
 /// so a caller that goes on to await the response body, join the pump later,
 /// or race it again never leaves it unpolled. Cancellation (dropping this
 /// future) leaves the pump inside the join, whose `Drop` does the same.
-pub(crate) async fn await_upload_write_watermark_first<F>(
+pub(crate) fn await_upload_write_watermark_first<'a, F>(
+    fut: F,
+    pump: Option<&'a mut upload_pump::UploadPumpJoin>,
+) -> impl std::future::Future<Output = Result<F::Output, ()>> + 'a
+where
+    F: std::future::Future + 'a,
+{
+    await_upload_write_watermark_first_disarming_post_eos(fut, pump, |_| false)
+}
+
+/// Like [`await_upload_write_watermark_first`], and when `should_disarm` holds
+/// for the resolved output (or the write watermark itself expired), disarms the
+/// pump's post-EOS kernel send-queue drain watch before [`UploadPumpJoin::detach_if_live`].
+///
+/// Use this at single-wait call sites where no subsequent watermark race will
+/// observe a post-EOS drain timeout (for example after HTTP/1.1 response
+/// headers arrive without an idle-race replay, or after direct-H2's final
+/// upload gate). A completed inline pump then settles in place without
+/// spawning a detached 100ms `SIOCOUTQ` probe task, while an upload still
+/// streaming frames detaches normally.
+async fn await_upload_write_watermark_first_disarming_post_eos<F, P>(
     fut: F,
     pump: Option<&mut upload_pump::UploadPumpJoin>,
+    should_disarm: P,
 ) -> Result<F::Output, ()>
 where
     F: std::future::Future,
+    P: FnOnce(&F::Output) -> bool,
 {
     let Some(pump) = pump else {
         return Ok(fut.await);
@@ -60065,6 +60109,13 @@ where
         output = &mut fut => Ok(output),
         () = pump.backend_write_watermark_expired() => Err(()),
     };
+    let disarm = match &raced {
+        Ok(output) => should_disarm(output),
+        Err(()) => true,
+    };
+    if disarm {
+        pump.disarm_post_eos_drain();
+    }
     pump.detach_if_live();
     raced
 }
@@ -60297,7 +60348,12 @@ where
     Fut: std::future::Future<Output = A>,
 {
     loop {
-        let outcome = await_upload_write_watermark_first(attempt(builder), pump.as_mut()).await?;
+        let outcome = await_upload_write_watermark_first_disarming_post_eos(
+            attempt(builder),
+            pump.as_mut(),
+            |_| true,
+        )
+        .await?;
         if !should_replay(&outcome) {
             return Ok(outcome);
         }
@@ -66537,14 +66593,25 @@ async fn proxy_to_backend_http2(
     // request-side receipt to offer.
     if let Some(pump) = upload_pump.as_mut() {
         pump.bind_backend_socket(sender.backend_socket());
+        // Prime any already-buffered client body frame before the final
+        // handoff gate so HEADERS and the first DATA frame can coalesce while
+        // a deadline elapsing during priming still fails closed below.
+        if grpc_deadline_at.is_none_or(|at| tokio::time::Instant::now() < at)
+            && upload_auth_deadline
+                .as_ref()
+                .is_none_or(|(plan, _, _)| tokio::time::Instant::now() < plan.at)
+        {
+            pump.prime_inline();
+        }
     }
     // Fail closed BEFORE the handoff (GHSA-xcg4-wj3x-gjj2). `send_request`
     // enqueues the request on the connection task synchronously, before the
     // bounded response-header wait below is first polled, and the connection
     // task can open the backend stream before a dropped response future cancels
     // it. A client RPC deadline or authorization lifetime that elapsed while the
-    // sender was acquired therefore refuses here, with nothing enqueued; the
-    // gateway-owned upload pump is joined first, as on every other bounded exit.
+    // sender was acquired or priming ran therefore refuses here, with nothing
+    // enqueued; the gateway-owned upload pump is joined first, as on every
+    // other bounded exit.
     if let Some((source, handoff_dispatch_bound)) =
         direct_h2_handoff_refusal(grpc_deadline_at, upload_auth_deadline.as_ref())
     {
@@ -66659,11 +66726,13 @@ async fn proxy_to_backend_http2(
     // never observes the pump's terminal error. Without this arm a configured
     // `backend_write_timeout_ms` was invisible until `backend_read_timeout_ms`
     // expired (#4055).
+    let disarm_after_headers = body_completion_rx.is_none();
     let mut header_write_watermark_expired = false;
     let response = if let Some((deadline, deadline_source)) = header_deadline {
-        let bounded = await_upload_write_watermark_first(
+        let bounded = await_upload_write_watermark_first_disarming_post_eos(
             crate::plugins::await_deadline_first(Some(deadline), h2_send_fut),
             upload_pump.as_mut(),
+            |_| disarm_after_headers,
         )
         .await;
         // A send failure observed at/after the header bound, before its timer
@@ -66760,7 +66829,12 @@ async fn proxy_to_backend_http2(
             }
         }
     } else {
-        let bounded = await_upload_write_watermark_first(h2_send_fut, upload_pump.as_mut()).await;
+        let bounded = await_upload_write_watermark_first_disarming_post_eos(
+            h2_send_fut,
+            upload_pump.as_mut(),
+            |_| disarm_after_headers,
+        )
+        .await;
         match bounded {
             Ok(Ok(resp)) => Some(resp),
             Ok(Err(e)) => return map_h2_err(e),
@@ -66835,9 +66909,10 @@ async fn proxy_to_backend_http2(
         );
         let outcome = match upload_bound {
             Some((upload_deadline, bound_kind)) => {
-                let joined = await_upload_write_watermark_first(
+                let joined = await_upload_write_watermark_first_disarming_post_eos(
                     crate::plugins::await_deadline_first(Some(upload_deadline), body_completion_rx),
                     upload_pump.as_mut(),
+                    |_| true,
                 )
                 .await;
                 match joined {
@@ -66938,9 +67013,12 @@ async fn proxy_to_backend_http2(
             // the connection drops. Do not add a hidden floor here — that would
             // silently break the documented contract.
             None => {
-                let joined =
-                    await_upload_write_watermark_first(body_completion_rx, upload_pump.as_mut())
-                        .await;
+                let joined = await_upload_write_watermark_first_disarming_post_eos(
+                    body_completion_rx,
+                    upload_pump.as_mut(),
+                    |_| true,
+                )
+                .await;
                 match joined {
                     Ok(received) => received.ok(),
                     Err(()) => None,
