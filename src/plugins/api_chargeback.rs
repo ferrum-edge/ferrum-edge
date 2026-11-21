@@ -45,11 +45,14 @@ use super::{Plugin, StreamTransactionSummary, TransactionSummary, WsDisconnectCo
 use crate::plugins::chargeback::pricing::{
     PricingConfig, checked_add_charge, checked_mul_quantity, require_finite_charge,
 };
-use crate::plugins::chargeback::{bounded_billing_identity, bounded_display};
+use crate::plugins::chargeback::{
+    billing_principal, bounded_billing_identity, bounded_display, with_principal_billing_identity,
+};
 use crate::plugins::utils::log_schema::{
     DerivedKind, EmittedKeys, MetadataPolicy, SchemaCapabilities, SchemaSerializable, SchemaView,
     SummarySchema, TimestampFormat, resolve_schema,
 };
+use crate::plugins::utils::principal::Principal;
 use crate::util::unknown_keys::reject_unknown_keys;
 
 /// Closed top-level config key set for `api_chargeback` admission.
@@ -1676,7 +1679,9 @@ impl ChargebackRegistry {
     }
 
     /// Record a chargeable HTTP-family transaction (HTTP/1.1, H2, H3, gRPC,
-    /// WebSocket upgrade). Status code is the response status.
+    /// WebSocket upgrade). Status code is the response status. `consumer` is a
+    /// mapped gateway Consumer's username; the plugin's own hooks bill the
+    /// summary's full principal (GHSA-q9vj-rf66-3j58).
     #[allow(clippy::too_many_arguments)]
     pub fn record_http(
         &self,
@@ -1694,7 +1699,7 @@ impl ChargebackRegistry {
         self.record_http_in_namespace(
             scope,
             scope.namespace.as_ref(),
-            consumer,
+            Principal::Consumer(consumer),
             proxy_id,
             proxy_name,
             status_code,
@@ -1717,7 +1722,7 @@ impl ChargebackRegistry {
         &self,
         scope: &InstanceScope,
         proxy_namespace: &str,
-        consumer: &str,
+        principal: Principal<'_>,
         proxy_id: &str,
         proxy_name: &str,
         status_code: u16,
@@ -1731,7 +1736,7 @@ impl ChargebackRegistry {
         self.record_inner(
             scope,
             proxy_namespace,
-            consumer,
+            principal,
             proxy_id,
             proxy_name,
             status_code,
@@ -1749,7 +1754,7 @@ impl ChargebackRegistry {
     /// Record a chargeable stream session (TCP, TCP+TLS, UDP, DTLS). Streams
     /// have no HTTP status code; entries are keyed by
     /// `(consumer, proxy_id, ProtocolFamily::Stream)` with the
-    /// [`STREAM_STATUS_SENTINEL`].
+    /// [`STREAM_STATUS_SENTINEL`]. `consumer` is a mapped Consumer's username.
     #[allow(clippy::too_many_arguments)]
     pub fn record_stream(
         &self,
@@ -1766,7 +1771,7 @@ impl ChargebackRegistry {
         self.record_stream_in_namespace(
             scope,
             scope.namespace.as_ref(),
-            consumer,
+            Principal::Consumer(consumer),
             proxy_id,
             proxy_name,
             connection_price,
@@ -1782,7 +1787,7 @@ impl ChargebackRegistry {
         &self,
         scope: &InstanceScope,
         proxy_namespace: &str,
-        consumer: &str,
+        principal: Principal<'_>,
         proxy_id: &str,
         proxy_name: &str,
         connection_price: f64,
@@ -1794,7 +1799,7 @@ impl ChargebackRegistry {
         self.record_inner(
             scope,
             proxy_namespace,
-            consumer,
+            principal,
             proxy_id,
             proxy_name,
             STREAM_STATUS_SENTINEL,
@@ -1809,6 +1814,8 @@ impl ChargebackRegistry {
         );
     }
 
+    /// Record WebSocket session bandwidth. `consumer` is a mapped Consumer's
+    /// username.
     #[allow(clippy::too_many_arguments)]
     pub fn record_websocket_bandwidth(
         &self,
@@ -1824,7 +1831,7 @@ impl ChargebackRegistry {
         self.record_websocket_bandwidth_in_namespace(
             scope,
             scope.namespace.as_ref(),
-            consumer,
+            Principal::Consumer(consumer),
             proxy_id,
             proxy_name,
             bytes_sent,
@@ -1839,7 +1846,7 @@ impl ChargebackRegistry {
         &self,
         scope: &InstanceScope,
         proxy_namespace: &str,
-        consumer: &str,
+        principal: Principal<'_>,
         proxy_id: &str,
         proxy_name: &str,
         bytes_sent: u64,
@@ -1850,7 +1857,7 @@ impl ChargebackRegistry {
         self.record_inner(
             scope,
             proxy_namespace,
-            consumer,
+            principal,
             proxy_id,
             proxy_name,
             STREAM_STATUS_SENTINEL,
@@ -1901,7 +1908,7 @@ impl ChargebackRegistry {
         &self,
         scope: &InstanceScope,
         proxy_namespace: &str,
-        consumer: &str,
+        principal: Principal<'_>,
         proxy_id: &str,
         proxy_name: &str,
         status_code: u16,
@@ -1920,38 +1927,41 @@ impl ChargebackRegistry {
             return;
         }
 
-        // Bound the billing identity collision-resistantly: within the bound
-        // this borrows and allocates nothing, and an oversized identity keeps a
-        // digest of its complete value so two principals sharing a prefix stay
-        // distinct entries (GHSA-m28c-f3v5-26qg). Marker-bearing values —
-        // including any identity equal to [`OVERFLOW_CONSUMER_SENTINEL`] — are
-        // always digested, so a real principal can never share the internal
-        // overflow row's consumer label.
-        let consumer = bounded_billing_identity(consumer, MAX_REGISTRY_IDENTITY_BYTES);
-        debug_assert_ne!(
-            consumer.as_ref(),
-            OVERFLOW_CONSUMER_SENTINEL,
-            "bounded billing identity must never equal the internal overflow sentinel"
-        );
         let proxy_id = bounded_billing_identity(proxy_id, MAX_REGISTRY_IDENTITY_BYTES);
         let proxy_name = bounded_display(proxy_name, MAX_REGISTRY_IDENTITY_BYTES);
-        self.record_admitted(
-            scope,
-            proxy_namespace,
-            &consumer,
-            &proxy_id,
-            proxy_name,
-            status_code,
-            overflow_status_code,
-            protocol_family,
-            call_price,
-            bytes_sent,
-            bytes_received,
-            bw_price_sent,
-            bw_price_received,
-            count_call,
-            true,
-        );
+        // The billing identity keeps a mapped Consumer and unmapped external
+        // principals of distinct mechanisms/authorities on disjoint rows even
+        // when their display strings match (GHSA-q9vj-rf66-3j58), and bounds
+        // it collision-resistantly: within the bound it allocates nothing, and
+        // an oversized identity keeps a digest of its complete value so two
+        // principals sharing a prefix stay distinct entries
+        // (GHSA-m28c-f3v5-26qg). Marker-bearing values — including any
+        // identity equal to [`OVERFLOW_CONSUMER_SENTINEL`] — are always
+        // digested, so a real principal can never share the internal overflow
+        // row's consumer label.
+        with_principal_billing_identity(principal, MAX_REGISTRY_IDENTITY_BYTES, |consumer| {
+            debug_assert_ne!(
+                consumer, OVERFLOW_CONSUMER_SENTINEL,
+                "bounded billing identity must never equal the internal overflow sentinel"
+            );
+            self.record_admitted(
+                scope,
+                proxy_namespace,
+                consumer,
+                &proxy_id,
+                proxy_name,
+                status_code,
+                overflow_status_code,
+                protocol_family,
+                call_price,
+                bytes_sent,
+                bytes_received,
+                bw_price_sent,
+                bw_price_received,
+                count_call,
+                true,
+            );
+        });
     }
 
     /// Record one charge against an already-bounded identity.
@@ -3943,9 +3953,11 @@ impl Plugin for ApiChargeback {
             return;
         }
 
-        let consumer = match summary.consumer_username.as_deref() {
-            Some(c) if !c.is_empty() => c,
-            _ => return,
+        let Some(principal) = billing_principal(
+            summary.consumer_username.as_deref(),
+            summary.principal_origin,
+        ) else {
+            return;
         };
 
         let status_code = super::chargeback::http_billing_outcome(summary).status_code;
@@ -3971,7 +3983,7 @@ impl Plugin for ApiChargeback {
         self.registry.record_http_in_namespace(
             &self.scope,
             &summary.namespace,
-            consumer,
+            principal,
             proxy_id,
             proxy_name,
             status_code,
@@ -3985,9 +3997,11 @@ impl Plugin for ApiChargeback {
     }
 
     async fn on_stream_disconnect(&self, summary: &StreamTransactionSummary) {
-        let consumer = match summary.consumer_username.as_deref() {
-            Some(c) if !c.is_empty() => c,
-            _ => return,
+        let Some(principal) = billing_principal(
+            summary.consumer_username.as_deref(),
+            summary.principal_origin,
+        ) else {
+            return;
         };
 
         let Some(charge) = self
@@ -4002,7 +4016,7 @@ impl Plugin for ApiChargeback {
         self.registry.record_stream_in_namespace(
             &self.scope,
             &summary.namespace,
-            consumer,
+            principal,
             &summary.proxy_id,
             proxy_name,
             charge.charge_call,
@@ -4028,9 +4042,11 @@ impl Plugin for ApiChargeback {
     }
 
     async fn on_ws_disconnect(&self, summary: &WsDisconnectContext) {
-        let consumer = match summary.consumer_username.as_deref() {
-            Some(c) if !c.is_empty() => c,
-            _ => return,
+        let Some(principal) = billing_principal(
+            summary.consumer_username.as_deref(),
+            summary.principal_origin,
+        ) else {
+            return;
         };
         if self
             .pricing
@@ -4046,7 +4062,7 @@ impl Plugin for ApiChargeback {
         self.registry.record_websocket_bandwidth_in_namespace(
             &self.scope,
             &summary.namespace,
-            consumer,
+            principal,
             &summary.proxy_id,
             proxy_name,
             summary.bytes_client_to_backend,

@@ -3340,10 +3340,10 @@ async fn run_tcp_accept_loop(
                             connected_wall_at,
                             chrono::Utc::now(),
                         );
-                        let consumer_username = if !plugins.is_empty() {
-                            stream_ctx.effective_identity().map(str::to_owned)
+                        let (consumer_username, principal_origin) = if !plugins.is_empty() {
+                            stream_ctx.summary_identity()
                         } else {
-                            None
+                            (None, None)
                         };
                         let summary = StreamTransactionSummary {
                             namespace: final_proxy_namespace,
@@ -3355,6 +3355,7 @@ async fn run_tcp_accept_loop(
                             proxy_name,
                             client_ip,
                             consumer_username,
+                            principal_origin,
                             auth_method: stream_ctx.auth_method,
                             backend_target: result.backend.backend_target,
                             backend_resolved_ip: result.backend.backend_resolved_ip,

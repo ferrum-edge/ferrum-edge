@@ -18038,6 +18038,7 @@ async fn handle_websocket_request_authenticated(
                             timestamp_received: ctx.timestamp_received.to_rfc3339(),
                             client_ip: ctx.client_ip.clone(),
                             consumer_username: ctx.effective_identity().map(str::to_owned),
+                            principal_origin: ctx.principal_origin(),
                             auth_method: ctx.auth_method,
                             http_method: ws_err_method.to_string(),
                             // Record the path the client sent, not the
@@ -18289,6 +18290,7 @@ async fn handle_websocket_request_authenticated(
         timestamp_received: ctx.timestamp_received.to_rfc3339(),
         client_ip: ctx.client_ip.clone(),
         consumer_username: ctx.effective_identity().map(str::to_owned),
+        principal_origin: ctx.principal_origin(),
         auth_method: ctx.auth_method,
         http_method: ws_method.to_string(),
         // Record the path the client sent, not the VirtualService-rewritten
@@ -18501,6 +18503,7 @@ async fn handle_websocket_request_authenticated(
         // per-frame lookup map.
         connection_id: ws_conn_id,
         consumer_username: ctx.effective_identity().map(str::to_owned),
+        principal_origin: ctx.principal_origin(),
         auth_method: ctx.auth_method,
         metadata: clone_log_metadata(&ctx),
         proxy_lifecycle_generation: ctx.proxy_lifecycle_generation,
@@ -20932,6 +20935,9 @@ pub struct WsSessionMeta {
     /// Same value as the `connection_id` argument to `on_ws_frame` / the relay.
     pub connection_id: u64,
     pub consumer_username: Option<String>,
+    /// Namespace of `consumer_username`, carried to `WsDisconnectContext` for
+    /// billing (GHSA-q9vj-rf66-3j58).
+    pub principal_origin: Option<crate::plugins::utils::principal::PrincipalOrigin>,
     pub auth_method: Option<&'static str>,
     pub metadata: crate::plugins::MetadataMap,
     /// Ownership generation captured at WebSocket upgrade admission.
@@ -21169,6 +21175,7 @@ async fn fire_ws_tunnel_disconnect_hooks_with_reason(
         io_side: failure.as_ref().and_then(|(_, _, side)| *side),
         error_class: failure.map(|(_, c, _)| c),
         consumer_username: session_meta.consumer_username.clone(),
+        principal_origin: session_meta.principal_origin,
         auth_method: session_meta.auth_method,
         metadata,
     };
@@ -21232,6 +21239,7 @@ pub(crate) async fn fire_ws_framed_disconnect_hooks_with_reason(
         io_side: failure.as_ref().and_then(|(_, _, side)| *side),
         error_class: failure.map(|(_, c, _)| c),
         consumer_username: session_meta.consumer_username,
+        principal_origin: session_meta.principal_origin,
         auth_method: session_meta.auth_method,
         metadata,
     };
@@ -26585,6 +26593,7 @@ async fn log_rejected_request_with_path_and_backend_state(
         timestamp_received: ctx.timestamp_received.to_rfc3339(),
         client_ip: ctx.client_ip.clone(),
         consumer_username: ctx.effective_identity().map(str::to_owned),
+        principal_origin: ctx.principal_origin(),
         auth_method: ctx.auth_method,
         http_method: ctx.method.clone(),
         // Use the caller-supplied original path when provided; otherwise fall
@@ -43596,6 +43605,7 @@ async fn handle_proxy_request_inner(
                         },
                         client_ip: ctx.client_ip.clone(),
                         consumer_username: ctx.effective_identity().map(str::to_owned),
+                        principal_origin: ctx.principal_origin(),
                         auth_method: ctx.auth_method,
                         http_method: logged_http_method(&ctx, method),
                         request_path: original_request_path.clone(),
@@ -44799,6 +44809,7 @@ async fn handle_proxy_request_inner(
                         timestamp_received: ctx.timestamp_received.to_rfc3339(),
                         client_ip: ctx.client_ip.clone(),
                         consumer_username: ctx.effective_identity().map(str::to_owned),
+                        principal_origin: ctx.principal_origin(),
                         auth_method: ctx.auth_method,
                         http_method: logged_http_method(&ctx, method),
                         request_path: original_request_path.clone(),
@@ -45103,6 +45114,7 @@ async fn handle_proxy_request_inner(
                             timestamp_received: ctx.timestamp_received.to_rfc3339(),
                             client_ip: ctx.client_ip.clone(),
                             consumer_username: ctx.effective_identity().map(str::to_owned),
+                            principal_origin: ctx.principal_origin(),
                             auth_method: ctx.auth_method,
                             http_method: ctx.method.clone(),
                             request_path: original_request_path.clone(),
@@ -47831,6 +47843,7 @@ async fn handle_proxy_request_inner(
                 },
                 client_ip: ctx.client_ip.clone(),
                 consumer_username: ctx.effective_identity().map(str::to_owned),
+                principal_origin: ctx.principal_origin(),
                 auth_method: ctx.auth_method,
                 http_method: logged_http_method(&ctx, method),
                 request_path: original_request_path.clone(),

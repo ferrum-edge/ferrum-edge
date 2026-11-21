@@ -2408,6 +2408,7 @@ mod tests {
             io_side: Some(crate::proxy::tcp_proxy::StreamIoSide::Write),
             error_class: Some(crate::retry::ErrorClass::ConnectionReset),
             consumer_username: Some("alice".to_string()),
+            principal_origin: Some(crate::plugins::utils::principal::PrincipalOrigin::Consumer),
             auth_method: Some("jwt_auth"),
             connection_id: 0,
             metadata,

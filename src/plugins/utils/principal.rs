@@ -19,6 +19,11 @@
 //!   `external:<mechanism>:<authority>:<identity>`) and binds an external
 //!   identity to the realm that verified it, so two authorities that issue the
 //!   same subject never share a bucket.
+//! - Transaction summaries carry the display identity in `consumer_username`
+//!   and its namespace in [`PrincipalOrigin`] (GHSA-q9vj-rf66-3j58), so a
+//!   consumer of the finished summary (the chargeback billing row, for one)
+//!   can rebuild the [`Principal`] with [`Principal::with_origin`] instead of
+//!   keying on the collapsed display string.
 
 use crate::plugins::utils::auth_flow::ExternalIdentityRealm;
 use crate::plugins::{RequestContext, StreamConnectionContext, meaningful_identity};
@@ -31,6 +36,8 @@ pub const EXTERNAL_KEY_PREFIX: &str = "external:";
 /// compiled-in mechanism name nor a lowercase-hex authority digest can equal
 /// it.
 const ABSENT_REALM_COMPONENT: &str = "-";
+/// Lowercase hex alphabet for the in-place authority encoding.
+const LOWER_HEX: &[u8; 16] = b"0123456789abcdef";
 
 /// The mapped gateway Consumer's username, never an unmapped external identity.
 pub fn consumer_username(ctx: &RequestContext) -> Option<&str> {
@@ -78,7 +85,66 @@ pub enum Principal<'a> {
     },
 }
 
+/// Which namespace a transaction summary's display identity belongs to, and
+/// for an unmapped external principal the realm that verified it
+/// (GHSA-q9vj-rf66-3j58).
+///
+/// `consumer_username` on `TransactionSummary`, `StreamTransactionSummary`,
+/// and `WsDisconnectContext` is the collapsed display string
+/// (`effective_identity()`); this is the provenance that string lost. It is
+/// `Copy` and holds no identity text, so stamping it on a summary allocates
+/// nothing. It is never serialized into transaction logs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PrincipalOrigin {
+    /// The display identity is a mapped gateway Consumer's username.
+    Consumer,
+    /// The display identity is an unmapped external principal; `realm` as in
+    /// [`Principal::External`].
+    External {
+        realm: Option<ExternalIdentityRealm>,
+    },
+}
+
+impl PrincipalOrigin {
+    /// The origin of an HTTP-family request's principal, matching
+    /// [`Principal::of_request`] (and therefore `effective_identity()`).
+    pub fn of_request(ctx: &RequestContext) -> Option<Self> {
+        Principal::of_request(ctx).map(|principal| principal.origin())
+    }
+
+    /// The origin of a stream connection's principal, matching
+    /// [`Principal::of_stream`].
+    pub fn of_stream(ctx: &StreamConnectionContext) -> Option<Self> {
+        Principal::of_stream(ctx).map(|principal| principal.origin())
+    }
+}
+
 impl<'a> Principal<'a> {
+    /// Rebuild the principal behind a summary's display `identity` from its
+    /// recorded [`PrincipalOrigin`].
+    ///
+    /// A missing origin fails closed to an external principal with no realm:
+    /// an identity whose namespace was not recorded is never treated as a
+    /// mapped Consumer, so it cannot share a Consumer's key.
+    pub fn with_origin(identity: &'a str, origin: Option<PrincipalOrigin>) -> Self {
+        match origin {
+            Some(PrincipalOrigin::Consumer) => Self::Consumer(identity),
+            Some(PrincipalOrigin::External { realm }) => Self::External { identity, realm },
+            None => Self::External {
+                identity,
+                realm: None,
+            },
+        }
+    }
+
+    /// This principal's namespace and realm, without the identity text.
+    pub fn origin(&self) -> PrincipalOrigin {
+        match self {
+            Self::Consumer(_) => PrincipalOrigin::Consumer,
+            Self::External { realm, .. } => PrincipalOrigin::External { realm: *realm },
+        }
+    }
+
     /// The principal of an HTTP-family request: its mapped Consumer, else its
     /// external identity with the committed realm.
     pub fn of_request(ctx: &'a RequestContext) -> Option<Self> {
@@ -119,21 +185,51 @@ impl<'a> Principal<'a> {
                 let mechanism = realm
                     .map(|realm| realm.mechanism())
                     .unwrap_or(ABSENT_REALM_COMPONENT);
-                let authority = realm.and_then(|realm| realm.authority().map(hex::encode));
-                let authority = authority.as_deref().unwrap_or(ABSENT_REALM_COMPONENT);
+                let authority = realm.as_ref().and_then(|realm| realm.authority());
+                let authority_len =
+                    authority.map_or(ABSENT_REALM_COMPONENT.len(), |digest| digest.len() * 2);
                 out.reserve(
                     EXTERNAL_KEY_PREFIX.len()
                         + mechanism.len()
-                        + authority.len()
+                        + authority_len
                         + 2
                         + identity.len(),
                 );
                 out.push_str(EXTERNAL_KEY_PREFIX);
                 out.push_str(mechanism);
                 out.push(':');
-                out.push_str(authority);
+                match authority {
+                    // Lowercase hex written in place (same text as
+                    // `hex::encode`) so a per-request key build allocates
+                    // nothing beyond `out`.
+                    Some(digest) => {
+                        for &byte in digest {
+                            out.push(char::from(LOWER_HEX[usize::from(byte >> 4)]));
+                            out.push(char::from(LOWER_HEX[usize::from(byte & 0x0f)]));
+                        }
+                    }
+                    None => out.push_str(ABSENT_REALM_COMPONENT),
+                }
                 out.push(':');
                 out.push_str(identity);
+            }
+        }
+    }
+
+    /// Byte length of [`Self::push_key`]'s output, computed without building
+    /// it.
+    pub fn key_len(&self) -> usize {
+        match self {
+            Self::Consumer(username) => CONSUMER_KEY_PREFIX.len() + username.len(),
+            Self::External { identity, realm } => {
+                let mechanism = realm
+                    .map(|realm| realm.mechanism())
+                    .unwrap_or(ABSENT_REALM_COMPONENT);
+                let authority_len = realm
+                    .as_ref()
+                    .and_then(|realm| realm.authority())
+                    .map_or(ABSENT_REALM_COMPONENT.len(), |digest| digest.len() * 2);
+                EXTERNAL_KEY_PREFIX.len() + mechanism.len() + authority_len + 2 + identity.len()
             }
         }
     }

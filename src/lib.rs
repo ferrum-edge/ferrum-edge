@@ -11740,6 +11740,10 @@ pub mod _test_support {
             handshake_status_code: 101,
             listen_port,
             connection_id: 0,
+            // Test sessions model a mapped Consumer.
+            principal_origin: consumer_username
+                .as_ref()
+                .map(|_| crate::plugins::utils::principal::PrincipalOrigin::Consumer),
             consumer_username,
             auth_method: None,
             metadata,
@@ -11773,6 +11777,10 @@ pub mod _test_support {
             handshake_status_code: 101,
             listen_port,
             connection_id: 0,
+            // Test sessions model a mapped Consumer.
+            principal_origin: consumer_username
+                .as_ref()
+                .map(|_| crate::plugins::utils::principal::PrincipalOrigin::Consumer),
             consumer_username,
             auth_method: None,
             metadata,

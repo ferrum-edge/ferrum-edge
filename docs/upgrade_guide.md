@@ -127,6 +127,42 @@ load-balancing and outlier settings now also shape cross-cluster traffic
 entering through the gateway. A rule meant only for in-cluster clients can be
 narrowed with `exportTo` so it is not visible to the gateway's namespace.
 
+### Chargeback rows for external principals are realm-qualified (GHSA-q9vj-rf66-3j58)
+
+`api_chargeback` (`/charges`) and `api_chargeback_sink` (`consumer_id`) now key
+billing rows on the authenticated principal rather than on the logged
+`consumer_username` display string. A mapped gateway Consumer's row is
+unchanged. An unmapped external principal (`jwks_auth`, `oidc_relying_party`,
+`oauth2_introspection`, `ldap_auth`, `soap_ws_security`, or an external stream
+identity) is now reported as `external:<mechanism>:<authority>:<identity>`, for
+example `external:jwks_auth:<64 hex>:alice`, where `<authority>` is the opaque
+verifying-authority digest (`-` when absent). Previously such a principal was
+billed under its bare identity, sharing a row with any Consumer or other
+provider that used the same string. A Consumer whose username begins with
+`external:` is now always reported in its `~sha256:` digest form.
+
+**Treat the upgrade as a billing boundary.** Rows recorded before it — ClickHouse
+rows, Prometheus series, and charge events still pending in the sink spool,
+which replay with their original bytes after the upgrade — are keyed on the bare
+display identity and are not realm-qualified. A pre-upgrade bare value can even
+coincide with a post-upgrade key: a Consumer whose username was literally
+`external:jwks_auth:<64 hex>:alice` billed under that string before the upgrade,
+while after it the same string identifies the external principal and the
+Consumer moves to its digest form. Because the shipped ClickHouse rollups group
+by `consumer_id` without the realm, keep the two eras separately attributable
+for the first realm-qualified rollout — for example ship it with a new
+`pricing_version` (part of every rollup key) or write it to a new table — and
+let pending spool rows drain before reconciling across the boundary.
+
+**Operator action:** update invoicing and reconciliation that maps `/charges`
+consumer keys or ClickHouse `consumer_id` values for external principals to
+customers: match the `external:` key (or its identity suffix together with the
+mechanism and authority) instead of the bare identity. External rows are
+qualified by the realm authority the mechanism commits; `soap_ws_security`
+currently commits none, so its principals are qualified by mechanism only
+(`external:soap_ws_security:-:<identity>`). Transaction log output
+(`consumer_username`) is unchanged.
+
 ### Sidecar VirtualService HTTP routes (#7423)
 
 Sidecar data planes now apply the `http[]` routes of VirtualServices bound to

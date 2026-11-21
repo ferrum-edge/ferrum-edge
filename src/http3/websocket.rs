@@ -1984,6 +1984,7 @@ pub(crate) async fn handle_h3_websocket(
         listen_port: crate::proxy::websocket_session_listen_port(&ctx, true, &state.env_config),
         connection_id: ws_conn_id,
         consumer_username: ctx.effective_identity().map(str::to_owned),
+        principal_origin: ctx.principal_origin(),
         auth_method: ctx.auth_method,
         metadata: crate::proxy::clone_log_metadata(&ctx),
         proxy_lifecycle_generation: ctx.proxy_lifecycle_generation,
@@ -2193,6 +2194,7 @@ async fn emit_successful_upgrade_summary(
         timestamp_received: ctx.timestamp_received.to_rfc3339(),
         client_ip: ctx.client_ip.clone(),
         consumer_username: ctx.effective_identity().map(str::to_owned),
+        principal_origin: ctx.principal_origin(),
         auth_method: ctx.auth_method,
         // RFC 9220 Extended CONNECT uses :method=CONNECT, mirroring the
         // H2 RFC 8441 path's "CONNECT" label.
@@ -2284,6 +2286,7 @@ async fn emit_failed_upgrade_summary(
         timestamp_received: ctx.timestamp_received.to_rfc3339(),
         client_ip: ctx.client_ip.clone(),
         consumer_username: ctx.effective_identity().map(str::to_owned),
+        principal_origin: ctx.principal_origin(),
         auth_method: ctx.auth_method,
         http_method: "CONNECT".to_string(),
         // Record the path the client sent, not the VirtualService-rewritten

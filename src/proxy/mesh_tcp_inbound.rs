@@ -667,6 +667,7 @@ async fn emit_disconnect(
         proxy_name: proxy.name.clone(),
         client_ip: client_ip.to_string(),
         consumer_username: stream_ctx.effective_identity().map(str::to_owned),
+        principal_origin: stream_ctx.principal_origin(),
         auth_method: stream_ctx.auth_method,
         backend_target,
         backend_resolved_ip: None,

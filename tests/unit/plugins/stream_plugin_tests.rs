@@ -311,6 +311,7 @@ fn make_stream_summary() -> StreamTransactionSummary {
         proxy_name: Some("Test Proxy".to_string()),
         client_ip: "10.1.2.3".to_string(),
         consumer_username: None,
+        principal_origin: None,
         auth_method: None,
         backend_target: "10.0.0.50:5432".to_string(),
         backend_resolved_ip: Some("10.0.0.50".to_string()),

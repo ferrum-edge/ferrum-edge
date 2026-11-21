@@ -1929,6 +1929,36 @@ Charges accumulate in-memory and are exposed via the admin `/charges` endpoint
 in both Prometheus text and JSON formats for external billing system
 integration.
 
+**Billing identity (GHSA-q9vj-rf66-3j58):** a row's `consumer` (the JSON
+`consumers` key and the Prometheus `consumer` label) is the authenticated
+*principal*, not the display string logged as `consumer_username`. That display
+string is the same for a mapped Consumer `alice` and for an unmapped external
+principal `alice` from any `jwks_auth` / `oidc_relying_party` /
+`oauth2_introspection` / `ldap_auth` / `soap_ws_security` provider, so it never
+keys a billing row:
+
+| Principal | Billing identity |
+|-----------|------------------|
+| Mapped gateway Consumer | its username, unchanged (for example `alice`) |
+| Unmapped external principal | `external:<mechanism>:<authority>:<identity>` — the same namespaced key per-caller limiters use, for example `external:jwks_auth:<64 hex>:alice` |
+
+`<mechanism>` is the authentication plugin that verified the identity and
+`<authority>` is the opaque 64-hex digest of the verifying authority (issuer,
+key source, directory) that the mechanism commits with the identity; either is
+`-` when absent (for example a stream connection, which carries no realm). Two
+providers that issue the same subject therefore bill two rows, and neither
+shares the Consumer's row. External rows are only as fine-grained as the
+committed realm: `soap_ws_security` currently commits no authority, so its
+principals are qualified by mechanism only
+(`external:soap_ws_security:-:<identity>`), and two SAML issuers trusted by one
+instance share a row for the same subject. Rows recorded before this keying
+took effect carry bare display identities; see the upgrade guide for the
+cutover. A value above 512 bytes, or one containing the
+`~sha256:` marker, uses the collision-resistant digest form described below
+(external keys hash under a separate domain from Consumer usernames). A
+Consumer whose username itself begins with `external:` is always given its
+digest form so it can never spell an external principal's row.
+
 **Exactly-once accounting:** the `/charges` registry is one
 process-global accumulator. After ordinary scope merging, each proxy may retain
 at most one effective `api_chargeback` instance. Two proxy-scoped configs, two
@@ -1990,7 +2020,8 @@ billing-identity class (`~sha256:` marker, non-hex suffix), so
 `bounded_billing_identity` can never return it for a real authenticated claim
 or operator-configured Consumer username — including one equal to the
 human-looking label `__cardinality_overflow__` or to the sentinel string
-itself.
+itself — and no external principal's `external:` billing identity can equal
+it either.
 Already-admitted rows keep accumulating normally and capacity is recovered
 by ordinary `stale_entry_ttl_seconds` eviction, subject to the collection
 contract below. Admission pressure is exported
@@ -2270,6 +2301,14 @@ under `/metrics`. See
 [plugins/api_chargeback_sink.md](plugins/api_chargeback_sink.md) for DDL,
 configuration, OpenAPI/runtime admission layers, spool sizing, replay, the
 ownership/claim protocol, and reconciliation guidance.
+
+Each row's `consumer_id` is the principal's billing identity, exactly as
+`api_chargeback` forms its `consumer` key (see
+[Billing identity](#api_chargeback)): a mapped Consumer's username unchanged,
+and `external:<mechanism>:<authority>:<identity>` for an unmapped external
+principal, so a Consumer and same-named external principals from distinct
+mechanisms or authorities never share a `consumer_id` or a snapshot row
+(GHSA-q9vj-rf66-3j58).
 
 `include_request_id` and `include_trace_id` (both Boolean, default `true`)
 control whether the exported row carries the transaction's `request_id` and

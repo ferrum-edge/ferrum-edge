@@ -54,6 +54,7 @@ fn primary_summary(consumer: &str, proxy_id: &str, status: u16) -> TransactionSu
         timestamp_received: "2025-01-01T00:00:00Z".to_string(),
         client_ip: "127.0.0.1".to_string(),
         consumer_username: Some(consumer.to_string()),
+        principal_origin: Some(ferrum_edge::plugins::utils::principal::PrincipalOrigin::Consumer),
         auth_method: None,
         http_method: "GET".to_string(),
         request_path: "/chargeback-mirror".to_string(),

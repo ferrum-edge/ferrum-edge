@@ -870,6 +870,7 @@ fn minimum_stream_summary() -> StreamTransactionSummary {
         proxy_name: None,
         client_ip: "::".to_string(),
         consumer_username: None,
+        principal_origin: None,
         auth_method: None,
         backend_target: "a:1".to_string(),
         backend_resolved_ip: None,

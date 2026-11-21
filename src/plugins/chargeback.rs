@@ -1,8 +1,10 @@
 //! Shared chargeback helpers used by in-memory and durable charge exporters.
 
 use std::borrow::Cow;
+use std::cell::RefCell;
 
 use crate::fips::approved::Sha256;
+use crate::plugins::utils::principal::{EXTERNAL_KEY_PREFIX, Principal, PrincipalOrigin};
 
 use super::TransactionSummary;
 
@@ -10,6 +12,22 @@ use super::TransactionSummary;
 /// colliding with any other SHA-256 use in the process and pins the encoding
 /// version so a future change is a visibly different representation.
 const BILLING_IDENTITY_DIGEST_DOMAIN: &[u8] = b"ferrum-edge/chargeback-billing-identity/v1\0";
+
+/// Domain separator for the digest form of an unmapped external principal's
+/// billing identity (GHSA-q9vj-rf66-3j58). Distinct from
+/// [`BILLING_IDENTITY_DIGEST_DOMAIN`], so an external digest form never equals
+/// a Consumer's even when the two hashed strings are the same bytes.
+const EXTERNAL_BILLING_IDENTITY_DIGEST_DOMAIN: &[u8] =
+    b"ferrum-edge/chargeback-billing-identity/external/v1\0";
+
+/// Initial capacity of the per-thread external billing key buffer: the
+/// longest fixed part of an external key (prefix, mechanism, 64-hex authority,
+/// separators) plus a typical subject.
+const EXTERNAL_KEY_BUF_INITIAL_CAPACITY: usize = 160;
+
+/// Capacity above which the per-thread external billing key buffer is released
+/// after use instead of being retained for the next record.
+const EXTERNAL_KEY_BUF_MAX_RETAINED_CAPACITY: usize = 4096;
 
 /// Marker separating the human-readable prefix from the digest.
 const BILLING_IDENTITY_DIGEST_MARKER: &str = "~sha256:";
@@ -73,18 +91,267 @@ pub fn bounded_billing_identity(value: &str, max_len: usize) -> Cow<'_, str> {
     if value.len() <= max_len && !value.contains(BILLING_IDENTITY_DIGEST_MARKER) {
         return Cow::Borrowed(value);
     }
+    Cow::Owned(digest_billing_identity(
+        BILLING_IDENTITY_DIGEST_DOMAIN,
+        value,
+        max_len,
+    ))
+}
+
+/// Lowercase hex alphabet for digest suffixes written in place.
+const LOWER_HEX: &[u8; 16] = b"0123456789abcdef";
+
+/// SHA-256 of `domain || value`.
+fn billing_identity_digest(domain: &[u8], value: &str) -> [u8; 32] {
     let mut hasher = Sha256::new();
-    hasher.update(BILLING_IDENTITY_DIGEST_DOMAIN);
+    hasher.update(domain);
     hasher.update(value.as_bytes());
-    let digest = hex::encode(hasher.finalize());
+    hasher.finalize()
+}
+
+/// Append the first `hex_len` lowercase hex digits of `digest` to `out` (the
+/// same text as a prefix of `hex::encode(digest)`), without allocating beyond
+/// `out`'s own growth.
+fn push_digest_hex(out: &mut String, digest: &[u8; 32], hex_len: usize) {
+    let mut remaining = hex_len.min(BILLING_IDENTITY_DIGEST_HEX_LEN);
+    for &byte in digest {
+        for nibble in [byte >> 4, byte & 0x0f] {
+            if remaining == 0 {
+                return;
+            }
+            out.push(char::from(LOWER_HEX[usize::from(nibble)]));
+            remaining -= 1;
+        }
+    }
+}
+
+/// The digest form `<utf8-safe prefix>~sha256:<hex of SHA-256(domain || value)>`
+/// bounded to `max_len` (see [`bounded_billing_identity`]).
+fn digest_billing_identity(domain: &[u8], value: &str, max_len: usize) -> String {
+    let digest = billing_identity_digest(domain, value);
     if max_len < BILLING_IDENTITY_DIGEST_SUFFIX_BYTES {
-        // No prefix budget: emit as much of the digest as fits. `digest` is
-        // ASCII hex, so byte slicing is always on a char boundary.
-        return Cow::Owned(digest[..max_len.min(BILLING_IDENTITY_DIGEST_HEX_LEN)].to_string());
+        // No prefix budget: emit as much of the digest as fits.
+        let mut out = String::with_capacity(max_len.min(BILLING_IDENTITY_DIGEST_HEX_LEN));
+        push_digest_hex(&mut out, &digest, max_len);
+        return out;
     }
     let prefix_budget = max_len - BILLING_IDENTITY_DIGEST_SUFFIX_BYTES;
     let prefix = bounded_display(value, prefix_budget);
-    Cow::Owned(format!("{prefix}{BILLING_IDENTITY_DIGEST_MARKER}{digest}"))
+    let mut out = String::with_capacity(prefix.len() + BILLING_IDENTITY_DIGEST_SUFFIX_BYTES);
+    out.push_str(prefix);
+    out.push_str(BILLING_IDENTITY_DIGEST_MARKER);
+    push_digest_hex(&mut out, &digest, BILLING_IDENTITY_DIGEST_HEX_LEN);
+    out
+}
+
+/// Replace the complete value held in `buf` with its digest form, in place:
+/// byte-for-byte what [`digest_billing_identity`] returns for the same value,
+/// but reusing `buf` (hash the whole value, truncate at the UTF-8-safe prefix
+/// boundary, append marker and hex) so a warm buffer allocates nothing.
+fn digest_billing_identity_in_place(domain: &[u8], buf: &mut String, max_len: usize) {
+    let digest = billing_identity_digest(domain, buf.as_str());
+    if max_len < BILLING_IDENTITY_DIGEST_SUFFIX_BYTES {
+        buf.clear();
+        push_digest_hex(buf, &digest, max_len);
+        return;
+    }
+    let prefix_budget = max_len - BILLING_IDENTITY_DIGEST_SUFFIX_BYTES;
+    let prefix_len = bounded_display(buf.as_str(), prefix_budget).len();
+    buf.truncate(prefix_len);
+    buf.push_str(BILLING_IDENTITY_DIGEST_MARKER);
+    push_digest_hex(buf, &digest, BILLING_IDENTITY_DIGEST_HEX_LEN);
+}
+
+/// The billable principal behind a summary's display identity, or `None` when
+/// the summary carries no (or an empty) identity and is therefore not billed.
+///
+/// `origin` is the summary's recorded [`PrincipalOrigin`]; a missing origin
+/// fails closed to an external principal (see [`Principal::with_origin`]).
+pub fn billing_principal(
+    identity: Option<&str>,
+    origin: Option<PrincipalOrigin>,
+) -> Option<Principal<'_>> {
+    identity
+        .filter(|identity| !identity.is_empty())
+        .map(|identity| Principal::with_origin(identity, origin))
+}
+
+/// The billing identity (`/charges` consumer key, `consumer` label, and
+/// `api_chargeback_sink` `consumer_id`) of an authenticated principal, bounded
+/// to `max_len` bytes (GHSA-q9vj-rf66-3j58).
+///
+/// The display string `effective_identity()` puts in a summary's
+/// `consumer_username` is shared by a mapped Consumer and by unmapped external
+/// principals of every mechanism and authority, so it cannot be the billing
+/// key. Each principal gets one of these disjoint forms instead:
+///
+/// - **Consumer** `alice`: the username, exactly as [`bounded_billing_identity`]
+///   represents it, so Consumer rows are unchanged. The one exception is a
+///   username that begins with `external:`, which is always given its digest
+///   form so it can never spell an external principal's row.
+/// - **External principal**: its namespaced
+///   [`Principal::push_key`](crate::plugins::utils::principal::Principal::push_key)
+///   form `external:<mechanism|->:<authority-hex|->:<identity>`, the same
+///   key per-caller limiters use. Two authorities (or mechanisms) that issue
+///   the same subject therefore bill separate rows, and neither shares the
+///   Consumer's.
+/// - **Digest form** `<prefix>~sha256:<64 hex>`: any value that is oversized or
+///   contains the digest marker. External keys hash under a separate domain
+///   from Consumer usernames, so the two digest forms never coincide.
+///
+/// The verbatim Consumer class never starts with `external:` and the verbatim
+/// external class always does; neither contains the digest marker, which every
+/// digest form does; and the internal `api_chargeback` overflow sentinel is a
+/// marker-bearing value whose suffix is not 64 hex, so no real principal can
+/// share its row either. `max_len` must be at least
+/// [`BILLING_IDENTITY_DIGEST_SUFFIX_BYTES`] for these guarantees (both
+/// chargeback plugins use 512).
+///
+/// Allocates only for an external principal or a digest form; the
+/// allocation-free [`with_principal_billing_identity`] serves the request path.
+pub fn principal_billing_identity(principal: Principal<'_>, max_len: usize) -> Cow<'_, str> {
+    match principal {
+        Principal::Consumer(username) => consumer_billing_identity(username, max_len),
+        Principal::External { .. } => {
+            let mut key = String::new();
+            principal.push_key(&mut key);
+            Cow::Owned(external_billing_identity_from_key(key, max_len))
+        }
+    }
+}
+
+/// [`principal_billing_identity`] as an owned `String`, for a value that is
+/// moved into an exported event. A verbatim Consumer username is copied once
+/// and an in-bound external key is built once (and digested from that key only
+/// when it carries the digest marker, which a custom mechanism name can also
+/// complete). Any other digest form is encoded in the per-thread buffer and
+/// copied once, except an input larger than that buffer retains, which takes
+/// the plain owned path instead of regrowing the buffer. The bytes are always
+/// identical to [`principal_billing_identity`].
+pub fn owned_principal_billing_identity(principal: Principal<'_>, max_len: usize) -> String {
+    match principal {
+        Principal::Consumer(username) if !consumer_needs_digest(username, max_len) => {
+            username.to_owned()
+        }
+        Principal::Consumer(username)
+            if username.len() > EXTERNAL_KEY_BUF_MAX_RETAINED_CAPACITY =>
+        {
+            consumer_billing_identity(username, max_len).into_owned()
+        }
+        // Only the identity or a (custom) mechanism name can contain the
+        // marker's `~`: the prefix, hex-or-`-` authority, and separators
+        // cannot. Without a `~` in the mechanism, an in-bound key is verbatim
+        // exactly when its identity is marker-free, so it is built once and
+        // moved. Anything else takes the per-thread encoder below, which
+        // applies the complete-key predicate.
+        Principal::External { identity, realm }
+            if principal.key_len() <= max_len
+                && !identity.contains(BILLING_IDENTITY_DIGEST_MARKER)
+                && !realm.is_some_and(|realm| realm.mechanism().contains('~')) =>
+        {
+            let mut key = String::new();
+            principal.push_key(&mut key);
+            external_billing_identity_from_key(key, max_len)
+        }
+        Principal::External { .. }
+            if principal.key_len() > EXTERNAL_KEY_BUF_MAX_RETAINED_CAPACITY =>
+        {
+            principal_billing_identity(principal, max_len).into_owned()
+        }
+        _ => with_principal_billing_identity(principal, max_len, str::to_owned),
+    }
+}
+
+/// [`principal_billing_identity`] handed to `f` without allocating once the
+/// per-thread buffer is warm: an in-bound Consumer borrows its username, and
+/// every other form (an external principal's key, and any digest form) is
+/// built in that buffer. The bytes are identical to
+/// [`principal_billing_identity`].
+pub fn with_principal_billing_identity<R>(
+    principal: Principal<'_>,
+    max_len: usize,
+    f: impl FnOnce(&str) -> R,
+) -> R {
+    if let Principal::Consumer(username) = principal
+        && !consumer_needs_digest(username, max_len)
+    {
+        return f(username);
+    }
+    thread_local! {
+        static EXTERNAL_KEY_BUF: RefCell<String> =
+            RefCell::new(String::with_capacity(EXTERNAL_KEY_BUF_INITIAL_CAPACITY));
+    }
+    EXTERNAL_KEY_BUF.with(move |buf| match buf.try_borrow_mut() {
+        Ok(mut key) => {
+            key.clear();
+            match principal {
+                // Only a digest-form Consumer reaches the buffer.
+                Principal::Consumer(username) => {
+                    key.push_str(username);
+                    digest_billing_identity_in_place(
+                        BILLING_IDENTITY_DIGEST_DOMAIN,
+                        &mut key,
+                        max_len,
+                    );
+                }
+                Principal::External { .. } => {
+                    principal.push_key(&mut key);
+                    if !external_key_is_verbatim(key.as_str(), max_len) {
+                        digest_billing_identity_in_place(
+                            EXTERNAL_BILLING_IDENTITY_DIGEST_DOMAIN,
+                            &mut key,
+                            max_len,
+                        );
+                    }
+                }
+            }
+            let result = f(key.as_str());
+            if key.capacity() > EXTERNAL_KEY_BUF_MAX_RETAINED_CAPACITY {
+                *key = String::with_capacity(EXTERNAL_KEY_BUF_INITIAL_CAPACITY);
+            }
+            result
+        }
+        // Re-entered from inside `f`: build an owned key rather than share
+        // the buffer that is still lent out.
+        Err(_) => f(principal_billing_identity(principal, max_len).as_ref()),
+    })
+}
+
+/// Whether a Consumer username needs its digest form: oversized,
+/// marker-bearing (as for [`bounded_billing_identity`]), or spelling the
+/// reserved external-key prefix.
+fn consumer_needs_digest(username: &str, max_len: usize) -> bool {
+    username.len() > max_len
+        || username.contains(BILLING_IDENTITY_DIGEST_MARKER)
+        || username.starts_with(EXTERNAL_KEY_PREFIX)
+}
+
+/// Consumer arm of [`principal_billing_identity`]: the username exactly as
+/// [`bounded_billing_identity`] represents it, except that a reserved-prefix
+/// username is always digested.
+fn consumer_billing_identity(username: &str, max_len: usize) -> Cow<'_, str> {
+    if consumer_needs_digest(username, max_len) {
+        return Cow::Owned(digest_billing_identity(
+            BILLING_IDENTITY_DIGEST_DOMAIN,
+            username,
+            max_len,
+        ));
+    }
+    Cow::Borrowed(username)
+}
+
+/// Whether an external key is its own billing identity (in bound and free of
+/// the digest marker) rather than needing its digest form.
+fn external_key_is_verbatim(key: &str, max_len: usize) -> bool {
+    key.len() <= max_len && !key.contains(BILLING_IDENTITY_DIGEST_MARKER)
+}
+
+/// External arm of [`principal_billing_identity`] for an already built key.
+fn external_billing_identity_from_key(key: String, max_len: usize) -> String {
+    if external_key_is_verbatim(&key, max_len) {
+        return key;
+    }
+    digest_billing_identity(EXTERNAL_BILLING_IDENTITY_DIGEST_DOMAIN, &key, max_len)
 }
 
 /// Final status dimensions used by both chargeback implementations.
