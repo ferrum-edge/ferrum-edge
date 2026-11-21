@@ -4068,13 +4068,23 @@ route included, so a rule can be bound before a second provider is added), while
 `soap_ws_security` commits none.
 
 `authority` tells providers apart only as far as the mechanism's realm derivation
-does. For `oauth2_introspection` the digest covers the pinned `issuer`, the
-introspection or discovery endpoint, and the identity claim (plus a returned
-`iss` when no `issuer` is pinned), not the client credentials: two providers that
-share an endpoint and identity claim without distinct `issuer` pins commit the
-same authority, even when they authenticate to that endpoint as different
-clients. Pin a distinct `issuer` on each, or use distinct endpoints, to make them
-independently scopeable.
+does. For `oauth2_introspection` the base digest covers the pinned `issuer`, the
+introspection or discovery endpoint, and the identity claim. The provider's client
+credentials are not part of it, so they never distinguish authorities.
+
+- A provider that pins `issuer` commits exactly one digest, and it only accepts
+  introspection responses whose `iss` equals the pin.
+- A provider that pins no `issuer` refines its base digest with the response's
+  string `iss`. It can therefore commit several digests: one per returned issuer,
+  plus the unrefined base digest for responses without an `iss`. A rule meant to
+  cover every identity namespace behind such a provider needs an entry per
+  digest it commits.
+- Two unpinned providers with the same endpoint and identity claim commit the
+  same digest whenever the returned issuer is also equal (or absent in both),
+  even when they authenticate to that endpoint as different clients.
+
+Pin a distinct `issuer` on each provider, or use distinct endpoints, to give each
+provider one independently scopeable authority.
 
 Scoping can only narrow admission:
 

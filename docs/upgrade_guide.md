@@ -47,9 +47,12 @@ as before.
 of one mechanism (multi-provider `jwks_auth` or `oauth2_introspection`), a
 `mechanism`-only entry matches an equal subject from every one of those
 providers. Add `authority` to each external-identity entry that is meant for one
-provider. `oauth2_introspection` providers that share an endpoint and identity
-claim without distinct `issuer` pins commit the same authority; pin a distinct
-`issuer` or use distinct endpoints first. Older builds reject the new key, so upgrade every gateway node (CP and
+provider. `oauth2_introspection` client credentials do not distinguish
+authorities. An introspection provider without an `issuer` pin commits one digest
+per returned `iss`, plus a base digest when `iss` is absent. Two such providers on
+the same endpoint and identity claim share a digest whenever the returned issuer
+is equal. Pin a distinct `issuer` (responses must then carry that `iss`) or use
+distinct endpoints to give each provider exactly one authority. Older builds reject the new key, so upgrade every gateway node (CP and
 DPs together) before adding it.
 
 ### EastWestGateway passthrough legs now follow DestinationRules (#7424)

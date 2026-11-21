@@ -31407,9 +31407,14 @@ components:
                   mechanism (two `jwks_auth` issuers, two
                   `oauth2_introspection` endpoints) have different digests, so
                   this is what tells them apart, as far as the mechanism's
-                  realm derivation does (`oauth2_introspection` providers that
-                  share an endpoint and identity claim without distinct
-                  `issuer` pins share one authority). `jwks_auth`,
+                  realm derivation does. For `oauth2_introspection`, client
+                  credentials do not distinguish authorities, and a provider
+                  without an `issuer` pin commits one digest per returned
+                  `iss` (plus a base digest when `iss` is absent), so two such
+                  providers on the same endpoint and identity claim share a
+                  digest whenever the returned issuer is equal. Pinning
+                  `issuer` gives one digest per provider and requires the
+                  response `iss` to match. `jwks_auth`,
                   `oauth2_introspection`, `ldap_auth`, and `oidc_relying_party`
                   commit a digest for every identity; `soap_ws_security`
                   commits none. Allow entries never match an identity with no
