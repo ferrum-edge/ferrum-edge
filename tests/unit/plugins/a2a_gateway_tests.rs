@@ -8448,3 +8448,133 @@ async fn byte_identical_final_body_with_changed_classification_headers_is_rechec
         .await;
     assert_uninspectable_refusal(result, &ctx, "version header removed after admission");
 }
+
+/// The header re-check on a byte-identical final body applies only where
+/// classification is required: a metadata-only instance keeps the plain
+/// byte-identity shortcut, so removing the version header from an unchanged,
+/// admitted batch still forwards it.
+#[tokio::test]
+async fn version_header_removal_on_an_unchanged_batch_is_refused_only_when_classification_is_required()
+ {
+    let batch = json!([
+        {"jsonrpc": "2.0", "id": 1, "method": "tasks/get", "params": {"id": "t"}},
+        {"jsonrpc": "2.0", "id": 2, "method": "vendor/ping"}
+    ]);
+    let same_bytes = batch.to_string();
+
+    let metadata_only = plugin(json!({"discovery": {"rewrite_agent_card_urls": false}}));
+    let (mut ctx, mut headers) = jsonrpc_ctx(batch.clone());
+    headers.insert("a2a-version".to_string(), "0.3.0".to_string());
+    assert!(matches!(
+        metadata_only.before_proxy(&mut ctx, &mut headers).await,
+        PluginResult::Continue
+    ));
+    headers.remove("a2a-version");
+    assert!(matches!(
+        metadata_only
+            .on_final_request_body_with_context(&mut ctx, &headers, same_bytes.as_bytes())
+            .await,
+        PluginResult::Continue
+    ));
+
+    let rewriting = plugin(json!({}));
+    let (mut ctx, mut headers) = jsonrpc_ctx(batch);
+    headers.insert("a2a-version".to_string(), "0.3.0".to_string());
+    assert!(matches!(
+        rewriting.before_proxy(&mut ctx, &mut headers).await,
+        PluginResult::Continue
+    ));
+    headers.remove("a2a-version");
+    let result = rewriting
+        .on_final_request_body_with_context(&mut ctx, &headers, same_bytes.as_bytes())
+        .await;
+    let body = assert_uninspectable_refusal(result, &ctx, "version header removed from a batch");
+    let responses = body.as_array().expect("a batch refusal is a batch");
+    assert_eq!(responses.len(), 2);
+}
+
+fn native_grpc_get_task_ctx(path: &str) -> (RequestContext, HashMap<String, String>) {
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        path.to_string(),
+    );
+    ctx.headers
+        .insert("content-type".to_string(), "application/grpc".to_string());
+    ctx.request_body_bytes = Some(Bytes::from_static(b"\x00\x00\x00\x00\x03\x0a\x01t"));
+    let headers = ctx.headers.clone();
+    (ctx, headers)
+}
+
+/// A native gRPC call positively classified as the gRPC binding is not an
+/// unclassifiable JSON-RPC request when `endpoint.path` equals its RPC path:
+/// it is not buffered, admitted at arrival, and passes the final backstop —
+/// for one instance with both bindings and for a JSON-RPC sibling behind a
+/// gRPC instance that claimed it.
+#[tokio::test]
+async fn native_grpc_call_on_a_shared_endpoint_path_is_not_refused_as_jsonrpc() {
+    const SHARED: &str = "/a2a.v1.A2AService/GetTask";
+    let protobuf = b"\x00\x00\x00\x00\x03\x0a\x01t".as_slice();
+
+    let both = plugin(json!({"endpoint": {"path": SHARED}}));
+    let (mut ctx, mut headers) = native_grpc_get_task_ctx(SHARED);
+    assert!(!both.should_buffer_request_body(&ctx));
+    assert!(matches!(
+        both.before_proxy(&mut ctx, &mut headers).await,
+        PluginResult::Continue
+    ));
+    assert_eq!(
+        ctx.metadata.get("a2a.binding").map(String::as_str),
+        Some("grpc")
+    );
+    assert_eq!(
+        ctx.metadata.get("a2a.method").map(String::as_str),
+        Some("tasks/get")
+    );
+    assert!(matches!(
+        both.on_final_request_body_with_context(&mut ctx, &headers, protobuf)
+            .await,
+        PluginResult::Continue
+    ));
+
+    // A gRPC instance claims the call first; the JSON-RPC sibling on the same
+    // path neither refuses it at arrival nor at the final body.
+    let grpc_only = plugin(json!({
+        "endpoint": {"path": SHARED},
+        "detection": {"bindings": ["grpc"]}
+    }));
+    let jsonrpc_only = plugin(json!({
+        "endpoint": {"path": SHARED},
+        "detection": {"bindings": ["jsonrpc"]}
+    }));
+    let (mut ctx, mut headers) = native_grpc_get_task_ctx(SHARED);
+    for instance in [&grpc_only, &jsonrpc_only] {
+        assert!(matches!(
+            instance.before_proxy(&mut ctx, &mut headers).await,
+            PluginResult::Continue
+        ));
+    }
+    assert!(matches!(
+        jsonrpc_only
+            .on_final_request_body_with_context(&mut ctx, &headers, protobuf)
+            .await,
+        PluginResult::Continue
+    ));
+
+    // A JSON-RPC request relabelled as gRPC after admission stays refused.
+    let (mut ctx, mut headers) =
+        jsonrpc_ctx(json!({"jsonrpc": "2.0", "id": 1, "method": "tasks/get"}));
+    let gateway = plugin(json!({}));
+    assert!(matches!(
+        gateway.before_proxy(&mut ctx, &mut headers).await,
+        PluginResult::Continue
+    ));
+    headers.insert("content-type".to_string(), "application/grpc".to_string());
+    let dispatched = json!({"jsonrpc": "2.0", "id": 1, "method": "agent/getCard"}).to_string();
+    assert!(matches!(
+        gateway
+            .on_final_request_body_with_context(&mut ctx, &headers, dispatched.as_bytes())
+            .await,
+        PluginResult::Reject { .. }
+    ));
+}

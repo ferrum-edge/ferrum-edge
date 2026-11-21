@@ -761,6 +761,7 @@ impl A2aGateway {
         if self.jsonrpc_requires_classification()
             && ctx.method.eq_ignore_ascii_case("POST")
             && ctx.path == self.endpoint.path
+            && !native_grpc_classified(ctx, headers)
         {
             return self.jsonrpc_inspection_failed_detection(false);
         }
@@ -1287,9 +1288,10 @@ impl A2aGateway {
     /// Whether the finalized headers still satisfy the header inputs the
     /// arrival-time JSON-RPC classification read: a JSON media type, and the
     /// version header when it was present (an unknown method is classifiable
-    /// only with it). A header-only transform after admission that breaks
-    /// either must not ride the byte-identity shortcut past the full final
-    /// check (GHSA-q25c-76f4-fp7h).
+    /// only with it). Where classification is required, a header-only
+    /// transform after admission that breaks either must not ride the
+    /// byte-identity shortcut past the full final check (GHSA-q25c-76f4-fp7h).
+    /// A metadata-only instance keeps the plain byte-identity shortcut.
     fn final_headers_preserve_classification(
         &self,
         claim: &A2aGatewayClaim,
@@ -1763,6 +1765,12 @@ impl A2aGateway {
         if !ctx.method.eq_ignore_ascii_case("POST") || ctx.path != self.endpoint.path {
             return None;
         }
+        // A native gRPC call an A2A instance positively classified as the gRPC
+        // binding is not JSON-RPC on a shared path. A JSON-RPC claim relabelled
+        // as gRPC after admission is not exempt.
+        if native_grpc_classified(ctx, headers) {
+            return None;
+        }
         // A finalized media type that is no longer JSON leaves nothing the
         // classifier reads, while a lenient server may still parse the body —
         // exactly the arrival-time non-JSON case, so it is unprovable too.
@@ -1867,14 +1875,19 @@ impl Plugin for A2aGateway {
     /// whatever its media type: an earlier header normalizer can relabel it
     /// JSON before `before_proxy`, and an unbuffered body would then be
     /// refused as unclassifiable (GHSA-q25c-76f4-fp7h). The proxy's global body
-    /// limits still apply. A transparent configuration keeps buffering only
+    /// limits still apply. A native gRPC call this instance positively
+    /// classifies as its gRPC binding is not buffered, so a shared path does not
+    /// buffer valid gRPC. A transparent configuration keeps buffering only
     /// JSON.
     fn should_buffer_request_body(&self, ctx: &RequestContext) -> bool {
         self.enabled
             && self.detection.bindings.contains(&A2aBinding::JsonRpc)
             && ctx.method.eq_ignore_ascii_case("POST")
             && ctx.path == self.endpoint.path
-            && (self.jsonrpc_requires_classification() || content_type_is_json(&ctx.headers))
+            && (content_type_is_json(&ctx.headers)
+                || (self.jsonrpc_requires_classification()
+                    && !(self.detection.bindings.contains(&A2aBinding::Grpc)
+                        && self.detect_grpc(ctx, &ctx.headers).is_some())))
     }
 
     /// Agent Card rewriting is a presentation policy a finalized replay skips,
@@ -2443,7 +2456,8 @@ impl Plugin for A2aGateway {
                 .classified_request_body
                 .as_deref()
                 .is_some_and(|classified| classified == body)
-                && self.final_headers_preserve_classification(claim, headers)
+                && (!self.jsonrpc_requires_classification()
+                    || self.final_headers_preserve_classification(claim, headers))
         }) {
             // The exact bytes `before_proxy` classified and admitted, under the
             // same instance configuration, request identity, and the header
@@ -5308,6 +5322,19 @@ fn is_event_stream_content_type(value: &str) -> bool {
         .unwrap_or(value)
         .trim()
         .eq_ignore_ascii_case("text/event-stream")
+}
+
+/// Whether this request is a native gRPC call (by its media type) that an A2A
+/// instance positively classified as the gRPC binding — the claim on the
+/// request says so. Such a call on an `endpoint.path` shared with the JSON-RPC
+/// binding is not an unclassifiable JSON-RPC request. A JSON-RPC claim, an
+/// unclaimed request, or a non-gRPC media type proves nothing.
+fn native_grpc_classified(ctx: &RequestContext, headers: &HashMap<String, String>) -> bool {
+    is_grpc_request(headers)
+        && ctx
+            .a2a_gateway_claim
+            .as_deref()
+            .is_some_and(|claim| claim.binding == A2aBinding::Grpc.as_str())
 }
 
 fn is_grpc_request(headers: &HashMap<String, String>) -> bool {
