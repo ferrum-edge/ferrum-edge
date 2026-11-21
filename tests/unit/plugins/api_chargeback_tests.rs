@@ -7274,7 +7274,7 @@ fn build(stream_ctx: &StreamConnectionContext, plugins: &[u8]) -> StreamTransact
         "let consumer_username = stream_ctx.effective_identity().map(str::to_owned);\n    let principal_origin = None;",
     );
     assert_ne!(cleared, TCP_STYLE, "fixture rewrite must apply");
-    let (found, violations) = check(&cleared);
+    let (found, violations) = check(cleared.as_str());
     assert_eq!(found, 1);
     assert_eq!(violations.len(), 1, "{violations:?}");
 
@@ -7283,7 +7283,18 @@ fn build(stream_ctx: &StreamConnectionContext, plugins: &[u8]) -> StreamTransact
         "        principal_origin,\n",
         "        principal_origin: None,\n",
     );
-    assert_eq!(check(&none_origin).1.len(), 1);
+    assert_eq!(check(none_origin.as_str()).1.len(), 1);
+
+    // A conditional whose fallback branch keeps the identity but drops the
+    // origin.
+    let lossy_fallback = TCP_STYLE.replace(
+        "        (None, None)\n",
+        "        (stream_ctx.effective_identity().map(str::to_owned), None)\n",
+    );
+    assert_ne!(lossy_fallback, TCP_STYLE, "fixture rewrite must apply");
+    let (found, violations) = check(lossy_fallback.as_str());
+    assert_eq!(found, 1);
+    assert_eq!(violations.len(), 1, "{violations:?}");
 
     // A missing origin behind a comment between the type name and its brace.
     let commented = r#"
@@ -7339,8 +7350,9 @@ fn hardcode(stream_ctx: &StreamConnectionContext) -> StreamTransactionSummary {
 /// - a carried `X.consumer_username` (optionally `.clone()`) with
 ///   `X.principal_origin`;
 /// - a local (or shorthand) identity bound together with the origin local by
-///   the nearest preceding `let (identity, origin) = …summary_identity()…` in
-///   the same function;
+///   the nearest preceding `let (identity, origin) = …` in the same function,
+///   whose every branch yields either `summary_identity()` or `(None, None)`
+///   (see [`initializer_preserves_pair`]);
 /// - an origin derived from the identity value itself (`identity.…`), as the
 ///   crate's own test-session helpers do;
 /// - a literal fixture identity (`Some(…)`) with a non-`None` origin.
@@ -7375,12 +7387,12 @@ fn principal_origin_violations(relative: &str, source: &str) -> (usize, Vec<Stri
         } else if let Some(receiver) =
             consumer.strip_suffix(".effective_identity().map(str::to_owned)")
         {
-            origin == &format!("{receiver}.principal_origin()")
+            origin.as_str() == format!("{receiver}.principal_origin()")
         } else if let Some(receiver) = consumer
             .strip_suffix(".consumer_username.clone()")
             .or_else(|| consumer.strip_suffix(".consumer_username"))
         {
-            origin == &format!("{receiver}.principal_origin")
+            origin.as_str() == format!("{receiver}.principal_origin")
         } else {
             let local = consumer
                 .strip_suffix(".clone()")
@@ -7394,7 +7406,7 @@ fn principal_origin_violations(relative: &str, source: &str) -> (usize, Vec<Stri
                     && nearest_let_binding(&code[..offset], local).is_some_and(
                         |(pattern, initializer)| {
                             pattern == format!("({local},{origin})")
-                                && initializer.contains(".summary_identity()")
+                                && initializer_preserves_pair(&initializer)
                         },
                     )
             }
@@ -7406,6 +7418,67 @@ fn principal_origin_violations(relative: &str, source: &str) -> (usize, Vec<Stri
         }
     }
     (inspected, violations)
+}
+
+/// Whether a whitespace-free `let` initializer keeps the identity/origin pair
+/// together on every branch: it takes the pair from `summary_identity()`,
+/// reads no identity or origin any other way, and every tuple it builds (a
+/// parenthesized group with a top-level comma that is not a call's argument
+/// list) is the anonymous `(None,None)`.
+fn initializer_preserves_pair(initializer: &str) -> bool {
+    const OTHER_SOURCES: &[&str] = &[
+        "effective_identity",
+        "principal_origin",
+        "consumer_username",
+        "authenticated_identity",
+        "identified_consumer",
+    ];
+    if !initializer.contains(".summary_identity()")
+        || OTHER_SOURCES
+            .iter()
+            .any(|source| initializer.contains(source))
+    {
+        return false;
+    }
+    let bytes = initializer.as_bytes();
+    for (open, &byte) in bytes.iter().enumerate() {
+        if byte != b'(' {
+            continue;
+        }
+        let call = open > 0 && {
+            let previous = bytes[open - 1];
+            previous.is_ascii_alphanumeric()
+                || matches!(previous, b'_' | b')' | b']' | b'!')
+                || (previous == b'>' && !(open >= 2 && bytes[open - 2] == b'='))
+        };
+        if call {
+            continue;
+        }
+        let mut depth = 0i32;
+        let mut has_comma = false;
+        let mut close = None;
+        for (index, &inner) in bytes.iter().enumerate().skip(open) {
+            match inner {
+                b'(' | b'[' | b'{' => depth += 1,
+                b')' | b']' | b'}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        close = Some(index);
+                        break;
+                    }
+                }
+                b',' if depth == 1 => has_comma = true,
+                _ => {}
+            }
+        }
+        let Some(close) = close else {
+            return false;
+        };
+        if has_comma && initializer.get(open..=close) != Some("(None,None)") {
+            return false;
+        }
+    }
+    true
 }
 
 /// The `(pattern, initializer)` of the last `let` before the end of `code`,

@@ -248,7 +248,7 @@ pub fn with_principal_billing_identity<R>(
                     key.push_str(username);
                     digest_billing_identity_in_place(
                         BILLING_IDENTITY_DIGEST_DOMAIN,
-                        &mut *key,
+                        &mut key,
                         max_len,
                     );
                 }
@@ -257,7 +257,7 @@ pub fn with_principal_billing_identity<R>(
                     if !external_key_is_verbatim(key.as_str(), max_len) {
                         digest_billing_identity_in_place(
                             EXTERNAL_BILLING_IDENTITY_DIGEST_DOMAIN,
-                            &mut *key,
+                            &mut key,
                             max_len,
                         );
                     }
