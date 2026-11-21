@@ -7275,14 +7275,18 @@ async fn same_class_final_method_change_drops_a_stale_task_id() {
     assert!(!ctx.metadata.contains_key("a2a.task_id.truncated"));
 }
 
-/// A representation retained before the encoded/partial card handling and the
-/// multipart refusal must no longer match the current presentation policy.
+/// A representation retained before the encoded/partial card handling, the
+/// multipart refusal, or the rewrite-driven JSON-RPC classification
+/// requirement must no longer match the current presentation policy.
 #[test]
 fn a2a_presentation_digest_retires_previous_card_policy_domains() {
     let config = configured_base_config();
     for previous_domain in [
         "ferrum.plugin.a2a_gateway.static.v1",
         "ferrum.plugin.a2a_gateway.static.v2",
+        // GHSA-q25c-76f4-fp7h: a v3 completion may hold the un-rewritten card
+        // of a JSON-RPC request that passed unclaimed.
+        "ferrum.plugin.a2a_gateway.static.v3",
     ] {
         let previous = ferrum_edge::plugins::utils::policy_digest::static_config_digest(
             previous_domain,
@@ -7801,6 +7805,28 @@ async fn rewrite_disabled_without_deny_policy_keeps_unclassified_jsonrpc_passthr
         assert!(!ctx.metadata.contains_key("a2a.error"), "{label}");
         assert!(!gateway.should_buffer_response_body(&ctx), "{label}");
     }
+
+    // BOM handling is part of the classification requirement, so the
+    // transparent configuration classifies the raw bytes exactly as before: a
+    // BOM-prefixed call stays unclaimed and neither its body nor its headers
+    // change.
+    let bom_body = format!(
+        "\u{feff}{}",
+        json!({"jsonrpc": "2.0", "id": 1, "method": "message/send", "params": {}})
+    );
+    let (mut ctx, _) = jsonrpc_ctx_with_raw_body(bom_body.clone());
+    ctx.headers
+        .insert("accept-encoding".to_string(), "gzip".to_string());
+    let mut headers = ctx.headers.clone();
+    let headers_before = headers.clone();
+    assert!(matches!(
+        gateway.before_proxy(&mut ctx, &mut headers).await,
+        PluginResult::Continue
+    ));
+    assert_eq!(headers, headers_before);
+    assert_eq!(ctx.request_body_bytes.as_deref(), Some(bom_body.as_bytes()));
+    assert!(!ctx.metadata.contains_key("a2a.method"));
+    assert!(!gateway.should_buffer_response_body(&ctx));
 }
 
 /// The final-body backstop covers a request nothing classified at arrival:
@@ -7837,26 +7863,217 @@ async fn rewrite_enabled_unreadable_final_body_of_an_unclaimed_request_is_refuse
     ));
 }
 
-/// With the JSON-RPC binding disabled nothing at the endpoint is classified,
-/// so an Agent Card call there must be refused rather than forwarded unclaimed
-/// while rewriting is on.
+/// An instance that does not serve the JSON-RPC binding never claims a
+/// JSON-RPC card call, so it makes no rewrite promise for one and must not
+/// refuse POSTs at the endpoint path.
 #[tokio::test]
-async fn rewrite_enabled_endpoint_post_with_jsonrpc_binding_disabled_fails_closed() {
-    let gateway = plugin(json!({"detection": {"bindings": ["rest", "grpc"]}}));
-    let (mut ctx, mut headers) =
-        jsonrpc_ctx(json!({"jsonrpc": "2.0", "id": 1, "method": "agent/getCard"}));
-    let result = gateway.before_proxy(&mut ctx, &mut headers).await;
-    let body = assert_uninspectable_refusal(result, &ctx, "JSON-RPC binding disabled");
-    assert_eq!(body["error"]["code"], -32001);
+async fn rest_only_instance_with_rewrite_does_not_refuse_endpoint_posts() {
+    let rest_only = plugin(json!({"detection": {"bindings": ["rest", "grpc"]}}));
+    assert!(!rest_only.needs_final_request_body_context());
+    for body in [
+        json!({"jsonrpc": "2.0", "id": 1, "method": "agent/getCard"}).to_string(),
+        "not-json".to_string(),
+    ] {
+        let (mut ctx, mut headers) = jsonrpc_ctx_with_raw_body(body.clone());
+        assert!(
+            matches!(
+                rest_only.before_proxy(&mut ctx, &mut headers).await,
+                PluginResult::Continue
+            ),
+            "{body}"
+        );
+        assert!(!ctx.metadata.contains_key("a2a.error"), "{body}");
+    }
+}
 
-    let passthrough = plugin(json!({
-        "detection": {"bindings": ["rest", "grpc"]},
-        "discovery": {"rewrite_agent_card_urls": false}
-    }));
-    let (mut ctx, mut headers) =
-        jsonrpc_ctx(json!({"jsonrpc": "2.0", "id": 1, "method": "agent/getCard"}));
+/// A REST-only instance and a JSON-RPC instance sharing one endpoint, in either
+/// order: the JSON-RPC sibling classifies the card call, owns the response, and
+/// rewrites it; the REST-only instance neither refuses nor claims it.
+#[tokio::test]
+async fn rest_only_and_jsonrpc_siblings_share_an_endpoint_in_either_order() {
+    let card_call = json!({"jsonrpc": "2.0", "id": "req-card", "method": "agent/getCard"});
+    for jsonrpc_first in [false, true] {
+        let rest_only = plugin(json!({"detection": {"bindings": ["rest", "grpc"]}}));
+        let jsonrpc = plugin(json!({"detection": {"bindings": ["jsonrpc"]}}));
+        let order: [&Arc<dyn Plugin>; 2] = if jsonrpc_first {
+            [&jsonrpc, &rest_only]
+        } else {
+            [&rest_only, &jsonrpc]
+        };
+        let (mut ctx, mut headers) = jsonrpc_ctx(card_call.clone());
+        for instance in order {
+            assert!(
+                matches!(
+                    instance.before_proxy(&mut ctx, &mut headers).await,
+                    PluginResult::Continue
+                ),
+                "jsonrpc_first={jsonrpc_first}"
+            );
+        }
+        assert!(jsonrpc.should_buffer_response_body(&ctx));
+        assert!(!rest_only.should_buffer_response_body(&ctx));
+        assert_eq!(
+            ctx.metadata.get("a2a.method").map(String::as_str),
+            Some("agent/getCard")
+        );
+        let unchanged = card_call.to_string();
+        for instance in order {
+            assert!(matches!(
+                instance
+                    .on_final_request_body_with_context(&mut ctx, &headers, unchanged.as_bytes())
+                    .await,
+                PluginResult::Continue
+            ));
+        }
+        let mut response_headers =
+            HashMap::from([("content-type".to_string(), "application/json".to_string())]);
+        let response = json!({
+            "jsonrpc": "2.0",
+            "id": "req-card",
+            "result": {"name": "planner", "url": "https://planner.internal/a2a"}
+        })
+        .to_string();
+        let rewritten =
+            expect_http_card_rewrite(&jsonrpc, &mut ctx, &mut response_headers, &response).await;
+        assert_eq!(
+            rewritten["result"]["url"],
+            "https://gateway.example.com/a2a"
+        );
+    }
+}
+
+/// Once a sibling instance has claimed a request it owns the response phase,
+/// so a later instance's rewrite-driven requirement is waived (its rewrite
+/// would never apply) at arrival and at the final body. A deny-capable policy
+/// is never waived.
+#[tokio::test]
+async fn sibling_claim_waives_only_the_rewrite_driven_requirement() {
+    let unlimited = plugin(json!({"detection": {"max_request_body_size": 0}}));
+    let strict = plugin(json!({"detection": {"max_request_body_size": 64}}));
+    let large_card_call = json!({
+        "jsonrpc": "2.0",
+        "id": "x".repeat(128),
+        "method": "agent/getCard"
+    });
+    let (mut ctx, mut headers) = jsonrpc_ctx(large_card_call.clone());
     assert!(matches!(
-        passthrough.before_proxy(&mut ctx, &mut headers).await,
+        unlimited.before_proxy(&mut ctx, &mut headers).await,
         PluginResult::Continue
     ));
+    assert!(unlimited.should_buffer_response_body(&ctx));
+    assert!(matches!(
+        strict.before_proxy(&mut ctx, &mut headers).await,
+        PluginResult::Continue
+    ));
+    let dispatched = json!({
+        "jsonrpc": "2.0",
+        "id": "y".repeat(128),
+        "method": "agent/getCard"
+    })
+    .to_string();
+    assert!(matches!(
+        strict
+            .on_final_request_body_with_context(&mut ctx, &headers, dispatched.as_bytes())
+            .await,
+        PluginResult::Continue
+    ));
+
+    // Without the sibling's claim the strict instance refuses the same body.
+    let (mut ctx, mut headers) = jsonrpc_ctx(large_card_call.clone());
+    assert!(matches!(
+        strict.before_proxy(&mut ctx, &mut headers).await,
+        PluginResult::Reject {
+            status_code: 413,
+            ..
+        }
+    ));
+
+    // A deny-capable policy still refuses what it cannot classify.
+    let deny = plugin(json!({
+        "discovery": {"rewrite_agent_card_urls": false},
+        "policy": {"methods": {"tasks/cancel": {"action": "deny"}}}
+    }));
+    let (mut ctx, mut headers) =
+        jsonrpc_ctx(json!({"jsonrpc": "2.0", "id": 1, "method": "tasks/get"}));
+    assert!(matches!(
+        unlimited.before_proxy(&mut ctx, &mut headers).await,
+        PluginResult::Continue
+    ));
+    ctx.request_body_bytes = Some(Bytes::from_static(
+        br#"{"jsonrpc":"2.0","id":1,"method":"tasks/cancel","method":"tasks/get"}"#,
+    ));
+    assert!(matches!(
+        deny.before_proxy(&mut ctx, &mut headers).await,
+        PluginResult::Reject { .. }
+    ));
+}
+
+/// A case-insensitive decoder binds `METHOD` (or a Unicode case-fold variant)
+/// to the same field as `method`, so an envelope carrying one beside the
+/// canonical spelling is ambiguous and refused while classification is
+/// required; a transparent configuration is unchanged.
+#[tokio::test]
+async fn case_variant_envelope_members_are_ambiguous_when_classification_is_required() {
+    let rewriting = plugin(json!({}));
+    let deny = plugin(json!({
+        "discovery": {"rewrite_agent_card_urls": false},
+        "policy": {"methods": {"tasks/cancel": {"action": "deny"}}}
+    }));
+    let singletons = [
+        r#"{"jsonrpc":"2.0","id":1,"method":"message/send","METHOD":"agent/getCard"}"#,
+        r#"{"jsonrpc":"2.0","id":1,"method":"message/send","Method":"tasks/cancel"}"#,
+        r#"{"jsonrpc":"2.0","id":1,"JsonRpc":"1.0","method":"tasks/get","params":{"id":"t"}}"#,
+        r#"{"jsonrpc":"2.0","id":1,"method":"tasks/get","params":{"id":"t"},"param\u017f":{"id":"u"}}"#,
+        r#"{"jsonrpc":"2.0","id":1,"ID":2,"method":"tasks/get","params":{"id":"t"}}"#,
+    ];
+    for gateway in [&rewriting, &deny] {
+        for raw in singletons {
+            let (mut ctx, mut headers) = jsonrpc_ctx_with_raw_body(raw.to_string());
+            let result = gateway.before_proxy(&mut ctx, &mut headers).await;
+            let body = assert_uninspectable_refusal(result, &ctx, raw);
+            assert!(!body.is_array(), "{raw}");
+            assert_eq!(body["error"]["code"], -32001, "{raw}");
+            assert_eq!(body["error"]["data"]["method"], "unknown", "{raw}");
+        }
+        // A batch member carrying the alias refuses the whole batch, answering
+        // every member.
+        let (mut ctx, mut headers) = jsonrpc_ctx_with_raw_body(
+            r#"[{"jsonrpc":"2.0","id":1,"method":"tasks/get","params":{"id":"t"}},{"jsonrpc":"2.0","id":2,"method":"message/send","METHOD":"agent/getCard"}]"#
+                .to_string(),
+        );
+        let result = gateway.before_proxy(&mut ctx, &mut headers).await;
+        let body = assert_uninspectable_refusal(result, &ctx, "case-variant batch member");
+        let responses = body.as_array().expect("a batch refusal is a batch");
+        assert_eq!(responses.len(), 2);
+        assert_eq!(responses[0]["id"], 1);
+        assert_eq!(responses[1]["id"], 2);
+    }
+
+    // The final-body re-check applies the same screen.
+    let (mut ctx, mut headers) =
+        jsonrpc_ctx(json!({"jsonrpc": "2.0", "id": 1, "method": "message/send"}));
+    assert!(matches!(
+        rewriting.before_proxy(&mut ctx, &mut headers).await,
+        PluginResult::Continue
+    ));
+    let dispatched = singletons[0];
+    assert!(matches!(
+        rewriting
+            .on_final_request_body_with_context(&mut ctx, &headers, dispatched.as_bytes())
+            .await,
+        PluginResult::Reject { .. }
+    ));
+
+    // Without a deny-capable policy or rewriting, the canonical spelling is
+    // classified as before.
+    let transparent = plugin(json!({"discovery": {"rewrite_agent_card_urls": false}}));
+    let (mut ctx, mut headers) = jsonrpc_ctx_with_raw_body(singletons[0].to_string());
+    assert!(matches!(
+        transparent.before_proxy(&mut ctx, &mut headers).await,
+        PluginResult::Continue
+    ));
+    assert_eq!(
+        ctx.metadata.get("a2a.method").map(String::as_str),
+        Some("message/send")
+    );
 }
