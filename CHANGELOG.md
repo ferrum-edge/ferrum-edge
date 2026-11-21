@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.21] - 2026-11-21
+
+This patch release follows published 0.9.20. It fixes security advisories in
+the authentication, `access_control`, `oidc_relying_party`, chargeback,
+`a2a_gateway`, transformer and AI plugins, the Admin API and the mesh. Sidecar
+and NodeWaypoint data planes now apply mesh VirtualService HTTP routes, the
+data plane applies wildcard DestinationRules, refused Istio security resources
+fail closed, and configuration fields and chart values that nothing read are
+removed. Many changes refuse configuration or traffic that 0.9.20 accepted.
+The `V001` baseline checksum changes, so build-out databases must be rebuilt,
+and the ConfigSync protocol revision is now 6, so control planes and data
+planes must be upgraded together. Read
+[Upgrading to 0.9.21](docs/upgrade_guide.md#upgrading-to-0921) before updating
+gateways, control planes, custom plugins, charts or contract consumers.
+
 ### Security
 - **SQLx 0.9.1 retires two advisory exceptions.** The database layer now
   resolves `libsqlite3-sys` 0.40.0 (bundled SQLite >= 3.54.0), which fixes
@@ -239,6 +254,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
   Decode validates bodies with the plugins' own constructors and builds no DNS
   or HTTP clients. A `null` `source_namespace` is treated as absent.
+- Fixed GHSA-c259-vchc-3vgr: `jwt_auth` (`token_lookup: query:<name>`),
+  `jwks_auth` and `oauth2_introspection` (`providers[].from_params`) now apply
+  the `key_auth` `;`-alias query contract (issue #6579). A request whose
+  configured token query name also appears as a `;`-separated sub-parameter is
+  refused with `401` `Ambiguous token query parameter` instead of being treated
+  as carrying no token. The alias is redacted for OPA and `request_mirror`, and
+  is removed from the forwarded query when credentials are hidden (#7464).
+- Fixed GHSA-r378-r7j8-2qm3: `access_control` `allowed_external_identities` and
+  `disallowed_external_identities` entries accept an optional `authority`, the
+  verifying provider's realm authority digest, so an entry can be scoped to one
+  provider. A `mechanism`-only entry still matches an equal subject from every
+  provider of that mechanism on the route (#7465).
+- Fixed GHSA-6rwj-gc4r-3jm9: `oidc_relying_party` sends an accepted post-login
+  target in the normalized form it validated, and refuses a target that
+  contains an ASCII control character or a backslash, which lands on
+  `behavior.post_login_default_path`. The target is judged when the login
+  starts and re-checked at the callback (#7467).
+- Fixed GHSA-q9vj-rf66-3j58: `api_chargeback` (`/charges`) and
+  `api_chargeback_sink` key billing rows on the authenticated principal. An
+  unmapped external principal is reported as
+  `external:<mechanism>:<authority>:<identity>` instead of sharing a row with a
+  Consumer or another provider that uses the same string (#7466).
+- Fixed GHSA-q25c-76f4-fp7h: with `discovery.rewrite_agent_card_urls` on (the
+  default) and the `jsonrpc` binding served, `a2a_gateway` refuses a
+  `POST endpoint.path` request it cannot classify as JSON-RPC instead of
+  forwarding it unclaimed, so an Agent Card call can no longer return the
+  backend's un-rewritten internal URLs (#7468).
+- Fixed GHSA-pq95-952r-2x32: `request_transformer` and `response_transformer`
+  instances with JSON body rules refuse a body with duplicate object member
+  names (`400` for a request, `502` for a backend response) instead of skipping
+  the rules and forwarding the original bytes. Body rules also strip one
+  leading UTF-8 byte order mark before parsing (#7469).
 
 ### Added
 - **Sidecar data planes apply mesh-bound VirtualService `http[]` routes**
@@ -2841,6 +2888,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `openapi.yaml` spells its 14 chargeback price `maximum` bounds as `1.0e+288`.
   YAML 1.1 resolvers (libyaml/Psych, PyYAML) read the signless `1.0e288` as a
   string (#7408).
+- `POST /api-specs` and `DELETE /api-specs/{id}` refuse a request that carries
+  `If-Match` with `400`, like other mutating routes that do not evaluate it.
+  Both ignored the header before, so a conditional `DELETE` cascade-deleted the
+  spec and its owned resources unconditionally (#7459, issue #7439).
+- The plugin sensitivity schema classifies root `redis_url` for `jwks_auth`,
+  `hmac_auth` and `soap_ws_security` with the Redis projection the other
+  Redis-backed plugins use (#7460, issue #7438).
+- `ferrum-gateway` chart: with `autoscaling.enabled=true`, the render fails
+  unless `1 <= autoscaling.minReplicas <= autoscaling.maxReplicas`, instead of
+  producing a HorizontalPodAutoscaler that Kubernetes refuses (#7461,
+  issue #7426).
 
 ### Performance
 - **The TLS record layer now uses AWS-LC's AES-GCM on the CPUs where it is
@@ -3167,6 +3225,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   with a passive policy. They no longer allocate DashMap's `4 × cores`
   cache-padded shards (about 16 KiB per proxy on 16 cores), so the 1 s passive
   recovery sweep and the `/metrics` walk visit fewer empty shards.
+- **HTTP request-upload pump** (#7448). A completed socket-bound `direct_h1`
+  upload no longer leaves a detached post-EOS drain task behind, an inline pump
+  is primed so already-buffered body frames coalesce with the request headers,
+  and the pump's control state shares one allocation.
+- **DTLS datapath** (#7450). Linux listeners batch ingress with `recvmmsg(2)`,
+  each reply commits through a single `oneshot`, plaintext is forwarded without
+  per-datagram copies and session timers are reused.
 
 ## [0.9.20] - 2026-11-02
 
@@ -15018,7 +15083,8 @@ published release notes.
   remediate these rows before upgrade; see the
   [Safe Upgrade Guide](docs/upgrade_guide.md#tcp-connection-throttle-validation-hardening).
 
-[Unreleased]: https://github.com/ferrum-edge/ferrum-edge/compare/v0.9.20...HEAD
+[Unreleased]: https://github.com/ferrum-edge/ferrum-edge/compare/v0.9.21...HEAD
+[0.9.21]: https://github.com/ferrum-edge/ferrum-edge/compare/v0.9.20...v0.9.21
 [0.9.20]: https://github.com/ferrum-edge/ferrum-edge/compare/v0.9.19...v0.9.20
 [0.9.19]: https://github.com/ferrum-edge/ferrum-edge/compare/v0.9.17...v0.9.19
 [0.9.18]: https://github.com/ferrum-edge/ferrum-edge/compare/v0.9.17...v0.9.18

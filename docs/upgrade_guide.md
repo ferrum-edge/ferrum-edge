@@ -26,7 +26,24 @@ over production traffic.** File mode has no database; its config format is
 `version: "1"` with no shipped config transforms, so breaking field changes are
 applied by editing the file (see [File Mode](#file-mode-ferrum_modefile)).
 
-## Upgrading to the next release (unreleased)
+Per-release sections below are written when a release is cut. Changes already
+on `main` but not yet released, including breaking ones, are listed under
+`[Unreleased]` in [CHANGELOG.md](../CHANGELOG.md); review that section before
+deploying a build from `main`.
+
+## Upgrading to 0.9.21
+
+0.9.21 was prepared on 2026-11-21 UTC from `main` and follows published
+0.9.20 directly. It collects security-advisory fixes, mesh VirtualService and
+DestinationRule data-plane work, and the removal of configuration that nothing
+read. Many sections below refuse configuration or traffic that 0.9.20
+accepted, so review every section before upgrading. The `V001` baseline
+checksum changes from 0.9.20 (issues #7218 and #7228), so a 0.9.20 database is
+refused on migration-history grounds; rebuild it as described in
+[Build-Out database upgrade](#build-out-database-upgrade-postgresql-mysql-sqlite-mongodb).
+CP/DP must run the same build, and the ConfigSync revision is now `6`. The
+matching `contracts-edge-0.9.21` release must be cut from the verified release
+commit; move downstream contract pins when each consumer adopts 0.9.21.
 
 ### `;`-aliased query tokens are refused by `jwt_auth`, `jwks_auth`, and `oauth2_introspection` (GHSA-c259-vchc-3vgr)
 
@@ -1086,11 +1103,6 @@ ancestor index gains `amba.host` (the list now carries rules beneath it). With
 refused as effectively universal, so a config that carries one fails
 validation the same way as the matchers listed under PR #6639. Use exact
 origins, or drop credentials for that matcher.
-
-Per-release sections below are written when a release is cut. Changes already
-on `main` but not yet released, including breaking ones, are listed under
-`[Unreleased]` in [CHANGELOG.md](../CHANGELOG.md); review that section before
-deploying a build from `main`.
 
 ## Upgrading to 0.9.20
 
