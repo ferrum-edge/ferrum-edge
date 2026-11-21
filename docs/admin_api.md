@@ -1715,7 +1715,9 @@ curl -X PUT -H "Authorization: Bearer $TOKEN" -H "If-Match: $ETAG" \
   `ETag` from `GET /api-specs/{id}`, `/batch`, and `/gateway-trust-bundles/{id}`,
   which keeps its own body `revision` contract) is `400` rather than applied
   unconditionally.
-  A request that would be `404` without the header is still `404`.
+  A request that would be `404` without the header is still `404`, except on
+  `POST /api-specs` and `DELETE /api-specs/{id}`, which refuse the header
+  before looking the spec up (a missing spec ID is `400` with `If-Match`).
 - **Namespace restore precondition.** `GET /backup?conditional=true` returns
   an `ETag` equal to `conditional.namespace_etag` for the complete coherent
   namespace state. Send that tag as `If-Match` to `POST /restore?confirm=true`

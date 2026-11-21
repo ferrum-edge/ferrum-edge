@@ -8490,7 +8490,7 @@ paths:
           content:
             application/json:
               schema:
-                oneOf:
+                anyOf:
                   - $ref: "#/components/schemas/ApiSpecParseError"
                   - $ref: "#/components/schemas/Error"
         "401":
@@ -8861,7 +8861,8 @@ paths:
 
         The delete is unconditional. A request carrying `If-Match` (including
         the `ETag` returned by `GET /api-specs/{id}`) is refused with 400 and
-        deletes nothing, after the role check.
+        deletes nothing. The refusal follows the role check but precedes the
+        existence check, so it is 400 even for a spec ID that does not exist.
 
         This mutation requires the `admin` role.
       tags: [API Specs]
