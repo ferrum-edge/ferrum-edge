@@ -8484,11 +8484,15 @@ paths:
             Spec document is structurally invalid (bad JSON/YAML, unrecognised
             OpenAPI/Swagger version, or missing/malformed `x-ferrum-*`
             extension). See `ApiSpecParseError.code` for which structural
-            problem fired.
+            problem fired. A request carrying `If-Match` is also refused with
+            400 (`Error` body) before the document is read: a create does not
+            evaluate preconditions, so nothing is written.
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/ApiSpecParseError"
+                oneOf:
+                  - $ref: "#/components/schemas/ApiSpecParseError"
+                  - $ref: "#/components/schemas/Error"
         "401":
           $ref: "#/components/responses/Unauthorized"
         "403":
@@ -8855,6 +8859,10 @@ paths:
         Returns 204 on success, 404 if the spec does not exist, or 422 when the
         prospective deletion fails plugin-graph or restore-snapshot validation.
 
+        The delete is unconditional. A request carrying `If-Match` (including
+        the `ETag` returned by `GET /api-specs/{id}`) is refused with 400 and
+        deletes nothing, after the role check.
+
         This mutation requires the `admin` role.
       tags: [API Specs]
       parameters:
@@ -8870,6 +8878,8 @@ paths:
               $ref: "#/components/headers/X-Ferrum-Config-Cursor"
             X-Ferrum-Namespace-Unserved:
               $ref: "#/components/headers/X-Ferrum-Namespace-Unserved"
+        "400":
+          $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/Unauthorized"
         "403":

@@ -1711,8 +1711,10 @@ curl -X PUT -H "Authorization: Bearer $TOKEN" -H "If-Match: $ETAG" \
   precondition described below. Opt-in deployment removal and spec replacement
   use the separate [deployment authority profile](deployment_mutations.md).
   `If-Match` on any other mutating route (including
-  `POST` creates, `/batch`, and `/gateway-trust-bundles/{id}`, which keeps its
-  own body `revision` contract) is `400` rather than applied unconditionally.
+  `POST` creates, `POST /api-specs`, `DELETE /api-specs/{id}` even with the
+  `ETag` from `GET /api-specs/{id}`, `/batch`, and `/gateway-trust-bundles/{id}`,
+  which keeps its own body `revision` contract) is `400` rather than applied
+  unconditionally.
   A request that would be `404` without the header is still `404`.
 - **Namespace restore precondition.** `GET /backup?conditional=true` returns
   an `ETag` equal to `conditional.namespace_etag` for the complete coherent
