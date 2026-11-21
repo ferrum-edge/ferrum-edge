@@ -249,6 +249,23 @@ impl fmt::Debug for ExternalIdentityRealm {
     }
 }
 
+/// Decode the configured text form of an [`ExternalIdentityRealm::authority`]
+/// digest: exactly 64 hex characters, compared case-insensitively (the
+/// canonical rendering, `opa`'s `input.consumer.realm.authority`, is
+/// lowercase). `None` for any other value.
+///
+/// Every configuration surface that names a realm authority (the plugin-trigger
+/// `external_identity_authority` predicate and `access_control`'s
+/// external-identity rules) decodes through this one helper so they admit
+/// exactly the same spellings.
+pub fn parse_external_identity_realm_authority(value: &str) -> Option<[u8; 32]> {
+    let mut digest = [0u8; 32];
+    if value.len() != 64 || hex::decode_to_slice(value, &mut digest).is_err() {
+        return None;
+    }
+    Some(digest)
+}
+
 /// Derive the opaque verifying-authority digest for an
 /// [`ExternalIdentityRealm`].
 ///
