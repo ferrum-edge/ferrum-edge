@@ -4973,6 +4973,43 @@ fn the_config_component_agrees_with_constructor_admission() {
         provider("authorization_params", json!({"prompt": 1})),
         false,
     );
+
+    // GHSA-6rwj-gc4r-3jm9: the default path is emitted verbatim as `Location`.
+    // The constructor trims surrounding whitespace (Rust `str::trim`, i.e.
+    // Unicode White_Space) and rejects a value that trims to empty.
+    for (label, path) in [
+        ("default path", "/home?tab=1"),
+        ("default path with surrounding spaces", "  /home  "),
+        (
+            "default path with surrounding Unicode whitespace",
+            "\u{3000}/home\u{a0}",
+        ),
+    ] {
+        case(
+            label,
+            behavior("post_login_default_path", json!(path)),
+            true,
+        );
+    }
+    for (label, path) in [
+        ("default path with CR/LF", "/home\r\nx-injected: 1"),
+        ("default path with a tab", "/home\tx"),
+        ("default path with DEL", "/home\u{7f}"),
+        ("default path with a backslash", "/\\evil.example.com"),
+        ("default path with a trailing newline", "/home\n"),
+        ("spaces-only default path", "   "),
+        (
+            "Unicode-whitespace-only default path",
+            "\u{3000}\u{2003}\u{a0}",
+        ),
+        ("NEL-only default path", "\u{85}"),
+    ] {
+        case(
+            label,
+            behavior("post_login_default_path", json!(path)),
+            false,
+        );
+    }
 }
 
 fn no_endpoints_with_discovery() -> serde_json::Value {
@@ -6043,17 +6080,20 @@ async fn post_login_redirects_require_a_trusted_origin() {
         (HOST_ONLY, "http://app.example.com/account", "/"),
         (HOST_ONLY, "https://app.example.com:9443/admin", "/"),
         (HOST_ONLY, "https://user@app.example.com/account", "/"),
+        // The emitted Location is the canonical URL that was judged, not the
+        // raw input (GHSA-6rwj-gc4r-3jm9): hosts lowercase.
         (
             HOST_ONLY,
             "https://APP.example.com/account",
-            "https://APP.example.com/account",
+            "https://app.example.com/account",
         ),
         // An explicit default port is the same origin as the bare host, in
-        // both the allowlist entry and the target (PR6833-SOL-4).
+        // both the allowlist entry and the target (PR6833-SOL-4), and the
+        // canonical form omits it.
         (
             HOST_ONLY,
             "https://app.example.com:443/account",
-            "https://app.example.com:443/account",
+            "https://app.example.com/account",
         ),
         (
             DEFAULT_PORT,
@@ -6063,7 +6103,7 @@ async fn post_login_redirects_require_a_trusted_origin() {
         (
             DEFAULT_PORT,
             "https://app.example.com:443/account",
-            "https://app.example.com:443/account",
+            "https://app.example.com/account",
         ),
         (DEFAULT_PORT, "https://app.example.com:8443/account", "/"),
         (
@@ -6104,6 +6144,192 @@ async fn post_login_redirects_require_a_trusted_origin() {
             "trusted={trusted:?} rd={target}"
         );
     }
+}
+
+/// Complete a login whose challenge carried `rd` (already percent-decoded, as
+/// the query parameter map holds it) and return the callback's `Location`.
+/// The default path is `/home` so a fallback is distinguishable from `/`.
+async fn post_login_location_for(rd: &str) -> String {
+    post_login_location_via("app.example.com", &["app.example.com"], rd).await
+}
+
+/// [`post_login_location_for`] with the challenge request on `host` and
+/// `trusted` as `behavior.trusted_redirect_hosts`.
+async fn post_login_location_via(host: &str, trusted: &[&str], rd: &str) -> String {
+    let server = MockServer::start().await;
+    let plugin = callback_plugin_with(&server, |config| {
+        config["behavior"]["post_login_default_path"] = json!("/home");
+        config["behavior"]["trusted_redirect_hosts"] = json!(trusted);
+    })
+    .await;
+    let mut ctx = html_ctx();
+    ctx.headers.insert("host".to_string(), host.to_string());
+    ctx.query_params.insert("rd".to_string(), rd.to_string());
+    let challenge = issue_browser_challenge_for_context(&plugin, ctx).await;
+    let id_token = create_rs256_token(
+        &oidc_id_token_claims(&challenge),
+        include_bytes!("../../../tests/fixtures/test_rsa_private.pem"),
+    );
+    mount_token_and_jwks(&server, &id_token).await;
+    let headers = assert_callback_redirect(
+        complete_callback(&plugin, &challenge, "authorization-code").await,
+    );
+    let location = headers
+        .get("location")
+        .cloned()
+        .unwrap_or_else(|| panic!("callback redirect for rd={rd:?} has no Location"));
+    assert!(
+        http::HeaderValue::from_str(&location).is_ok(),
+        "Location for rd={rd:?} is not a valid header value: {location:?}"
+    );
+    location
+}
+
+/// GHSA-6rwj-gc4r-3jm9: redirect targets carrying ASCII control characters or
+/// a backslash are refused outright, in absolute and path-relative form, even
+/// when WHATWG parsing alone would resolve them to a trusted origin.
+#[serial_test::serial(jwks_remote_global_cache)]
+#[tokio::test]
+async fn post_login_redirects_with_controls_or_backslashes_fall_back() {
+    for rd in [
+        // Absolute targets on the trusted origin.
+        "https://app.example.com/account\r\nset-cookie: injected=1",
+        "https://app.example.com/account\n",
+        "https://app.example.com/acc\tount",
+        "https://app.exam\tple.com/account",
+        "https://app.example.com/account\u{7f}",
+        "https://app.example.com/account\u{0}",
+        "https://app.example.com\\@evil.example.com/",
+        "https://app.example.com/\\evil.example.com",
+        "https:\\\\app.example.com/account",
+        // Path-relative and scheme-relative forms.
+        "/\\evil.example.com",
+        "/\\/evil.example.com",
+        "/account\r\nset-cookie: injected=1",
+        "/acc\tount",
+        "/account\\..\\admin",
+        "\\\\evil.example.com",
+        "//evil.example.com",
+    ] {
+        assert_eq!(
+            post_login_location_for(rd).await,
+            "/home",
+            "rd={rd:?} must fall back to post_login_default_path"
+        );
+    }
+}
+
+/// GHSA-6rwj-gc4r-3jm9: an accepted target is emitted as the canonical URL
+/// that was validated, never the raw input, and is always a valid header value.
+#[serial_test::serial(jwks_remote_global_cache)]
+#[tokio::test]
+async fn accepted_post_login_redirects_emit_the_canonical_url() {
+    for (rd, expected) in [
+        (
+            "https://app.example.com/account?tab=1",
+            "https://app.example.com/account?tab=1",
+        ),
+        ("https://APP.Example.COM:443", "https://app.example.com/"),
+        (
+            "https://app.example.com/a b?q=c d#f g",
+            "https://app.example.com/a%20b?q=c%20d#f%20g",
+        ),
+        (
+            "https://app.example.com/caf\u{e9}",
+            "https://app.example.com/caf%C3%A9",
+        ),
+        (
+            "https://app.example.com/orders/../account",
+            "https://app.example.com/account",
+        ),
+        ("/orders?id=7", "https://app.example.com/orders?id=7"),
+    ] {
+        assert_eq!(post_login_location_for(rd).await, expected, "rd={rd:?}");
+    }
+}
+
+/// GHSA-6rwj-gc4r-3jm9: a refused target is never sealed into the pending
+/// flow, so text that would expand under JSON escaping (control characters)
+/// or percent-encoding (quotes) cannot push the correlation cookie past its
+/// budget and fail the challenge with `503`; the login completes and lands on
+/// `post_login_default_path`.
+#[serial_test::serial(jwks_remote_global_cache)]
+#[tokio::test]
+async fn refused_or_expanding_redirect_targets_do_not_exhaust_the_cookie_budget() {
+    for rd in [
+        format!("https://app.example.com/{}", "\u{1}".repeat(2000)),
+        format!("/{}", "\u{1}".repeat(2000)),
+        format!("https://evil.example.com/{}", "\"".repeat(2000)),
+        // Trusted and admissible, but its canonical form (`%22` per quote)
+        // exceeds the sealed-target limit.
+        format!("https://app.example.com/{}", "\"".repeat(2000)),
+    ] {
+        assert!(rd.len() < 2048, "fixture must fit the raw-target limit");
+        assert_eq!(
+            post_login_location_for(&rd).await,
+            "/home",
+            "rd of {} bytes must fall back to post_login_default_path",
+            rd.len()
+        );
+    }
+}
+
+/// GHSA-6rwj-gc4r-3jm9: a trusted target whose canonical form fits the
+/// sealed-target limit but would push the pending-flow cookie past a reduced
+/// `session.max_cookie_bytes` is dropped for the default path; the challenge
+/// still succeeds instead of answering `503`.
+#[serial_test::serial(jwks_remote_global_cache)]
+#[tokio::test]
+async fn trusted_targets_that_exceed_the_cookie_budget_fall_back_to_the_default_path() {
+    // 553 raw bytes; 1593 canonical bytes once each `é` becomes `%C3%A9`.
+    let rd = format!("https://app.example.com/search?q={}", "\u{e9}".repeat(260));
+    let canonical = format!("https://app.example.com/search?q={}", "%C3%A9".repeat(260));
+    assert!(
+        canonical.len() < 2048,
+        "fixture must fit the sealed-target limit"
+    );
+
+    // Control: under the default cookie cap the canonical target survives.
+    assert_eq!(post_login_location_for(&rd).await, canonical);
+
+    let server = MockServer::start().await;
+    let plugin = callback_plugin_with(&server, |config| {
+        config["session"]["max_cookie_bytes"] = json!(2048);
+        config["behavior"]["post_login_default_path"] = json!("/home");
+    })
+    .await;
+    let mut ctx = html_ctx();
+    ctx.query_params.insert("rd".to_string(), rd.clone());
+    let challenge = issue_browser_challenge_for_context(&plugin, ctx).await;
+    let id_token = create_rs256_token(
+        &oidc_id_token_claims(&challenge),
+        include_bytes!("../../../tests/fixtures/test_rsa_private.pem"),
+    );
+    mount_token_and_jwks(&server, &id_token).await;
+    let headers = assert_callback_redirect(
+        complete_callback(&plugin, &challenge, "authorization-code").await,
+    );
+    assert_eq!(headers.get("location").map(String::as_str), Some("/home"));
+}
+
+/// GHSA-6rwj-gc4r-3jm9: an oversized target falls back to the configured
+/// (relative) `post_login_default_path`, not to that path rebuilt as an
+/// absolute URL on the challenge request's authority, which could be a
+/// different trusted origin than the callback's.
+#[serial_test::serial(jwks_remote_global_cache)]
+#[tokio::test]
+async fn oversized_redirect_targets_fall_back_to_the_relative_default_path() {
+    let trusted = ["app.example.com:8443"];
+    let oversized = format!("/{}", "a".repeat(3000));
+    assert_eq!(
+        post_login_location_via("app.example.com:8443", &trusted, &oversized).await,
+        "/home"
+    );
+    // Control: a short target on the same entry origin is still honoured.
+    assert_eq!(
+        post_login_location_via("app.example.com:8443", &trusted, "/orders").await,
+        "https://app.example.com:8443/orders"
+    );
 }
 
 /// Issue #7147: under the minimal config (no `trusted_redirect_hosts`, no
