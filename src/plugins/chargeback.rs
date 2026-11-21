@@ -220,27 +220,33 @@ pub fn principal_billing_identity(principal: Principal<'_>, max_len: usize) -> C
     }
 }
 
-/// [`principal_billing_identity`] as an owned `String` built with exactly one
-/// allocation, for a value that is moved into an exported event: a verbatim
-/// Consumer username is copied once, a verbatim external key is built directly
-/// at its exact length, and any digest form is encoded in the per-thread
-/// buffer and copied once. The bytes are identical to
-/// [`principal_billing_identity`].
+/// [`principal_billing_identity`] as an owned `String`, for a value that is
+/// moved into an exported event. A verbatim Consumer username is copied once
+/// and an in-bound external key is built once (and digested from that key only
+/// when it carries the digest marker, which a custom mechanism name can also
+/// complete). Any other digest form is encoded in the per-thread buffer and
+/// copied once, except an input larger than that buffer retains, which takes
+/// the plain owned path instead of regrowing the buffer. The bytes are always
+/// identical to [`principal_billing_identity`].
 pub fn owned_principal_billing_identity(principal: Principal<'_>, max_len: usize) -> String {
     match principal {
         Principal::Consumer(username) if !consumer_needs_digest(username, max_len) => {
             username.to_owned()
         }
-        // The fixed key components (prefix, compiled-in mechanism, hex or `-`
-        // authority, separators) cannot form the digest marker, so the
-        // identity alone decides whether the marker appears.
-        Principal::External { identity, .. }
-            if principal.key_len() <= max_len
-                && !identity.contains(BILLING_IDENTITY_DIGEST_MARKER) =>
+        Principal::Consumer(username)
+            if username.len() > EXTERNAL_KEY_BUF_MAX_RETAINED_CAPACITY =>
         {
+            consumer_billing_identity(username, max_len).into_owned()
+        }
+        Principal::External { .. } if principal.key_len() <= max_len => {
             let mut key = String::new();
             principal.push_key(&mut key);
-            key
+            external_billing_identity_from_key(key, max_len)
+        }
+        Principal::External { .. }
+            if principal.key_len() > EXTERNAL_KEY_BUF_MAX_RETAINED_CAPACITY =>
+        {
+            principal_billing_identity(principal, max_len).into_owned()
         }
         _ => with_principal_billing_identity(principal, max_len, str::to_owned),
     }
