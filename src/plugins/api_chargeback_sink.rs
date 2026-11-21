@@ -49,7 +49,7 @@ use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use super::chargeback::pricing::{ChargeComputation, PricingConfig, require_finite_charge};
 use super::chargeback::{
     HttpBillingOutcome, billing_principal, http_billing_outcome, is_websocket_handshake,
-    principal_billing_identity,
+    principal_billing_identity, with_principal_billing_identity,
 };
 use super::utils::byte_budget::{
     GrowableProcessReservation, JSON_STRING_WORST_CASE_EXPANSION, PayloadMaterializationError,
@@ -3799,43 +3799,45 @@ impl Plugin for ApiChargebackSink {
         // `consumer_id` keeps a mapped Consumer and unmapped external
         // principals of distinct mechanisms/authorities apart even when their
         // display strings match (GHSA-q9vj-rf66-3j58); it is already bounded.
-        let consumer_id = principal_billing_identity(principal, MAX_FIELD_LEN);
-        let consumer = consumer_id.as_ref();
         if self.config.mode == SinkMode::Snapshot {
             if let Some(lifecycle) = self.snapshot_lifecycle.get() {
                 let Some(_admission) = lifecycle.admit() else {
                     record_late_snapshot_charge(lifecycle);
                     return;
                 };
-                match lifecycle
-                    .accumulator
-                    .record_http(summary, consumer, outcome, charge)
-                {
-                    SnapshotRecordOutcome::Accumulated => {}
-                    SnapshotRecordOutcome::OverflowImmediate => {
-                        // The overflow row carries the same `grpc_status` the
-                        // accumulator keys on, so one request class never
-                        // appears under two values (issue #7112).
-                        spool_snapshot_overflow_event(
-                            lifecycle,
-                            event_from_http_summary(
-                                summary,
-                                consumer,
-                                snapshot_http_outcome(outcome),
-                                charge,
-                                &self.config,
-                                &self.node_id,
-                                None,
-                            ),
-                        );
+                // Synchronous: the identity is borrowed from the shared
+                // scratch encoding, so an accumulator hit allocates nothing.
+                with_principal_billing_identity(principal, MAX_FIELD_LEN, |consumer| {
+                    match lifecycle
+                        .accumulator
+                        .record_http(summary, consumer, outcome, charge)
+                    {
+                        SnapshotRecordOutcome::Accumulated => {}
+                        SnapshotRecordOutcome::OverflowImmediate => {
+                            // The overflow row carries the same `grpc_status`
+                            // the accumulator keys on, so one request class
+                            // never appears under two values (issue #7112).
+                            spool_snapshot_overflow_event(
+                                lifecycle,
+                                event_from_http_summary(
+                                    summary,
+                                    consumer.to_owned(),
+                                    snapshot_http_outcome(outcome),
+                                    charge,
+                                    &self.config,
+                                    &self.node_id,
+                                    None,
+                                ),
+                            );
+                        }
                     }
-                }
+                });
             }
             return;
         }
         self.enqueue(event_from_http_summary(
             summary,
-            consumer,
+            principal_billing_identity(principal, MAX_FIELD_LEN).into_owned(),
             outcome,
             charge,
             &self.config,
@@ -3857,39 +3859,41 @@ impl Plugin for ApiChargebackSink {
         else {
             return;
         };
-        let consumer_id = principal_billing_identity(principal, MAX_FIELD_LEN);
-        let consumer = consumer_id.as_ref();
         if self.config.mode == SinkMode::Snapshot {
             if let Some(lifecycle) = self.snapshot_lifecycle.get() {
                 let Some(_admission) = lifecycle.admit() else {
                     record_late_snapshot_charge(lifecycle);
                     return;
                 };
-                match lifecycle
-                    .accumulator
-                    .record_stream(summary, consumer, charge)
-                {
-                    SnapshotRecordOutcome::Accumulated => {}
-                    SnapshotRecordOutcome::OverflowImmediate => {
-                        spool_snapshot_overflow_event(
-                            lifecycle,
-                            event_from_stream_summary(
-                                summary,
-                                consumer,
-                                charge,
-                                &self.config,
-                                &self.node_id,
-                                None,
-                            ),
-                        );
-                    }
-                }
+                with_principal_billing_identity(
+                    principal,
+                    MAX_FIELD_LEN,
+                    |consumer| match lifecycle
+                        .accumulator
+                        .record_stream(summary, consumer, charge)
+                    {
+                        SnapshotRecordOutcome::Accumulated => {}
+                        SnapshotRecordOutcome::OverflowImmediate => {
+                            spool_snapshot_overflow_event(
+                                lifecycle,
+                                event_from_stream_summary(
+                                    summary,
+                                    consumer.to_owned(),
+                                    charge,
+                                    &self.config,
+                                    &self.node_id,
+                                    None,
+                                ),
+                            );
+                        }
+                    },
+                );
             }
             return;
         }
         self.enqueue(event_from_stream_summary(
             summary,
-            consumer,
+            principal_billing_identity(principal, MAX_FIELD_LEN).into_owned(),
             charge,
             &self.config,
             &self.node_id,
@@ -3914,39 +3918,41 @@ impl Plugin for ApiChargebackSink {
         ) else {
             return;
         };
-        let consumer_id = principal_billing_identity(principal, MAX_FIELD_LEN);
-        let consumer = consumer_id.as_ref();
         if self.config.mode == SinkMode::Snapshot {
             if let Some(lifecycle) = self.snapshot_lifecycle.get() {
                 let Some(_admission) = lifecycle.admit() else {
                     record_late_snapshot_charge(lifecycle);
                     return;
                 };
-                match lifecycle
-                    .accumulator
-                    .record_websocket(summary, consumer, charge)
-                {
-                    SnapshotRecordOutcome::Accumulated => {}
-                    SnapshotRecordOutcome::OverflowImmediate => {
-                        spool_snapshot_overflow_event(
-                            lifecycle,
-                            event_from_ws_summary(
-                                summary,
-                                consumer,
-                                charge,
-                                &self.config,
-                                &self.node_id,
-                                None,
-                            ),
-                        );
-                    }
-                }
+                with_principal_billing_identity(
+                    principal,
+                    MAX_FIELD_LEN,
+                    |consumer| match lifecycle
+                        .accumulator
+                        .record_websocket(summary, consumer, charge)
+                    {
+                        SnapshotRecordOutcome::Accumulated => {}
+                        SnapshotRecordOutcome::OverflowImmediate => {
+                            spool_snapshot_overflow_event(
+                                lifecycle,
+                                event_from_ws_summary(
+                                    summary,
+                                    consumer.to_owned(),
+                                    charge,
+                                    &self.config,
+                                    &self.node_id,
+                                    None,
+                                ),
+                            );
+                        }
+                    },
+                );
             }
             return;
         }
         self.enqueue(event_from_ws_summary(
             summary,
-            consumer,
+            principal_billing_identity(principal, MAX_FIELD_LEN).into_owned(),
             charge,
             &self.config,
             &self.node_id,
@@ -16178,11 +16184,12 @@ fn emit_final_snapshot_to_spool(
     true
 }
 
-/// `consumer` (here and in the stream/WebSocket builders) is the principal's
-/// already-bounded billing identity from [`principal_billing_identity`].
+/// `consumer_id` (here and in the stream/WebSocket builders) is the
+/// principal's already-bounded billing identity from
+/// [`principal_billing_identity`], moved into the event.
 fn event_from_http_summary(
     summary: &TransactionSummary,
-    consumer: &str,
+    consumer_id: String,
     outcome: HttpBillingOutcome,
     charge: ChargeComputation,
     config: &ApiChargebackSinkConfig,
@@ -16195,7 +16202,7 @@ fn event_from_http_summary(
         received_at: unix_timestamp_nanos(),
         node_id: bound_string(node_id, MAX_FIELD_LEN),
         namespace: bound_key_field(&summary.namespace, MAX_FIELD_LEN),
-        consumer_id: consumer.to_owned(),
+        consumer_id,
         consumer_name: metadata_value(metadata, &["consumer_name"]),
         proxy_id: bound_key_field(
             summary.proxy_id.as_deref().unwrap_or("unknown"),
@@ -16235,7 +16242,7 @@ fn event_from_http_summary(
 
 fn event_from_stream_summary(
     summary: &StreamTransactionSummary,
-    consumer: &str,
+    consumer_id: String,
     charge: ChargeComputation,
     config: &ApiChargebackSinkConfig,
     node_id: &str,
@@ -16247,7 +16254,7 @@ fn event_from_stream_summary(
         received_at: unix_timestamp_nanos(),
         node_id: bound_string(node_id, MAX_FIELD_LEN),
         namespace: bound_key_field(&summary.namespace, MAX_FIELD_LEN),
-        consumer_id: consumer.to_owned(),
+        consumer_id,
         consumer_name: metadata_value(metadata, &["consumer_name"]),
         proxy_id: bound_key_field(&summary.proxy_id, MAX_FIELD_LEN),
         proxy_name: bound_key_field(
@@ -16284,7 +16291,7 @@ fn event_from_stream_summary(
 
 fn event_from_ws_summary(
     summary: &WsDisconnectContext,
-    consumer: &str,
+    consumer_id: String,
     charge: ChargeComputation,
     config: &ApiChargebackSinkConfig,
     node_id: &str,
@@ -16296,7 +16303,7 @@ fn event_from_ws_summary(
         received_at: unix_timestamp_nanos(),
         node_id: bound_string(node_id, MAX_FIELD_LEN),
         namespace: bound_key_field(&summary.namespace, MAX_FIELD_LEN),
-        consumer_id: consumer.to_owned(),
+        consumer_id,
         consumer_name: metadata_value(metadata, &["consumer_name"]),
         proxy_id: bound_key_field(&summary.proxy_id, MAX_FIELD_LEN),
         proxy_name: bound_key_field(

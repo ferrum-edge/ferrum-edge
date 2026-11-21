@@ -851,6 +851,7 @@ mod tests {
             timestamp_received: "2026-05-11T12:00:00Z".into(),
             client_ip: "10.0.0.1".into(),
             consumer_username: Some("alice".into()),
+            principal_origin: Some(crate::plugins::utils::principal::PrincipalOrigin::Consumer),
             http_method: "GET".into(),
             request_path: "/api/v1/things".into(),
             proxy_id: Some("p1".into()),

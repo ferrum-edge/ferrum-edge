@@ -15896,16 +15896,42 @@ async fn per_event_exports_bill_consumer_and_two_jwks_providers_to_three_consume
     );
 }
 
+/// Rows exported to a test-owned ClickHouse mock, deduplicated by `event_id`
+/// (the snapshot hand-off and a later spool replay deliver the same event).
+fn exported_rows_by_event_id(requests: &[Request]) -> std::collections::BTreeMap<String, Value> {
+    let mut rows = std::collections::BTreeMap::new();
+    for request in requests {
+        let body = String::from_utf8(request.body.clone()).expect("JSONEachRow body is UTF-8");
+        for line in body.lines().filter(|line| !line.trim().is_empty()) {
+            let row: Value = serde_json::from_str(line).expect("charge event row");
+            let event_id = row["event_id"].as_str().expect("event_id").to_string();
+            rows.insert(event_id, row);
+        }
+    }
+    rows
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial_test::serial(api_chargeback_sink_active_sink)]
 async fn snapshot_rows_bill_consumer_and_two_jwks_providers_to_three_consumer_ids() {
     use ferrum_edge::_test_support::api_chargeback_sink_emit_snapshot_tick_for_test;
+
+    // Verified through a test-owned ClickHouse mock rather than the spool
+    // directory, which the replay worker may claim (rename) at any time.
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&server)
+        .await;
 
     let temp = tempfile::tempdir().unwrap();
     let spool_dir = temp.path().join("principal-snapshot-spool");
     fs::create_dir_all(&spool_dir).unwrap();
     let mut config = valid_config(&spool_dir);
     config["mode"] = json!("snapshot");
+    config["clickhouse"]["url"] = json!(server.uri());
+    config["batch"]["size"] = json!(1);
+    config["batch"]["flush_interval_ms"] = json!(50);
     config["snapshot"] = json!({
         "interval_secs": 3600,
         "cleanup_interval_secs": 3600,
@@ -15932,19 +15958,29 @@ async fn snapshot_rows_bill_consumer_and_two_jwks_providers_to_three_consumer_id
         Some(Ok(3)),
         "three principals must accumulate into three snapshot identities"
     );
-    let mut calls_by_consumer = std::collections::BTreeMap::new();
-    for path in owned_spool_artifacts(&spool_dir) {
-        let decoded = decode_spool_file_for_tests(&path).expect("owned spool artifact decodes");
-        for line in decoded.lines().filter(|line| !line.trim().is_empty()) {
-            let row: Value = serde_json::from_str(line).expect("snapshot row");
-            calls_by_consumer.insert(
-                row["consumer_id"]
-                    .as_str()
-                    .expect("consumer_id")
-                    .to_string(),
-                row["call_count"].as_u64().expect("call_count"),
-            );
+
+    let mut rows = std::collections::BTreeMap::new();
+    for _ in 0..400 {
+        rows = exported_rows_by_event_id(&server.received_requests().await.unwrap_or_default());
+        if rows.len() >= 3 {
+            break;
         }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert_eq!(rows.len(), 3, "exactly three snapshot rows: {rows:?}");
+    let mut calls_by_consumer = std::collections::BTreeMap::new();
+    for row in rows.values() {
+        assert!(
+            row["snapshot_id"].as_str().is_some_and(|id| !id.is_empty()),
+            "a snapshot delta carries its snapshot_id: {row}"
+        );
+        calls_by_consumer.insert(
+            row["consumer_id"]
+                .as_str()
+                .expect("consumer_id")
+                .to_string(),
+            row["call_count"].as_u64().expect("call_count"),
+        );
     }
     assert_eq!(
         calls_by_consumer,

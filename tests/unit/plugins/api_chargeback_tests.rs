@@ -7149,3 +7149,294 @@ fn test_principal_origin_is_not_serialized_and_survives_ws_session_end_projectio
         provider_a.principal_origin()
     );
 }
+
+/// GHSA-q9vj-rf66-3j58 parity guard: every struct literal in `src/` that
+/// carries a principal's display identity into a summary (or into a context a
+/// summary is later built from) must record that identity's origin beside it,
+/// from the same context, and may leave the origin `None` only when there is
+/// no identity. The exporter tests above project the origin by hand, so this
+/// is what catches a builder (HTTP, gRPC, H3, WebSocket, stream, UDP/DTLS,
+/// mesh, abort, HBONE, …) that drops it.
+#[test]
+fn every_summary_builder_records_principal_origin_beside_consumer_username() {
+    const CARRIERS: &[&str] = &[
+        "TransactionSummary",
+        "StreamTransactionSummary",
+        "WsDisconnectContext",
+        "WsSessionMeta",
+        "UdpSession",
+        "UdpSetupAttribution",
+        "DtlsDisconnectContext",
+    ];
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut files = Vec::new();
+    collect_rust_sources(&root.join("src"), &mut files);
+    assert!(!files.is_empty(), "src/ must contain Rust sources");
+
+    let mut inspected = 0usize;
+    let mut violations = Vec::new();
+    for path in files {
+        let source = std::fs::read_to_string(&path).expect("read source");
+        let code = blank_strings_and_comments(&source);
+        let relative = path
+            .strip_prefix(root)
+            .unwrap_or(&path)
+            .display()
+            .to_string();
+        for (offset, body) in carrier_literals(&code, CARRIERS) {
+            let fields = top_level_fields(body);
+            let Some(consumer) = fields.get("consumer_username") else {
+                continue;
+            };
+            inspected += 1;
+            let line = code[..offset].matches('\n').count() + 1;
+            let location = format!("{relative}:{line}");
+            let Some(origin) = fields.get("principal_origin") else {
+                violations.push(format!(
+                    "{location}: sets consumer_username without principal_origin"
+                ));
+                continue;
+            };
+            if origin == "None" && consumer != "None" {
+                violations.push(format!(
+                    "{location}: carries an identity (`{consumer}`) with principal_origin: None"
+                ));
+            }
+            if let Some(receiver) =
+                consumer.strip_suffix(".effective_identity().map(str::to_owned)")
+            {
+                let expected = format!("{receiver}.principal_origin()");
+                if origin != &expected {
+                    violations.push(format!(
+                        "{location}: identity from `{receiver}` but principal_origin is `{origin}` (expected `{expected}`)"
+                    ));
+                }
+            }
+        }
+    }
+    assert!(
+        inspected >= 30,
+        "the guard must actually find the summary builders (found {inspected})"
+    );
+    assert!(
+        violations.is_empty(),
+        "summary builders must record principal_origin beside consumer_username:\n{}",
+        violations.join("\n")
+    );
+}
+
+fn collect_rust_sources(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+    let mut entries: Vec<_> = std::fs::read_dir(dir)
+        .expect("read source dir")
+        .flatten()
+        .map(|entry| entry.path())
+        .collect();
+    entries.sort();
+    for path in entries {
+        if path.is_dir() {
+            collect_rust_sources(&path, out);
+        } else if path.extension().and_then(|ext| ext.to_str()) == Some("rs") {
+            out.push(path);
+        }
+    }
+}
+
+/// Replace string/char literal contents and comments with spaces (newlines
+/// kept) so brace and comma structure can be scanned without a parser.
+fn blank_strings_and_comments(source: &str) -> String {
+    let bytes = source.as_bytes();
+    let mut out = bytes.to_vec();
+    let is_ident = |byte: u8| byte.is_ascii_alphanumeric() || byte == b'_';
+    let blank = |out: &mut Vec<u8>, from: usize, to: usize| {
+        let to = to.min(bytes.len());
+        if from >= to {
+            return;
+        }
+        for byte in &mut out[from..to] {
+            if *byte != b'\n' {
+                *byte = b' ';
+            }
+        }
+    };
+    let mut i = 0;
+    while i < bytes.len() {
+        let previous_is_ident = i > 0 && is_ident(bytes[i - 1]);
+        if bytes[i..].starts_with(b"//") {
+            let end = bytes[i..]
+                .iter()
+                .position(|&byte| byte == b'\n')
+                .map_or(bytes.len(), |at| i + at);
+            blank(&mut out, i, end);
+            i = end;
+            continue;
+        }
+        if bytes[i..].starts_with(b"/*") {
+            let end = source[i + 2..]
+                .find("*/")
+                .map_or(bytes.len(), |at| i + 2 + at + 2);
+            blank(&mut out, i, end);
+            i = end;
+            continue;
+        }
+        let raw_start = if !previous_is_ident && bytes[i] == b'r' {
+            Some(i + 1)
+        } else if !previous_is_ident && bytes[i] == b'b' && bytes.get(i + 1) == Some(&b'r') {
+            Some(i + 2)
+        } else {
+            None
+        };
+        if let Some(start) = raw_start {
+            let hashes = bytes[start..]
+                .iter()
+                .take_while(|&&byte| byte == b'#')
+                .count();
+            if bytes.get(start + hashes) == Some(&b'"') {
+                let mut closing = vec![b'"'];
+                closing.resize(hashes + 1, b'#');
+                let body = start + hashes + 1;
+                let end = bytes[body..]
+                    .windows(closing.len())
+                    .position(|window| window == closing.as_slice())
+                    .map_or(bytes.len(), |at| body + at + closing.len());
+                blank(&mut out, body, end.saturating_sub(closing.len()));
+                i = end;
+                continue;
+            }
+        }
+        if bytes[i] == b'"' {
+            let mut j = i + 1;
+            while j < bytes.len() && bytes[j] != b'"' {
+                j += if bytes[j] == b'\\' { 2 } else { 1 };
+            }
+            blank(&mut out, i + 1, j);
+            i = j + 1;
+            continue;
+        }
+        if bytes[i] == b'\'' {
+            // Char/byte literal; a lone quote is a lifetime or label.
+            let end = if bytes.get(i + 1) == Some(&b'\\') {
+                bytes[i + 2..]
+                    .iter()
+                    .position(|&byte| byte == b'\'')
+                    .map(|at| i + 2 + at)
+            } else {
+                (i + 2..(i + 6).min(bytes.len()))
+                    .find(|&at| bytes[at] == b'\'')
+                    .filter(|&at| {
+                        std::str::from_utf8(&bytes[i + 1..at])
+                            .is_ok_and(|text| text.chars().count() == 1)
+                    })
+            };
+            if let Some(end) = end {
+                blank(&mut out, i + 1, end);
+                i = end + 1;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// `(offset, body)` of each struct literal of a carrier type: the type's name
+/// (optionally path-qualified) directly followed by `{`, excluding struct,
+/// impl, and function-signature positions.
+fn carrier_literals<'a>(code: &'a str, carriers: &[&str]) -> Vec<(usize, &'a str)> {
+    let bytes = code.as_bytes();
+    let is_ident = |byte: u8| byte.is_ascii_alphanumeric() || byte == b'_';
+    let mut literals = Vec::new();
+    for carrier in carriers {
+        let mut from = 0;
+        while let Some(at) = code[from..].find(carrier) {
+            let start = from + at;
+            let end = start + carrier.len();
+            from = end;
+            if start > 0 && is_ident(bytes[start - 1]) {
+                continue;
+            }
+            let rest = &code[end..];
+            let trimmed = rest.trim_start();
+            if !trimmed.starts_with('{') || rest.len() - trimmed.len() > 1 {
+                continue;
+            }
+            let path_start = code[..start]
+                .trim_end_matches(|c: char| c.is_ascii_alphanumeric() || c == '_' || c == ':')
+                .len();
+            let before = code[..path_start].trim_end();
+            if ["struct", "impl", "for", "enum", "->", "trait", "union"]
+                .iter()
+                .any(|keyword| before.ends_with(keyword))
+            {
+                continue;
+            }
+            let open = end + (rest.len() - trimmed.len());
+            let mut depth = 0usize;
+            let mut close = None;
+            for (index, byte) in bytes.iter().enumerate().skip(open) {
+                match *byte {
+                    b'{' => depth += 1,
+                    b'}' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            close = Some(index);
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            if let Some(close) = close {
+                literals.push((start, &code[open + 1..close]));
+            }
+        }
+    }
+    literals
+}
+
+/// Top-level `field: value` pairs of a struct-literal body (shorthand fields
+/// map to their own name), with whitespace removed from values.
+fn top_level_fields(body: &str) -> HashMap<String, String> {
+    let mut segments = Vec::new();
+    let mut depth = 0i32;
+    let mut segment_start = 0;
+    for (index, byte) in body.bytes().enumerate() {
+        match byte {
+            b'(' | b'[' | b'{' => depth += 1,
+            b')' | b']' | b'}' => depth -= 1,
+            b',' if depth == 0 => {
+                segments.push(&body[segment_start..index]);
+                segment_start = index + 1;
+            }
+            _ => {}
+        }
+    }
+    segments.push(&body[segment_start..]);
+    let mut fields = HashMap::new();
+    for segment in segments {
+        let segment = segment.trim();
+        if segment.is_empty() || segment.starts_with("..") {
+            continue;
+        }
+        let name_len = segment
+            .bytes()
+            .take_while(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
+            .count();
+        if name_len == 0 {
+            continue;
+        }
+        let (name, rest) = segment.split_at(name_len);
+        let rest = rest.trim_start();
+        let value = if rest.is_empty() {
+            name.to_string()
+        } else if let Some(value) = rest
+            .strip_prefix(':')
+            .filter(|value| !value.starts_with(':'))
+        {
+            value.split_whitespace().collect::<String>()
+        } else {
+            continue;
+        };
+        fields.insert(name.to_string(), value);
+    }
+    fields
+}
