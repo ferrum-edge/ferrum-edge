@@ -7149,6 +7149,23 @@ fn test_principal_billing_identity_classes_are_disjoint() {
     }
     identity_of(Principal::Consumer(&"z".repeat(600)));
 
+    // A custom mechanism name can complete the digest marker at its trailing
+    // separator; every path must still digest that key the same way.
+    for mechanism in ["partner~sha256", "partner~sha256:x"] {
+        let custom = Principal::External {
+            identity: "alice",
+            realm: Some(ExternalIdentityRealm::new(mechanism, None)),
+        };
+        let custom_identity = identity_of(custom);
+        assert!(custom_identity.contains("~sha256:"), "{custom_identity}");
+    }
+
+    // Inputs larger than the per-thread buffer retains take the plain owned
+    // path and still agree byte for byte.
+    let huge = "h".repeat(8192);
+    identity_of(external(huge.as_str()));
+    identity_of(Principal::Consumer(huge.as_str()));
+
     // The overflow sentinel itself is never reproduced by a real principal.
     identity_of(Principal::Consumer(OVERFLOW_CONSUMER_SENTINEL));
     identity_of(external(OVERFLOW_CONSUMER_SENTINEL));
