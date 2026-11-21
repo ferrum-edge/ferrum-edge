@@ -52,9 +52,10 @@ commit; move downstream contract pins when each consumer adopts 0.9.21.
 `oauth2_introspection` (`providers[].from_params`) now apply the `key_auth`
 issue #6579 contract to query token locations. A request whose configured query
 name also appears as a `;`-separated sub-parameter (`?carrier=;token=...`, or a
-name such as `token;x`) is refused with `401`
-`{"error":"Ambiguous token query parameter"}` instead of being treated as
-carrying no token. For `jwks_auth` and `oauth2_introspection` an alias at any
+name such as `token;x`) gets the token plugin's `401`
+`{"error":"Ambiguous token query parameter"}` rejection instead of being
+treated as carrying no token; in multi-auth mode another configured mechanism
+can still authenticate the request. For `jwks_auth` and `oauth2_introspection` an alias at any
 provider's query location is terminal for the whole instance, even when a
 valid token is also present in a header or `Authorization`. The alias is also
 marked for OPA and `request_mirror` redaction (including a raw spelling such as
@@ -301,7 +302,9 @@ protocol faults still produce the gateway `502`/`504`.
 now screen the body for object member names that repeat, compared after escape
 decoding and at any depth, before applying the rules. A request with such a
 body is refused with `400`; a backend response with one is replaced with a
-`502`. Before, the rules were skipped and the original bytes were forwarded. A
+`502`. Before, a repeated member collapsed to its last value and the rules ran
+against that value, which a first-key-wins next hop could read differently;
+when no rule changed the document the original bytes were forwarded. A
 body with an invalid Unicode surrogate escape, one past the duplicate-key
 scanner's depth (256), token, member, member-name, or size budget, or a
 well-formed document the rule engine cannot materialize (nesting deeper than

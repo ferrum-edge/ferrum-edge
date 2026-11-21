@@ -279,9 +279,9 @@ gateways, control planes, custom plugins, charts or contract consumers.
   `api_chargeback_sink` key billing rows on the authenticated principal. An
   unmapped external principal is reported as
   `external:<mechanism>:<authority>:<identity>` (`-` for a missing authority;
-  an oversized or marker-bearing key is given its `~sha256:` digest form)
-  instead of sharing a row with a Consumer or another provider that uses the
-  same string (#7466).
+  an oversized or marker-bearing key is given its `~sha256:` digest form), so
+  external principals no longer share a row with a Consumer that uses the same
+  string and are distinguished by mechanism and authority (#7466).
 - Fixed GHSA-q25c-76f4-fp7h: with `discovery.rewrite_agent_card_urls` on (the
   default) and the `jsonrpc` binding served, `a2a_gateway` refuses a
   `POST endpoint.path` request it cannot classify as JSON-RPC instead of
@@ -289,8 +289,9 @@ gateways, control planes, custom plugins, charts or contract consumers.
   backend's un-rewritten internal URLs (#7468).
 - Fixed GHSA-pq95-952r-2x32: `request_transformer` and `response_transformer`
   instances with JSON body rules refuse a body with duplicate object member
-  names (`400` for a request, `502` for a backend response) instead of skipping
-  the rules and forwarding the original bytes. Body rules also strip one
+  names (`400` for a request, `502` for a backend response). Before, a repeated
+  member collapsed to its last value and the rules ran against that value,
+  which a first-key-wins next hop could read differently. Body rules also strip one
   leading UTF-8 byte order mark from a request body before parsing; a
   BOM-prefixed backend response under a body policy is still refused by the
   shared response representation gate (#7469).
@@ -2906,9 +2907,10 @@ gateways, control planes, custom plugins, charts or contract consumers.
   `hmac_auth` and `soap_ws_security` with the Redis projection the other
   Redis-backed plugins use (#7460, issue #7438).
 - `ferrum-gateway` chart: with `autoscaling.enabled=true`, the render fails
-  unless `1 <= autoscaling.minReplicas <= autoscaling.maxReplicas`, instead of
-  producing a HorizontalPodAutoscaler that Kubernetes refuses (#7461,
-  issue #7426).
+  unless `1 <= minReplicas <= autoscaling.maxReplicas`, where `minReplicas` is
+  `autoscaling.minReplicas` or, when that is `null` (omitted from the HPA),
+  Kubernetes' default of `1`, instead of producing a HorizontalPodAutoscaler
+  that Kubernetes refuses (#7461, issue #7426).
 
 ### Performance
 - **The TLS record layer now uses AWS-LC's AES-GCM on the CPUs where it is
@@ -3235,8 +3237,8 @@ gateways, control planes, custom plugins, charts or contract consumers.
   with a passive policy. They no longer allocate DashMap's `4 × cores`
   cache-padded shards (about 16 KiB per proxy on 16 cores), so the 1 s passive
   recovery sweep and the `/metrics` walk visit fewer empty shards.
-- **HTTP request-upload pump** (#7448). A completed socket-bound `direct_h1`
-  upload no longer leaves a detached post-EOS drain task behind, an inline pump
+- **HTTP request-upload pump** (#7448). A completed socket-bound direct
+  HTTP/1.1 or HTTP/2 upload no longer leaves a detached post-EOS drain task behind, an inline pump
   is primed so already-buffered body frames coalesce with the request headers,
   and the pump's control state shares one allocation.
 - **DTLS datapath** (#7450). Linux listeners batch ingress with `recvmmsg(2)`,
