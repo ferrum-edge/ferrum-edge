@@ -28,30 +28,34 @@ applied by editing the file (see [File Mode](#file-mode-ferrum_modefile)).
 
 ## Upgrading to the next release (unreleased)
 
-### Duplicate JSON member names are refused by the transformers (GHSA-pq95-952r-2x32)
+### `access_control` external-identity rules can bind the verifying authority (GHSA-r378-r7j8-2qm3)
 
-`request_transformer` and `response_transformer` instances with JSON body rules
-now screen the body for object member names that repeat, compared after escape
-decoding and at any depth, before applying the rules. A request with such a
-body is refused with `400`; a backend response with one is replaced with a
-`502`. Before, the rules were skipped and the original bytes were forwarded. A
-body with an invalid Unicode surrogate escape, one past the duplicate-key
-scanner's depth (256), token, member, member-name, or size budget, or a
-well-formed document the rule engine cannot materialize (nesting deeper than
-128 levels, a number outside the `f64` range) is refused the same way. Clients
-and backends must send each member once.
+`allowed_external_identities` and `disallowed_external_identities` entries accept
+an optional `authority`: the 64-character hex realm authority digest of the
+provider that verified the identity (the value `opa` reports as
+`input.consumer.realm.authority`, the same encoding the plugin-trigger
+`external_identity_authority` predicate takes). `jwks_auth`,
+`oauth2_introspection`, `ldap_auth`, and `oidc_relying_party` commit a digest for
+every identity, single-provider routes included; `soap_ws_security` commits none.
+An authority-scoped allow entry matches only an identity committed with that
+authority. An authority-scoped deny entry also matches an identity with no
+verified realm or no committed digest, unless the entry also names a `mechanism`
+and the identity came from a different one. Entries without `authority` behave
+as before.
 
-The `response_transformer` presentation-policy digest moved to a new version,
-so Redis-persisted `request_deduplication` replays recorded before the upgrade
-take the superseded-policy path once instead of being served.
-
-Body rules now also strip one leading UTF-8 byte order mark before parsing, so
-they apply to BOM-prefixed request bodies (the backend receives the rewritten
-document without the BOM). A BOM-prefixed backend response under a body policy
-is still refused by the shared response representation gate, as before.
-A body-rule `request_transformer` now counts as a final request-body policy,
-so a configuration that orders `ai_semantic_cache` at or ahead of it with
-`priority_override` is refused. Instances with only header or query rules are unaffected.
+**Operator action:** on routes that authenticate through more than one provider
+of one mechanism (multi-provider `jwks_auth` or `oauth2_introspection`), a
+`mechanism`-only entry matches an equal subject from every one of those
+providers. Add `authority` to each external-identity entry that is meant for one
+provider. `oauth2_introspection` client credentials do not distinguish
+authorities. An introspection provider without an `issuer` pin commits one digest
+per returned `iss`, plus a base digest when `iss` is absent. Two such providers on
+the same endpoint and identity claim share a digest whenever the returned issuer
+is equal. Pin a distinct `issuer` (responses must then carry that `iss`) to give
+each provider exactly one authority; distinct endpoints separate providers, but an
+unpinned provider still commits one digest per returned `iss`, so cover each digest
+it commits with its own entry. Older builds reject the new key, so upgrade every gateway node (CP and
+DPs together) before adding it.
 
 ### `oidc_relying_party` post-login redirects are emitted in canonical form (GHSA-6rwj-gc4r-3jm9)
 
@@ -154,6 +158,31 @@ a `4xx` refusal no longer counts as a backend failure.
 `rejection_phase="websocket_backend_error"` as backend refusals should key on
 the relayed status instead. Dead or unreachable backends, timeouts, and
 protocol faults still produce the gateway `502`/`504`.
+
+### Duplicate JSON member names are refused by the transformers (GHSA-pq95-952r-2x32)
+
+`request_transformer` and `response_transformer` instances with JSON body rules
+now screen the body for object member names that repeat, compared after escape
+decoding and at any depth, before applying the rules. A request with such a
+body is refused with `400`; a backend response with one is replaced with a
+`502`. Before, the rules were skipped and the original bytes were forwarded. A
+body with an invalid Unicode surrogate escape, one past the duplicate-key
+scanner's depth (256), token, member, member-name, or size budget, or a
+well-formed document the rule engine cannot materialize (nesting deeper than
+128 levels, a number outside the `f64` range) is refused the same way. Clients
+and backends must send each member once.
+
+The `response_transformer` presentation-policy digest moved to a new version,
+so Redis-persisted `request_deduplication` replays recorded before the upgrade
+take the superseded-policy path once instead of being served.
+
+Body rules now also strip one leading UTF-8 byte order mark before parsing, so
+they apply to BOM-prefixed request bodies (the backend receives the rewritten
+document without the BOM). A BOM-prefixed backend response under a body policy
+is still refused by the shared response representation gate, as before.
+A body-rule `request_transformer` now counts as a final request-body policy,
+so a configuration that orders `ai_semantic_cache` at or ahead of it with
+`priority_override` is refused. Instances with only header or query rules are unaffected.
 
 ### `preserve_host_header` now applies to WebSocket backends (#7392)
 
