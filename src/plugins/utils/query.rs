@@ -269,22 +269,7 @@ impl CanonicalQuery {
                         .into_owned()
                 }
             };
-            let mut semicolon_sub_names = semicolon_sub_pair_names(pair);
-            // Also each sub-pair's raw spelling: authentication matches a
-            // configured name against the raw spelling as well as the
-            // decodings (`query_has_semicolon_credential_alias`), so redaction
-            // must consult the same set (GHSA-c259-vchc-3vgr).
-            if pair.contains(';') {
-                for sub_pair in pair.split(';') {
-                    let raw_sub_name = sub_pair.split_once('=').map_or(sub_pair, |(name, _)| name);
-                    if !semicolon_sub_names
-                        .iter()
-                        .any(|known| known == raw_sub_name)
-                    {
-                        semicolon_sub_names.push(raw_sub_name.to_string());
-                    }
-                }
-            }
+            let semicolon_sub_names = semicolon_sub_pair_names_with_raw(pair);
             let form_name = if raw_name.contains('+') {
                 query_name_decodings(raw_name).into_iter().nth(1)
             } else {
@@ -415,6 +400,36 @@ pub fn semicolon_sub_pair_names(segment: &str) -> Vec<String> {
             query_name_decodings(sub_pair.split_once('=').map_or(sub_pair, |(name, _)| name))
         })
         .collect()
+}
+
+/// [`semicolon_sub_pair_names`] plus each sub-pair's raw spelling when it
+/// differs from that sub-pair's own decodings, in one linear pass.
+///
+/// Authentication matches a configured name against a sub-pair's raw spelling
+/// as well as its decodings (`query_has_semicolon_credential_alias`), so
+/// policy redaction must consult the same set (GHSA-c259-vchc-3vgr). A name
+/// with neither `%` nor `+` decodes to itself and is reported once without
+/// decoding. Entries are not deduplicated across sub-pairs; consumers only
+/// test membership.
+pub fn semicolon_sub_pair_names_with_raw(segment: &str) -> Vec<String> {
+    if !segment.contains(';') {
+        return Vec::new();
+    }
+    let mut names = Vec::new();
+    for sub_pair in segment.split(';') {
+        let raw_name = sub_pair.split_once('=').map_or(sub_pair, |(name, _)| name);
+        if !raw_name.contains('%') && !raw_name.contains('+') {
+            names.push(raw_name.to_string());
+            continue;
+        }
+        let decodings = query_name_decodings(raw_name);
+        let raw_differs = decodings.iter().all(|decoded| decoded != raw_name);
+        names.extend(decodings);
+        if raw_differs {
+            names.push(raw_name.to_string());
+        }
+    }
+    names
 }
 
 /// Whether a still-encoded `&`-separated query pair carries a parameter in

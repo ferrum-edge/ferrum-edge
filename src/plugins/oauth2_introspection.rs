@@ -122,6 +122,11 @@ pub struct Oauth2Introspection {
     consumer_header_claim: Option<String>,
     strip_authorization_on_success: bool,
     has_custom_query_token_locations: bool,
+    /// Some provider has a query token location and does not forward the
+    /// original token, so this instance may strip a query parameter (an
+    /// accepted token, or a `;` alias marked during discovery) before the
+    /// backend request (GHSA-c259-vchc-3vgr).
+    strips_query_tokens: bool,
     request_headers_to_redact: Vec<String>,
     allow_provider_fanout: bool,
     /// Complete gateway-owned `claim_headers` destination set across every
@@ -593,6 +598,13 @@ impl Oauth2Introspection {
         let strip_authorization_on_success = providers
             .iter()
             .any(|provider| !provider.forward_original_token);
+        let strips_query_tokens = providers.iter().any(|provider| {
+            !provider.forward_original_token
+                && provider
+                    .token_locations
+                    .iter()
+                    .any(|location| matches!(location, TokenLocation::QueryParam(_)))
+        });
         let has_custom_query_token_locations = providers.iter().any(|provider| {
             provider
                 .token_locations
@@ -640,6 +652,7 @@ impl Oauth2Introspection {
             consumer_header_claim,
             strip_authorization_on_success,
             has_custom_query_token_locations,
+            strips_query_tokens,
             request_headers_to_redact,
             allow_provider_fanout,
             claim_header_destinations,
@@ -1720,6 +1733,13 @@ impl super::Plugin for Oauth2Introspection {
 
     fn request_headers_to_redact(&self) -> &[String] {
         &self.request_headers_to_redact
+    }
+
+    /// A provider that does not forward the original token strips its query
+    /// token locations: the accepted token on success, and a `;` alias from
+    /// the pre-authentication discovery hook, whichever mechanism wins.
+    fn modifies_request_query(&self) -> bool {
+        self.strips_query_tokens
     }
 
     fn modifies_request_headers(&self) -> bool {

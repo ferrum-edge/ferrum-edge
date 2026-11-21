@@ -320,7 +320,7 @@ fn header_source_is_chain_credential(ctx: &RequestContext, name: &str) -> bool {
 /// request, only when a template reads `$(query.<name>)`.
 ///
 /// A pair whose `;`-separated sub-pair names an authentication-marked query
-/// credential is left out (issue #6579, GHSA-c259-vchc-3vgr): the outbound
+/// credential is unavailable (issue #6579, GHSA-c259-vchc-3vgr): the outbound
 /// strip removes that whole `&` segment, so a template reading the carrier
 /// must not copy the embedded credential into another field. Matching uses
 /// the outbound strip's own raw-or-decoded sub-pair rule.
@@ -339,14 +339,19 @@ fn original_query_params(ctx: &RequestContext) -> HashMap<String, String> {
         if pair.is_empty() {
             continue;
         }
+        let (name, value) = pair.split_once('=').unwrap_or((pair, ""));
+        let name = percent_decode_str(name).decode_utf8_lossy().into_owned();
         if !marked_credentials.is_empty()
             && super::utils::query::semicolon_sub_pair_names_any(pair, &marked_credentials)
         {
+            // Last occurrence wins: a blocked occurrence also retires any
+            // earlier one, so the template is unresolved unless a later clean
+            // occurrence follows.
+            params.remove(&name);
             continue;
         }
-        let (name, value) = pair.split_once('=').unwrap_or((pair, ""));
         params.insert(
-            percent_decode_str(name).decode_utf8_lossy().into_owned(),
+            name,
             percent_decode_str(value).decode_utf8_lossy().into_owned(),
         );
     }

@@ -3785,3 +3785,54 @@ async fn query_template_never_copies_a_carrier_embedding_a_marked_alias() {
     plugin.before_proxy(&mut ctx, &mut headers).await;
     assert_eq!(headers.get("x-copied").map(String::as_str), Some("a;b=c"));
 }
+
+/// A blocked carrier occurrence keeps last-occurrence-wins semantics: it
+/// retires an earlier clean occurrence (the template is unresolved), while a
+/// later clean occurrence still wins. The outer name is compared decoded.
+#[tokio::test]
+async fn query_template_blocked_carrier_keeps_last_occurrence_semantics() {
+    use ferrum_edge::plugins::request_transformer::RULE_SKIPPED_METADATA_KEY;
+
+    let jwt = ferrum_edge::plugins::jwt_auth::JwtAuth::new(&json!({
+        "token_lookup": "query:tenant_jwt",
+        "hide_credentials": true
+    }))
+    .unwrap();
+    let plugin = RequestTransformer::new(&json!({
+        "rules": [{"operation": "update", "target": "header", "key": "x-copied", "value": "$(query.carrier)"}]
+    }))
+    .unwrap();
+    for (raw_query, expected) in [
+        ("carrier=plain&carrier=;tenant_jwt=aliased-secret", None),
+        (
+            "carrier=;tenant_jwt=aliased-secret&carrier=plain",
+            Some("plain"),
+        ),
+        ("carrier=plain&c%61rrier=;tenant_jwt=aliased-secret", None),
+        (
+            "c%61rrier=;tenant_jwt=aliased-secret&carrier=plain",
+            Some("plain"),
+        ),
+    ] {
+        let mut ctx = make_ctx();
+        ctx.set_raw_query_string(raw_query.to_string());
+        ctx.materialize_query_params();
+        jwt.mark_query_credentials_for_redaction(&mut ctx);
+        let mut headers: HashMap<String, String> = HashMap::new();
+        plugin.before_proxy(&mut ctx, &mut headers).await;
+        assert_eq!(
+            headers.get("x-copied").map(String::as_str),
+            expected,
+            "{raw_query}"
+        );
+        if expected.is_none() {
+            assert_eq!(
+                ctx.metadata
+                    .get(RULE_SKIPPED_METADATA_KEY)
+                    .map(String::as_str),
+                Some("template_unresolved"),
+                "{raw_query}"
+            );
+        }
+    }
+}

@@ -14,7 +14,7 @@ use ferrum_edge::plugins::utils::jwt_verifier::{
 use ferrum_edge::plugins::utils::query::{
     CanonicalQuery, OrderedQuery, QueryAmbiguity, canonical_query_for_policy,
     has_conflicting_duplicate_among, query_has_semicolon_credential_alias,
-    semicolon_sub_pair_names,
+    semicolon_sub_pair_names, semicolon_sub_pair_names_with_raw,
 };
 use ferrum_edge::plugins::utils::scope_role_check::{ScopeRoleRequirements, check};
 use ferrum_edge::plugins::utils::socket_host::parse_socket_host;
@@ -1302,6 +1302,39 @@ fn canonical_query_reports_raw_semicolon_sub_pair_spellings() {
         "{:?}",
         carrier.semicolon_sub_names
     );
+}
+
+/// The single-pass collection reports exactly the decoded sub-pair names
+/// plus every raw spelling, as membership, and nothing else.
+#[test]
+fn semicolon_sub_pair_names_with_raw_is_decoded_names_plus_raw_spellings() {
+    for segment in [
+        "carrier=;workspace%2Dslot=t;private+key=x;a%2Bb=1;plain=2",
+        "access_token;x=1",
+        "carrier=a;b=c",
+        "carrier=;%E2%82%AC=t;%ZZ=bad",
+    ] {
+        let collected: HashSet<String> = semicolon_sub_pair_names_with_raw(segment)
+            .into_iter()
+            .collect();
+        let mut expected: HashSet<String> = semicolon_sub_pair_names(segment).into_iter().collect();
+        expected.extend(
+            segment
+                .split(';')
+                .map(|sub_pair| sub_pair.split_once('=').map_or(sub_pair, |(name, _)| name))
+                .map(str::to_string),
+        );
+        assert_eq!(collected, expected, "{segment}");
+    }
+    assert!(semicolon_sub_pair_names_with_raw("a=1%3Bapi_key%3Dx").is_empty());
+    assert!(semicolon_sub_pair_names_with_raw("plain=1").is_empty());
+
+    // Linear in the number of sub-pairs: a long run of distinct plain names
+    // yields one entry each.
+    let segment: String = std::iter::once("carrier=".to_string())
+        .chain((0..2048).map(|idx| format!(";n{idx}=v")))
+        .collect();
+    assert_eq!(semicolon_sub_pair_names_with_raw(&segment).len(), 2049);
 }
 
 #[test]

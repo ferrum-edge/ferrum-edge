@@ -171,6 +171,11 @@ pub struct JwksAuth {
     claim_header_destinations: ClaimHeaderDestinations,
     strip_authorization_on_success: bool,
     has_custom_query_token_locations: bool,
+    /// Some provider has a query token location and does not forward the
+    /// original token, so this instance may strip a query parameter (an
+    /// accepted token, or a `;` alias marked during discovery) before the
+    /// backend request (GHSA-c259-vchc-3vgr).
+    strips_query_tokens: bool,
     /// Providers that may accept an access token presented under the RFC 9449
     /// `DPoP` authorization scheme (§7.1).
     ///
@@ -1072,6 +1077,13 @@ impl JwksAuth {
                         .iter()
                         .any(|location| matches!(location, TokenLocation::Header(_))))
         });
+        let strips_query_tokens = providers.iter().any(|provider| {
+            !provider.forward_original_token
+                && provider
+                    .token_locations
+                    .iter()
+                    .any(|location| matches!(location, TokenLocation::QueryParam(_)))
+        });
         let has_custom_query_token_locations = providers.iter().any(|provider| {
             provider
                 .token_locations
@@ -1171,6 +1183,7 @@ impl JwksAuth {
             claim_header_destinations,
             strip_authorization_on_success,
             has_custom_query_token_locations,
+            strips_query_tokens,
             dpop_authorization_scheme_providers,
             sender_constrained_issuers,
             advertised_challenge,
@@ -2172,6 +2185,13 @@ impl super::Plugin for JwksAuth {
 
     fn request_headers_to_redact(&self) -> &[String] {
         &self.request_headers_to_redact
+    }
+
+    /// A provider that does not forward the original token strips its query
+    /// token locations: the accepted token on success, and a `;` alias from
+    /// the pre-authentication discovery hook, whichever mechanism wins.
+    fn modifies_request_query(&self) -> bool {
+        self.strips_query_tokens
     }
 
     fn modifies_request_headers(&self) -> bool {
