@@ -33,7 +33,10 @@ Configuration and database mutations are blocked and return `403 Forbidden`, for
 The same applies to every other persisted-config write: upstreams, consumer
 credentials, namespaces, API specs, `POST /batch`, and `POST /restore`
 (in file and DP modes, which have no database, `POST /restore` returns
-`503 Service Unavailable` instead).
+`503 Service Unavailable` instead). A request refused for its shape before
+write admission, such as `If-Match` on a route that does not evaluate it
+(`400`), gets that refusal instead and is not counted as a read-only
+rejection.
 
 Operational POST endpoints that do not persist configuration remain available
 with their normal JWT and role checks. These include

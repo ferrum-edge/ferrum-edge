@@ -484,6 +484,9 @@ pub const PLUGIN_SENSITIVITY_SCHEMAS: &[(&str, &[SensitivityRule])] = &[
             endpoint_url(&["providers", "*", "jwks_uri"]),
             endpoint_url(&["discovery_url"]),
             endpoint_url(&["jwks_uri"]),
+            // Shared DPoP replay authority (`sync_mode: "redis"`), read from
+            // the config root by `RedisConfig::from_plugin_config`.
+            redis_url(&["redis_url"]),
         ],
     ),
     (
@@ -522,13 +525,16 @@ pub const PLUGIN_SENSITIVITY_SCHEMAS: &[(&str, &[SensitivityRule])] = &[
         ],
     ),
     ("basic_auth", NONE),
-    ("hmac_auth", NONE),
+    // Shared replay cache (`replay_scope: "shared"`, `sync_mode: "redis"`).
+    ("hmac_auth", REDIS_BACKED),
     (
         "soap_ws_security",
-        // Trusted certificate sources (inline PEM or references).
+        // Trusted certificate sources (inline PEM or references), and the
+        // shared nonce replay cache's Redis endpoint.
         &[
             certificate_source(&["x509_signature", "trusted_certs", "*"]),
             certificate_source(&["saml", "trusted_signing_certs", "*"]),
+            redis_url(&["redis_url"]),
         ],
     ),
     // ---- Authorization ----------------------------------------------------

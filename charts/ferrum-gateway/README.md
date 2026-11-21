@@ -445,6 +445,12 @@ PodDisruptionBudget (`podDisruptionBudget.enabled`, default **true**,
 `minAvailable: 1`) renders only when at least two replicas are configured (or
 `autoscaling.minReplicas >= 2` when HPA is enabled).
 
+With `autoscaling.enabled=true`, the HorizontalPodAutoscaler uses only Resource
+(cpu/memory) metrics, so the render fails unless
+`1 <= autoscaling.minReplicas <= autoscaling.maxReplicas`. Kubernetes accepts
+scale-to-zero only with Object or External metrics and rejects `maxReplicas`
+below `minReplicas`, so the chart refuses both before a manifest is produced.
+
 Single-replica installs (`replicaCount: 1`) are an explicit non-HA choice: the
 chart skips the PDB so `minAvailable: 1` cannot block all voluntary evictions
 during a drain. Pair multi-replica installs with `topologySpreadConstraints` if
