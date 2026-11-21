@@ -363,3 +363,165 @@ fn find_header_end(buffer: &[u8]) -> Option<usize> {
         .position(|window| window == b"\r\n\r\n")
         .map(|position| position + 4)
 }
+
+// ---------------------------------------------------------------------------
+// GHSA-pq95-952r-2x32: `request_transformer` refuses an ambiguous JSON body on
+// the ordinary (deferred) H1/H2 dispatch, and the `400` is published as the
+// gateway request-representation terminal it is — a default (non-buffering)
+// `response_size_limiting` ceiling shorter than the fixed error body must not
+// turn it into a `502`.
+// ---------------------------------------------------------------------------
+
+/// The clean body the transformer leaves untouched (its rule targets
+/// `user.debug`), and an ambiguous one repeating `user`.
+const TRANSFORMER_CLEAN_BODY: &str = r#"{"role":"safe"}"#;
+const TRANSFORMER_AMBIGUOUS_BODY: &str = r#"{"user":{"role":"admin"},"user":{"role":"safe"}}"#;
+
+#[ignore]
+#[tokio::test]
+async fn transformer_ambiguous_body_keeps_its_400_under_a_small_response_ceiling_over_http1() {
+    let backend = Backend::spawn().await;
+    let mut gateway = transformer_gateway_builder(backend.port)
+        .spawn()
+        .await
+        .expect("start transformer gateway");
+    gateway
+        .wait_for_proxy_port(Duration::from_secs(5))
+        .await
+        .expect("proxy port ready");
+
+    let client = reqwest::Client::builder()
+        .http1_only()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .expect("http1 client");
+
+    let clean = client
+        .post(gateway.proxy_url("/orders"))
+        .header("content-type", "application/json")
+        .body(TRANSFORMER_CLEAN_BODY)
+        .send()
+        .await
+        .expect("clean response");
+    assert_eq!(clean.status(), StatusCode::OK);
+
+    let ambiguous = client
+        .post(gateway.proxy_url("/orders"))
+        .header("content-type", "application/json")
+        .body(TRANSFORMER_AMBIGUOUS_BODY)
+        .send()
+        .await
+        .expect("ambiguous response");
+    assert_eq!(
+        ambiguous.status(),
+        StatusCode::BAD_REQUEST,
+        "the transformer's refusal must not be replaced by response policy over HTTP/1.1"
+    );
+    let text = ambiguous.text().await.expect("ambiguous body");
+    assert!(
+        text.contains("duplicate JSON object member names"),
+        "HTTP/1.1: {text}"
+    );
+
+    backend.assert_saw_clean_body_only("HTTP/1.1");
+    gateway.shutdown();
+    backend.shutdown();
+}
+
+#[ignore]
+#[tokio::test]
+async fn transformer_ambiguous_body_keeps_its_400_under_a_small_response_ceiling_over_http2() {
+    let backend = Backend::spawn().await;
+    let mut gateway = transformer_gateway_builder(backend.port)
+        .spawn()
+        .await
+        .expect("start transformer gateway");
+    gateway
+        .wait_for_proxy_port(Duration::from_secs(5))
+        .await
+        .expect("proxy port ready");
+
+    let stream = TcpStream::connect(("127.0.0.1", gateway.proxy_port))
+        .await
+        .expect("connect h2c");
+    let _ = stream.set_nodelay(true);
+    let io = TokioIo::new(stream);
+    let (mut sender, conn) = hyper::client::conn::http2::handshake(TokioExecutor::new(), io)
+        .await
+        .expect("h2 handshake");
+    let conn_task = tokio::spawn(async move {
+        let _ = conn.await;
+    });
+    let url = format!("http://127.0.0.1:{}/orders", gateway.proxy_port);
+    for (body, expected) in [
+        (TRANSFORMER_CLEAN_BODY, StatusCode::OK),
+        (TRANSFORMER_AMBIGUOUS_BODY, StatusCode::BAD_REQUEST),
+    ] {
+        let response = sender
+            .send_request(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(&url)
+                    .header("content-type", "application/json")
+                    .body(Full::new(Bytes::from_static(body.as_bytes())))
+                    .expect("build h2 request"),
+            )
+            .await
+            .expect("h2 send");
+        assert_eq!(response.status(), expected, "HTTP/2 body {body}");
+        let _ = response.into_body().collect().await;
+    }
+
+    backend.assert_saw_clean_body_only("HTTP/2");
+    drop(sender);
+    conn_task.abort();
+    gateway.shutdown();
+    backend.shutdown();
+}
+
+fn transformer_gateway_builder(backend_port: u16) -> TestGatewayBuilder {
+    let config = json!({
+        "version": "1",
+        "proxies": [{
+            "id": "transformer-dup-guard",
+            "listen_path": "/",
+            "backend_scheme": "http",
+            "backend_host": "127.0.0.1",
+            "backend_port": backend_port,
+            "strip_listen_path": false,
+            "pool_enable_http2": false,
+            "plugins": [
+                {"plugin_config_id": "rt-body"},
+                {"plugin_config_id": "rsl-small"}
+            ]
+        }],
+        "consumers": [],
+        "upstreams": [],
+        "plugin_configs": [
+            {
+                "id": "rt-body",
+                "proxy_id": "transformer-dup-guard",
+                "plugin_name": "request_transformer",
+                "scope": "proxy",
+                "enabled": true,
+                "config": {
+                    "rules": [{"operation": "remove", "target": "body", "key": "user.debug"}]
+                }
+            },
+            {
+                // Shorter than the transformer's fixed error body, longer than
+                // the backend's `{"ok":true}`.
+                "id": "rsl-small",
+                "proxy_id": "transformer-dup-guard",
+                "plugin_name": "response_size_limiting",
+                "scope": "proxy",
+                "enabled": true,
+                "config": {"max_bytes": 64}
+            }
+        ]
+    });
+    TestGateway::builder()
+        .mode_file(serde_yaml::to_string(&config).expect("serialize transformer config"))
+        .log_level("warn")
+        .env("FERRUM_POOL_WARMUP_ENABLED", "false")
+}

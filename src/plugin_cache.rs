@@ -2460,6 +2460,13 @@ impl Plugin for PluginInstanceWrapper {
         }
         self.inner.enforces_final_client_visible_response_body(ctx)
     }
+    fn has_staged_response_body_transform_refusal(&self, ctx: &RequestContext) -> bool {
+        // A skipped instance ran no transform and staged nothing.
+        if !self.runs_cached(ctx) {
+            return false;
+        }
+        self.inner.has_staged_response_body_transform_refusal(ctx)
+    }
     async fn finalize_client_visible_response_body(
         &self,
         ctx: &mut RequestContext,

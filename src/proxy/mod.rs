@@ -19135,9 +19135,12 @@ pub(crate) fn finalize_request_transformer_headers(
     owned_proxy_headers: &mut Option<HashMap<String, String>>,
 ) {
     if ctx.request_body_integrity_retirement {
+        let wire_framed =
+            crate::plugins::request_transformer::request_wire_declares_framed_grpc(ctx);
         crate::plugins::request_transformer::record_body_rule_header_skip(
             &ctx.method,
             owned_proxy_headers.as_ref().unwrap_or(&ctx.headers),
+            wire_framed,
             &mut ctx.metadata,
         );
     }
@@ -19150,9 +19153,12 @@ pub(crate) fn finalize_request_transformer_headers_in_map(
     headers: &mut HashMap<String, String>,
 ) {
     if ctx.request_body_integrity_retirement {
+        let wire_framed =
+            crate::plugins::request_transformer::request_wire_declares_framed_grpc(ctx);
         crate::plugins::request_transformer::record_body_rule_header_skip(
             &ctx.method,
             headers,
+            wire_framed,
             &mut ctx.metadata,
         );
     }
@@ -28468,6 +28474,24 @@ pub(crate) async fn apply_synthetic_response_body_hooks(
                     response_headers,
                     response_body,
                 ));
+            } else if stage == ResponseTransformStage::Semantic
+                && terminal_body_response_selected
+                && mandatory_replay_transform_failed.is_none()
+                && run_staged_response_body_transform_refusals(
+                    plugins,
+                    ctx,
+                    response_status,
+                    response_headers,
+                    response_body,
+                    InitialResponseHeaderPolicySource::ProtocolPlugins(plugins),
+                )
+                .await
+            {
+                // An earlier body phase selected a gateway terminal, so the
+                // ordinary sweep above stays closed, but a transform that ran
+                // over that terminal and refused its bytes as ambiguous must
+                // still replace them (GHSA-pq95-952r-2x32).
+                break 'stages;
             }
         }
         if let Some(plugin_name) = mandatory_replay_transform_failed {
@@ -31426,9 +31450,69 @@ async fn run_final_client_visible_response_body_policy(
     response_body: &mut Bytes,
     initial_response_header_policy_source: InitialResponseHeaderPolicySource<'_>,
 ) -> bool {
+    run_final_client_visible_response_body_policy_for(
+        plugins,
+        ctx,
+        response_status,
+        response_headers,
+        response_body,
+        initial_response_header_policy_source,
+        false,
+    )
+    .await
+}
+
+/// Discharge transform-staged refusals when the ordinary final phase is
+/// skipped because a gateway-authored terminal already owns the response.
+///
+/// Only plugins answering [`Plugin::has_staged_response_body_transform_refusal`]
+/// — whose own transform ran over the terminal's body and declined bytes it
+/// could not evaluate (GHSA-pq95-952r-2x32) — are invoked; no other final
+/// policy re-decides the gateway's own error payload. Same return contract as
+/// [`run_final_client_visible_response_body_policy`].
+async fn run_staged_response_body_transform_refusals(
+    plugins: &[Arc<dyn Plugin>],
+    ctx: &mut RequestContext,
+    response_status: &mut u16,
+    response_headers: &mut HashMap<String, String>,
+    response_body: &mut Bytes,
+    initial_response_header_policy_source: InitialResponseHeaderPolicySource<'_>,
+) -> bool {
+    if !plugins
+        .iter()
+        .any(|plugin| plugin.has_staged_response_body_transform_refusal(ctx))
+    {
+        return false;
+    }
+    run_final_client_visible_response_body_policy_for(
+        plugins,
+        ctx,
+        response_status,
+        response_headers,
+        response_body,
+        initial_response_header_policy_source,
+        true,
+    )
+    .await
+}
+
+async fn run_final_client_visible_response_body_policy_for(
+    plugins: &[Arc<dyn Plugin>],
+    ctx: &mut RequestContext,
+    response_status: &mut u16,
+    response_headers: &mut HashMap<String, String>,
+    response_body: &mut Bytes,
+    initial_response_header_policy_source: InitialResponseHeaderPolicySource<'_>,
+    staged_refusals_only: bool,
+) -> bool {
     let mut selected_reject = None;
     for plugin in plugins.iter() {
-        if !plugin.enforces_final_client_visible_response_body(ctx) {
+        let participates = if staged_refusals_only {
+            plugin.has_staged_response_body_transform_refusal(ctx)
+        } else {
+            plugin.enforces_final_client_visible_response_body(ctx)
+        };
+        if !participates {
             continue;
         }
         let bound = ctx.precommit_response_phase_bound();
@@ -32573,6 +32657,26 @@ async fn transform_buffered_response_body_with_deadline_inner(
             // replacement so the caller drops backend trailers and skips the
             // later final-body hooks, and as a representation rewrite because the
             // published bytes are no longer the backend's.
+            return (true, true);
+        }
+        // The ordinary sweep is closed over a gateway-generated terminal (an
+        // inspection-hook rejection), but a transform that ran over that
+        // terminal and refused its bytes as ambiguous must still replace them;
+        // no other policy is reopened (GHSA-pq95-952r-2x32).
+        if stage == ResponseTransformStage::Semantic
+            && !final_policy_eligible
+            && run_staged_response_body_transform_refusals(
+                plugins,
+                ctx,
+                response_status,
+                response_headers,
+                response_body,
+                InitialResponseHeaderPolicySource::Prefiltered(
+                    initial_response_header_policy_plugins,
+                ),
+            )
+            .await
+        {
             return (true, true);
         }
     }
@@ -47142,9 +47246,15 @@ async fn handle_proxy_request_inner(
     // still replace the backend response here (for example, content-length fast-path
     // enforcement in response_size_limiting).
     let mut after_proxy_rejected = false;
+    // A dispatch-stage request-representation refusal (the shared request
+    // representation gate's `400`, or `request_transformer`'s ambiguous-JSON
+    // `400`, GHSA-pq95-952r-2x32) is likewise a gateway terminal returned
+    // before any backend I/O: response-side policy must publish it as written,
+    // exactly as the synthetic reject finalizer already does for this marker.
+    let gateway_request_representation_terminal = ctx.gateway_representation_response_selected();
     if !plugins.is_empty() {
         let phase_start = Instant::now();
-        if ctx.gateway_capacity_response_selected()
+        if (ctx.gateway_capacity_response_selected() || gateway_request_representation_terminal)
             && let ResponseBody::Buffered(capacity_body) = &mut response_body
         {
             // A dispatch-stage capacity refusal is a gateway terminal, not a
@@ -47153,7 +47263,9 @@ async fn handle_proxy_request_inner(
             // replacer never rewrites it, decorators (CORS) still run, and the
             // rejection marker keeps a header hook from committing a body
             // coding (`compression`) that the skipped body transforms below
-            // would never apply.
+            // would never apply. A request-representation refusal takes the
+            // same `after_proxy` path so no replacer (for example a response
+            // size limit) rewrites it.
             boxed_after_proxy_hooks_to_gateway_error_terminal(
                 &plugins,
                 &mut ctx,
@@ -47245,6 +47357,7 @@ async fn handle_proxy_request_inner(
     if !after_proxy_rejected
         && !charged_backend_deadline_terminal
         && !ctx.gateway_capacity_response_selected()
+        && !gateway_request_representation_terminal
         && !plugins.is_empty()
         && let ResponseBody::Buffered(ref mut data) = response_body
     {
@@ -47268,7 +47381,11 @@ async fn handle_proxy_request_inner(
     // `on_response_body`, it also records a representation-gate or deadline
     // replacement below. A retained-response capacity terminal is already
     // protocol-correct and skips those later mutating phases entirely.
-    let mut response_body_rejected = ctx.gateway_capacity_response_selected();
+    // A request-representation refusal is a selected gateway terminal too: the
+    // transform phase still runs (as gateway-generated bytes) for protocol wire
+    // shape, but no inspection or final-body validator may replace it.
+    let mut response_body_rejected =
+        ctx.gateway_capacity_response_selected() || gateway_request_representation_terminal;
 
     // on_response_body hooks — only for buffered responses, only when plugins exist.
     // This phase sees the normalized backend body before ordinary response

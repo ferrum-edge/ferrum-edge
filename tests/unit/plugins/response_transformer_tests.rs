@@ -3399,3 +3399,100 @@ async fn ambiguous_response_refusal_is_bound_to_its_producing_instance() {
     assert_eq!(status, 502);
     assert!(!String::from_utf8_lossy(&published).contains("hunter2"));
 }
+
+/// An inspection-stage policy that replaces the response with a JSON error
+/// document of its own (here one repeating a member and carrying a value a body
+/// rule targets).
+struct InspectionReplacer;
+
+#[async_trait::async_trait]
+impl Plugin for InspectionReplacer {
+    fn name(&self) -> &str {
+        "inspection_replacer"
+    }
+
+    fn requires_response_body_buffering(&self) -> bool {
+        true
+    }
+
+    async fn on_response_body(
+        &self,
+        _ctx: &mut RequestContext,
+        _response_status: u16,
+        _response_headers: &mut HashMap<String, String>,
+        _body: &[u8],
+    ) -> PluginResult {
+        PluginResult::Reject {
+            status_code: 403,
+            body: r#"{"account":{"ssn":"hunter2"},"account":{"id":1}}"#.to_string(),
+            headers: json_response_headers(),
+        }
+    }
+}
+
+/// The transform still runs over a gateway terminal an inspection hook
+/// installed, and the ordinary final sweep stays closed for it; a refusal the
+/// transform staged there must still be discharged (and cleared) on both
+/// funnels, never published.
+#[tokio::test]
+async fn ambiguous_inspection_replacement_is_refused_on_both_funnels() {
+    let redactor = Arc::new(sensitive_field_redactor());
+
+    // Backend funnel: the body is the gateway-generated replacement.
+    let plugins: Vec<Arc<dyn Plugin>> = vec![redactor.clone() as Arc<dyn Plugin>];
+    let mut ctx = make_ctx();
+    let mut status = 403;
+    let mut headers = json_response_headers();
+    let mut body =
+        bytes::Bytes::from_static(br#"{"account":{"ssn":"hunter2"},"account":{"id":1}}"#);
+    let (replaced, _) = transform_buffered_response_body_with_deadline_full_for_test(
+        &plugins,
+        &mut ctx,
+        &mut status,
+        &mut headers,
+        &mut body,
+        None,
+        true,
+    )
+    .await;
+    assert!(
+        replaced,
+        "backend funnel: the staged refusal must replace it"
+    );
+    assert_eq!(status, 502);
+    assert!(!String::from_utf8_lossy(&body).contains("hunter2"));
+    assert!(
+        !redactor.has_staged_response_body_transform_refusal(&ctx),
+        "backend funnel: the staged refusal is consumed"
+    );
+
+    // Synthetic funnel: an inspection hook replaces a synthetic success before
+    // the semantic transforms run.
+    let plugins: Vec<Arc<dyn Plugin>> = vec![
+        Arc::new(InspectionReplacer) as Arc<dyn Plugin>,
+        redactor.clone() as Arc<dyn Plugin>,
+    ];
+    let mut ctx = make_ctx();
+    let mut status = 200;
+    let mut headers = json_response_headers();
+    let mut body = bytes::Bytes::from_static(br#"{"ok":true}"#);
+    apply_synthetic_response_body_hooks_for_test(
+        &plugins,
+        &mut ctx,
+        &mut status,
+        &mut headers,
+        &mut body,
+    )
+    .await;
+    assert_eq!(
+        status,
+        502,
+        "synthetic funnel: {:?}",
+        String::from_utf8_lossy(&body)
+    );
+    assert!(!String::from_utf8_lossy(&body).contains("hunter2"));
+    assert!(
+        !redactor.has_staged_response_body_transform_refusal(&ctx),
+        "synthetic funnel: the staged refusal is consumed"
+    );
+}

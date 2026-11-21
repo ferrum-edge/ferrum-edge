@@ -641,7 +641,11 @@ output-policy phase between them (`GHSA-62jg-v563-4q23`,
    document past the duplicate-key screen's budgets, or one the rule engine
    cannot materialize; `GHSA-pq95-952r-2x32`). Only the instance whose rules
    refused it participates, and it replaces the response with a `502` so the
-   ambiguous bytes are never published.
+   ambiguous bytes are never published. When an earlier inspection-stage
+   rejection already owns the response, this sweep stays closed, but the
+   lifecycle still invokes the finalize hook of a plugin whose own transform
+   staged such a refusal over that replacement
+   (`has_staged_response_body_transform_refusal`), and of no other policy.
    Header policy is NOT decided here — the header map is not final at this point
    on the synthetic lifecycle — it is decided in
    `finalize_client_visible_response_headers` below.

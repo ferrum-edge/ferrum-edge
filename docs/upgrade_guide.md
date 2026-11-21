@@ -49,10 +49,13 @@ Body rules now also strip one leading UTF-8 byte order mark before parsing, so
 they apply to BOM-prefixed request bodies (the backend receives the rewritten
 document without the BOM). A BOM-prefixed backend response under a body policy
 is still refused by the shared response representation gate, as before.
-Framed gRPC and gRPC-Web `+json` uploads are no longer buffered by
-`request_transformer` body rules: the transform declines them on media type
+Framed gRPC and gRPC-Web `+json` uploads whose client sent that media type
+are no longer buffered by `request_transformer` body rules: the transform
+declines them on media type
 (`request_transformer.body_skipped=non_json_content_type`, previously
-`parse_error`). Instances with only header or query rules are unaffected.
+`parse_error`). A body-rule `request_transformer` now counts as a final
+request-body policy, so a configuration that orders `ai_semantic_cache` at or
+ahead of it with `priority_override` is refused. Instances with only header or query rules are unaffected.
 
 ### EastWestGateway passthrough legs now follow DestinationRules (#7424)
 

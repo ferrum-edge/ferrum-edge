@@ -1562,6 +1562,14 @@ impl Plugin for ResponseTransformer {
         ctx.response_transformer_ambiguous_body_refusal == Some(self.instance_id)
     }
 
+    /// The same staged refusal, so the lifecycle still discharges it when the
+    /// ordinary final phase is skipped because a gateway terminal (an
+    /// inspection-hook rejection) already owns the response and this transform
+    /// ran over that terminal's body.
+    fn has_staged_response_body_transform_refusal(&self, ctx: &RequestContext) -> bool {
+        ctx.response_transformer_ambiguous_body_refusal == Some(self.instance_id)
+    }
+
     /// Replace a response whose JSON body the transform refused as ambiguous.
     ///
     /// Rejecting and non-rewriting, like every participant in this phase: the

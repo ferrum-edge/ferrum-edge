@@ -13728,6 +13728,24 @@ pub trait Plugin: Any + Send + Sync {
         false
     }
 
+    /// Returns `true` when THIS plugin's own `transform_response_body*` staged
+    /// a refusal for the current response that only its
+    /// [`Plugin::finalize_client_visible_response_body`] can discharge.
+    ///
+    /// The ordinary final client-visible phase is skipped once a
+    /// gateway-authored terminal owns the response (an inspection-hook
+    /// rejection, for example), so that no policy re-decides the gateway's own
+    /// error payload. Transforms still run over such a terminal, though, and a
+    /// transform that declined to rewrite bytes it could not evaluate must not
+    /// have them published merely because the sweep was skipped. On those paths
+    /// the lifecycle invokes `finalize_client_visible_response_body` for exactly
+    /// the plugins answering `true` here — no other policy is reopened.
+    /// `response_transformer` uses it for its ambiguous-JSON refusal
+    /// (GHSA-pq95-952r-2x32). The default is `false`.
+    fn has_staged_response_body_transform_refusal(&self, _ctx: &RequestContext) -> bool {
+        false
+    }
+
     /// Decide semantic response policy over the EXACT representation the client
     /// will receive.
     ///

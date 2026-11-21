@@ -2381,6 +2381,10 @@ fn upload_ctx(content_type: Option<&str>) -> RequestContext {
         ctx.headers
             .insert("content-type".to_string(), content_type.to_string());
     }
+    // The client sent exactly these headers: retain them as the immutable wire
+    // view the framed-gRPC exemption is decided from.
+    let wire = ctx.headers.clone();
+    retain_client_wire_headers(&mut ctx, &wire);
     ctx
 }
 
@@ -4244,6 +4248,7 @@ async fn framed_grpc_json_requests_are_not_screened_or_buffered() {
         let headers = HashMap::from([("content-type".to_string(), content_type.to_string())]);
         for body in [&framed, &large] {
             let mut ctx = post_ctx();
+            retain_client_wire_headers(&mut ctx, &headers);
             assert!(
                 plugin
                     .transform_request_body_with_context(
@@ -4269,5 +4274,64 @@ async fn framed_grpc_json_requests_are_not_screened_or_buffered() {
                 ferrum_edge::plugins::PluginResult::Continue
             ));
         }
+    }
+}
+
+/// The framed-gRPC exemption is decided from the client's wire media type, not
+/// from a label a header rule wrote: a bare JSON upload relabelled to
+/// `application/grpc+json` stays buffered, screened, and rewritten.
+#[tokio::test]
+async fn relabelled_bare_json_upload_is_not_exempted_as_framed_grpc() {
+    use ferrum_edge::plugins::request_transformer::BODY_SKIPPED_METADATA_KEY;
+
+    let plugin = privileged_field_stripper();
+    let wire = json_request_headers();
+    for relabel in [
+        "application/grpc+json",
+        "application/grpc-web+json",
+        "application/grpc-web-text+json",
+    ] {
+        let outbound = HashMap::from([("content-type".to_string(), relabel.to_string())]);
+
+        // Buffering vote: the label alone does not release the upload.
+        let mut vote = upload_ctx(Some("application/json"));
+        vote.headers = outbound.clone();
+        assert!(
+            plugin.should_buffer_request_body(&vote),
+            "{relabel}: a relabelled JSON upload must stay buffered"
+        );
+
+        // Transform: an unambiguous document is still rewritten.
+        let mut ctx = post_ctx();
+        retain_client_wire_headers(&mut ctx, &wire);
+        let rewritten = plugin
+            .transform_request_body_with_context(
+                &mut ctx,
+                br#"{"user":{"role":"admin","name":"a"}}"#,
+                Some(relabel),
+                &outbound,
+            )
+            .await
+            .expect("a relabelled bare JSON document must be rewritten");
+        let rewritten: serde_json::Value = serde_json::from_slice(&rewritten).unwrap();
+        assert_eq!(rewritten, json!({"user": {"name": "a"}}), "{relabel}");
+        assert!(!ctx.metadata.contains_key(BODY_SKIPPED_METADATA_KEY));
+
+        // Transform + final hook: an ambiguous document is still refused.
+        let mut ctx = post_ctx();
+        retain_client_wire_headers(&mut ctx, &wire);
+        let body = br#"{"user":{"role":"admin"},"user":{}}"#;
+        assert!(
+            plugin
+                .transform_request_body_with_context(&mut ctx, body, Some(relabel), &outbound)
+                .await
+                .is_none()
+        );
+        assert_ambiguous_body_rejected(
+            &plugin
+                .on_final_request_body_with_context(&mut ctx, &outbound, body)
+                .await,
+            relabel,
+        );
     }
 }
