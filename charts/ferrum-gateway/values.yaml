@@ -572,6 +572,9 @@ service:
   httpsPort: 443
 
 # Optional HorizontalPodAutoscaler.
+# When enabled, the HPA uses only Resource (cpu/memory) metrics, so the render
+# fails unless 1 <= minReplicas <= maxReplicas (Kubernetes allows scale-to-zero
+# only with Object/External metrics and rejects maxReplicas < minReplicas).
 autoscaling:
   enabled: false
   minReplicas: 2
