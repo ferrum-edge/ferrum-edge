@@ -226,7 +226,6 @@
 use async_trait::async_trait;
 use bytes::Bytes;
 use chrono::Utc;
-use percent_encoding::percent_decode_str;
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -5159,19 +5158,14 @@ fn query_after_strip_markers(
     let mut stripped = String::with_capacity(query.len());
     for pair in query.split('&').filter(|p| !p.is_empty()) {
         let raw_name = pair.split_once('=').map_or(pair, |(name, _)| name);
-        let decoded_name = percent_decode_str(raw_name).decode_utf8_lossy();
         // A `;` sub-pair is a parameter of its own to a provider that also
         // splits on `;` (issue #6579): it must neither carry a stripped
-        // credential through nor override an endpoint-owned parameter.
-        if strip_names.contains(raw_name)
-            || strip_names.contains(decoded_name.as_ref())
-            || super::utils::query::query_name_decodings(raw_name)
-                .iter()
-                .any(|name| strip_names.contains(name.as_str()))
+        // credential through nor override an endpoint-owned parameter. The
+        // credential side is the outbound strip's own predicate.
+        if super::utils::query::query_pair_names_any(pair, &strip_names)
             || super::utils::query::query_name_decodings(raw_name)
                 .iter()
                 .any(|name| endpoint_query_names.contains(name))
-            || super::utils::query::semicolon_sub_pair_names_any(pair, &strip_names)
             || super::utils::query::semicolon_sub_pair_names(pair)
                 .iter()
                 .any(|name| endpoint_query_names.contains(name))

@@ -40,8 +40,10 @@ carrying no token. For `jwks_auth` and `oauth2_introspection` an alias at any
 provider's query location is terminal for the whole instance, even when a
 valid token is also present in a header or `Authorization`. The alias is also
 marked for OPA and `request_mirror` redaction (including a raw spelling such as
-`workspace%2Dslot`), a `request_transformer` `$(query.<name>)` template never
-copies a pair that carries it, and it is removed from the forwarded query —
+`workspace%2Dslot`, for a top-level occurrence as well as an alias), a copy of
+its value under another query name is withheld from `request_mirror`, a
+`request_transformer` `$(query.<name>)` template never copies a pair the
+credential strip removes, and it is removed from the forwarded query —
 including when another mechanism authenticates the request — under
 `jwt_auth` `hide_credentials: true` or a provider's
 `forward_original_token: false`.

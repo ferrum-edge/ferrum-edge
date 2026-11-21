@@ -122,10 +122,11 @@ pub struct Oauth2Introspection {
     consumer_header_claim: Option<String>,
     strip_authorization_on_success: bool,
     has_custom_query_token_locations: bool,
-    /// Some provider has a query token location and does not forward the
-    /// original token, so this instance may strip a query parameter (an
-    /// accepted token, or a `;` alias marked during discovery) before the
-    /// backend request (GHSA-c259-vchc-3vgr).
+    /// Some provider does not forward the original token and some provider
+    /// has a query token location, so this instance may strip a query
+    /// parameter before the backend request: an accepted token (every
+    /// configured occurrence, across providers) or a `;` alias marked during
+    /// discovery (GHSA-c259-vchc-3vgr).
     strips_query_tokens: bool,
     request_headers_to_redact: Vec<String>,
     allow_provider_fanout: bool,
@@ -598,13 +599,19 @@ impl Oauth2Introspection {
         let strip_authorization_on_success = providers
             .iter()
             .any(|provider| !provider.forward_original_token);
-        let strips_query_tokens = providers.iter().any(|provider| {
-            !provider.forward_original_token
-                && provider
+        // Instance-wide: a provider that hides its accepted token strips every
+        // configured occurrence of it, including another provider's query
+        // location, so any non-forwarding provider plus any query location
+        // may rewrite the query.
+        let strips_query_tokens = providers
+            .iter()
+            .any(|provider| !provider.forward_original_token)
+            && providers.iter().any(|provider| {
+                provider
                     .token_locations
                     .iter()
                     .any(|location| matches!(location, TokenLocation::QueryParam(_)))
-        });
+            });
         let has_custom_query_token_locations = providers.iter().any(|provider| {
             provider
                 .token_locations
@@ -1735,9 +1742,10 @@ impl super::Plugin for Oauth2Introspection {
         &self.request_headers_to_redact
     }
 
-    /// A provider that does not forward the original token strips its query
-    /// token locations: the accepted token on success, and a `;` alias from
-    /// the pre-authentication discovery hook, whichever mechanism wins.
+    /// A provider that does not forward the original token strips every
+    /// configured query occurrence of the accepted token (across providers)
+    /// on success, and its own `;` aliases from the pre-authentication
+    /// discovery hook, whichever mechanism wins.
     fn modifies_request_query(&self) -> bool {
         self.strips_query_tokens
     }

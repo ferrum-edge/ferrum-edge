@@ -3809,3 +3809,78 @@ async fn semicolon_aliased_query_token_is_terminal_beside_a_valid_header_token()
         }
     }
 }
+
+/// The accepted-token strip spans every provider's configured locations: a
+/// header provider that hides its token also removes the same token from a
+/// forwarding provider's query location, so the instance declares query
+/// mutation whenever any provider hides and any provider reads the query.
+#[tokio::test]
+async fn accepted_token_strip_spans_another_providers_query_location() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/introspect"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(json!({"active": true, "username": "u"})),
+        )
+        .mount(&server)
+        .await;
+    let endpoint = format!("{}/introspect", server.uri());
+    let plugin = Oauth2Introspection::new(
+        &json!({"providers": [
+            {
+                "introspection_endpoint": endpoint,
+                "client_auth": {"method": "none"},
+                "from_headers": [{"name": "x-opaque-token"}],
+                "forward_original_token": false
+            },
+            {
+                "introspection_endpoint": endpoint,
+                "client_auth": {"method": "none"},
+                "from_params": ["access_token"],
+                "forward_original_token": true
+            }
+        ]}),
+        PluginHttpClient::default(),
+    )
+    .unwrap();
+    assert!(plugin.modifies_request_query());
+
+    let mut ctx = ctx_with_raw_query("access_token=shared-opaque-token&keep=1");
+    ctx.headers.insert(
+        "x-opaque-token".to_string(),
+        "shared-opaque-token".to_string(),
+    );
+    assert_continue(
+        plugin
+            .authenticate(&mut ctx, &ConsumerIndex::new(&[]))
+            .await,
+    );
+    assert!(
+        ctx.metadata
+            .contains_key("auth.strip_query_param.access_token"),
+        "the hiding provider strips the forwarding provider's query copy"
+    );
+    assert_eq!(
+        ferrum_edge::_test_support::effective_backend_query_string_for_test(&ctx),
+        "keep=1"
+    );
+
+    // Neither provider hides: no query mutation is declared.
+    let forwarding = Oauth2Introspection::new(
+        &json!({"providers": [
+            {
+                "introspection_endpoint": "http://127.0.0.1:8181/introspect",
+                "client_auth": {"method": "none"},
+                "from_headers": [{"name": "x-opaque-token"}]
+            },
+            {
+                "introspection_endpoint": "http://127.0.0.1:8181/introspect",
+                "client_auth": {"method": "none"},
+                "from_params": ["access_token"]
+            }
+        ]}),
+        PluginHttpClient::default(),
+    )
+    .unwrap();
+    assert!(!forwarding.modifies_request_query());
+}

@@ -168,6 +168,13 @@ pub struct CanonicalQueryParam {
     /// `+` and that reading differs from [`Self::name`]. A form-decoding
     /// backend reads the parameter under this name, so redaction consults it.
     pub form_name: Option<String>,
+    /// The still-encoded name, when it differs from [`Self::name`] and
+    /// [`Self::form_name`] (for example `workspace%2Dslot`). Authentication
+    /// matches a configured name against the raw spelling as well as the
+    /// decodings ([`query_name_matches`]), so credential redaction consults it
+    /// (GHSA-c259-vchc-3vgr). Comparison only: policy payloads serialize
+    /// [`Self::name`], never this field.
+    pub raw_name: Option<String>,
 }
 
 /// Ordered, occurrence-complete, explicitly ambiguity-classified view of a
@@ -275,12 +282,15 @@ impl CanonicalQuery {
             } else {
                 None
             };
+            let raw_name = (raw_name != name && form_name.as_deref() != Some(raw_name))
+                .then(|| raw_name.to_string());
             params.push(CanonicalQueryParam {
                 name,
                 value,
                 bare,
                 semicolon_sub_names,
                 form_name,
+                raw_name,
             });
         }
 
@@ -444,12 +454,47 @@ pub fn semicolon_sub_pair_names_with_raw(segment: &str) -> Vec<String> {
 /// separately.
 pub fn semicolon_sub_pair_names_any(segment: &str, names: &HashSet<&str>) -> bool {
     segment.contains(';')
-        && (segment.split(';').any(|sub_pair| {
-            names.contains(sub_pair.split_once('=').map_or(sub_pair, |(name, _)| name))
-        }) || ((segment.contains('%') || segment.contains('+'))
-            && semicolon_sub_pair_names(segment)
+        && segment.split(';').any(|sub_pair| {
+            query_name_matches_any(
+                sub_pair.split_once('=').map_or(sub_pair, |(name, _)| name),
+                names,
+            )
+        })
+}
+
+/// The one query-name equivalence every credential consumer shares with the
+/// outbound strip ([`crate::proxy::query_string_after_plugin_strips`]): a
+/// still-encoded name reads as `name` by its raw spelling, its RFC 3986
+/// percent-decoding, or (with a raw `+`) its form decoding
+/// (GHSA-c259-vchc-3vgr). A name with neither `%` nor `+` decodes to itself
+/// under both readings, so only the raw comparison runs and nothing is
+/// allocated.
+pub fn query_name_matches(raw_name: &str, name: &str) -> bool {
+    raw_name == name
+        || ((raw_name.contains('%') || raw_name.contains('+'))
+            && query_name_decodings(raw_name)
                 .iter()
-                .any(|name| names.contains(name.as_str()))))
+                .any(|decoded| decoded == name))
+}
+
+/// [`query_name_matches`] against a set of names.
+pub fn query_name_matches_any(raw_name: &str, names: &HashSet<&str>) -> bool {
+    names.contains(raw_name)
+        || ((raw_name.contains('%') || raw_name.contains('+'))
+            && query_name_decodings(raw_name)
+                .iter()
+                .any(|decoded| names.contains(decoded.as_str())))
+}
+
+/// Whether a still-encoded `&`-separated query pair is an occurrence of a
+/// name in `names`: by its own name ([`query_name_matches_any`]) or by any
+/// `;` sub-pair ([`semicolon_sub_pair_names_any`]). This is exactly the set
+/// of pairs the outbound credential strip removes, so any consumer that must
+/// agree with that strip (policy redaction, templates, mirror provenance)
+/// uses this predicate.
+pub fn query_pair_names_any(pair: &str, names: &HashSet<&str>) -> bool {
+    let raw_name = pair.split_once('=').map_or(pair, |(name, _)| name);
+    query_name_matches_any(raw_name, names) || semicolon_sub_pair_names_any(pair, names)
 }
 
 /// Whether `raw_query` carries `name` as a `;`-separated sub-parameter that
@@ -487,20 +532,9 @@ pub fn query_has_semicolon_credential_alias(raw_query: Option<&str>, name: &str)
             let sub_name = sub_pair
                 .split_once('=')
                 .map_or(sub_pair, |(sub_name, _)| sub_name);
-            sub_name == name || sub_name_decodes_to(sub_name, name)
+            query_name_matches(sub_name, name)
         })
     })
-}
-
-/// Whether a still-encoded sub-pair name reads as `name` under any decoding
-/// [`query_name_decodings`] reports. A name with neither `%` nor `+` decodes
-/// to itself under both readings, so the caller's raw comparison already
-/// decided it and no decoding (or allocation) is needed.
-fn sub_name_decodes_to(sub_name: &str, name: &str) -> bool {
-    (sub_name.contains('%') || sub_name.contains('+'))
-        && query_name_decodings(sub_name)
-            .iter()
-            .any(|decoded| decoded == name)
 }
 
 /// Whether every `%` in `value` begins a complete `%HH` triplet.
@@ -696,11 +730,8 @@ impl OrderedQuery {
         }
         let before = self.pairs.len();
         self.pairs.retain(|pair| {
-            if names.contains(pair.raw_name.as_str())
-                || names.contains(pair.decoded_name.as_str())
-                || query_name_decodings(&pair.raw_name)
-                    .iter()
-                    .any(|name| names.contains(name.as_str()))
+            if names.contains(pair.decoded_name.as_str())
+                || query_name_matches_any(&pair.raw_name, names)
             {
                 return false;
             }

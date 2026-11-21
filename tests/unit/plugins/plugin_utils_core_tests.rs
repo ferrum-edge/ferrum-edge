@@ -13,8 +13,9 @@ use ferrum_edge::plugins::utils::jwt_verifier::{
 };
 use ferrum_edge::plugins::utils::query::{
     CanonicalQuery, OrderedQuery, QueryAmbiguity, canonical_query_for_policy,
-    has_conflicting_duplicate_among, query_has_semicolon_credential_alias,
-    semicolon_sub_pair_names, semicolon_sub_pair_names_with_raw,
+    has_conflicting_duplicate_among, query_has_semicolon_credential_alias, query_name_matches,
+    query_name_matches_any, query_pair_names_any, semicolon_sub_pair_names,
+    semicolon_sub_pair_names_with_raw,
 };
 use ferrum_edge::plugins::utils::scope_role_check::{ScopeRoleRequirements, check};
 use ferrum_edge::plugins::utils::socket_host::parse_socket_host;
@@ -1335,6 +1336,67 @@ fn semicolon_sub_pair_names_with_raw_is_decoded_names_plus_raw_spellings() {
         .chain((0..2048).map(|idx| format!(";n{idx}=v")))
         .collect();
     assert_eq!(semicolon_sub_pair_names_with_raw(&segment).len(), 2049);
+}
+
+/// The one shared name-equivalence predicate: raw spelling, percent
+/// decoding, or (with a raw `+`) form decoding — the outbound strip's rule.
+#[test]
+fn shared_query_name_predicate_matches_raw_and_decoded_spellings() {
+    assert!(query_name_matches("workspace%2Dslot", "workspace%2Dslot"));
+    assert!(query_name_matches("workspace%2Dslot", "workspace-slot"));
+    assert!(query_name_matches("private+key", "private key"));
+    assert!(query_name_matches("private+key", "private+key"));
+    assert!(!query_name_matches("private%2Bkey", "private key"));
+    assert!(!query_name_matches("workspace-slot", "workspace%2Dslot"));
+
+    let marked: HashSet<&str> = ["workspace%2Dslot", "private key"].into_iter().collect();
+    assert!(query_name_matches_any("workspace%2Dslot", &marked));
+    assert!(query_name_matches_any("private+key", &marked));
+    assert!(!query_name_matches_any("workspace-slot", &marked));
+
+    // Pair-level: own name or any `;` sub-pair, exactly what the strip drops.
+    for pair in [
+        "workspace%2Dslot=v",
+        "private+key=v",
+        "carrier=;workspace%2Dslot=v",
+        "carrier=;private%20key=v",
+    ] {
+        assert!(query_pair_names_any(pair, &marked), "{pair}");
+    }
+    for pair in [
+        "workspace-slot=v",
+        "carrier=a;b=c",
+        "carrier=a%3Bprivate%20key%3Dv",
+    ] {
+        assert!(!query_pair_names_any(pair, &marked), "{pair}");
+    }
+    let mut ctx = ctx_for(
+        "workspace%2Dslot=a&carrier=;private+key=b&private%20key=c&workspace-slot=kept&page=1",
+    );
+    for name in ["workspace%2Dslot", "private key"] {
+        ctx.metadata
+            .insert(format!("auth.strip_query_param.{name}"), "true".to_string());
+    }
+    assert_eq!(
+        ferrum_edge::_test_support::effective_backend_query_string_for_test(&ctx),
+        "workspace-slot=kept&page=1"
+    );
+}
+
+/// The canonical view keeps a distinct raw top-level spelling for credential
+/// comparison only.
+#[test]
+fn canonical_query_keeps_a_distinct_raw_top_level_name_for_comparison() {
+    let query = CanonicalQuery::parse("workspace%2Dslot=1&plain=2&private+key=3");
+    let params = query.params();
+    assert_eq!(params[0].name, "workspace-slot");
+    assert_eq!(params[0].raw_name.as_deref(), Some("workspace%2Dslot"));
+    assert_eq!(params[1].raw_name, None);
+    // `+` survives RFC decoding, so the raw spelling equals the name and the
+    // form reading is carried separately.
+    assert_eq!(params[2].name, "private+key");
+    assert_eq!(params[2].form_name.as_deref(), Some("private key"));
+    assert_eq!(params[2].raw_name, None);
 }
 
 #[test]

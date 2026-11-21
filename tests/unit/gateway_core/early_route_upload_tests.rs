@@ -515,6 +515,32 @@ async fn a_hidden_provider_query_token_undecides_query_rules() {
         let auth = built_in(name, minimal_plugin_config(name));
         assert!(!auth.modifies_request_query(), "{name}");
     }
+
+    // `oauth2_introspection` strips an accepted token from EVERY provider's
+    // configured locations, so a hiding header provider beside a forwarding
+    // query provider still rewrites the query.
+    let mut config = minimal_plugin_config("oauth2_introspection");
+    let header_provider = json!({
+        "introspection_endpoint": "http://127.0.0.1:9/introspect",
+        "client_auth": {"method": "none"},
+        "from_headers": [{"name": "x-opaque-token"}],
+        "forward_original_token": false
+    });
+    let query_provider = json!({
+        "introspection_endpoint": "http://127.0.0.1:9/introspect",
+        "client_auth": {"method": "none"},
+        "from_params": ["access_token"],
+        "forward_original_token": true
+    });
+    config["providers"] = json!([header_provider, query_provider]);
+    let auth = built_in("oauth2_introspection", config);
+    assert!(auth.modifies_request_query());
+    let plugins = [auth, dispatch(rules)];
+    assert_eq!(
+        preview(&plugins, &request("/soap", &[])),
+        Some(9000),
+        "the hiding header provider may strip the query provider's token copy"
+    );
 }
 
 #[tokio::test]

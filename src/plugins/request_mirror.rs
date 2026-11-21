@@ -1244,27 +1244,52 @@ impl MirrorRouteCredentials {
         let outbound_query = ctx
             .outbound_query_string()
             .filter(|outbound| Some(*outbound) != raw_query);
-        for query in [raw_query, outbound_query].into_iter().flatten() {
-            for pair in query.split('&').filter(|pair| !pair.is_empty()) {
-                let (raw_name, raw_value) = pair.split_once('=').unwrap_or((pair, ""));
-                if matches!(
-                    classify_mirror_query_name(raw_name, query_patterns, &query_names),
-                    MirrorQueryNameDecision::NonSensitive
-                ) {
-                    continue;
-                }
-                push(&mut value_digests, raw_value.as_bytes());
-                // Without a `%` the percent-decoded form is the raw bytes, and
-                // without a `+` the form-decoded form is the percent-decoded
-                // one, so those digests would only repeat an earlier one.
-                if raw_value.contains('%') {
-                    let decoded: Vec<u8> = percent_decode_str(raw_value).collect();
-                    push(&mut value_digests, &decoded);
-                }
-                if raw_value.contains('+') {
-                    let form = raw_value.replace('+', " ");
-                    let form_decoded: Vec<u8> = percent_decode_str(&form).collect();
-                    push(&mut value_digests, &form_decoded);
+        fn push_query_value(digests: &mut Vec<[u8; 32]>, raw_value: &str) {
+            push(digests, raw_value.as_bytes());
+            // Without a `%` the percent-decoded form is the raw bytes, and
+            // without a `+` the form-decoded form is the percent-decoded one,
+            // so those digests would only repeat an earlier one.
+            if raw_value.contains('%') {
+                let decoded: Vec<u8> = percent_decode_str(raw_value).collect();
+                push(digests, &decoded);
+            }
+            if raw_value.contains('+') {
+                let form = raw_value.replace('+', " ");
+                let form_decoded: Vec<u8> = percent_decode_str(&form).collect();
+                push(digests, &form_decoded);
+            }
+        }
+        {
+            // Marked names also match under the outbound strip's raw /
+            // percent-decoded / form-decoded rule (GHSA-c259-vchc-3vgr).
+            let marked: std::collections::HashSet<&str> =
+                query_names.iter().map(String::as_str).collect();
+            let name_is_credential = |raw_name: &str| {
+                crate::plugins::utils::query::query_name_matches_any(raw_name, &marked)
+                    || !matches!(
+                        classify_mirror_query_name(raw_name, query_patterns, &query_names),
+                        MirrorQueryNameDecision::NonSensitive
+                    )
+            };
+            for query in [raw_query, outbound_query].into_iter().flatten() {
+                for pair in query.split('&').filter(|pair| !pair.is_empty()) {
+                    let (raw_name, raw_value) = pair.split_once('=').unwrap_or((pair, ""));
+                    if name_is_credential(raw_name) {
+                        push_query_value(&mut value_digests, raw_value);
+                    }
+                    // A `;`-splitting backend reads each sub-pair as a
+                    // parameter of its own (issue #6579): a credential that
+                    // rides behind a `;` supplies value provenance too, so a
+                    // copy under a benign name is still withheld.
+                    if pair.contains(';') {
+                        for sub_pair in pair.split(';') {
+                            let (sub_name, sub_value) =
+                                sub_pair.split_once('=').unwrap_or((sub_pair, ""));
+                            if name_is_credential(sub_name) {
+                                push_query_value(&mut value_digests, sub_value);
+                            }
+                        }
+                    }
                 }
             }
         }

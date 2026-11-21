@@ -319,22 +319,21 @@ fn header_source_is_chain_credential(ctx: &RequestContext, name: &str) -> bool {
 /// exactly as `RequestContext::materialize_query_params` does. Built once per
 /// request, only when a template reads `$(query.<name>)`.
 ///
-/// A pair whose `;`-separated sub-pair names an authentication-marked query
-/// credential is unavailable (issue #6579, GHSA-c259-vchc-3vgr): the outbound
-/// strip removes that whole `&` segment, so a template reading the carrier
-/// must not copy the embedded credential into another field. Matching uses
-/// the outbound strip's own raw-or-decoded sub-pair rule.
+/// An occurrence the outbound credential strip removes is unavailable
+/// (issue #6579, GHSA-c259-vchc-3vgr): one whose own name or any `;`
+/// sub-pair names an authentication-marked query credential under the
+/// strip's raw / percent-decoded / form-decoded rule
+/// ([`super::utils::query::query_pair_names_any`]). A template must not copy
+/// such a value into another field. A blocked occurrence also retires any
+/// earlier one under the same decoded name, so last-occurrence-wins holds and
+/// the template is unresolved unless a later clean occurrence follows.
 fn original_query_params(ctx: &RequestContext) -> HashMap<String, String> {
     use percent_encoding::percent_decode_str;
     let mut params = HashMap::new();
     let Some(raw) = ctx.raw_query_string() else {
         return params;
     };
-    let marked_credentials: HashSet<&str> = if raw.contains(';') {
-        marked_query_credential_names(ctx).collect()
-    } else {
-        HashSet::new()
-    };
+    let marked_credentials: HashSet<&str> = marked_query_credential_names(ctx).collect();
     for pair in raw.split('&') {
         if pair.is_empty() {
             continue;
@@ -342,11 +341,8 @@ fn original_query_params(ctx: &RequestContext) -> HashMap<String, String> {
         let (name, value) = pair.split_once('=').unwrap_or((pair, ""));
         let name = percent_decode_str(name).decode_utf8_lossy().into_owned();
         if !marked_credentials.is_empty()
-            && super::utils::query::semicolon_sub_pair_names_any(pair, &marked_credentials)
+            && super::utils::query::query_pair_names_any(pair, &marked_credentials)
         {
-            // Last occurrence wins: a blocked occurrence also retires any
-            // earlier one, so the template is unresolved unless a later clean
-            // occurrence follows.
             params.remove(&name);
             continue;
         }

@@ -7050,6 +7050,36 @@ async fn query_pair_reusing_a_credential_value_is_withheld_from_the_mirror() {
     );
 }
 
+/// GHSA-c259-vchc-3vgr: a credential whose only recognised location is a
+/// `;` sub-pair (marked by real `jwt_auth` discovery, forwarding left on)
+/// still supplies value provenance, so a copy under a benign name is withheld
+/// alongside the dropped carrier segment. Covers a raw-spelling mark too.
+#[tokio::test]
+async fn query_pair_reusing_a_semicolon_alias_value_is_withheld_from_the_mirror() {
+    for (lookup, raw_query) in [
+        (
+            "query:wsid",
+            "carrier=;wsid=alias-value-0123456789&tracking=alias-value-0123456789&x=1",
+        ),
+        (
+            "query:workspace%2Dslot",
+            "carrier=;workspace%2Dslot=alias-value-0123456789&tracking=alias-value-0123456789&x=1",
+        ),
+    ] {
+        let jwt = ferrum_edge::plugins::jwt_auth::JwtAuth::new(&json!({"token_lookup": lookup}))
+            .expect("valid jwt_auth config");
+        let mut ctx = make_ctx_with_proxy();
+        ctx.set_raw_query_string(raw_query.to_string());
+        ctx.materialize_query_params();
+        jwt.mark_query_credentials_for_redaction(&mut ctx);
+        let line = capture_mirror_request_line(&mut ctx).await;
+        assert!(
+            line.contains("?x=1 ") && !line.contains("alias-value"),
+            "the alias value and its benign-named copy must be withheld: {lookup}: {line}"
+        );
+    }
+}
+
 /// A credential's percent- and form-decoded forms are still recognised under
 /// a renamed, non-sensitive name. Decoded digests are skipped only when the
 /// raw value has no `%` (percent-decoding is the identity) or no `+` (the form

@@ -3836,3 +3836,50 @@ async fn query_template_blocked_carrier_keeps_last_occurrence_semantics() {
         }
     }
 }
+
+/// GHSA-c259-vchc-3vgr: the template snapshot uses the outbound strip's own
+/// raw / percent-decoded / form-decoded name rule for top-level names as well
+/// as `;` sub-pairs. With the literal escaped configured name
+/// `workspace%2Dslot`, a top-level occurrence under that raw spelling is the
+/// marked credential, so `$(query.workspace-slot)` must not copy it.
+#[tokio::test]
+async fn query_template_never_copies_a_raw_spelling_marked_credential() {
+    use ferrum_edge::plugins::request_transformer::RULE_SKIPPED_METADATA_KEY;
+
+    let jwt = ferrum_edge::plugins::jwt_auth::JwtAuth::new(&json!({
+        "token_lookup": "query:workspace%2Dslot",
+        "hide_credentials": true
+    }))
+    .unwrap();
+    for (operation, target) in [("update", "header"), ("add", "query")] {
+        let plugin = RequestTransformer::new(&json!({
+            "rules": [{"operation": operation, "target": target, "key": "x-copied", "value": "$(query.workspace-slot)"}]
+        }))
+        .unwrap();
+        let mut ctx = make_ctx();
+        ctx.set_raw_query_string(
+            "carrier=;workspace%2Dslot=raw-secret&workspace%2Dslot=raw-secret&page=1".to_string(),
+        );
+        ctx.materialize_query_params();
+        jwt.mark_query_credentials_for_redaction(&mut ctx);
+        assert!(
+            ctx.metadata
+                .contains_key("auth.strip_query_param.workspace%2Dslot")
+        );
+
+        let mut headers: HashMap<String, String> = HashMap::new();
+        plugin.before_proxy(&mut ctx, &mut headers).await;
+        assert!(!headers.contains_key("x-copied"), "{target}");
+        if target == "header" {
+            assert_eq!(
+                ctx.metadata
+                    .get(RULE_SKIPPED_METADATA_KEY)
+                    .map(String::as_str),
+                Some("template_unresolved")
+            );
+        }
+        let forwarded = ferrum_edge::_test_support::effective_backend_query_string_for_test(&ctx);
+        assert!(!forwarded.contains("raw-secret"), "{target}: {forwarded}");
+        assert!(!forwarded.contains("x-copied"), "{target}: {forwarded}");
+    }
+}

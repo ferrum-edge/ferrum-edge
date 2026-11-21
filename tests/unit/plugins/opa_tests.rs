@@ -537,7 +537,10 @@ async fn opa_delegate_mode_redacts_a_raw_spelling_auth_marked_alias() {
     }))
     .expect("a query name with a literal escape is admitted");
     let mut ctx = make_ctx();
-    ctx.set_raw_query_string("carrier=;workspace%2Dslot=raw-alias-secret&page=1".to_string());
+    ctx.set_raw_query_string(
+        "carrier=;workspace%2Dslot=raw-alias-secret&workspace%2Dslot=top-level-secret&page=1"
+            .to_string(),
+    );
     ctx.materialize_query_params();
     jwt.mark_query_credentials_for_redaction(&mut ctx);
     assert!(
@@ -550,6 +553,9 @@ async fn opa_delegate_mode_redacts_a_raw_spelling_auth_marked_alias() {
     let payload = received_opa_payload(&server).await;
     let rendered = serde_json::to_string(&payload).unwrap();
     assert!(!rendered.contains("raw-alias-secret"), "{rendered}");
+    // The top-level occurrence under the same raw spelling is the same
+    // credential. `query_pairs` (asserted below) carries only decoded names.
+    assert!(!rendered.contains("top-level-secret"), "{rendered}");
     assert_eq!(
         payload["input"]["query_pairs"],
         json!([{"name": "page", "value": "1", "bare": false}])
