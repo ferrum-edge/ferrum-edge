@@ -4015,8 +4015,8 @@ UDP+DTLS streams via certificate-based consumer mapping.
 | `disallowed_consumers` | String[] | `[]` | Consumer usernames or, with `allow_authenticated_identity`, external principals explicitly denied. Takes precedence over every allow rule. Entries match byte-for-byte (no trimming), must contain a non-whitespace value, and may be up to 4096 characters so JWT/OIDC/SPIFFE-style principals are not constrained by the 255-character gateway Consumer username ceiling. An external principal above the 512-byte authenticated-principal limit is rejected during authentication, so entries longer than that can never match. |
 | `allowed_groups` | String[] | (omitted) | ACL group names explicitly allowed. Matches if any of the consumer's `acl_groups` appears in this list. Omit it for no group allow check; an explicitly empty array is rejected. Entries match byte-for-byte (no trimming), must contain a non-whitespace value, and are at most 255 Unicode characters (`chars().count()`, matching JSON Schema `maxLength`). |
 | `disallowed_groups` | String[] | `[]` | ACL group names explicitly denied. Rejects even when the username is in `allowed_consumers`. Entries match byte-for-byte (no trimming), must contain a non-whitespace value, and are at most 255 Unicode characters (`chars().count()`, matching JSON Schema `maxLength`). |
-| `allowed_external_identities` | Object[] | (omitted) | Exact unmapped external principals that are allowed: each entry is `{identity, mechanism?}`. `identity` matches the external identity string byte-for-byte (non-whitespace, at most 4096 characters); `mechanism`, when set, restricts the entry to identities committed by that built-in mechanism (`jwks_auth`, `ldap_auth`, `oauth2_introspection`, `oidc_relying_party`, or `soap_ws_security`). The narrow alternative to `allow_authenticated_identity`, and cannot be combined with it. Omit it for no external allow-list; an explicitly empty array is rejected. |
-| `disallowed_external_identities` | Object[] | `[]` | Exact unmapped external principals that are denied, same entry shape. A `mechanism`-scoped entry revokes the principal only as verified by that mechanism, so an equal subject string from another mechanism is unaffected. Takes precedence over every allow rule. |
+| `allowed_external_identities` | Object[] | (omitted) | Exact unmapped external principals that are allowed: each entry is `{identity, mechanism?, authority?}`. `identity` matches the external identity string byte-for-byte (non-whitespace, at most 4096 characters); `mechanism`, when set, restricts the entry to identities committed by that built-in mechanism (`jwks_auth`, `ldap_auth`, `oauth2_introspection`, `oidc_relying_party`, or `soap_ws_security`); `authority`, when set, restricts it to identities committed with that verifying authority (a 64-character hex realm authority digest, see below). The narrow alternative to `allow_authenticated_identity`, and cannot be combined with it. Omit it for no external allow-list; an explicitly empty array is rejected. |
+| `disallowed_external_identities` | Object[] | `[]` | Exact unmapped external principals that are denied, same entry shape. A `mechanism`-scoped entry revokes the principal only as verified by that mechanism, and an `authority`-scoped entry only as verified by that authority, so an equal subject string from another mechanism or provider is unaffected. Takes precedence over every allow rule. |
 | `allow_authenticated_identity` | bool | `false` | Allows requests with a meaningful, non-whitespace `ctx.authenticated_identity` even when no Consumer was mapped. Cannot be combined with an allow-list (see below). |
 
 At least one of the above must be configured (non-empty list or `allow_authenticated_identity: true`). Unknown/misspelled config keys are rejected so a typo cannot silently weaken the policy.
@@ -4042,13 +4042,34 @@ bypassing the deny-list.
 **External identity realms.** An external subject names a user only within the
 authority that verified it, so `allowed_external_identities` and
 `disallowed_external_identities` entries can be scoped with `mechanism` to the
-authentication plugin that committed the identity. Scoping is by mechanism only:
-two providers of the same plugin (two `jwks_auth` issuers, say) share one
-mechanism, so an entry cannot tell them apart. An identity with no verified realm
-— every TCP/UDP stream identity, or one a custom plugin set without the
-authentication commit boundary — never matches a `mechanism`-scoped allow entry
-and always matches a `mechanism`-scoped deny entry, so scoping can only narrow
-admission. Entries without `mechanism` match the identity from every mechanism.
+authentication plugin that committed the identity, and with `authority` to the
+exact verifying authority (issuer, key source, introspection endpoint, or
+directory). Two providers of the same plugin (two `jwks_auth` issuers, or two
+`oauth2_introspection` endpoints) share one mechanism, so `mechanism` alone cannot
+tell them apart: **on a route with more than one provider of a mechanism, bind
+`authority` on every external-identity rule**, or an equal subject asserted by any
+of those providers matches it.
+
+`authority` is the opaque 64-character hex realm authority digest the
+authentication boundary commits with the identity: the value `opa` reports as
+`input.consumer.realm.authority` (read it from OPA's decision log for a test
+request through each provider) and the plugin-trigger
+`external_identity_authority` predicate accepts. It is stable across reloads and
+replicas for the same provider configuration, and changes when the provider's
+issuer, key source, endpoint, or identity claim changes (for a provider that pins
+no `issuer`, the verified token or introspection-response `iss` is part of it). Hex is compared
+case-insensitively; any other value is rejected at config validation. A mechanism
+with a single authority commits no digest, so an `authority`-scoped allow entry
+never matches its identities. With both `mechanism` and `authority`, both must
+hold.
+
+Scoping can only narrow admission. An identity with no verified realm — every
+TCP/UDP stream identity, or one a custom plugin set without the authentication
+commit boundary — never matches a realm-scoped allow entry and always matches a
+realm-scoped deny entry. Likewise an `authority`-scoped allow entry never matches
+an identity committed without an authority, and an `authority`-scoped deny entry
+always matches one (it fails closed). Entries with neither `mechanism` nor
+`authority` match the identity from every realm.
 
 **An allow-list means "only these principals".** Once any allow-list is configured,
 a principal that matches none of them is denied. In particular, a policy whose only
@@ -4110,6 +4131,15 @@ config:
   disallowed_external_identities:
     - identity: "svc-reporting"
       mechanism: ldap_auth
+
+# Multi-provider jwks_auth route (corporate + partner issuer): admit `ops-admin`
+# only as the corporate issuer asserts it
+plugin_name: access_control
+config:
+  allowed_external_identities:
+    - identity: "ops-admin"
+      mechanism: jwks_auth
+      authority: "<64-hex realm authority digest of the corporate provider>"
 ```
 
 ### `opa`

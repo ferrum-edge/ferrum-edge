@@ -28,6 +28,24 @@ applied by editing the file (see [File Mode](#file-mode-ferrum_modefile)).
 
 ## Upgrading to the next release (unreleased)
 
+### `access_control` external-identity rules can bind the verifying authority (GHSA-r378-r7j8-2qm3)
+
+`allowed_external_identities` and `disallowed_external_identities` entries accept
+an optional `authority`: the 64-character hex realm authority digest of the
+provider that verified the identity (the value `opa` reports as
+`input.consumer.realm.authority`, the same encoding the plugin-trigger
+`external_identity_authority` predicate takes). An authority-scoped allow entry
+matches only an identity committed with that authority; an authority-scoped deny
+entry also matches an identity with no verified realm or no committed authority.
+Entries without `authority` behave as before.
+
+**Operator action:** on routes that authenticate through more than one provider
+of one mechanism (multi-provider `jwks_auth` or `oauth2_introspection`), a
+`mechanism`-only entry matches an equal subject from every one of those
+providers. Add `authority` to each external-identity entry that is meant for one
+provider. Older builds reject the new key, so upgrade every gateway node (CP and
+DPs together) before adding it.
+
 ### EastWestGateway passthrough legs now follow DestinationRules (#7424)
 
 An EastWestGateway data plane now applies DestinationRules to its
