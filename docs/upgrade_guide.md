@@ -28,6 +28,30 @@ applied by editing the file (see [File Mode](#file-mode-ferrum_modefile)).
 
 ## Upgrading to the next release (unreleased)
 
+### `;`-aliased query tokens are refused by `jwt_auth`, `jwks_auth`, and `oauth2_introspection` (GHSA-c259-vchc-3vgr)
+
+`jwt_auth` (`token_lookup: query:<name>`), `jwks_auth`, and
+`oauth2_introspection` (`providers[].from_params`) now apply the `key_auth`
+issue #6579 contract to query token locations. A request whose configured query
+name also appears as a `;`-separated sub-parameter (`?carrier=;token=...`, or a
+name such as `token;x`) is refused with `401`
+`{"error":"Ambiguous token query parameter"}` instead of being treated as
+carrying no token. For `jwks_auth` and `oauth2_introspection` an alias at any
+provider's query location is terminal for the whole instance, even when a
+valid token is also present in a header or `Authorization`. The alias is also
+marked for OPA and `request_mirror` redaction (including a raw spelling such as
+`workspace%2Dslot`, for a top-level occurrence as well as an alias), a copy of
+its value under another query name is withheld from `request_mirror`, a
+`request_transformer` `$(query.<name>)` template never copies a pair the
+credential strip removes, and it is removed from the forwarded query —
+including when another mechanism authenticates the request — under
+`jwt_auth` `hide_credentials: true` or a provider's
+`forward_original_token: false`.
+
+**Operator action:** none for ordinary clients. A client that sent a query
+token alongside a `;` sub-parameter of the same name must send the token as a
+normal `&`-separated parameter (or percent-encode a literal `;` as `%3B`).
+
 ### `access_control` external-identity rules can bind the verifying authority (GHSA-r378-r7j8-2qm3)
 
 `allowed_external_identities` and `disallowed_external_identities` entries accept

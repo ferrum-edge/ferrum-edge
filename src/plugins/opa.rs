@@ -533,6 +533,13 @@ impl Opa {
                 .form_name
                 .as_deref()
                 .is_some_and(|name| self.query_key_is_redacted(marked_credentials, name))
+            // The still-encoded spelling an auth plugin may have marked
+            // (`workspace%2Dslot`); compared only, never serialized
+            // (GHSA-c259-vchc-3vgr).
+            || param
+                .raw_name
+                .as_deref()
+                .is_some_and(|name| self.query_key_is_redacted(marked_credentials, name))
             || param
                 .semicolon_sub_names
                 .iter()

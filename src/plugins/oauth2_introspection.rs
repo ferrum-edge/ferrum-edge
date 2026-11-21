@@ -46,9 +46,10 @@ use super::utils::response_body::read_response_body_bounded;
 use super::utils::scope_role_check::{self, ScopeRoleRequirements};
 use super::utils::session_cookie::contains_unresolved_env_placeholder;
 use super::utils::token_extract::{
-    STRIP_QUERY_PARAM_METADATA_PREFIX, TokenHeaderLocation, TokenLocation, TokenLocationExtract,
-    extract_authorization_bearer, extract_from_location, mark_present_query_credential_locations,
-    push_stripped_credential_header_names,
+    AMBIGUOUS_QUERY_TOKEN_BODY, STRIP_QUERY_PARAM_METADATA_PREFIX, TokenHeaderLocation,
+    TokenLocation, TokenLocationExtract, extract_authorization_bearer, extract_from_location,
+    mark_provider_query_credential_locations, push_stripped_credential_header_names,
+    query_locations_have_semicolon_alias,
 };
 use super::{PluginResult, RequestContext, strip_auth_scheme};
 
@@ -121,6 +122,12 @@ pub struct Oauth2Introspection {
     consumer_header_claim: Option<String>,
     strip_authorization_on_success: bool,
     has_custom_query_token_locations: bool,
+    /// Some provider does not forward the original token and some provider
+    /// has a query token location, so this instance may strip a query
+    /// parameter before the backend request: an accepted token (every
+    /// configured occurrence, across providers) or a `;` alias marked during
+    /// discovery (GHSA-c259-vchc-3vgr).
+    strips_query_tokens: bool,
     request_headers_to_redact: Vec<String>,
     allow_provider_fanout: bool,
     /// Complete gateway-owned `claim_headers` destination set across every
@@ -592,6 +599,19 @@ impl Oauth2Introspection {
         let strip_authorization_on_success = providers
             .iter()
             .any(|provider| !provider.forward_original_token);
+        // Instance-wide: a provider that hides its accepted token strips every
+        // configured occurrence of it, including another provider's query
+        // location, so any non-forwarding provider plus any query location
+        // may rewrite the query.
+        let strips_query_tokens = providers
+            .iter()
+            .any(|provider| !provider.forward_original_token)
+            && providers.iter().any(|provider| {
+                provider
+                    .token_locations
+                    .iter()
+                    .any(|location| matches!(location, TokenLocation::QueryParam(_)))
+            });
         let has_custom_query_token_locations = providers.iter().any(|provider| {
             provider
                 .token_locations
@@ -639,6 +659,7 @@ impl Oauth2Introspection {
             consumer_header_claim,
             strip_authorization_on_success,
             has_custom_query_token_locations,
+            strips_query_tokens,
             request_headers_to_redact,
             allow_provider_fanout,
             claim_header_destinations,
@@ -1194,6 +1215,25 @@ impl Oauth2Introspection {
     }
 
     fn extract_credential(&self, ctx: &RequestContext) -> Oauth2ExtractedCredential {
+        // A `;`-aliased query token at ANY configured query location is
+        // terminal for this instance, before any header, `Authorization`, or
+        // fallback source is read (issue #6579, GHSA-c259-vchc-3vgr): a valid
+        // token elsewhere must not mask a credential Ferrum and a
+        // `;`-splitting backend read differently. With this rule, an
+        // accepted token can never leave an aliased copy behind for
+        // accepted-token stripping to miss.
+        if self.has_custom_query_token_locations
+            && query_locations_have_semicolon_alias(
+                ctx,
+                self.providers
+                    .iter()
+                    .flat_map(|provider| provider.token_locations.iter()),
+            )
+        {
+            return Oauth2ExtractedCredential::InvalidFormat(
+                AMBIGUOUS_QUERY_TOKEN_BODY.to_string(),
+            );
+        }
         let mut first_invalid_format = None;
         for (idx, provider) in self.providers.iter().enumerate() {
             for (location_idx, location) in provider.token_locations.iter().enumerate() {
@@ -1684,14 +1724,30 @@ impl super::Plugin for Oauth2Introspection {
         self.authenticate_request(ctx, consumer_index).await
     }
 
+    /// Mark every present query token location — in the decoded map or behind
+    /// a `;` sub-parameter — for policy redaction. A provider that does not
+    /// forward the original token also marks a `;` alias for removal here,
+    /// before multi-auth can stop at another mechanism (GHSA-c259-vchc-3vgr).
     fn mark_query_credentials_for_redaction(&self, ctx: &mut RequestContext) {
         for provider in &self.providers {
-            mark_present_query_credential_locations(ctx, &provider.token_locations);
+            mark_provider_query_credential_locations(
+                ctx,
+                &provider.token_locations,
+                provider.forward_original_token,
+            );
         }
     }
 
     fn request_headers_to_redact(&self) -> &[String] {
         &self.request_headers_to_redact
+    }
+
+    /// A provider that does not forward the original token strips every
+    /// configured query occurrence of the accepted token (across providers)
+    /// on success, and its own `;` aliases from the pre-authentication
+    /// discovery hook, whichever mechanism wins.
+    fn modifies_request_query(&self) -> bool {
+        self.strips_query_tokens
     }
 
     fn modifies_request_headers(&self) -> bool {

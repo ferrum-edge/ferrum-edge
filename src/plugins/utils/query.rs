@@ -157,7 +157,8 @@ pub struct CanonicalQueryParam {
     /// distinguishable in a lossless representation.
     pub bare: bool,
     /// Decoded names of this pair's `;`-separated sub-pairs, split on the
-    /// still-encoded bytes (issue #6579; see [`semicolon_sub_pair_names`]).
+    /// still-encoded bytes (issue #6579; see [`semicolon_sub_pair_names`]),
+    /// plus each sub-pair's raw spelling when it differs from every decoding.
     /// Empty unless the pair carries an unencoded `;`. A backend that also
     /// splits on `;` reads each of these as a parameter of its own, so
     /// credential redaction must consult them; a `%3B` is content and never
@@ -167,6 +168,13 @@ pub struct CanonicalQueryParam {
     /// `+` and that reading differs from [`Self::name`]. A form-decoding
     /// backend reads the parameter under this name, so redaction consults it.
     pub form_name: Option<String>,
+    /// The still-encoded name, when it differs from [`Self::name`] and
+    /// [`Self::form_name`] (for example `workspace%2Dslot`). Authentication
+    /// matches a configured name against the raw spelling as well as the
+    /// decodings ([`query_name_matches`]), so credential redaction consults it
+    /// (GHSA-c259-vchc-3vgr). Comparison only: policy payloads serialize
+    /// [`Self::name`], never this field.
+    pub raw_name: Option<String>,
 }
 
 /// Ordered, occurrence-complete, explicitly ambiguity-classified view of a
@@ -268,18 +276,21 @@ impl CanonicalQuery {
                         .into_owned()
                 }
             };
-            let semicolon_sub_names = semicolon_sub_pair_names(pair);
+            let semicolon_sub_names = semicolon_sub_pair_names_with_raw(pair);
             let form_name = if raw_name.contains('+') {
                 query_name_decodings(raw_name).into_iter().nth(1)
             } else {
                 None
             };
+            let raw_name = (raw_name != name && form_name.as_deref() != Some(raw_name))
+                .then(|| raw_name.to_string());
             params.push(CanonicalQueryParam {
                 name,
                 value,
                 bare,
                 semicolon_sub_names,
                 form_name,
+                raw_name,
             });
         }
 
@@ -401,6 +412,36 @@ pub fn semicolon_sub_pair_names(segment: &str) -> Vec<String> {
         .collect()
 }
 
+/// [`semicolon_sub_pair_names`] plus each sub-pair's raw spelling when it
+/// differs from that sub-pair's own decodings, in one linear pass.
+///
+/// Authentication matches a configured name against a sub-pair's raw spelling
+/// as well as its decodings (`query_has_semicolon_credential_alias`), so
+/// policy redaction must consult the same set (GHSA-c259-vchc-3vgr). A name
+/// with neither `%` nor `+` decodes to itself and is reported once without
+/// decoding. Entries are not deduplicated across sub-pairs; consumers only
+/// test membership.
+pub fn semicolon_sub_pair_names_with_raw(segment: &str) -> Vec<String> {
+    if !segment.contains(';') {
+        return Vec::new();
+    }
+    let mut names = Vec::new();
+    for sub_pair in segment.split(';') {
+        let raw_name = sub_pair.split_once('=').map_or(sub_pair, |(name, _)| name);
+        if !raw_name.contains('%') && !raw_name.contains('+') {
+            names.push(raw_name.to_string());
+            continue;
+        }
+        let decodings = query_name_decodings(raw_name);
+        let raw_differs = decodings.iter().all(|decoded| decoded != raw_name);
+        names.extend(decodings);
+        if raw_differs {
+            names.push(raw_name.to_string());
+        }
+    }
+    names
+}
+
 /// Whether a still-encoded `&`-separated query pair carries a parameter in
 /// `names` once a backend also splits it on `;` (issue #6579).
 ///
@@ -413,11 +454,87 @@ pub fn semicolon_sub_pair_names(segment: &str) -> Vec<String> {
 /// separately.
 pub fn semicolon_sub_pair_names_any(segment: &str, names: &HashSet<&str>) -> bool {
     segment.contains(';')
-        && (segment.split(';').any(|sub_pair| {
-            names.contains(sub_pair.split_once('=').map_or(sub_pair, |(name, _)| name))
-        }) || semicolon_sub_pair_names(segment)
-            .iter()
-            .any(|name| names.contains(name.as_str())))
+        && segment.split(';').any(|sub_pair| {
+            query_name_matches_any(
+                sub_pair.split_once('=').map_or(sub_pair, |(name, _)| name),
+                names,
+            )
+        })
+}
+
+/// The one query-name equivalence every credential consumer shares with the
+/// outbound strip ([`crate::proxy::query_string_after_plugin_strips`]): a
+/// still-encoded name reads as `name` by its raw spelling, its RFC 3986
+/// percent-decoding, or (with a raw `+`) its form decoding
+/// (GHSA-c259-vchc-3vgr). A name with neither `%` nor `+` decodes to itself
+/// under both readings, so only the raw comparison runs and nothing is
+/// allocated.
+pub fn query_name_matches(raw_name: &str, name: &str) -> bool {
+    raw_name == name
+        || ((raw_name.contains('%') || raw_name.contains('+'))
+            && query_name_decodings(raw_name)
+                .iter()
+                .any(|decoded| decoded == name))
+}
+
+/// [`query_name_matches`] against a set of names.
+pub fn query_name_matches_any(raw_name: &str, names: &HashSet<&str>) -> bool {
+    names.contains(raw_name)
+        || ((raw_name.contains('%') || raw_name.contains('+'))
+            && query_name_decodings(raw_name)
+                .iter()
+                .any(|decoded| names.contains(decoded.as_str())))
+}
+
+/// Whether a still-encoded `&`-separated query pair is an occurrence of a
+/// name in `names`: by its own name ([`query_name_matches_any`]) or by any
+/// `;` sub-pair ([`semicolon_sub_pair_names_any`]). This is exactly the set
+/// of pairs the outbound credential strip removes, so any consumer that must
+/// agree with that strip (policy redaction, templates, mirror provenance)
+/// uses this predicate.
+pub fn query_pair_names_any(pair: &str, names: &HashSet<&str>) -> bool {
+    let raw_name = pair.split_once('=').map_or(pair, |(name, _)| name);
+    query_name_matches_any(raw_name, names) || semicolon_sub_pair_names_any(pair, names)
+}
+
+/// Whether `raw_query` carries `name` as a `;`-separated sub-parameter that
+/// Ferrum's `&`-only parser does not see as that name (issue #6579 shape):
+/// `carrier=;api_key=k`, or `api_key;x=1` whose Ferrum name is `api_key;x`.
+///
+/// Every authentication plugin with a query credential location applies this
+/// one contract (GHSA-c259-vchc-3vgr): extraction refuses such a request as an
+/// invalid credential format, and the pre-authentication discovery hook marks
+/// the name for policy redaction and, when the plugin hides credentials, for
+/// removal from the forwarded query.
+///
+/// A sub-pair name matches by its raw spelling or by any decoding
+/// [`query_name_decodings`] reports, the same raw-or-decoded contract the
+/// outbound strip uses. The leading sub-pair of a segment is the segment's own
+/// parameter, already represented in the decoded map, unless the segment's
+/// NAME itself holds the `;`. Allocation-free unless the query contains a raw
+/// `;`.
+pub fn query_has_semicolon_credential_alias(raw_query: Option<&str>, name: &str) -> bool {
+    let Some(raw_query) = raw_query else {
+        return false;
+    };
+    if !raw_query.contains(';') {
+        return false;
+    }
+    raw_query.split('&').any(|segment| {
+        if !segment.contains(';') {
+            return false;
+        }
+        let ferrum_name = segment
+            .split_once('=')
+            .map_or(segment, |(pair_name, _)| pair_name);
+        let skip_leading = usize::from(!ferrum_name.contains(';'));
+        segment.split(';').skip(skip_leading).any(|sub_pair| {
+            let sub_name = sub_pair
+                .split_once('=')
+                .map_or(sub_pair, |(sub_name, _)| sub_name);
+            query_name_matches(sub_name, name)
+        })
+    })
 }
 
 /// Whether every `%` in `value` begins a complete `%HH` triplet.
@@ -613,11 +730,8 @@ impl OrderedQuery {
         }
         let before = self.pairs.len();
         self.pairs.retain(|pair| {
-            if names.contains(pair.raw_name.as_str())
-                || names.contains(pair.decoded_name.as_str())
-                || query_name_decodings(&pair.raw_name)
-                    .iter()
-                    .any(|name| names.contains(name.as_str()))
+            if names.contains(pair.decoded_name.as_str())
+                || query_name_matches_any(&pair.raw_name, names)
             {
                 return false;
             }
