@@ -28,6 +28,35 @@ applied by editing the file (see [File Mode](#file-mode-ferrum_modefile)).
 
 ## Upgrading to the next release (unreleased)
 
+### `access_control` external-identity rules can bind the verifying authority (GHSA-r378-r7j8-2qm3)
+
+`allowed_external_identities` and `disallowed_external_identities` entries accept
+an optional `authority`: the 64-character hex realm authority digest of the
+provider that verified the identity (the value `opa` reports as
+`input.consumer.realm.authority`, the same encoding the plugin-trigger
+`external_identity_authority` predicate takes). `jwks_auth`,
+`oauth2_introspection`, `ldap_auth`, and `oidc_relying_party` commit a digest for
+every identity, single-provider routes included; `soap_ws_security` commits none.
+An authority-scoped allow entry matches only an identity committed with that
+authority. An authority-scoped deny entry also matches an identity with no
+verified realm or no committed digest, unless the entry also names a `mechanism`
+and the identity came from a different one. Entries without `authority` behave
+as before.
+
+**Operator action:** on routes that authenticate through more than one provider
+of one mechanism (multi-provider `jwks_auth` or `oauth2_introspection`), a
+`mechanism`-only entry matches an equal subject from every one of those
+providers. Add `authority` to each external-identity entry that is meant for one
+provider. `oauth2_introspection` client credentials do not distinguish
+authorities. An introspection provider without an `issuer` pin commits one digest
+per returned `iss`, plus a base digest when `iss` is absent. Two such providers on
+the same endpoint and identity claim share a digest whenever the returned issuer
+is equal. Pin a distinct `issuer` (responses must then carry that `iss`) to give
+each provider exactly one authority; distinct endpoints separate providers, but an
+unpinned provider still commits one digest per returned `iss`, so cover each digest
+it commits with its own entry. Older builds reject the new key, so upgrade every gateway node (CP and
+DPs together) before adding it.
+
 ### `oidc_relying_party` post-login redirects are emitted in canonical form (GHSA-6rwj-gc4r-3jm9)
 
 After a successful OIDC callback, an accepted post-login target is now sent as
