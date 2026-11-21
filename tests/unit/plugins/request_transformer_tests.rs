@@ -3726,3 +3726,293 @@ async fn digest_retirement_folds_underscore_spellings() {
     assert!(!outbound.contains_key("content_digest"));
     assert!(!outbound.contains_key("Repr_Digest"));
 }
+
+// ---------------------------------------------------------------------------
+// GHSA-pq95-952r-2x32: duplicate-member and BOM-prefixed JSON request bodies.
+// ---------------------------------------------------------------------------
+
+fn privileged_field_stripper() -> Arc<dyn Plugin> {
+    Arc::new(
+        RequestTransformer::new(&json!({"rules": [
+            {"operation": "remove", "target": "body", "key": "user.role"},
+            {"operation": "rename", "target": "body", "key": "user.token", "new_key": "user.redacted"}
+        ]}))
+        .unwrap(),
+    )
+}
+
+fn json_request_headers() -> HashMap<String, String> {
+    HashMap::from([("content-type".to_string(), "application/json".to_string())])
+}
+
+fn bom(document: &[u8]) -> Vec<u8> {
+    [b"\xEF\xBB\xBF".as_slice(), document].concat()
+}
+
+fn assert_ambiguous_body_rejected(result: &ferrum_edge::plugins::PluginResult, case: &str) {
+    match result {
+        ferrum_edge::plugins::PluginResult::Reject {
+            status_code, body, ..
+        } => {
+            assert_eq!(*status_code, 400, "{case}");
+            assert!(
+                body.contains("duplicate JSON object member names"),
+                "{case}: {body}"
+            );
+            assert!(!body.contains("admin"), "{case}: no body byte is echoed");
+        }
+        other => panic!("{case}: an ambiguous JSON body must be refused, got {other:?}"),
+    }
+}
+
+/// Bodies whose JSON objects repeat a member name (an ancestor of a targeted
+/// leaf, a sibling elsewhere, an escaped spelling of the same name, BOM or no
+/// BOM), plus a document past the screen's depth budget.
+fn ambiguous_request_bodies() -> Vec<(&'static str, Vec<u8>)> {
+    vec![
+        (
+            "duplicate ancestor",
+            br#"{"user":{"role":"admin","token":"t0k"},"user":{"name":"a"}}"#.to_vec(),
+        ),
+        (
+            "BOM-prefixed duplicate ancestor",
+            bom(br#"{"user":{"role":"admin"},"user":{"name":"a"}}"#),
+        ),
+        (
+            "escaped duplicate ancestor",
+            br#"{"user":{"role":"admin"},"user":{"name":"a"}}"#.to_vec(),
+        ),
+        (
+            "escaped duplicate leaf",
+            br#"{"user":{"role":"admin","role":"viewer"}}"#.to_vec(),
+        ),
+        (
+            "unrelated sibling duplicate",
+            br#"{"user":{"role":"admin"},"a":1,"a":2}"#.to_vec(),
+        ),
+        (
+            "screen depth budget exhausted",
+            [
+                br#"{"user":{"role":"admin"},"deep":"#.as_slice(),
+                "[".repeat(300).as_bytes(),
+                "]".repeat(300).as_bytes(),
+                b"}".as_slice(),
+            ]
+            .concat(),
+        ),
+    ]
+}
+
+#[tokio::test]
+async fn ambiguous_json_body_is_refused_by_the_final_hook_not_forwarded() {
+    let plugin = privileged_field_stripper();
+    let headers = json_request_headers();
+    for (case, body) in ambiguous_request_bodies() {
+        let mut ctx = post_ctx();
+        assert!(
+            plugin
+                .transform_request_body_with_context(
+                    &mut ctx,
+                    &body,
+                    Some("application/json"),
+                    &headers
+                )
+                .await
+                .is_none(),
+            "{case}: the transform must not rewrite an ambiguous document"
+        );
+        let result = plugin
+            .on_final_request_body_with_context(&mut ctx, &headers, &body)
+            .await;
+        assert_ambiguous_body_rejected(&result, case);
+        // The latch is consumed: a second finalization does not reject again.
+        assert!(matches!(
+            plugin
+                .on_final_request_body_with_context(&mut ctx, &headers, &body)
+                .await,
+            ferrum_edge::plugins::PluginResult::Continue
+        ));
+    }
+}
+
+/// The production H1/H2 shape (transform and final hook on the compatibility
+/// clone) and the native H3 shape (both on the real context) refuse the
+/// request; an absent `Content-Type` is screened the same way because the body
+/// rules still parse it as JSON.
+#[tokio::test]
+async fn ambiguous_json_body_is_refused_on_h1_h2_and_h3_body_stages() {
+    let plugins = vec![privileged_field_stripper()];
+    for headers in [json_request_headers(), HashMap::new()] {
+        for (case, body) in ambiguous_request_bodies() {
+            let mut ctx = post_ctx();
+            let (_, result) =
+                ferrum_edge::_test_support::run_buffered_request_body_hook_round_trip_for_test(
+                    &plugins,
+                    &mut ctx,
+                    &headers,
+                    body.clone(),
+                )
+                .await;
+            assert_ambiguous_body_rejected(&result, &format!("H1/H2 {case}"));
+
+            let mut ctx = post_ctx();
+            let (_, result) =
+                ferrum_edge::_test_support::run_request_body_stage_with_context_for_test(
+                    &plugins, &mut ctx, &headers, &body,
+                )
+                .await;
+            assert_ambiguous_body_rejected(&result, &format!("H3 {case}"));
+        }
+    }
+}
+
+/// A later instance cannot launder the refusal: with two instances the first
+/// latches and the final stage still refuses.
+#[tokio::test]
+async fn ambiguous_json_body_is_refused_with_multiple_instances() {
+    let plugins = vec![
+        privileged_field_stripper(),
+        Arc::new(
+            RequestTransformer::new(&json!({"rules": [
+                {"operation": "add", "target": "body", "key": "added", "value": 1}
+            ]}))
+            .unwrap(),
+        ) as Arc<dyn Plugin>,
+    ];
+    let mut ctx = post_ctx();
+    let (_, result) =
+        ferrum_edge::_test_support::run_buffered_request_body_hook_round_trip_for_test(
+            &plugins,
+            &mut ctx,
+            &json_request_headers(),
+            br#"{"user":{"role":"admin"},"user":{}}"#.to_vec(),
+        )
+        .await;
+    assert_ambiguous_body_rejected(&result, "two instances");
+}
+
+/// The context-free compatibility hook has no rejection channel, so it must
+/// not return `None` (which forwards the original ambiguous bytes).
+#[tokio::test]
+async fn context_free_transform_never_forwards_an_ambiguous_body() {
+    let plugin = privileged_field_stripper();
+    let replacement = plugin
+        .transform_request_body(
+            br#"{"user":{"role":"admin"},"user":{}}"#,
+            Some("application/json"),
+            &json_request_headers(),
+        )
+        .await;
+    assert_eq!(replacement, Some(Vec::new()));
+}
+
+/// A BOM-prefixed document has its `remove` and `rename` rules applied; the
+/// backend receives the re-serialized document without the BOM.
+#[tokio::test]
+async fn bom_prefixed_json_body_has_remove_and_rename_applied() {
+    let plugins = vec![privileged_field_stripper()];
+    let body = bom(br#"{"user":{"role":"admin","token":"t0k","name":"a"}}"#);
+    for headers in [json_request_headers(), HashMap::new()] {
+        let mut ctx = post_ctx();
+        let (transformed, result) =
+            ferrum_edge::_test_support::run_buffered_request_body_hook_round_trip_for_test(
+                &plugins,
+                &mut ctx,
+                &headers,
+                body.clone(),
+            )
+            .await;
+        assert!(
+            matches!(result, ferrum_edge::plugins::PluginResult::Continue),
+            "got {result:?}"
+        );
+        assert!(!transformed.starts_with(b"\xEF\xBB\xBF"));
+        let rewritten: serde_json::Value =
+            serde_json::from_slice(&transformed).expect("the rewrite is JSON");
+        assert_eq!(rewritten, json!({"user": {"name": "a", "redacted": "t0k"}}));
+    }
+}
+
+/// Bytes that are not JSON at all keep their existing behavior: unchanged,
+/// `parse_error` published, and no refusal.
+#[tokio::test]
+async fn non_json_body_keeps_parse_error_behavior() {
+    use ferrum_edge::plugins::request_transformer::BODY_SKIPPED_METADATA_KEY;
+
+    let plugins = vec![privileged_field_stripper()];
+    for body in [
+        b"role=admin&role=viewer".to_vec(),
+        br#"{"user":{"role":"admin"},"user":"#.to_vec(),
+    ] {
+        let mut ctx = post_ctx();
+        let (transformed, result) =
+            ferrum_edge::_test_support::run_request_body_stage_with_context_for_test(
+                &plugins,
+                &mut ctx,
+                &HashMap::new(),
+                &body,
+            )
+            .await;
+        assert!(
+            matches!(result, ferrum_edge::plugins::PluginResult::Continue),
+            "got {result:?}"
+        );
+        assert_eq!(transformed, body);
+        assert_eq!(
+            ctx.metadata
+                .get(BODY_SKIPPED_METADATA_KEY)
+                .map(String::as_str),
+            Some("parse_error")
+        );
+    }
+}
+
+/// An instance with only header/query rules does not screen bodies at all: it
+/// does not claim the body, and a duplicate-member body passes through it.
+#[tokio::test]
+async fn header_and_query_only_instance_does_not_screen_bodies() {
+    let plugin: Arc<dyn Plugin> = Arc::new(
+        RequestTransformer::new(&json!({"rules": [
+            {"operation": "add", "target": "header", "key": "x-tagged", "value": "1"},
+            {"operation": "remove", "target": "query", "key": "debug"}
+        ]}))
+        .unwrap(),
+    );
+    assert!(!plugin.modifies_request_body());
+    let body = br#"{"user":{"role":"admin"},"user":{}}"#.to_vec();
+    let headers = json_request_headers();
+
+    let mut ctx = post_ctx();
+    assert!(
+        plugin
+            .transform_request_body_with_context(
+                &mut ctx,
+                &body,
+                Some("application/json"),
+                &headers
+            )
+            .await
+            .is_none()
+    );
+    assert!(matches!(
+        plugin
+            .on_final_request_body_with_context(&mut ctx, &headers, &body)
+            .await,
+        ferrum_edge::plugins::PluginResult::Continue
+    ));
+
+    let mut ctx = post_ctx();
+    let (transformed, result) =
+        ferrum_edge::_test_support::run_buffered_request_body_hook_round_trip_for_test(
+            &[plugin],
+            &mut ctx,
+            &headers,
+            body.clone(),
+        )
+        .await;
+    assert!(
+        matches!(result, ferrum_edge::plugins::PluginResult::Continue),
+        "got {result:?}"
+    );
+    assert_eq!(transformed, body);
+}

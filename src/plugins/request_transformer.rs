@@ -87,6 +87,19 @@
 //! preserved exactly across a rewrite (see
 //! `body_transform::apply_request_body_rules`).
 //!
+//! ## Ambiguous JSON bodies (GHSA-pq95-952r-2x32)
+//!
+//! Body rules strip one optional leading UTF-8 BOM and screen the candidate
+//! with the shared duplicate-member scanner before parsing (see
+//! `body_transform`). A document whose meaning is parser-dependent cannot be
+//! rewritten faithfully, and forwarding the original bytes would hand a
+//! first-key-wins backend the very field a `remove` / `rename` rule targets, so
+//! the request is refused with `400`. The transform hook has no rejection
+//! channel: it latches the refusal on a private `RequestContext` field and this
+//! plugin's `on_final_request_body_with_context` returns the rejection. Only an
+//! instance with enabled body rules screens; header/query-only instances never
+//! do.
+//!
 //! ## Non-application signal
 //!
 //! A rule or body pass that did not apply publishes a fixed, value-free
@@ -150,6 +163,7 @@ use super::utils::body_transform::{self, BodyRule, RequestBodyRulesOutcome};
 use super::utils::query::OrderedQuery;
 use super::utils::transformer_gate;
 use super::{MetadataMap, Plugin, PluginResult, RequestContext};
+use crate::util::json_dup_keys::JsonScanMemo;
 
 pub mod runtime_overlay;
 
@@ -1013,7 +1027,15 @@ impl RequestTransformer {
     }
 
     /// Shared body pass for the context-free and context-aware hooks.
-    fn transform_body(&self, body: &[u8], content_type: Option<&str>) -> BodyPass {
+    ///
+    /// `memo` is the request's duplicate-member screen memo when the caller has
+    /// a context; the context-free hook screens directly.
+    fn transform_body(
+        &self,
+        body: &[u8],
+        content_type: Option<&str>,
+        memo: Option<&mut JsonScanMemo>,
+    ) -> BodyPass {
         // The same immutable decision `before_proxy` used. A marker header and
         // its paired body removal therefore cannot straddle a gate flip.
         if !self.rules_enabled {
@@ -1027,10 +1049,17 @@ impl RequestTransformer {
         {
             return BodyPass::Skipped(BODY_SKIPPED_NON_JSON_CONTENT_TYPE);
         }
-        match body_transform::apply_request_body_rules(body, &self.body_rules) {
+        let outcome = match memo {
+            Some(memo) => {
+                body_transform::apply_request_body_rules_screened(body, &self.body_rules, memo)
+            }
+            None => body_transform::apply_request_body_rules(body, &self.body_rules),
+        };
+        match outcome {
             RequestBodyRulesOutcome::Replaced(bytes) => BodyPass::Replaced(bytes),
             RequestBodyRulesOutcome::Skipped(reason) => BodyPass::Skipped(reason.as_str()),
             RequestBodyRulesOutcome::Unchanged => BodyPass::Unchanged,
+            RequestBodyRulesOutcome::Ambiguous(reason) => BodyPass::Refused(reason),
         }
     }
 }
@@ -1039,6 +1068,22 @@ enum BodyPass {
     Replaced(Vec<u8>),
     Skipped(&'static str),
     Unchanged,
+    /// The JSON body is ambiguous (GHSA-pq95-952r-2x32); the request must be
+    /// refused rather than forwarded with the original bytes.
+    Refused(&'static str),
+}
+
+/// Fixed client-visible error for a request refused because its JSON body is
+/// ambiguous to the configured body rules (GHSA-pq95-952r-2x32). Never echoes
+/// body bytes or the screen's internal reason.
+const AMBIGUOUS_JSON_BODY_ERROR: &str = r#"{"error":"Request body contains duplicate JSON object member names or could not be screened for them"}"#;
+
+fn ambiguous_json_body_reject() -> PluginResult {
+    PluginResult::Reject {
+        status_code: 400,
+        body: AMBIGUOUS_JSON_BODY_ERROR.to_string(),
+        headers: HashMap::from([("content-type".to_string(), "application/json".to_string())]),
+    }
 }
 
 /// Whether `name` is a request field computed over the request content,
@@ -1321,9 +1366,16 @@ impl Plugin for RequestTransformer {
         content_type: Option<&str>,
         _request_headers: &std::collections::HashMap<String, String>,
     ) -> Option<Vec<u8>> {
-        match self.transform_body(body, content_type) {
+        match self.transform_body(body, content_type, None) {
             BodyPass::Replaced(bytes) => Some(bytes),
             BodyPass::Skipped(_) | BodyPass::Unchanged => None,
+            // This compatibility API has no rejection channel, and returning
+            // `None` would forward the ambiguous original bytes. Production
+            // always selects the context-aware hook below for an instance with
+            // body rules (`needs_final_request_body_context`), which refuses
+            // the request with `400`; an empty replacement is the fail-closed
+            // result for a context-free caller, as `ai_prompt_compressor` does.
+            BodyPass::Refused(_) => Some(Vec::new()),
         }
     }
 
@@ -1334,7 +1386,7 @@ impl Plugin for RequestTransformer {
         content_type: Option<&str>,
         _request_headers: &std::collections::HashMap<String, String>,
     ) -> Option<Vec<u8>> {
-        match self.transform_body(body, content_type) {
+        match self.transform_body(body, content_type, Some(&mut ctx.json_scan_memo)) {
             BodyPass::Replaced(bytes) => {
                 // A provisional final-header skip is superseded when a later
                 // header change made the body rewritable after all.
@@ -1347,7 +1399,37 @@ impl Plugin for RequestTransformer {
                 None
             }
             BodyPass::Unchanged => None,
+            BodyPass::Refused(reason) => {
+                // The body was not skipped: the request is refused. Latch the
+                // decision on a private field (never metadata, which a later
+                // plugin could clear) for `on_final_request_body_with_context`,
+                // and keep the original bytes — they never reach a backend.
+                debug!(
+                    reason,
+                    "request_transformer: refusing an ambiguous JSON request body"
+                );
+                ctx.metadata.remove(BODY_SKIPPED_METADATA_KEY);
+                ctx.request_transformer_ambiguous_body_refused = true;
+                None
+            }
         }
+    }
+
+    /// Return the refusal the body transform latched (GHSA-pq95-952r-2x32).
+    ///
+    /// Runs after every request-body transform on the same context the
+    /// transform used, on every dispatch ladder, before backend egress. The
+    /// latch is consumed so a retry or second finalization cannot inherit it.
+    async fn on_final_request_body_with_context(
+        &self,
+        ctx: &mut RequestContext,
+        _headers: &HashMap<String, String>,
+        _body: &[u8],
+    ) -> PluginResult {
+        if std::mem::take(&mut ctx.request_transformer_ambiguous_body_refused) {
+            return ambiguous_json_body_reject();
+        }
+        PluginResult::Continue
     }
 }
 

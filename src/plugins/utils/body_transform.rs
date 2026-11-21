@@ -14,6 +14,25 @@
 //!
 //! Used by `request_transformer` and `response_transformer` plugins to
 //! support `target: "body"` rules.
+//!
+//! ## Ambiguous and BOM-prefixed documents (GHSA-pq95-952r-2x32)
+//!
+//! One optional leading UTF-8 byte order mark is stripped before the body is
+//! parsed, so the rules apply to a BOM-prefixed document exactly as they do to
+//! the bare one; a rewritten document is re-serialized without the BOM.
+//!
+//! The (BOM-stripped) candidate is then screened with the shared bounded
+//! duplicate-member scanner ([`crate::util::json_dup_keys`]) before
+//! `serde_json` ever sees it. `serde_json` keeps the LAST of two same-named
+//! members while many downstream parsers keep the FIRST, so a rule evaluated
+//! over the collapsed value would leave the occurrence the next parser reads
+//! untouched. A document the screen cannot vouch for (duplicate member names
+//! compared after escape decoding, an invalid surrogate escape, or an exhausted
+//! scan budget) is reported as [`RequestBodyRulesOutcome::Ambiguous`] /
+//! [`BoundedBodyRulesOutcome::Ambiguous`] and the caller must refuse it rather
+//! than forward the original bytes. Bytes that are not JSON at all keep their
+//! existing parse-error handling. The screen runs only on the body-rule path,
+//! so an instance without body rules pays nothing.
 
 use std::borrow::Cow;
 
@@ -21,6 +40,20 @@ use serde::ser::{Serialize, SerializeMap, SerializeSeq, Serializer};
 use serde_json::value::RawValue;
 use serde_json::{Map, Value};
 use tracing::{debug, warn};
+
+use crate::util::json_dup_keys::{self, JsonScanMemo};
+
+/// The UTF-8 encoding of U+FEFF. RFC 8259 forbids emitting it but lets a
+/// parser ignore it, and many backend JSON parsers do.
+const UTF8_BOM: &[u8] = b"\xEF\xBB\xBF";
+
+/// Strip one optional leading UTF-8 byte order mark.
+///
+/// Exactly one is removed: a second BOM is document content that every JSON
+/// parser rejects, so it keeps its ordinary parse-error handling.
+pub(crate) fn strip_utf8_bom(body: &[u8]) -> &[u8] {
+    body.strip_prefix(UTF8_BOM).unwrap_or(body)
+}
 
 // ── Path parsing ──────────────────────────────────────────────────────────
 
@@ -546,6 +579,26 @@ pub enum RequestBodyRulesOutcome {
     /// Nothing to report: no rules, an empty body, or a rewrite that could not
     /// be serialized.
     Unchanged,
+    /// The body is a JSON document this gateway cannot evaluate faithfully —
+    /// duplicate object member names (compared after escape decoding, at any
+    /// depth), an invalid surrogate escape, or a document past the bounded
+    /// screen's budgets (GHSA-pq95-952r-2x32). No rule was applied, and the
+    /// caller must refuse the request instead of forwarding the original bytes.
+    /// The reason is a fixed-cardinality [`json_dup_keys`] string that never
+    /// echoes body bytes.
+    Ambiguous(&'static str),
+}
+
+/// Outcome of the response-side [`apply_body_rules_bounded`] pass.
+#[derive(Debug)]
+pub(crate) enum BoundedBodyRulesOutcome {
+    /// The ordinary bounded-construction outcome.
+    Construction(crate::plugins::BoundedResponseBodyConstruction),
+    /// The document's meaning is parser-dependent, or the bounded screen could
+    /// not vouch for it (see [`RequestBodyRulesOutcome::Ambiguous`]). No rule
+    /// was applied, and the caller must fail closed rather than forward the
+    /// original bytes.
+    Ambiguous(&'static str),
 }
 
 /// Internal result of one body-rule pass, before it is mapped onto the
@@ -553,6 +606,7 @@ pub enum RequestBodyRulesOutcome {
 enum BodyRulesPass {
     Construction(crate::plugins::BoundedResponseBodyConstruction),
     Skipped(BodyRulesSkipReason),
+    Ambiguous(&'static str),
 }
 
 /// Request-side body-rule pass that reports why a body was left unchanged.
@@ -568,10 +622,31 @@ enum BodyRulesPass {
 ///
 /// The request side keeps an unbounded construction ceiling; its bounds live
 /// on the request-body ceilings.
+///
+/// A leading UTF-8 BOM is stripped first, and a document the duplicate-member
+/// screen cannot vouch for returns [`RequestBodyRulesOutcome::Ambiguous`]
+/// (GHSA-pq95-952r-2x32). Production calls
+/// [`apply_request_body_rules_screened`] so the screen reuses the request's
+/// memo; this entry point screens directly.
 pub fn apply_request_body_rules(body: &[u8], rules: &[BodyRule]) -> RequestBodyRulesOutcome {
+    request_body_rules_outcome(run_body_rules(body, rules, usize::MAX, None))
+}
+
+/// [`apply_request_body_rules`] with the duplicate-member screen served by the
+/// request's [`JsonScanMemo`], so a body another governed plugin already
+/// screened is not scanned twice.
+pub(crate) fn apply_request_body_rules_screened(
+    body: &[u8],
+    rules: &[BodyRule],
+    memo: &mut JsonScanMemo,
+) -> RequestBodyRulesOutcome {
+    request_body_rules_outcome(run_body_rules(body, rules, usize::MAX, Some(memo)))
+}
+
+fn request_body_rules_outcome(pass: BodyRulesPass) -> RequestBodyRulesOutcome {
     use crate::plugins::BoundedResponseBodyConstruction;
 
-    match run_body_rules(body, rules, usize::MAX) {
+    match pass {
         BodyRulesPass::Construction(BoundedResponseBodyConstruction::Replaced(bytes)) => {
             RequestBodyRulesOutcome::Replaced(bytes)
         }
@@ -581,6 +656,7 @@ pub fn apply_request_body_rules(body: &[u8], rules: &[BodyRule]) -> RequestBodyR
             | BoundedResponseBodyConstruction::SizeLimitExceeded(_),
         ) => RequestBodyRulesOutcome::Unchanged,
         BodyRulesPass::Skipped(reason) => RequestBodyRulesOutcome::Skipped(reason),
+        BodyRulesPass::Ambiguous(reason) => RequestBodyRulesOutcome::Ambiguous(reason),
     }
 }
 
@@ -605,22 +681,60 @@ pub fn apply_request_body_rules(body: &[u8], rules: &[BodyRule]) -> RequestBodyR
 /// when a claimed rewrite exceeds the ceiling, or `CapacityRefused` for other
 /// construction failures — distinct from an ordinary semantic no-op
 /// ([`crate::plugins::BoundedResponseBodyConstruction::Unchanged`]).
+///
+/// A leading UTF-8 BOM is stripped before parsing, and a document the
+/// duplicate-member screen cannot vouch for returns
+/// [`BoundedBodyRulesOutcome::Ambiguous`] (GHSA-pq95-952r-2x32). `memo` is the
+/// request's [`JsonScanMemo`] when the caller has a context.
 pub(crate) fn apply_body_rules_bounded(
     body: &[u8],
     rules: &[BodyRule],
     ceiling: usize,
-) -> crate::plugins::BoundedResponseBodyConstruction {
-    match run_body_rules(body, rules, ceiling) {
-        BodyRulesPass::Construction(construction) => construction,
-        BodyRulesPass::Skipped(_) => crate::plugins::BoundedResponseBodyConstruction::Unchanged,
+    memo: Option<&mut JsonScanMemo>,
+) -> BoundedBodyRulesOutcome {
+    match run_body_rules(body, rules, ceiling, memo) {
+        BodyRulesPass::Construction(construction) => {
+            BoundedBodyRulesOutcome::Construction(construction)
+        }
+        BodyRulesPass::Skipped(_) => BoundedBodyRulesOutcome::Construction(
+            crate::plugins::BoundedResponseBodyConstruction::Unchanged,
+        ),
+        BodyRulesPass::Ambiguous(reason) => BoundedBodyRulesOutcome::Ambiguous(reason),
     }
 }
 
-fn run_body_rules(body: &[u8], rules: &[BodyRule], ceiling: usize) -> BodyRulesPass {
+fn run_body_rules(
+    body: &[u8],
+    rules: &[BodyRule],
+    ceiling: usize,
+    memo: Option<&mut JsonScanMemo>,
+) -> BodyRulesPass {
     use crate::plugins::BoundedResponseBodyConstruction;
 
     if rules.is_empty() || body.is_empty() {
         return BodyRulesPass::Construction(BoundedResponseBodyConstruction::Unchanged);
+    }
+
+    // One optional leading BOM is not part of the document: strip it so the
+    // rules apply to what a BOM-tolerant downstream parser reads, instead of
+    // failing the parse and forwarding the original bytes untouched
+    // (GHSA-pq95-952r-2x32). Every later step — the screen, the parse, and the
+    // number-lexeme scan — sees these same stripped bytes.
+    let body = strip_utf8_bom(body);
+
+    // Screen exactly the bytes `serde_json` is about to parse. A duplicate
+    // member collapses to its LAST value here while a first-key-wins parser
+    // reads the FIRST, so a rule could miss the occurrence the next hop acts on
+    // (GHSA-pq95-952r-2x32, GHSA-c78j-5w9p-cpq6). Ordinary malformed input the
+    // screen leaves alone keeps the parse-error handling below; an exhausted
+    // screen budget fails closed like a duplicate.
+    let ambiguity = match memo {
+        Some(memo) => memo.ambiguity(body),
+        None => json_dup_keys::slice_ambiguity(body),
+    };
+    if let Some(reason) = ambiguity {
+        debug!(reason, "body_transform: refusing an ambiguous JSON body");
+        return BodyRulesPass::Ambiguous(reason);
     }
 
     let mut json: Value = match serde_json::from_slice(body) {

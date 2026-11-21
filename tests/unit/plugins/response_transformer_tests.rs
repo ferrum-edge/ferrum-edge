@@ -3051,3 +3051,234 @@ async fn response_lexeme_preserving_rewrite_honours_the_retained_ceiling() {
         &mut ctx
     ));
 }
+
+// ---------------------------------------------------------------------------
+// GHSA-pq95-952r-2x32: duplicate-member and BOM-prefixed JSON response bodies.
+// ---------------------------------------------------------------------------
+
+fn sensitive_field_redactor() -> ResponseTransformer {
+    ResponseTransformer::new(&json!({"rules": [
+        {"operation": "remove", "target": "body", "key": "account.ssn"},
+        {"operation": "rename", "target": "body", "key": "account.secret", "new_key": "account.redacted"}
+    ]}))
+    .unwrap()
+}
+
+fn json_response_headers() -> HashMap<String, String> {
+    HashMap::from([("content-type".to_string(), "application/json".to_string())])
+}
+
+/// Response bodies whose JSON objects repeat a member name, including an
+/// escaped spelling of the same name and a document past the screen's depth
+/// budget. Every one holds a value a `remove` or `rename` rule targets.
+fn ambiguous_response_bodies() -> Vec<(&'static str, Vec<u8>)> {
+    vec![
+        (
+            "duplicate ancestor",
+            br#"{"account":{"ssn":"hunter2","secret":"hunter2"},"account":{"id":1}}"#.to_vec(),
+        ),
+        (
+            "escaped duplicate ancestor",
+            br#"{"account":{"ssn":"hunter2"},"account":{"id":1}}"#.to_vec(),
+        ),
+        (
+            "escaped duplicate leaf",
+            br#"{"account":{"ssn":"hunter2","ssn":"x"}}"#.to_vec(),
+        ),
+        (
+            "screen depth budget exhausted",
+            [
+                br#"{"account":{"ssn":"hunter2"},"deep":"#.as_slice(),
+                "[".repeat(300).as_bytes(),
+                "]".repeat(300).as_bytes(),
+                b"}".as_slice(),
+            ]
+            .concat(),
+        ),
+    ]
+}
+
+#[tokio::test]
+async fn ambiguous_json_response_is_refused_in_the_final_client_visible_phase() {
+    let plugin = sensitive_field_redactor();
+    let headers = json_response_headers();
+    for (case, body) in ambiguous_response_bodies() {
+        let mut ctx = make_ctx();
+        assert!(!plugin.enforces_final_client_visible_response_body(&ctx));
+        assert!(
+            plugin
+                .transform_response_body_with_context(
+                    &mut ctx,
+                    &body,
+                    Some("application/json"),
+                    &headers
+                )
+                .await
+                .is_none(),
+            "{case}: the transform must not rewrite an ambiguous document"
+        );
+        assert!(
+            plugin.enforces_final_client_visible_response_body(&ctx),
+            "{case}: the refusal must enrol the final client-visible phase"
+        );
+        match plugin
+            .finalize_client_visible_response_body(&mut ctx, 200, &headers, &body)
+            .await
+        {
+            PluginResult::Reject {
+                status_code, body, ..
+            } => {
+                assert_eq!(status_code, 502, "{case}");
+                assert!(!body.contains("hunter2"), "{case}");
+            }
+            other => panic!("{case}: expected a 502 refusal, got {other:?}"),
+        }
+        assert!(
+            !plugin.enforces_final_client_visible_response_body(&ctx),
+            "{case}: the refusal is consumed once"
+        );
+    }
+}
+
+/// The real buffered backend funnel (the body phase the H1/H2, buffered gRPC,
+/// native H3, and H3 bridge paths share) never publishes the ambiguous bytes.
+#[tokio::test]
+async fn ambiguous_json_backend_response_is_replaced_not_forwarded() {
+    let plugins: Vec<Arc<dyn Plugin>> = vec![Arc::new(sensitive_field_redactor())];
+    for content_type in [Some("application/json"), None] {
+        for (case, original) in ambiguous_response_bodies() {
+            let mut ctx = make_ctx();
+            let mut status = 200;
+            let mut headers = HashMap::new();
+            if let Some(content_type) = content_type {
+                headers.insert("content-type".to_string(), content_type.to_string());
+            }
+            let mut body = bytes::Bytes::from(original);
+            stamp_original_response_metadata_for_test(&mut ctx, status, &headers);
+            let (replaced, _) = transform_buffered_response_body_with_deadline_full_for_test(
+                &plugins,
+                &mut ctx,
+                &mut status,
+                &mut headers,
+                &mut body,
+                None,
+                false,
+            )
+            .await;
+            assert!(replaced, "{case} ({content_type:?}): must be replaced");
+            assert_eq!(status, 502, "{case} ({content_type:?})");
+            let rendered = String::from_utf8_lossy(&body);
+            assert!(
+                !rendered.contains("hunter2"),
+                "{case} ({content_type:?}): protected value forwarded: {rendered}"
+            );
+            // A document past `serde_json`'s own recursion limit is already
+            // refused by the shared representation gate before any transform
+            // runs; every other case reaches this plugin's own refusal.
+            let gate_reason =
+                ferrum_edge::_test_support::representation_rejection_reason_for_test(&ctx);
+            assert!(
+                rendered.contains("duplicate JSON object member names")
+                    || gate_reason == Some("unparseable_document"),
+                "{case} ({content_type:?}): {rendered}"
+            );
+        }
+    }
+}
+
+/// The synthetic / short-circuit lifecycle runs the same final phase.
+#[tokio::test]
+async fn ambiguous_json_synthetic_response_is_replaced_not_forwarded() {
+    let plugins: Vec<Arc<dyn Plugin>> = vec![Arc::new(sensitive_field_redactor())];
+    let mut ctx = make_ctx();
+    let mut status = 200;
+    let mut headers = json_response_headers();
+    let mut body =
+        bytes::Bytes::from_static(br#"{"account":{"ssn":"hunter2"},"account":{"id":1}}"#);
+    apply_synthetic_response_body_hooks_for_test(
+        &plugins,
+        &mut ctx,
+        &mut status,
+        &mut headers,
+        &mut body,
+    )
+    .await;
+    assert_eq!(status, 502);
+    assert!(!String::from_utf8_lossy(&body).contains("hunter2"));
+}
+
+/// A BOM-prefixed document has its `remove` and `rename` rules applied by the
+/// enforcer; the rewrite carries no BOM. (On the buffered lifecycle the shared
+/// representation gate still refuses a BOM-prefixed claimed body first.)
+#[tokio::test]
+async fn bom_prefixed_json_response_has_remove_and_rename_applied() {
+    let plugin = sensitive_field_redactor();
+    let mut ctx = make_ctx();
+    let body = [
+        b"\xEF\xBB\xBF".as_slice(),
+        br#"{"account":{"ssn":"hunter2","secret":"s3","id":1}}"#.as_slice(),
+    ]
+    .concat();
+    let rewritten = plugin
+        .transform_response_body_with_context(
+            &mut ctx,
+            &body,
+            Some("application/json"),
+            &json_response_headers(),
+        )
+        .await
+        .expect("a BOM-prefixed document must be rewritten");
+    assert!(!rewritten.starts_with(b"\xEF\xBB\xBF"));
+    let rewritten: serde_json::Value = serde_json::from_slice(&rewritten).unwrap();
+    assert_eq!(rewritten, json!({"account": {"id": 1, "redacted": "s3"}}));
+    assert!(!plugin.enforces_final_client_visible_response_body(&ctx));
+}
+
+/// Bytes that are not JSON at all keep their existing behavior: unchanged and
+/// no refusal from this plugin.
+#[tokio::test]
+async fn non_json_response_body_is_left_unchanged_without_refusal() {
+    let plugin = sensitive_field_redactor();
+    for (content_type, body) in [
+        (None, b"ssn=hunter2&ssn=x".as_slice()),
+        (
+            Some("application/json"),
+            br#"{"account":{"ssn":"hunter2"},"account":"#.as_slice(),
+        ),
+        (Some("text/plain"), br#"{"a":1,"a":2}"#.as_slice()),
+    ] {
+        let mut ctx = make_ctx();
+        assert!(
+            plugin
+                .transform_response_body_with_context(&mut ctx, body, content_type, &HashMap::new())
+                .await
+                .is_none()
+        );
+        assert!(
+            !plugin.enforces_final_client_visible_response_body(&ctx),
+            "{content_type:?}: no refusal for a body the rules never parse"
+        );
+    }
+}
+
+/// An instance with only header rules does not screen response bodies.
+#[tokio::test]
+async fn header_only_response_transformer_does_not_screen_bodies() {
+    let plugin = ResponseTransformer::new(&json!({"rules": [
+        {"operation": "add", "target": "header", "key": "x-tagged", "value": "1"}
+    ]}))
+    .unwrap();
+    let mut ctx = make_ctx();
+    assert!(
+        plugin
+            .transform_response_body_with_context(
+                &mut ctx,
+                br#"{"account":{"ssn":"hunter2"},"account":{}}"#,
+                Some("application/json"),
+                &json_response_headers(),
+            )
+            .await
+            .is_none()
+    );
+    assert!(!plugin.enforces_final_client_visible_response_body(&ctx));
+}

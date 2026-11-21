@@ -16,6 +16,9 @@ fn apply(document: &Value, rules: Value) -> Option<Value> {
             Some(serde_json::from_slice(&bytes).expect("rewritten document is JSON"))
         }
         RequestBodyRulesOutcome::Skipped(_) | RequestBodyRulesOutcome::Unchanged => None,
+        RequestBodyRulesOutcome::Ambiguous(reason) => {
+            panic!("a serialized `Value` is never ambiguous: {reason}")
+        }
     }
 }
 
@@ -156,7 +159,9 @@ fn test_remove_preserves_member_order() {
                 expected,
                 "removing {key:?} must not reorder the remaining members"
             ),
-            RequestBodyRulesOutcome::Skipped(_) | RequestBodyRulesOutcome::Unchanged => {
+            RequestBodyRulesOutcome::Skipped(_)
+            | RequestBodyRulesOutcome::Unchanged
+            | RequestBodyRulesOutcome::Ambiguous(_) => {
                 panic!("removing {key:?} must rewrite the body")
             }
         }
@@ -536,4 +541,148 @@ fn parse_body_rules_rejects_empty_path_segments() {
         .is_ok(),
         "an escaped dot is part of one non-empty segment"
     );
+}
+
+// ---------------------------------------------------------------------------
+// GHSA-pq95-952r-2x32: BOM-prefixed and duplicate-member JSON bodies.
+// ---------------------------------------------------------------------------
+
+fn remove_and_rename_rules() -> Vec<ferrum_edge::plugins::utils::body_transform::BodyRule> {
+    parse_body_rules(&json!({ "rules": [
+        {"operation": "remove", "target": "body", "key": "user.role"},
+        {"operation": "rename", "target": "body", "key": "user.token", "new_key": "user.redacted"}
+    ]}))
+    .expect("valid body rules")
+}
+
+/// One leading UTF-8 BOM is stripped before parsing, so `remove` and `rename`
+/// apply to a BOM-prefixed document, and the rewrite carries no BOM.
+#[test]
+fn bom_prefixed_body_has_remove_and_rename_applied_without_the_bom() {
+    let mut body = b"\xEF\xBB\xBF".to_vec();
+    body.extend_from_slice(br#"{"user":{"role":"admin","token":"t0k","name":"a"}}"#);
+    match apply_request_body_rules(&body, &remove_and_rename_rules()) {
+        RequestBodyRulesOutcome::Replaced(bytes) => {
+            assert!(
+                !bytes.starts_with(b"\xEF\xBB\xBF"),
+                "the rewrite must not carry the BOM"
+            );
+            let rewritten: Value = serde_json::from_slice(&bytes).expect("rewrite is JSON");
+            assert_eq!(rewritten, json!({"user": {"name": "a", "redacted": "t0k"}}));
+        }
+        other => panic!("a BOM-prefixed document must be rewritten, got {other:?}"),
+    }
+}
+
+/// Only ONE BOM is stripped; a second one is document content no JSON parser
+/// accepts, so it keeps the ordinary parse-error handling.
+#[test]
+fn a_second_bom_keeps_parse_error_handling() {
+    let mut body = b"\xEF\xBB\xBF\xEF\xBB\xBF".to_vec();
+    body.extend_from_slice(br#"{"user":{"role":"admin"}}"#);
+    assert!(matches!(
+        apply_request_body_rules(&body, &remove_and_rename_rules()),
+        RequestBodyRulesOutcome::Skipped(
+            ferrum_edge::plugins::utils::body_transform::BodyRulesSkipReason::ParseError
+        )
+    ));
+}
+
+/// A duplicated ANCESTOR key whose earlier occurrence holds the targeted leaf
+/// must never come back as "unchanged" (which forwards the original bytes) or
+/// as a rewrite of the last-wins collapse: it is ambiguous, with or without a
+/// BOM, at any depth.
+#[test]
+fn duplicate_ancestor_key_is_ambiguous_not_unchanged() {
+    for body in [
+        br#"{"user":{"role":"admin","token":"t0k"},"user":{"name":"a"}}"#.to_vec(),
+        [
+            b"\xEF\xBB\xBF".as_slice(),
+            br#"{"user":{"role":"admin"},"user":{"name":"a"}}"#.as_slice(),
+        ]
+        .concat(),
+        br#"{"items":[{"user":{"role":"admin"},"user":{}}]}"#.to_vec(),
+        // A sibling duplicate elsewhere in the document is just as ambiguous.
+        br#"{"user":{"role":"admin"},"a":1,"a":2}"#.to_vec(),
+    ] {
+        match apply_request_body_rules(&body, &remove_and_rename_rules()) {
+            RequestBodyRulesOutcome::Ambiguous(reason) => assert_eq!(
+                reason, "JSON body contains duplicate object member names",
+                "the reason is the fixed scanner reason"
+            ),
+            other => panic!(
+                "{:?} must be refused as ambiguous, got {other:?}",
+                String::from_utf8_lossy(&body)
+            ),
+        }
+    }
+}
+
+/// Member names are compared after escape decoding: a literal name and a
+/// `\u`-escaped spelling of the same name collide.
+#[test]
+fn escaped_name_duplicates_collide() {
+    for body in [
+        br#"{"user":{"role":"admin"},"\u0075ser":{"name":"a"}}"#.as_slice(),
+        br#"{"user":{"role":"admin","\u0072ole":"viewer"}}"#.as_slice(),
+    ] {
+        assert!(
+            matches!(
+                apply_request_body_rules(body, &remove_and_rename_rules()),
+                RequestBodyRulesOutcome::Ambiguous(_)
+            ),
+            "{:?} must be ambiguous",
+            String::from_utf8_lossy(body)
+        );
+    }
+}
+
+/// A lone surrogate escape is accepted by some downstream parsers while
+/// `serde_json` rejects it, so it is refused rather than skipped as a parse
+/// error that would forward the original bytes.
+#[test]
+fn invalid_surrogate_escape_is_ambiguous() {
+    assert!(matches!(
+        apply_request_body_rules(br#"{"user":{"role":"\ud800"}}"#, &remove_and_rename_rules()),
+        RequestBodyRulesOutcome::Ambiguous(_)
+    ));
+}
+
+/// Bytes that are not JSON at all keep their existing parse-error handling.
+#[test]
+fn non_json_bodies_keep_parse_error_handling() {
+    for body in [
+        b"role=admin&role=viewer".as_slice(),
+        b"<user><role>admin</role></user>".as_slice(),
+        br#"{"user":{"role":"admin"},"user":"#.as_slice(),
+    ] {
+        assert!(
+            matches!(
+                apply_request_body_rules(body, &remove_and_rename_rules()),
+                RequestBodyRulesOutcome::Skipped(
+                    ferrum_edge::plugins::utils::body_transform::BodyRulesSkipReason::ParseError
+                )
+            ),
+            "{:?} must keep parse-error handling",
+            String::from_utf8_lossy(body)
+        );
+    }
+}
+
+/// An unambiguous document is still rewritten exactly as before.
+#[test]
+fn unambiguous_document_is_still_rewritten() {
+    match apply_request_body_rules(
+        br#"{"user":{"role":"admin","token":"t0k"},"users":[{"role":1},{"role":2}]}"#,
+        &remove_and_rename_rules(),
+    ) {
+        RequestBodyRulesOutcome::Replaced(bytes) => {
+            let rewritten: Value = serde_json::from_slice(&bytes).expect("rewrite is JSON");
+            assert_eq!(
+                rewritten,
+                json!({"user": {"redacted": "t0k"}, "users": [{"role": 1}, {"role": 2}]})
+            );
+        }
+        other => panic!("an unambiguous document must be rewritten, got {other:?}"),
+    }
 }

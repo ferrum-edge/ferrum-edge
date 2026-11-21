@@ -3126,6 +3126,19 @@ pub struct RequestContext {
     /// cannot safely produce bounded provider-visible bytes. Kept private so
     /// request metadata cannot spoof or clear the fail-closed decision.
     pub(crate) ai_prompt_compressor_marker_reject_status: Option<u16>,
+    /// Final-hook rejection staged by `request_transformer` when its JSON body
+    /// rules met a document whose meaning is parser-dependent (duplicate object
+    /// member names, an invalid surrogate escape, or an exhausted duplicate-key
+    /// screen budget; GHSA-pq95-952r-2x32). `transform_request_body*` has no
+    /// rejection channel, so it latches here and the plugin's
+    /// `on_final_request_body_with_context` refuses the request. Kept private so
+    /// request metadata cannot spoof or clear the fail-closed decision.
+    pub(crate) request_transformer_ambiguous_body_refused: bool,
+    /// Response counterpart of `request_transformer_ambiguous_body_refused`:
+    /// latched by `response_transformer`'s body transform, consumed (and turned
+    /// into a `502`) by its `finalize_client_visible_response_body`, so the
+    /// ambiguous backend bytes are never published (GHSA-pq95-952r-2x32).
+    pub(crate) response_transformer_ambiguous_body_refused: bool,
     /// Encoding selected by the built-in compression plugin for the response it
     /// will create at the gateway. This is authoritative ownership state for
     /// distinguishing planned gateway compression from an already-encoded
@@ -4875,6 +4888,8 @@ impl RequestContext {
             ai_prompt_compressor_classification_path: None,
             ai_prompt_compressor_wire_stats_started: false,
             ai_prompt_compressor_marker_reject_status: None,
+            request_transformer_ambiguous_body_refused: false,
+            response_transformer_ambiguous_body_refused: false,
             gateway_response_compression_algorithm: None,
             compression_request_decode_owner: None,
             compression_response_encode_owner: None,
@@ -6632,6 +6647,15 @@ impl RequestContext {
             ai_prompt_compressor_marker_reject_status: std::mem::take(
                 &mut self.ai_prompt_compressor_marker_reject_status,
             ),
+            // Transferred like the compressor's staged rejection: the body
+            // transform and the final hook that consumes it run on this clone.
+            request_transformer_ambiguous_body_refused: std::mem::take(
+                &mut self.request_transformer_ambiguous_body_refused,
+            ),
+            // Response-side state; the response lifecycle runs on the live
+            // context, never on this request-body clone.
+            response_transformer_ambiguous_body_refused: self
+                .response_transformer_ambiguous_body_refused,
             gateway_response_compression_algorithm: self.gateway_response_compression_algorithm,
             compression_request_decode_owner: self.compression_request_decode_owner,
             compression_response_encode_owner: self.compression_response_encode_owner,

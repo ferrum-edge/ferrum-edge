@@ -121,6 +121,24 @@
 //! names when the origin representation changed, not the gateway-authored
 //! rewrite. Parse failures and semantic no-ops return `None` from
 //! `transform_response_body` and leave origin metadata untouched.
+//!
+//! ## Ambiguous JSON bodies (GHSA-pq95-952r-2x32)
+//!
+//! Body rules strip one optional leading UTF-8 BOM and screen the candidate
+//! with the shared duplicate-member scanner before parsing (see
+//! `body_transform`). A backend document whose meaning is parser-dependent
+//! cannot be redacted faithfully: forwarding it would hand a first-key-wins
+//! client the very field a `remove` / `rename` rule targets. The context-aware
+//! transform therefore latches a refusal on a private `RequestContext` field
+//! and returns `None`; this plugin then participates in the authoritative
+//! `finalize_client_visible_response_body` phase — which runs after every
+//! semantic transform and before anything is published — and replaces the
+//! response with a fixed `502`. The ambiguous bytes are never forwarded.
+//!
+//! The shared buffered-response representation gate still refuses a
+//! BOM-prefixed claimed body before any transform runs (`unparseable_document`),
+//! because other claimants' enforcers do not strip a BOM; the gate being
+//! stricter than this enforcer is the safe direction.
 
 use async_trait::async_trait;
 use http::header::{HeaderName, HeaderValue};
@@ -130,7 +148,7 @@ use std::collections::hash_map::Entry;
 use tracing::debug;
 
 use super::response_representation::effective_response_media_type;
-use super::utils::body_transform::{self, BodyRule};
+use super::utils::body_transform::{self, BodyRule, BoundedBodyRulesOutcome};
 use super::utils::policy_digest;
 use super::utils::route_header_transform::RouteHeaderTransformOp;
 use super::utils::sse::is_text_event_stream_media_type;
@@ -227,6 +245,11 @@ pub struct ResponseTransformer {
 /// rather than letting an old digest match new semantics.
 const STATIC_POLICY_DIGEST_DOMAIN: &str = "ferrum.plugin.response_transformer.static.v1";
 
+/// Fixed client-visible error for a backend response refused because its JSON
+/// body is ambiguous to the configured body rules (GHSA-pq95-952r-2x32). Never
+/// echoes body bytes or the screen's internal reason.
+const AMBIGUOUS_JSON_RESPONSE_ERROR: &str = r#"{"error":"Backend response body contains duplicate JSON object member names or could not be screened for them"}"#;
+
 impl ResponseTransformer {
     /// Apply the configured JSON body rules, serializing the result through a
     /// sink bounded by `ceiling`.
@@ -235,16 +258,23 @@ impl ResponseTransformer {
     /// body. Both `Plugin` entry points reach it, so the ceiling-bounded
     /// construction cannot be bypassed by calling the context-free hook
     /// (GHSA-pwcm-6rh8-f2gh).
+    ///
+    /// `memo` is the request's duplicate-member screen memo when the caller has
+    /// a context. A document the screen cannot vouch for comes back as
+    /// [`BoundedBodyRulesOutcome::Ambiguous`] (GHSA-pq95-952r-2x32).
     fn apply_response_body_rules(
         &self,
         body: &[u8],
         content_type: Option<&str>,
         ceiling: usize,
-    ) -> crate::plugins::BoundedResponseBodyConstruction {
+        memo: Option<&mut crate::util::json_dup_keys::JsonScanMemo>,
+    ) -> BoundedBodyRulesOutcome {
         use crate::plugins::BoundedResponseBodyConstruction;
 
         if !self.rules_enabled {
-            return BoundedResponseBodyConstruction::Unchanged;
+            return BoundedBodyRulesOutcome::Construction(
+                BoundedResponseBodyConstruction::Unchanged,
+            );
         }
         // Framed gRPC is declined explicitly rather than left to fail inside
         // `apply_body_rules_bounded`. Both routes return `Unchanged`, but only the
@@ -256,9 +286,11 @@ impl ResponseTransformer {
             && (!body_transform::is_json_content_type(ct)
                 || body_transform::is_framed_grpc_content_type(ct))
         {
-            return BoundedResponseBodyConstruction::Unchanged;
+            return BoundedBodyRulesOutcome::Construction(
+                BoundedResponseBodyConstruction::Unchanged,
+            );
         }
-        body_transform::apply_body_rules_bounded(body, &self.body_rules, ceiling)
+        body_transform::apply_body_rules_bounded(body, &self.body_rules, ceiling, memo)
     }
 
     /// Whether THIS request's terminal metadata is policed over the buffered
@@ -1444,8 +1476,30 @@ impl Plugin for ResponseTransformer {
         // reserved before invoking this hook — so an amplifying rule set is
         // refused while the output is written rather than after a larger buffer
         // is already resident (GHSA-pwcm-6rh8-f2gh).
-        self.apply_response_body_rules(body, content_type, ctx.retained_response_body_ceiling())
-            .into_transform_option(ctx)
+        let ceiling = ctx.retained_response_body_ceiling();
+        match self.apply_response_body_rules(
+            body,
+            content_type,
+            ceiling,
+            Some(&mut ctx.json_scan_memo),
+        ) {
+            BoundedBodyRulesOutcome::Construction(construction) => {
+                construction.into_transform_option(ctx)
+            }
+            BoundedBodyRulesOutcome::Ambiguous(reason) => {
+                // `None` alone would read as "unchanged" and publish the
+                // ambiguous backend bytes. Latch the refusal on a private field
+                // for `finalize_client_visible_response_body`, which runs after
+                // every semantic transform and before publication
+                // (GHSA-pq95-952r-2x32).
+                debug!(
+                    reason,
+                    "response_transformer: refusing an ambiguous JSON response body"
+                );
+                ctx.response_transformer_ambiguous_body_refused = true;
+                None
+            }
+        }
     }
 
     /// The context-free transform. Every buffered call site reaches this through
@@ -1462,12 +1516,53 @@ impl Plugin for ResponseTransformer {
         content_type: Option<&str>,
         _response_headers: &HashMap<String, String>,
     ) -> Option<Vec<u8>> {
-        self.apply_response_body_rules(
+        match self.apply_response_body_rules(
             body,
             content_type,
             crate::proxy::response_buffer_budget::buffered_response_body_ceiling(0),
-        )
-        .into_option()
+            None,
+        ) {
+            BoundedBodyRulesOutcome::Construction(construction) => construction.into_option(),
+            // Without a context there is no channel to refuse the response, the
+            // same as a capacity refusal on this compatibility path
+            // (`into_option`). Every buffered production call site uses the
+            // context-aware hook, which fails closed with a `502`.
+            BoundedBodyRulesOutcome::Ambiguous(_) => None,
+        }
+    }
+
+    /// Participate in the authoritative final client-visible body phase only
+    /// for a response this instance's body transform refused as ambiguous
+    /// (GHSA-pq95-952r-2x32), so every other response pays one bool test.
+    fn enforces_final_client_visible_response_body(&self, ctx: &RequestContext) -> bool {
+        ctx.response_transformer_ambiguous_body_refused
+    }
+
+    /// Replace a response whose JSON body the transform refused as ambiguous.
+    ///
+    /// Rejecting and non-rewriting, like every participant in this phase: the
+    /// gateway-authored `502` replaces the backend representation, so neither
+    /// the ambiguous bytes nor any field a body rule targets reach the client.
+    /// The latch is consumed so a re-decision of the replacement does not
+    /// reject again.
+    async fn finalize_client_visible_response_body(
+        &self,
+        ctx: &mut RequestContext,
+        _response_status: u16,
+        _response_headers: &HashMap<String, String>,
+        _body: &[u8],
+    ) -> PluginResult {
+        if std::mem::take(&mut ctx.response_transformer_ambiguous_body_refused) {
+            return PluginResult::Reject {
+                status_code: 502,
+                body: AMBIGUOUS_JSON_RESPONSE_ERROR.to_string(),
+                headers: HashMap::from([(
+                    "content-type".to_string(),
+                    "application/json".to_string(),
+                )]),
+            };
+        }
+        PluginResult::Continue
     }
 
     fn on_response_body_transformed(
