@@ -5944,14 +5944,16 @@ where
             return Poll::Ready(None);
         }
         // If an earlier inner route request deadline has already elapsed,
-        // enforce it at dequeue before yielding any frame the outer
-        // authorization pump queued ahead of the deadline.
+        // atomically claim the shared terminal owner before yielding any frame
+        // the outer authorization pump queued ahead of the deadline. If the
+        // authorization pump already won ownership, fall through to
+        // `observe_expiry()` so wire terminal and accounting agree.
         if let Some((route_at, route_fired)) = this.inner_route_deadline.as_ref()
             && tokio::time::Instant::now() >= *route_at
-            && !this
+            && this
                 .authorization_terminal
                 .as_ref()
-                .is_some_and(AuthorizationTerminalOwner::expiry_claimed)
+                .is_none_or(AuthorizationTerminalOwner::claim_inner_terminal)
         {
             this.done = true;
             this.deadline = None;

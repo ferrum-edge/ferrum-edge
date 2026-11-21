@@ -356,6 +356,15 @@ impl AuthorizationTerminalOwner {
         self.claim(TERMINAL_INNER_COMPLETION) == AuthorizationTerminalOwnership::InnerCompletion
     }
 
+    /// Atomically claim this response for an inner gateway deadline terminal
+    /// (such as an earlier route request deadline) without consulting the
+    /// authorization clock. Returns `true` iff this call won the CAS from
+    /// `Open`; returns `false` if authorization expiry (or another terminal)
+    /// already claimed ownership.
+    pub(crate) fn claim_inner_terminal(&self) -> bool {
+        self.claim(TERMINAL_INNER_COMPLETION) == AuthorizationTerminalOwnership::InnerCompletion
+    }
+
     /// Claim this response for the authorization bound, returning the winner.
     /// Idempotent: a bound another observer already claimed stays claimed.
     pub(crate) fn claim_authorization_expiry(&self) -> AuthorizationTerminalOwnership {
@@ -917,9 +926,16 @@ async fn run_response_pump<B>(
             // CLAIM BEFORE CLOSING. The closure below is what wakes a parked
             // receiver, and every observer reads the owner before it reads the
             // channel — so the claim must be visible to anything the closure
-            // can wake. Idempotent: an observer that already claimed the bound
-            // from its own poll stays the winner.
-            terminal.claim_authorization_expiry();
+            // can wake. Only publish expiry accounting and close the connection
+            // if authorization actually won ownership (an inner route deadline
+            // or pre-deadline inner completion may have already claimed the
+            // terminal atomically).
+            if terminal.claim_authorization_expiry()
+                != AuthorizationTerminalOwnership::AuthorizationExpiry
+            {
+                drop(sender);
+                return;
+            }
             fired.store(true, Ordering::Release);
             // ONE latch, shared with the adapter outside this body, so the two
             // mechanisms record exactly one termination for the stream no

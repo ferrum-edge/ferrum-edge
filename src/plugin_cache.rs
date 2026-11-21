@@ -6350,7 +6350,12 @@ fn build_phase_data(plugins: &[Arc<dyn Plugin>]) -> PluginPhaseData {
         // Multiple instances (and a global plus a proxy-scoped instance) compose
         // to their minimum; a zero/disabled instance contributes nothing rather
         // than relaxing a sibling's active bound (`GHSA-xrfj-852f-645j`).
-        if !p.supports_request_header_passthrough() {
+        // Only registered built-in `key_auth` instances may elide `before_proxy`
+        // into the passthrough strip overlay; custom plugins (including an
+        // impostor reporting `name() == "key_auth"`) always stay on the
+        // materialized path so their `before_proxy` rejections can never be
+        // skipped.
+        if !(is_builtin_named(p, "key_auth") && p.supports_request_header_passthrough()) {
             supports_request_header_passthrough = false;
         } else if p.modifies_request_headers() {
             for name in p.request_headers_to_redact() {

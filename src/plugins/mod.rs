@@ -12203,13 +12203,13 @@ pub trait Plugin: Any + Send + Sync {
         false
     }
 
-    /// Returns `true` when this plugin never reads `ctx.headers` (inspecting
-    /// `ctx.raw_headers` instead), does not mutate query parameters, and its
-    /// only `before_proxy` header mutation (when `modifies_request_headers()`
-    /// is `true`) is stripping `request_headers_to_redact()`. Chains composed
-    /// solely of such plugins can stay on the zero-allocation
-    /// `RequestHeaderPassthrough` lane instead of materializing and cloning
-    /// `HashMap<String, String>`.
+    /// Returns `true` when this built-in plugin never reads `ctx.headers`
+    /// (inspecting `ctx.raw_headers` instead), does not mutate query
+    /// parameters, never rejects in `before_proxy`, and its only `before_proxy`
+    /// header mutation (when `modifies_request_headers()` is `true`) is
+    /// stripping `request_headers_to_redact()`. `PluginCache` only honors this
+    /// elision for registered built-in `key_auth`; custom plugins always run
+    /// `before_proxy` on the materialized path.
     fn supports_request_header_passthrough(&self) -> bool {
         false
     }
