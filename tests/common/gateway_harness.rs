@@ -2364,15 +2364,29 @@ pub fn explicit_test_binary() -> Option<PathBuf> {
         .find(|path| path.exists())
 }
 
-/// Pure resolution behind [`locate_binary`]: the first existing `explicit`
-/// candidate, then `<root>/target/release/ferrum-edge` if `prefer_release`,
-/// then `<root>/target/debug/ferrum-edge`, then the release build.
+/// Pure resolution behind [`locate_binary`]. `explicit` holds the
+/// `FERRUM_EDGE_TEST_BIN` and `CARGO_BIN_EXE_ferrum-edge` candidates in that
+/// order. An existing `FERRUM_EDGE_TEST_BIN` always wins. Then
+/// `<root>/target/release/ferrum-edge` if `prefer_release`, then an existing
+/// `CARGO_BIN_EXE_ferrum-edge`, then `<root>/target/debug/ferrum-edge`, then
+/// the release build.
+///
+/// Cargo sets `CARGO_BIN_EXE_ferrum-edge` at runtime under every
+/// `cargo test`, pointing at the test profile's build (`target/debug` unless
+/// a profile says otherwise). It must not outrank the release build a load
+/// test asks for: when it did, the scheduled 30k-proxy scale and 10k load
+/// stress tests measured the debug gateway while CI built a release one.
 pub fn select_gateway_binary(
     explicit: &[Option<PathBuf>],
     root: &Path,
     prefer_release: bool,
 ) -> Option<PathBuf> {
-    if let Some(path) = explicit.iter().flatten().find(|path| path.exists()) {
+    let mut existing = explicit
+        .iter()
+        .map(|path| path.as_ref().filter(|path| path.exists()));
+    let operator = existing.next().flatten();
+    let cargo_built = existing.flatten().next();
+    if let Some(path) = operator {
         return Some(path.clone());
     }
 
@@ -2381,13 +2395,17 @@ pub fn select_gateway_binary(
     if prefer_release && release.exists() {
         return Some(release);
     }
+    if let Some(path) = cargo_built {
+        return Some(path.clone());
+    }
     [debug, release].into_iter().find(|path| path.exists())
 }
 
 /// Locate the built `ferrum-edge` binary. Preference order:
 /// 1. `FERRUM_EDGE_TEST_BIN`, when an outer harness wants an explicit binary.
-/// 2. `CARGO_BIN_EXE_ferrum-edge`, when Cargo built an instrumented binary.
-/// 3. `target/release/ferrum-edge` if `prefer_release` (load tests).
+/// 2. `target/release/ferrum-edge` if `prefer_release` (load tests).
+/// 3. `CARGO_BIN_EXE_ferrum-edge`, the binary Cargo built for this test run
+///    (set at runtime by `cargo test`; instrumented under coverage).
 /// 4. `target/debug/ferrum-edge` (normal).
 /// 5. `target/release/ferrum-edge` as a fallback.
 ///
@@ -3606,5 +3624,37 @@ mod binary_selection_tests {
         assert_eq!(select(None, root.path(), false), Some(debug.clone()));
         assert_eq!(select(None, root.path(), true), Some(release));
         assert_eq!(select(Some(&debug), root.path(), true), Some(debug));
+    }
+
+    #[test]
+    fn cargo_test_binary_never_outranks_a_requested_release_build() {
+        let root = TempDir::new().expect("temp root");
+        let cargo_built = root.path().join("cargo/debug/ferrum-edge");
+        let release = root.path().join("target/release/ferrum-edge");
+        write_stub(&cargo_built);
+        write_stub(&release);
+        let explicit = [None, Some(cargo_built.clone())];
+
+        assert_eq!(
+            select_gateway_binary(&explicit, root.path(), true),
+            Some(release)
+        );
+        assert_eq!(
+            select_gateway_binary(&explicit, root.path(), false),
+            Some(cargo_built)
+        );
+    }
+
+    #[test]
+    fn cargo_test_binary_stands_in_when_no_release_build_exists() {
+        let root = TempDir::new().expect("temp root");
+        let cargo_built = root.path().join("cargo/debug/ferrum-edge");
+        write_stub(&cargo_built);
+        let explicit = [None, Some(cargo_built.clone())];
+
+        assert_eq!(
+            select_gateway_binary(&explicit, root.path(), true),
+            Some(cargo_built)
+        );
     }
 }
