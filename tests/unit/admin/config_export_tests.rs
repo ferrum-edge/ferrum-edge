@@ -971,6 +971,7 @@ fn export_fingerprints_redis_url_on_every_redis_backed_builtin() {
         .collect();
     let config: GatewayConfig = serde_json::from_value(json!({
         "version": "1",
+        "proxies": [],
         "plugin_configs": plugin_configs,
     }))
     .expect("fixture deserializes");
