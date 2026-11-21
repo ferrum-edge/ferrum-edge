@@ -1124,8 +1124,9 @@ struct MirrorRouteCredentials {
     /// value of a built-in credential header or a route-registered credential
     /// header on the inbound request, plus the recorded query credential
     /// digests. Any outbound header or query value with one of these digests
-    /// is treated as a credential, whatever it is now called.
-    value_digests: Vec<[u8; 32]>,
+    /// is treated as a credential, whatever it is now called. A set, so
+    /// collecting many client-controlled `;` sub-pair values stays linear.
+    value_digests: std::collections::HashSet<[u8; 32]>,
 }
 
 impl MirrorRouteCredentials {
@@ -1201,21 +1202,18 @@ impl MirrorRouteCredentials {
                 header_names.push(destination.to_ascii_lowercase());
             }
         }
-        let mut value_digests: Vec<[u8; 32]> = Vec::new();
+        let mut value_digests: std::collections::HashSet<[u8; 32]> =
+            std::collections::HashSet::new();
         for (_, digest) in ctx.query_credential_partition_digests() {
-            if !value_digests.contains(digest) {
-                value_digests.push(*digest);
-            }
+            value_digests.insert(*digest);
         }
 
-        fn push(digests: &mut Vec<[u8; 32]>, bytes: &[u8]) {
+        fn push(digests: &mut std::collections::HashSet<[u8; 32]>, bytes: &[u8]) {
             if bytes.is_empty() {
                 return;
             }
             let digest: [u8; 32] = Sha256::digest(bytes);
-            if !digests.contains(&digest) {
-                digests.push(digest);
-            }
+            digests.insert(digest);
         }
         let header_is_credential = |name: &str| {
             let lower = name.to_ascii_lowercase();
@@ -1244,7 +1242,7 @@ impl MirrorRouteCredentials {
         let outbound_query = ctx
             .outbound_query_string()
             .filter(|outbound| Some(*outbound) != raw_query);
-        fn push_query_value(digests: &mut Vec<[u8; 32]>, raw_value: &str) {
+        fn push_query_value(digests: &mut std::collections::HashSet<[u8; 32]>, raw_value: &str) {
             push(digests, raw_value.as_bytes());
             // Without a `%` the percent-decoded form is the raw bytes, and
             // without a `+` the form-decoded form is the percent-decoded one,
