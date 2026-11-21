@@ -28476,6 +28476,24 @@ pub(crate) async fn apply_synthetic_response_body_hooks(
                     response_headers,
                     response_body,
                 ));
+            } else if stage == ResponseTransformStage::Semantic
+                && terminal_body_response_selected
+                && mandatory_replay_transform_failed.is_none()
+                && run_staged_response_body_transform_refusals(
+                    plugins,
+                    ctx,
+                    response_status,
+                    response_headers,
+                    response_body,
+                    InitialResponseHeaderPolicySource::ProtocolPlugins(plugins),
+                )
+                .await
+            {
+                // An earlier body phase selected a gateway terminal, so the
+                // ordinary sweep above stays closed, but a transform that ran
+                // over that terminal and refused its bytes as ambiguous must
+                // still replace them (GHSA-pq95-952r-2x32).
+                break 'stages;
             }
         }
         if let Some(plugin_name) = mandatory_replay_transform_failed {
@@ -31434,9 +31452,69 @@ async fn run_final_client_visible_response_body_policy(
     response_body: &mut Bytes,
     initial_response_header_policy_source: InitialResponseHeaderPolicySource<'_>,
 ) -> bool {
+    run_final_client_visible_response_body_policy_for(
+        plugins,
+        ctx,
+        response_status,
+        response_headers,
+        response_body,
+        initial_response_header_policy_source,
+        false,
+    )
+    .await
+}
+
+/// Discharge transform-staged refusals when the ordinary final phase is
+/// skipped because a gateway-authored terminal already owns the response.
+///
+/// Only plugins answering [`Plugin::has_staged_response_body_transform_refusal`]
+/// — whose own transform ran over the terminal's body and declined bytes it
+/// could not evaluate (GHSA-pq95-952r-2x32) — are invoked; no other final
+/// policy re-decides the gateway's own error payload. Same return contract as
+/// [`run_final_client_visible_response_body_policy`].
+async fn run_staged_response_body_transform_refusals(
+    plugins: &[Arc<dyn Plugin>],
+    ctx: &mut RequestContext,
+    response_status: &mut u16,
+    response_headers: &mut HashMap<String, String>,
+    response_body: &mut Bytes,
+    initial_response_header_policy_source: InitialResponseHeaderPolicySource<'_>,
+) -> bool {
+    if !plugins
+        .iter()
+        .any(|plugin| plugin.has_staged_response_body_transform_refusal(ctx))
+    {
+        return false;
+    }
+    run_final_client_visible_response_body_policy_for(
+        plugins,
+        ctx,
+        response_status,
+        response_headers,
+        response_body,
+        initial_response_header_policy_source,
+        true,
+    )
+    .await
+}
+
+async fn run_final_client_visible_response_body_policy_for(
+    plugins: &[Arc<dyn Plugin>],
+    ctx: &mut RequestContext,
+    response_status: &mut u16,
+    response_headers: &mut HashMap<String, String>,
+    response_body: &mut Bytes,
+    initial_response_header_policy_source: InitialResponseHeaderPolicySource<'_>,
+    staged_refusals_only: bool,
+) -> bool {
     let mut selected_reject = None;
     for plugin in plugins.iter() {
-        if !plugin.enforces_final_client_visible_response_body(ctx) {
+        let participates = if staged_refusals_only {
+            plugin.has_staged_response_body_transform_refusal(ctx)
+        } else {
+            plugin.enforces_final_client_visible_response_body(ctx)
+        };
+        if !participates {
             continue;
         }
         let bound = ctx.precommit_response_phase_bound();
@@ -32581,6 +32659,26 @@ async fn transform_buffered_response_body_with_deadline_inner(
             // replacement so the caller drops backend trailers and skips the
             // later final-body hooks, and as a representation rewrite because the
             // published bytes are no longer the backend's.
+            return (true, true);
+        }
+        // The ordinary sweep is closed over a gateway-generated terminal (an
+        // inspection-hook rejection), but a transform that ran over that
+        // terminal and refused its bytes as ambiguous must still replace them;
+        // no other policy is reopened (GHSA-pq95-952r-2x32).
+        if stage == ResponseTransformStage::Semantic
+            && !final_policy_eligible
+            && run_staged_response_body_transform_refusals(
+                plugins,
+                ctx,
+                response_status,
+                response_headers,
+                response_body,
+                InitialResponseHeaderPolicySource::Prefiltered(
+                    initial_response_header_policy_plugins,
+                ),
+            )
+            .await
+        {
             return (true, true);
         }
     }

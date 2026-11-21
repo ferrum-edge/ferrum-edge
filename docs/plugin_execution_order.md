@@ -636,6 +636,16 @@ output-policy phase between them (`GHSA-62jg-v563-4q23`,
    over the exact bytes the client will receive. `waf` (response body scan),
    `body_validator` (response validation), and `ai_response_guard`
    (undischarged-redaction check plus a residual re-detection) decide here.
+   `response_transformer` participates only for a response whose JSON body its
+   semantic-stage rules refused as ambiguous (duplicate member names, a
+   document past the duplicate-key screen's budgets, or one the rule engine
+   cannot materialize; `GHSA-pq95-952r-2x32`). Only the instance whose rules
+   refused it participates, and it replaces the response with a `502` so the
+   ambiguous bytes are never published. When an earlier inspection-stage
+   rejection already owns the response, this sweep stays closed, but the
+   lifecycle still invokes the finalize hook of a plugin whose own transform
+   staged such a refusal over that replacement
+   (`has_staged_response_body_transform_refusal`), and of no other policy.
    Header policy is NOT decided here — the header map is not final at this point
    on the synthetic lifecycle — it is decided in
    `finalize_client_visible_response_headers` below.
@@ -1877,7 +1887,7 @@ Given all built-in plugins enabled, the execution order is:
 | 45 | `mcp_gateway` | 2992 | before_proxy, transform_request_body, enforce_final_backend_header_policy, on_final_request_body, normalize_response_body, transform_response_body, after_proxy, on_final_response_body |
 | 46 | `a2a_gateway` | 2993 | before_proxy, on_final_request_body, after_proxy, normalize_response_body, on_response_body, transform_response_body, on_final_response_body, response_stream_inspector, on_response_stream_terminated |
 | 47 | `mesh_route_dispatch` | 2995 | before_proxy |
-| 48 | `request_transformer` | 3000 | before_proxy, transform_request_body_with_context |
+| 48 | `request_transformer` | 3000 | before_proxy, transform_request_body_with_context, on_final_request_body_with_context |
 | 49 | `request_deduplication` | 3010 | before_proxy, on_final_response_body, on_response_stream_terminated, on_response_committed |
 | 50 | `serverless_function` | 3025 | finalized request egress |
 | 51 | `response_mock` | 3030 | before_proxy |
@@ -1886,7 +1896,7 @@ Given all built-in plugins enabled, the execution order is:
 | 54 | `request_mirror` | 3075 | authorize (pre-buffer mirror admission; never rejects), finalized request egress |
 | 55 | `response_size_limiting` | 3490 | after_proxy, on_final_response_body |
 | 56 | `response_caching` | 3500 | before_proxy, after_proxy, on_final_response_headers, on_final_response_body |
-| 57 | `response_transformer` | 4000 | after_proxy, transform_response_body |
+| 57 | `response_transformer` | 4000 | after_proxy, transform_response_body, finalize_client_visible_response_body |
 | 58 | `compression` | 4050 | normalize_buffered_request_body_before_before_proxy, before_proxy, after_proxy, transform_request_body_with_context, transform_response_body_with_context |
 | 59 | `ai_prompt_compressor` | 4055 | before_proxy, transform_request_body_with_context, on_final_request_body_with_context |
 | 60 | `ai_semantic_cache` | 4057 | on_final_request_body_with_context, after_proxy, on_final_response_body, on_response_committed |

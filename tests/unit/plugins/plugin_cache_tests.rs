@@ -5779,6 +5779,105 @@ async fn ai_semantic_cache_must_follow_every_final_request_body_policy() {
     }
 }
 
+/// A body-rule `request_transformer` refuses an ambiguous JSON body from its
+/// final request-body hook (GHSA-pq95-952r-2x32), so it is a finalized request
+/// policy: an `ai_semantic_cache` hit ordered at or ahead of it would answer
+/// before that refusal. Header/query-only instances never refuse there and keep
+/// composing in any order.
+#[tokio::test]
+async fn ai_semantic_cache_must_follow_a_body_rule_request_transformer() {
+    let cache = |priority_override: Option<u16>| {
+        let mut config = make_plugin_config(
+            "cache",
+            "ai_semantic_cache",
+            PluginScope::Proxy,
+            Some("p1"),
+            true,
+        );
+        config.priority_override = priority_override;
+        config
+    };
+    let transformer = |rules: serde_json::Value, priority_override: Option<u16>| {
+        let mut config = make_plugin_config_with_json(
+            "transformer",
+            "request_transformer",
+            json!({ "rules": rules }),
+            PluginScope::Proxy,
+            Some("p1"),
+        );
+        config.priority_override = priority_override;
+        config
+    };
+    let body_rules = || json!([{"operation": "remove", "target": "body", "key": "user.role"}]);
+    let header_rules =
+        || json!([{"operation": "add", "target": "header", "key": "x-tagged", "value": "1"}]);
+    let compose = |plugins: Vec<PluginConfig>| {
+        let ids: Vec<String> = plugins.iter().map(|plugin| plugin.id.clone()).collect();
+        make_config(
+            vec![make_proxy(
+                "p1",
+                "/api",
+                ids.iter().map(String::as_str).collect(),
+            )],
+            plugins,
+        )
+    };
+
+    for (label, config) in [
+        (
+            "cache overridden ahead of the transformer",
+            compose(vec![cache(Some(2500)), transformer(body_rules(), None)]),
+        ),
+        (
+            "transformer overridden after the cache",
+            compose(vec![cache(None), transformer(body_rules(), Some(4100))]),
+        ),
+        (
+            "transformer at the cache's priority",
+            compose(vec![
+                cache(None),
+                transformer(
+                    body_rules(),
+                    Some(ferrum_edge::plugins::priority::AI_SEMANTIC_CACHE),
+                ),
+            ]),
+        ),
+    ] {
+        let candidate_error =
+            validate_plugin_composition_candidate_with_real_ip_header_for_test(&config, None)
+                .expect_err(label);
+        assert!(
+            candidate_error.contains("must run before every ai_semantic_cache instance")
+                && candidate_error.contains("request_transformer"),
+            "{label}: {candidate_error}"
+        );
+        let runtime_error = PluginCache::new(&config)
+            .err()
+            .unwrap_or_else(|| panic!("{label}: runtime cache must repeat the refusal"));
+        assert!(
+            runtime_error.contains("must run before every ai_semantic_cache instance"),
+            "{label}: {runtime_error}"
+        );
+    }
+
+    for (label, config) in [
+        (
+            "default ordering",
+            compose(vec![transformer(body_rules(), None), cache(None)]),
+        ),
+        (
+            "header-only transformer after the cache",
+            compose(vec![cache(None), transformer(header_rules(), Some(4100))]),
+        ),
+    ] {
+        validate_plugin_composition_candidate_with_real_ip_header_for_test(&config, None)
+            .unwrap_or_else(|error| panic!("{label} must be admitted: {error}"));
+        if let Err(error) = PluginCache::new(&config) {
+            panic!("{label} must build at runtime: {error}");
+        }
+    }
+}
+
 #[test]
 fn candidate_security_validation_constructs_custom_capabilities_without_builtin_gate() {
     let source = include_str!("../../../src/plugin_cache.rs");

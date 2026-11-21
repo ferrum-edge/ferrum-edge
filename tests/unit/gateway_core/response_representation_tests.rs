@@ -700,11 +700,13 @@ async fn unprotected_responses_are_never_rejected_by_the_gate() {
     }
 }
 
-/// Regression: the gate must parse exactly the way the enforcer does. A body the
-/// gate accepts but `apply_body_rules_bounded` cannot parse would return `Unchanged` from the
+/// Regression: the gate must never be more lenient than an enforcer. A body the
+/// gate accepts but an enforcer cannot parse would return `Unchanged` from the
 /// transform, be read as "no rule matched", and forward the protected bytes —
 /// the same conflation this whole gate exists to close. A UTF-8 BOM is the
-/// concrete case: `serde_json` rejects it, so the gate must too.
+/// concrete case: `apply_body_rules_bounded` now strips one
+/// (GHSA-pq95-952r-2x32), but other claimants' enforcers do not, so the gate
+/// keeps refusing it.
 #[tokio::test]
 async fn bom_prefixed_json_is_rejected_rather_than_leniently_accepted() {
     let mut body = vec![0xef, 0xbb, 0xbf];

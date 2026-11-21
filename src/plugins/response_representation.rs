@@ -709,14 +709,17 @@ pub(crate) fn effective_response_media_type<'a>(
 /// body rule in the gateway operates on. A policy that declines on media type
 /// never claims the response in the first place, so it never reaches here.
 ///
-/// This parses **exactly** the way the enforcer does — `serde_json::from_slice`
-/// over the same bytes, with no normalization. That symmetry is load-bearing: if
-/// the gate were more lenient than `body_transform::apply_body_rules_bounded`
-/// (say, by stripping a UTF-8 BOM the enforcer chokes on), a body could pass the
-/// gate, fail to parse inside the transform, return `Unchanged`, and be forwarded
-/// unredacted — which is precisely the `None`-conflation bypass this module
-/// exists to close. A BOM-prefixed body is therefore rejected rather than
-/// accommodated; RFC 8259 forbids emitting one, and fail-closed is the posture.
+/// This parses with `serde_json::from_slice` over the same bytes, with no
+/// normalization. The gate must never be MORE lenient than any claimant's
+/// enforcer: a body could otherwise pass the gate, fail to parse inside the
+/// transform, return `Unchanged`, and be forwarded unredacted — which is
+/// precisely the `None`-conflation bypass this module exists to close.
+/// `body_transform::apply_body_rules_bounded` now strips one leading UTF-8 BOM
+/// itself (GHSA-pq95-952r-2x32), but other claimants' enforcers do not, so a
+/// BOM-prefixed body is still rejected here rather than accommodated: the gate
+/// being stricter than one enforcer is the safe direction, RFC 8259 forbids
+/// emitting a BOM, and fail-closed is the posture. A duplicate-member document
+/// parses here and is refused by the `response_transformer` enforcer itself.
 fn document_is_parseable(content_type: Option<&str>, body: &[u8]) -> bool {
     if content_type.is_some_and(|value| !is_json_content_type(value)) {
         return true;

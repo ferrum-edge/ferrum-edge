@@ -275,6 +275,31 @@ a `4xx` refusal no longer counts as a backend failure.
 the relayed status instead. Dead or unreachable backends, timeouts, and
 protocol faults still produce the gateway `502`/`504`.
 
+### Duplicate JSON member names are refused by the transformers (GHSA-pq95-952r-2x32)
+
+`request_transformer` and `response_transformer` instances with JSON body rules
+now screen the body for object member names that repeat, compared after escape
+decoding and at any depth, before applying the rules. A request with such a
+body is refused with `400`; a backend response with one is replaced with a
+`502`. Before, the rules were skipped and the original bytes were forwarded. A
+body with an invalid Unicode surrogate escape, one past the duplicate-key
+scanner's depth (256), token, member, member-name, or size budget, or a
+well-formed document the rule engine cannot materialize (nesting deeper than
+128 levels, a number outside the `f64` range) is refused the same way. Clients
+and backends must send each member once.
+
+The `response_transformer` presentation-policy digest moved to a new version,
+so Redis-persisted `request_deduplication` replays recorded before the upgrade
+take the superseded-policy path once instead of being served.
+
+Body rules now also strip one leading UTF-8 byte order mark before parsing, so
+they apply to BOM-prefixed request bodies (the backend receives the rewritten
+document without the BOM). A BOM-prefixed backend response under a body policy
+is still refused by the shared response representation gate, as before.
+A body-rule `request_transformer` now counts as a final request-body policy,
+so a configuration that orders `ai_semantic_cache` at or ahead of it with
+`priority_override` is refused. Instances with only header or query rules are unaffected.
+
 ### `preserve_host_header` now applies to WebSocket backends (#7392)
 
 With `preserve_host_header: true`, direct `ws://`/`wss://` backend handshakes

@@ -2419,8 +2419,8 @@ fn json_and_untyped_uploads_keep_request_buffering() {
         "application/json; charset=utf-8",
         "application/merge-patch+json",
         // Framed gRPC `+json` satisfies `is_json_content_type`, so it stays
-        // buffered exactly as the transform treats it: declined only after the
-        // document parse fails.
+        // buffered exactly as the transform treats it: declined only after it
+        // has seen the bytes.
         "application/grpc+json",
     ] {
         let ctx = upload_ctx(Some(content_type));
@@ -3725,6 +3725,711 @@ async fn digest_retirement_folds_underscore_spellings() {
         .expect("the stale digests are retired");
     assert!(!outbound.contains_key("content_digest"));
     assert!(!outbound.contains_key("Repr_Digest"));
+}
+
+// ---------------------------------------------------------------------------
+// GHSA-pq95-952r-2x32: duplicate-member and BOM-prefixed JSON request bodies.
+// ---------------------------------------------------------------------------
+
+fn privileged_field_stripper() -> Arc<dyn Plugin> {
+    Arc::new(
+        RequestTransformer::new(&json!({"rules": [
+            {"operation": "remove", "target": "body", "key": "user.role"},
+            {"operation": "rename", "target": "body", "key": "user.token", "new_key": "user.redacted"}
+        ]}))
+        .unwrap(),
+    )
+}
+
+fn json_request_headers() -> HashMap<String, String> {
+    HashMap::from([("content-type".to_string(), "application/json".to_string())])
+}
+
+fn bom(document: &[u8]) -> Vec<u8> {
+    [b"\xEF\xBB\xBF".as_slice(), document].concat()
+}
+
+/// `prefix` followed by a unique-member subtree nested 200 deep: past
+/// `serde_json`'s 128-level recursion limit, inside the duplicate-key screen's
+/// 256-level budget, so the screen accepts it as well-formed.
+fn deeper_than_serde(prefix: &[u8]) -> Vec<u8> {
+    [
+        prefix,
+        "[".repeat(200).as_bytes(),
+        "]".repeat(200).as_bytes(),
+        b"}".as_slice(),
+    ]
+    .concat()
+}
+
+fn assert_ambiguous_body_rejected(result: &ferrum_edge::plugins::PluginResult, case: &str) {
+    match result {
+        ferrum_edge::plugins::PluginResult::Reject {
+            status_code, body, ..
+        } => {
+            assert_eq!(*status_code, 400, "{case}");
+            assert!(
+                body.contains("duplicate JSON object member names"),
+                "{case}: {body}"
+            );
+            assert!(!body.contains("admin"), "{case}: no body byte is echoed");
+        }
+        other => panic!("{case}: an ambiguous JSON body must be refused, got {other:?}"),
+    }
+}
+
+/// Bodies whose JSON objects repeat a member name (an ancestor of a targeted
+/// leaf, a sibling elsewhere, an escaped spelling of the same name, BOM or no
+/// BOM), plus a document past the screen's depth budget.
+fn ambiguous_request_bodies() -> Vec<(&'static str, Vec<u8>)> {
+    vec![
+        (
+            "duplicate ancestor",
+            br#"{"user":{"role":"admin","token":"t0k"},"user":{"name":"a"}}"#.to_vec(),
+        ),
+        (
+            "BOM-prefixed duplicate ancestor",
+            bom(br#"{"user":{"role":"admin"},"user":{"name":"a"}}"#),
+        ),
+        (
+            "escaped duplicate ancestor",
+            br#"{"user":{"role":"admin"},"\u0075ser":{"name":"a"}}"#.to_vec(),
+        ),
+        (
+            "escaped duplicate leaf",
+            br#"{"user":{"role":"admin","\u0072ole":"viewer"}}"#.to_vec(),
+        ),
+        (
+            "unrelated sibling duplicate",
+            br#"{"user":{"role":"admin"},"a":1,"a":2}"#.to_vec(),
+        ),
+        (
+            "well-formed but deeper than serde_json can materialize",
+            deeper_than_serde(br#"{"user":{"role":"admin"},"deep":"#),
+        ),
+        (
+            "BOM-prefixed and deeper than serde_json can materialize",
+            bom(&deeper_than_serde(br#"{"user":{"role":"admin"},"deep":"#)),
+        ),
+        (
+            "screen depth budget exhausted",
+            [
+                br#"{"user":{"role":"admin"},"deep":"#.as_slice(),
+                "[".repeat(300).as_bytes(),
+                "]".repeat(300).as_bytes(),
+                b"}".as_slice(),
+            ]
+            .concat(),
+        ),
+    ]
+}
+
+#[tokio::test]
+async fn ambiguous_json_body_is_refused_by_the_final_hook_not_forwarded() {
+    let plugin = privileged_field_stripper();
+    let headers = json_request_headers();
+    for (case, body) in ambiguous_request_bodies() {
+        let mut ctx = post_ctx();
+        assert!(
+            plugin
+                .transform_request_body_with_context(
+                    &mut ctx,
+                    &body,
+                    Some("application/json"),
+                    &headers
+                )
+                .await
+                .is_none(),
+            "{case}: the transform must not rewrite an ambiguous document"
+        );
+        let result = plugin
+            .on_final_request_body_with_context(&mut ctx, &headers, &body)
+            .await;
+        assert_ambiguous_body_rejected(&result, case);
+        // The latch is consumed: a second finalization does not reject again.
+        assert!(matches!(
+            plugin
+                .on_final_request_body_with_context(&mut ctx, &headers, &body)
+                .await,
+            ferrum_edge::plugins::PluginResult::Continue
+        ));
+    }
+}
+
+/// The production H1/H2 shape (transform and final hook on the compatibility
+/// clone) and the native H3 shape (both on the real context) refuse the
+/// request; an absent `Content-Type` is screened the same way because the body
+/// rules still parse it as JSON.
+#[tokio::test]
+async fn ambiguous_json_body_is_refused_on_h1_h2_and_h3_body_stages() {
+    let plugins = vec![privileged_field_stripper()];
+    for headers in [json_request_headers(), HashMap::new()] {
+        for (case, body) in ambiguous_request_bodies() {
+            let mut ctx = post_ctx();
+            let (_, result) =
+                ferrum_edge::_test_support::run_buffered_request_body_hook_round_trip_for_test(
+                    &plugins,
+                    &mut ctx,
+                    &headers,
+                    body.clone(),
+                )
+                .await;
+            assert_ambiguous_body_rejected(&result, &format!("H1/H2 {case}"));
+
+            let mut ctx = post_ctx();
+            let (_, result) =
+                ferrum_edge::_test_support::run_request_body_stage_with_context_for_test(
+                    &plugins, &mut ctx, &headers, &body,
+                )
+                .await;
+            assert_ambiguous_body_rejected(&result, &format!("H3 {case}"));
+        }
+    }
+}
+
+/// A later instance cannot launder the refusal: with two instances the first
+/// latches and the final stage still refuses.
+#[tokio::test]
+async fn ambiguous_json_body_is_refused_with_multiple_instances() {
+    let plugins = vec![
+        privileged_field_stripper(),
+        Arc::new(
+            RequestTransformer::new(&json!({"rules": [
+                {"operation": "add", "target": "body", "key": "added", "value": 1}
+            ]}))
+            .unwrap(),
+        ) as Arc<dyn Plugin>,
+    ];
+    let mut ctx = post_ctx();
+    let (_, result) =
+        ferrum_edge::_test_support::run_buffered_request_body_hook_round_trip_for_test(
+            &plugins,
+            &mut ctx,
+            &json_request_headers(),
+            br#"{"user":{"role":"admin"},"user":{}}"#.to_vec(),
+        )
+        .await;
+    assert_ambiguous_body_rejected(&result, "two instances");
+}
+
+/// The context-free compatibility hook has no rejection channel, so it must
+/// not return `None` (which forwards the original ambiguous bytes).
+#[tokio::test]
+async fn context_free_transform_never_forwards_an_ambiguous_body() {
+    let plugin = privileged_field_stripper();
+    let replacement = plugin
+        .transform_request_body(
+            br#"{"user":{"role":"admin"},"user":{}}"#,
+            Some("application/json"),
+            &json_request_headers(),
+        )
+        .await;
+    assert_eq!(replacement, Some(Vec::new()));
+}
+
+/// A BOM-prefixed document has its `remove` and `rename` rules applied; the
+/// backend receives the re-serialized document without the BOM.
+#[tokio::test]
+async fn bom_prefixed_json_body_has_remove_and_rename_applied() {
+    let plugins = vec![privileged_field_stripper()];
+    let body = bom(br#"{"user":{"role":"admin","token":"t0k","name":"a"}}"#);
+    for headers in [json_request_headers(), HashMap::new()] {
+        let mut ctx = post_ctx();
+        let (transformed, result) =
+            ferrum_edge::_test_support::run_buffered_request_body_hook_round_trip_for_test(
+                &plugins,
+                &mut ctx,
+                &headers,
+                body.clone(),
+            )
+            .await;
+        assert!(
+            matches!(result, ferrum_edge::plugins::PluginResult::Continue),
+            "got {result:?}"
+        );
+        assert!(!transformed.starts_with(b"\xEF\xBB\xBF"));
+        let rewritten: serde_json::Value =
+            serde_json::from_slice(&transformed).expect("the rewrite is JSON");
+        assert_eq!(rewritten, json!({"user": {"name": "a", "redacted": "t0k"}}));
+    }
+}
+
+/// Bytes that are not JSON at all keep their existing behavior: unchanged,
+/// `parse_error` published, and no refusal.
+#[tokio::test]
+async fn non_json_body_keeps_parse_error_behavior() {
+    use ferrum_edge::plugins::request_transformer::BODY_SKIPPED_METADATA_KEY;
+
+    let plugins = vec![privileged_field_stripper()];
+    for body in [
+        b"role=admin&role=viewer".to_vec(),
+        br#"{"user":{"role":"admin"},"user":"#.to_vec(),
+    ] {
+        let mut ctx = post_ctx();
+        let (transformed, result) =
+            ferrum_edge::_test_support::run_request_body_stage_with_context_for_test(
+                &plugins,
+                &mut ctx,
+                &HashMap::new(),
+                &body,
+            )
+            .await;
+        assert!(
+            matches!(result, ferrum_edge::plugins::PluginResult::Continue),
+            "got {result:?}"
+        );
+        assert_eq!(transformed, body);
+        assert_eq!(
+            ctx.metadata
+                .get(BODY_SKIPPED_METADATA_KEY)
+                .map(String::as_str),
+            Some("parse_error")
+        );
+    }
+}
+
+/// An instance with only header/query rules does not screen bodies at all: it
+/// does not claim the body, and a duplicate-member body passes through it.
+#[tokio::test]
+async fn header_and_query_only_instance_does_not_screen_bodies() {
+    let plugin: Arc<dyn Plugin> = Arc::new(
+        RequestTransformer::new(&json!({"rules": [
+            {"operation": "add", "target": "header", "key": "x-tagged", "value": "1"},
+            {"operation": "remove", "target": "query", "key": "debug"}
+        ]}))
+        .unwrap(),
+    );
+    assert!(!plugin.modifies_request_body());
+    let body = br#"{"user":{"role":"admin"},"user":{}}"#.to_vec();
+    let headers = json_request_headers();
+
+    let mut ctx = post_ctx();
+    assert!(
+        plugin
+            .transform_request_body_with_context(
+                &mut ctx,
+                &body,
+                Some("application/json"),
+                &headers
+            )
+            .await
+            .is_none()
+    );
+    assert!(matches!(
+        plugin
+            .on_final_request_body_with_context(&mut ctx, &headers, &body)
+            .await,
+        ferrum_edge::plugins::PluginResult::Continue
+    ));
+
+    let mut ctx = post_ctx();
+    let (transformed, result) =
+        ferrum_edge::_test_support::run_buffered_request_body_hook_round_trip_for_test(
+            &[plugin],
+            &mut ctx,
+            &headers,
+            body.clone(),
+        )
+        .await;
+    assert!(
+        matches!(result, ferrum_edge::plugins::PluginResult::Continue),
+        "got {result:?}"
+    );
+    assert_eq!(transformed, body);
+}
+
+/// A final-body policy between two transformer instances, used to prove the
+/// refusal stays at its producer's position in the chain.
+struct FinalBodyBlocker;
+
+#[async_trait::async_trait]
+impl Plugin for FinalBodyBlocker {
+    fn name(&self) -> &str {
+        "final_body_blocker"
+    }
+
+    async fn on_final_request_body_with_context(
+        &self,
+        _ctx: &mut RequestContext,
+        _headers: &HashMap<String, String>,
+        _body: &[u8],
+    ) -> ferrum_edge::plugins::PluginResult {
+        ferrum_edge::plugins::PluginResult::Reject {
+            status_code: 403,
+            body: r#"{"error":"blocked"}"#.to_string(),
+            headers: HashMap::new(),
+        }
+    }
+}
+
+/// The refusal belongs to the instance whose body rules produced it: a
+/// header-only or RTDS-disabled sibling ordered first can neither issue it
+/// (jumping ahead of a policy between them) nor consume it.
+#[tokio::test]
+async fn ambiguous_body_refusal_is_bound_to_its_producing_instance() {
+    let header_only: Arc<dyn Plugin> = Arc::new(
+        RequestTransformer::new(&json!({"rules": [
+            {"operation": "add", "target": "header", "key": "x-tagged", "value": "1"}
+        ]}))
+        .unwrap(),
+    );
+    let disabled: Arc<dyn Plugin> = Arc::new(
+        RequestTransformer::new(&json!({
+            "rules": [{"operation": "remove", "target": "body", "key": "user.role"}],
+            "runtime_overlay_scope": "dup-test",
+            "default_enabled": false
+        }))
+        .unwrap(),
+    );
+    let producer = privileged_field_stripper();
+    let headers = json_request_headers();
+    let body = br#"{"user":{"role":"admin"},"user":{}}"#.to_vec();
+
+    // Direct hook order: siblings answer `Continue` and leave the refusal in
+    // place; only the producer consumes it.
+    let mut ctx = post_ctx();
+    for plugin in [&header_only, &disabled, &producer] {
+        let _ = plugin
+            .transform_request_body_with_context(
+                &mut ctx,
+                &body,
+                Some("application/json"),
+                &headers,
+            )
+            .await;
+    }
+    for sibling in [&header_only, &disabled] {
+        assert!(matches!(
+            sibling
+                .on_final_request_body_with_context(&mut ctx, &headers, &body)
+                .await,
+            ferrum_edge::plugins::PluginResult::Continue
+        ));
+    }
+    assert_ambiguous_body_rejected(
+        &producer
+            .on_final_request_body_with_context(&mut ctx, &headers, &body)
+            .await,
+        "producer",
+    );
+
+    // Chain order: the policy between the siblings and the producer decides
+    // first, so a sibling did not issue the producer's refusal early.
+    let plugins = vec![
+        header_only.clone(),
+        disabled.clone(),
+        Arc::new(FinalBodyBlocker) as Arc<dyn Plugin>,
+        producer.clone(),
+    ];
+    for (stage, result) in [
+        (
+            "H1/H2",
+            ferrum_edge::_test_support::run_buffered_request_body_hook_round_trip_for_test(
+                &plugins,
+                &mut post_ctx(),
+                &headers,
+                body.clone(),
+            )
+            .await
+            .1,
+        ),
+        (
+            "H3",
+            ferrum_edge::_test_support::run_request_body_stage_with_context_for_test(
+                &plugins,
+                &mut post_ctx(),
+                &headers,
+                &body,
+            )
+            .await
+            .1,
+        ),
+    ] {
+        match result {
+            ferrum_edge::plugins::PluginResult::Reject { status_code, .. } => {
+                assert_eq!(
+                    status_code, 403,
+                    "{stage}: the earlier policy decides first"
+                )
+            }
+            other => panic!("{stage}: expected the blocker's rejection, got {other:?}"),
+        }
+    }
+
+    // Without the blocker, the producer still refuses behind its siblings.
+    let plugins = vec![header_only, disabled, producer];
+    let (_, result) =
+        ferrum_edge::_test_support::run_buffered_request_body_hook_round_trip_for_test(
+            &plugins,
+            &mut post_ctx(),
+            &headers,
+            body,
+        )
+        .await;
+    assert_ambiguous_body_rejected(&result, "mixed chain");
+}
+
+/// The refusal carries the typed gateway request-representation terminal
+/// provenance, handed back from the H1/H2 hook clone and set on the live H3
+/// context, so response-side policy (a response size ceiling) cannot rewrite
+/// the `400` into a `502`. An accepted body carries none.
+#[tokio::test]
+async fn ambiguous_body_refusal_is_a_gateway_representation_terminal() {
+    use ferrum_edge::_test_support::gateway_representation_response_selected_for_test;
+
+    let plugins = vec![privileged_field_stripper()];
+    let headers = json_request_headers();
+    let ambiguous = br#"{"user":{"role":"admin"},"user":{}}"#.to_vec();
+
+    let mut ctx = post_ctx();
+    let (_, result) =
+        ferrum_edge::_test_support::run_buffered_request_body_hook_round_trip_for_test(
+            &plugins,
+            &mut ctx,
+            &headers,
+            ambiguous.clone(),
+        )
+        .await;
+    assert_ambiguous_body_rejected(&result, "H1/H2");
+    assert!(gateway_representation_response_selected_for_test(&ctx));
+
+    let mut ctx = post_ctx();
+    let (_, result) = ferrum_edge::_test_support::run_request_body_stage_with_context_for_test(
+        &plugins, &mut ctx, &headers, &ambiguous,
+    )
+    .await;
+    assert_ambiguous_body_rejected(&result, "H3");
+    assert!(gateway_representation_response_selected_for_test(&ctx));
+
+    let mut ctx = post_ctx();
+    let (_, result) = ferrum_edge::_test_support::run_request_body_stage_with_context_for_test(
+        &plugins,
+        &mut ctx,
+        &headers,
+        br#"{"user":{"role":"admin"}}"#,
+    )
+    .await;
+    assert!(matches!(
+        result,
+        ferrum_edge::plugins::PluginResult::Continue
+    ));
+    assert!(!gateway_representation_response_selected_for_test(&ctx));
+}
+
+/// Genuine framed gRPC `+json` uploads the client declared skip the
+/// duplicate-member screen: frames never start like a JSON document, so even a
+/// frame payload that repeats a member (or a body above the screen memo's
+/// threshold) is neither screened nor refused, keeps the `parse_error` outcome
+/// it always had, and stays on the buffered path as before.
+#[tokio::test]
+async fn framed_grpc_json_requests_skip_screening() {
+    use ferrum_edge::plugins::request_transformer::BODY_SKIPPED_METADATA_KEY;
+
+    let plugin = privileged_field_stripper();
+    let message = br#"{"user":{"role":"admin"},"user":{}}"#;
+    let mut framed = vec![0u8];
+    framed.extend_from_slice(&(message.len() as u32).to_be_bytes());
+    framed.extend_from_slice(message);
+    let mut large = framed.clone();
+    large.resize(8192, b' ');
+    use base64::Engine;
+    let text = base64::engine::general_purpose::STANDARD
+        .encode(&framed)
+        .into_bytes();
+
+    for (content_type, body) in [
+        ("application/grpc+json", &framed),
+        ("application/grpc+json", &large),
+        ("application/grpc-web+json", &framed),
+        ("application/grpc-web-text+json", &text),
+    ] {
+        assert!(
+            plugin.should_buffer_request_body(&upload_ctx(Some(content_type))),
+            "{content_type}: the buffering vote is unchanged"
+        );
+        let headers = HashMap::from([("content-type".to_string(), content_type.to_string())]);
+        let mut ctx = post_ctx();
+        retain_client_wire_headers(&mut ctx, &headers);
+        assert!(
+            plugin
+                .transform_request_body_with_context(&mut ctx, body, Some(content_type), &headers)
+                .await
+                .is_none()
+        );
+        assert_eq!(
+            ctx.metadata
+                .get(BODY_SKIPPED_METADATA_KEY)
+                .map(String::as_str),
+            Some("parse_error"),
+            "{content_type}"
+        );
+        assert!(matches!(
+            plugin
+                .on_final_request_body_with_context(&mut ctx, &headers, body)
+                .await,
+            ferrum_edge::plugins::PluginResult::Continue
+        ));
+    }
+}
+
+/// A client's own framed `+json` declaration is not proof of framing: a bare
+/// JSON body under it (BOM and leading whitespace included) is transformed when
+/// unambiguous and refused when it repeats a member.
+#[tokio::test]
+async fn client_labelled_framed_json_with_a_bare_json_body_is_still_governed() {
+    let plugin = privileged_field_stripper();
+    for content_type in [
+        "application/grpc+json",
+        "application/grpc-web+json",
+        "application/grpc-web-text+json",
+    ] {
+        let headers = HashMap::from([("content-type".to_string(), content_type.to_string())]);
+        for clean in [
+            br#"{"user":{"role":"admin","name":"a"}}"#.to_vec(),
+            bom(b" \n\t{\"user\":{\"role\":\"admin\",\"name\":\"a\"}}"),
+        ] {
+            let mut ctx = post_ctx();
+            retain_client_wire_headers(&mut ctx, &headers);
+            let rewritten = plugin
+                .transform_request_body_with_context(&mut ctx, &clean, Some(content_type), &headers)
+                .await
+                .unwrap_or_else(|| panic!("{content_type}: a bare JSON body must be rewritten"));
+            let rewritten: serde_json::Value = serde_json::from_slice(&rewritten).unwrap();
+            assert_eq!(rewritten, json!({"user": {"name": "a"}}), "{content_type}");
+        }
+
+        let mut ctx = post_ctx();
+        retain_client_wire_headers(&mut ctx, &headers);
+        let ambiguous = br#"{"user":{"role":"admin"},"user":{}}"#;
+        assert!(
+            plugin
+                .transform_request_body_with_context(
+                    &mut ctx,
+                    ambiguous,
+                    Some(content_type),
+                    &headers
+                )
+                .await
+                .is_none()
+        );
+        assert_ambiguous_body_rejected(
+            &plugin
+                .on_final_request_body_with_context(&mut ctx, &headers, ambiguous)
+                .await,
+            content_type,
+        );
+    }
+}
+
+/// The framed-gRPC exemption is decided from the client's wire media type, not
+/// from a label a header rule wrote: a bare JSON upload relabelled to
+/// `application/grpc+json` stays buffered, screened, and rewritten.
+#[tokio::test]
+async fn relabelled_bare_json_upload_is_not_exempted_as_framed_grpc() {
+    use ferrum_edge::plugins::request_transformer::BODY_SKIPPED_METADATA_KEY;
+
+    let plugin = privileged_field_stripper();
+    let wire = json_request_headers();
+    for relabel in [
+        "application/grpc+json",
+        "application/grpc-web+json",
+        "application/grpc-web-text+json",
+    ] {
+        let outbound = HashMap::from([("content-type".to_string(), relabel.to_string())]);
+
+        // Buffering vote: the label alone does not release the upload.
+        let mut vote = upload_ctx(Some("application/json"));
+        vote.headers = outbound.clone();
+        assert!(
+            plugin.should_buffer_request_body(&vote),
+            "{relabel}: a relabelled JSON upload must stay buffered"
+        );
+
+        // Transform: an unambiguous document is still rewritten.
+        let mut ctx = post_ctx();
+        retain_client_wire_headers(&mut ctx, &wire);
+        let rewritten = plugin
+            .transform_request_body_with_context(
+                &mut ctx,
+                br#"{"user":{"role":"admin","name":"a"}}"#,
+                Some(relabel),
+                &outbound,
+            )
+            .await
+            .expect("a relabelled bare JSON document must be rewritten");
+        let rewritten: serde_json::Value = serde_json::from_slice(&rewritten).unwrap();
+        assert_eq!(rewritten, json!({"user": {"name": "a"}}), "{relabel}");
+        assert!(!ctx.metadata.contains_key(BODY_SKIPPED_METADATA_KEY));
+
+        // Transform + final hook: an ambiguous document is still refused.
+        let mut ctx = post_ctx();
+        retain_client_wire_headers(&mut ctx, &wire);
+        let body = br#"{"user":{"role":"admin"},"user":{}}"#;
+        assert!(
+            plugin
+                .transform_request_body_with_context(&mut ctx, body, Some(relabel), &outbound)
+                .await
+                .is_none()
+        );
+        assert_ambiguous_body_rejected(
+            &plugin
+                .on_final_request_body_with_context(&mut ctx, &outbound, body)
+                .await,
+            relabel,
+        );
+    }
+}
+
+/// Integrity-field retirement follows rewrite eligibility: a header rule that
+/// relabels a digest-bearing JSON upload as framed gRPC-Web does not stop the
+/// body rules from rewriting it (a BOM-prefixed document included), so its
+/// stale digests must not reach the backend beside the rewritten bytes. A
+/// client-declared framed upload keeps its fields
+/// (`integrity_headers_survive_when_body_rules_cannot_rewrite`).
+#[tokio::test]
+async fn relabelled_bom_json_upload_retires_stale_integrity_headers() {
+    let relabel = RequestTransformer::new(&json!({"rules": [
+        {"operation": "update", "target": "header", "key": "content-type",
+         "value": "application/grpc-web+json"}
+    ]}))
+    .unwrap();
+    let body_plugin = RequestTransformer::new(&json!({
+        "rules": [{"operation": "remove", "target": "body", "key": "debug"}]
+    }))
+    .unwrap();
+
+    let mut ctx = post_ctx();
+    let outbound = run_chain_then_retire(
+        &[&relabel, &body_plugin],
+        &mut ctx,
+        integrity_headers(Some("application/json")),
+    )
+    .await
+    .expect("the relabelled upload's stale digests must be retired");
+    for field in ["content-digest", "repr-digest", "digest", "content-md5"] {
+        assert!(
+            !outbound.keys().any(|name| name.eq_ignore_ascii_case(field)),
+            "{field} must be retired: {outbound:?}"
+        );
+    }
+    assert_eq!(outbound.get("x-keep").map(String::as_str), Some("1"));
+    assert_eq!(
+        outbound.get("content-type").map(String::as_str),
+        Some("application/grpc-web+json")
+    );
+
+    // And the transform does rewrite that representation.
+    let rewritten = body_plugin
+        .transform_request_body_with_context(
+            &mut ctx,
+            &bom(br#"{"debug":true,"keep":1}"#),
+            Some("application/grpc-web+json"),
+            &outbound,
+        )
+        .await
+        .expect("the relabelled BOM-prefixed JSON body is rewritten");
+    let rewritten: serde_json::Value = serde_json::from_slice(&rewritten).unwrap();
+    assert_eq!(rewritten, json!({"keep": 1}));
 }
 
 /// GHSA-c259-vchc-3vgr: the outbound strip removes a whole `&` segment whose

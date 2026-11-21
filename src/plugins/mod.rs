@@ -3144,6 +3144,24 @@ pub struct RequestContext {
     /// cannot safely produce bounded provider-visible bytes. Kept private so
     /// request metadata cannot spoof or clear the fail-closed decision.
     pub(crate) ai_prompt_compressor_marker_reject_status: Option<u16>,
+    /// Final-hook rejection staged by `request_transformer` when its JSON body
+    /// rules met a document they cannot evaluate faithfully (duplicate object
+    /// member names, an invalid surrogate escape, an exhausted duplicate-key
+    /// screen budget, or a well-formed document `serde_json` could not
+    /// materialize; GHSA-pq95-952r-2x32). `transform_request_body*` has no
+    /// rejection channel, so it records the PRODUCING instance's private id
+    /// here and only that instance's `on_final_request_body_with_context`
+    /// consumes it and refuses the request: a header-only or disabled sibling
+    /// can neither issue nor swallow another instance's refusal. The first
+    /// producer owns it. Kept private so request metadata cannot spoof or clear
+    /// the fail-closed decision.
+    pub(crate) request_transformer_ambiguous_body_refusal: Option<u64>,
+    /// Response counterpart of `request_transformer_ambiguous_body_refusal`:
+    /// the producing `response_transformer` instance's id, recorded by its body
+    /// transform and consumed (and turned into a `502`) by the same instance's
+    /// `finalize_client_visible_response_body`, so the ambiguous backend bytes
+    /// are never published (GHSA-pq95-952r-2x32).
+    pub(crate) response_transformer_ambiguous_body_refusal: Option<u64>,
     /// Encoding selected by the built-in compression plugin for the response it
     /// will create at the gateway. This is authoritative ownership state for
     /// distinguishing planned gateway compression from an already-encoded
@@ -4893,6 +4911,8 @@ impl RequestContext {
             ai_prompt_compressor_classification_path: None,
             ai_prompt_compressor_wire_stats_started: false,
             ai_prompt_compressor_marker_reject_status: None,
+            request_transformer_ambiguous_body_refusal: None,
+            response_transformer_ambiguous_body_refusal: None,
             gateway_response_compression_algorithm: None,
             compression_request_decode_owner: None,
             compression_response_encode_owner: None,
@@ -6650,6 +6670,15 @@ impl RequestContext {
             ai_prompt_compressor_marker_reject_status: std::mem::take(
                 &mut self.ai_prompt_compressor_marker_reject_status,
             ),
+            // Transferred like the compressor's staged rejection: the body
+            // transform and the final hook that consumes it run on this clone.
+            request_transformer_ambiguous_body_refusal: std::mem::take(
+                &mut self.request_transformer_ambiguous_body_refusal,
+            ),
+            // Response-side state; the response lifecycle runs on the live
+            // context, never on this request-body clone.
+            response_transformer_ambiguous_body_refusal: self
+                .response_transformer_ambiguous_body_refusal,
             gateway_response_compression_algorithm: self.gateway_response_compression_algorithm,
             compression_request_decode_owner: self.compression_request_decode_owner,
             compression_response_encode_owner: self.compression_response_encode_owner,
@@ -13762,6 +13791,24 @@ pub trait Plugin: Any + Send + Sync {
     /// [`Plugin::finalize_client_visible_response_body`], so a chain with no
     /// participant pays only a bit test.
     fn enforces_final_client_visible_response_body(&self, _ctx: &RequestContext) -> bool {
+        false
+    }
+
+    /// Returns `true` when THIS plugin's own `transform_response_body*` staged
+    /// a refusal for the current response that only its
+    /// [`Plugin::finalize_client_visible_response_body`] can discharge.
+    ///
+    /// The ordinary final client-visible phase is skipped once a
+    /// gateway-authored terminal owns the response (an inspection-hook
+    /// rejection, for example), so that no policy re-decides the gateway's own
+    /// error payload. Transforms still run over such a terminal, though, and a
+    /// transform that declined to rewrite bytes it could not evaluate must not
+    /// have them published merely because the sweep was skipped. On those paths
+    /// the lifecycle invokes `finalize_client_visible_response_body` for exactly
+    /// the plugins answering `true` here — no other policy is reopened.
+    /// `response_transformer` uses it for its ambiguous-JSON refusal
+    /// (GHSA-pq95-952r-2x32). The default is `false`.
+    fn has_staged_response_body_transform_refusal(&self, _ctx: &RequestContext) -> bool {
         false
     }
 

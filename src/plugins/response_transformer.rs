@@ -121,16 +121,36 @@
 //! names when the origin representation changed, not the gateway-authored
 //! rewrite. Parse failures and semantic no-ops return `None` from
 //! `transform_response_body` and leave origin metadata untouched.
+//!
+//! ## Ambiguous JSON bodies (GHSA-pq95-952r-2x32)
+//!
+//! Body rules strip one optional leading UTF-8 BOM and screen the candidate
+//! with the shared duplicate-member scanner before parsing (see
+//! `body_transform`). A backend document whose meaning is parser-dependent, or
+//! a well-formed one `serde_json` could not materialize, cannot be redacted
+//! faithfully: forwarding it would hand a client the very field a `remove` /
+//! `rename` rule targets. The context-aware transform therefore records its own
+//! instance id on a private `RequestContext` field and returns `None`; the same
+//! instance then participates in the authoritative
+//! `finalize_client_visible_response_body` phase — which runs after every
+//! semantic transform and before anything is published — and replaces the
+//! response with a fixed `502`. The ambiguous bytes are never forwarded.
+//!
+//! The shared buffered-response representation gate still refuses a
+//! BOM-prefixed claimed body before any transform runs (`unparseable_document`),
+//! because other claimants' enforcers do not strip a BOM; the gate being
+//! stricter than this enforcer is the safe direction.
 
 use async_trait::async_trait;
 use http::header::{HeaderName, HeaderValue};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
+use std::sync::atomic::{AtomicU64, Ordering};
 use tracing::debug;
 
 use super::response_representation::effective_response_media_type;
-use super::utils::body_transform::{self, BodyRule};
+use super::utils::body_transform::{self, BodyRule, BoundedBodyRulesOutcome};
 use super::utils::policy_digest;
 use super::utils::route_header_transform::RouteHeaderTransformOp;
 use super::utils::sse::is_text_event_stream_media_type;
@@ -220,12 +240,29 @@ pub struct ResponseTransformer {
     /// the gate is now in the config: the two are independent provenance inputs
     /// and the Redis-persisted replay contract binds both.
     static_policy_digest: [u8; 32],
+    /// Process-local identity of this instance. Binds an ambiguous-body refusal
+    /// to the instance whose body rules produced it (GHSA-pq95-952r-2x32), so a
+    /// sibling instance can neither issue nor consume it.
+    instance_id: u64,
 }
+
+/// Source of [`ResponseTransformer::instance_id`].
+static NEXT_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
 
 /// Domain separator and schema version for [`ResponseTransformer`] provenance.
 /// Bumping the version invalidates every previously persisted representation
 /// rather than letting an old digest match new semantics.
-const STATIC_POLICY_DIGEST_DOMAIN: &str = "ferrum.plugin.response_transformer.static.v1";
+///
+/// v2: JSON body rules strip a leading BOM and refuse duplicate-member or
+/// unmaterializable documents (GHSA-pq95-952r-2x32). A replay retained under v1
+/// may hold an unredacted ambiguous body, so it must take the superseded-policy
+/// path instead of being served.
+const STATIC_POLICY_DIGEST_DOMAIN: &str = "ferrum.plugin.response_transformer.static.v2";
+
+/// Fixed client-visible error for a backend response refused because its JSON
+/// body is ambiguous to the configured body rules (GHSA-pq95-952r-2x32). Never
+/// echoes body bytes or the screen's internal reason.
+const AMBIGUOUS_JSON_RESPONSE_ERROR: &str = r#"{"error":"Backend response body contains duplicate JSON object member names or a JSON document the gateway could not evaluate"}"#;
 
 impl ResponseTransformer {
     /// Apply the configured JSON body rules, serializing the result through a
@@ -235,16 +272,23 @@ impl ResponseTransformer {
     /// body. Both `Plugin` entry points reach it, so the ceiling-bounded
     /// construction cannot be bypassed by calling the context-free hook
     /// (GHSA-pwcm-6rh8-f2gh).
+    ///
+    /// `memo` is the request's duplicate-member screen memo when the caller has
+    /// a context. A document the screen cannot vouch for comes back as
+    /// [`BoundedBodyRulesOutcome::Ambiguous`] (GHSA-pq95-952r-2x32).
     fn apply_response_body_rules(
         &self,
         body: &[u8],
         content_type: Option<&str>,
         ceiling: usize,
-    ) -> crate::plugins::BoundedResponseBodyConstruction {
+        memo: Option<&mut crate::util::json_dup_keys::JsonScanMemo>,
+    ) -> BoundedBodyRulesOutcome {
         use crate::plugins::BoundedResponseBodyConstruction;
 
         if !self.rules_enabled {
-            return BoundedResponseBodyConstruction::Unchanged;
+            return BoundedBodyRulesOutcome::Construction(
+                BoundedResponseBodyConstruction::Unchanged,
+            );
         }
         // Framed gRPC is declined explicitly rather than left to fail inside
         // `apply_body_rules_bounded`. Both routes return `Unchanged`, but only the
@@ -256,9 +300,11 @@ impl ResponseTransformer {
             && (!body_transform::is_json_content_type(ct)
                 || body_transform::is_framed_grpc_content_type(ct))
         {
-            return BoundedResponseBodyConstruction::Unchanged;
+            return BoundedBodyRulesOutcome::Construction(
+                BoundedResponseBodyConstruction::Unchanged,
+            );
         }
-        body_transform::apply_body_rules_bounded(body, &self.body_rules, ceiling)
+        body_transform::apply_body_rules_bounded(body, &self.body_rules, ceiling, memo)
     }
 
     /// Whether THIS request's terminal metadata is policed over the buffered
@@ -767,6 +813,7 @@ impl ResponseTransformer {
             rules_enabled,
             route_override_consumer_only,
             static_policy_digest,
+            instance_id: NEXT_INSTANCE_ID.fetch_add(1, Ordering::Relaxed),
         })
     }
 }
@@ -1421,6 +1468,11 @@ impl Plugin for ResponseTransformer {
         content_type: Option<&str>,
         _response_headers: &HashMap<String, String>,
     ) -> Option<Vec<u8>> {
+        // A refusal this instance recorded for an earlier pass does not
+        // describe these bytes: decide afresh.
+        if ctx.response_transformer_ambiguous_body_refusal == Some(self.instance_id) {
+            ctx.response_transformer_ambiguous_body_refusal = None;
+        }
         // Defense in depth: the shared synthetic path already skips ordinary
         // presentation transforms when `finalized_response_replay` is set.
         // Returning `None` here keeps direct callers from re-mutating a cached
@@ -1444,8 +1496,33 @@ impl Plugin for ResponseTransformer {
         // reserved before invoking this hook — so an amplifying rule set is
         // refused while the output is written rather than after a larger buffer
         // is already resident (GHSA-pwcm-6rh8-f2gh).
-        self.apply_response_body_rules(body, content_type, ctx.retained_response_body_ceiling())
-            .into_transform_option(ctx)
+        let ceiling = ctx.retained_response_body_ceiling();
+        match self.apply_response_body_rules(
+            body,
+            content_type,
+            ceiling,
+            Some(&mut ctx.json_scan_memo),
+        ) {
+            BoundedBodyRulesOutcome::Construction(construction) => {
+                construction.into_transform_option(ctx)
+            }
+            BoundedBodyRulesOutcome::Ambiguous(reason) => {
+                // `None` alone would read as "unchanged" and publish the
+                // ambiguous backend bytes. Record this instance as the producer
+                // on a private field for its own
+                // `finalize_client_visible_response_body`, which runs after
+                // every semantic transform and before publication
+                // (GHSA-pq95-952r-2x32). The first producer owns the refusal.
+                debug!(
+                    reason,
+                    "response_transformer: refusing an ambiguous JSON response body"
+                );
+                if ctx.response_transformer_ambiguous_body_refusal.is_none() {
+                    ctx.response_transformer_ambiguous_body_refusal = Some(self.instance_id);
+                }
+                None
+            }
+        }
     }
 
     /// The context-free transform. Every buffered call site reaches this through
@@ -1462,12 +1539,63 @@ impl Plugin for ResponseTransformer {
         content_type: Option<&str>,
         _response_headers: &HashMap<String, String>,
     ) -> Option<Vec<u8>> {
-        self.apply_response_body_rules(
+        match self.apply_response_body_rules(
             body,
             content_type,
             crate::proxy::response_buffer_budget::buffered_response_body_ceiling(0),
-        )
-        .into_option()
+            None,
+        ) {
+            BoundedBodyRulesOutcome::Construction(construction) => construction.into_option(),
+            // Without a context there is no channel to refuse the response, the
+            // same as a capacity refusal on this compatibility path
+            // (`into_option`). Every buffered production call site uses the
+            // context-aware hook, which fails closed with a `502`.
+            BoundedBodyRulesOutcome::Ambiguous(_) => None,
+        }
+    }
+
+    /// Participate in the authoritative final client-visible body phase only
+    /// for a response THIS instance's body transform refused as ambiguous
+    /// (GHSA-pq95-952r-2x32), so every other response pays one comparison and
+    /// a sibling instance never answers for it.
+    fn enforces_final_client_visible_response_body(&self, ctx: &RequestContext) -> bool {
+        ctx.response_transformer_ambiguous_body_refusal == Some(self.instance_id)
+    }
+
+    /// The same staged refusal, so the lifecycle still discharges it when the
+    /// ordinary final phase is skipped because a gateway terminal (an
+    /// inspection-hook rejection) already owns the response and this transform
+    /// ran over that terminal's body.
+    fn has_staged_response_body_transform_refusal(&self, ctx: &RequestContext) -> bool {
+        ctx.response_transformer_ambiguous_body_refusal == Some(self.instance_id)
+    }
+
+    /// Replace a response whose JSON body the transform refused as ambiguous.
+    ///
+    /// Rejecting and non-rewriting, like every participant in this phase: the
+    /// gateway-authored `502` replaces the backend representation, so neither
+    /// the ambiguous bytes nor any field a body rule targets reach the client.
+    /// The latch is consumed so a re-decision of the replacement does not
+    /// reject again.
+    async fn finalize_client_visible_response_body(
+        &self,
+        ctx: &mut RequestContext,
+        _response_status: u16,
+        _response_headers: &HashMap<String, String>,
+        _body: &[u8],
+    ) -> PluginResult {
+        if ctx.response_transformer_ambiguous_body_refusal == Some(self.instance_id) {
+            ctx.response_transformer_ambiguous_body_refusal = None;
+            return PluginResult::Reject {
+                status_code: 502,
+                body: AMBIGUOUS_JSON_RESPONSE_ERROR.to_string(),
+                headers: HashMap::from([(
+                    "content-type".to_string(),
+                    "application/json".to_string(),
+                )]),
+            };
+        }
+        PluginResult::Continue
     }
 
     fn on_response_body_transformed(

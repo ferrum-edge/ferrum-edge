@@ -87,6 +87,22 @@
 //! preserved exactly across a rewrite (see
 //! `body_transform::apply_request_body_rules`).
 //!
+//! ## Ambiguous JSON bodies (GHSA-pq95-952r-2x32)
+//!
+//! Body rules strip one optional leading UTF-8 BOM and screen the candidate
+//! with the shared duplicate-member scanner before parsing (see
+//! `body_transform`). A document whose meaning is parser-dependent cannot be
+//! rewritten faithfully, and forwarding the original bytes would hand a
+//! first-key-wins backend the very field a `remove` / `rename` rule targets, so
+//! the request is refused with `400`; so is a well-formed document
+//! `serde_json` could not materialize. The transform hook has no rejection
+//! channel: it records its own instance id on a private `RequestContext` field
+//! and the same instance's `on_final_request_body_with_context` returns the
+//! rejection. Only an instance with enabled body rules screens;
+//! header/query-only instances never do, and a framed gRPC `+json` upload the
+//! client declared skips screening only when its bytes do not start like a
+//! JSON document.
+//!
 //! ## Non-application signal
 //!
 //! A rule or body pass that did not apply publishes a fixed, value-free
@@ -144,12 +160,14 @@ use http::header::{HeaderName, HeaderValue};
 use serde_json::Value;
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicU64, Ordering};
 use tracing::debug;
 
 use super::utils::body_transform::{self, BodyRule, RequestBodyRulesOutcome};
 use super::utils::query::OrderedQuery;
 use super::utils::transformer_gate;
 use super::{MetadataMap, Plugin, PluginResult, RequestContext};
+use crate::util::json_dup_keys::JsonScanMemo;
 
 pub mod runtime_overlay;
 
@@ -615,7 +633,14 @@ pub struct RequestTransformer {
     /// headers, which the dispatcher keeps intact only while it hands this
     /// instance a separate outbound copy.
     templates_read_headers: bool,
+    /// Process-local identity of this instance. Binds an ambiguous-body refusal
+    /// to the instance whose body rules produced it (GHSA-pq95-952r-2x32), so a
+    /// sibling instance can neither issue nor consume it.
+    instance_id: u64,
 }
+
+/// Source of [`RequestTransformer::instance_id`].
+static NEXT_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
 
 fn parse_op(op: &str) -> Option<(HeaderOp, QueryOp)> {
     match op {
@@ -1031,11 +1056,21 @@ impl RequestTransformer {
             rules_enabled,
             templates_read_query,
             templates_read_headers,
+            instance_id: NEXT_INSTANCE_ID.fetch_add(1, Ordering::Relaxed),
         })
     }
 
     /// Shared body pass for the context-free and context-aware hooks.
-    fn transform_body(&self, body: &[u8], content_type: Option<&str>) -> BodyPass {
+    ///
+    /// `memo` is the request's duplicate-member screen memo when the caller has
+    /// a context; the context-free hook screens directly.
+    fn transform_body(
+        &self,
+        body: &[u8],
+        content_type: Option<&str>,
+        memo: Option<&mut JsonScanMemo>,
+        wire_framed: bool,
+    ) -> BodyPass {
         // The same immutable decision `before_proxy` used. A marker header and
         // its paired body removal therefore cannot straddle a gate flip.
         if !self.rules_enabled {
@@ -1049,11 +1084,62 @@ impl RequestTransformer {
         {
             return BodyPass::Skipped(BODY_SKIPPED_NON_JSON_CONTENT_TYPE);
         }
-        match body_transform::apply_request_body_rules(body, &self.body_rules) {
+        // Framed gRPC / gRPC-Web `+json` carries length-prefixed frames, never
+        // one JSON document, so it skips the duplicate-member screen (which
+        // would otherwise hash or scan it) and keeps the parse-error outcome it
+        // always had (GHSA-pq95-952r-2x32). Neither a label nor the client's
+        // own declaration is proof of framing on its own, so the skip needs
+        // both: the client's wire `Content-Type` declared framed gRPC
+        // (`wire_framed`) AND the bytes do not even start like a JSON document.
+        // A bare JSON body under a framed label is screened and transformed.
+        if wire_framed && !body_looks_like_json_document(body) {
+            return BodyPass::Skipped(body_transform::BodyRulesSkipReason::ParseError.as_str());
+        }
+        let outcome = match memo {
+            Some(memo) => {
+                body_transform::apply_request_body_rules_screened(body, &self.body_rules, memo)
+            }
+            None => body_transform::apply_request_body_rules(body, &self.body_rules),
+        };
+        match outcome {
             RequestBodyRulesOutcome::Replaced(bytes) => BodyPass::Replaced(bytes),
             RequestBodyRulesOutcome::Skipped(reason) => BodyPass::Skipped(reason.as_str()),
             RequestBodyRulesOutcome::Unchanged => BodyPass::Unchanged,
+            RequestBodyRulesOutcome::Ambiguous(reason) => BodyPass::Refused(reason),
         }
+    }
+}
+
+/// Whether `body` starts like a JSON document: after one optional UTF-8 BOM
+/// and leading JSON whitespace, the first byte can begin a JSON value
+/// (`{ [ " - 0-9 t f n`). A gRPC / gRPC-Web frame starts with its flag byte
+/// (binary) or base64 text, neither of which can.
+fn body_looks_like_json_document(body: &[u8]) -> bool {
+    body_transform::strip_utf8_bom(body)
+        .iter()
+        .copied()
+        .find(|byte| !matches!(byte, b' ' | b'\t' | b'\n' | b'\r'))
+        .is_some_and(|byte| {
+            matches!(
+                byte,
+                b'{' | b'[' | b'"' | b'-' | b'0'..=b'9' | b't' | b'f' | b'n'
+            )
+        })
+}
+
+/// Whether the client's own request declared a framed gRPC / gRPC-Web media
+/// type: exactly one `Content-Type` field line in the immutable retained wire
+/// headers, and that value is a framed gRPC type. A context without retained
+/// wire headers, or with several `Content-Type` lines, proves nothing and keeps
+/// the body eligible for the JSON body rules. This alone never exempts a body:
+/// see [`body_looks_like_json_document`].
+pub(crate) fn request_wire_declares_framed_grpc(ctx: &RequestContext) -> bool {
+    let mut values = ctx.raw_header_value_bytes("content-type");
+    match (values.next(), values.next()) {
+        (Some(value), None) => {
+            std::str::from_utf8(value).is_ok_and(body_transform::is_framed_grpc_content_type)
+        }
+        _ => false,
     }
 }
 
@@ -1061,6 +1147,22 @@ enum BodyPass {
     Replaced(Vec<u8>),
     Skipped(&'static str),
     Unchanged,
+    /// The JSON body is ambiguous (GHSA-pq95-952r-2x32); the request must be
+    /// refused rather than forwarded with the original bytes.
+    Refused(&'static str),
+}
+
+/// Fixed client-visible error for a request refused because its JSON body is
+/// ambiguous to the configured body rules (GHSA-pq95-952r-2x32). Never echoes
+/// body bytes or the screen's internal reason.
+const AMBIGUOUS_JSON_BODY_ERROR: &str = r#"{"error":"Request body contains duplicate JSON object member names or a JSON document the gateway could not evaluate"}"#;
+
+fn ambiguous_json_body_reject() -> PluginResult {
+    PluginResult::Reject {
+        status_code: 400,
+        body: AMBIGUOUS_JSON_BODY_ERROR.to_string(),
+        headers: HashMap::from([("content-type".to_string(), "application/json".to_string())]),
+    }
 }
 
 /// Whether `name` is a request field computed over the request content,
@@ -1074,8 +1176,11 @@ pub(crate) fn is_body_bound_request_integrity_header(name: &str) -> bool {
 
 /// Whether request-transformer body rules may replace the bytes of a request
 /// with these FINAL outbound headers: the body is not proven empty and the
-/// effective `Content-Type` is absent or a JSON document type (framed gRPC
-/// `+json` can never parse as one document).
+/// effective `Content-Type` is absent or a JSON document type. A framed gRPC
+/// `+json` label is exempt only when the client's own wire `Content-Type`
+/// declared that framing ([`request_wire_declares_framed_grpc`]): a header rule
+/// that relabels a JSON upload does not stop the transform from rewriting it
+/// (GHSA-pq95-952r-2x32), so its stale integrity fields must still be retired.
 ///
 /// The method is deliberately NOT consulted: an HTTP/2 or HTTP/3 `GET` may
 /// carry DATA without `Content-Length`, and the body pass buffers and rewrites
@@ -1101,7 +1206,8 @@ pub(crate) fn request_body_rules_may_rewrite(
             .map(String::as_str)
             .is_none_or(|content_type| {
                 body_transform::is_json_content_type(content_type)
-                    && !body_transform::is_framed_grpc_content_type(content_type)
+                    && !(body_transform::is_framed_grpc_content_type(content_type)
+                        && request_wire_declares_framed_grpc(ctx))
             })
 }
 
@@ -1216,6 +1322,16 @@ impl Plugin for RequestTransformer {
         self.rules_enabled
     }
 
+    /// An enabled body-rule instance refuses an ambiguous JSON body from its
+    /// final request-body hook (GHSA-pq95-952r-2x32), so it is a finalized
+    /// request policy for composition admission: nothing that answers or
+    /// egresses from that phase (an `ai_semantic_cache` hit, early egress) may
+    /// be ordered ahead of it. Header/query-only and RTDS-disabled instances
+    /// never refuse there.
+    fn enforces_finalized_request_policy(&self) -> bool {
+        self.rules_enabled && !self.body_rules.is_empty()
+    }
+
     fn modifies_request_body(&self) -> bool {
         // The gate is immutable for this plugin generation, so a disabled
         // instance can safely drop the config-time buffering capability too.
@@ -1236,7 +1352,7 @@ impl Plugin for RequestTransformer {
         // ABSENT `Content-Type` keeps the buffered path because the transform
         // still attempts a JSON parse for it. Framed gRPC `+json` satisfies
         // `is_json_content_type` and so also stays buffered, matching the
-        // transform, which declines it only after a failed document parse.
+        // transform, which declines it only after inspecting the bytes.
         //
         // Safe against a header rewrite that changes eligibility: proxy core
         // (and the H3 path) re-evaluates `final_request_body_requirements`
@@ -1343,9 +1459,17 @@ impl Plugin for RequestTransformer {
         content_type: Option<&str>,
         _request_headers: &std::collections::HashMap<String, String>,
     ) -> Option<Vec<u8>> {
-        match self.transform_body(body, content_type) {
+        // No context, so no wire evidence: a framed label never exempts here.
+        match self.transform_body(body, content_type, None, false) {
             BodyPass::Replaced(bytes) => Some(bytes),
             BodyPass::Skipped(_) | BodyPass::Unchanged => None,
+            // This compatibility API has no rejection channel, and returning
+            // `None` would forward the ambiguous original bytes. Production
+            // always selects the context-aware hook below for an instance with
+            // body rules (`needs_final_request_body_context`), which refuses
+            // the request with `400`; an empty replacement is the fail-closed
+            // result for a context-free caller, as `ai_prompt_compressor` does.
+            BodyPass::Refused(_) => Some(Vec::new()),
         }
     }
 
@@ -1356,7 +1480,19 @@ impl Plugin for RequestTransformer {
         content_type: Option<&str>,
         _request_headers: &std::collections::HashMap<String, String>,
     ) -> Option<Vec<u8>> {
-        match self.transform_body(body, content_type) {
+        // A refusal this instance recorded for an earlier pass (a retry or a
+        // second finalization on the same context) does not describe these
+        // bytes: decide afresh.
+        if ctx.request_transformer_ambiguous_body_refusal == Some(self.instance_id) {
+            ctx.request_transformer_ambiguous_body_refusal = None;
+        }
+        let wire_framed = request_wire_declares_framed_grpc(ctx);
+        match self.transform_body(
+            body,
+            content_type,
+            Some(&mut ctx.json_scan_memo),
+            wire_framed,
+        ) {
             BodyPass::Replaced(bytes) => {
                 // A provisional final-header skip is superseded when a later
                 // header change made the body rewritable after all.
@@ -1369,7 +1505,50 @@ impl Plugin for RequestTransformer {
                 None
             }
             BodyPass::Unchanged => None,
+            BodyPass::Refused(reason) => {
+                // The body was not skipped: the request is refused. Record this
+                // instance as the producer on a private field (never metadata,
+                // which a later plugin could clear) for its own
+                // `on_final_request_body_with_context`, and keep the original
+                // bytes — they never reach a backend. The first producer owns
+                // the refusal; a later producer's refusal is redundant.
+                debug!(
+                    reason,
+                    "request_transformer: refusing an ambiguous JSON request body"
+                );
+                ctx.metadata.remove(BODY_SKIPPED_METADATA_KEY);
+                if ctx.request_transformer_ambiguous_body_refusal.is_none() {
+                    ctx.request_transformer_ambiguous_body_refusal = Some(self.instance_id);
+                }
+                None
+            }
         }
+    }
+
+    /// Return the refusal the body transform latched (GHSA-pq95-952r-2x32).
+    ///
+    /// Runs after every request-body transform on the same context the
+    /// transform used, on every dispatch ladder, before backend egress. Only
+    /// the instance that produced the refusal consumes it, at its own position
+    /// in the chain, so the request never reaches a backend. The refusal is
+    /// marked as a gateway request-representation terminal — the same typed
+    /// provenance the shared request representation gate's `400` carries,
+    /// handed back from the H1/H2 hook clone — which the synthetic reject
+    /// finalizer publishes as written. On the ordinary deferred H1/H2 dispatch,
+    /// response-side policy may still reshape the refusal's status or body;
+    /// that path always fails closed.
+    async fn on_final_request_body_with_context(
+        &self,
+        ctx: &mut RequestContext,
+        _headers: &HashMap<String, String>,
+        _body: &[u8],
+    ) -> PluginResult {
+        if ctx.request_transformer_ambiguous_body_refusal != Some(self.instance_id) {
+            return PluginResult::Continue;
+        }
+        ctx.request_transformer_ambiguous_body_refusal = None;
+        ctx.mark_gateway_representation_response_selected();
+        ambiguous_json_body_reject()
     }
 }
 

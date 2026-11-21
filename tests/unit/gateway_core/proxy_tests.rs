@@ -5041,6 +5041,7 @@ fn test_finalized_request_egress_runs_after_final_body_hooks_and_before_dispatch
         include_str!("../../../src/plugins/grpc_web.rs"),
         include_str!("../../../src/plugins/openapi_validator.rs"),
         include_str!("../../../src/plugins/request_size_limiting.rs"),
+        include_str!("../../../src/plugins/request_transformer.rs"),
         include_str!("../../../src/plugins/soap_ws_security.rs"),
         include_str!("../../../src/plugins/waf/mod.rs"),
     ] {
