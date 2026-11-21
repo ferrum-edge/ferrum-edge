@@ -1715,8 +1715,9 @@ curl -X PUT -H "Authorization: Bearer $TOKEN" -H "If-Match: $ETAG" \
   `ETag` from `GET /api-specs/{id}`, `/batch`, and `/gateway-trust-bundles/{id}`,
   which keeps its own body `revision` contract) is `400` rather than applied
   unconditionally.
-  Where a row precondition is evaluated, a request that would be `404`
-  without the header is still `404`. A route that does not evaluate the
+  When a well-formed row precondition is evaluated and the target resource
+  (the Consumer, for the credential sub-routes, whose index is checked after
+  the tag) does not exist, the response is still `404`. A route that does not evaluate the
   header (including all three `/api-specs` mutations, whose `PUT` accepts only
   the deployment profile) refuses it before any lookup, so a missing ID is
   `400` there, and the refusal also precedes the read-only `403`.
