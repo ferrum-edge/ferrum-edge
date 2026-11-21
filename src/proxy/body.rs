@@ -1675,6 +1675,13 @@ impl ProxyBody {
         // stream whichever of them fires first — including when the caller
         // supplied no request-level latch to share with the upload direction.
         let auth_latch = auth_latch.unwrap_or_default();
+        // Do not read ahead when an inner response-deadline wrapper (client
+        // `grpc-timeout` or route `timeouts.request`) is already installed:
+        // draining frames here could exhaust the inner wrapper before the
+        // client polls, causing it to claim completion and drop its own
+        // earlier deadline and close grace.
+        let allow_read_ahead =
+            self.client_grpc_deadline.is_none() && self.route_request_deadline_fired.is_none();
         let placeholder = ProxyBodyKind::Full(Full::default());
         let previous = std::mem::replace(&mut self.kind, placeholder);
         let (kind, settled_watchdog, clean_backend_eof, backend_errored) = match previous {
@@ -1688,6 +1695,7 @@ impl ProxyBody {
                 deadline_frame,
                 terminal,
                 closer,
+                allow_read_ahead,
             ),
             ProxyBodyKind::Tracked(body) => wrap_authorization_deadline_body(
                 body,
@@ -1699,6 +1707,7 @@ impl ProxyBody {
                 deadline_frame,
                 terminal,
                 closer,
+                allow_read_ahead,
             ),
             full @ ProxyBodyKind::Full(_) => (full, None, false, false),
         };
@@ -5807,13 +5816,13 @@ impl<B> TotalDeadlineBody<B> {
         self
     }
 
-    /// Whether this adapter's own deadline can only END the body with a
-    /// transport error — no body-framed terminal, no native trailers, and no
-    /// authorization regime — so it never changes how many bytes are sent.
+    /// Whether this adapter's deadline can only END the body with a transport
+    /// `Err(io::Error)` — no body-framed gRPC-Web terminal DATA frame and no
+    /// native gRPC trailers — so it never emits additional wire bytes or
+    /// trailers. (`pre_data_message` and `post_data_message` are `io::Error`
+    /// strings, never body bytes.)
     fn deadline_only_errors(&self) -> bool {
-        self.deadline_frame.is_none()
-            && !self.terminal.native_grpc_trailers
-            && self.terminal.auth_termination.is_none()
+        self.deadline_frame.is_none() && !self.terminal.native_grpc_trailers
     }
 
     /// Emit this regime's protocol-correct terminal for a bound that has been
@@ -6313,11 +6322,13 @@ fn wrap_authorization_deadline_body<B>(
     deadline_frame: Option<Frame<Bytes>>,
     terminal: DeadlineTerminal,
     closer: Option<crate::proxy::auth_lifetime::AuthorizationConnectionCloser>,
+    allow_read_ahead: bool,
 ) -> (ProxyBodyKind, Option<SettledWatchdogGuard>, bool, bool)
 where
     B: http_body::Body<Data = Bytes, Error = ProxyBodyError> + Send + Unpin + 'static,
 {
-    if let Some(closer_ref) = closer.as_ref()
+    if allow_read_ahead
+        && let Some(closer_ref) = closer.as_ref()
         && tokio::time::Instant::now() < deadline.at
     {
         let original_exact = http_body::Body::size_hint(&body).exact();

@@ -1961,22 +1961,6 @@ where
             Some(Ok(frame)) => {
                 let last = http_body::Body::is_end_stream(&body);
                 permit.send(BridgedFrame { frame, last });
-                // For unauthenticated single-frame uploads whose client body is
-                // already at EOF (`last == true`), probe EOF immediately so we
-                // release `body` and avoid a wasted Full-channel iteration.
-                // Authenticated uploads deliberately keep waiting on the next
-                // reserve so a frame still sitting unconsumed in the bridge
-                // remains subject to `expiry` if the credential expires before
-                // the transport takes it.
-                if last && plan.is_none() {
-                    let mut noop_cx = Context::from_waker(std::task::Waker::noop());
-                    if matches!(
-                        Pin::new(&mut body).poll_frame(&mut noop_cx),
-                        Poll::Ready(None)
-                    ) {
-                        break 'pump UploadPumpOutcome::Completed;
-                    }
-                }
             }
             Some(Err(error)) => {
                 let error: BoxError = error.into();

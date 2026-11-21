@@ -2553,6 +2553,26 @@ pub fn apply_sanitized_response_headers(
 /// is visible ASCII/HTAB that `HeaderValue::from_str` accepts unchanged.
 #[inline]
 pub(crate) fn response_headers_passthrough_eligible(headers: &http::HeaderMap) -> bool {
+    if headers.contains_key(http::header::CONNECTION) {
+        // Any Connection nomination beyond `keep-alive` / `close` can strip
+        // fields (`content-length`, `content-type`, custom headers) during
+        // collection before the rest of the response pipeline inspects them;
+        // materialize so header lookups stay 1:1 with the standard path.
+        for value in headers.get_all(http::header::CONNECTION) {
+            let Ok(text) = value.to_str() else {
+                return false;
+            };
+            for token in text.split(',') {
+                let trimmed = token.trim();
+                if !trimmed.is_empty()
+                    && !trimmed.eq_ignore_ascii_case("keep-alive")
+                    && !trimmed.eq_ignore_ascii_case("close")
+                {
+                    return false;
+                }
+            }
+        }
+    }
     let unique_or_set_cookie = headers.len() == headers.keys_len()
         || headers.keys().all(|name| {
             name == http::header::SET_COOKIE || headers.get_all(name).iter().nth(1).is_none()
@@ -2562,7 +2582,7 @@ pub(crate) fn response_headers_passthrough_eligible(headers: &http::HeaderMap) -
             value
                 .as_bytes()
                 .iter()
-                .all(|&b| b == b'\t' || (b >= 0x20 && b < 0x7f))
+                .all(|&b| b == b'\t' || (0x20..0x7f).contains(&b))
         })
 }
 

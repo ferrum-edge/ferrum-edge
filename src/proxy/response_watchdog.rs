@@ -545,12 +545,22 @@ impl SettledWatchdogHub {
                 let notify = Arc::clone(&hub.notify);
                 handle.spawn(run_settled_watchdog_hub(weak, notify));
             } else {
-                let mut guard = match hub.state.lock() {
-                    Ok(guard) => guard,
-                    Err(poisoned) => poisoned.into_inner(),
-                };
-                guard.task_running = false;
-                guard.armed_wake_at = None;
+                // Fail closed if called outside a Tokio runtime: no background
+                // watchdog can arm the deadline, so remove the orphaned entry
+                // and close the connection rather than leaving the stream
+                // unguarded.
+                {
+                    let mut guard = match hub.state.lock() {
+                        Ok(guard) => guard,
+                        Err(poisoned) => poisoned.into_inner(),
+                    };
+                    if let Some(pos) = guard.entries.iter().position(|e| e.id == id) {
+                        guard.entries.swap_remove(pos);
+                    }
+                    guard.task_running = false;
+                    guard.armed_wake_at = None;
+                }
+                inner.request_close();
             }
         } else if should_notify {
             hub.notify.notify_one();

@@ -5629,6 +5629,16 @@ fn project_log_metadata(
     ctx: &RequestContext,
     mut metadata: crate::plugins::MetadataMap,
 ) -> crate::plugins::MetadataMap {
+    metadata
+        .entry("ferrum.frontend_scheme".to_string())
+        .or_insert_with(|| {
+            if ctx.request_is_secure {
+                "https"
+            } else {
+                "http"
+            }
+            .to_string()
+        });
     // Detached uploads publish through the shared latch. Import its bounded
     // class even when no response relay copied it into the request context.
     if let Some(termination) = ctx.observed_authorization_termination() {
@@ -36595,12 +36605,7 @@ async fn handle_proxy_request_inner(
         &state,
         start_time,
         inbound_version,
-        RequestContext::new_with_start_time(
-            socket_ip.clone(),
-            method.clone(),
-            path.clone(),
-            start_time,
-        ),
+        RequestContext::new(socket_ip.clone(), method.clone(), path.clone()),
     );
     // Carry the operator's response-body ceiling so the buffered representation
     // gate bounds its decompression by the same limit the wire path enforces.
@@ -45818,17 +45823,18 @@ async fn handle_proxy_request_inner(
             ctx.adopt_final_request_body_hook_context(*body_hook_ctx);
         }
         let (mut result, retained_body) = match initial_dispatch {
-            BackendDispatchResult::Response {
-                response,
-                retained_body,
-                backend_admission_permits: permits,
-                request_body_exceeded,
-                streaming_h2_read_timeout_ms: mesh_read_timeout_ms,
-                passthrough_request_bytes,
-                client_upload_gate_wait,
-                pooled_backend_lease,
-                response_headers_deferred: headers_deferred,
-            } => {
+            BackendDispatchResult::Response(dispatch) => {
+                let BackendDispatchResponse {
+                    mut response,
+                    retained_body,
+                    backend_admission_permits: permits,
+                    request_body_exceeded,
+                    streaming_h2_read_timeout_ms: mesh_read_timeout_ms,
+                    passthrough_request_bytes,
+                    client_upload_gate_wait,
+                    pooled_backend_lease,
+                    response_headers_deferred: headers_deferred,
+                } = *dispatch;
                 backend_admission_permits = permits;
                 mesh_request_body_exceeded = request_body_exceeded;
                 direct_pooled_backend_lease = pooled_backend_lease;
@@ -45837,7 +45843,6 @@ async fn handle_proxy_request_inner(
                 passthrough_request_bytes_latch = passthrough_request_bytes;
                 direct_h2_client_upload_gate =
                     (backend_admission_started_at, client_upload_gate_wait);
-                let mut response = *response;
                 if charge_generic_grpc_route_attempt_budget_expiry(
                     &ctx,
                     &ctx.request_headers_view(owned_proxy_headers_ref),
@@ -46551,6 +46556,11 @@ async fn handle_proxy_request_inner(
             // the deadline. A total-deadline expiry then stops the retry
             // planner at the loop guard; a per-attempt budget expiry is an
             // ordinary backend-timeout `504` the retry policy may retry.
+            // Replacing `result` discards any previous direct-H1 streaming
+            // response: drop its connection lease and clear its deferred
+            // header-map flag so the retry response cannot inherit them.
+            direct_pooled_backend_lease = None;
+            response_headers_deferred = false;
             result = match attempt_result {
                 Ok(response) => response,
                 Err(expiry) => {
@@ -46683,17 +46693,18 @@ async fn handle_proxy_request_inner(
             ctx.adopt_final_request_body_hook_context(*body_hook_ctx);
         }
         let resp = match dispatch {
-            BackendDispatchResult::Response {
-                response,
-                backend_admission_permits: permits,
-                request_body_exceeded,
-                streaming_h2_read_timeout_ms: effective_streaming_h2_read_timeout_ms,
-                passthrough_request_bytes,
-                client_upload_gate_wait,
-                pooled_backend_lease,
-                response_headers_deferred: headers_deferred,
-                ..
-            } => {
+            BackendDispatchResult::Response(dispatch) => {
+                let BackendDispatchResponse {
+                    mut response,
+                    backend_admission_permits: permits,
+                    request_body_exceeded,
+                    streaming_h2_read_timeout_ms: effective_streaming_h2_read_timeout_ms,
+                    passthrough_request_bytes,
+                    client_upload_gate_wait,
+                    pooled_backend_lease,
+                    response_headers_deferred: headers_deferred,
+                    ..
+                } = *dispatch;
                 backend_admission_permits = permits;
                 mesh_request_body_exceeded = request_body_exceeded;
                 direct_pooled_backend_lease = pooled_backend_lease;
@@ -46702,7 +46713,6 @@ async fn handle_proxy_request_inner(
                 passthrough_request_bytes_latch = passthrough_request_bytes;
                 direct_h2_client_upload_gate =
                     (backend_admission_started_at, client_upload_gate_wait);
-                let mut response = *response;
                 if charge_generic_grpc_route_attempt_budget_expiry(
                     &ctx,
                     &ctx.request_headers_view(owned_proxy_headers_ref),
@@ -46871,10 +46881,6 @@ async fn handle_proxy_request_inner(
             backend_body,
         );
     }
-    // Record original backend response invariants before any `after_proxy` hook
-    // can rewrite headers. Compression preserves these markers even if an earlier
-    // hook strips/renames `Content-Range` or `Cache-Control`.
-    stamp_original_response_metadata(&mut ctx, response_status, &response_headers);
     let backend_resolved_ip = backend_resp.backend_resolved_ip;
     let backend_error_class = backend_resp.error_class;
     // Attribute the target and transport of the attempt that answered, not
@@ -47086,6 +47092,44 @@ async fn handle_proxy_request_inner(
         ResponseBody::StreamingH3(_) => true,
         _ => false,
     };
+    // If any response-header consumer, trailer governor, or late fallback needs
+    // the materialized `HashMap<String, String>`, materialize from
+    // `resp.headers()` once now BEFORE pre-policy trailer capture and BEFORE
+    // original-response metadata stamping / response hooks run. Common
+    // Content-Length streaming plain-HTTP / passthrough-auth responses stay on
+    // the zero-allocation `HeaderMap` lane.
+    if response_headers_deferred {
+        let needs_map = hyper_or_h3_streaming_relay
+            || reqwest_trailers_relayed
+            || buffered_response_trailers.is_some()
+            || sticky_cookie_needed
+            || ctx.gateway_capacity_response_selected()
+            || capabilities.has(PluginCapabilities::HAS_AFTER_PROXY_HOOK)
+            || capabilities.has(PluginCapabilities::HAS_RESPONSE_COMMITTED_HOOK)
+            || capabilities.has(PluginCapabilities::HAS_RESPONSE_STREAM_HOOKS)
+            || capabilities.has(PluginCapabilities::RUNS_BUILTIN_GRPC_WEB)
+            || ctx.route_override_response_transform.is_some()
+            || is_grpc_request
+            || grpc_web_request
+            || method.eq_ignore_ascii_case("HEAD")
+            || ctx.grpc_deadline_at().is_some()
+            || !matches!(&response_body, ResponseBody::StreamingH2(_));
+        if needs_map {
+            if let ResponseBody::StreamingH2(resp) = &response_body {
+                response_headers.reserve(resp.headers().keys_len());
+                collect_hyper_response_headers(resp.headers(), &mut response_headers);
+            }
+            response_headers_deferred = false;
+        }
+    }
+    // Record original backend response invariants before any `after_proxy` hook
+    // can rewrite headers. Compression preserves these markers even if an
+    // earlier hook strips/renames `Content-Range` or `Cache-Control`. Skipped
+    // on the deferred lane where no response hook can run and log projection
+    // strips these internal keys anyway.
+    if !response_headers_deferred {
+        stamp_original_response_metadata(&mut ctx, response_status, &response_headers);
+    }
     let streaming_trailer_policy = if hyper_or_h3_streaming_relay
         || reqwest_trailers_relayed
         || buffered_response_trailers.is_some()
@@ -47180,33 +47224,6 @@ async fn handle_proxy_request_inner(
     } else {
         None
     };
-
-    // If any response-header consumer or late fallback needs the materialized
-    // `HashMap<String, String>`, materialize from `resp.headers()` once now
-    // before any header phase runs. Common streaming plain-HTTP / passthrough
-    // auth responses stay on the zero-allocation `HeaderMap` lane.
-    if response_headers_deferred {
-        let needs_map = streaming_trailer_policy.is_some()
-            || sticky_cookie_needed
-            || ctx.gateway_capacity_response_selected()
-            || capabilities.has(PluginCapabilities::HAS_AFTER_PROXY_HOOK)
-            || capabilities.has(PluginCapabilities::HAS_RESPONSE_COMMITTED_HOOK)
-            || capabilities.has(PluginCapabilities::HAS_RESPONSE_STREAM_HOOKS)
-            || capabilities.has(PluginCapabilities::RUNS_BUILTIN_GRPC_WEB)
-            || ctx.route_override_response_transform.is_some()
-            || is_grpc_request
-            || grpc_web_request
-            || method.eq_ignore_ascii_case("HEAD")
-            || ctx.grpc_deadline_at().is_some()
-            || !matches!(&response_body, ResponseBody::StreamingH2(_));
-        if needs_map {
-            if let ResponseBody::StreamingH2(resp) = &response_body {
-                response_headers.reserve(resp.headers().keys_len());
-                collect_hyper_response_headers(resp.headers(), &mut response_headers);
-            }
-            response_headers_deferred = false;
-        }
-    }
 
     // Codex r2-2 finding 2: the BUFFERED arm needs the same seeding. A
     // gRPC-flavored buffered response on this path is the mesh-mTLS
@@ -48355,7 +48372,7 @@ async fn handle_proxy_request_inner(
         if let Some(alt_svc) = state.alt_svc_for_frontend_port(ctx.frontend_listen_port)
             && let Ok(value) = http::HeaderValue::from_str(alt_svc.as_ref())
         {
-            raw.insert(http::header::ALT_SVC, value);
+            raw.append(http::header::ALT_SVC, value);
         }
         if state.overload.should_close_keepalive() {
             raw.insert(
@@ -48366,16 +48383,14 @@ async fn handle_proxy_request_inner(
         if let Some(via) = resp_via
             && let Ok(value) = http::HeaderValue::from_str(via.as_str())
         {
-            raw.insert(http::header::VIA, value);
+            raw.append(http::header::VIA, value);
         }
         deferred_response_headers = Some(raw);
     } else {
+        use headers_mod::apply_sanitized_response_headers;
         headers_mod::strip_gateway_owned_diagnostic_response_headers(&mut response_headers);
-        resp_builder = headers_mod::apply_sanitized_response_headers(
-            resp_builder,
-            &mut response_headers,
-            framing,
-        );
+        resp_builder =
+            apply_sanitized_response_headers(resp_builder, &mut response_headers, framing);
 
         // Add gateway error categorization headers so clients and ops teams
         // can distinguish different failure modes:
@@ -51698,30 +51713,34 @@ pub(crate) fn record_backend_admission_retry_outcome(
     }
 }
 
+/// Payload of [`BackendDispatchResult::Response`], boxed as a single
+/// allocation so [`BackendDispatchResult`] stays compact on the stack.
+struct BackendDispatchResponse {
+    response: retry::BackendResponse,
+    retained_body: Option<Bytes>,
+    backend_admission_permits: Option<BackendAdmissionPermitSet>,
+    request_body_exceeded: Option<Arc<std::sync::atomic::AtomicBool>>,
+    streaming_h2_read_timeout_ms: Option<u64>,
+    /// Join for unlimited direct-H2 passthrough byte publication. `None`
+    /// on every other dispatch (reqwest, limited H2, mesh, H3).
+    passthrough_request_bytes: Option<Arc<body::DirectH2BytesLatch>>,
+    /// Time the direct-H2 dispatcher held already-received backend response
+    /// headers while waiting for the client upload to finish. Client time,
+    /// excluded from the adaptive-concurrency latency sample. `ZERO` on
+    /// every other dispatch.
+    client_upload_gate_wait: Duration,
+    /// Direct HTTP/1.1 streaming connection lease, carried inline to avoid
+    /// boxing through `response.extensions_mut()` (`PooledBackendLeaseSlot`).
+    pooled_backend_lease: Option<Box<dyn body::PooledBackendLease>>,
+    /// True when `proxy_to_backend_direct_h1` left the wire `HeaderMap` on
+    /// `ResponseBody::StreamingH2(resp)` instead of allocating a
+    /// `HashMap<String, String>` round-trip.
+    response_headers_deferred: bool,
+}
+
 /// Outcome of one [`proxy_to_backend`] dispatch attempt.
 enum BackendDispatchResult {
-    Response {
-        response: Box<retry::BackendResponse>,
-        retained_body: Option<Bytes>,
-        backend_admission_permits: Option<BackendAdmissionPermitSet>,
-        request_body_exceeded: Option<Arc<std::sync::atomic::AtomicBool>>,
-        streaming_h2_read_timeout_ms: Option<u64>,
-        /// Join for unlimited direct-H2 passthrough byte publication. `None`
-        /// on every other dispatch (reqwest, limited H2, mesh, H3).
-        passthrough_request_bytes: Option<Arc<body::DirectH2BytesLatch>>,
-        /// Time the direct-H2 dispatcher held already-received backend response
-        /// headers while waiting for the client upload to finish. Client time,
-        /// excluded from the adaptive-concurrency latency sample. `ZERO` on
-        /// every other dispatch.
-        client_upload_gate_wait: Duration,
-        /// Direct HTTP/1.1 streaming connection lease, carried inline to avoid
-        /// boxing through `response.extensions_mut()` (`PooledBackendLeaseSlot`).
-        pooled_backend_lease: Option<Box<dyn body::PooledBackendLease>>,
-        /// True when `proxy_to_backend_direct_h1` left the wire `HeaderMap` on
-        /// `ResponseBody::StreamingH2(resp)` instead of allocating a
-        /// `HashMap<String, String>` round-trip.
-        response_headers_deferred: bool,
-    },
+    Response(Box<BackendDispatchResponse>),
     AdmissionRejected(backend_dispatch::BackendAdmissionRejection),
 }
 
@@ -51815,8 +51834,8 @@ fn backend_dispatch_response(
     retained_body: Option<Bytes>,
     backend_admission_permits: Option<BackendAdmissionPermitSet>,
 ) -> BackendDispatchResult {
-    BackendDispatchResult::Response {
-        response: Box::new(response),
+    BackendDispatchResult::Response(Box::new(BackendDispatchResponse {
+        response,
         retained_body,
         backend_admission_permits,
         request_body_exceeded: None,
@@ -51825,7 +51844,7 @@ fn backend_dispatch_response(
         client_upload_gate_wait: Duration::ZERO,
         pooled_backend_lease: None,
         response_headers_deferred: false,
-    }
+    }))
 }
 
 /// Record a direct-H2 pool/connect failure against the admission permit acquired
@@ -52836,11 +52855,11 @@ async fn proxy_to_backend(
     //
     // Every ordinary host still fails closed here. Retry dispatch repeats the
     // same target-effective preflight before entering any direct or mesh pool.
-    let resolved_ip = if unix_target.is_some()
+    let (resolved_ip_addr, resolved_ip) = if unix_target.is_some()
         || (dispatch_hbone
             && upstream_target.is_some_and(is_synthetic_cross_cluster_hbone_dispatch_target))
     {
-        None
+        (None, None)
     } else {
         // Resolve backend IP from DNS cache (O(1) cached lookup, <1μs).
         // When `dns_override` is set, this returns the override IP for the
@@ -52876,7 +52895,7 @@ async fn proxy_to_backend(
             || !request_ctx.mirror_result_rxs.is_empty()
             || request_ctx.diagnostic_slot().is_some();
         match resolved_ip_result {
-            Ok(ip) => need_resolved_ip_string.then(|| ip.to_string()),
+            Ok(ip) => (Some(ip), need_resolved_ip_string.then(|| ip.to_string())),
             Err(error) => {
                 return backend_dns_resolution_failed_dispatch_result(effective_host, &error);
             }
@@ -53090,8 +53109,8 @@ async fn proxy_to_backend(
             )
             .await
         };
-        return BackendDispatchResult::Response {
-            response: Box::new(backend_resp),
+        return BackendDispatchResult::Response(Box::new(BackendDispatchResponse {
+            response: backend_resp,
             retained_body: unix_retained_body.or(body_bytes),
             backend_admission_permits,
             request_body_exceeded,
@@ -53100,7 +53119,7 @@ async fn proxy_to_backend(
             client_upload_gate_wait: Duration::ZERO,
             pooled_backend_lease: None,
             response_headers_deferred: false,
-        };
+        }));
     }
 
     if dispatch_hbone {
@@ -53173,8 +53192,8 @@ async fn proxy_to_backend(
             )
         })
         .await;
-        return BackendDispatchResult::Response {
-            response: Box::new(backend_resp),
+        return BackendDispatchResult::Response(Box::new(BackendDispatchResponse {
+            response: backend_resp,
             retained_body: mesh_retained_body.or(body_bytes),
             backend_admission_permits,
             request_body_exceeded,
@@ -53183,7 +53202,7 @@ async fn proxy_to_backend(
             client_upload_gate_wait: Duration::ZERO,
             pooled_backend_lease: None,
             response_headers_deferred: false,
-        };
+        }));
     }
 
     // Sidecar egress: plain HTTP/2 over SVID-mTLS to the peer sidecar's
@@ -53316,8 +53335,8 @@ async fn proxy_to_backend(
             )
         })
         .await;
-        return BackendDispatchResult::Response {
-            response: Box::new(backend_resp),
+        return BackendDispatchResult::Response(Box::new(BackendDispatchResponse {
+            response: backend_resp,
             retained_body: mesh_retained_body.or(body_bytes),
             backend_admission_permits,
             request_body_exceeded,
@@ -53326,7 +53345,7 @@ async fn proxy_to_backend(
             client_upload_gate_wait: Duration::ZERO,
             pooled_backend_lease: None,
             response_headers_deferred: false,
-        };
+        }));
     }
 
     // Plain HTTPS requests attempt the native H3 pool only when startup
@@ -53517,11 +53536,19 @@ async fn proxy_to_backend(
             // A backend proven to speak only HTTP/1.1 over TLS is the ordinary
             // BackendTLSPolicy case, not an error: honor the overridden TLS
             // server name on the reqwest/H1 path instead of failing the request.
+            let sni_ip_fallback;
+            let sni_resolved_ip = match resolved_ip.as_deref() {
+                Some(ip) => Some(ip),
+                None => {
+                    sni_ip_fallback = resolved_ip_addr.map(|ip| ip.to_string());
+                    sni_ip_fallback.as_deref()
+                }
+            };
             match resolve_backend_tls_sni_reqwest_dial(
                 direct_h2_proxy,
                 backend_url,
                 effective_host,
-                resolved_ip.as_deref(),
+                sni_resolved_ip,
             ) {
                 Some(dial) => {
                     debug!(
@@ -53617,11 +53644,19 @@ async fn proxy_to_backend(
                             upstream_target,
                         );
                         if requires_direct_h2_for_sni {
+                            let sni_ip_fallback;
+                            let sni_resolved_ip = match resolved_ip.as_deref() {
+                                Some(ip) => Some(ip),
+                                None => {
+                                    sni_ip_fallback = resolved_ip_addr.map(|ip| ip.to_string());
+                                    sni_ip_fallback.as_deref()
+                                }
+                            };
                             match resolve_backend_tls_sni_reqwest_dial(
                                 direct_h2_proxy,
                                 backend_url,
                                 effective_host,
-                                resolved_ip.as_deref(),
+                                sni_resolved_ip,
                             ) {
                                 Some(dial) => {
                                     debug!(
@@ -53755,8 +53790,8 @@ async fn proxy_to_backend(
                     })
                     .await
                 };
-                return BackendDispatchResult::Response {
-                    response: Box::new(backend_resp),
+                return BackendDispatchResult::Response(Box::new(BackendDispatchResponse {
+                    response: backend_resp,
                     retained_body: None,
                     backend_admission_permits: h2_admission_permits.take(),
                     request_body_exceeded,
@@ -53765,7 +53800,7 @@ async fn proxy_to_backend(
                     client_upload_gate_wait,
                     pooled_backend_lease: None,
                     response_headers_deferred: false,
-                };
+                }));
             }
             // Fall through to the reqwest path: `h2_admission_permits` drops here,
             // releasing the in-flight slot so the reqwest path below re-admits
@@ -53776,11 +53811,19 @@ async fn proxy_to_backend(
             // `pool_enable_http2: false` makes this request incompatible with the
             // direct-H2 sender. The reqwest/H1 path supports all three, so honor
             // the overridden TLS server name there rather than failing closed.
+            let sni_ip_fallback;
+            let sni_resolved_ip = match resolved_ip.as_deref() {
+                Some(ip) => Some(ip),
+                None => {
+                    sni_ip_fallback = resolved_ip_addr.map(|ip| ip.to_string());
+                    sni_ip_fallback.as_deref()
+                }
+            };
             match resolve_backend_tls_sni_reqwest_dial(
                 direct_h2_proxy,
                 backend_url,
                 effective_host,
-                resolved_ip.as_deref(),
+                sni_resolved_ip,
             ) {
                 Some(dial) => {
                     debug!(
@@ -56613,8 +56656,8 @@ async fn proxy_to_backend_direct_h1(
         } else {
             None
         };
-        return BackendDispatchResult::Response {
-            response: Box::new(retry::BackendResponse {
+        return BackendDispatchResult::Response(Box::new(BackendDispatchResponse {
+            response: retry::BackendResponse {
                 status_code: status,
                 body: ResponseBody::StreamingH2(response),
                 headers: HashMap::new(),
@@ -56623,7 +56666,7 @@ async fn proxy_to_backend_direct_h1(
                 error_class: None,
                 request_on_wire: true,
                 buffered_trailers: None,
-            }),
+            },
             retained_body,
             backend_admission_permits,
             request_body_exceeded: body_size_exceeded,
@@ -56632,7 +56675,7 @@ async fn proxy_to_backend_direct_h1(
             client_upload_gate_wait: Duration::ZERO,
             pooled_backend_lease,
             response_headers_deferred: true,
-        };
+        }));
     }
 
     let mut resp_headers = HashMap::with_capacity(response.headers().keys_len());
@@ -56694,8 +56737,8 @@ async fn proxy_to_backend_direct_h1(
         } else {
             None
         };
-        return BackendDispatchResult::Response {
-            response: Box::new(retry::BackendResponse {
+        return BackendDispatchResult::Response(Box::new(BackendDispatchResponse {
+            response: retry::BackendResponse {
                 status_code: status,
                 body: ResponseBody::StreamingH2(response),
                 headers: resp_headers,
@@ -56704,7 +56747,7 @@ async fn proxy_to_backend_direct_h1(
                 error_class: None,
                 request_on_wire: true,
                 buffered_trailers: None,
-            }),
+            },
             retained_body,
             backend_admission_permits,
             request_body_exceeded: body_size_exceeded,
@@ -56713,7 +56756,7 @@ async fn proxy_to_backend_direct_h1(
             client_upload_gate_wait: Duration::ZERO,
             pooled_backend_lease,
             response_headers_deferred: false,
-        };
+        }));
     }
     let collected = match collect_response_under_authorization(
         request_ctx.grpc_deadline_at(),
@@ -60108,8 +60151,8 @@ fn route_deadline_dispatch_result(
 ) -> BackendDispatchResult {
     let response =
         route_deadline_expiry_response(expiry, handoff.handed_to_backend(), timeout_phase);
-    BackendDispatchResult::Response {
-        response: Box::new(response),
+    BackendDispatchResult::Response(Box::new(BackendDispatchResponse {
+        response,
         retained_body: handoff.into_retained_body(),
         backend_admission_permits: None,
         request_body_exceeded: None,
@@ -60118,7 +60161,7 @@ fn route_deadline_dispatch_result(
         client_upload_gate_wait: Duration::ZERO,
         pooled_backend_lease: None,
         response_headers_deferred: false,
-    }
+    }))
 }
 
 pub(crate) fn client_grpc_deadline_exceeded_response_for_request<
@@ -74011,9 +74054,10 @@ mod tests {
         )
         .await;
 
-        let BackendDispatchResult::Response { response, .. } = dispatch else {
+        let BackendDispatchResult::Response(dispatch) = dispatch else {
             panic!("dns_override policy rejection must be a backend response");
         };
+        let response = dispatch.response;
         assert_eq!(response.status_code, 502);
         assert!(!response.connection_error);
         assert_eq!(
@@ -74078,7 +74122,7 @@ mod tests {
             )
             .await;
             let resp = match dispatch {
-                BackendDispatchResult::Response { response, .. } => *response,
+                BackendDispatchResult::Response(dispatch) => dispatch.response,
                 BackendDispatchResult::AdmissionRejected(_) => {
                     panic!("test does not configure backend admission plugins")
                 }
@@ -74204,7 +74248,7 @@ mod tests {
             )
             .await;
             let resp = match dispatch {
-                BackendDispatchResult::Response { response, .. } => *response,
+                BackendDispatchResult::Response(dispatch) => dispatch.response,
                 BackendDispatchResult::AdmissionRejected(_) => {
                     panic!("test does not configure backend admission plugins")
                 }
@@ -74382,7 +74426,7 @@ mod tests {
         )
         .await;
         let initial_response = match initial {
-            BackendDispatchResult::Response { response, .. } => *response,
+            BackendDispatchResult::Response(dispatch) => dispatch.response,
             BackendDispatchResult::AdmissionRejected(_) => {
                 panic!("test does not configure backend admission plugins")
             }

@@ -412,6 +412,9 @@ auth_flow::impl_auth_plugin!(
 
     fn supports_request_header_passthrough(&self) -> bool {
         !self.requires_decoded_query_params()
+            && !self.locations.iter().any(|location| {
+                matches!(location, KeyLocation::Header { lower, .. } if lower == "host")
+            })
     }
 
     fn lifecycle_hooks(&self) -> crate::plugins::PluginHooks {

@@ -161,7 +161,7 @@ impl RequestHeaderPassthrough {
         let mut idx = 0usize;
         let pairs: [(&'static HeaderName, Option<&str>); 4] = [
             (&CONSUMER_USERNAME_HEADER, username),
-            (&CONSUMER_CUSTOM_ID_HEADER, username.and_then(|_| custom_id)),
+            (&CONSUMER_CUSTOM_ID_HEADER, username.and(custom_id)),
             (&AUTHENTICATED_IDENTITY_HEADER, identity),
             (&GEO_COUNTRY_HEADER, geo_country),
         ];
@@ -274,7 +274,7 @@ impl<'a> PassthroughRequestHeaders<'a> {
             .filter(|slot| slot.is_some())
             .count();
         self.raw.len().saturating_sub(stripped_present)
-            + usize::from(self.host_backfill.is_some())
+            + usize::from(self.host_backfill.is_some() && !self.is_stripped("host"))
             + usize::from(hops_added)
             + injected
     }
@@ -357,7 +357,8 @@ impl<'a> Iterator for PassthroughEntries<'a> {
         }
         if self.tail == 1 {
             self.tail = 2;
-            if let Some(host) = self.view.host_backfill
+            if !self.view.is_stripped("host")
+                && let Some(host) = self.view.host_backfill
                 && let Some(text) = wire_text(host)
             {
                 return Some(RequestHeaderEntry {

@@ -2454,6 +2454,40 @@ impl From<&RequestContext> for HboneReuseContext {
     }
 }
 
+/// Lazily-allocated shared latch (`OnceLock<T>`).
+///
+/// Hot-path requests that never touch the latch pay zero heap allocations,
+/// while cloning initializes the cell on `&self` first so the original and
+/// every clone always share the exact same underlying handle.
+#[derive(Debug)]
+pub(crate) struct LazyShared<T>(std::sync::OnceLock<T>);
+
+impl<T> LazyShared<T> {
+    #[inline]
+    pub(crate) const fn new() -> Self {
+        Self(std::sync::OnceLock::new())
+    }
+
+    #[inline]
+    pub(crate) fn get(&self) -> Option<&T> {
+        self.0.get()
+    }
+
+    #[inline]
+    pub(crate) fn get_or_init(&self, f: impl FnOnce() -> T) -> &T {
+        self.0.get_or_init(f)
+    }
+}
+
+impl<T: Clone + Default> Clone for LazyShared<T> {
+    fn clone(&self) -> Self {
+        let value = self.0.get_or_init(T::default).clone();
+        let out = std::sync::OnceLock::new();
+        let _ = out.set(value);
+        Self(out)
+    }
+}
+
 /// Context passed through the plugin pipeline for a single request.
 ///
 /// Headers and query parameters are lazily materialized to avoid per-request
@@ -2673,7 +2707,7 @@ pub struct RequestContext {
     /// request path reads it back to decide the pre-commitment terminal.
     /// Carries the bounded class only, never credential material.
     pub(crate) authorization_termination_latch:
-        std::sync::OnceLock<crate::proxy::auth_lifetime::StreamAuthTerminationLatch>,
+        LazyShared<crate::proxy::auth_lifetime::StreamAuthTerminationLatch>,
     /// Transport-level close signal for the client connection this request
     /// arrived on (issue #3815).
     ///
@@ -3440,7 +3474,7 @@ pub struct RequestContext {
     /// the client abandoned its upload before the backend response head
     /// (issue #6776). Read into the terminal summary's `client_disconnected`.
     pub(crate) proven_client_upload_abort:
-        std::sync::OnceLock<crate::proxy::upload_pump::ProvenClientUploadAbort>,
+        LazyShared<crate::proxy::upload_pump::ProvenClientUploadAbort>,
     /// Receivers for mirror response metadata from every dispatched
     /// `request_mirror` instance on this request.
     ///
@@ -4799,15 +4833,6 @@ impl RequestContext {
     }
 
     pub fn new(client_ip: String, method: String, path: String) -> Self {
-        Self::new_with_start_time(client_ip, method, path, std::time::Instant::now())
-    }
-
-    pub(crate) fn new_with_start_time(
-        client_ip: String,
-        method: String,
-        path: String,
-        start_time: std::time::Instant,
-    ) -> Self {
         Self {
             direct_client_ip: client_ip.clone(),
             client_ip,
@@ -4848,7 +4873,7 @@ impl RequestContext {
             auth_method: None,
             credential_deadline_at: None,
             authorization_termination: None,
-            authorization_termination_latch: std::sync::OnceLock::new(),
+            authorization_termination_latch: LazyShared::new(),
             authorization_connection_closer: None,
             websocket_shutdown_rx: None,
             client_trust_session: None,
@@ -4858,7 +4883,7 @@ impl RequestContext {
             grpc_deadline_initialized: false,
             grpc_deadline_had_valid_client_timeout: false,
             request_body_integrity_retirement: false,
-            grpc_deadline_received_at: tokio::time::Instant::from_std(start_time),
+            grpc_deadline_received_at: tokio::time::Instant::now(),
             grpc_deadline_budget_ms: None,
             grpc_deadline_policy_budget_ms: None,
             grpc_deadline_ceiling_ms: None,
@@ -4959,7 +4984,7 @@ impl RequestContext {
             peer_spiffe_certificate_principal: false,
             plugin_http_call_ns: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             reject_hook_execution_ns: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            proven_client_upload_abort: std::sync::OnceLock::new(),
+            proven_client_upload_abort: LazyShared::new(),
             mirror_result_rxs: Vec::new(),
             request_mirror_admissions: request_mirror::RequestMirrorAdmissions::default(),
             hmac_prebuffer_state: hmac_auth::HmacPrebufferState::default(),
@@ -7709,6 +7734,22 @@ impl RequestContext {
     ) {
         if let Some(passthrough) = self.request_header_passthrough.as_mut() {
             passthrough.set_stripped_headers(stripped);
+        }
+    }
+
+    #[inline]
+    pub(crate) fn try_set_request_header_passthrough_gateway_assertions(
+        &mut self,
+        username: Option<&str>,
+        custom_id: Option<&str>,
+        identity: Option<&str>,
+        geo_country: Option<&str>,
+    ) -> bool {
+        match self.request_header_passthrough.as_mut() {
+            Some(passthrough) => {
+                passthrough.try_set_gateway_assertions(username, custom_id, identity, geo_country)
+            }
+            None => false,
         }
     }
 
@@ -13194,7 +13235,9 @@ pub trait Plugin: Any + Send + Sync {
     ///
     /// Proxy core records the status on [`RequestContext`] as private typed
     /// provenance and then invokes this hook for every plugin in configured
-    /// order. Default is a no-op. Plugins whose success-boundary side effects
+    /// order during the `after_proxy` phase (plugins overriding this must
+    /// declare [`PluginHooks::AFTER_PROXY`] in [`Self::lifecycle_hooks`]).
+    /// Default is a no-op. Plugins whose success-boundary side effects
     /// must not depend on later hooks presenting the origin status to the
     /// client (for example cache invalidation) override this.
     fn observe_origin_http_response_status(&self, _ctx: &mut RequestContext, _status: u16) {}
@@ -13202,7 +13245,9 @@ pub trait Plugin: Any + Send + Sync {
     /// Returns `true` when this plugin bounds what the ORIGIN contributed to the
     /// response header map for this request.
     ///
-    /// Checked once per response before the first `after_proxy` hook runs, so a
+    /// Checked once per response before the first `after_proxy` hook runs
+    /// (plugins overriding this must declare [`PluginHooks::AFTER_PROXY`] in
+    /// [`Self::lifecycle_hooks`]), so a
     /// plugin that repointed the request at a third-party destination can reduce
     /// that destination's metadata without also discarding gateway decorations
     /// (CORS, tracing, correlation, rate-limit headers) that later hooks add.
