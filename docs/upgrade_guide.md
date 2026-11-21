@@ -34,16 +34,22 @@ applied by editing the file (see [File Mode](#file-mode-ferrum_modefile)).
 an optional `authority`: the 64-character hex realm authority digest of the
 provider that verified the identity (the value `opa` reports as
 `input.consumer.realm.authority`, the same encoding the plugin-trigger
-`external_identity_authority` predicate takes). An authority-scoped allow entry
-matches only an identity committed with that authority; an authority-scoped deny
-entry also matches an identity with no verified realm or no committed authority.
-Entries without `authority` behave as before.
+`external_identity_authority` predicate takes). `jwks_auth`,
+`oauth2_introspection`, `ldap_auth`, and `oidc_relying_party` commit a digest for
+every identity, single-provider routes included; `soap_ws_security` commits none.
+An authority-scoped allow entry matches only an identity committed with that
+authority. An authority-scoped deny entry also matches an identity with no
+verified realm or no committed digest, unless the entry also names a `mechanism`
+and the identity came from a different one. Entries without `authority` behave
+as before.
 
 **Operator action:** on routes that authenticate through more than one provider
 of one mechanism (multi-provider `jwks_auth` or `oauth2_introspection`), a
 `mechanism`-only entry matches an equal subject from every one of those
 providers. Add `authority` to each external-identity entry that is meant for one
-provider. Older builds reject the new key, so upgrade every gateway node (CP and
+provider. `oauth2_introspection` providers that share an endpoint and identity
+claim without distinct `issuer` pins commit the same authority; pin a distinct
+`issuer` or use distinct endpoints first. Older builds reject the new key, so upgrade every gateway node (CP and
 DPs together) before adding it.
 
 ### EastWestGateway passthrough legs now follow DestinationRules (#7424)

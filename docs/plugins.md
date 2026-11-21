@@ -4057,19 +4057,36 @@ request through each provider) and the plugin-trigger
 `external_identity_authority` predicate accepts. It is stable across reloads and
 replicas for the same provider configuration, and changes when the provider's
 issuer, key source, endpoint, or identity claim changes (for a provider that pins
-no `issuer`, the verified token or introspection-response `iss` is part of it). Hex is compared
-case-insensitively; any other value is rejected at config validation. A mechanism
-with a single authority commits no digest, so an `authority`-scoped allow entry
-never matches its identities. With both `mechanism` and `authority`, both must
-hold.
+no `issuer`, the verified token or introspection-response `iss` is part of it).
+Hex is compared case-insensitively; any other value is rejected at config
+validation. With both `mechanism` and `authority`, both must hold.
 
-Scoping can only narrow admission. An identity with no verified realm — every
-TCP/UDP stream identity, or one a custom plugin set without the authentication
-commit boundary — never matches a realm-scoped allow entry and always matches a
-realm-scoped deny entry. Likewise an `authority`-scoped allow entry never matches
-an identity committed without an authority, and an `authority`-scoped deny entry
-always matches one (it fails closed). Entries with neither `mechanism` nor
-`authority` match the identity from every realm.
+Whether a digest exists depends on what the mechanism commits, not on how many
+providers the route has: `jwks_auth`, `oauth2_introspection`, `ldap_auth`, and
+`oidc_relying_party` commit one for every identity they verify (a single-provider
+route included, so a rule can be bound before a second provider is added), while
+`soap_ws_security` commits none.
+
+`authority` tells providers apart only as far as the mechanism's realm derivation
+does. For `oauth2_introspection` the digest covers the pinned `issuer`, the
+introspection or discovery endpoint, and the identity claim (plus a returned
+`iss` when no `issuer` is pinned), not the client credentials: two providers that
+share an endpoint and identity claim without distinct `issuer` pins commit the
+same authority, even when they authenticate to that endpoint as different
+clients. Pin a distinct `issuer` on each, or use distinct endpoints, to make them
+independently scopeable.
+
+Scoping can only narrow admission:
+
+- An identity with no verified realm (every TCP/UDP stream identity, or one a
+  custom plugin set without the authentication commit boundary) never matches a
+  realm-scoped allow entry. It matches every realm-scoped deny entry.
+- An `authority`-scoped allow entry never matches an identity committed without a
+  digest. An `authority`-scoped deny entry does match it (it fails closed),
+  unless the entry also names a `mechanism` and the identity was committed by a
+  different one: a known mechanism mismatch is definitively another principal.
+- Entries with neither `mechanism` nor `authority` match the identity from every
+  realm.
 
 **An allow-list means "only these principals".** Once any allow-list is configured,
 a principal that matches none of them is denied. In particular, a policy whose only

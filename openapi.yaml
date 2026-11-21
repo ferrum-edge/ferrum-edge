@@ -31406,9 +31406,14 @@ components:
                   accepts; compared case-insensitively). Two providers of one
                   mechanism (two `jwks_auth` issuers, two
                   `oauth2_introspection` endpoints) have different digests, so
-                  this is what tells them apart. Allow entries never match an
-                  identity with no committed authority. Combined with
-                  `mechanism`, both must hold.
+                  this is what tells them apart, as far as the mechanism's
+                  realm derivation does (`oauth2_introspection` providers that
+                  share an endpoint and identity claim without distinct
+                  `issuer` pins share one authority). `jwks_auth`,
+                  `oauth2_introspection`, `ldap_auth`, and `oidc_relying_party`
+                  commit a digest for every identity; `soap_ws_security`
+                  commits none. Allow entries never match an identity with no
+                  committed digest. Combined with `mechanism`, both must hold.
           description: >-
             Exact unmapped external principals (for example a `jwks_auth` `sub`)
             that are allowed when no gateway Consumer was mapped — the narrow
@@ -31466,8 +31471,9 @@ components:
                   the plugin-trigger `external_identity_authority` predicate
                   accepts; compared case-insensitively). A deny entry fails
                   closed: it also matches an identity with no verified realm or
-                  no committed authority. Combined with `mechanism`, both must
-                  hold.
+                  no committed digest, unless the entry also names a
+                  `mechanism` and the identity was committed by a different
+                  one. Combined with `mechanism`, both must hold.
           default: []
           description: >-
             Exact unmapped external principals that are denied, optionally
@@ -31476,7 +31482,8 @@ components:
             revoking an equal subject string from a different mechanism or
             provider. A realm-scoped entry also matches an identity with no
             verified realm, and an `authority`-scoped entry also matches an
-            identity with no committed authority (it fails closed). Takes precedence
+            identity with no committed digest (it fails closed) unless its
+            `mechanism` is a known mismatch. Takes precedence
             over every allow rule. `disallowed_consumers` remains a
             realm-blind deny for external identities.
 

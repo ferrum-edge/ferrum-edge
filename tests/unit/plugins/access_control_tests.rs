@@ -1672,31 +1672,46 @@ async fn introspection_server_for(subject: &str) -> wiremock::MockServer {
     server
 }
 
-/// Authenticate a bearer token through one `oauth2_introspection` authority
-/// whose endpoint vouches for `subject`, with no Consumer mapping.
-async fn authenticate_via_introspection(
-    server: &wiremock::MockServer,
-    subject: &str,
-) -> ferrum_edge::plugins::RequestContext {
-    let plugin = ferrum_edge::plugins::oauth2_introspection::Oauth2Introspection::new(
+/// One `oauth2_introspection` instance with two providers (two introspection
+/// endpoints), each selected by its own token header.
+fn two_provider_introspection(
+    corp: &wiremock::MockServer,
+    partner: &wiremock::MockServer,
+) -> ferrum_edge::plugins::oauth2_introspection::Oauth2Introspection {
+    ferrum_edge::plugins::oauth2_introspection::Oauth2Introspection::new(
         &json!({
-            "providers": [{
-                "introspection_endpoint": format!("{}/introspect", server.uri()),
-                "client_auth": {"method": "none"}
-            }]
+            "providers": [
+                {
+                    "introspection_endpoint": format!("{}/introspect", corp.uri()),
+                    "client_auth": {"method": "none"},
+                    "from_headers": [{"name": "x-corp-token"}]
+                },
+                {
+                    "introspection_endpoint": format!("{}/introspect", partner.uri()),
+                    "client_auth": {"method": "none"},
+                    "from_headers": [{"name": "x-partner-token"}]
+                }
+            ]
         }),
         ferrum_edge::plugins::PluginHttpClient::default(),
     )
-    .expect("oauth2_introspection");
-    let mut ctx = create_test_context();
-    ctx.identified_consumer = None;
-    ctx.authenticated_identity = None;
-    ctx.headers
-        .retain(|name, _| !name.eq_ignore_ascii_case("authorization"));
-    ctx.headers.insert(
-        "authorization".to_string(),
-        "Bearer opaque-token".to_string(),
+    .expect("two-provider oauth2_introspection")
+}
+
+/// Authenticate the token carried in `header` through `plugin`, with no
+/// Consumer mapping.
+async fn authenticate_via_introspection_header(
+    plugin: &ferrum_edge::plugins::oauth2_introspection::Oauth2Introspection,
+    header: &str,
+    token: &str,
+    subject: &str,
+) -> ferrum_edge::plugins::RequestContext {
+    let mut ctx = ferrum_edge::plugins::RequestContext::new(
+        "127.0.0.1".to_string(),
+        "GET".to_string(),
+        "/test".to_string(),
     );
+    ctx.headers.insert(header.to_string(), token.to_string());
     let result = plugin
         .authenticate(&mut ctx, &ferrum_edge::ConsumerIndex::new(&[]))
         .await;
@@ -1706,27 +1721,93 @@ async fn authenticate_via_introspection(
     ctx
 }
 
-/// The same subject vouched for by two introspection authorities: an
-/// authority-scoped allow rule admits only the authority it names.
+async fn introspection_request_count(server: &wiremock::MockServer) -> usize {
+    server.received_requests().await.unwrap_or_default().len()
+}
+
+/// The same subject vouched for by two providers of ONE `oauth2_introspection`
+/// instance: each request commits the authority of the provider that accepted
+/// it, and an authority-scoped allow rule admits only the provider it names.
 #[tokio::test]
-async fn test_access_control_two_introspection_authorities_same_subject_bound_by_authority() {
-    let first = introspection_server_for("ops-admin").await;
-    let second = introspection_server_for("ops-admin").await;
-    let mut from_first = authenticate_via_introspection(&first, "ops-admin").await;
-    let mut from_second = authenticate_via_introspection(&second, "ops-admin").await;
-    let first_authority = committed_authority_hex(&from_first);
-    assert_ne!(first_authority, committed_authority_hex(&from_second));
+async fn test_access_control_two_introspection_providers_same_subject_bound_by_authority() {
+    let corp_server = introspection_server_for("ops-admin").await;
+    let partner_server = introspection_server_for("ops-admin").await;
+    let plugin = two_provider_introspection(&corp_server, &partner_server);
+
+    let mut corp =
+        authenticate_via_introspection_header(&plugin, "x-corp-token", "corp-token", "ops-admin")
+            .await;
+    assert_eq!(introspection_request_count(&corp_server).await, 1);
+    assert_eq!(introspection_request_count(&partner_server).await, 0);
+
+    let mut partner = authenticate_via_introspection_header(
+        &plugin,
+        "x-partner-token",
+        "partner-token",
+        "ops-admin",
+    )
+    .await;
+    assert_eq!(introspection_request_count(&corp_server).await, 1);
+    assert_eq!(introspection_request_count(&partner_server).await, 1);
+
+    let corp_authority = committed_authority_hex(&corp);
+    let partner_authority = committed_authority_hex(&partner);
+    assert_ne!(
+        corp_authority, partner_authority,
+        "each provider of one instance commits its own authority"
+    );
 
     let bound = AccessControl::new(&json!({
         "allowed_external_identities": [{
             "identity": "ops-admin",
             "mechanism": "oauth2_introspection",
-            "authority": first_authority
+            "authority": corp_authority
         }]
     }))
     .unwrap();
-    assert_continue(bound.authorize(&mut from_first).await);
-    assert_reject(bound.authorize(&mut from_second).await, Some(403));
+    assert_continue(bound.authorize(&mut corp).await);
+    assert_reject(bound.authorize(&mut partner).await, Some(403));
+
+    let bound_to_partner = AccessControl::new(&json!({
+        "allowed_external_identities": [{
+            "identity": "ops-admin",
+            "authority": partner_authority
+        }]
+    }))
+    .unwrap();
+    assert_reject(bound_to_partner.authorize(&mut corp).await, Some(403));
+    assert_continue(bound_to_partner.authorize(&mut partner).await);
+}
+
+/// An authority-scoped deny overrides a mechanism-scoped or unscoped allow for
+/// the same identity, and leaves other authorities admitted.
+#[tokio::test]
+async fn test_access_control_authority_scoped_deny_overrides_broader_allow() {
+    for allow_entry in [
+        json!({"identity": "ops-admin", "mechanism": "jwks_auth"}),
+        json!({"identity": "ops-admin"}),
+    ] {
+        let plugin = AccessControl::new(&json!({
+            "allowed_external_identities": [allow_entry],
+            "disallowed_external_identities": [{
+                "identity": "ops-admin",
+                "authority": hex::encode(AUTHORITY_B)
+            }]
+        }))
+        .unwrap();
+
+        let mut provider_a =
+            external_identity_context_with_authority("ops-admin", "jwks_auth", Some(AUTHORITY_A));
+        assert_continue(plugin.authorize(&mut provider_a).await);
+        let mut provider_b =
+            external_identity_context_with_authority("ops-admin", "jwks_auth", Some(AUTHORITY_B));
+        assert_reject(plugin.authorize(&mut provider_b).await, Some(403));
+        // The deny fails closed for a realm without a digest, overriding the
+        // broader allow.
+        let mut no_authority =
+            external_identity_context_with_authority("ops-admin", "jwks_auth", None);
+        assert_reject(plugin.authorize(&mut no_authority).await, Some(403));
+    }
 }
 
 // ---- Consumer rename referential integrity ----
