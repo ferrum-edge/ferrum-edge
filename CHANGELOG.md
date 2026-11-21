@@ -13,12 +13,13 @@ This patch release follows published 0.9.20. It fixes security advisories in
 the authentication, `access_control`, `oidc_relying_party`, chargeback,
 `a2a_gateway`, transformer and AI plugins, the Admin API and the mesh. Sidecar
 and NodeWaypoint data planes now apply mesh VirtualService HTTP routes, the
-data plane applies wildcard DestinationRules, refused Istio security resources
-fail closed, and configuration fields and chart values that nothing read are
-removed. Many changes refuse configuration or traffic that 0.9.20 accepted.
-The `V001` baseline checksum changes, so build-out databases must be rebuilt,
-and the ConfigSync protocol revision is now 6, so control planes and data
-planes must be upgraded together. Read
+data plane applies wildcard DestinationRules, refused enforcing Istio security
+resources fail closed, configuration fields that nothing read are removed, and
+the `ferrum-mesh` chart drops its standalone mesh CA component. Many changes
+refuse configuration or traffic that 0.9.20 accepted. The `V001` baseline
+checksum changes, so PostgreSQL, MySQL and SQLite build-out databases must be
+rebuilt, and the ConfigSync protocol revision is now 6, so control planes and
+data planes must be upgraded together. Read
 [Upgrading to 0.9.21](docs/upgrade_guide.md#upgrading-to-0921) before updating
 gateways, control planes, custom plugins, charts or contract consumers.
 
@@ -257,15 +258,18 @@ gateways, control planes, custom plugins, charts or contract consumers.
 - Fixed GHSA-c259-vchc-3vgr: `jwt_auth` (`token_lookup: query:<name>`),
   `jwks_auth` and `oauth2_introspection` (`providers[].from_params`) now apply
   the `key_auth` `;`-alias query contract (issue #6579). A request whose
-  configured token query name also appears as a `;`-separated sub-parameter is
-  refused with `401` `Ambiguous token query parameter` instead of being treated
-  as carrying no token. The alias is redacted for OPA and `request_mirror`, and
-  is removed from the forwarded query when credentials are hidden (#7464).
+  configured token query name also appears as a `;`-separated sub-parameter now
+  gets the token plugin's `401` `Ambiguous token query parameter` rejection
+  instead of being treated as carrying no token (another mechanism can still
+  authenticate the request in multi-auth mode). The alias is redacted for OPA
+  and `request_mirror`, and is removed from the forwarded query when
+  credentials are hidden (#7464).
 - Fixed GHSA-r378-r7j8-2qm3: `access_control` `allowed_external_identities` and
   `disallowed_external_identities` entries accept an optional `authority`, the
-  verifying provider's realm authority digest, so an entry can be scoped to one
-  provider. A `mechanism`-only entry still matches an equal subject from every
-  provider of that mechanism on the route (#7465).
+  verifying realm's authority digest, so an entry can be scoped by verifying
+  realm. A `mechanism`-only entry still matches an equal subject from every
+  provider of that mechanism on the route; see the upgrade guide for the
+  matching rules, including providers that share a digest (#7465).
 - Fixed GHSA-6rwj-gc4r-3jm9: `oidc_relying_party` sends an accepted post-login
   target in the normalized form it validated, and refuses a target that
   contains an ASCII control character or a backslash, which lands on
@@ -274,8 +278,10 @@ gateways, control planes, custom plugins, charts or contract consumers.
 - Fixed GHSA-q9vj-rf66-3j58: `api_chargeback` (`/charges`) and
   `api_chargeback_sink` key billing rows on the authenticated principal. An
   unmapped external principal is reported as
-  `external:<mechanism>:<authority>:<identity>` instead of sharing a row with a
-  Consumer or another provider that uses the same string (#7466).
+  `external:<mechanism>:<authority>:<identity>` (`-` for a missing authority;
+  an oversized or marker-bearing key is given its `~sha256:` digest form)
+  instead of sharing a row with a Consumer or another provider that uses the
+  same string (#7466).
 - Fixed GHSA-q25c-76f4-fp7h: with `discovery.rewrite_agent_card_urls` on (the
   default) and the `jsonrpc` binding served, `a2a_gateway` refuses a
   `POST endpoint.path` request it cannot classify as JSON-RPC instead of
@@ -285,7 +291,9 @@ gateways, control planes, custom plugins, charts or contract consumers.
   instances with JSON body rules refuse a body with duplicate object member
   names (`400` for a request, `502` for a backend response) instead of skipping
   the rules and forwarding the original bytes. Body rules also strip one
-  leading UTF-8 byte order mark before parsing (#7469).
+  leading UTF-8 byte order mark from a request body before parsing; a
+  BOM-prefixed backend response under a body policy is still refused by the
+  shared response representation gate (#7469).
 
 ### Added
 - **Sidecar data planes apply mesh-bound VirtualService `http[]` routes**
@@ -877,9 +885,9 @@ gateways, control planes, custom plugins, charts or contract consumers.
   under Helm's default Kubernetes version (1.20.0), which is not a real
   cluster. An explicit `--kube-version` below 1.29 still fails, as in
   ferrum-mesh (issue #7299).
-- `openapi.yaml` `info.version` now tracks the crate version (0.9.20,
-  previously frozen at 0.2.0); a unit test keeps them equal, and releases bump
-  both (#7304).
+- `openapi.yaml` `info.version` now tracks the crate version (previously
+  frozen at 0.2.0); a unit test keeps them equal, and releases bump both
+  (#7304).
 - `mesh_authz`, `workload_metrics` and the injected
   `_effective_mesh_authz_baggage_gates` share one `MeshTrustedHboneAssertors`
   OpenAPI schema. It now matches the runtime parser: Unicode whitespace is
@@ -1147,8 +1155,9 @@ gateways, control planes, custom plugins, charts or contract consumers.
   `fail_on_uninspectable_body`). (#7417)
 - **BREAKING:** (issue #7417) `a2a_gateway` refuses JSON-RPC bodies with duplicate member
   names under a policy that can deny (`-32001`,
-  `a2a.error=request_body_uninspectable`) and leaves them unclassified
-  otherwise. (#7417)
+  `a2a.error=request_body_uninspectable`) and, after GHSA-q25c-76f4-fp7h
+  (#7468), also whenever Agent Card rewriting is on for an instance serving the
+  `jsonrpc` binding; otherwise it leaves them unclassified. (#7417)
 - **BREAKING:** (issue #7417) `ai_rate_limiter` treats request bodies with duplicate member
   names as unparseable (refused with 400 while `model_limits` is set). (#7417)
 - **BREAKING:** (issue #7417) WAF `global_exemptions.consumers` and rule
@@ -1167,7 +1176,8 @@ gateways, control planes, custom plugins, charts or contract consumers.
   and an external host a wildcard rule asked to dial over TLS went out in
   plaintext. Wildcards now apply on Sidecar, Ambient, ServiceWaypoint,
   NodeWaypoint and EgressGateway upstreams (EastWestGateway SNI-passthrough
-  Service upstreams stay ungoverned by any DestinationRule, as before). Per
+  Service upstreams follow DestinationRules too, without TLS origination; see
+  #7424). Per
   destination host the winner is the most specific lookup tier (client, then
   target service, then root namespace), then the most specific host (an exact
   host or Service alias beats any wildcard, a longer suffix beats a shorter
@@ -3230,8 +3240,11 @@ gateways, control planes, custom plugins, charts or contract consumers.
   is primed so already-buffered body frames coalesce with the request headers,
   and the pump's control state shares one allocation.
 - **DTLS datapath** (#7450). Linux listeners batch ingress with `recvmmsg(2)`,
-  each reply commits through a single `oneshot`, plaintext is forwarded without
-  per-datagram copies and session timers are reused.
+  each reply commits through a single `oneshot`, the UDP relay forwards
+  plaintext without its two extra per-datagram clones and session timers are
+  reused.
+- **Plain-UDP ingress and reply datapaths** (#7442) do less per-datagram
+  user-space and kernel work, without adding threads or cross-core hops.
 
 ## [0.9.20] - 2026-11-02
 

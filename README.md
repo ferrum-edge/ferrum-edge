@@ -584,7 +584,8 @@ tags remain unchanged.
 
 The **v0.9.21 candidate** follows published v0.9.20 with security-advisory and
 correctness fixes, mesh VirtualService HTTP routes on Sidecar and NodeWaypoint
-data planes, and fail-closed enforcement of refused Istio security resources.
+data planes, and fail-closed enforcement of refused enforcing Istio security
+resources.
 Its protected production release and the matching `contracts-edge-0.9.21`
 publication must succeed before consumers move their pins. See the
 [upgrade guide](docs/upgrade_guide.md#upgrading-to-0921).

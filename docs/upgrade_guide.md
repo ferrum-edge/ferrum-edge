@@ -38,8 +38,9 @@ deploying a build from `main`.
 DestinationRule data-plane work, and the removal of configuration that nothing
 read. Many sections below refuse configuration or traffic that 0.9.20
 accepted, so review every section before upgrading. The `V001` baseline
-checksum changes from 0.9.20 (issues #7218 and #7228), so a 0.9.20 database is
-refused on migration-history grounds; rebuild it as described in
+checksum changes from 0.9.20 (issues #7218 and #7228), so a PostgreSQL, MySQL
+or SQLite database that applied the 0.9.20 baseline is refused on
+migration-history grounds; rebuild it as described in
 [Build-Out database upgrade](#build-out-database-upgrade-postgresql-mysql-sqlite-mongodb).
 CP/DP must run the same build, and the ConfigSync revision is now `6`. The
 matching `contracts-edge-0.9.21` release must be cut from the verified release
@@ -153,7 +154,9 @@ unchanged. An unmapped external principal (`jwks_auth`, `oidc_relying_party`,
 `oauth2_introspection`, `ldap_auth`, `soap_ws_security`, or an external stream
 identity) is now reported as `external:<mechanism>:<authority>:<identity>`, for
 example `external:jwks_auth:<64 hex>:alice`, where `<authority>` is the opaque
-verifying-authority digest (`-` when absent). Previously such a principal was
+verifying-authority digest (`-` when absent); like a Consumer username, an
+oversized or marker-bearing key is reported in its `~sha256:` digest form.
+Previously such a principal was
 billed under its bare identity, sharing a row with any Consumer or other
 provider that used the same string. A Consumer whose username begins with
 `external:` is now always reported in its `~sha256:` digest form.
@@ -417,8 +420,9 @@ even when it spells a listed username.
 ### Duplicate JSON member names are refused by more plugins (GHSA-49cr-v28q-9hgp, #7417)
 
 `ai_prompt_shield` (every scan mode), `ai_semantic_firewall` (request and
-buffered JSON response), `a2a_gateway` (JSON-RPC, under a deny-capable policy)
-and `ai_rate_limiter` (with `model_limits`) now refuse request bodies whose
+buffered JSON response), `a2a_gateway` (JSON-RPC, under a deny-capable policy
+or, since GHSA-q25c-76f4-fp7h, with Agent Card rewriting on for the `jsonrpc`
+binding) and `ai_rate_limiter` (with `model_limits`) now refuse request bodies whose
 JSON objects repeat a member name, compared after escape decoding and at any
 depth. Clients must send each member once.
 
@@ -478,7 +482,9 @@ semantics, so they start governing destinations they used to leave untouched:
 - Mesh-generated upstreams are matched on their logical host only: a Service
   upstream on its FQDN, an EgressGateway ServiceEntry upstream on its
   ServiceEntry host (never its STATIC endpoint addresses). EastWestGateway
-  SNI-passthrough Service upstreams remain ungoverned by DestinationRules.
+  SNI-passthrough Service upstreams are matched on their Service host and never
+  originate TLS; see
+  [EastWestGateway passthrough legs now follow DestinationRules](#eastwestgateway-passthrough-legs-now-follow-destinationrules-7424).
 - Gateways running in the root namespace (`istio-system`): only the root
   namespace's private rules (`exportTo: ["."]`) take precedence over a
   destination owner's rules. Exported root rules are now the mesh-wide default
@@ -1033,8 +1039,9 @@ file-source data planes) to keep namespace-wide identity lists.
 ### NodeWaypoint VirtualService HTTP routes and ConfigSync revision 5 (#7233)
 
 `MeshConfig` gained `virtual_service_http_routes` and `MeshSlice` gained
-`http_routes`, so the ConfigSync protocol revision is now 5: upgrade CPs and
-DPs together. A mesh data plane from an older build refuses slices from a newer
+`http_routes`, which moved the ConfigSync protocol revision to 5 (0.9.21 ships
+revision 6; see [ConfigSync revision 6](#configsync-revision-6-7417)): upgrade
+CPs and DPs together. A mesh data plane from an older build refuses slices from a newer
 control plane (`invalid_slice_json`) and keeps its last-good slice until it is
 upgraded. On NodeWaypoint, mesh-bound VirtualService `http[]` routes in the
 waypoint's namespace now take effect: their in-mesh destinations dial over the
