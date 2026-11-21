@@ -2318,6 +2318,7 @@ fn sni_admission_summary(error: &anyhow::Error) -> StreamTransactionSummary {
         proxy_name: None,
         client_ip: "127.0.0.1".into(),
         consumer_username: None,
+        principal_origin: None,
         auth_method: None,
         backend_target: String::new(),
         backend_resolved_ip: None,

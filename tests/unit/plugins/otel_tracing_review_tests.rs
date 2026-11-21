@@ -72,6 +72,7 @@ fn summary_for(ctx: &RequestContext, status: u16) -> TransactionSummary {
         timestamp_received: "2026-03-23T12:00:00Z".to_string(),
         client_ip: "10.0.0.1".to_string(),
         consumer_username: None,
+        principal_origin: None,
         auth_method: None,
         http_method: "GET".to_string(),
         request_path: "/api/test".to_string(),

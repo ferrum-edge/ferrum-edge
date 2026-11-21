@@ -58,6 +58,7 @@ fn make_summary(
         timestamp_received: "2025-01-01T00:00:00Z".to_string(),
         client_ip: "127.0.0.1".to_string(),
         consumer_username: consumer.map(|c| c.to_string()),
+        principal_origin: Some(ferrum_edge::plugins::utils::principal::PrincipalOrigin::Consumer),
         auth_method: None,
         http_method: "GET".to_string(),
         request_path: "/test".to_string(),
@@ -138,6 +139,7 @@ fn make_stream_summary(
         proxy_name: Some(proxy_name.to_string()),
         client_ip: "127.0.0.1".to_string(),
         consumer_username: consumer.map(|c| c.to_string()),
+        principal_origin: Some(ferrum_edge::plugins::utils::principal::PrincipalOrigin::Consumer),
         auth_method: None,
         backend_target: "127.0.0.1:9000".to_string(),
         backend_resolved_ip: None,
@@ -3423,6 +3425,9 @@ async fn test_reload_overlap_old_stream_disconnect_after_new_websocket_stays_par
             io_side: None,
             error_class: None,
             consumer_username: Some(CONSUMER.to_string()),
+            principal_origin: Some(
+                ferrum_edge::plugins::utils::principal::PrincipalOrigin::Consumer,
+            ),
             auth_method: None,
             metadata: ferrum_edge::plugins::MetadataMap::default(),
             proxy_lifecycle_generation: Some(2),
@@ -3576,6 +3581,9 @@ async fn test_effective_chain_records_each_protocol_path_exactly_once() {
             io_side: None,
             error_class: None,
             consumer_username: Some(CONSUMER.to_string()),
+            principal_origin: Some(
+                ferrum_edge::plugins::utils::principal::PrincipalOrigin::Consumer,
+            ),
             auth_method: None,
             metadata: ferrum_edge::plugins::MetadataMap::default(),
             proxy_lifecycle_generation: None,
@@ -6844,5 +6852,300 @@ async fn test_unattached_chargeback_definition_needs_no_registry_reservation() {
             .get_plugins("ferrum", "issue-6891-unattached")
             .iter()
             .all(|plugin| plugin.name() != "api_chargeback")
+    );
+}
+
+// --- GHSA-q9vj-rf66-3j58: billing rows key on the principal, not its display string ---
+
+/// Verifying-authority digests of two `jwks_auth` providers that both issue
+/// the subject `alice`.
+const PROVIDER_A_AUTHORITY: [u8; 32] = [0xa1; 32];
+const PROVIDER_B_AUTHORITY: [u8; 32] = [0xb2; 32];
+
+fn external_alice_key(authority: [u8; 32]) -> String {
+    format!("external:jwks_auth:{}:alice", hex::encode(authority))
+}
+
+/// A mapped Consumer `alice` and unmapped `jwks_auth` principals `alice` from
+/// two providers, each committed exactly as the authentication boundary
+/// leaves it. All three share the display identity `alice`.
+fn alice_principal_contexts() -> [ferrum_edge::plugins::RequestContext; 3] {
+    let consumer = super::plugin_utils::consumer_context("alice");
+    let mut provider_a = super::plugin_utils::create_test_context();
+    super::plugin_utils::commit_external_identity_with_authority(
+        &mut provider_a,
+        "alice",
+        "jwks_auth",
+        Some(PROVIDER_A_AUTHORITY),
+    );
+    let mut provider_b = super::plugin_utils::create_test_context();
+    super::plugin_utils::commit_external_identity_with_authority(
+        &mut provider_b,
+        "alice",
+        "jwks_auth",
+        Some(PROVIDER_B_AUTHORITY),
+    );
+    for ctx in [&consumer, &provider_a, &provider_b] {
+        assert_eq!(ctx.effective_identity(), Some("alice"));
+    }
+    [consumer, provider_a, provider_b]
+}
+
+/// The summary a production builder stamps from `ctx`: the display identity
+/// plus its recorded principal origin.
+fn principal_summary(
+    proxy_id: &str,
+    ctx: &ferrum_edge::plugins::RequestContext,
+) -> TransactionSummary {
+    let mut summary = make_summary(proxy_id, "Principal API", ctx.effective_identity(), 200);
+    summary.principal_origin = ctx.principal_origin();
+    summary
+}
+
+fn billed_consumers_for_proxy(proxy_id: &str) -> HashMap<String, u64> {
+    global_registry()
+        .entries
+        .iter()
+        .filter(|entry| entry.proxy_id.as_ref() == proxy_id)
+        .map(|entry| {
+            (
+                entry.consumer.to_string(),
+                entry.call_count.load(Ordering::Relaxed),
+            )
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn test_consumer_and_external_principals_from_two_jwks_providers_bill_three_rows() {
+    const PROXY_ID: &str = "principal-rows-ghsa-q9vj";
+    let plugin = ApiChargeback::new(
+        &json!({"pricing_tiers": [{"status_codes": [200], "price_per_call": 1.0}]}),
+        "ferrum",
+    )
+    .unwrap();
+    let [consumer, provider_a, provider_b] = alice_principal_contexts();
+
+    plugin.log(&principal_summary(PROXY_ID, &consumer)).await;
+    for _ in 0..2 {
+        plugin.log(&principal_summary(PROXY_ID, &provider_a)).await;
+    }
+    for _ in 0..3 {
+        plugin.log(&principal_summary(PROXY_ID, &provider_b)).await;
+    }
+
+    let provider_a_key = external_alice_key(PROVIDER_A_AUTHORITY);
+    let provider_b_key = external_alice_key(PROVIDER_B_AUTHORITY);
+    assert_eq!(
+        billed_consumers_for_proxy(PROXY_ID),
+        HashMap::from([
+            ("alice".to_string(), 1),
+            (provider_a_key.clone(), 2),
+            (provider_b_key.clone(), 3),
+        ]),
+        "the mapped Consumer keeps its bare row and each provider bills its own row"
+    );
+
+    // The `/charges` JSON document exposes the same three disjoint rows.
+    let rendered: serde_json::Value =
+        serde_json::from_str(&global_registry().render_json_uncached().unwrap()).unwrap();
+    let consumers = rendered["consumers"].as_object().expect("consumers map");
+    for key in ["alice", provider_a_key.as_str(), provider_b_key.as_str()] {
+        assert!(
+            consumers
+                .get(key)
+                .and_then(|row| row["proxies"].get(PROXY_ID))
+                .is_some(),
+            "/charges must render a `{key}` row for {PROXY_ID}: {rendered}"
+        );
+    }
+
+    // And the Prometheus exposition labels them apart.
+    let prometheus = global_registry().render_prometheus_uncached().unwrap();
+    for key in ["alice", provider_a_key.as_str(), provider_b_key.as_str()] {
+        assert!(
+            prometheus.contains(&format!(
+                "ferrum_api_chargeable_calls_total{{consumer=\"{key}\",proxy_id=\"{PROXY_ID}\""
+            )),
+            "Prometheus /charges must carry a `{key}` series"
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_stream_external_principal_never_shares_a_consumer_stream_row() {
+    const PROXY_ID: &str = "principal-stream-rows-ghsa-q9vj";
+    let plugin = ApiChargeback::new(
+        &json!({"stream_connection_pricing": {"price_per_connection": 0.5}}),
+        "ferrum",
+    )
+    .unwrap();
+    let consumer = make_stream_summary(PROXY_ID, "Stream", Some("alice"), "tcp", 10, 20);
+    let mut external = make_stream_summary(PROXY_ID, "Stream", Some("alice"), "tcp", 10, 20);
+    external.principal_origin =
+        Some(ferrum_edge::plugins::utils::principal::PrincipalOrigin::External { realm: None });
+
+    plugin.on_stream_disconnect(&consumer).await;
+    plugin.on_stream_disconnect(&external).await;
+
+    assert_eq!(
+        billed_consumers_for_proxy(PROXY_ID),
+        HashMap::from([
+            ("alice".to_string(), 1),
+            ("external:-:-:alice".to_string(), 1),
+        ])
+    );
+}
+
+#[tokio::test]
+async fn test_websocket_bandwidth_bills_the_external_principal_row() {
+    const PROXY_ID: &str = "principal-ws-rows-ghsa-q9vj";
+    let plugin = ApiChargeback::new(
+        &json!({"bandwidth_pricing": {"price_per_byte_sent": 0.001}}),
+        "ferrum",
+    )
+    .unwrap();
+    let [consumer, provider_a, _] = alice_principal_contexts();
+    for ctx in [&consumer, &provider_a] {
+        let mut ws = super::plugin_utils::create_test_ws_disconnect_context();
+        ws.proxy_id = PROXY_ID.to_string();
+        ws.bytes_client_to_backend = 100;
+        ws.consumer_username = ctx.effective_identity().map(str::to_owned);
+        ws.principal_origin = ctx.principal_origin();
+        plugin.on_ws_disconnect(&ws).await;
+    }
+
+    let rows = billed_consumers_for_proxy(PROXY_ID);
+    assert_eq!(rows.len(), 2, "{rows:?}");
+    assert!(rows.contains_key("alice"));
+    assert!(rows.contains_key(&external_alice_key(PROVIDER_A_AUTHORITY)));
+}
+
+/// A summary whose builder recorded no origin is never billed as a Consumer.
+#[tokio::test]
+async fn test_summary_without_principal_origin_fails_closed_to_external_row() {
+    const PROXY_ID: &str = "principal-origin-missing-ghsa-q9vj";
+    let plugin = ApiChargeback::new(
+        &json!({"pricing_tiers": [{"status_codes": [200], "price_per_call": 1.0}]}),
+        "ferrum",
+    )
+    .unwrap();
+    let mut summary = make_summary(PROXY_ID, "Principal API", Some("alice"), 200);
+    summary.principal_origin = None;
+    plugin.log(&summary).await;
+
+    assert_eq!(
+        billed_consumers_for_proxy(PROXY_ID),
+        HashMap::from([("external:-:-:alice".to_string(), 1)])
+    );
+}
+
+#[test]
+fn test_principal_billing_identity_classes_are_disjoint() {
+    use ferrum_edge::plugins::chargeback::{
+        billing_principal, principal_billing_identity, with_principal_billing_identity,
+    };
+    use ferrum_edge::plugins::utils::auth_flow::ExternalIdentityRealm;
+    use ferrum_edge::plugins::utils::principal::{Principal, PrincipalOrigin};
+
+    const BOUND: usize = 512;
+    /// An unmapped principal verified by `jwks_auth` provider A.
+    fn external(identity: &str) -> Principal<'_> {
+        Principal::External {
+            identity,
+            realm: Some(ExternalIdentityRealm::new(
+                "jwks_auth",
+                Some(PROVIDER_A_AUTHORITY),
+            )),
+        }
+    }
+    let identity_of = |principal: Principal<'_>| {
+        let owned = principal_billing_identity(principal, BOUND).into_owned();
+        let pooled = with_principal_billing_identity(principal, BOUND, str::to_owned);
+        assert_eq!(
+            owned, pooled,
+            "the per-thread path must agree with the owned path for {principal:?}"
+        );
+        assert!(owned.len() <= BOUND, "{owned}");
+        assert_ne!(owned, OVERFLOW_CONSUMER_SENTINEL);
+        owned
+    };
+
+    // Consumer rows are unchanged; external rows are the namespaced key.
+    assert_eq!(identity_of(Principal::Consumer("alice")), "alice");
+    let external_alice = identity_of(external("alice"));
+    assert_eq!(external_alice, external_alice_key(PROVIDER_A_AUTHORITY));
+
+    // A Consumer cannot spell an external principal's row.
+    let spelled = identity_of(Principal::Consumer(&external_alice));
+    assert_ne!(spelled, external_alice);
+    assert!(spelled.contains("~sha256:"), "{spelled}");
+
+    // Marker-bearing values are digested under disjoint domains, so the same
+    // bytes presented as a Consumer and as an external identity stay apart.
+    let marker = "bob~sha256:0000";
+    let consumer_marker = identity_of(Principal::Consumer(marker));
+    let external_marker = identity_of(external(marker));
+    assert!(consumer_marker.contains("~sha256:"));
+    assert!(external_marker.contains("~sha256:"));
+    assert_ne!(consumer_marker, external_marker);
+
+    // Oversized external identities keep a digest of their complete key.
+    let long_a = format!("{}a", "x".repeat(600));
+    let long_b = format!("{}b", "x".repeat(600));
+    assert_ne!(
+        identity_of(external(long_a.as_str())),
+        identity_of(external(long_b.as_str()))
+    );
+
+    // The overflow sentinel itself is never reproduced by a real principal.
+    identity_of(Principal::Consumer(OVERFLOW_CONSUMER_SENTINEL));
+    identity_of(external(OVERFLOW_CONSUMER_SENTINEL));
+
+    // Summary entry point: empty identities are not billed, a missing origin
+    // fails closed to an external principal, and a recorded origin is kept.
+    assert_eq!(
+        billing_principal(Some(""), Some(PrincipalOrigin::Consumer)),
+        None
+    );
+    assert_eq!(
+        billing_principal(None, Some(PrincipalOrigin::Consumer)),
+        None
+    );
+    assert_eq!(
+        billing_principal(Some("alice"), None),
+        Some(Principal::External {
+            identity: "alice",
+            realm: None
+        })
+    );
+    assert_eq!(
+        billing_principal(Some("alice"), Some(PrincipalOrigin::Consumer)),
+        Some(Principal::Consumer("alice"))
+    );
+}
+
+/// The origin is provenance only: it never reaches transaction-log output,
+/// and the WebSocket session-end projection keeps it for billing.
+#[test]
+fn test_principal_origin_is_not_serialized_and_survives_ws_session_end_projection() {
+    let [_, provider_a, _] = alice_principal_contexts();
+    let summary = principal_summary("principal-serialize-ghsa-q9vj", &provider_a);
+    assert!(summary.principal_origin.is_some());
+    let rendered = serde_json::to_string(&summary).unwrap();
+    assert!(!rendered.contains("principal_origin"), "{rendered}");
+    assert!(!rendered.contains("external:"), "{rendered}");
+
+    let mut stream = make_stream_summary("s", "S", Some("alice"), "tcp", 1, 1);
+    stream.principal_origin =
+        Some(ferrum_edge::plugins::utils::principal::PrincipalOrigin::Consumer);
+    let rendered = serde_json::to_string(&stream).unwrap();
+    assert!(!rendered.contains("principal_origin"), "{rendered}");
+
+    let mut ws = super::plugin_utils::create_test_ws_disconnect_context();
+    ws.principal_origin = provider_a.principal_origin();
+    assert_eq!(
+        ws.session_end_summary().principal_origin,
+        provider_a.principal_origin()
     );
 }

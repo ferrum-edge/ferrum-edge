@@ -47,7 +47,10 @@ use url::Url;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
 use super::chargeback::pricing::{ChargeComputation, PricingConfig, require_finite_charge};
-use super::chargeback::{HttpBillingOutcome, http_billing_outcome, is_websocket_handshake};
+use super::chargeback::{
+    HttpBillingOutcome, billing_principal, http_billing_outcome, is_websocket_handshake,
+    principal_billing_identity,
+};
 use super::utils::byte_budget::{
     GrowableProcessReservation, JSON_STRING_WORST_CASE_EXPANSION, PayloadMaterializationError,
     ProcessByteReservation, ReservedPayload, RetainedByteCeiling, materialize_reserved_buffer,
@@ -3779,9 +3782,11 @@ impl Plugin for ApiChargebackSink {
             return;
         }
 
-        let consumer = match summary.consumer_username.as_deref() {
-            Some(c) if !c.is_empty() => c,
-            _ => return,
+        let Some(principal) = billing_principal(
+            summary.consumer_username.as_deref(),
+            summary.principal_origin,
+        ) else {
+            return;
         };
         let outcome = http_billing_outcome(summary);
         let Some(charge) = self.pricing.compute_http(
@@ -3791,6 +3796,11 @@ impl Plugin for ApiChargebackSink {
         ) else {
             return;
         };
+        // `consumer_id` keeps a mapped Consumer and unmapped external
+        // principals of distinct mechanisms/authorities apart even when their
+        // display strings match (GHSA-q9vj-rf66-3j58); it is already bounded.
+        let consumer_id = principal_billing_identity(principal, MAX_FIELD_LEN);
+        let consumer = consumer_id.as_ref();
         if self.config.mode == SinkMode::Snapshot {
             if let Some(lifecycle) = self.snapshot_lifecycle.get() {
                 let Some(_admission) = lifecycle.admit() else {
@@ -3835,9 +3845,11 @@ impl Plugin for ApiChargebackSink {
     }
 
     async fn on_stream_disconnect(&self, summary: &StreamTransactionSummary) {
-        let consumer = match summary.consumer_username.as_deref() {
-            Some(c) if !c.is_empty() => c,
-            _ => return,
+        let Some(principal) = billing_principal(
+            summary.consumer_username.as_deref(),
+            summary.principal_origin,
+        ) else {
+            return;
         };
         let Some(charge) = self
             .pricing
@@ -3845,6 +3857,8 @@ impl Plugin for ApiChargebackSink {
         else {
             return;
         };
+        let consumer_id = principal_billing_identity(principal, MAX_FIELD_LEN);
+        let consumer = consumer_id.as_ref();
         if self.config.mode == SinkMode::Snapshot {
             if let Some(lifecycle) = self.snapshot_lifecycle.get() {
                 let Some(_admission) = lifecycle.admit() else {
@@ -3888,9 +3902,11 @@ impl Plugin for ApiChargebackSink {
     }
 
     async fn on_ws_disconnect(&self, summary: &WsDisconnectContext) {
-        let consumer = match summary.consumer_username.as_deref() {
-            Some(c) if !c.is_empty() => c,
-            _ => return,
+        let Some(principal) = billing_principal(
+            summary.consumer_username.as_deref(),
+            summary.principal_origin,
+        ) else {
+            return;
         };
         let Some(charge) = self.pricing.compute_websocket_bandwidth(
             summary.bytes_client_to_backend,
@@ -3898,6 +3914,8 @@ impl Plugin for ApiChargebackSink {
         ) else {
             return;
         };
+        let consumer_id = principal_billing_identity(principal, MAX_FIELD_LEN);
+        let consumer = consumer_id.as_ref();
         if self.config.mode == SinkMode::Snapshot {
             if let Some(lifecycle) = self.snapshot_lifecycle.get() {
                 let Some(_admission) = lifecycle.admit() else {
@@ -15153,6 +15171,9 @@ impl SnapshotAccumulator {
         self.process_retained.release_all();
     }
 
+    /// `consumer` (here and in `record_stream` / `record_websocket`) is the
+    /// principal's already-bounded billing identity from
+    /// [`principal_billing_identity`]; it is used verbatim as `consumer_id`.
     fn record_http(
         &self,
         summary: &TransactionSummary,
@@ -15161,7 +15182,6 @@ impl SnapshotAccumulator {
         charge: ChargeComputation,
     ) -> SnapshotRecordOutcome {
         let namespace = bounded_key_field(&summary.namespace, MAX_FIELD_LEN);
-        let consumer_id = bounded_key_field(consumer, MAX_FIELD_LEN);
         let consumer_name = metadata_value_cow(&summary.metadata, &["consumer_name"]);
         let proxy_id = bounded_key_field(
             summary.proxy_id.as_deref().unwrap_or("unknown"),
@@ -15176,7 +15196,7 @@ impl SnapshotAccumulator {
         self.record(
             SnapshotKeyRef {
                 namespace: &namespace,
-                consumer_id: &consumer_id,
+                consumer_id: consumer,
                 consumer_name: consumer_name.as_deref(),
                 proxy_id: &proxy_id,
                 proxy_name: &proxy_name,
@@ -15197,7 +15217,6 @@ impl SnapshotAccumulator {
         charge: ChargeComputation,
     ) -> SnapshotRecordOutcome {
         let namespace = bounded_key_field(&summary.namespace, MAX_FIELD_LEN);
-        let consumer_id = bounded_key_field(consumer, MAX_FIELD_LEN);
         let consumer_name = metadata_value_cow(&summary.metadata, &["consumer_name"]);
         let proxy_id = bounded_key_field(&summary.proxy_id, MAX_FIELD_LEN);
         let proxy_name = bounded_key_field(
@@ -15209,7 +15228,7 @@ impl SnapshotAccumulator {
         self.record(
             SnapshotKeyRef {
                 namespace: &namespace,
-                consumer_id: &consumer_id,
+                consumer_id: consumer,
                 consumer_name: consumer_name.as_deref(),
                 proxy_id: &proxy_id,
                 proxy_name: &proxy_name,
@@ -15230,7 +15249,6 @@ impl SnapshotAccumulator {
         charge: ChargeComputation,
     ) -> SnapshotRecordOutcome {
         let namespace = bounded_key_field(&summary.namespace, MAX_FIELD_LEN);
-        let consumer_id = bounded_key_field(consumer, MAX_FIELD_LEN);
         let consumer_name = metadata_value_cow(&summary.metadata, &["consumer_name"]);
         let proxy_id = bounded_key_field(&summary.proxy_id, MAX_FIELD_LEN);
         let proxy_name = bounded_key_field(
@@ -15241,7 +15259,7 @@ impl SnapshotAccumulator {
         self.record(
             SnapshotKeyRef {
                 namespace: &namespace,
-                consumer_id: &consumer_id,
+                consumer_id: consumer,
                 consumer_name: consumer_name.as_deref(),
                 proxy_id: &proxy_id,
                 proxy_name: &proxy_name,
@@ -15717,7 +15735,11 @@ impl SnapshotAccumulator {
         consumer: &str,
         charge: ChargeComputation,
     ) {
-        let _ = self.record_http(summary, consumer, http_billing_outcome(summary), charge);
+        let consumer_id = principal_billing_identity(
+            crate::plugins::utils::principal::Principal::Consumer(consumer),
+            MAX_FIELD_LEN,
+        );
+        let _ = self.record_http(summary, &consumer_id, http_billing_outcome(summary), charge);
     }
 
     /// Seed a single identity with an arbitrary `call_count` for boundary tests.
@@ -16156,6 +16178,8 @@ fn emit_final_snapshot_to_spool(
     true
 }
 
+/// `consumer` (here and in the stream/WebSocket builders) is the principal's
+/// already-bounded billing identity from [`principal_billing_identity`].
 fn event_from_http_summary(
     summary: &TransactionSummary,
     consumer: &str,
@@ -16171,7 +16195,7 @@ fn event_from_http_summary(
         received_at: unix_timestamp_nanos(),
         node_id: bound_string(node_id, MAX_FIELD_LEN),
         namespace: bound_key_field(&summary.namespace, MAX_FIELD_LEN),
-        consumer_id: bound_key_field(consumer, MAX_FIELD_LEN),
+        consumer_id: consumer.to_owned(),
         consumer_name: metadata_value(metadata, &["consumer_name"]),
         proxy_id: bound_key_field(
             summary.proxy_id.as_deref().unwrap_or("unknown"),
@@ -16223,7 +16247,7 @@ fn event_from_stream_summary(
         received_at: unix_timestamp_nanos(),
         node_id: bound_string(node_id, MAX_FIELD_LEN),
         namespace: bound_key_field(&summary.namespace, MAX_FIELD_LEN),
-        consumer_id: bound_key_field(consumer, MAX_FIELD_LEN),
+        consumer_id: consumer.to_owned(),
         consumer_name: metadata_value(metadata, &["consumer_name"]),
         proxy_id: bound_key_field(&summary.proxy_id, MAX_FIELD_LEN),
         proxy_name: bound_key_field(
@@ -16272,7 +16296,7 @@ fn event_from_ws_summary(
         received_at: unix_timestamp_nanos(),
         node_id: bound_string(node_id, MAX_FIELD_LEN),
         namespace: bound_key_field(&summary.namespace, MAX_FIELD_LEN),
-        consumer_id: bound_key_field(consumer, MAX_FIELD_LEN),
+        consumer_id: consumer.to_owned(),
         consumer_name: metadata_value(metadata, &["consumer_name"]),
         proxy_id: bound_key_field(&summary.proxy_id, MAX_FIELD_LEN),
         proxy_name: bound_key_field(

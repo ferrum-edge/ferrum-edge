@@ -133,6 +133,7 @@ fn summary_for(consumer: &str, proxy_id: &str, path: &str) -> TransactionSummary
         timestamp_received: "2026-01-01T00:00:00Z".to_string(),
         client_ip: "10.1.2.3".to_string(),
         consumer_username: Some(consumer.to_string()),
+        principal_origin: Some(ferrum_edge::plugins::utils::principal::PrincipalOrigin::Consumer),
         http_method: "GET".to_string(),
         request_path: path.to_string(),
         proxy_id: Some(proxy_id.to_string()),

@@ -1512,6 +1512,7 @@ mod tests {
             proxy_name: None,
             client_ip: "127.0.0.1".to_string(),
             consumer_username: None,
+            principal_origin: None,
             auth_method: None,
             backend_target: "tcp://127.0.0.1:9001".to_string(),
             backend_resolved_ip: None,

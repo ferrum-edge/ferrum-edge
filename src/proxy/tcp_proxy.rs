@@ -3345,6 +3345,11 @@ async fn run_tcp_accept_loop(
                         } else {
                             None
                         };
+                        let principal_origin = if !plugins.is_empty() {
+                            stream_ctx.principal_origin()
+                        } else {
+                            None
+                        };
                         let summary = StreamTransactionSummary {
                             namespace: final_proxy_namespace,
                             proxy_id: final_proxy_id,
@@ -3355,6 +3360,7 @@ async fn run_tcp_accept_loop(
                             proxy_name,
                             client_ip,
                             consumer_username,
+                            principal_origin,
                             auth_method: stream_ctx.auth_method,
                             backend_target: result.backend.backend_target,
                             backend_resolved_ip: result.backend.backend_resolved_ip,

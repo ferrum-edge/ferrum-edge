@@ -376,6 +376,7 @@ impl ClientAbortRecord {
             timestamp_received: ctx.timestamp_received.to_rfc3339(),
             client_ip: ctx.client_ip.clone(),
             consumer_username: ctx.effective_identity().map(str::to_owned),
+            principal_origin: ctx.principal_origin(),
             auth_method: ctx.auth_method,
             http_method: ctx.method.clone(),
             request_path: self

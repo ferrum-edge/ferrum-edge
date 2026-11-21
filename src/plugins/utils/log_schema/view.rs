@@ -878,6 +878,7 @@ mod tests {
             proxy_name: Some("postgres-front".into()),
             client_ip: "10.0.0.2".into(),
             consumer_username: None,
+            principal_origin: None,
             auth_method: None,
             backend_target: "10.5.0.10:5432".into(),
             backend_resolved_ip: None,

@@ -1298,6 +1298,7 @@ fn stream_summary(client_ip: &str) -> StreamTransactionSummary {
         proxy_name: Some("tcp".to_string()),
         client_ip: client_ip.to_string(),
         consumer_username: None,
+        principal_origin: None,
         auth_method: None,
         backend_target: "127.0.0.1:9000".to_string(),
         backend_resolved_ip: None,

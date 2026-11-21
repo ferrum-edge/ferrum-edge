@@ -29,6 +29,7 @@ fn http_summary(status: u16, class: Option<ErrorClass>, phase: Option<&str>) -> 
         timestamp_received: "2026-08-31T00:00:00Z".to_string(),
         client_ip: "127.0.0.1".to_string(),
         consumer_username: None,
+        principal_origin: None,
         auth_method: None,
         http_method: "GET".to_string(),
         request_path: "/test".to_string(),
