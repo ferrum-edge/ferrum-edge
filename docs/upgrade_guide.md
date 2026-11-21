@@ -28,61 +28,34 @@ applied by editing the file (see [File Mode](#file-mode-ferrum_modefile)).
 
 ## Upgrading to the next release (unreleased)
 
-### `a2a_gateway` refuses unclassifiable JSON-RPC while Agent Card rewriting is on (GHSA-q25c-76f4-fp7h)
+### `access_control` external-identity rules can bind the verifying authority (GHSA-r378-r7j8-2qm3)
 
-With `discovery.rewrite_agent_card_urls` enabled (the default) on an instance
-that serves the `jsonrpc` binding, every `POST endpoint.path` request must now
-be classified as JSON-RPC at arrival, even under the default `allow` policy. An
-instance without the `jsonrpc` binding is unaffected. Each instance enforces its
-own requirement whichever instance claimed the request first, so a stricter
-instance behind a more permissive one on the same endpoint (a smaller
-`detection.max_request_body_size`, for example) now refuses what it cannot
-classify itself, and an Agent Card call a sibling claimed as a non-card
-operation, or claimed without rewriting Agent Cards, is refused with `-32001`
-(`a2a.error: operation_class_changed`). Such POSTs are buffered whatever their
-original media type. An `endpoint.path` that equals a native gRPC method path
-now fails closed for that gRPC call; keep the JSON-RPC endpoint on its own
-path. Before, only a deny-capable policy made the plugin fail closed on a body
-it could not classify; otherwise the request was forwarded unclaimed, and an
-Agent Card call inside it was answered with the backend's un-rewritten internal
-URLs.
+`allowed_external_identities` and `disallowed_external_identities` entries accept
+an optional `authority`: the 64-character hex realm authority digest of the
+provider that verified the identity (the value `opa` reports as
+`input.consumer.realm.authority`, the same encoding the plugin-trigger
+`external_identity_authority` predicate takes). `jwks_auth`,
+`oauth2_introspection`, `ldap_auth`, and `oidc_relying_party` commit a digest for
+every identity, single-provider routes included; `soap_ws_security` commits none.
+An authority-scoped allow entry matches only an identity committed with that
+authority. An authority-scoped deny entry also matches an identity with no
+verified realm or no committed digest, unless the entry also names a `mechanism`
+and the identity came from a different one. Entries without `authority` behave
+as before.
 
-What is now refused when rewriting is on:
-
-- a body over `detection.max_request_body_size` (default 1 MiB): HTTP `413`,
-  JSON-RPC `-32013`, `a2a.error: request_body_too_large`;
-- a duplicate-member body (a case-variant spelling of `jsonrpc`, `method`,
-  `params`, or `id`, such as `METHOD`, counts as one), a batch with a member
-  the plugin does not recognize, an empty batch, a method-bearing body that is not a well-formed
-  JSON-RPC 2.0 request, an unknown method sent without the version header, a
-  body that is not a JSON document or has no JSON-RPC envelope, and a POST with
-  a non-JSON media type: JSON-RPC `-32001`,
-  `a2a.error: request_body_uninspectable` (a batch is answered per member).
-
-Wherever classification is required (rewriting as above, or a deny-capable
-policy), a body with a leading UTF-8 byte order mark is now classified on the
-bytes after the mark instead of being treated as unparseable, a case-variant
-envelope member is refused like a duplicate one, and a changed final request
-body is refused when its media type is no longer JSON, the classifier's parser
-rejects it, or it carries no JSON-RPC envelope. The forwarded
-bytes are unchanged. A transparent configuration (rewriting off, no deny-capable
-policy) classifies the raw bytes exactly as before.
-
-`a2a_gateway`'s replay-provenance digest moved to a new version, so
-`request_deduplication` / `response_caching` representations retained before
-the upgrade on a proxy with `a2a_gateway` no longer replay: a retry under a
-previous idempotency key answers `409 Conflict` until the record expires, and a
-cached response is re-fetched.
-
-**Operator action:** if JSON-RPC bodies legitimately exceed 1 MiB (inline file
-parts, for example), raise `detection.max_request_body_size` or set it to `0`.
-Clients that call non-A2A methods on the endpoint should send the version header
-(`detection.allow_unknown_methods_with_version_header` defaults to `true`). To
-keep the previous transparent passthrough of unrecognized JSON-RPC, set
-`discovery.rewrite_agent_card_urls: false` and configure no deny-capable policy.
-Deployments with a deny-capable policy already failed closed at arrival; for
-them only BOM and case-variant member handling, the final-body refusals above,
-and buffering of non-JSON POSTs to the endpoint change.
+**Operator action:** on routes that authenticate through more than one provider
+of one mechanism (multi-provider `jwks_auth` or `oauth2_introspection`), a
+`mechanism`-only entry matches an equal subject from every one of those
+providers. Add `authority` to each external-identity entry that is meant for one
+provider. `oauth2_introspection` client credentials do not distinguish
+authorities. An introspection provider without an `issuer` pin commits one digest
+per returned `iss`, plus a base digest when `iss` is absent. Two such providers on
+the same endpoint and identity claim share a digest whenever the returned issuer
+is equal. Pin a distinct `issuer` (responses must then carry that `iss`) to give
+each provider exactly one authority; distinct endpoints separate providers, but an
+unpinned provider still commits one digest per returned `iss`, so cover each digest
+it commits with its own entry. Older builds reject the new key, so upgrade every gateway node (CP and
+DPs together) before adding it.
 
 ### `oidc_relying_party` post-login redirects are emitted in canonical form (GHSA-6rwj-gc4r-3jm9)
 
@@ -169,6 +142,62 @@ mirrors, exactly as on a NodeWaypoint.
 
 **Operator action:** upgrade the control plane and data planes together, and
 review mesh-bound VirtualServices before upgrading Sidecars.
+
+### `a2a_gateway` refuses unclassifiable JSON-RPC while Agent Card rewriting is on (GHSA-q25c-76f4-fp7h)
+
+With `discovery.rewrite_agent_card_urls` enabled (the default) on an instance
+that serves the `jsonrpc` binding, every `POST endpoint.path` request must now
+be classified as JSON-RPC at arrival, even under the default `allow` policy. An
+instance without the `jsonrpc` binding is unaffected. Each instance enforces its
+own requirement whichever instance claimed the request first, so a stricter
+instance behind a more permissive one on the same endpoint (a smaller
+`detection.max_request_body_size`, for example) now refuses what it cannot
+classify itself, and an Agent Card call a sibling claimed as a non-card
+operation, or claimed without rewriting Agent Cards, is refused with `-32001`
+(`a2a.error: operation_class_changed`). Such POSTs are buffered whatever their
+original media type. An `endpoint.path` that equals a native gRPC method path
+now fails closed for that gRPC call; keep the JSON-RPC endpoint on its own
+path. Before, only a deny-capable policy made the plugin fail closed on a body
+it could not classify; otherwise the request was forwarded unclaimed, and an
+Agent Card call inside it was answered with the backend's un-rewritten internal
+URLs.
+
+What is now refused when rewriting is on:
+
+- a body over `detection.max_request_body_size` (default 1 MiB): HTTP `413`,
+  JSON-RPC `-32013`, `a2a.error: request_body_too_large`;
+- a duplicate-member body (a case-variant spelling of `jsonrpc`, `method`,
+  `params`, or `id`, such as `METHOD`, counts as one), a batch with a member
+  the plugin does not recognize, an empty batch, a method-bearing body that is not a well-formed
+  JSON-RPC 2.0 request, an unknown method sent without the version header, a
+  body that is not a JSON document or has no JSON-RPC envelope, and a POST with
+  a non-JSON media type: JSON-RPC `-32001`,
+  `a2a.error: request_body_uninspectable` (a batch is answered per member).
+
+Wherever classification is required (rewriting as above, or a deny-capable
+policy), a body with a leading UTF-8 byte order mark is now classified on the
+bytes after the mark instead of being treated as unparseable, a case-variant
+envelope member is refused like a duplicate one, and a changed final request
+body is refused when its media type is no longer JSON, the classifier's parser
+rejects it, or it carries no JSON-RPC envelope. The forwarded
+bytes are unchanged. A transparent configuration (rewriting off, no deny-capable
+policy) classifies the raw bytes exactly as before.
+
+`a2a_gateway`'s replay-provenance digest moved to a new version, so
+`request_deduplication` / `response_caching` representations retained before
+the upgrade on a proxy with `a2a_gateway` no longer replay: a retry under a
+previous idempotency key answers `409 Conflict` until the record expires, and a
+cached response is re-fetched.
+
+**Operator action:** if JSON-RPC bodies legitimately exceed 1 MiB (inline file
+parts, for example), raise `detection.max_request_body_size` or set it to `0`.
+Clients that call non-A2A methods on the endpoint should send the version header
+(`detection.allow_unknown_methods_with_version_header` defaults to `true`). To
+keep the previous transparent passthrough of unrecognized JSON-RPC, set
+`discovery.rewrite_agent_card_urls: false` and configure no deny-capable policy.
+Deployments with a deny-capable policy already failed closed at arrival; for
+them only BOM and case-variant member handling, the final-body refusals above,
+and buffering of non-JSON POSTs to the endpoint change.
 
 ### A backend's WebSocket upgrade refusal is relayed to the client (GHSA-7x2j-3389-2h35)
 

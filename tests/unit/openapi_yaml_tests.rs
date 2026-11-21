@@ -2991,6 +2991,21 @@ fn access_control_schema_matches_runtime_validation() {
             "allow_authenticated_identity": true
         }),
         json!({"disallowed_external_identities": [{"identity": "\u{feff}"}]}),
+        // GHSA-r378-r7j8-2qm3: entries can bind the verifying authority digest.
+        json!({
+            "allowed_external_identities": [{"identity": "alice", "authority": "ab".repeat(32)}]
+        }),
+        json!({
+            "allowed_external_identities": [{
+                "identity": "alice",
+                "mechanism": "jwks_auth",
+                "authority": "AB".repeat(32)
+            }]
+        }),
+        json!({
+            "disallowed_external_identities": [{"identity": "alice", "authority": "09".repeat(32)}],
+            "allow_authenticated_identity": true
+        }),
     ] {
         assert!(
             validator.validate(&config).is_ok(),
@@ -3045,6 +3060,14 @@ fn access_control_schema_matches_runtime_validation() {
         json!({"disallowed_external_identities": [{"identity": "alice", "mechanism": "jwks"}]}),
         json!({"disallowed_external_identities": [{"identity": "alice", "realm": "x"}]}),
         json!({"disallowed_external_identities": []}),
+        json!({"allowed_external_identities": [{"identity": "alice", "authority": "ab".repeat(31)}]}),
+        json!({"allowed_external_identities": [{"identity": "alice", "authority": "ab".repeat(33)}]}),
+        json!({"allowed_external_identities": [{"identity": "alice", "authority": "zz".repeat(32)}]}),
+        json!({"allowed_external_identities": [{"identity": "alice", "authority": 7}]}),
+        json!({
+            "disallowed_external_identities": [{"identity": "alice", "authority": format!("0x{}", "ab".repeat(31))}],
+            "allow_authenticated_identity": true
+        }),
     ] {
         assert!(
             validator.validate(&config).is_err(),

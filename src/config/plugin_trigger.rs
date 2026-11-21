@@ -781,12 +781,13 @@ fn compile_authority_digests(values: &[String]) -> Result<Vec<[u8; 32]>, String>
     }
     let mut out = Vec::with_capacity(values.len());
     for (index, value) in values.iter().enumerate() {
-        let mut digest = [0u8; 32];
-        if value.len() != 64 || hex::decode_to_slice(value, &mut digest).is_err() {
+        let Some(digest) =
+            crate::plugins::utils::auth_flow::parse_external_identity_realm_authority(value)
+        else {
             return Err(format!(
                 "trigger: `{LABEL}[{index}]` must be a 64-character hex realm authority digest"
             ));
-        }
+        };
         out.push(digest);
     }
     Ok(out)

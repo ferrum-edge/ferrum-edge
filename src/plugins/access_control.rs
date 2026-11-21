@@ -24,7 +24,9 @@
 //! 4. **External-principal rules**: `allowed_external_identities` /
 //!    `disallowed_external_identities` name exact unmapped external
 //!    principals, optionally scoped to the authentication mechanism that
-//!    verified them (`ExternalIdentityRealm::mechanism`). An external
+//!    verified them (`ExternalIdentityRealm::mechanism`) and/or to the exact
+//!    verifying authority (`ExternalIdentityRealm::authority`, GHSA-r378-r7j8-2qm3),
+//!    which tells two providers of one mechanism apart. An external
 //!    allow-list is a positive authorization for unmapped identities, so it is
 //!    the narrow alternative to the blanket `allow_authenticated_identity`
 //!    bypass (and, like the consumer allow-lists, cannot be combined with it).
@@ -44,7 +46,9 @@
 //! otherwise read as "allow nobody" while behaving as "no restriction".
 
 use crate::config::types::GatewayConfig;
-use crate::plugins::utils::auth_flow::ExternalIdentityRealm;
+use crate::plugins::utils::auth_flow::{
+    ExternalIdentityRealm, parse_external_identity_realm_authority,
+};
 use crate::plugins::utils::log_sampling::warn_sampled;
 
 use async_trait::async_trait;
@@ -73,13 +77,52 @@ const EXTERNAL_IDENTITY_MECHANISMS: [&str; 5] = [
     "soap_ws_security",
 ];
 
+/// The realm restriction of one realm-scoped external-identity entry: the
+/// verifying mechanism, the verifying-authority digest, or both (at least one
+/// is set). Both must hold when both are set.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct ExternalIdentityScope {
+    mechanism: Option<&'static str>,
+    authority: Option<[u8; 32]>,
+}
+
+impl ExternalIdentityScope {
+    /// Whether this scope covers an identity committed under `realm`.
+    ///
+    /// A known realm whose mechanism differs from a configured `mechanism`, or
+    /// whose committed authority differs from a configured `authority`, is
+    /// definitively another principal. A missing realm, or (for an
+    /// authority-scoped entry) a realm that committed no authority, cannot be
+    /// told apart from the one the entry names, so `unknown_realm_matches`
+    /// decides: a deny rule matches it, an allow rule does not
+    /// (GHSA-r378-r7j8-2qm3).
+    fn matches(&self, realm: Option<ExternalIdentityRealm>, unknown_realm_matches: bool) -> bool {
+        let Some(realm) = realm else {
+            return unknown_realm_matches;
+        };
+        if self
+            .mechanism
+            .is_some_and(|mechanism| mechanism != realm.mechanism())
+        {
+            return false;
+        }
+        match (&self.authority, realm.authority()) {
+            (None, _) => true,
+            (Some(configured), Some(committed)) => configured == committed,
+            (Some(_), None) => unknown_realm_matches,
+        }
+    }
+}
+
 /// Every exact rule configured for one external identity string.
 #[derive(Default)]
 struct ExternalIdentityRule {
-    /// An entry without `mechanism`: matches the identity from every realm.
+    /// An entry with neither `mechanism` nor `authority`: matches the identity
+    /// from every realm.
     any_realm: bool,
-    /// Mechanisms the identity's realm-scoped entries name.
-    mechanisms: Vec<&'static str>,
+    /// The realm restrictions of the identity's realm-scoped entries; the rule
+    /// matches when any one of them does.
+    scopes: Vec<ExternalIdentityScope>,
 }
 
 impl ExternalIdentityRule {
@@ -90,14 +133,14 @@ impl ExternalIdentityRule {
     /// custom plugin may set the identity directly). A realm-scoped entry cannot
     /// tell whether such an identity is the one it names, so the caller decides
     /// the fail-closed direction: a deny rule matches it, an allow rule does not.
+    /// The same holds for an authority-scoped entry and a realm that committed
+    /// no authority.
     fn matches(&self, realm: Option<ExternalIdentityRealm>, unknown_realm_matches: bool) -> bool {
-        if self.any_realm {
-            return true;
-        }
-        match realm {
-            Some(realm) => self.mechanisms.contains(&realm.mechanism()),
-            None => unknown_realm_matches,
-        }
+        self.any_realm
+            || self
+                .scopes
+                .iter()
+                .any(|scope| scope.matches(realm, unknown_realm_matches))
     }
 }
 
@@ -111,10 +154,11 @@ pub struct AccessControl {
     /// O(1) group deny list.
     disallowed_groups: HashSet<String>,
     /// Exact unmapped external principals that are allowed, optionally scoped
-    /// to the verifying mechanism (empty = no external allow-list).
+    /// to the verifying mechanism and/or authority (empty = no external
+    /// allow-list).
     allowed_external_identities: HashMap<String, ExternalIdentityRule>,
     /// Exact unmapped external principals that are denied, optionally scoped
-    /// to the verifying mechanism.
+    /// to the verifying mechanism and/or authority.
     disallowed_external_identities: HashMap<String, ExternalIdentityRule>,
     /// When true, allow requests authenticated by an external auth plugin
     /// (for example `jwks_auth`) even if no gateway Consumer was mapped.
@@ -325,9 +369,9 @@ impl AccessControl {
     /// two together. Deny rules run first: `disallowed_consumers` is applied to
     /// the raw identity string from every realm, and a
     /// `disallowed_external_identities` entry applies to its scoped realm (or
-    /// to every realm when it names no mechanism). The consumer and group
-    /// allow-lists never apply here: an unmapped identity has no Consumer
-    /// username or `acl_groups`.
+    /// to every realm when it names neither `mechanism` nor `authority`). The
+    /// consumer and group allow-lists never apply here: an unmapped identity
+    /// has no Consumer username or `acl_groups`.
     fn authorize_external_identity(
         &self,
         client_ip: &str,
@@ -360,8 +404,9 @@ impl AccessControl {
                 headers: HashMap::new(),
             };
         }
-        // A realm-scoped deny entry also matches an identity whose realm is
-        // unknown: it cannot rule out that this is the principal it revokes.
+        // A realm-scoped deny entry also matches an identity whose realm (or,
+        // for an authority-scoped entry, whose committed authority) is unknown:
+        // it cannot rule out that this is the principal it revokes.
         if self.disallowed_consumers.contains(identity)
             || self
                 .disallowed_external_identities
@@ -382,7 +427,8 @@ impl AccessControl {
         }
         if !self.allowed_external_identities.is_empty() {
             // A realm-scoped allow entry never matches an identity whose realm
-            // is unknown: admission must be positively established.
+            // (or, for an authority-scoped entry, whose committed authority) is
+            // unknown: admission must be positively established.
             if self
                 .allowed_external_identities
                 .get(identity)
@@ -493,13 +539,16 @@ fn parse_string_set(
 
 /// Parse `allowed_external_identities` / `disallowed_external_identities`.
 ///
-/// Each entry is `{ "identity": <exact principal>, "mechanism": <optional> }`.
-/// The identity follows the same admission rules as the string lists (stored
-/// byte-for-byte, non-whitespace, at most [`MAX_EXTERNAL_IDENTITY_LENGTH`]
-/// characters); `mechanism`, when present, must name one of
-/// [`EXTERNAL_IDENTITY_MECHANISMS`]. Several entries for one identity merge:
-/// an unscoped entry covers every realm. Error messages never echo the
-/// supplied values.
+/// Each entry is `{ "identity": <exact principal>, "mechanism": <optional>,
+/// "authority": <optional> }`. The identity follows the same admission rules as
+/// the string lists (stored byte-for-byte, non-whitespace, at most
+/// [`MAX_EXTERNAL_IDENTITY_LENGTH`] characters); `mechanism`, when present,
+/// must name one of [`EXTERNAL_IDENTITY_MECHANISMS`]; `authority`, when
+/// present, must be a 64-character hex realm authority digest, decoded by the
+/// same helper as the plugin-trigger `external_identity_authority` predicate
+/// ([`parse_external_identity_realm_authority`]). Several entries for one
+/// identity merge: an entry with neither scope covers every realm. Error
+/// messages never echo the supplied values.
 fn parse_external_identity_rules(
     object: &serde_json::Map<String, Value>,
     field: &str,
@@ -521,10 +570,11 @@ fn parse_external_identity_rules(
         };
         if entry
             .keys()
-            .any(|key| key != "identity" && key != "mechanism")
+            .any(|key| key != "identity" && key != "mechanism" && key != "authority")
         {
             return Err(format!(
-                "access_control: `{field}` entries accept only `identity` and `mechanism`"
+                "access_control: `{field}` entries accept only `identity`, `mechanism`, and \
+                 `authority`"
             ));
         }
         let Some(identity) = entry.get("identity").and_then(Value::as_str) else {
@@ -561,13 +611,31 @@ fn parse_external_identity_rules(
                 Some(known)
             }
         };
+        let authority = match entry.get("authority") {
+            None => None,
+            Some(value) => {
+                let Some(digest) = value
+                    .as_str()
+                    .and_then(parse_external_identity_realm_authority)
+                else {
+                    return Err(format!(
+                        "access_control: `{field}` entry `authority` must be a 64-character hex \
+                         realm authority digest"
+                    ));
+                };
+                Some(digest)
+            }
+        };
         let rule = rules.entry(identity.to_string()).or_default();
-        match mechanism {
-            None => rule.any_realm = true,
-            Some(mechanism) => {
-                if !rule.mechanisms.contains(&mechanism) {
-                    rule.mechanisms.push(mechanism);
-                }
+        if mechanism.is_none() && authority.is_none() {
+            rule.any_realm = true;
+        } else {
+            let scope = ExternalIdentityScope {
+                mechanism,
+                authority,
+            };
+            if !rule.scopes.contains(&scope) {
+                rule.scopes.push(scope);
             }
         }
     }
@@ -653,7 +721,8 @@ impl Plugin for AccessControl {
 
     async fn on_stream_connect(&self, ctx: &mut StreamConnectionContext) -> PluginResult {
         // Stream contexts carry no verified realm, so realm-scoped external
-        // rules see an unknown realm: scoped denies match, scoped allows do not.
+        // rules (mechanism or authority) see an unknown realm: scoped denies
+        // match, scoped allows do not.
         self.authorize_identity(
             &ctx.client_ip,
             ctx.identified_consumer.as_deref(),
