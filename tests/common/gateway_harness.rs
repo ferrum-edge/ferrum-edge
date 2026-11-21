@@ -2381,9 +2381,10 @@ pub fn select_gateway_binary(
     root: &Path,
     prefer_release: bool,
 ) -> Option<PathBuf> {
-    let mut existing = explicit
-        .iter()
-        .map(|path| path.as_ref().filter(|path| path.exists()));
+    fn existing_path(path: &Option<PathBuf>) -> Option<&PathBuf> {
+        path.as_ref().filter(|path| path.exists())
+    }
+    let mut existing = explicit.iter().map(existing_path);
     let operator = existing.next().flatten();
     let cargo_built = existing.flatten().next();
     if let Some(path) = operator {
