@@ -28,41 +28,34 @@ applied by editing the file (see [File Mode](#file-mode-ferrum_modefile)).
 
 ## Upgrading to the next release (unreleased)
 
-### Chargeback rows for external principals are realm-qualified (GHSA-q9vj-rf66-3j58)
+### `access_control` external-identity rules can bind the verifying authority (GHSA-r378-r7j8-2qm3)
 
-`api_chargeback` (`/charges`) and `api_chargeback_sink` (`consumer_id`) now key
-billing rows on the authenticated principal rather than on the logged
-`consumer_username` display string. A mapped gateway Consumer's row is
-unchanged. An unmapped external principal (`jwks_auth`, `oidc_relying_party`,
-`oauth2_introspection`, `ldap_auth`, `soap_ws_security`, or an external stream
-identity) is now reported as `external:<mechanism>:<authority>:<identity>`, for
-example `external:jwks_auth:<64 hex>:alice`, where `<authority>` is the opaque
-verifying-authority digest (`-` when absent). Previously such a principal was
-billed under its bare identity, sharing a row with any Consumer or other
-provider that used the same string. A Consumer whose username begins with
-`external:` is now always reported in its `~sha256:` digest form.
+`allowed_external_identities` and `disallowed_external_identities` entries accept
+an optional `authority`: the 64-character hex realm authority digest of the
+provider that verified the identity (the value `opa` reports as
+`input.consumer.realm.authority`, the same encoding the plugin-trigger
+`external_identity_authority` predicate takes). `jwks_auth`,
+`oauth2_introspection`, `ldap_auth`, and `oidc_relying_party` commit a digest for
+every identity, single-provider routes included; `soap_ws_security` commits none.
+An authority-scoped allow entry matches only an identity committed with that
+authority. An authority-scoped deny entry also matches an identity with no
+verified realm or no committed digest, unless the entry also names a `mechanism`
+and the identity came from a different one. Entries without `authority` behave
+as before.
 
-**Treat the upgrade as a billing boundary.** Rows recorded before it — ClickHouse
-rows, Prometheus series, and charge events still pending in the sink spool,
-which replay with their original bytes after the upgrade — are keyed on the bare
-display identity and are not realm-qualified. A pre-upgrade bare value can even
-coincide with a post-upgrade key: a Consumer whose username was literally
-`external:jwks_auth:<64 hex>:alice` billed under that string before the upgrade,
-while after it the same string identifies the external principal and the
-Consumer moves to its digest form. Because the shipped ClickHouse rollups group
-by `consumer_id` without the realm, keep the two eras separately attributable
-for the first realm-qualified rollout — for example ship it with a new
-`pricing_version` (part of every rollup key) or write it to a new table — and
-let pending spool rows drain before reconciling across the boundary.
-
-**Operator action:** update invoicing and reconciliation that maps `/charges`
-consumer keys or ClickHouse `consumer_id` values for external principals to
-customers: match the `external:` key (or its identity suffix together with the
-mechanism and authority) instead of the bare identity. External rows are
-qualified by the realm authority the mechanism commits; `soap_ws_security`
-currently commits none, so its principals are qualified by mechanism only
-(`external:soap_ws_security:-:<identity>`). Transaction log output
-(`consumer_username`) is unchanged.
+**Operator action:** on routes that authenticate through more than one provider
+of one mechanism (multi-provider `jwks_auth` or `oauth2_introspection`), a
+`mechanism`-only entry matches an equal subject from every one of those
+providers. Add `authority` to each external-identity entry that is meant for one
+provider. `oauth2_introspection` client credentials do not distinguish
+authorities. An introspection provider without an `issuer` pin commits one digest
+per returned `iss`, plus a base digest when `iss` is absent. Two such providers on
+the same endpoint and identity claim share a digest whenever the returned issuer
+is equal. Pin a distinct `issuer` (responses must then carry that `iss`) to give
+each provider exactly one authority; distinct endpoints separate providers, but an
+unpinned provider still commits one digest per returned `iss`, so cover each digest
+it commits with its own entry. Older builds reject the new key, so upgrade every gateway node (CP and
+DPs together) before adding it.
 
 ### `oidc_relying_party` post-login redirects are emitted in canonical form (GHSA-6rwj-gc4r-3jm9)
 
@@ -109,6 +102,42 @@ an east-west gateway, mesh-wide root-namespace wildcards (`*`,
 load-balancing and outlier settings now also shape cross-cluster traffic
 entering through the gateway. A rule meant only for in-cluster clients can be
 narrowed with `exportTo` so it is not visible to the gateway's namespace.
+
+### Chargeback rows for external principals are realm-qualified (GHSA-q9vj-rf66-3j58)
+
+`api_chargeback` (`/charges`) and `api_chargeback_sink` (`consumer_id`) now key
+billing rows on the authenticated principal rather than on the logged
+`consumer_username` display string. A mapped gateway Consumer's row is
+unchanged. An unmapped external principal (`jwks_auth`, `oidc_relying_party`,
+`oauth2_introspection`, `ldap_auth`, `soap_ws_security`, or an external stream
+identity) is now reported as `external:<mechanism>:<authority>:<identity>`, for
+example `external:jwks_auth:<64 hex>:alice`, where `<authority>` is the opaque
+verifying-authority digest (`-` when absent). Previously such a principal was
+billed under its bare identity, sharing a row with any Consumer or other
+provider that used the same string. A Consumer whose username begins with
+`external:` is now always reported in its `~sha256:` digest form.
+
+**Treat the upgrade as a billing boundary.** Rows recorded before it — ClickHouse
+rows, Prometheus series, and charge events still pending in the sink spool,
+which replay with their original bytes after the upgrade — are keyed on the bare
+display identity and are not realm-qualified. A pre-upgrade bare value can even
+coincide with a post-upgrade key: a Consumer whose username was literally
+`external:jwks_auth:<64 hex>:alice` billed under that string before the upgrade,
+while after it the same string identifies the external principal and the
+Consumer moves to its digest form. Because the shipped ClickHouse rollups group
+by `consumer_id` without the realm, keep the two eras separately attributable
+for the first realm-qualified rollout — for example ship it with a new
+`pricing_version` (part of every rollup key) or write it to a new table — and
+let pending spool rows drain before reconciling across the boundary.
+
+**Operator action:** update invoicing and reconciliation that maps `/charges`
+consumer keys or ClickHouse `consumer_id` values for external principals to
+customers: match the `external:` key (or its identity suffix together with the
+mechanism and authority) instead of the bare identity. External rows are
+qualified by the realm authority the mechanism commits; `soap_ws_security`
+currently commits none, so its principals are qualified by mechanism only
+(`external:soap_ws_security:-:<identity>`). Transaction log output
+(`consumer_username`) is unchanged.
 
 ### Sidecar VirtualService HTTP routes (#7423)
 
