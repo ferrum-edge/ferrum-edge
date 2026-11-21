@@ -762,9 +762,15 @@ Validation: fail render on missing/unsafe configuration.
 {{/* Issue #7426: Kubernetes refuses an autoscaling/v2 HPA whose maxReplicas
      is below minReplicas, and allows minReplicas=0 only with an Object or
      External metric. hpa.yaml emits only Resource (cpu/memory) metrics, so an
-     enabled HPA needs 1 <= minReplicas <= maxReplicas. */}}
+     enabled HPA needs 1 <= minReplicas <= maxReplicas. A cleared minimum
+     (minReplicas: null) is omitted from the HPA, and Kubernetes defaults it to
+     1, so it is checked as 1 (not with `default`, which would also replace an
+     explicit 0). */}}
 {{- if .Values.autoscaling.enabled -}}
-{{- $minReplicas := .Values.autoscaling.minReplicas | int -}}
+{{- $minReplicas := 1 -}}
+{{- if not (kindIs "invalid" .Values.autoscaling.minReplicas) -}}
+{{- $minReplicas = .Values.autoscaling.minReplicas | int -}}
+{{- end -}}
 {{- $maxReplicas := .Values.autoscaling.maxReplicas | int -}}
 {{- if lt $minReplicas 1 -}}
 {{- fail (printf "autoscaling.minReplicas=%d is invalid with autoscaling.enabled=true: the chart's HorizontalPodAutoscaler uses only Resource (cpu/memory) metrics, and Kubernetes allows scale-to-zero only with Object or External metrics. Set autoscaling.minReplicas to at least 1." $minReplicas) -}}
