@@ -62,10 +62,11 @@ use super::utils::replay_partition::PartitionHasher;
 use super::utils::response_body::read_response_body_bounded;
 use super::utils::scope_role_check::{self, ScopeRoleRequirements};
 use super::utils::token_extract::{
-    STRIP_QUERY_PARAM_METADATA_PREFIX, TokenHeaderLocation, TokenLocation, TokenLocationExtract,
-    extract_authorization_bearer, extract_authorization_dpop, extract_from_location,
-    mark_provider_query_credential_locations, provider_locations_extract_token,
-    push_stripped_credential_header_names, stage_original_token_stripping as stage_token_stripping,
+    AMBIGUOUS_QUERY_TOKEN_BODY, STRIP_QUERY_PARAM_METADATA_PREFIX, TokenHeaderLocation,
+    TokenLocation, TokenLocationExtract, extract_authorization_bearer, extract_authorization_dpop,
+    extract_from_location, mark_provider_query_credential_locations,
+    provider_locations_extract_token, push_stripped_credential_header_names,
+    query_locations_have_semicolon_alias, stage_original_token_stripping as stage_token_stripping,
 };
 use super::{JwtAuthAttributeValue, PluginResult, RequestContext};
 
@@ -1830,6 +1831,23 @@ impl JwksAuth {
     }
 
     fn extract_jwks_credential(&self, ctx: &RequestContext) -> JwksExtractedCredential {
+        // A `;`-aliased query token at ANY configured query location is
+        // terminal for this instance, before any header, `Authorization`, or
+        // fallback source is read (issue #6579, GHSA-c259-vchc-3vgr): a valid
+        // token elsewhere must not mask a credential Ferrum and a
+        // `;`-splitting backend read differently. With this rule, an
+        // accepted token can never leave an aliased copy behind for
+        // accepted-token stripping to miss.
+        if self.has_custom_query_token_locations
+            && query_locations_have_semicolon_alias(
+                ctx,
+                self.providers
+                    .iter()
+                    .flat_map(|provider| provider.token_locations.iter()),
+            )
+        {
+            return JwksExtractedCredential::InvalidFormat(AMBIGUOUS_QUERY_TOKEN_BODY.to_string());
+        }
         let mut first_invalid_format: Option<String> = None;
         for (idx, provider) in self.providers.iter().enumerate() {
             if provider.token_locations.is_empty() {

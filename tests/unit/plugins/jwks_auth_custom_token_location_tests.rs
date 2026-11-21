@@ -593,3 +593,86 @@ async fn semicolon_aliased_query_token_respects_forward_original_token() {
         raw_query
     );
 }
+
+/// A `;` alias at any configured query location is terminal for the
+/// instance: a valid token in another location (explicit `Authorization`, a
+/// later provider's implicit `Bearer` fallback, or a provider with the
+/// opposite forwarding setting) must not mask it, in either provider order.
+#[tokio::test]
+async fn semicolon_aliased_query_token_is_terminal_beside_a_valid_header_token() {
+    let jwks = build_rsa_jwks_from_pem(include_bytes!(
+        "../../../tests/fixtures/test_rsa_public.pem"
+    ))
+    .to_string();
+    let header_and_param = json!({"providers": [{
+        "issuer": "https://issuer.example.com",
+        "jwks": jwks,
+        "from_headers": [{"name": "Authorization"}],
+        "from_params": ["access_token"]
+    }]});
+    let param_provider = json!({
+        "issuer": "https://custom.example.com",
+        "jwks": jwks,
+        "from_params": ["access_token"],
+        "forward_original_token": true
+    });
+    let fallback_provider = json!({
+        "issuer": "https://issuer.example.com",
+        "jwks": jwks,
+        "forward_original_token": false
+    });
+    let configs = [
+        header_and_param,
+        json!({"providers": [param_provider.clone(), fallback_provider.clone()]}),
+        json!({"providers": [fallback_provider, param_provider]}),
+    ];
+    let header = format!("Bearer {}", token_for("header-user"));
+    for config in configs {
+        let plugin = std::sync::Arc::new(JwksAuth::new(&config, default_client()).unwrap());
+        let auth_plugins: Vec<std::sync::Arc<dyn Plugin>> = vec![plugin.clone()];
+        for raw_query in [
+            "carrier=;access_token=other.jwt.value",
+            "access_token;x=1&carrier=1",
+        ] {
+            let mut ctx = ctx_with_raw_query(raw_query);
+            ctx.headers
+                .insert("authorization".to_string(), header.clone());
+            assert_reject_body(
+                plugin
+                    .authenticate(&mut ctx, &ConsumerIndex::new(&[]))
+                    .await,
+                AMBIGUOUS_QUERY_TOKEN_BODY,
+            );
+            assert!(ctx.authenticated_identity.is_none(), "{config} {raw_query}");
+
+            let mut ctx = ctx_with_raw_query(raw_query);
+            ctx.headers
+                .insert("authorization".to_string(), header.clone());
+            let (status, _, _) = ferrum_edge::proxy::run_authentication_phase(
+                ferrum_edge::config::types::AuthMode::Single,
+                &auth_plugins,
+                &mut ctx,
+                &ConsumerIndex::new(&[]),
+            )
+            .await
+            .expect("an ambiguous query token must be rejected");
+            assert_eq!(status, 401, "{config} {raw_query}");
+            assert!(ctx.authenticated_identity.is_none(), "{config} {raw_query}");
+        }
+
+        // Without the alias the header token still authenticates.
+        let mut ctx = ctx_with_raw_query("carrier=a;b=c");
+        ctx.headers
+            .insert("authorization".to_string(), header.clone());
+        assert_continue(
+            plugin
+                .authenticate(&mut ctx, &ConsumerIndex::new(&[]))
+                .await,
+        );
+        assert_eq!(
+            ctx.authenticated_identity.as_deref(),
+            Some("header-user"),
+            "{config}"
+        );
+    }
+}

@@ -36,9 +36,12 @@ issue #6579 contract to query token locations. A request whose configured query
 name also appears as a `;`-separated sub-parameter (`?carrier=;token=...`, or a
 name such as `token;x`) is refused with `401`
 `{"error":"Ambiguous token query parameter"}` instead of being treated as
-carrying no token (for `jwks_auth` and `oauth2_introspection`, when no other
-configured location yields a token). The alias is also marked for OPA and
-`request_mirror` redaction, and it is removed from the forwarded query —
+carrying no token. For `jwks_auth` and `oauth2_introspection` an alias at any
+provider's query location is terminal for the whole instance, even when a
+valid token is also present in a header or `Authorization`. The alias is also
+marked for OPA and `request_mirror` redaction (including a raw spelling such as
+`workspace%2Dslot`), a `request_transformer` `$(query.<name>)` template never
+copies a pair that carries it, and it is removed from the forwarded query —
 including when another mechanism authenticates the request — under
 `jwt_auth` `hide_credentials: true` or a provider's
 `forward_original_token: false`.

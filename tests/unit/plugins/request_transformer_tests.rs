@@ -3726,3 +3726,62 @@ async fn digest_retirement_folds_underscore_spellings() {
     assert!(!outbound.contains_key("content_digest"));
     assert!(!outbound.contains_key("Repr_Digest"));
 }
+
+/// GHSA-c259-vchc-3vgr: the outbound strip removes a whole `&` segment whose
+/// `;` sub-pair names an auth-marked credential, so a template reading that
+/// carrier must not copy the embedded credential into another field. The
+/// mark comes from a real auth discovery hook.
+#[tokio::test]
+async fn query_template_never_copies_a_carrier_embedding_a_marked_alias() {
+    use ferrum_edge::plugins::request_transformer::RULE_SKIPPED_METADATA_KEY;
+
+    let jwt = ferrum_edge::plugins::jwt_auth::JwtAuth::new(&json!({
+        "token_lookup": "query:tenant_jwt",
+        "hide_credentials": true
+    }))
+    .unwrap();
+    for (operation, target) in [("update", "header"), ("add", "query")] {
+        let plugin = RequestTransformer::new(&json!({
+            "rules": [{"operation": operation, "target": target, "key": "x-copied", "value": "$(query.carrier)"}]
+        }))
+        .unwrap();
+        let mut ctx = make_ctx();
+        ctx.set_raw_query_string("carrier=;tenant_jwt=aliased-secret&page=1".to_string());
+        ctx.materialize_query_params();
+        jwt.mark_query_credentials_for_redaction(&mut ctx);
+        assert!(
+            ctx.metadata
+                .contains_key("auth.strip_query_param.tenant_jwt")
+        );
+
+        let mut headers: HashMap<String, String> = HashMap::new();
+        plugin.before_proxy(&mut ctx, &mut headers).await;
+        assert!(!headers.contains_key("x-copied"), "{target}");
+        assert_eq!(
+            ctx.metadata
+                .get(RULE_SKIPPED_METADATA_KEY)
+                .map(String::as_str),
+            Some("template_unresolved"),
+            "{target}"
+        );
+        let forwarded = ferrum_edge::_test_support::effective_backend_query_string_for_test(&ctx);
+        assert!(
+            !forwarded.contains("aliased-secret"),
+            "{target}: {forwarded}"
+        );
+        assert!(!forwarded.contains("x-copied"), "{target}: {forwarded}");
+    }
+
+    // An unmarked `;` inside a carrier value still resolves.
+    let plugin = RequestTransformer::new(&json!({
+        "rules": [{"operation": "update", "target": "header", "key": "x-copied", "value": "$(query.carrier)"}]
+    }))
+    .unwrap();
+    let mut ctx = make_ctx();
+    ctx.set_raw_query_string("carrier=a;b=c&page=1".to_string());
+    ctx.materialize_query_params();
+    jwt.mark_query_credentials_for_redaction(&mut ctx);
+    let mut headers: HashMap<String, String> = HashMap::new();
+    plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert_eq!(headers.get("x-copied").map(String::as_str), Some("a;b=c"));
+}

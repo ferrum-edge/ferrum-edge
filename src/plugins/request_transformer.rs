@@ -318,14 +318,30 @@ fn header_source_is_chain_credential(ctx: &RequestContext, name: &str) -> bool {
 /// The percent-decoded ORIGINAL client query (last occurrence wins), decoded
 /// exactly as `RequestContext::materialize_query_params` does. Built once per
 /// request, only when a template reads `$(query.<name>)`.
+///
+/// A pair whose `;`-separated sub-pair names an authentication-marked query
+/// credential is left out (issue #6579, GHSA-c259-vchc-3vgr): the outbound
+/// strip removes that whole `&` segment, so a template reading the carrier
+/// must not copy the embedded credential into another field. Matching uses
+/// the outbound strip's own raw-or-decoded sub-pair rule.
 fn original_query_params(ctx: &RequestContext) -> HashMap<String, String> {
     use percent_encoding::percent_decode_str;
     let mut params = HashMap::new();
     let Some(raw) = ctx.raw_query_string() else {
         return params;
     };
+    let marked_credentials: HashSet<&str> = if raw.contains(';') {
+        marked_query_credential_names(ctx).collect()
+    } else {
+        HashSet::new()
+    };
     for pair in raw.split('&') {
         if pair.is_empty() {
+            continue;
+        }
+        if !marked_credentials.is_empty()
+            && super::utils::query::semicolon_sub_pair_names_any(pair, &marked_credentials)
+        {
             continue;
         }
         let (name, value) = pair.split_once('=').unwrap_or((pair, ""));
@@ -337,20 +353,25 @@ fn original_query_params(ctx: &RequestContext) -> HashMap<String, String> {
     params
 }
 
-/// Whether an authentication plugin marked `name` as a query credential
-/// location (stripped or not) for this request.
-fn query_name_is_auth_credential(ctx: &RequestContext, name: &str) -> bool {
+/// Every query name an authentication plugin marked as a credential location
+/// (stripped or not) for this request.
+fn marked_query_credential_names(ctx: &RequestContext) -> impl Iterator<Item = &str> {
     use super::utils::token_extract::{
         QUERY_CREDENTIAL_METADATA_PREFIX, STRIP_QUERY_PARAM_METADATA_PREFIX,
     };
     ctx.query_credential_partition_digests()
         .iter()
-        .any(|(marked, _)| marked == name)
-        || ctx.metadata.keys().any(|key| {
+        .map(|(marked, _)| marked.as_str())
+        .chain(ctx.metadata.keys().filter_map(|key| {
             key.strip_prefix(STRIP_QUERY_PARAM_METADATA_PREFIX)
                 .or_else(|| key.strip_prefix(QUERY_CREDENTIAL_METADATA_PREFIX))
-                == Some(name)
-        })
+        }))
+}
+
+/// Whether an authentication plugin marked `name` as a query credential
+/// location (stripped or not) for this request.
+fn query_name_is_auth_credential(ctx: &RequestContext, name: &str) -> bool {
+    marked_query_credential_names(ctx).any(|marked| marked == name)
 }
 
 fn parse_template_variable(name: &str, idx: usize) -> Result<TemplateVariable, String> {

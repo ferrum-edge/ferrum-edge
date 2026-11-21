@@ -83,6 +83,30 @@ pub fn mark_provider_query_credential_locations(
     }
 }
 
+/// Whether any configured query token location in `token_locations` also
+/// rides behind a `;` sub-parameter (issue #6579, GHSA-c259-vchc-3vgr).
+///
+/// Multi-location plugins (`jwks_auth`, `oauth2_introspection`) treat such an
+/// alias as terminal for the whole instance — checked before any header,
+/// `Authorization`, or fallback extraction, across every provider — exactly
+/// as `key_auth` refuses a request whose query key is ambiguous whatever its
+/// other locations carry. Free unless the raw query holds a `;`.
+pub fn query_locations_have_semicolon_alias<'a>(
+    ctx: &RequestContext,
+    token_locations: impl IntoIterator<Item = &'a TokenLocation>,
+) -> bool {
+    let Some(raw_query) = ctx.raw_query_string().filter(|raw| raw.contains(';')) else {
+        return false;
+    };
+    token_locations.into_iter().any(|location| {
+        matches!(
+            location,
+            TokenLocation::QueryParam(name)
+                if query_has_semicolon_credential_alias(Some(raw_query), name)
+        )
+    })
+}
+
 #[derive(Clone)]
 pub struct TokenHeaderLocation {
     pub name: String,

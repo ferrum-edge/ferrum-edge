@@ -157,7 +157,8 @@ pub struct CanonicalQueryParam {
     /// distinguishable in a lossless representation.
     pub bare: bool,
     /// Decoded names of this pair's `;`-separated sub-pairs, split on the
-    /// still-encoded bytes (issue #6579; see [`semicolon_sub_pair_names`]).
+    /// still-encoded bytes (issue #6579; see [`semicolon_sub_pair_names`]),
+    /// plus each sub-pair's raw spelling when it differs from every decoding.
     /// Empty unless the pair carries an unencoded `;`. A backend that also
     /// splits on `;` reads each of these as a parameter of its own, so
     /// credential redaction must consult them; a `%3B` is content and never
@@ -268,7 +269,22 @@ impl CanonicalQuery {
                         .into_owned()
                 }
             };
-            let semicolon_sub_names = semicolon_sub_pair_names(pair);
+            let mut semicolon_sub_names = semicolon_sub_pair_names(pair);
+            // Also each sub-pair's raw spelling: authentication matches a
+            // configured name against the raw spelling as well as the
+            // decodings (`query_has_semicolon_credential_alias`), so redaction
+            // must consult the same set (GHSA-c259-vchc-3vgr).
+            if pair.contains(';') {
+                for sub_pair in pair.split(';') {
+                    let raw_sub_name = sub_pair.split_once('=').map_or(sub_pair, |(name, _)| name);
+                    if !semicolon_sub_names
+                        .iter()
+                        .any(|known| known == raw_sub_name)
+                    {
+                        semicolon_sub_names.push(raw_sub_name.to_string());
+                    }
+                }
+            }
             let form_name = if raw_name.contains('+') {
                 query_name_decodings(raw_name).into_iter().nth(1)
             } else {
@@ -415,9 +431,10 @@ pub fn semicolon_sub_pair_names_any(segment: &str, names: &HashSet<&str>) -> boo
     segment.contains(';')
         && (segment.split(';').any(|sub_pair| {
             names.contains(sub_pair.split_once('=').map_or(sub_pair, |(name, _)| name))
-        }) || semicolon_sub_pair_names(segment)
-            .iter()
-            .any(|name| names.contains(name.as_str())))
+        }) || ((segment.contains('%') || segment.contains('+'))
+            && semicolon_sub_pair_names(segment)
+                .iter()
+                .any(|name| names.contains(name.as_str()))))
 }
 
 /// Whether `raw_query` carries `name` as a `;`-separated sub-parameter that
@@ -455,12 +472,20 @@ pub fn query_has_semicolon_credential_alias(raw_query: Option<&str>, name: &str)
             let sub_name = sub_pair
                 .split_once('=')
                 .map_or(sub_pair, |(sub_name, _)| sub_name);
-            sub_name == name
-                || query_name_decodings(sub_name)
-                    .iter()
-                    .any(|decoded| decoded == name)
+            sub_name == name || sub_name_decodes_to(sub_name, name)
         })
     })
+}
+
+/// Whether a still-encoded sub-pair name reads as `name` under any decoding
+/// [`query_name_decodings`] reports. A name with neither `%` nor `+` decodes
+/// to itself under both readings, so the caller's raw comparison already
+/// decided it and no decoding (or allocation) is needed.
+fn sub_name_decodes_to(sub_name: &str, name: &str) -> bool {
+    (sub_name.contains('%') || sub_name.contains('+'))
+        && query_name_decodings(sub_name)
+            .iter()
+            .any(|decoded| decoded == name)
 }
 
 /// Whether every `%` in `value` begins a complete `%HH` triplet.

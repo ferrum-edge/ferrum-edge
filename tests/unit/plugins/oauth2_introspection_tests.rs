@@ -3730,3 +3730,82 @@ async fn semicolon_aliased_query_token_respects_forward_original_token() {
         raw_query
     );
 }
+
+/// A `;` alias at any configured query location is terminal for the
+/// instance: a bearer token in another location (explicit `Authorization`,
+/// the implicit `Authorization` fallback, or a provider with the opposite
+/// forwarding setting) must not mask it, in either provider order. The
+/// endpoint is unreachable, so reaching introspection would surface as `503`
+/// rather than the ambiguous-format `401`.
+#[tokio::test]
+async fn semicolon_aliased_query_token_is_terminal_beside_a_valid_header_token() {
+    let endpoint = "http://127.0.0.1:8181/introspect";
+    let param_provider = json!({
+        "introspection_endpoint": endpoint,
+        "client_auth": {"method": "none"},
+        "from_params": ["access_token"],
+        "forward_original_token": true
+    });
+    let implicit_provider = json!({
+        "introspection_endpoint": endpoint,
+        "client_auth": {"method": "none"},
+        "forward_original_token": false
+    });
+    let explicit_provider = json!({
+        "introspection_endpoint": endpoint,
+        "client_auth": {"method": "none"},
+        "from_headers": [{"name": "Authorization"}],
+        "forward_original_token": false
+    });
+    let configs = [
+        json!({"providers": [{
+            "introspection_endpoint": endpoint,
+            "client_auth": {"method": "none"},
+            "from_headers": [{"name": "Authorization"}],
+            "from_params": ["access_token"]
+        }]}),
+        json!({"providers": [param_provider.clone()]}),
+        json!({"providers": [param_provider.clone(), implicit_provider.clone()]}),
+        json!({"providers": [implicit_provider, param_provider.clone()]}),
+        json!({"providers": [param_provider.clone(), explicit_provider.clone()]}),
+        json!({"providers": [explicit_provider, param_provider]}),
+    ];
+    let consumer_index = ConsumerIndex::new(&[create_test_consumer()]);
+    for config in configs {
+        let plugin =
+            Arc::new(Oauth2Introspection::new(&config, PluginHttpClient::default()).unwrap());
+        let auth_plugins: Vec<Arc<dyn Plugin>> = vec![plugin.clone()];
+        for raw_query in [
+            "carrier=;access_token=opaque-token",
+            "access_token;x=1&carrier=1",
+        ] {
+            let mut ctx = ctx_with_raw_query(raw_query);
+            ctx.headers.insert(
+                "authorization".to_string(),
+                "Bearer opaque-token".to_string(),
+            );
+            assert_reject_body(
+                plugin.authenticate(&mut ctx, &consumer_index).await,
+                AMBIGUOUS_QUERY_TOKEN_BODY,
+            );
+            assert!(ctx.identified_consumer.is_none(), "{config} {raw_query}");
+            assert!(ctx.authenticated_identity.is_none(), "{config} {raw_query}");
+
+            let mut ctx = ctx_with_raw_query(raw_query);
+            ctx.headers.insert(
+                "authorization".to_string(),
+                "Bearer opaque-token".to_string(),
+            );
+            let (status, _, _) = run_authentication_phase(
+                AuthMode::Single,
+                &auth_plugins,
+                &mut ctx,
+                &consumer_index,
+            )
+            .await
+            .expect("an ambiguous query token must be rejected");
+            assert_eq!(status, 401, "{config} {raw_query}");
+            assert!(ctx.identified_consumer.is_none(), "{config} {raw_query}");
+        }
+    }
+}

@@ -28,7 +28,7 @@ use ferrum_edge::plugins::utils::sse::{
 use ferrum_edge::plugins::utils::token_extract::{
     TokenHeaderLocation, TokenLocation, TokenLocationExtract, extract_authorization_bearer,
     extract_from_location, mark_present_query_credential_locations,
-    mark_provider_query_credential_locations,
+    mark_provider_query_credential_locations, query_locations_have_semicolon_alias,
 };
 use ferrum_edge::startup::render_startup_error;
 use ferrum_edge::util::unknown_keys::reject_unknown_keys;
@@ -1248,6 +1248,84 @@ fn semicolon_credential_alias_detects_sub_pair_spellings_only() {
         );
     }
     assert!(!query_has_semicolon_credential_alias(None, "access_token"));
+}
+
+#[test]
+fn semicolon_credential_alias_matches_raw_and_decoded_names_without_changing_semantics() {
+    // Plain names compare by raw spelling only.
+    assert!(query_has_semicolon_credential_alias(
+        Some("carrier=;tenant_ticket=t"),
+        "tenant_ticket"
+    ));
+    // A configured name holding a literal escape matches its raw spelling...
+    assert!(query_has_semicolon_credential_alias(
+        Some("carrier=;workspace%2Dslot=t"),
+        "workspace%2Dslot"
+    ));
+    // ...and the decoded reading of an encoded sub-pair still matches.
+    assert!(query_has_semicolon_credential_alias(
+        Some("carrier=;workspace%2Dslot=t"),
+        "workspace-slot"
+    ));
+    // `%2B` is a literal plus under either decoding, never a space.
+    assert!(!query_has_semicolon_credential_alias(
+        Some("carrier=;private%2Bkey=t"),
+        "private key"
+    ));
+    assert!(query_has_semicolon_credential_alias(
+        Some("carrier=;private%2Bkey=t"),
+        "private+key"
+    ));
+}
+
+#[test]
+fn canonical_query_reports_raw_semicolon_sub_pair_spellings() {
+    let query = CanonicalQuery::parse("carrier=;workspace%2Dslot=t&page=1");
+    let carrier = query
+        .params()
+        .iter()
+        .find(|param| param.name == "carrier")
+        .expect("carrier pair");
+    assert!(
+        carrier
+            .semicolon_sub_names
+            .iter()
+            .any(|name| name == "workspace-slot"),
+        "{:?}",
+        carrier.semicolon_sub_names
+    );
+    assert!(
+        carrier
+            .semicolon_sub_names
+            .iter()
+            .any(|name| name == "workspace%2Dslot"),
+        "{:?}",
+        carrier.semicolon_sub_names
+    );
+}
+
+#[test]
+fn query_locations_alias_check_spans_every_configured_query_location() {
+    let locations = [
+        TokenLocation::Header(TokenHeaderLocation {
+            name: "authorization".to_string(),
+            prefix: None,
+        }),
+        TokenLocation::QueryParam("first".to_string()),
+        TokenLocation::QueryParam("second".to_string()),
+    ];
+    assert!(query_locations_have_semicolon_alias(
+        &materialized_ctx_for("carrier=;second=t"),
+        &locations
+    ));
+    assert!(!query_locations_have_semicolon_alias(
+        &materialized_ctx_for("first=t&carrier=a;b=c"),
+        &locations
+    ));
+    assert!(!query_locations_have_semicolon_alias(
+        &materialized_ctx_for("first=t"),
+        &locations
+    ));
 }
 
 fn materialized_ctx_for(raw_query: &str) -> RequestContext {

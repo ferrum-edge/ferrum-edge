@@ -2702,13 +2702,16 @@ Claim header fan-out refuses reserved hop-by-hop, authorization, host, and consu
 **`;` sub-parameter aliases (`from_params`).** A request whose configured
 `from_params` name also appears as a `;`-separated sub-parameter
 (`?carrier=;access_token=...`, matched by raw spelling or any percent/form
-decoding, and including a name such as `access_token;x`) is ambiguous: that
-location is refused as an invalid credential (`401`
-`{"error":"Ambiguous token query parameter"}` when no other configured
-location yields a token), the same contract as [`key_auth`](#key_auth). The
-alias is always marked for policy redaction, and for a provider with
-`forward_original_token: false` the whole carrying `&` segment is removed from
-the forwarded query even when another mechanism authenticates the request.
+decoding, and including a name such as `access_token;x`) is ambiguous and is
+refused with `401` `{"error":"Ambiguous token query parameter"}`, the same
+contract as [`key_auth`](#key_auth). An alias at any provider's query location
+is terminal for the whole instance: it is checked before any header,
+`Authorization: Bearer` / `DPoP`, or default-location fallback is read, so a
+valid token elsewhere never masks it. The alias is always marked for policy
+redaction, and for a provider with `forward_original_token: false` the whole
+carrying `&` segment is removed from the forwarded query even when another
+mechanism authenticates the request.
+
 Unknown top-level, provider, and custom-header-location fields are rejected so misspelled authentication controls cannot silently fail open. For each remote or managed provider, `jwks_refresh_interval_secs` must not exceed its effective `jwks_max_stale_seconds`. Shared stores use both the minimum refresh interval and the minimum maximum-stale value requested by active consumers. A newly added stricter consumer takes effect immediately; full or incremental publication deterministically reconciles the exact minima, so removing the strict consumer may relax policy without replacing the store or resetting key age. Discovery-backed reloads retain the last validated URI/store until rediscovery produces a usable replacement, but discovery success alone never refreshes key trust. A discovery-backed provider is never frozen into the publication snapshot; its current store is tracked only through a generation-owned contribution that rediscovery repoints, so a superseded `jwks_uri` leaves the active set (and readiness) as soon as the provider stops using it unless another consumer still does. A store an OIDC discovery task resolves *after* its generation was published joins the active refresh/maximum-stale arbitration and the trust aggregate at that moment rather than at the next reload, and leaves it when that generation retires or repoints to a different URI; a staged generation that is never published contributes nothing to readiness or metrics.
 
 Remote discovery documents are capped at 128 KiB and JWKS responses at 1 MiB/256 keys, with bounded key components. A valid non-empty JWKS atomically replaces the key map, refreshes the monotonic trust deadline, clears failure state, and can restore authentication after expiry. Empty 200 responses, malformed or oversized bodies, non-2xx status, and transport/DNS/TLS/timeout failures retain last-known-good material only for the finite grace window and use a bounded accelerated retry cadence; after the deadline, verification refuses the retained material without deleting diagnostic/recovery state. JWKs are accepted for signature verification only when `use` is absent or `sig` and `key_ops` is absent or includes `verify`; contradictory operation metadata is rejected. The JWK `alg` parameter is honoured per RFC 7517 §4.4: a key that declares an `alg` is admitted only when that value names a supported signature algorithm for its key type — `RS256`/`RS384`/`RS512`/`PS256`/`PS384`/`PS512` for RSA, `ES256`/`ES384` matching the key's `crv` for EC, and `EdDSA` for an `OKP` key with `crv: Ed25519` — and verification is then bound to exactly that algorithm, so a PSS key never verifies a PKCS#1 v1.5 token and vice versa. Keys declaring an encryption algorithm (`RSA-OAEP`, `RSA-OAEP-256`, `RSA1_5`), a key-agreement algorithm or curve (`ECDH-ES`, `X25519`, `X448`), `Ed448`, or an `alg` that contradicts the key type or curve are skipped as unsupported rather than silently treated as RS256/curve-derived verification keys. A key with no `alg` defaults to RS256 for RSA (an RSASSA-PSS issuer must publish `alg: PS256`/`PS384`/`PS512`), a curve-derived algorithm for EC, and `EdDSA` for Ed25519. Ed25519 public keys must be exactly 32 bytes, and `OKP` keys are skipped while FIPS mode is enforced. RSA signing keys must carry a modulus of at least 2048 bits; weaker keys are skipped rather than trusted. Signing keys without a non-empty `kid` are unusable, and a JWKS with duplicate usable `kid` values is rejected rather than choosing one by response order.
@@ -2830,13 +2833,15 @@ Authorization fallback never fans a token across providers by default. Explicit 
 **`;` sub-parameter aliases (`from_params`).** A request whose configured
 `from_params` name also appears as a `;`-separated sub-parameter
 (`?carrier=;access_token=...`, matched by raw spelling or any percent/form
-decoding, and including a name such as `access_token;x`) is ambiguous: that
-location is refused as an invalid credential before any introspection call
-(`401` `{"error":"Ambiguous token query parameter"}` when no other configured
-location yields a token), the same contract as [`key_auth`](#key_auth). The
-alias is always marked for policy redaction, and for a provider with
-`forward_original_token: false` the whole carrying `&` segment is removed from
-the forwarded query even when another mechanism authenticates the request.
+decoding, and including a name such as `access_token;x`) is ambiguous and is
+refused with `401` `{"error":"Ambiguous token query parameter"}` before any
+introspection call, the same contract as [`key_auth`](#key_auth). An alias at
+any provider's query location is terminal for the whole instance: it is
+checked before any header or `Authorization` fallback is read, so a valid
+token elsewhere never masks it. The alias is always marked for policy
+redaction, and for a provider with `forward_original_token: false` the whole
+carrying `&` segment is removed from the forwarded query even when another
+mechanism authenticates the request.
 
 Ordinary bearer tokens are supported, and with `providers[].accept_mtls_bound_tokens: true` so are RFC 8705 certificate-bound tokens: an active response whose `cnf` is exactly one non-empty `x5t#S256` member is admitted only when the request arrived over frontend mTLS with a client certificate whose base64url SHA-256 DER thumbprint matches (see [Frontend TLS](frontend_tls.md)); a missing or different certificate is a `401` with `Bearer error="invalid_token"` and the body `{"error":"mTLS binding mismatch"}`. The binding is retained with the cached result and re-verified on every request, including cache hits, before any scope or role decision is revealed. Every other confirmation — DPoP `jkt`, `jwk`, a `cnf` with additional or unknown members, or any `cnf` while the flag is off — and every non-Bearer `token_type` (including `DPoP`) fail closed with a `401`, because this plugin does not validate DPoP proofs. A JSON `null` `cnf` or `token_type` is read as omitted. Missing or non-Boolean `active` members, oversized/malformed responses, provider transport failures, and non-success provider responses are treated as dependency failures and return `503`; only explicit `active: false` is negative-cached and returned as `401`.
 
