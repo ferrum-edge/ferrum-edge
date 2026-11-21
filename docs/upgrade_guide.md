@@ -51,8 +51,10 @@ provider. `oauth2_introspection` client credentials do not distinguish
 authorities. An introspection provider without an `issuer` pin commits one digest
 per returned `iss`, plus a base digest when `iss` is absent. Two such providers on
 the same endpoint and identity claim share a digest whenever the returned issuer
-is equal. Pin a distinct `issuer` (responses must then carry that `iss`) or use
-distinct endpoints to give each provider exactly one authority. Older builds reject the new key, so upgrade every gateway node (CP and
+is equal. Pin a distinct `issuer` (responses must then carry that `iss`) to give
+each provider exactly one authority; distinct endpoints separate providers, but an
+unpinned provider still commits one digest per returned `iss`, so cover each digest
+it commits with its own entry. Older builds reject the new key, so upgrade every gateway node (CP and
 DPs together) before adding it.
 
 ### EastWestGateway passthrough legs now follow DestinationRules (#7424)

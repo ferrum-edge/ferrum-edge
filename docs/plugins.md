@@ -4083,10 +4083,16 @@ credentials are not part of it, so they never distinguish authorities.
   same digest whenever the returned issuer is also equal (or absent in both),
   even when they authenticate to that endpoint as different clients.
 
-Pin a distinct `issuer` on each provider, or use distinct endpoints, to give each
-provider one independently scopeable authority.
+Pinning a distinct `issuer` on each provider gives each provider exactly one
+digest. Distinct endpoints separate two providers' digests, but an unpinned
+provider still commits one digest per returned `iss` (plus the base digest for
+responses without a string `iss`), so a rule meant to cover every identity behind
+it needs one entry per digest it commits.
 
-Scoping can only narrow admission:
+Scoping limits which identities a rule matches: a scoped allow entry grants access
+to fewer principals, and a scoped deny entry revokes access for fewer principals
+(so replacing an unscoped deny with a scoped one can admit an equal subject from
+another authority under a broader allow). For identities without full provenance:
 
 - An identity with no verified realm (every TCP/UDP stream identity, or one a
   custom plugin set without the authentication commit boundary) never matches a

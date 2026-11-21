@@ -31414,7 +31414,9 @@ components:
                   providers on the same endpoint and identity claim share a
                   digest whenever the returned issuer is equal. Pinning
                   `issuer` gives one digest per provider and requires the
-                  response `iss` to match. `jwks_auth`,
+                  response `iss` to match; distinct endpoints separate
+                  providers, but an unpinned provider still commits one digest
+                  per returned `iss`, so cover each with its own entry. `jwks_auth`,
                   `oauth2_introspection`, `ldap_auth`, and `oidc_relying_party`
                   commit a digest for every identity; `soap_ws_security`
                   commits none. Allow entries never match an identity with no
