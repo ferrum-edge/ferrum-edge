@@ -6274,6 +6274,44 @@ async fn refused_or_expanding_redirect_targets_do_not_exhaust_the_cookie_budget(
     }
 }
 
+/// GHSA-6rwj-gc4r-3jm9: a trusted target whose canonical form fits the
+/// sealed-target limit but would push the pending-flow cookie past a reduced
+/// `session.max_cookie_bytes` is dropped for the default path; the challenge
+/// still succeeds instead of answering `503`.
+#[serial_test::serial(jwks_remote_global_cache)]
+#[tokio::test]
+async fn trusted_targets_that_exceed_the_cookie_budget_fall_back_to_the_default_path() {
+    // 553 raw bytes; 1593 canonical bytes once each `é` becomes `%C3%A9`.
+    let rd = format!("https://app.example.com/search?q={}", "\u{e9}".repeat(260));
+    let canonical = format!("https://app.example.com/search?q={}", "%C3%A9".repeat(260));
+    assert!(
+        canonical.len() < 2048,
+        "fixture must fit the sealed-target limit"
+    );
+
+    // Control: under the default cookie cap the canonical target survives.
+    assert_eq!(post_login_location_for(&rd).await, canonical);
+
+    let server = MockServer::start().await;
+    let plugin = callback_plugin_with(&server, |config| {
+        config["session"]["max_cookie_bytes"] = json!(2048);
+        config["behavior"]["post_login_default_path"] = json!("/home");
+    })
+    .await;
+    let mut ctx = html_ctx();
+    ctx.query_params.insert("rd".to_string(), rd.clone());
+    let challenge = issue_browser_challenge_for_context(&plugin, ctx).await;
+    let id_token = create_rs256_token(
+        &oidc_id_token_claims(&challenge),
+        include_bytes!("../../../tests/fixtures/test_rsa_private.pem"),
+    );
+    mount_token_and_jwks(&server, &id_token).await;
+    let headers = assert_callback_redirect(
+        complete_callback(&plugin, &challenge, "authorization-code").await,
+    );
+    assert_eq!(headers.get("location").map(String::as_str), Some("/home"));
+}
+
 /// GHSA-6rwj-gc4r-3jm9: an oversized target falls back to the configured
 /// (relative) `post_login_default_path`, not to that path rebuilt as an
 /// absolute URL on the challenge request's authority, which could be a

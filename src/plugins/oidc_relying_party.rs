@@ -2659,7 +2659,7 @@ impl OidcRelyingParty {
         let original_url = self.pending_flow_original_url(ctx);
         let now = chrono::Utc::now().timestamp();
         let expires_at_unix = now.saturating_add(self.behavior.state_ttl.as_secs() as i64);
-        let payload = PendingFlowPayload {
+        let mut payload = PendingFlowPayload {
             version: PENDING_FLOW_PAYLOAD_VERSION,
             context_id: self.session.context_id.clone(),
             state: state.clone(),
@@ -2668,6 +2668,15 @@ impl OidcRelyingParty {
             original_url,
             expires_at_unix,
         };
+        // A post-login target is optional: when it would push the sealed
+        // cookie past `session.max_cookie_bytes`, record the empty marker
+        // (the callback then uses `post_login_default_path`) instead of
+        // failing the challenge (GHSA-6rwj-gc4r-3jm9). Only a marker-only
+        // payload that still does not fit, or a real serialization/sealing
+        // failure, reaches the error path below.
+        if !payload.original_url.is_empty() && !self.pending_flow_fits_cookie_budget(&payload) {
+            payload.original_url.clear();
+        }
         let sealed_cookie = self.seal_pending_flow(&payload)?;
         let sealed_binding_hash: [u8; 32] = Sha256::digest(sealed_cookie.as_bytes());
         let flow = FlowState {
@@ -2715,6 +2724,16 @@ impl OidcRelyingParty {
             }
         }
         Some(url.to_string())
+    }
+
+    /// Whether `payload` serializes and its sealed, encoded form stays within
+    /// `session.max_cookie_bytes`. `encoded_session_cookie_len` is an upper
+    /// bound on the unpadded encoding the codec emits, so a payload that fits
+    /// here also passes the codec's own cap.
+    fn pending_flow_fits_cookie_budget(&self, payload: &PendingFlowPayload) -> bool {
+        serde_json::to_vec(payload).is_ok_and(|bytes| {
+            encoded_session_cookie_len(bytes.len()) <= self.session.max_cookie_bytes
+        })
     }
 
     fn seal_pending_flow(&self, payload: &PendingFlowPayload) -> Result<String, String> {
@@ -3295,7 +3314,8 @@ impl OidcRelyingParty {
     /// The post-login target sealed into the pending flow: the canonical
     /// trusted target when it fits `MAX_PENDING_FLOW_ORIGINAL_URL_BYTES`, else
     /// the empty marker that resolves to `behavior.post_login_default_path`
-    /// at the callback. Refused text is never sealed, so hostile redirect
+    /// at the callback (`create_flow` also falls back to the marker when the
+    /// target would exceed the encoded cookie budget). Refused text is never sealed, so hostile redirect
     /// parameters cannot inflate the correlation cookie past its budget, and
     /// the fallback stays the configured (relative) default path rather than
     /// an absolute URL on the challenge's authority (GHSA-6rwj-gc4r-3jm9).
