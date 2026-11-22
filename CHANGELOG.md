@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- **`url` is updated from 2.5.8 to 2.5.9** (with `form_urlencoded` 1.2.2 ->
+  1.2.3) in the root, `fuzz/`, and `tests/performance/mesh/` lockfiles to fix
+  RUSTSEC-2026-0592 (`Url::origin()` stack overflow on nested `blob:` URLs).
+
 ### Fixed
 
 - The release workflow's SQLite volume smoke (`scripts/smoke_sqlite_volume.sh`) now
