@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- **`url` is updated from 2.5.8 to 2.5.9** (with `form_urlencoded` 1.2.2 ->
+  1.2.3) in the root, `fuzz/`, and `tests/performance/mesh/` lockfiles to fix
+  RUSTSEC-2026-0592 (`Url::origin()` stack overflow on nested `blob:` URLs).
+
+### Changed
+
+- **Raw `^` in request paths is now forwarded to backends as `%5E`.** `url`
+  2.5.9 added `^` to the WHATWG path percent-encode set, and Ferrum's direct
+  HTTP/1.1 origin-form request-target builder now matches `url` 2.5.9 so
+  backends receive `%5E` for a literal `^` in the path on both the direct
+  HTTP/1.1 pool and the `reqwest` dispatch path (a `^` in the query string
+  remains literal).
+
 ### Fixed
 
 - The release workflow's SQLite volume smoke (`scripts/smoke_sqlite_volume.sh`) now

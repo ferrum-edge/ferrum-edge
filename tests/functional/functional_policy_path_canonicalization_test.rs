@@ -501,6 +501,21 @@ const CASES: &[Case] = &[
         why: "encoded brace cannot be forwarded literally",
     },
     Case {
+        target: "/canon/a%5Eb",
+        status: 400,
+        backend_target: Backend::Never,
+        why: "encoded caret cannot be forwarded literally",
+    },
+    // Literal `^` is admitted by `http::uri::PathAndQuery` and kept in the
+    // canonical path, and `url` 2.5.9+ percent-encodes it to `%5E` on the
+    // backend request line across both the direct H1 pool and reqwest.
+    Case {
+        target: "/canon/a^b",
+        status: 200,
+        backend_target: Backend::Exact("/canon/a%5Eb"),
+        why: "literal caret is forwarded as %5E matching url 2.5.9 across H1/H2/H3",
+    },
+    Case {
         target: "/canon/caf%C3%A9",
         status: 400,
         backend_target: Backend::Never,

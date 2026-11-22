@@ -55632,21 +55632,39 @@ pub(crate) fn direct_h1_origin_form_target_for_test(backend_url: &str) -> Option
     direct_h1_origin_form_uri(backend_url).map(|uri| uri.to_string())
 }
 
+/// Lookup table of bytes that require delegating an HTTP/1.1 origin-form target
+/// to `url::Url::parse` so the wire bytes match reqwest (`url` 2.5.9+):
+/// - `PATH` percent-encode set (excluding `?`, which delimits the query):
+///   C0 controls (`0x00..=0x1F`), space (`0x20`), `DEL` (`0x7F`), non-ASCII
+///   (`0x80..=0xFF`), `"`, `#`, `<`, `>`, `^`, `` ` ``, `{`, `}`
+/// - `SPECIAL_QUERY` additional byte: `'`
+/// - Special-scheme path separator: `\`
+const DIRECT_H1_TARGET_URL_SERIALIZE_BYTES: [bool; 256] = {
+    let mut table = [false; 256];
+    let mut i = 0usize;
+    while i < 256 {
+        let b = i as u8;
+        table[i] = b <= b' '
+            || b >= 0x7f
+            || matches!(
+                b,
+                b'"' | b'#' | b'\'' | b'<' | b'>' | b'\\' | b'^' | b'`' | b'{' | b'}'
+            );
+        i += 1;
+    }
+    table
+};
+
 /// Whether `url` would rewrite this request target: any byte it percent-encodes
 /// in a path or a special-scheme query (controls, space, non-ASCII, `"` `#`
-/// `<` `>` `` ` `` `{` `}` `'`), a backslash it treats as a separator, a
+/// `'` `<` `>` `^` `` ` `` `{` `}`), a backslash it treats as a separator, a
 /// possible dot segment (`/.`, or `%2e` in either case), or a target that does
 /// not start with `/`. Over-matching only takes the slower, exact path.
 fn direct_h1_target_needs_url_serialization(target: &str) -> bool {
     !target.starts_with('/')
-        || target.bytes().any(|b| {
-            b <= b' '
-                || b >= 0x7f
-                || matches!(
-                    b,
-                    b'"' | b'#' | b'<' | b'>' | b'`' | b'{' | b'}' | b'\\' | b'\''
-                )
-        })
+        || target
+            .bytes()
+            .any(|b| DIRECT_H1_TARGET_URL_SERIALIZE_BYTES[b as usize])
         || target.contains("/.")
         || target.contains("%2e")
         || target.contains("%2E")

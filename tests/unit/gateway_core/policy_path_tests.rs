@@ -718,6 +718,10 @@ fn non_canonical_reason_flags_config_values_that_can_never_match() {
         Some("unrepresentable_escape")
     );
     assert_eq!(
+        non_canonical_policy_path_reason("/api%5Ename"),
+        Some("unrepresentable_escape")
+    );
+    assert_eq!(
         non_canonical_policy_path_reason("/caf%C3%A9"),
         Some("unrepresentable_escape")
     );

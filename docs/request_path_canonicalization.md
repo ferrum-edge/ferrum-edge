@@ -68,7 +68,7 @@ risking disagreement with the backend:
 | `encoded_backslash`      | `/a%5Cb`         | Several backend stacks treat `\` as a path separator. |
 | `literal_backslash`      | `/a\b`           | The Rust `url` parser — which parses the backend URL on the reqwest dispatch paths — treats `\` as a path separator for special HTTP(S) URLs, as do several backend stacks. A literal `\` is the same route-structure mismatch an encoded one is. |
 | `encoded_control`        | `/a%00`, `/a%0A` | A NUL truncates the path in several runtimes; other C0 controls and `DEL` are equally divergent. |
-| `unrepresentable_escape` | `/a%20b`, `/a%7Bb`, `/caf%C3%A9`, `/caf%C3%28` | The escaped byte is outside the `pchar` decode set (space, `"`, `<`, `>`, `[`, `]`, `^`, `` ` ``, `{`, `\|`, `}`, and every non-ASCII byte, valid UTF-8 sequence or not). Keeping it escaped would put a different string on the wire than the one policy read; decoding it would emit a byte the backend URL parser cannot carry (space, controls) or percent-encodes again (`"`, `{`, `}`, non-ASCII), so the forwarded request line would not be the canonical string. Neither is a single coordinate, so the target is refused. This rule governs *escapes*; see [Literal non-`pchar` bytes](#literal-non-pchar-bytes) for the same bytes sent literally. |
+| `unrepresentable_escape` | `/a%20b`, `/a%7Bb`, `/caf%C3%A9`, `/caf%C3%28` | The escaped byte is outside the `pchar` decode set (space, `"`, `<`, `>`, `[`, `]`, `^`, `` ` ``, `{`, `\|`, `}`, and every non-ASCII byte, valid UTF-8 sequence or not). Keeping it escaped would put a different string on the wire than the one policy read; decoding it would emit a byte the backend URL parser cannot carry (space, controls) or percent-encodes again (`"`, `^`, `{`, `}`, non-ASCII), so the forwarded request line would not be the canonical string. Neither is a single coordinate, so the target is refused. This rule governs *escapes*; see [Literal non-`pchar` bytes](#literal-non-pchar-bytes) for the same bytes sent literally. |
 | `ambiguous_dot_segment`  | `/a/%2e%2e/b`, `/a/%2e%2e;/b`, `/a/..%3B/b` | A percent escape produced a `.` or `..` segment, or the `;` that makes one a path-parameter dot segment. |
 | `literal_dot_segment`    | `/a/../b`, `/a/./b`, `/a/..`, `/a/..;/b`, `/a/.;x/b` | A `.` or `..` segment written literally, with or without a `;` path parameter. See below. |
 | `empty_segment`          | `//a`, `/a//b`, `/;x/a`, `/a/%3Bx/b` | A non-final empty segment, or a non-final segment that is empty before its first `;`. See below. |
@@ -370,9 +370,11 @@ That is deliberate — refusing an escape the gateway cannot forward as one
 coordinate does not require also refusing a byte a client may legally send
 literally — but it bounds what the invariants below claim. The `url` crate's
 path percent-encode set covers controls, space, `"`, `<`, `>`, `` ` ``, `#`,
-`?`, `{`, `}`, and every non-ASCII byte, so when a canonical path carrying a
+`?`, `^`, `{`, `}`, and every non-ASCII byte, so when a canonical path carrying a
 literal one of those is parsed into the backend URL, the forwarded request line
-carries the percent-encoded spelling rather than the canonical bytes.
+carries the percent-encoded spelling rather than the canonical bytes (for example,
+a literal `^` in the path is forwarded to the backend as `%5E`, matching the
+reqwest path).
 Percent-encoding only ever expands one byte into `%XX`; it can never synthesize
 a `/`, `?`, or `#`, and a decoding backend resolves it straight back to the
 canonical byte. Segment structure is therefore still preserved and policy still
