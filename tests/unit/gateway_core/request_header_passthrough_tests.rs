@@ -286,7 +286,7 @@ fn handler_gate_keeps_every_lane_exclusion() {
         "!is_hbone_connect_any",
         "method!=\"OPTIONS\"",
         "state.mesh_egress_strip_baggage_keys.is_empty()",
-        "plugin_cache_view.plugins().is_empty()",
+        "!plugin_cache_view.has_plugins()",
         "ctx.try_begin_request_header_passthrough(",
     ] {
         assert!(gate.contains(needle), "passthrough gate lost `{needle}`");

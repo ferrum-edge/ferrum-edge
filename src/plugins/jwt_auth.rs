@@ -416,7 +416,8 @@ impl AuthMechanism for JwtAuth {
             }
         };
 
-        let consumer = match consumer_index.find_by_identity(&identity) {
+        let identity = identity.as_str();
+        let consumer = match consumer_index.find_by_identity(identity) {
             Some(consumer) => consumer,
             None => {
                 // The identity claim is unverified, attacker-chosen text:

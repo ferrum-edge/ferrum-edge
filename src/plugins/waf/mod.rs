@@ -1049,6 +1049,7 @@ impl Waf {
     /// attacker-influenceable with a cheap request flood, and `scan_budget_ms`
     /// is the operator's sizing knob for `O(active_rules × max_scan_bytes)` —
     /// the only term they can actually size.
+    #[cfg(test)]
     async fn run_body_scan_with_budget<F>(&self, scan: F) -> ScanOutcome
     where
         F: FnOnce() -> ScanOutcome,

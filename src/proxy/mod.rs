@@ -38067,7 +38067,7 @@ async fn handle_proxy_request_inner(
         finalize_synthesized_reject_headers(
             &mut reject,
             request_protocol,
-            initial_response_header_policy_plugins.as_ref(),
+            initial_response_header_policy_plugins,
         );
         // gRPC-Web carries the status in a body trailer frame, never as
         // response header fields (issue #7155), exactly like the
@@ -38124,7 +38124,7 @@ async fn handle_proxy_request_inner(
         finalize_synthesized_reject_headers(
             &mut reject,
             request_protocol,
-            initial_response_header_policy_plugins.as_ref(),
+            initial_response_header_policy_plugins,
         );
         restore_authoritative_allow_header(&mut reject.headers, &allow_header);
         // Same gRPC reject metadata as a plugin rejection, so the diagnostic
@@ -38182,7 +38182,7 @@ async fn handle_proxy_request_inner(
         finalize_synthesized_reject_headers(
             &mut reject,
             request_protocol,
-            initial_response_header_policy_plugins.as_ref(),
+            initial_response_header_policy_plugins,
         );
         apply_grpc_reject_metadata(&mut ctx, &reject);
         let grpc_web_response =
@@ -38234,7 +38234,7 @@ async fn handle_proxy_request_inner(
         finalize_synthesized_reject_headers(
             &mut reject,
             request_protocol,
-            initial_response_header_policy_plugins.as_ref(),
+            initial_response_header_policy_plugins,
         );
         // HEAD keeps the representation `Content-Length` but carries no body
         // bytes on any protocol (HTTP/2 would otherwise send DATA).
@@ -38512,7 +38512,7 @@ async fn handle_proxy_request_inner(
         finalize_synthesized_reject_headers(
             &mut reject,
             request_protocol,
-            initial_response_header_policy_plugins.as_ref(),
+            initial_response_header_policy_plugins,
         );
         boxed_log_rejected_request(
             &plugins,
@@ -40834,7 +40834,7 @@ async fn handle_proxy_request_inner(
                 resolve_effective_proxy_for_target(&proxy, upstream_target.as_deref());
             let permits = match backend_dispatch::run_backend_admission_plugins(
                 &state,
-                backend_admission_plugins.as_ref(),
+                backend_admission_plugins,
                 &ctx,
                 admission_proxy.as_ref(),
                 upstream_target.as_deref(),
@@ -41451,7 +41451,7 @@ async fn handle_proxy_request_inner(
                 return Ok(grpc_proxy::build_grpc_error_response_with_policy(
                     14, // UNAVAILABLE
                     message,
-                    initial_response_header_policy_plugins.as_ref(),
+                    initial_response_header_policy_plugins,
                 ));
             }
         }
@@ -41512,7 +41512,7 @@ async fn handle_proxy_request_inner(
                 grpc_request_is_web_translated,
                 14,
                 "backend address blocked by egress policy",
-                initial_response_header_policy_plugins.as_ref(),
+                initial_response_header_policy_plugins,
             ));
         }
         // Materialize the HTTP/2 transport for the LB-selected target BEFORE any
@@ -41580,7 +41580,7 @@ async fn handle_proxy_request_inner(
                 return Ok(grpc_proxy::build_grpc_error_response_with_policy(
                     14, // UNAVAILABLE
                     message,
-                    initial_response_header_policy_plugins.as_ref(),
+                    initial_response_header_policy_plugins,
                 ));
             }
         };
@@ -41810,7 +41810,7 @@ async fn handle_proxy_request_inner(
                                 grpc_request_is_web_translated,
                                 grpc_proxy::grpc_status::RESOURCE_EXHAUSTED,
                                 &message,
-                                initial_response_header_policy_plugins.as_ref(),
+                                initial_response_header_policy_plugins,
                             ));
                         }
                         // The shared request-buffer budget refused the upload:
@@ -41869,7 +41869,7 @@ async fn handle_proxy_request_inner(
                                 "gRPC request payload size exceeds maximum of {} bytes",
                                 effective_max_grpc_recv_size_bytes
                             ),
-                            initial_response_header_policy_plugins.as_ref(),
+                            initial_response_header_policy_plugins,
                         ));
                     }
                     (
@@ -42063,7 +42063,7 @@ async fn handle_proxy_request_inner(
             // single-return contract used by the buffered-request gRPC path.
             backend_admission_permits = match backend_dispatch::run_backend_admission_plugins(
                 &state,
-                backend_admission_plugins.as_ref(),
+                backend_admission_plugins,
                 &ctx,
                 &proxy,
                 upstream_target.as_deref(),
@@ -42179,7 +42179,7 @@ async fn handle_proxy_request_inner(
                             "gRPC request payload size exceeds maximum of {} bytes",
                             effective_max_grpc_recv_size_bytes
                         ),
-                        initial_response_header_policy_plugins.as_ref(),
+                        initial_response_header_policy_plugins,
                     ));
                 }
                 // Fully streaming fast path: forward request body frame-by-
@@ -42255,7 +42255,7 @@ async fn handle_proxy_request_inner(
                     };
                 backend_admission_permits = match backend_dispatch::run_backend_admission_plugins(
                     &state,
-                    backend_admission_plugins.as_ref(),
+                    backend_admission_plugins,
                     &ctx,
                     &proxy,
                     upstream_target.as_deref(),
@@ -42412,7 +42412,7 @@ async fn handle_proxy_request_inner(
                         backend_admission_permits =
                             match backend_dispatch::run_backend_admission_plugins(
                                 &state,
-                                backend_admission_plugins.as_ref(),
+                                backend_admission_plugins,
                                 &ctx,
                                 &proxy,
                                 upstream_target.as_deref(),
@@ -42898,7 +42898,7 @@ async fn handle_proxy_request_inner(
                     return Ok(grpc_proxy::build_grpc_error_response_with_policy(
                         14, // UNAVAILABLE
                         "direct gRPC retry cannot switch into a mesh transport",
-                        initial_response_header_policy_plugins.as_ref(),
+                        initial_response_header_policy_plugins,
                     ));
                 }
 
@@ -42930,7 +42930,7 @@ async fn handle_proxy_request_inner(
                         grpc_request_is_web_translated,
                         14,
                         "backend address blocked by egress policy",
-                        initial_response_header_policy_plugins.as_ref(),
+                        initial_response_header_policy_plugins,
                     ));
                 }
 
@@ -42983,7 +42983,7 @@ async fn handle_proxy_request_inner(
 
                 backend_admission_permits = match backend_dispatch::run_backend_admission_plugins(
                     &state,
-                    backend_admission_plugins.as_ref(),
+                    backend_admission_plugins,
                     &ctx,
                     &proxy,
                     grpc_current_target.as_deref(),
@@ -43087,7 +43087,7 @@ async fn handle_proxy_request_inner(
                         return Ok(grpc_proxy::build_grpc_error_response_with_policy(
                             14, // UNAVAILABLE
                             message,
-                            initial_response_header_policy_plugins.as_ref(),
+                            initial_response_header_policy_plugins,
                         ));
                     }
                 };
@@ -43874,7 +43874,7 @@ async fn handle_proxy_request_inner(
                         grpc_request_is_web_translated,
                         grpc_proxy::grpc_status::RESOURCE_EXHAUSTED,
                         "gRPC request payload size exceeds maximum",
-                        initial_response_header_policy_plugins.as_ref(),
+                        initial_response_header_policy_plugins,
                     ));
                 }
 
@@ -44259,7 +44259,7 @@ async fn handle_proxy_request_inner(
                             grpc_request_is_web_translated,
                             grpc_proxy::grpc_status::UNAVAILABLE,
                             "Internal gateway error",
-                            initial_response_header_policy_plugins.as_ref(),
+                            initial_response_header_policy_plugins,
                         ));
                     }
                 }
@@ -44456,7 +44456,7 @@ async fn handle_proxy_request_inner(
                         &mut response_status,
                         &mut plugin_response_headers,
                         &mut response_body,
-                        initial_response_header_policy_plugins.as_ref(),
+                        initial_response_header_policy_plugins,
                     )
                     .await;
                     let mut capacity_terminal = ctx.gateway_capacity_response_selected();
@@ -44483,7 +44483,7 @@ async fn handle_proxy_request_inner(
                                         &mut plugin_response_headers,
                                         &mut response_body,
                                         InitialResponseHeaderPolicySource::Prefiltered(
-                                            initial_response_header_policy_plugins.as_ref(),
+                                            initial_response_header_policy_plugins,
                                         ),
                                     ) {
                                         capacity_terminal = true;
@@ -44583,7 +44583,7 @@ async fn handle_proxy_request_inner(
                             &mut plugin_response_headers,
                             &mut response_body,
                             grpc_web_response_content_type,
-                            initial_response_header_policy_plugins.as_ref(),
+                            initial_response_header_policy_plugins,
                         )
                         .await;
                     if response_replaced {
@@ -44763,7 +44763,7 @@ async fn handle_proxy_request_inner(
                             content_type.as_deref(),
                             &response_trailers,
                             http_status,
-                            initial_response_header_policy_plugins.as_ref(),
+                            initial_response_header_policy_plugins,
                         );
                         if let Some((synced_len, true)) = stored {
                             plugin_response_headers
@@ -44934,7 +44934,7 @@ async fn handle_proxy_request_inner(
                     &mut response_headers,
                     &mut response_trailers,
                     &mut response_body,
-                    initial_response_header_policy_plugins.as_ref(),
+                    initial_response_header_policy_plugins,
                 );
 
                 if capabilities.has(PluginCapabilities::HAS_RESPONSE_COMMITTED_HOOK) {
@@ -44945,7 +44945,7 @@ async fn handle_proxy_request_inner(
                         &mut response_status,
                         &mut response_headers,
                         &mut response_body,
-                        initial_response_header_policy_plugins.as_ref(),
+                        initial_response_header_policy_plugins,
                     )
                     .await
                     {
@@ -44969,7 +44969,7 @@ async fn handle_proxy_request_inner(
                     &mut response_headers,
                     &mut response_trailers,
                     &mut response_body,
-                    initial_response_header_policy_plugins.as_ref(),
+                    initial_response_header_policy_plugins,
                 );
 
                 let total_ms = start_time.elapsed().as_secs_f64() * 1000.0;
@@ -45117,7 +45117,7 @@ async fn handle_proxy_request_inner(
                         grpc_request_is_web_translated,
                         grpc_proxy::grpc_status::UNAVAILABLE,
                         "Internal gateway error",
-                        initial_response_header_policy_plugins.as_ref(),
+                        initial_response_header_policy_plugins,
                     )
                 }));
             }
@@ -45370,7 +45370,7 @@ async fn handle_proxy_request_inner(
                         content_type,
                         grpc_code,
                         msg,
-                        initial_response_header_policy_plugins.as_ref(),
+                        initial_response_header_policy_plugins,
                     )
                     .await;
                     return Ok(grpc_proxy::attach_held_frontend_grpc_upload(
@@ -45389,7 +45389,7 @@ async fn handle_proxy_request_inner(
                         &content_type,
                         grpc_code,
                         msg,
-                        initial_response_header_policy_plugins.as_ref(),
+                        initial_response_header_policy_plugins,
                     )
                     .await;
                     return Ok(grpc_proxy::attach_held_frontend_grpc_upload(
@@ -45401,7 +45401,7 @@ async fn handle_proxy_request_inner(
                     grpc_proxy::build_grpc_error_response_with_policy(
                         grpc_code,
                         msg,
-                        initial_response_header_policy_plugins.as_ref(),
+                        initial_response_header_policy_plugins,
                     ),
                     held_frontend_grpc_upload.take(),
                 ));
@@ -45609,7 +45609,7 @@ async fn handle_proxy_request_inner(
             return Ok(grpc_proxy::build_grpc_error_response_with_policy(
                 14, // UNAVAILABLE
                 &message,
-                initial_response_header_policy_plugins.as_ref(),
+                initial_response_header_policy_plugins,
             ));
         }
         ctx.terminal_record.mark_counted();
@@ -45684,7 +45684,7 @@ async fn handle_proxy_request_inner(
             return Ok(grpc_proxy::build_grpc_error_response_with_policy(
                 14,
                 &message,
-                initial_response_header_policy_plugins.as_ref(),
+                initial_response_header_policy_plugins,
             ));
         }
         ctx.terminal_record.mark_counted();
@@ -45819,7 +45819,7 @@ async fn handle_proxy_request_inner(
                         client_request_body,
                         upstream_target.as_deref(),
                         &plugins,
-                        backend_admission_plugins.as_ref(),
+                        backend_admission_plugins,
                         std::mem::take(&mut preacquired_backend_admission),
                         body_hook_ctx.as_deref_mut(),
                         &ctx,
@@ -46434,7 +46434,7 @@ async fn handle_proxy_request_inner(
 
             backend_admission_permits = match backend_dispatch::run_backend_admission_plugins(
                 &state,
-                backend_admission_plugins.as_ref(),
+                backend_admission_plugins,
                 &ctx,
                 &proxy,
                 current_target.as_deref(),
@@ -46702,7 +46702,7 @@ async fn handle_proxy_request_inner(
                         client_request_body,
                         upstream_target.as_deref(),
                         &plugins,
-                        backend_admission_plugins.as_ref(),
+                        backend_admission_plugins,
                         std::mem::take(&mut preacquired_backend_admission),
                         body_hook_ctx.as_deref_mut(),
                         &ctx,
@@ -46909,7 +46909,7 @@ async fn handle_proxy_request_inner(
         &mut response_status,
         &mut response_headers,
         &mut response_body,
-        initial_response_header_policy_plugins.as_ref(),
+        initial_response_header_policy_plugins,
     );
     if precommit_authorization_terminal.is_some() {
         backend_resp.connection_error = false;
@@ -47541,7 +47541,7 @@ async fn handle_proxy_request_inner(
             &mut response_status,
             &mut response_headers,
             data,
-            initial_response_header_policy_plugins.as_ref(),
+            initial_response_header_policy_plugins,
         )
         .await;
         plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
@@ -47584,7 +47584,7 @@ async fn handle_proxy_request_inner(
                         &mut response_headers,
                         data,
                         InitialResponseHeaderPolicySource::Prefiltered(
-                            initial_response_header_policy_plugins.as_ref(),
+                            initial_response_header_policy_plugins,
                         ),
                     ) {
                         response_body_rejected = true;
@@ -47645,7 +47645,7 @@ async fn handle_proxy_request_inner(
             &mut response_headers,
             data,
             grpc_web_response_content_type,
-            initial_response_header_policy_plugins.as_ref(),
+            initial_response_header_policy_plugins,
         )
         .await;
         if response_replaced {
@@ -47693,7 +47693,7 @@ async fn handle_proxy_request_inner(
                 content_type.as_deref(),
                 &trailers,
                 http_status,
-                initial_response_header_policy_plugins.as_ref(),
+                initial_response_header_policy_plugins,
             );
             if let Some((synced_len, true)) = stored {
                 response_headers.insert("content-length".to_string(), synced_len.to_string());
@@ -47781,7 +47781,7 @@ async fn handle_proxy_request_inner(
             &mut response_status,
             &mut response_headers,
             data,
-            initial_response_header_policy_plugins.as_ref(),
+            initial_response_header_policy_plugins,
         )
         .await;
         plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
@@ -47823,7 +47823,7 @@ async fn handle_proxy_request_inner(
             &mut response_status,
             &mut response_headers,
             data,
-            initial_response_header_policy_plugins.as_ref(),
+            initial_response_header_policy_plugins,
         )
         .await;
         plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
@@ -47872,7 +47872,7 @@ async fn handle_proxy_request_inner(
         &mut response_status,
         &mut response_headers,
         &mut response_body,
-        initial_response_header_policy_plugins.as_ref(),
+        initial_response_header_policy_plugins,
     );
     if final_precommit_authorization_terminal.is_some() {
         // The terminal is fully buffered, so the summary and the latency

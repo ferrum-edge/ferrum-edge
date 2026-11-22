@@ -873,15 +873,7 @@ impl Plugin for GrpcMethodRouter {
         backend_path: &str,
     ) -> PluginResult {
         let parsed = parse_grpc_path(backend_path);
-        // When routing left the gRPC path unchanged and `on_request_received`
-        // already published the parsed metadata, avoid re-allocating the 3
-        // metadata strings.
-        if backend_path != ctx.path
-            || parsed.is_none()
-            || !ctx.metadata.contains_key("grpc_full_method")
-        {
-            publish_grpc_method_metadata(&mut ctx.metadata, parsed);
-        }
+        publish_grpc_method_metadata(&mut ctx.metadata, parsed);
         let (full_method, service) = match (ctx.metadata.get("grpc_full_method"), parsed) {
             (Some(method), Some((service, _))) => (method.as_str(), service),
             _ => {
