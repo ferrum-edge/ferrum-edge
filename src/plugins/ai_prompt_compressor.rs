@@ -1979,6 +1979,10 @@ impl Plugin for AiPromptCompressor {
         "ai_prompt_compressor"
     }
 
+    fn is_authorize_plugin(&self) -> bool {
+        false
+    }
+
     fn priority(&self) -> u16 {
         super::priority::AI_PROMPT_COMPRESSOR
     }

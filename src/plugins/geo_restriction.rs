@@ -650,6 +650,10 @@ impl Plugin for GeoRestriction {
         "geo_restriction"
     }
 
+    fn is_authorize_plugin(&self) -> bool {
+        false
+    }
+
     fn country_mmdb_snapshot(&self) -> Option<&CountryMmdbSnapshot> {
         self.reader.as_deref()
     }

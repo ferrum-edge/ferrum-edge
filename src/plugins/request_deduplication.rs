@@ -3972,6 +3972,10 @@ impl Plugin for RequestDeduplication {
         "request_deduplication"
     }
 
+    fn is_authorize_plugin(&self) -> bool {
+        false
+    }
+
     fn priority(&self) -> u16 {
         super::priority::REQUEST_DEDUPLICATION
     }

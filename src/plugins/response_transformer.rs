@@ -960,6 +960,10 @@ impl Plugin for ResponseTransformer {
         "response_transformer"
     }
 
+    fn is_authorize_plugin(&self) -> bool {
+        false
+    }
+
     fn priority(&self) -> u16 {
         super::priority::RESPONSE_TRANSFORMER
     }

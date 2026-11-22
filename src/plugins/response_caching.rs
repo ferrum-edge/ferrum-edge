@@ -3404,6 +3404,10 @@ impl Plugin for ResponseCaching {
         "response_caching"
     }
 
+    fn is_authorize_plugin(&self) -> bool {
+        false
+    }
+
     // Every short-circuit is a cached origin representation (HIT or
     // REVALIDATED), never a rejection of this plugin's own.
     fn rejects_with_origin_response(&self) -> bool {

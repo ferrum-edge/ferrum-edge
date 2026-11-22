@@ -1425,6 +1425,10 @@ impl Plugin for WorkloadMetrics {
         "workload_metrics"
     }
 
+    fn is_authorize_plugin(&self) -> bool {
+        false
+    }
+
     fn records_mesh_service_graph(&self, _summary: &TransactionSummary) -> bool {
         true
     }

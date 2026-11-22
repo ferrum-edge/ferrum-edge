@@ -288,6 +288,10 @@ impl Plugin for TransactionLogSchema {
         "transaction_log_schema"
     }
 
+    fn is_authorize_plugin(&self) -> bool {
+        false
+    }
+
     fn priority(&self) -> u16 {
         super::priority::TRANSACTION_LOG_SCHEMA
     }

@@ -372,6 +372,10 @@ impl Plugin for SecurityHeaders {
         "security_headers"
     }
 
+    fn is_authorize_plugin(&self) -> bool {
+        false
+    }
+
     fn priority(&self) -> u16 {
         super::priority::SECURITY_HEADERS
     }

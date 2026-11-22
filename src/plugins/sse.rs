@@ -740,6 +740,10 @@ impl super::Plugin for SsePlugin {
         "sse"
     }
 
+    fn is_authorize_plugin(&self) -> bool {
+        false
+    }
+
     fn priority(&self) -> u16 {
         super::priority::SSE
     }

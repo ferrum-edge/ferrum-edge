@@ -1001,6 +1001,10 @@ macro_rules! impl_auth_plugin {
                 true
             }
 
+            fn is_authorize_plugin(&self) -> bool {
+                false
+            }
+
             fn priority(&self) -> u16 {
                 $priority
             }

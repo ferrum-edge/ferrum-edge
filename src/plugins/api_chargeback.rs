@@ -3910,6 +3910,10 @@ impl Plugin for ApiChargeback {
         "api_chargeback"
     }
 
+    fn is_authorize_plugin(&self) -> bool {
+        false
+    }
+
     fn priority(&self) -> u16 {
         super::priority::API_CHARGEBACK
     }

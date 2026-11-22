@@ -814,6 +814,10 @@ impl Plugin for GrpcMethodRouter {
         "grpc_method_router"
     }
 
+    fn is_authorize_plugin(&self) -> bool {
+        false
+    }
+
     fn priority(&self) -> u16 {
         super::priority::GRPC_METHOD_ROUTER
     }

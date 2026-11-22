@@ -805,6 +805,10 @@ impl Plugin for StatsdLogging {
         "statsd_logging"
     }
 
+    fn is_authorize_plugin(&self) -> bool {
+        false
+    }
+
     fn priority(&self) -> u16 {
         super::priority::STATSD_LOGGING
     }

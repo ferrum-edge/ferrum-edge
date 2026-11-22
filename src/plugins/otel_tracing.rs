@@ -909,6 +909,10 @@ impl Plugin for OtelTracing {
         "otel_tracing"
     }
 
+    fn is_authorize_plugin(&self) -> bool {
+        false
+    }
+
     fn priority(&self) -> u16 {
         super::priority::OTEL_TRACING
     }

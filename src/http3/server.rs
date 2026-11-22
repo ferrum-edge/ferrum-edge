@@ -4576,11 +4576,24 @@ async fn handle_h3_request(
         state.max_response_body_size_bytes,
         route_response_body_limit,
     );
-    ctx.set_request_headers_to_redact(plugin_cache_view.request_headers_to_redact());
-    ctx.set_request_trailer_strip_headers(
-        plugin_cache_view.request_trailer_strip_headers(),
-        plugin_cache_view.owned_request_assertion_headers(),
-    );
+    if !plugin_cache_view
+        .request_headers_to_redact_slice()
+        .is_empty()
+    {
+        ctx.set_request_headers_to_redact(plugin_cache_view.request_headers_to_redact());
+    }
+    if !plugin_cache_view
+        .request_trailer_strip_headers_slice()
+        .is_empty()
+        || !plugin_cache_view
+            .owned_request_assertion_headers_slice()
+            .is_empty()
+    {
+        ctx.set_request_trailer_strip_headers(
+            plugin_cache_view.request_trailer_strip_headers(),
+            plugin_cache_view.owned_request_assertion_headers(),
+        );
+    }
     // Same cache generation as `plugins` above: replay provenance must describe
     // exactly the response-side rules this request will run.
     ctx.set_response_presentation_policy_digest(
@@ -4727,127 +4740,130 @@ async fn handle_h3_request(
     let mut plugin_execution_ns: u64 = 0;
 
     // Execute on_request_received hooks
-    let phase_start = std::time::Instant::now();
-    for plugin in plugins.iter() {
-        // Skipped hooks are the default `Continue`; see `PluginHooks`.
-        if !plugin
-            .lifecycle_hooks()
-            .contains(crate::plugins::PluginHooks::ON_REQUEST_RECEIVED)
-        {
-            continue;
-        }
-        let deadline = ctx.grpc_deadline_at();
-        match crate::plugins::await_request_plugin_deadline_with_provenance(
-            deadline,
-            plugin.on_request_received(&mut ctx),
-        )
-        .await
-        .into_plugin_result(&mut ctx)
-        {
-            PluginResult::Continue => {}
-            reject @ PluginResult::Reject { .. } | reject @ PluginResult::RejectBinary { .. } => {
-                crate::diagnostic_ref::note_rejecting_plugin(&ctx, plugin.as_ref());
-                let Some(reject) = plugin_result_into_reject_parts(reject) else {
-                    tracing::error!("Plugin result could not be converted to rejection parts");
+    if capabilities.has(crate::plugin_cache::PluginCapabilities::HAS_ON_REQUEST_RECEIVED_HOOK) {
+        let phase_start = std::time::Instant::now();
+        for plugin in plugins.iter() {
+            // Skipped hooks are the default `Continue`; see `PluginHooks`.
+            if !plugin
+                .lifecycle_hooks()
+                .contains(crate::plugins::PluginHooks::ON_REQUEST_RECEIVED)
+            {
+                continue;
+            }
+            let deadline = ctx.grpc_deadline_at();
+            match crate::plugins::await_request_plugin_deadline_with_provenance(
+                deadline,
+                plugin.on_request_received(&mut ctx),
+            )
+            .await
+            .into_plugin_result(&mut ctx)
+            {
+                PluginResult::Continue => {}
+                reject @ PluginResult::Reject { .. }
+                | reject @ PluginResult::RejectBinary { .. } => {
+                    crate::diagnostic_ref::note_rejecting_plugin(&ctx, plugin.as_ref());
+                    let Some(reject) = plugin_result_into_reject_parts(reject) else {
+                        tracing::error!("Plugin result could not be converted to rejection parts");
+                        run_h3_reject_response_committed_hooks(
+                            &plugins,
+                            &mut ctx,
+                            http_flavor,
+                            grpc_web_response_content_type,
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            Bytes::from_static(b"Internal Server Error"),
+                            &HashMap::new(),
+                        )
+                        .await;
+                        let log_status_code = h3_reject_log_status_and_metadata(
+                            &mut ctx,
+                            http_flavor,
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            b"Internal Server Error",
+                            &HashMap::new(),
+                        );
+                        record_request(&state, log_status_code);
+                        send_h3_plugin_reject_flavor_aware(
+                            &mut stream,
+                            &mut ctx,
+                            http_flavor,
+                            grpc_web_response_content_type,
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            Bytes::from_static(b"Internal Server Error"),
+                            &HashMap::new(),
+                        )
+                        .await?;
+                        return Ok(());
+                    };
+                    let mut headers = reject.headers;
+                    let mut reject_status = reject.status_code;
+                    let mut reject_body = reject.body;
+                    // Run after_proxy reject hooks AND the synthetic response-body
+                    // guardrail/transform pipeline over 2xx short-circuit bodies so
+                    // H3 matches the H1/H2 rejection path. An `on_request_received`
+                    // short-circuit (e.g. `request_termination` returning a non-empty
+                    // 2xx body) must see the same AI response guard / body hooks as
+                    // every other reject phase — keeping the advertised H3 parity from
+                    // holding only for `before_proxy` short-circuits.
+                    apply_reject_after_proxy_and_synthetic_body_hooks(
+                        &plugins,
+                        &mut ctx,
+                        &mut reject_status,
+                        &mut headers,
+                        &mut reject_body,
+                        matches!(http_flavor, HttpFlavor::Grpc),
+                        false,
+                    )
+                    .await;
+                    plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
+                    let http_status = StatusCode::from_u16(reject_status)
+                        .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
                     run_h3_reject_response_committed_hooks(
                         &plugins,
                         &mut ctx,
                         http_flavor,
                         grpc_web_response_content_type,
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        Bytes::from_static(b"Internal Server Error"),
-                        &HashMap::new(),
+                        http_status,
+                        reject_body.clone(),
+                        &headers,
                     )
                     .await;
                     let log_status_code = h3_reject_log_status_and_metadata(
                         &mut ctx,
                         http_flavor,
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        b"Internal Server Error",
-                        &HashMap::new(),
+                        http_status,
+                        &reject_body,
+                        &headers,
                     );
+                    // Record the normalized wire status: a gRPC reject is sent as
+                    // HTTP 200 + grpc-status, so runtime status metrics must match
+                    // the logged/served status (not the plugin's HTTP-style code),
+                    // consistent across every H3 reject phase.
                     record_request(&state, log_status_code);
+                    log_rejected_request(
+                        &plugins,
+                        &ctx,
+                        log_status_code,
+                        start_time,
+                        "on_request_received",
+                        plugin_execution_ns,
+                    )
+                    .await;
                     send_h3_plugin_reject_flavor_aware(
                         &mut stream,
                         &mut ctx,
                         http_flavor,
                         grpc_web_response_content_type,
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        Bytes::from_static(b"Internal Server Error"),
-                        &HashMap::new(),
+                        http_status,
+                        reject_body.clone(),
+                        &headers,
                     )
                     .await?;
                     return Ok(());
-                };
-                let mut headers = reject.headers;
-                let mut reject_status = reject.status_code;
-                let mut reject_body = reject.body;
-                // Run after_proxy reject hooks AND the synthetic response-body
-                // guardrail/transform pipeline over 2xx short-circuit bodies so
-                // H3 matches the H1/H2 rejection path. An `on_request_received`
-                // short-circuit (e.g. `request_termination` returning a non-empty
-                // 2xx body) must see the same AI response guard / body hooks as
-                // every other reject phase — keeping the advertised H3 parity from
-                // holding only for `before_proxy` short-circuits.
-                apply_reject_after_proxy_and_synthetic_body_hooks(
-                    &plugins,
-                    &mut ctx,
-                    &mut reject_status,
-                    &mut headers,
-                    &mut reject_body,
-                    matches!(http_flavor, HttpFlavor::Grpc),
-                    false,
-                )
-                .await;
-                plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
-                let http_status = StatusCode::from_u16(reject_status)
-                    .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-                run_h3_reject_response_committed_hooks(
-                    &plugins,
-                    &mut ctx,
-                    http_flavor,
-                    grpc_web_response_content_type,
-                    http_status,
-                    reject_body.clone(),
-                    &headers,
-                )
-                .await;
-                let log_status_code = h3_reject_log_status_and_metadata(
-                    &mut ctx,
-                    http_flavor,
-                    http_status,
-                    &reject_body,
-                    &headers,
-                );
-                // Record the normalized wire status: a gRPC reject is sent as
-                // HTTP 200 + grpc-status, so runtime status metrics must match
-                // the logged/served status (not the plugin's HTTP-style code),
-                // consistent across every H3 reject phase.
-                record_request(&state, log_status_code);
-                log_rejected_request(
-                    &plugins,
-                    &ctx,
-                    log_status_code,
-                    start_time,
-                    "on_request_received",
-                    plugin_execution_ns,
-                )
-                .await;
-                send_h3_plugin_reject_flavor_aware(
-                    &mut stream,
-                    &mut ctx,
-                    http_flavor,
-                    grpc_web_response_content_type,
-                    http_status,
-                    reject_body.clone(),
-                    &headers,
-                )
-                .await?;
-                return Ok(());
+                }
             }
         }
+        plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
     }
-    plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
 
     // Recognition and policy selection are intentionally unconditional for a
     // valid gRPC-Web media type, even when no translator is installed. Backend
@@ -5071,94 +5087,97 @@ async fn handle_h3_request(
     // Native gRPC uses the gRPC view. Recognized gRPC-Web uses the composed
     // HTTP view so existing browser-facing HTTP auth/guardrails remain active
     // while the two compatible native-gRPC policies participate.
-    let auth_plugins = plugin_cache_view.auth_plugins();
+    let auth_plugins = plugin_cache_view.auth_plugins_slice();
 
-    let auth_phase_start = std::time::Instant::now();
-    if let Some((status_code, body, mut headers)) = run_authentication_phase_with_envelope(
-        proxy.auth_mode.clone(),
-        &auth_plugins,
-        &mut ctx,
-        &consumer_index,
-        plugin_cache_view.uses_openai_auth_error_envelope(),
-    )
-    .await
-    {
-        // A completed early body and its request-buffer charge are released
-        // before the rejection hooks run (issues #6008, #6009).
-        drop(prebuffered_body_data.take());
-        drop(retained_request_charge.take());
-        let mut reject_status = status_code;
-        let mut reject_body = body;
-        // Run after_proxy reject hooks AND the synthetic response-body
-        // guardrail/transform pipeline over 2xx short-circuit bodies so an
-        // authentication-phase short-circuit on H3 sees the same AI response
-        // guard / body hooks as the H1/H2 rejection path and every other H3
-        // reject phase.
-        apply_reject_after_proxy_and_synthetic_body_hooks(
-            &plugins,
+    if !auth_plugins.is_empty() {
+        let auth_phase_start = std::time::Instant::now();
+        if let Some((status_code, body, mut headers)) = run_authentication_phase_with_envelope(
+            proxy.auth_mode.clone(),
+            auth_plugins,
             &mut ctx,
-            &mut reject_status,
-            &mut headers,
-            &mut reject_body,
-            matches!(http_flavor, HttpFlavor::Grpc),
-            false,
+            &consumer_index,
+            plugin_cache_view.uses_openai_auth_error_envelope(),
         )
-        .await;
+        .await
+        {
+            // A completed early body and its request-buffer charge are released
+            // before the rejection hooks run (issues #6008, #6009).
+            drop(prebuffered_body_data.take());
+            drop(retained_request_charge.take());
+            let mut reject_status = status_code;
+            let mut reject_body = body;
+            // Run after_proxy reject hooks AND the synthetic response-body
+            // guardrail/transform pipeline over 2xx short-circuit bodies so an
+            // authentication-phase short-circuit on H3 sees the same AI response
+            // guard / body hooks as the H1/H2 rejection path and every other H3
+            // reject phase.
+            apply_reject_after_proxy_and_synthetic_body_hooks(
+                &plugins,
+                &mut ctx,
+                &mut reject_status,
+                &mut headers,
+                &mut reject_body,
+                matches!(http_flavor, HttpFlavor::Grpc),
+                false,
+            )
+            .await;
+            plugin_execution_ns += auth_phase_start.elapsed().as_nanos() as u64;
+            let http_status =
+                StatusCode::from_u16(reject_status).unwrap_or(StatusCode::UNAUTHORIZED);
+            run_h3_reject_response_committed_hooks(
+                &plugins,
+                &mut ctx,
+                http_flavor,
+                grpc_web_response_content_type,
+                http_status,
+                reject_body.clone(),
+                &headers,
+            )
+            .await;
+            let log_status_code = h3_reject_log_status_and_metadata(
+                &mut ctx,
+                http_flavor,
+                http_status,
+                &reject_body,
+                &headers,
+            );
+            // Record the normalized wire status: gRPC rejects go out as HTTP 200 +
+            // grpc-status, so recording the raw `status_code` (e.g. 401/403) here
+            // would make /metrics/runtime disagree with the logged and served
+            // status. Must run AFTER `h3_reject_log_status_and_metadata`, matching
+            // every other H3 reject phase.
+            record_request(&state, log_status_code);
+            log_rejected_request(
+                &plugins,
+                &ctx,
+                log_status_code,
+                start_time,
+                "authenticate",
+                plugin_execution_ns,
+            )
+            .await;
+            send_h3_plugin_reject_flavor_aware(
+                &mut stream,
+                &mut ctx,
+                http_flavor,
+                grpc_web_response_content_type,
+                http_status,
+                reject_body.clone(),
+                &headers,
+            )
+            .await?;
+            return Ok(());
+        }
         plugin_execution_ns += auth_phase_start.elapsed().as_nanos() as u64;
-        let http_status = StatusCode::from_u16(reject_status).unwrap_or(StatusCode::UNAUTHORIZED);
-        run_h3_reject_response_committed_hooks(
-            &plugins,
-            &mut ctx,
-            http_flavor,
-            grpc_web_response_content_type,
-            http_status,
-            reject_body.clone(),
-            &headers,
-        )
-        .await;
-        let log_status_code = h3_reject_log_status_and_metadata(
-            &mut ctx,
-            http_flavor,
-            http_status,
-            &reject_body,
-            &headers,
-        );
-        // Record the normalized wire status: gRPC rejects go out as HTTP 200 +
-        // grpc-status, so recording the raw `status_code` (e.g. 401/403) here
-        // would make /metrics/runtime disagree with the logged and served
-        // status. Must run AFTER `h3_reject_log_status_and_metadata`, matching
-        // every other H3 reject phase.
-        record_request(&state, log_status_code);
-        log_rejected_request(
-            &plugins,
-            &ctx,
-            log_status_code,
-            start_time,
-            "authenticate",
-            plugin_execution_ns,
-        )
-        .await;
-        send_h3_plugin_reject_flavor_aware(
-            &mut stream,
-            &mut ctx,
-            http_flavor,
-            grpc_web_response_content_type,
-            http_status,
-            reject_body.clone(),
-            &headers,
-        )
-        .await?;
-        return Ok(());
     }
-    plugin_execution_ns += auth_phase_start.elapsed().as_nanos() as u64;
 
     // Authorization plugins that inspect bodies buffer only after
     // authentication succeeds. This avoids collecting unauthenticated H3
     // uploads solely for a later authorization decision.
-    let authorize_plugins = plugin_cache_view.authorize_plugins();
+    let authorize_plugins = plugin_cache_view.authorize_plugins_slice();
     let authorize_body_requirements =
         if capabilities.has(crate::plugin_cache::PluginCapabilities::HAS_BODY_BEFORE_AUTHORIZE) {
-            crate::proxy::request_body_requirements_before_authorize(&authorize_plugins, &ctx)
+            crate::proxy::request_body_requirements_before_authorize(authorize_plugins, &ctx)
         } else {
             crate::proxy::RequestBodyPhaseRequirements::default()
         };

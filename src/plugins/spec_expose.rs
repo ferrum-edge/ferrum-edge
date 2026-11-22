@@ -900,6 +900,10 @@ impl Plugin for SpecExpose {
         "spec_expose"
     }
 
+    fn is_authorize_plugin(&self) -> bool {
+        false
+    }
+
     fn priority(&self) -> u16 {
         super::priority::SPEC_EXPOSE
     }

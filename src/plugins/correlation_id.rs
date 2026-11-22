@@ -281,6 +281,10 @@ impl Plugin for CorrelationId {
         "correlation_id"
     }
 
+    fn is_authorize_plugin(&self) -> bool {
+        false
+    }
+
     fn correlation_id_header_name(&self) -> Option<&str> {
         Some(&self.header_name)
     }

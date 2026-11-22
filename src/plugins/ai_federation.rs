@@ -8248,6 +8248,10 @@ impl Plugin for AiFederation {
         "ai_federation"
     }
 
+    fn is_authorize_plugin(&self) -> bool {
+        false
+    }
+
     // The short-circuit is the federated provider's response (or a
     // provider-failure envelope standing in for it), not a gateway policy
     // rejection.

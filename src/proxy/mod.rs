@@ -29152,6 +29152,7 @@ pub(crate) async fn run_after_proxy_hooks(
     let last_route_response_finalizer = plugins
         .iter()
         .rposition(|plugin| plugin.participates_in_route_response_header_finalization());
+    let mut later_meta_dirty = false;
     for (index, plugin) in plugins.iter().enumerate() {
         if plugin.needs_later_response_cache_control_no_transform()
             || plugin.needs_later_response_strong_etag()
@@ -29165,7 +29166,8 @@ pub(crate) async fn run_after_proxy_hooks(
                     LATER_NO_TRANSFORM_RESPONSE_METADATA_KEY.to_string(),
                     "true".to_string(),
                 );
-            } else {
+                later_meta_dirty = true;
+            } else if later_meta_dirty {
                 ctx.metadata
                     .remove(LATER_NO_TRANSFORM_RESPONSE_METADATA_KEY);
             }
@@ -29174,16 +29176,18 @@ pub(crate) async fn run_after_proxy_hooks(
                     LATER_STRONG_ETAG_RESPONSE_METADATA_KEY.to_string(),
                     "true".to_string(),
                 );
-            } else {
+                later_meta_dirty = true;
+            } else if later_meta_dirty {
                 ctx.metadata.remove(LATER_STRONG_ETAG_RESPONSE_METADATA_KEY);
             }
-        } else {
+        } else if later_meta_dirty {
             ctx.metadata
                 .remove(LATER_NO_TRANSFORM_RESPONSE_METADATA_KEY);
             ctx.metadata.remove(LATER_STRONG_ETAG_RESPONSE_METADATA_KEY);
+            later_meta_dirty = false;
         }
 
-        let result = if ctx.charged_backend_deadline_terminal() {
+        let (result, ran_hook) = if ctx.charged_backend_deadline_terminal() {
             match run_charged_terminal_after_proxy_hook(
                 plugin,
                 ctx,
@@ -29192,16 +29196,16 @@ pub(crate) async fn run_after_proxy_hooks(
             )
             .await
             {
-                ChargedTerminalAfterProxyHook::Completed(result) => result,
+                ChargedTerminalAfterProxyHook::Completed(result) => (result, true),
                 ChargedTerminalAfterProxyHook::Skipped
                 | ChargedTerminalAfterProxyHook::Detached => continue,
             }
         } else {
             let bound = ctx.precommit_response_phase_bound();
-            if plugin
+            let has_hook = plugin
                 .lifecycle_hooks()
-                .contains(crate::plugins::PluginHooks::AFTER_PROXY)
-            {
+                .contains(crate::plugins::PluginHooks::AFTER_PROXY);
+            let outcome = if has_hook {
                 crate::plugins::await_precommit_response_phase(
                     bound,
                     plugin.after_proxy(ctx, response_status, response_headers),
@@ -29212,7 +29216,8 @@ pub(crate) async fn run_after_proxy_hooks(
                 // hit, and the per-plugin bookkeeping below.
                 crate::plugins::skipped_precommit_response_phase(bound, PluginResult::Continue)
             }
-            .into_plugin_result(ctx)
+            .into_plugin_result(ctx);
+            (outcome, has_hook)
         };
         match result {
             PluginResult::Continue => {
@@ -29221,7 +29226,8 @@ pub(crate) async fn run_after_proxy_hooks(
                 // later same-type instances cannot undo route policy
                 // (GHSA-3xxr-xhhj-9962). Subsequent after_proxy plugins still see
                 // the route-final map.
-                if last_route_response_finalizer == Some(index) {
+                let finalized_route = last_route_response_finalizer == Some(index);
+                if finalized_route {
                     crate::plugins::utils::route_header_transform::finalize_route_override_response_headers(
                         ctx,
                         response_headers,
@@ -29230,12 +29236,16 @@ pub(crate) async fn run_after_proxy_hooks(
                 // Snapshot the complete phase, including the chain-level route
                 // finalization above. Recording before finalization would omit
                 // route removals/appends from buffered gRPC trailer policy and
-                // deadline provenance.
-                ctx.record_buffered_initial_response_header_plugin(
-                    plugin.as_ref(),
-                    response_headers,
-                );
-                ctx.record_deadline_response_header_plugin(plugin.as_ref(), response_headers);
+                // deadline provenance. Skip when the plugin did not run
+                // `after_proxy` and did not finalize route headers: the header
+                // map cannot have changed.
+                if ran_hook || finalized_route {
+                    ctx.record_buffered_initial_response_header_plugin(
+                        plugin.as_ref(),
+                        response_headers,
+                    );
+                    ctx.record_deadline_response_header_plugin(plugin.as_ref(), response_headers);
+                }
             }
             reject @ PluginResult::Reject { .. } | reject @ PluginResult::RejectBinary { .. } => {
                 let RejectedResponseParts {
@@ -29249,9 +29259,11 @@ pub(crate) async fn run_after_proxy_hooks(
                     plugin.name(),
                     status_code,
                 );
-                ctx.metadata
-                    .remove(LATER_NO_TRANSFORM_RESPONSE_METADATA_KEY);
-                ctx.metadata.remove(LATER_STRONG_ETAG_RESPONSE_METADATA_KEY);
+                if later_meta_dirty {
+                    ctx.metadata
+                        .remove(LATER_NO_TRANSFORM_RESPONSE_METADATA_KEY);
+                    ctx.metadata.remove(LATER_STRONG_ETAG_RESPONSE_METADATA_KEY);
+                }
                 apply_replaceable_after_proxy_hooks_to_rejection(
                     plugins,
                     ctx,
@@ -29289,9 +29301,11 @@ pub(crate) async fn run_after_proxy_hooks(
         }
     }
 
-    ctx.metadata
-        .remove(LATER_NO_TRANSFORM_RESPONSE_METADATA_KEY);
-    ctx.metadata.remove(LATER_STRONG_ETAG_RESPONSE_METADATA_KEY);
+    if later_meta_dirty {
+        ctx.metadata
+            .remove(LATER_NO_TRANSFORM_RESPONSE_METADATA_KEY);
+        ctx.metadata.remove(LATER_STRONG_ETAG_RESPONSE_METADATA_KEY);
+    }
     // Over a charged terminal the last route response finalizer may have been
     // skipped or detached; apply the matched route list exactly once.
     if ctx.charged_backend_deadline_terminal() {
@@ -37966,7 +37980,7 @@ async fn handle_proxy_request_inner(
             && !is_hbone_connect_any
             && method != "OPTIONS"
             && state.mesh_egress_strip_baggage_keys.is_empty()
-            && (plugin_cache_view.plugins().is_empty()
+            && (!plugin_cache_view.has_plugins()
                 || plugin_cache_view
                     .capabilities()
                     .has(PluginCapabilities::SUPPORTS_REQUEST_HEADER_PASSTHROUGH))
@@ -37982,7 +37996,7 @@ async fn handle_proxy_request_inner(
     // `oidc_relying_party`, `mesh_route_dispatch`, `jwks_auth`, and logging
     // plugins read it). Skipping it on plugin-free and passthrough-auth chains
     // avoids a HashMap + 2 String allocations per request on the hot path.
-    if !plugin_cache_view.plugins().is_empty()
+    if plugin_cache_view.has_plugins()
         && !plugin_cache_view
             .capabilities()
             .has(PluginCapabilities::SUPPORTS_REQUEST_HEADER_PASSTHROUGH)
@@ -38017,7 +38031,7 @@ async fn handle_proxy_request_inner(
         route_response_body_limit,
     );
     let initial_response_header_policy_plugins =
-        plugin_cache_view.initial_response_header_policy_plugins();
+        plugin_cache_view.initial_response_header_policy_plugins_slice();
     let is_grpc_request = request_protocol == ProxyProtocol::Grpc;
 
     // The client selected this flavor (gRPC `Content-Type`, WebSocket upgrade,
@@ -38319,11 +38333,24 @@ async fn handle_proxy_request_inner(
     let plugins = plugin_cache_view.plugins();
     // From here a client abort is logged through this chain (issue #6768).
     client_abort_record.observe_plugins(&plugins);
-    ctx.set_request_headers_to_redact(plugin_cache_view.request_headers_to_redact());
-    ctx.set_request_trailer_strip_headers(
-        plugin_cache_view.request_trailer_strip_headers(),
-        plugin_cache_view.owned_request_assertion_headers(),
-    );
+    if !plugin_cache_view
+        .request_headers_to_redact_slice()
+        .is_empty()
+    {
+        ctx.set_request_headers_to_redact(plugin_cache_view.request_headers_to_redact());
+    }
+    if !plugin_cache_view
+        .request_trailer_strip_headers_slice()
+        .is_empty()
+        || !plugin_cache_view
+            .owned_request_assertion_headers_slice()
+            .is_empty()
+    {
+        ctx.set_request_trailer_strip_headers(
+            plugin_cache_view.request_trailer_strip_headers(),
+            plugin_cache_view.owned_request_assertion_headers(),
+        );
+    }
     // Bind this request to the same cache generation's static response-side
     // presentation policy that the plugin list above will execute, so a plugin
     // persisting a finalized representation can prove which rules produced it.
@@ -38722,13 +38749,13 @@ async fn handle_proxy_request_inner(
     }
 
     // Authentication phase (pre-computed auth plugin list — zero allocation)
-    let auth_plugins = plugin_cache_view.auth_plugins();
+    let auth_plugins = plugin_cache_view.auth_plugins_slice();
 
-    {
+    if !auth_plugins.is_empty() {
         let auth_phase_start = Instant::now();
         if let Some((status_code, body, headers)) = run_authentication_phase_with_envelope(
             proxy.auth_mode.clone(),
-            &auth_plugins,
+            auth_plugins,
             &mut ctx,
             &consumer_index,
             plugin_cache_view.uses_openai_auth_error_envelope(),
@@ -38781,10 +38808,10 @@ async fn handle_proxy_request_inner(
     // Authorization plugins that need a body buffer only after identity has
     // been established. This keeps unauthenticated requests on the early
     // rejection path without collecting their bodies.
-    let authorize_plugins = plugin_cache_view.authorize_plugins();
+    let authorize_plugins = plugin_cache_view.authorize_plugins_slice();
     let authorize_body_requirements =
         if capabilities.has(PluginCapabilities::HAS_BODY_BEFORE_AUTHORIZE) {
-            request_body_requirements_before_authorize(&authorize_plugins, &ctx)
+            request_body_requirements_before_authorize(authorize_plugins, &ctx)
         } else {
             RequestBodyPhaseRequirements::default()
         };
@@ -39512,8 +39539,12 @@ async fn handle_proxy_request_inner(
         }
         plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
         owned_proxy_headers = Some(cloned);
-    } else if !plugins.is_empty() {
-        // Run before_proxy hooks that don't modify headers (e.g., body_validator).
+    } else if capabilities.has(PluginCapabilities::HAS_BEFORE_PROXY_HOOK)
+        || (!plugins.is_empty()
+            && (grpc_web_request
+                || ctx.mesh_direction.is_some()
+                || ctx.route_override_request_transform.is_some()))
+    {
         // No plugin modifies headers, so swap headers out of ctx temporarily to
         // satisfy the borrow checker without cloning — zero allocation hot path.
         let phase_start = Instant::now();
@@ -40699,7 +40730,7 @@ async fn handle_proxy_request_inner(
         .plugin_cache
         .proxy_lifecycle_generation(&proxy.namespace, &proxy.id);
 
-    let backend_admission_plugins = plugin_cache_view.backend_admission_plugins();
+    let backend_admission_plugins = plugin_cache_view.backend_admission_plugins_slice();
     let mut backend_admission_permits: Option<BackendAdmissionPermitSet> = None;
     let mut preacquired_backend_admission = PreacquiredBackendAdmission::default();
 
@@ -41243,7 +41274,7 @@ async fn handle_proxy_request_inner(
             websocket_proxy_headers,
             plugins,
             initial_response_header_policy_plugins,
-            backend_admission_plugins,
+            plugin_cache_view.backend_admission_plugins(),
             plugin_execution_ns,
             Arc::clone(&epoch),
             upstream_target,

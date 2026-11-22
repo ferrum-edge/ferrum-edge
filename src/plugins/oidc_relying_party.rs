@@ -3352,6 +3352,10 @@ impl super::Plugin for OidcRelyingParty {
     fn name(&self) -> &str {
         "oidc_relying_party"
     }
+
+    fn is_authorize_plugin(&self) -> bool {
+        false
+    }
     fn is_auth_plugin(&self) -> bool {
         true
     }

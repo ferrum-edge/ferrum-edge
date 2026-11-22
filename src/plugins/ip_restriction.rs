@@ -253,6 +253,10 @@ impl Plugin for IpRestriction {
         "ip_restriction"
     }
 
+    fn is_authorize_plugin(&self) -> bool {
+        false
+    }
+
     fn priority(&self) -> u16 {
         super::priority::IP_RESTRICTION
     }

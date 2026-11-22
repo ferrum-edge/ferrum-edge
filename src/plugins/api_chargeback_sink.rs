@@ -3732,6 +3732,10 @@ impl Plugin for ApiChargebackSink {
         PLUGIN_NAME
     }
 
+    fn is_authorize_plugin(&self) -> bool {
+        false
+    }
+
     fn priority(&self) -> u16 {
         super::priority::API_CHARGEBACK_SINK
     }

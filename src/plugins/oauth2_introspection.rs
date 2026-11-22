@@ -1658,6 +1658,10 @@ impl super::Plugin for Oauth2Introspection {
         "oauth2_introspection"
     }
 
+    fn is_authorize_plugin(&self) -> bool {
+        false
+    }
+
     fn is_auth_plugin(&self) -> bool {
         true
     }

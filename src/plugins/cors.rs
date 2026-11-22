@@ -1391,6 +1391,10 @@ impl Plugin for CorsPlugin {
         "cors"
     }
 
+    fn is_authorize_plugin(&self) -> bool {
+        false
+    }
+
     fn priority(&self) -> u16 {
         super::priority::CORS
     }
@@ -1580,6 +1584,10 @@ impl CorsFinalizer {
 impl Plugin for CorsFinalizer {
     fn name(&self) -> &str {
         CORS_FINALIZER_NAME
+    }
+
+    fn is_authorize_plugin(&self) -> bool {
+        false
     }
 
     fn priority(&self) -> u16 {

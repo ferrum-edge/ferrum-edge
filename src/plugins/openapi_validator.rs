@@ -1556,6 +1556,10 @@ impl Plugin for OpenapiValidator {
         "openapi_validator"
     }
 
+    fn is_authorize_plugin(&self) -> bool {
+        false
+    }
+
     /// `bypass.header_present` values are shared secrets that skip
     /// validation; keep them out of diagnostics and policy calls.
     fn request_headers_to_redact(&self) -> &[String] {

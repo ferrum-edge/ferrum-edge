@@ -751,6 +751,10 @@ impl Plugin for ResponseMock {
         "response_mock"
     }
 
+    fn is_authorize_plugin(&self) -> bool {
+        false
+    }
+
     fn priority(&self) -> u16 {
         super::priority::RESPONSE_MOCK
     }

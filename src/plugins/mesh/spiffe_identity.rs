@@ -555,6 +555,10 @@ impl Plugin for SpiffeIdentity {
         "spiffe_identity"
     }
 
+    fn is_authorize_plugin(&self) -> bool {
+        false
+    }
+
     fn priority(&self) -> u16 {
         priority::SPIFFE_IDENTITY
     }

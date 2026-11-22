@@ -2033,6 +2033,10 @@ impl super::Plugin for JwksAuth {
         "jwks_auth"
     }
 
+    fn is_authorize_plugin(&self) -> bool {
+        false
+    }
+
     fn is_auth_plugin(&self) -> bool {
         true
     }

@@ -715,6 +715,10 @@ impl Plugin for RequestTermination {
         "request_termination"
     }
 
+    fn is_authorize_plugin(&self) -> bool {
+        false
+    }
+
     fn priority(&self) -> u16 {
         super::priority::REQUEST_TERMINATION
     }

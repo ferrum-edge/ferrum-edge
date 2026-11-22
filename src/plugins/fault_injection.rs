@@ -593,6 +593,10 @@ impl Plugin for FaultInjectionPlugin {
         "fault_injection"
     }
 
+    fn is_authorize_plugin(&self) -> bool {
+        false
+    }
+
     fn priority(&self) -> u16 {
         super::priority::FAULT_INJECTION
     }

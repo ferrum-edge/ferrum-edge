@@ -3436,6 +3436,10 @@ impl Plugin for AiToolGovernor {
         "ai_tool_governor"
     }
 
+    fn is_authorize_plugin(&self) -> bool {
+        false
+    }
+
     fn priority(&self) -> u16 {
         super::priority::AI_TOOL_GOVERNOR
     }

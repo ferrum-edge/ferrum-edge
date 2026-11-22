@@ -7460,6 +7460,10 @@ impl Plugin for PrometheusMetrics {
         "prometheus_metrics"
     }
 
+    fn is_authorize_plugin(&self) -> bool {
+        false
+    }
+
     fn uses_mesh_request_key(&self) -> bool {
         true
     }

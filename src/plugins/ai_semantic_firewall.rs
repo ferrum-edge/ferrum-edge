@@ -2661,6 +2661,10 @@ impl Plugin for AiSemanticFirewall {
         "ai_semantic_firewall"
     }
 
+    fn is_authorize_plugin(&self) -> bool {
+        false
+    }
+
     fn priority(&self) -> u16 {
         super::priority::AI_SEMANTIC_FIREWALL
     }

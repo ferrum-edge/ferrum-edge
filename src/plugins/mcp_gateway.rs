@@ -7643,6 +7643,10 @@ impl Plugin for McpGateway {
         "mcp_gateway"
     }
 
+    fn is_authorize_plugin(&self) -> bool {
+        false
+    }
+
     /// Start the at-rest session expiry sweep once the generation that owns
     /// this instance is installed. Only an enabled aggregate instance mints
     /// sessions, so only it needs the sweep. Idempotent: a concurrent second

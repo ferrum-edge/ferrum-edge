@@ -1830,6 +1830,10 @@ impl Plugin for A2aGateway {
         "a2a_gateway"
     }
 
+    fn is_authorize_plugin(&self) -> bool {
+        false
+    }
+
     fn priority(&self) -> u16 {
         super::priority::A2A_GATEWAY
     }

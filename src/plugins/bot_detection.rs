@@ -335,6 +335,10 @@ impl Plugin for BotDetection {
         "bot_detection"
     }
 
+    fn is_authorize_plugin(&self) -> bool {
+        false
+    }
+
     fn priority(&self) -> u16 {
         BOT_DETECTION_PRIORITY
     }

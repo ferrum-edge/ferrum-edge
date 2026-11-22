@@ -2320,6 +2320,10 @@ impl Plugin for AiPromptShield {
         "ai_prompt_shield"
     }
 
+    fn is_authorize_plugin(&self) -> bool {
+        false
+    }
+
     fn priority(&self) -> u16 {
         super::priority::AI_PROMPT_SHIELD
     }

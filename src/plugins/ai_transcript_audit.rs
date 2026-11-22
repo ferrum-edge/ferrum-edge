@@ -4880,6 +4880,10 @@ impl Plugin for AiTranscriptAudit {
         "ai_transcript_audit"
     }
 
+    fn is_authorize_plugin(&self) -> bool {
+        false
+    }
+
     fn priority(&self) -> u16 {
         super::priority::AI_TRANSCRIPT_AUDIT
     }

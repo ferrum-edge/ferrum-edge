@@ -616,6 +616,10 @@ impl Plugin for WsRateLimiting {
         "ws_rate_limiting"
     }
 
+    fn is_authorize_plugin(&self) -> bool {
+        false
+    }
+
     fn priority(&self) -> u16 {
         super::priority::WS_RATE_LIMITING
     }
@@ -729,6 +733,10 @@ struct WsRateLimitingSession {
 impl Plugin for WsRateLimitingSession {
     fn name(&self) -> &str {
         "ws_rate_limiting"
+    }
+
+    fn is_authorize_plugin(&self) -> bool {
+        false
     }
 
     fn priority(&self) -> u16 {

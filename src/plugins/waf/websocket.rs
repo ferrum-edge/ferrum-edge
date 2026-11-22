@@ -518,6 +518,10 @@ impl Plugin for WafWsSession {
         self.waf.name()
     }
 
+    fn is_authorize_plugin(&self) -> bool {
+        false
+    }
+
     fn priority(&self) -> u16 {
         self.waf.priority()
     }

@@ -385,6 +385,10 @@ impl Plugin for MeshBpfMetrics {
         PLUGIN_NAME
     }
 
+    fn is_authorize_plugin(&self) -> bool {
+        false
+    }
+
     fn priority(&self) -> u16 {
         priority::MESH_BPF_METRICS
     }
