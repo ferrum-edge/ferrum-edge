@@ -47123,6 +47123,7 @@ async fn handle_proxy_request_inner(
             || buffered_response_trailers.is_some()
             || sticky_cookie_needed
             || ctx.gateway_capacity_response_selected()
+            || ctx.charged_backend_deadline_terminal()
             || capabilities.has(PluginCapabilities::HAS_AFTER_PROXY_HOOK)
             || capabilities.has(PluginCapabilities::HAS_RESPONSE_COMMITTED_HOOK)
             || capabilities.has(PluginCapabilities::HAS_RESPONSE_STREAM_HOOKS)
@@ -47390,7 +47391,13 @@ async fn handle_proxy_request_inner(
     // still replace the backend response here (for example, content-length fast-path
     // enforcement in response_size_limiting).
     let mut after_proxy_rejected = false;
-    if capabilities.has(PluginCapabilities::HAS_AFTER_PROXY_HOOK) {
+    if capabilities.has(PluginCapabilities::HAS_AFTER_PROXY_HOOK)
+        || (!plugins.is_empty()
+            && (ctx.charged_backend_deadline_terminal()
+                || ctx.grpc_deadline_at().is_some()
+                || grpc_web_request
+                || ctx.route_override_response_transform.is_some()))
+    {
         let phase_start = Instant::now();
         if ctx.gateway_capacity_response_selected()
             && let ResponseBody::Buffered(capacity_body) = &mut response_body

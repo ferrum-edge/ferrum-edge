@@ -6008,7 +6008,11 @@ impl PluginCapabilities {
     pub const HAS_ON_REQUEST_RECEIVED_HOOK: u32 = 1 << 23;
     /// At least one plugin in the view declares `PluginHooks::BEFORE_PROXY`.
     pub const HAS_BEFORE_PROXY_HOOK: u32 = 1 << 24;
-    /// At least one plugin in the view declares `PluginHooks::AFTER_PROXY`.
+    /// At least one plugin in the view may participate in `run_after_proxy_hooks`
+    /// (`PluginHooks::AFTER_PROXY`, route response-header finalization, or any
+    /// non-built-in/custom plugin, which may override auxiliary response-header
+    /// trait hooks such as `enforces_final_client_visible_response_headers` or
+    /// `on_final_response_headers` without declaring `PluginHooks::AFTER_PROXY`).
     pub const HAS_AFTER_PROXY_HOOK: u32 = 1 << 25;
     /// At least one plugin in the view consumes a terminal `TransactionSummary`
     /// or response-stream completion (`PluginHooks::LOG`,
@@ -6154,6 +6158,14 @@ pub struct PluginPhaseData {
     /// members would produce a digest that matches while an undescribed
     /// transform silently changes.
     pub response_presentation_policy_digest: Option<[u8; 32]>,
+}
+
+/// Test-only helper exposing the precomputed `PluginCapabilities` for an
+/// arbitrary plugin slice (including custom test plugins).
+pub(crate) fn plugin_capabilities_for_plugins_for_test(
+    plugins: &[Arc<dyn Plugin>],
+) -> PluginCapabilities {
+    build_phase_data(plugins).capabilities
 }
 
 /// Build `PluginPhaseData` from a protocol-filtered plugin list.
@@ -6331,7 +6343,10 @@ fn build_phase_data(plugins: &[Arc<dyn Plugin>]) -> PluginPhaseData {
         if hooks.contains(crate::plugins::PluginHooks::BEFORE_PROXY) {
             caps |= PluginCapabilities::HAS_BEFORE_PROXY_HOOK;
         }
-        if hooks.contains(crate::plugins::PluginHooks::AFTER_PROXY) {
+        if hooks.contains(crate::plugins::PluginHooks::AFTER_PROXY)
+            || p.participates_in_route_response_header_finalization()
+            || !crate::plugins::is_builtin_plugin(p.as_ref())
+        {
             caps |= PluginCapabilities::HAS_AFTER_PROXY_HOOK;
         }
         if hooks.contains(crate::plugins::PluginHooks::LOG)

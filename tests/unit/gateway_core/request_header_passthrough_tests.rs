@@ -8,13 +8,20 @@
 //! (repeated names, non-UTF-8 values, reserved gateway assertions) stays on the
 //! materialized path.
 
+use std::collections::HashMap;
+use std::sync::Arc;
+
+use async_trait::async_trait;
 use ferrum_edge::_test_support::{
-    RequestHeaderPassthroughProbe, preserved_response_content_length_parity_for_test,
+    RequestHeaderPassthroughProbe, plugin_capabilities_for_plugins_for_test,
+    preserved_response_content_length_parity_for_test,
     request_header_passthrough_overlay_probe_for_test, request_header_passthrough_probe_for_test,
-    response_header_passthrough_parity_for_test,
+    response_header_passthrough_parity_for_test, run_after_proxy_hooks_reject_for_test,
 };
 use ferrum_edge::config::types::{GatewayConfig, PluginScope};
-use ferrum_edge::plugins::{ProxyProtocol, create_plugin};
+use ferrum_edge::plugins::{
+    Plugin, PluginHooks, PluginResult, ProxyProtocol, RequestContext, create_plugin,
+};
 use ferrum_edge::{PluginCache, PluginCapabilities};
 use http::{HeaderMap, HeaderName, HeaderValue};
 use serde_json::json;
@@ -548,4 +555,64 @@ fn deferred_response_header_lane_matches_materialized_wire_headers() {
         preserved_response_content_length_parity_for_test(block(&[("content-length", b"42")]), 204),
         (None, None),
     );
+}
+
+struct CustomFinalHeaderPolicyPlugin;
+
+#[async_trait]
+impl Plugin for CustomFinalHeaderPolicyPlugin {
+    fn name(&self) -> &str {
+        "custom_final_header_policy"
+    }
+
+    fn lifecycle_hooks(&self) -> PluginHooks {
+        PluginHooks::NONE
+    }
+
+    fn enforces_final_client_visible_response_headers(&self, _ctx: &RequestContext) -> bool {
+        true
+    }
+
+    async fn finalize_client_visible_response_headers(
+        &self,
+        _ctx: &mut RequestContext,
+        _response_status: u16,
+        response_headers: &HashMap<String, String>,
+    ) -> PluginResult {
+        if response_headers.contains_key("x-forbidden") {
+            PluginResult::Reject {
+                status_code: 451,
+                body: r#"{"error":"forbidden header"}"#.to_string(),
+                headers: HashMap::new(),
+            }
+        } else {
+            PluginResult::Continue
+        }
+    }
+}
+
+#[tokio::test]
+async fn custom_plugin_with_none_lifecycle_hooks_retains_after_proxy_phase() {
+    let plugins: Vec<Arc<dyn Plugin>> = vec![Arc::new(CustomFinalHeaderPolicyPlugin)];
+    let caps = plugin_capabilities_for_plugins_for_test(&plugins);
+    assert!(
+        caps.has(PluginCapabilities::HAS_AFTER_PROXY_HOOK),
+        "custom plugins must retain HAS_AFTER_PROXY_HOOK even when lifecycle_hooks() returns NONE"
+    );
+    assert!(
+        !caps.has(PluginCapabilities::SUPPORTS_REQUEST_HEADER_PASSTHROUGH),
+        "custom plugins must never qualify for built-in key_auth request-header passthrough"
+    );
+
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "GET".to_string(),
+        "/api/test".to_string(),
+    );
+    let mut response_headers = HashMap::from([("x-forbidden".to_string(), "1".to_string())]);
+    let reject =
+        run_after_proxy_hooks_reject_for_test(&plugins, &mut ctx, 200, &mut response_headers)
+            .await
+            .expect("custom final response-header policy must reject forbidden response header");
+    assert_eq!(reject.0, 451);
 }

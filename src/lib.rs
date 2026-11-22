@@ -10258,6 +10258,12 @@ pub mod _test_support {
         .await;
     }
 
+    pub fn plugin_capabilities_for_plugins_for_test(
+        plugins: &[Arc<dyn Plugin>],
+    ) -> crate::PluginCapabilities {
+        crate::plugin_cache::plugin_capabilities_for_plugins_for_test(plugins)
+    }
+
     pub async fn run_after_proxy_hooks_for_test(
         plugins: &[Arc<dyn Plugin>],
         ctx: &mut crate::plugins::RequestContext,

@@ -36,6 +36,17 @@ const GATED_HOOKS: &[(&str, &str)] = &[
     ("after_proxy", "AFTER_PROXY"),
     ("observe_origin_http_response_status", "AFTER_PROXY"),
     ("enforces_origin_response_header_policy", "AFTER_PROXY"),
+    ("on_final_response_headers", "AFTER_PROXY"),
+    (
+        "enforces_final_client_visible_response_headers",
+        "AFTER_PROXY",
+    ),
+    ("finalize_client_visible_response_headers", "AFTER_PROXY"),
+    (
+        "participates_in_route_response_header_finalization",
+        "AFTER_PROXY",
+    ),
+    ("may_enforce_response_body_policy", "AFTER_PROXY"),
     ("log", "LOG"),
     ("log_with_mesh_key", "LOG"),
     (
