@@ -326,30 +326,6 @@ impl SecurityHeaders {
     }
 
     fn apply(&self, headers: &mut HashMap<String, String>) {
-        // Production response maps arrive with canonical lowercase wire names.
-        // When every key is already lowercase and we are overriding existing
-        // entries, direct O(1) removes and inserts avoid scanning the entire
-        // map against every configured policy header name (O(R * P) -> O(R + P)).
-        let all_keys_lowercase = headers
-            .keys()
-            .all(|key| !key.bytes().any(|b| b.is_ascii_uppercase()));
-        if self.override_existing && all_keys_lowercase {
-            for name in &self.remove {
-                headers.remove(name.as_str());
-            }
-            for entry in &self.set {
-                if let Some(existing) = headers.get_mut(entry.name.as_str()) {
-                    if existing.as_str() != entry.value.as_str() {
-                        existing.clear();
-                        existing.push_str(&entry.value);
-                    }
-                } else {
-                    headers.insert(entry.name.clone(), entry.value.clone());
-                }
-            }
-            return;
-        }
-
         // One pass over the response map drops every case-insensitive copy of
         // a removed name and, when overriding, of every set name. `set` names
         // are unique, and `policy_header_names` is exactly `remove` ∪ `set`.
@@ -359,13 +335,7 @@ impl SecurityHeaders {
             &self.remove
         };
         if !dropped.is_empty() {
-            if all_keys_lowercase {
-                for name in dropped {
-                    headers.remove(name.as_str());
-                }
-            } else {
-                headers.retain(|key, _| !dropped.iter().any(|name| key.eq_ignore_ascii_case(name)));
-            }
+            headers.retain(|key, _| !dropped.iter().any(|name| key.eq_ignore_ascii_case(name)));
         }
         for entry in &self.set {
             if self.override_existing {
