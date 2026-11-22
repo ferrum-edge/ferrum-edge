@@ -34,7 +34,7 @@ use std::collections::HashSet;
 
 use async_trait::async_trait;
 use http::header::HeaderName;
-use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode};
+use jsonwebtoken::{Algorithm, DecodingKey, Validation, dangerous::insecure_decode, decode};
 use serde_json::Value;
 use tracing::debug;
 
@@ -56,78 +56,10 @@ use super::{RequestContext, strip_auth_scheme};
 
 /// Unsafe validation that skips signature verification, used only to extract
 /// claims before looking up the consumer's secret for proper verification.
-enum UnverifiedClaimLookup {
-    Malformed,
-    Missing,
-    Found(String),
-}
-
-/// Extract a single string claim from an unverified JWT payload without
-/// materializing the outer `serde_json::Map` or non-target key strings.
-/// Preserves `insecure_decode` structural validation (3 dot-separated segments,
-/// valid JWT header, strict `serde_json::Value` validation of every claim).
-fn extract_unverified_string_claim(token: &str, claim_field: &str) -> UnverifiedClaimLookup {
-    use base64::Engine as _;
-    use serde::de::{DeserializeSeed, Deserializer, MapAccess, Visitor};
-
-    struct SingleStringClaimSeed<'a>(&'a str);
-
-    impl<'de, 'a> DeserializeSeed<'de> for SingleStringClaimSeed<'a> {
-        type Value = Option<String>;
-
-        fn deserialize<D: Deserializer<'de>>(
-            self,
-            deserializer: D,
-        ) -> Result<Self::Value, D::Error> {
-            struct ClaimMapVisitor<'a>(&'a str);
-
-            impl<'de, 'a> Visitor<'de> for ClaimMapVisitor<'a> {
-                type Value = Option<String>;
-
-                fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                    f.write_str("a JSON object")
-                }
-
-                fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
-                    let mut found = None;
-                    while let Some(key) = map.next_key::<std::borrow::Cow<'de, str>>()? {
-                        let val: serde_json::Value = map.next_value()?;
-                        if key.as_ref() == self.0 {
-                            found = val.as_str().map(str::to_owned);
-                        }
-                    }
-                    Ok(found)
-                }
-            }
-
-            deserializer.deserialize_map(ClaimMapVisitor(self.0))
-        }
-    }
-
-    let mut parts = token.split('.');
-    let _header = match parts.next() {
-        Some(h) if !h.is_empty() => h,
-        _ => return UnverifiedClaimLookup::Malformed,
-    };
-    let Some(payload_b64) = parts.next() else {
-        return UnverifiedClaimLookup::Malformed;
-    };
-    if parts.next().is_none() || parts.next().is_some() {
-        return UnverifiedClaimLookup::Malformed;
-    }
-    if jsonwebtoken::decode_header(token).is_err() {
-        return UnverifiedClaimLookup::Malformed;
-    }
-    let Ok(payload_bytes) = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(payload_b64)
-    else {
-        return UnverifiedClaimLookup::Malformed;
-    };
-    let mut de = serde_json::Deserializer::from_slice(&payload_bytes);
-    match SingleStringClaimSeed(claim_field).deserialize(&mut de) {
-        Ok(Some(value)) if de.end().is_ok() => UnverifiedClaimLookup::Found(value),
-        Ok(None) if de.end().is_ok() => UnverifiedClaimLookup::Missing,
-        _ => UnverifiedClaimLookup::Malformed,
-    }
+fn decode_claims_only(token: &str) -> Option<serde_json::Value> {
+    insecure_decode::<serde_json::Value>(token)
+        .ok()
+        .map(|td| td.claims)
 }
 
 pub struct JwtAuth {
@@ -397,15 +329,22 @@ impl AuthMechanism for JwtAuth {
             return VerifyOutcome::NotApplicable;
         };
 
-        // O(1) lookup: extract only the identity claim without building a full
-        // `serde_json::Value` DOM, then look up the consumer and verify.
-        let identity = match extract_unverified_string_claim(&token, &self.consumer_claim_field) {
-            UnverifiedClaimLookup::Found(identity) => identity,
-            UnverifiedClaimLookup::Malformed => {
+        // O(1) lookup: decode claims without verification to extract identity,
+        // then look up the consumer by identity and verify with their secret only.
+        let claims = match decode_claims_only(&token) {
+            Some(claims) => claims,
+            None => {
                 debug!("jwt_auth: failed to decode JWT structure");
                 return VerifyOutcome::Invalid(r#"{"error":"Invalid JWT token"}"#.into());
             }
-            UnverifiedClaimLookup::Missing => {
+        };
+
+        let identity = match claims
+            .get(&self.consumer_claim_field)
+            .and_then(|value| value.as_str())
+        {
+            Some(identity) => identity,
+            None => {
                 debug!(
                     "jwt_auth: JWT missing identity claim '{}'",
                     self.consumer_claim_field
@@ -414,7 +353,6 @@ impl AuthMechanism for JwtAuth {
             }
         };
 
-        let identity = identity.as_str();
         let consumer = match consumer_index.find_by_identity(identity) {
             Some(consumer) => consumer,
             None => {
