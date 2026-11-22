@@ -141,6 +141,7 @@ Contributing to Ferrum Edge itself.
 | [release_platform_build_study.md](release_platform_build_study.md) | Non-publishing macOS/Windows/Linux release-build timing study (dated study; lane retired) |
 | [plans/diagnostic_ref_cross_replica_adr.md](plans/diagnostic_ref_cross_replica_adr.md) | ADR: diagnostic reference lookup across replicas |
 | [plans/mesh_multicluster_lifecycle_adr.md](plans/mesh_multicluster_lifecycle_adr.md) | ADR: mesh multicluster lifecycle |
+| [plans/mesh_virtualservice_servicewaypoint.md](plans/mesh_virtualservice_servicewaypoint.md) | Design spec: ServiceWaypoint VirtualService `http[]` routing, cross-namespace destinations, and live E2E infrastructure (#7423) |
 | [plans/node_waypoint_transport_adr.md](plans/node_waypoint_transport_adr.md) | ADR: NodeWaypoint secured transport |
 | [plans/test_framework_scripted_backends.md](plans/test_framework_scripted_backends.md) | Scripted-backend test framework record |
 

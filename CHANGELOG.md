@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- The release workflow's SQLite volume smoke (`scripts/smoke_sqlite_volume.sh`) now
+  accepts the default image's bare numeric `User` (`65532`, distroless `nonroot`),
+  which it previously rejected with "expected default UID/GID 65532:65532, got 65532"
+  even though the image runs as UID/GID 65532 as documented.
+
 ## [0.9.21] - 2026-11-21
 
 This patch release follows published 0.9.20. It was published on 2026-11-22
