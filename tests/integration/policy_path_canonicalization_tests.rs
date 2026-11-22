@@ -476,6 +476,7 @@ async fn escapes_that_cannot_be_forwarded_literally_never_reach_routing() {
     for raw in [
         "/admin%20reports",
         "/admin/%7Bid%7D",
+        "/admin%5Ereports",
         "/admin/caf%C3%A9",
         "/admin%5Bid%5D",
     ] {

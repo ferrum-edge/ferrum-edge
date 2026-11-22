@@ -1015,3 +1015,43 @@ fn direct_h1_request_target_matches_url_serialization() {
         }
     }
 }
+
+#[test]
+fn direct_h1_request_target_matches_url_serialization_across_all_ascii_bytes() {
+    use ferrum_edge::_test_support::direct_h1_origin_form_target_for_test as target;
+
+    // url 2.5.9+ percent-encodes `^` in paths (WHATWG PATH set) while keeping
+    // it literal in queries (SPECIAL_QUERY does not include `^`).
+    assert_eq!(
+        target("http://127.0.0.1:8080/a^b"),
+        Some("/a%5Eb".to_string())
+    );
+    assert_eq!(
+        target("http://127.0.0.1:8080/a^b|c[d]e"),
+        Some("/a%5Eb|c[d]e".to_string())
+    );
+    assert_eq!(
+        target("http://127.0.0.1:8080/p?q=a^b"),
+        Some("/p?q=a^b".to_string())
+    );
+
+    let check = |backend_url: &str| {
+        let parsed = url::Url::parse(backend_url).expect("valid URL");
+        let reqwest_target = parsed.as_str().parse::<http::Uri>().ok().map(|uri| {
+            uri.path_and_query()
+                .map_or_else(|| "/".to_string(), |pq| pq.as_str().to_string())
+        });
+        assert_eq!(target(backend_url), reqwest_target, "{backend_url:?}");
+    };
+
+    for byte in 0x00u8..=0x7Fu8 {
+        let ch = byte as char;
+        check(&format!("http://127.0.0.1:8080/x{ch}y"));
+        check(&format!("http://127.0.0.1:8080/p?k=x{ch}y"));
+    }
+
+    for ch in ['é', '€'] {
+        check(&format!("http://127.0.0.1:8080/x{ch}y"));
+        check(&format!("http://127.0.0.1:8080/p?k=x{ch}y"));
+    }
+}
