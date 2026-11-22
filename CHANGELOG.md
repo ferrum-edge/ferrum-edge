@@ -9,7 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [0.9.21] - 2026-11-21
 
-This patch release follows published 0.9.20. It fixes security advisories in
+This patch release follows published 0.9.20. It was published on 2026-11-22
+from commit `f9915358c8032214f4034a17c28cdf72d14006c3`; see the
+[publication record](docs/releases/v0.9.21-publication.md). It fixes security advisories in
 the authentication, `access_control`, `oidc_relying_party`, chargeback,
 `a2a_gateway`, transformer and AI plugins, the Admin API and the mesh. Sidecar
 and NodeWaypoint data planes now apply mesh VirtualService HTTP routes, the

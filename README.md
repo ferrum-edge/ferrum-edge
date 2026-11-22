@@ -568,8 +568,10 @@ publishes them in
 [ferrum-edge/ferrum-contracts](https://github.com/ferrum-edge/ferrum-contracts).
 Consumers (Nexus, Foundry, Anvil, Alloy, GitForgeOps) pin the
 `contracts-edge-<edge-version>` tags from that repository rather than reading
-Edge source. The current published Edge release is **v0.9.20**. Its matching
-Contracts tag is
+Edge source. The current published Edge release is **v0.9.21**, published on
+2026-11-22 from release commit `f9915358c8032214f4034a17c28cdf72d14006c3`. Its
+matching `contracts-edge-0.9.21` tag has not been cut yet; until it is
+published, the latest Contracts pairing is v0.9.20. That Contracts tag is
 [`contracts-edge-0.9.20`](https://github.com/ferrum-edge/ferrum-contracts/releases/tag/contracts-edge-0.9.20)
 on commit `39da322083044c2e92617209e62983c92387f0ad`, published on
 2026-11-03 for Edge release commit
@@ -582,12 +584,12 @@ at `d96b0292a0f87647f7552f25e0e5ce1b4ae30f8b`. No `contracts-edge-0.9.18` tag
 exists because Edge v0.9.18 was tagged but never published. Earlier contract
 tags remain unchanged.
 
-The **v0.9.21 candidate** follows published v0.9.20 with security-advisory and
-correctness fixes, mesh VirtualService HTTP routes on Sidecar and NodeWaypoint
-data planes, and fail-closed enforcement of refused enforcing Istio security
-resources.
-Its protected production release and the matching `contracts-edge-0.9.21`
-publication must succeed before consumers move their pins. See the
+**v0.9.21** follows published v0.9.20 with security-advisory and correctness
+fixes, mesh VirtualService HTTP routes on Sidecar and NodeWaypoint data planes,
+and fail-closed enforcement of refused enforcing Istio security resources.
+Consumers move their pins to `contracts-edge-0.9.21` once it is published and
+they adopt Edge v0.9.21. See the
+[publication record](docs/releases/v0.9.21-publication.md) and the
 [upgrade guide](docs/upgrade_guide.md#upgrading-to-0921).
 
 **v0.9.20** follows published v0.9.19 with security and correctness fixes,
