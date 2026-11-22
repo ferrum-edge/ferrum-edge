@@ -19,6 +19,7 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SMOKE_SH = REPO_ROOT / "scripts" / "smoke_sqlite_volume.sh"
 VERIFY_PY = REPO_ROOT / "scripts" / "smoke_sqlite_volume_verify.py"
+SMOKE_WORKFLOW = REPO_ROOT / ".github" / "workflows" / "sqlite-volume-smoke.yml"
 
 _SPEC = importlib.util.spec_from_file_location("smoke_sqlite_volume_verify", VERIFY_PY)
 if _SPEC is None or _SPEC.loader is None:
@@ -355,6 +356,22 @@ class SmokeSqliteVolumeTests(unittest.TestCase):
         self.assertNotIn("65532|65532:65532|nonroot|nonroot:nonroot", shell_source)
         for token in PROCESS_API_TOKENS:
             self.assertNotIn(token, verify_source)
+
+    def test_pr_workflow_exercises_published_image_smoke(self) -> None:
+        workflow_source = SMOKE_WORKFLOW.read_text(encoding="utf-8")
+        for required in (
+            "pull_request:",
+            "- scripts/smoke_sqlite_volume.sh",
+            "- scripts/smoke_sqlite_volume_verify.py",
+            "- Dockerfile.release",
+            "- .github/workflows/sqlite-volume-smoke.yml",
+            "contents: read",
+            "persist-credentials: false",
+            "runs-on: ubuntu-26.04",
+            "timeout-minutes:",
+            "bash scripts/smoke_sqlite_volume.sh docker.io/ferrumedge/ferrum-edge:v0.9.21",
+        ):
+            self.assertIn(required, workflow_source)
 
 
 def run_self_test() -> list[str]:
