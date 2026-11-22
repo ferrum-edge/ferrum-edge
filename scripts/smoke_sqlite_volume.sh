@@ -7,6 +7,10 @@ if [[ $# -ne 1 || -z "$1" || "$1" == -* ]]; then
   echo "Usage: bash scripts/smoke_sqlite_volume.sh IMAGE" >&2
   exit 2
 fi
+if [[ ! -f scripts/smoke_sqlite_volume_verify.py ]]; then
+  echo "SQLite volume smoke failed: run from the repository root (missing scripts/smoke_sqlite_volume_verify.py)" >&2
+  exit 2
+fi
 image="$1"
 tmp="$(mktemp -d "${TMPDIR:-/tmp}/ferrum-sqlite-volume.XXXXXX")"
 migrate=""
@@ -39,12 +43,26 @@ migrate="$(docker create --network none \
   -e FERRUM_DB_TYPE=sqlite \
   -e 'FERRUM_DB_URL=sqlite:////data/ferrum.db?mode=rwc' \
   "$image" run)"
-runtime_user="$(docker inspect --format '{{.Config.User}}' "$migrate")"
-# distroless :nonroot reports a bare numeric UID ("65532"); its primary group is 65532.
-case "$runtime_user" in
-  65532|65532:65532|nonroot|nonroot:nonroot) ;;
-  *) fail "expected default UID/GID 65532:65532, got $runtime_user" ;;
-esac
+config_user="$(docker inspect --format '{{.Config.User}}' "$migrate")"
+passwd_tar=""
+if docker cp -L "$migrate:/etc/passwd" - > "$tmp/passwd.tar" 2>/dev/null; then
+  passwd_tar="$tmp/passwd.tar"
+else
+  rm -f "$tmp/passwd.tar"
+fi
+group_tar=""
+if docker cp -L "$migrate:/etc/group" - > "$tmp/group.tar" 2>/dev/null; then
+  group_tar="$tmp/group.tar"
+else
+  rm -f "$tmp/group.tar"
+fi
+resolved_identity="$(python3 -I scripts/smoke_sqlite_volume_verify.py resolve-user \
+  --config-user="$config_user" \
+  --passwd-tar="$passwd_tar" \
+  --group-tar="$group_tar" \
+  --expected-uid=65532 \
+  --expected-gid=65532)"
+
 docker start "$migrate" >/dev/null
 deadline=$((SECONDS + 60))
 while [[ "$(docker inspect --format '{{.State.Running}}' "$migrate")" == true ]]; do
@@ -53,8 +71,12 @@ while [[ "$(docker inspect --format '{{.State.Running}}' "$migrate")" == true ]]
 done
 [[ "$(docker inspect --format '{{.State.ExitCode}}' "$migrate")" == 0 ]] \
   || fail "migration exited unsuccessfully"
-docker cp "$migrate:/data/ferrum.db" "$tmp/migrated.db"
-[[ -s "$tmp/migrated.db" ]] || fail "migration did not create /data/ferrum.db"
+docker cp "$migrate:/data" - > "$tmp/migrated-data.tar"
+migrated_identity="$(python3 -I scripts/smoke_sqlite_volume_verify.py verify-data-tar \
+  --tar="$tmp/migrated-data.tar" \
+  --extract-db="$tmp/migrated.db" \
+  --expected-uid=65532 \
+  --expected-gid=65532)"
 
 # Share precisely the fresh volume initialized above, without mounting host data.
 gateway="$(docker create --network none --volumes-from "$migrate" \
@@ -64,6 +86,9 @@ gateway="$(docker create --network none --volumes-from "$migrate" \
   -e FERRUM_ADMIN_JWT_SECRET=sqlite-volume-smoke-only-admin-secret-65532 \
   -e FERRUM_SHUTDOWN_DRAIN_SECONDS=0 \
   "$image" run)"
+gateway_user="$(docker inspect --format '{{.Config.User}}' "$gateway")"
+[[ "$gateway_user" == "$config_user" ]] \
+  || fail "gateway Config.User drifted from migrate container ($gateway_user != $config_user)"
 
 wait_for_gateway() {
   local deadline=$((SECONDS + 60))
@@ -89,30 +114,15 @@ docker stop --time 30 "$gateway" >/dev/null
 [[ "$(docker inspect --format '{{.State.ExitCode}}' "$gateway")" == 0 ]] \
   || fail "gateway did not shut down cleanly"
 # Read a stopped database, avoiding an inconsistent copy of an active WAL.
-docker cp "$gateway:/data/ferrum.db" "$tmp/restarted.db"
-[[ -s "$tmp/restarted.db" ]] || fail "database disappeared after restart"
+docker cp "$gateway:/data" - > "$tmp/restarted-data.tar"
+restarted_identity="$(python3 -I scripts/smoke_sqlite_volume_verify.py verify-data-tar \
+  --tar="$tmp/restarted-data.tar" \
+  --extract-db="$tmp/restarted.db" \
+  --expected-uid=65532 \
+  --expected-gid=65532)"
 
-python3 - "$tmp/migrated.db" "$tmp/restarted.db" <<'PY'
-import sqlite3
-import sys
-from pathlib import Path
+python3 -I scripts/smoke_sqlite_volume_verify.py verify-migrations \
+  --migrated="$tmp/migrated.db" \
+  --restarted="$tmp/restarted.db"
 
-
-def migration_records(path):
-    with sqlite3.connect(Path(path).resolve().as_uri() + "?mode=ro", uri=True) as db:
-        if db.execute("PRAGMA integrity_check").fetchall() != [("ok",)]:
-            raise SystemExit(f"SQLite integrity check failed: {path}")
-        rows = db.execute(
-            "SELECT version, name, applied_at, checksum, execution_time_ms "
-            "FROM _ferrum_migrations ORDER BY version"
-        ).fetchall()
-        if not rows:
-            raise SystemExit(f"No applied migrations in {path}")
-        return rows
-
-
-if migration_records(sys.argv[1]) != migration_records(sys.argv[2]):
-    raise SystemExit("Original SQLite migration records did not persist across restart")
-PY
-
-echo "SQLite volume smoke passed for $image (default user $runtime_user)"
+echo "SQLite volume smoke passed for $image (Config.User=$config_user, resolved=$resolved_identity, db=$migrated_identity/$restarted_identity)"

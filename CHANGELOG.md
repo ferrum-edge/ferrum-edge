@@ -10,9 +10,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - The release workflow's SQLite volume smoke (`scripts/smoke_sqlite_volume.sh`) now
-  accepts the default image's bare numeric `User` (`65532`, distroless `nonroot`),
-  which it previously rejected with "expected default UID/GID 65532:65532, got 65532"
-  even though the image runs as UID/GID 65532 as documented.
+  resolves the container's configured `Config.User` (including distroless `nonroot`'s
+  bare numeric `65532`) against `/etc/passwd` and `/etc/group` inside the image rather
+  than assuming a bare UID or username's primary group, verifies that `/data` (with
+  no setgid bit) and the created `/data/ferrum.db` are owned by `65532:65532` across
+  migration and restart, and is exercised on pull requests against the published
+  image via `.github/workflows/sqlite-volume-smoke.yml`.
 
 ## [0.9.21] - 2026-11-21
 
