@@ -18,6 +18,9 @@ from test_release_dispatch import run_self_test as release_dispatch_self_test
 from test_latest_trusted_scheduled_runs import (
     run_self_test as latest_trusted_scheduled_runs_self_test,
 )
+from test_smoke_sqlite_volume import (
+    run_self_test as smoke_sqlite_volume_self_test,
+)
 from test_unit_ci import (
     check_repository as unit_ci_contract_errors,
     self_test as unit_ci_self_test,
@@ -2345,6 +2348,7 @@ def main() -> int:
     planner_errors.extend(ci_policy_parallel_self_test())
     planner_errors.extend(release_dispatch_self_test())
     planner_errors.extend(latest_trusted_scheduled_runs_self_test())
+    planner_errors.extend(smoke_sqlite_volume_self_test())
     planner_errors.extend(merge_group_self_test())
     planner_errors.extend(optional_live_suite_self_test())
 
