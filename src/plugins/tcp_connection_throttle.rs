@@ -61,17 +61,51 @@ impl TcpConnectionThrottleState {
         key: String,
         max_connections_per_key: u64,
     ) -> Option<(String, Arc<ConnectionCounter>)> {
-        match self.active_counts.entry(key) {
-            Entry::Occupied(entry) => {
-                let counter = Arc::clone(entry.get());
-                let active = counter.active.load(Ordering::Relaxed);
+        // Shared-read fast path: when the key already has an active entry
+        // (`active >= 1`), atomically increment via CAS without taking an
+        // exclusive DashMap shard write lock. An entry transitions `1 -> 0`
+        // only while `release` holds the exclusive shard write lock immediately
+        // before removal, so `active >= 1` guarantees this entry is still live.
+        if let Some(entry) = self.active_counts.get(&key) {
+            let counter = entry.value();
+            let mut active = counter.active.load(Ordering::Acquire);
+            loop {
+                if active == 0 {
+                    break;
+                }
                 if active >= max_connections_per_key {
                     return None;
                 }
-                // The DashMap entry guard serializes admission and release for
-                // this key, so the increment cannot land on a detached entry.
-                counter.active.store(active + 1, Ordering::Relaxed);
-                Some((entry.key().clone(), counter))
+                match counter.active.compare_exchange_weak(
+                    active,
+                    active + 1,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                ) {
+                    Ok(_) => return Some((key, Arc::clone(counter))),
+                    Err(observed) => active = observed,
+                }
+            }
+        }
+
+        match self.active_counts.entry(key) {
+            Entry::Occupied(entry) => {
+                let counter = Arc::clone(entry.get());
+                let mut active = counter.active.load(Ordering::Acquire);
+                loop {
+                    if active >= max_connections_per_key {
+                        return None;
+                    }
+                    match counter.active.compare_exchange_weak(
+                        active,
+                        active + 1,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    ) {
+                        Ok(_) => return Some((entry.key().clone(), counter)),
+                        Err(observed) => active = observed,
+                    }
+                }
             }
             Entry::Vacant(entry) => {
                 let counter = Arc::new(ConnectionCounter {
@@ -85,6 +119,28 @@ impl TcpConnectionThrottleState {
     }
 
     fn release(&self, key: String, counter: Arc<ConnectionCounter>) {
+        // Shared-read fast path: decrement `active >= 2` in place without
+        // acquiring an exclusive shard write lock. Only the last active
+        // connection (`active == 1`) falls through to exclusive `.entry()` to
+        // transition `1 -> 0` and remove the map entry atomically.
+        if let Some(entry) = self.active_counts.get(&key) {
+            if !Arc::ptr_eq(entry.value(), &counter) {
+                return;
+            }
+            let mut active = counter.active.load(Ordering::Acquire);
+            while active >= 2 {
+                match counter.active.compare_exchange_weak(
+                    active,
+                    active - 1,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                ) {
+                    Ok(_) => return,
+                    Err(observed) => active = observed,
+                }
+            }
+        }
+
         let Entry::Occupied(entry) = self.active_counts.entry(key) else {
             return;
         };
@@ -92,21 +148,39 @@ impl TcpConnectionThrottleState {
             return;
         }
 
-        let active = counter.active.load(Ordering::Relaxed);
-        if active == 0 {
-            tracing::warn!(
-                plugin = "tcp_connection_throttle",
-                "ignored an already-released TCP connection admission permit"
-            );
-            return;
-        }
-        if active == 1 {
-            // Removal happens while the same shard entry is exclusively held.
-            // A concurrent admission therefore observes either this entry
-            // before removal or a fresh entry after removal, never both.
-            entry.remove();
-        } else {
-            counter.active.store(active - 1, Ordering::Relaxed);
+        let mut active = counter.active.load(Ordering::Acquire);
+        loop {
+            if active == 0 {
+                tracing::warn!(
+                    plugin = "tcp_connection_throttle",
+                    "ignored an already-released TCP connection admission permit"
+                );
+                return;
+            }
+            if active == 1 {
+                // Removal happens while the same shard entry is exclusively held.
+                // Setting `active` to `0` before removal ensures any concurrent
+                // shared-read observer sees `0` and falls through to `.entry()`.
+                if counter
+                    .active
+                    .compare_exchange_weak(1, 0, Ordering::AcqRel, Ordering::Acquire)
+                    .is_ok()
+                {
+                    entry.remove();
+                    return;
+                }
+                active = counter.active.load(Ordering::Acquire);
+            } else {
+                match counter.active.compare_exchange_weak(
+                    active,
+                    active - 1,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                ) {
+                    Ok(_) => return,
+                    Err(observed) => active = observed,
+                }
+            }
         }
     }
 

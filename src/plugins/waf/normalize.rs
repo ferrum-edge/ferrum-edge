@@ -1059,7 +1059,19 @@ fn percent_decode_plus(text: &str) -> Cow<'_, str> {
 fn percent_decode(text: &str, plus_is_space: bool) -> Cow<'_, str> {
     let bytes = text.as_bytes();
     let mut first = 0;
-    while first < bytes.len() && !percent_decodes_at(&bytes[first..], plus_is_space) {
+    while first < bytes.len() {
+        let next = if plus_is_space {
+            memchr::memchr2(b'%', b'+', &bytes[first..])
+        } else {
+            memchr::memchr(b'%', &bytes[first..])
+        };
+        let Some(offset) = next else {
+            return Cow::Borrowed(text);
+        };
+        first += offset;
+        if percent_decodes_at(&bytes[first..], plus_is_space) {
+            break;
+        }
         first += 1;
     }
     if first == bytes.len() {

@@ -154,7 +154,7 @@ pub struct GrpcMethodRouter {
     limit_by: String,
     limiter: RateLimitBackend<String, DynamicHttpRateLimitAlgorithm>,
     metrics: Arc<MetricsRegistry>,
-    request_counter: AtomicU64,
+    request_counter: crossbeam_utils::CachePadded<AtomicU64>,
     epoch_base: Instant,
     last_periodic_sweep_secs: AtomicU64,
 }
@@ -351,7 +351,7 @@ impl GrpcMethodRouter {
             )
             .map_err(|error| format!("grpc_method_router: {error}"))?,
             metrics: global_registry(),
-            request_counter: AtomicU64::new(0),
+            request_counter: crossbeam_utils::CachePadded::new(AtomicU64::new(0)),
             epoch_base: Instant::now(),
             last_periodic_sweep_secs: AtomicU64::new(0),
         })
@@ -465,18 +465,22 @@ impl GrpcMethodRouter {
 
     /// Evict entries with no recent activity to bound memory.
     fn evict_stale_entries(&self) {
-        self.evict_stale_entries_at(Instant::now());
-    }
-
-    fn evict_stale_entries_at(&self, now: Instant) {
-        // Sample every 1024 requests before any tracked_keys_count /
-        // cleanup work so the hot path avoids capacity bookkeeping on every
-        // request. Entry counts are atomic (not DashMap::len()).
         let request = self.request_counter.fetch_add(1, Ordering::Relaxed);
         if !request.is_multiple_of(EVICTION_CHECK_INTERVAL_REQUESTS) {
             return;
         }
+        self.evict_stale_entries_sampled_at(Instant::now());
+    }
 
+    fn evict_stale_entries_at(&self, now: Instant) {
+        let request = self.request_counter.fetch_add(1, Ordering::Relaxed);
+        if !request.is_multiple_of(EVICTION_CHECK_INTERVAL_REQUESTS) {
+            return;
+        }
+        self.evict_stale_entries_sampled_at(now);
+    }
+
+    fn evict_stale_entries_sampled_at(&self, now: Instant) {
         let len = self.limiter.tracked_keys_count();
         if len == 0 {
             return;
@@ -515,16 +519,12 @@ impl GrpcMethodRouter {
     ///
     /// Returns `None` when a previously unseen local/fallback key is denied at
     /// the hard cardinality cap (Redis-healthy admission is unaffected).
-    async fn check_rate(&self, key: &str, spec: &RateSpec) -> Option<RateLimitOutcome> {
+    async fn check_rate(&self, key: String, spec: &RateSpec) -> Option<RateLimitOutcome> {
         self.evict_stale_entries();
         self.limiter
-            .check_with_redis_key_and_local_capacity(
-                key.to_string(),
-                || key.to_string(),
-                &spec.op,
-                MAX_STATE_ENTRIES,
-            )
+            .check_same_key_with_local_capacity_attributed(key, &spec.op, MAX_STATE_ENTRIES)
             .await
+            .outcome
     }
 
     /// The most specific rate rule covering a method: exact, then
@@ -873,7 +873,15 @@ impl Plugin for GrpcMethodRouter {
         backend_path: &str,
     ) -> PluginResult {
         let parsed = parse_grpc_path(backend_path);
-        publish_grpc_method_metadata(&mut ctx.metadata, parsed);
+        // When routing left the gRPC path unchanged and `on_request_received`
+        // already published the parsed metadata, avoid re-allocating the 3
+        // metadata strings.
+        if backend_path != ctx.path
+            || parsed.is_none()
+            || !ctx.metadata.contains_key("grpc_full_method")
+        {
+            publish_grpc_method_metadata(&mut ctx.metadata, parsed);
+        }
         let (full_method, service) = match (ctx.metadata.get("grpc_full_method"), parsed) {
             (Some(method), Some((service, _))) => (method.as_str(), service),
             _ => {
@@ -925,7 +933,7 @@ impl Plugin for GrpcMethodRouter {
         // Check the most specific rate rule on the pinned selected method.
         if let Some(spec) = self.rate_spec_for(full_method, service) {
             let key = self.rate_key(ctx, &spec.rule);
-            match self.check_rate(&key, spec).await {
+            match self.check_rate(key, spec).await {
                 None => {
                     self.metrics.record_rate_limit_exceeded();
                     return PluginResult::Reject {

@@ -4403,7 +4403,11 @@ impl Plugin for BodyValidator {
     }
 
     fn lifecycle_hooks(&self) -> crate::plugins::PluginHooks {
-        crate::plugins::PluginHooks::BEFORE_PROXY | crate::plugins::PluginHooks::AFTER_PROXY
+        let mut hooks = crate::plugins::PluginHooks::BEFORE_PROXY;
+        if self.has_response_validation {
+            hooks |= crate::plugins::PluginHooks::AFTER_PROXY;
+        }
+        hooks
     }
 
     /// This plugin's enforcement decision is taken in the final request-body

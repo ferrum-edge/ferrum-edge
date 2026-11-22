@@ -207,7 +207,7 @@ const CREDENTIAL_QUERY_PARAM_MARKERS: &[&str] = &[
 /// into an `Arc<str>`. Keeping that reservation with the payload bounds both
 /// the transient assembly peak and every retry, even while new records queue.
 struct QueuedEntry {
-    json: Arc<str>,
+    json: String,
     _lease: Arc<WsByteLease>,
 }
 
@@ -1000,7 +1000,7 @@ impl WsLogging {
         let retained_bytes = retained_charge_for_serialized_len(writer.bytes.len());
         lease.shrink_to(retained_bytes);
         let json = match String::from_utf8(writer.bytes) {
-            Ok(line) => Arc::<str>::from(line),
+            Ok(line) => line,
             Err(error) => {
                 budget.record_drop(SinkLossReason::SinkError, "serialized entry was not UTF-8");
                 warn!(
@@ -1026,7 +1026,7 @@ fn serialize_under_byte_budget<T>(
     max_entry_bytes: usize,
     value: &T,
     kind: &str,
-) -> Option<(Arc<str>, Arc<WsByteLease>)>
+) -> Option<(String, Arc<WsByteLease>)>
 where
     T: serde::Serialize,
 {
@@ -1048,7 +1048,7 @@ where
     let retained_bytes = retained_charge_for_serialized_len(writer.bytes.len());
     lease.shrink_to(retained_bytes);
     match String::from_utf8(writer.bytes) {
-        Ok(line) => Some((Arc::<str>::from(line), lease)),
+        Ok(line) => Some((line, lease)),
         Err(error) => {
             byte_budget.record_drop(SinkLossReason::SinkError, "serialized entry was not UTF-8");
             warn!("WebSocket logging: serialized {kind} was not UTF-8: {error}");

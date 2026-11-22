@@ -402,8 +402,36 @@ struct ParameterValidator {
 }
 
 struct OperationBucket {
+    /// O(1) lookup for anchored literal path patterns whose exact match is
+    /// proven at construction time to win `path_regexes` first.
+    exact_paths: AHashMap<String, usize>,
     path_regexes: RegexSet,
     entries: Vec<OperationEntry>,
+}
+
+/// Extract an exact literal path from an anchored regex like `^/v1/users$`
+/// (containing no regex metacharacters or escapes outside `\/` or `\.`).
+fn extract_exact_literal_path(pattern: &str) -> Option<String> {
+    let body = pattern.strip_prefix('^')?.strip_suffix('$')?;
+    let mut out = String::with_capacity(body.len());
+    let mut chars = body.chars();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '\\' => {
+                let escaped = chars.next()?;
+                if matches!(escaped, '.' | '/' | '-' | '_' | '~' | ':' | '+' | '=') {
+                    out.push(escaped);
+                } else {
+                    return None;
+                }
+            }
+            '.' | '*' | '+' | '?' | '(' | ')' | '[' | ']' | '{' | '}' | '|' | '^' | '$' => {
+                return None;
+            }
+            other => out.push(other),
+        }
+    }
+    Some(out)
 }
 
 struct MediaValidator {
@@ -901,10 +929,19 @@ impl OpenapiValidator {
                     "openapi_validator: path regex set for {method:?} exceeds complexity limits"
                 )
             })?;
+            let mut exact_paths = AHashMap::new();
+            for (idx, (pattern, _)) in entries.iter().enumerate() {
+                if let Some(literal) = extract_exact_literal_path(pattern)
+                    && path_regexes.matches(&literal).into_iter().next() == Some(idx)
+                {
+                    exact_paths.insert(literal, idx);
+                }
+            }
             let entries = entries.into_iter().map(|(_, entry)| entry).collect();
             ops_by_method.push((
                 method,
                 OperationBucket {
+                    exact_paths,
                     path_regexes,
                     entries,
                 },
@@ -1067,14 +1104,12 @@ impl OpenapiValidator {
             .ops_by_method
             .iter()
             .position(|(key, _)| key.eq_ignore_ascii_case(method))?;
-        let entry_index = self
-            .ops_by_method
-            .get(bucket_index)?
-            .1
-            .path_regexes
-            .matches(path)
-            .into_iter()
-            .next()?;
+        let bucket = &self.ops_by_method.get(bucket_index)?.1;
+        let entry_index = if let Some(&idx) = bucket.exact_paths.get(path) {
+            idx
+        } else {
+            bucket.path_regexes.matches(path).into_iter().next()?
+        };
         self.operation_at((bucket_index, entry_index))
     }
 
@@ -1571,7 +1606,11 @@ impl Plugin for OpenapiValidator {
     }
 
     fn lifecycle_hooks(&self) -> crate::plugins::PluginHooks {
-        crate::plugins::PluginHooks::BEFORE_PROXY | crate::plugins::PluginHooks::AFTER_PROXY
+        let mut hooks = crate::plugins::PluginHooks::BEFORE_PROXY;
+        if self.requires_response_body_buffering() {
+            hooks |= crate::plugins::PluginHooks::AFTER_PROXY;
+        }
+        hooks
     }
 
     /// The request contract is normally decided in
@@ -3721,10 +3760,14 @@ fn body_to_schema_instance(
     let schema = validator.schema.as_ref();
     let encoding = &validator.encoding;
     let conversion = &validator.conversion;
-    let media_type = content_type_base(content_type)
-        .map(str::to_ascii_lowercase)
-        .unwrap_or_default();
-    if is_json_media_type(&media_type) {
+    let media_type: std::borrow::Cow<'_, str> = match content_type_base(content_type) {
+        Some(base) if !base.bytes().any(|b| b.is_ascii_uppercase()) => {
+            std::borrow::Cow::Borrowed(base)
+        }
+        Some(base) => std::borrow::Cow::Owned(base.to_ascii_lowercase()),
+        None => std::borrow::Cow::Borrowed(""),
+    };
+    if is_json_media_type(media_type.as_ref()) {
         // Screen for duplicate object member names BEFORE the schema sees a
         // `serde_json`-collapsed view of the document (advisory
         // `GHSA-c78j-5w9p-cpq6`). Validating the last-wins value while
