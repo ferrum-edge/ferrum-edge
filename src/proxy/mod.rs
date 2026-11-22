@@ -3181,6 +3181,7 @@ async fn reject_inbound_connect_relay_pre_plugin(
     state: &ProxyState,
     epoch: &RequestEpoch,
     ctx: &mut RequestContext,
+    request_scheme: &'static str,
     refusal: &InboundConnectRelayRefusal,
     is_udp_connect: bool,
     start_time: Instant,
@@ -3192,6 +3193,12 @@ async fn reject_inbound_connect_relay_pre_plugin(
         crate::modes::mesh::MESH_INBOUND_HBONE_RELAY_PROXY_ID,
         ProxyProtocol::Http,
     );
+    if !plugins.is_empty() && !ctx.metadata.contains_key("ferrum.frontend_scheme") {
+        ctx.metadata.insert(
+            "ferrum.frontend_scheme".to_string(),
+            request_scheme.to_string(),
+        );
+    }
     reject_inbound_connect_relay_synthesis_with_plugins(
         state,
         &plugins,
@@ -37574,6 +37581,7 @@ async fn handle_proxy_request_inner(
             &state,
             &epoch,
             &mut ctx,
+            request_scheme,
             &refusal,
             false,
             start_time,
@@ -37681,6 +37689,7 @@ async fn handle_proxy_request_inner(
                         &state,
                         &epoch,
                         &mut ctx,
+                        request_scheme,
                         &refusal,
                         is_udp_hbone_connect,
                         start_time,
