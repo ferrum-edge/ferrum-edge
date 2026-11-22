@@ -1752,6 +1752,33 @@ where
         }
     }
 
+    /// Same as [`Self::check_with_redis_key_and_local_capacity_attributed`] when
+    /// the local key and Redis key are identical `String`s, avoiding an extra
+    /// `String::clone()` on the local hot path.
+    pub async fn check_same_key_with_local_capacity_attributed(
+        &self,
+        key: String,
+        op: &A::Op,
+        max_entries: usize,
+    ) -> RateLimitDecision
+    where
+        K: From<String>,
+    {
+        match self {
+            Self::Local(local) => {
+                let outcome =
+                    local.check_at_with_capacity(K::from(key), op, Instant::now(), max_entries);
+                RateLimitDecision::local_only(outcome)
+            }
+            Self::Failover(failover) => {
+                let redis_key = key.clone();
+                failover
+                    .check_with_local_capacity_attributed(K::from(key), &redis_key, op, max_entries)
+                    .await
+            }
+        }
+    }
+
     /// [`Self::check_with_redis_key_and_local_capacity_attributed`] without the
     /// provenance. None denies only a previously unseen local key.
     pub async fn check_with_redis_key_and_local_capacity<F>(

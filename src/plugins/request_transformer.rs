@@ -1257,7 +1257,11 @@ impl Plugin for RequestTransformer {
     }
 
     fn lifecycle_hooks(&self) -> crate::plugins::PluginHooks {
-        crate::plugins::PluginHooks::BEFORE_PROXY
+        if self.rules_enabled {
+            crate::plugins::PluginHooks::BEFORE_PROXY
+        } else {
+            crate::plugins::PluginHooks::NONE
+        }
     }
 
     fn supported_protocols(&self) -> &'static [super::ProxyProtocol] {
@@ -1405,8 +1409,12 @@ impl Plugin for RequestTransformer {
                 }
                 HeaderOp::Update => match rule.authored_value(ctx, &original_query) {
                     Ok(val) => {
-                        let val = val.into_owned();
-                        headers.insert(rule.key.clone(), val);
+                        if let Some(existing) = headers.get_mut(&rule.key) {
+                            existing.clear();
+                            existing.push_str(val.as_ref());
+                        } else {
+                            headers.insert(rule.key.clone(), val.into_owned());
+                        }
                         debug!("request_transformer: set header {}", rule.key);
                     }
                     Err(reason) => rule_skipped = Some(reason),
@@ -1581,16 +1589,24 @@ fn apply_query_rules(
     // not relocate or re-encode the authenticated secret onto the outbound
     // query or the plugin-visible map. The proxy still applies a final strip
     // pass as defense in depth.
-    let strip_names: HashSet<&str> = ctx
-        .metadata
-        .keys()
-        .filter_map(|key| {
-            key.strip_prefix(
-                crate::plugins::utils::token_extract::STRIP_QUERY_PARAM_METADATA_PREFIX,
-            )
-        })
-        .collect();
-    let mut query_mutated = ordered.remove_matching_names(&strip_names);
+    let mut query_mutated = if ctx.metadata.is_empty() {
+        false
+    } else {
+        let strip_names: HashSet<&str> = ctx
+            .metadata
+            .keys()
+            .filter_map(|key| {
+                key.strip_prefix(
+                    crate::plugins::utils::token_extract::STRIP_QUERY_PARAM_METADATA_PREFIX,
+                )
+            })
+            .collect();
+        if strip_names.is_empty() {
+            false
+        } else {
+            ordered.remove_matching_names(&strip_names)
+        }
+    };
 
     for rule in &plugin.query_rules {
         match rule.operation {

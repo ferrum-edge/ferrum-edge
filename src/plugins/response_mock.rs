@@ -538,19 +538,29 @@ impl ResponseMock {
             })
         });
 
-        let regex_may_match = !self.regex_rule_indices.is_empty()
-            && self.regex_set.as_ref().is_none_or(|set| set.is_match(path));
-        let regex = if regex_may_match {
-            self.regex_rule_indices
-                .iter()
-                .copied()
-                .take_while(|&index| exact.is_none_or(|candidate| index < candidate))
-                .find(|&index| {
-                    self.rules.get(index).is_some_and(|rule| {
-                        rule.path_regex.as_ref().is_some_and(|re| re.is_match(path))
-                            && rule.matches_request(method, ctx)
+        let regex = if !self.regex_rule_indices.is_empty() {
+            if let Some(set) = self.regex_set.as_ref() {
+                set.matches(path)
+                    .into_iter()
+                    .filter_map(|pattern_idx| self.regex_rule_indices.get(pattern_idx).copied())
+                    .take_while(|&index| exact.is_none_or(|candidate| index < candidate))
+                    .find(|&index| {
+                        self.rules
+                            .get(index)
+                            .is_some_and(|rule| rule.matches_request(method, ctx))
                     })
-                })
+            } else {
+                self.regex_rule_indices
+                    .iter()
+                    .copied()
+                    .take_while(|&index| exact.is_none_or(|candidate| index < candidate))
+                    .find(|&index| {
+                        self.rules.get(index).is_some_and(|rule| {
+                            rule.path_regex.as_ref().is_some_and(|re| re.is_match(path))
+                                && rule.matches_request(method, ctx)
+                        })
+                    })
+            }
         } else {
             None
         };

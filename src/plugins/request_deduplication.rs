@@ -1896,6 +1896,60 @@ impl RequestDeduplication {
         now: Instant,
         owner_token: &str,
     ) -> LocalDeduplicationAction {
+        // Fast shared-read path: live completed replays, barriers, and active
+        // in-flight conflicts need no exclusive shard write lock and no key
+        // `String` allocation. Expired entries fall through to the exclusive
+        // `.entry()` path below.
+        if let Some(existing) = self.local.local_cache.get(key) {
+            match existing.value() {
+                DeduplicationEntry::Completed {
+                    cached,
+                    fingerprint: cached_fingerprint,
+                    pending_publication,
+                    ..
+                } if now.duration_since(cached.inserted_at) < cached.retention => {
+                    if cached_fingerprint != fingerprint {
+                        return LocalDeduplicationAction::Conflict(
+                            DeduplicationConflict::FingerprintMismatch,
+                        );
+                    }
+                    if *pending_publication {
+                        return LocalDeduplicationAction::Conflict(DeduplicationConflict::InFlight);
+                    }
+                    return LocalDeduplicationAction::Replay(cached.clone());
+                }
+                DeduplicationEntry::ExecutionBarrier {
+                    inserted_at,
+                    retention,
+                    fingerprint: cached_fingerprint,
+                    ..
+                } if now.duration_since(*inserted_at) < *retention => {
+                    return if cached_fingerprint == fingerprint {
+                        LocalDeduplicationAction::Conflict(DeduplicationConflict::InFlight)
+                    } else {
+                        LocalDeduplicationAction::Conflict(
+                            DeduplicationConflict::FingerprintMismatch,
+                        )
+                    };
+                }
+                DeduplicationEntry::InFlight {
+                    started_at,
+                    retention,
+                    fingerprint: cached_fingerprint,
+                    ..
+                } if now.duration_since(*started_at) < *retention => {
+                    return if cached_fingerprint == fingerprint {
+                        LocalDeduplicationAction::Conflict(DeduplicationConflict::InFlight)
+                    } else {
+                        LocalDeduplicationAction::Conflict(
+                            DeduplicationConflict::FingerprintMismatch,
+                        )
+                    };
+                }
+                _ => {}
+            }
+        }
+
         match self.local.local_cache.entry(key.to_string()) {
             Entry::Vacant(entry) => {
                 // Reserve before inserting, while the shard entry is held.

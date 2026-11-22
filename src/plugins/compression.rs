@@ -1516,21 +1516,36 @@ impl CompressionPlugin {
         permit: OwnedSemaphorePermit,
         ceiling: usize,
     ) -> Option<Vec<u8>> {
+        // Compress small response bodies inline without copying `body` into an
+        // owned `Vec<u8>` or paying a `tokio::task::spawn_blocking` thread-pool
+        // wakeup/handoff (for typical <= 16 KiB API payloads, inline gzip/zstd
+        // takes ~10-40 us, less than a thread-pool round-trip).
+        const INLINE_COMPRESS_MAX_BYTES: usize = 16 * 1024;
+
         let gzip_level = self.config.gzip_level;
         let brotli_quality = self.config.brotli_quality;
         let zstd_level = self.config.zstd_level;
-        let data = body.to_vec();
         let encoding_owned = algo.content_encoding();
 
-        let result = tokio::task::spawn_blocking(move || {
+        let result = if body.len() <= INLINE_COMPRESS_MAX_BYTES {
             let _permit = permit;
-            match algo {
-                Algorithm::Gzip => compress_gzip_blocking(&data, gzip_level, ceiling),
-                Algorithm::Brotli => compress_brotli_blocking(&data, brotli_quality, ceiling),
-                Algorithm::Zstd => compress_zstd_blocking(&data, zstd_level, ceiling),
-            }
-        })
-        .await;
+            Ok(match algo {
+                Algorithm::Gzip => compress_gzip_blocking(body, gzip_level, ceiling),
+                Algorithm::Brotli => compress_brotli_blocking(body, brotli_quality, ceiling),
+                Algorithm::Zstd => compress_zstd_blocking(body, zstd_level, ceiling),
+            })
+        } else {
+            let data = body.to_vec();
+            tokio::task::spawn_blocking(move || {
+                let _permit = permit;
+                match algo {
+                    Algorithm::Gzip => compress_gzip_blocking(&data, gzip_level, ceiling),
+                    Algorithm::Brotli => compress_brotli_blocking(&data, brotli_quality, ceiling),
+                    Algorithm::Zstd => compress_zstd_blocking(&data, zstd_level, ceiling),
+                }
+            })
+            .await
+        };
 
         match result {
             Ok(Ok(compressed)) => {

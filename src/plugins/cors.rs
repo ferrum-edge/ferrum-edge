@@ -779,18 +779,48 @@ impl CorsTokenKind {
 #[derive(Debug, Clone)]
 struct CorsTokenSet {
     values: Arc<Vec<String>>,
+    /// Pre-joined header value (`", "`) when `*` is kept (or absent).
+    joined: Option<Arc<str>>,
+    /// Pre-joined header value (`", "`) with literal `"*"` filtered out.
+    joined_without_star: Option<Arc<str>>,
     kind: CorsTokenKind,
     wildcard: bool,
 }
 
 impl CorsTokenSet {
-    fn new(values: Vec<String>, kind: CorsTokenKind, allow_credentials: bool) -> Self {
-        let wildcard = !allow_credentials && values.iter().any(|value| value == "*");
+    fn from_parts(values: Vec<String>, kind: CorsTokenKind, wildcard: bool) -> Self {
+        let joined = if values.is_empty() {
+            None
+        } else {
+            Some(Arc::<str>::from(values.join(", ")))
+        };
+        let has_star = values.iter().any(|value| value == "*");
+        let joined_without_star = if !has_star {
+            joined.clone()
+        } else {
+            let filtered: Vec<&str> = values
+                .iter()
+                .map(String::as_str)
+                .filter(|value| *value != "*")
+                .collect();
+            if filtered.is_empty() {
+                None
+            } else {
+                Some(Arc::<str>::from(filtered.join(", ")))
+            }
+        };
         Self {
             values: Arc::new(values),
+            joined,
+            joined_without_star,
             kind,
             wildcard,
         }
+    }
+
+    fn new(values: Vec<String>, kind: CorsTokenKind, allow_credentials: bool) -> Self {
+        let wildcard = !allow_credentials && values.iter().any(|value| value == "*");
+        Self::from_parts(values, kind, wildcard)
     }
 
     fn allows(&self, candidate: &str) -> bool {
@@ -807,34 +837,19 @@ impl CorsTokenSet {
                 values.push(value.clone());
             }
         }
-        Self {
-            values: Arc::new(values),
-            kind: self.kind,
-            wildcard: if intersection {
-                self.wildcard && other.wildcard
-            } else {
-                self.wildcard || other.wildcard
-            },
-        }
+        let wildcard = if intersection {
+            self.wildcard && other.wildcard
+        } else {
+            self.wildcard || other.wildcard
+        };
+        Self::from_parts(values, self.kind, wildcard)
     }
 
-    fn response_value(&self, allow_credentials: bool) -> Option<String> {
-        if self.values.is_empty() {
-            return None;
-        }
-        if self.wildcard || allow_credentials || !self.values.iter().any(|value| value == "*") {
-            return Some(self.values.join(", "));
-        }
-        let values: Vec<&str> = self
-            .values
-            .iter()
-            .map(String::as_str)
-            .filter(|value| *value != "*")
-            .collect();
-        if values.is_empty() {
-            None
+    fn response_value(&self, allow_credentials: bool) -> Option<&str> {
+        if self.wildcard || allow_credentials {
+            self.joined.as_deref()
         } else {
-            Some(values.join(", "))
+            self.joined_without_star.as_deref()
         }
     }
 }
@@ -1761,12 +1776,9 @@ fn finalize_cors_response(
         return PluginResult::Continue;
     }
 
-    let cors_headers = cors_headers(ctx, ctx.cors_state.is_preflight);
-    for (name, value) in cors_headers {
-        if name != "vary" {
-            response_headers.insert(name, value);
-        }
-    }
+    // Write CORS headers directly into `response_headers` without allocating a
+    // throwaway HashMap or a duplicate `Vary` header (already merged above).
+    write_cors_headers_into(ctx, ctx.cors_state.is_preflight, false, response_headers);
     PluginResult::Continue
 }
 
@@ -1777,10 +1789,20 @@ fn record_matched_origin(ctx: &mut RequestContext, origin: String) {
 }
 
 fn cors_headers(ctx: &RequestContext, preflight: bool) -> HashMap<String, String> {
+    let mut headers = HashMap::with_capacity(if preflight { 8 } else { 4 });
+    write_cors_headers_into(ctx, preflight, true, &mut headers);
+    headers
+}
+
+fn write_cors_headers_into(
+    ctx: &RequestContext,
+    preflight: bool,
+    include_vary: bool,
+    headers: &mut HashMap<String, String>,
+) {
     let state = &ctx.cors_state;
-    let mut headers = HashMap::new();
     let Some(origin) = state.matched_origin.as_ref() else {
-        return headers;
+        return;
     };
 
     headers.insert(
@@ -1802,7 +1824,10 @@ fn cors_headers(ctx: &RequestContext, preflight: bool) -> HashMap<String, String
         .as_ref()
         .and_then(|values| values.response_value(state.allow_credentials))
     {
-        headers.insert("access-control-expose-headers".to_string(), exposed);
+        headers.insert(
+            "access-control-expose-headers".to_string(),
+            exposed.to_string(),
+        );
     }
     if preflight {
         if let Some(methods) = state
@@ -1810,14 +1835,20 @@ fn cors_headers(ctx: &RequestContext, preflight: bool) -> HashMap<String, String
             .as_ref()
             .and_then(|values| values.response_value(state.allow_credentials))
         {
-            headers.insert("access-control-allow-methods".to_string(), methods);
+            headers.insert(
+                "access-control-allow-methods".to_string(),
+                methods.to_string(),
+            );
         }
         if let Some(allowed) = state
             .allowed_headers
             .as_ref()
             .and_then(|values| values.response_value(state.allow_credentials))
         {
-            headers.insert("access-control-allow-headers".to_string(), allowed);
+            headers.insert(
+                "access-control-allow-headers".to_string(),
+                allowed.to_string(),
+            );
         }
         if let Some(Some(max_age)) = state.max_age {
             headers.insert("access-control-max-age".to_string(), max_age.to_string());
@@ -1834,11 +1865,12 @@ fn cors_headers(ctx: &RequestContext, preflight: bool) -> HashMap<String, String
         }
     }
 
-    headers.insert(
-        "vary".to_string(),
-        merge_vary_tokens(None, cors_vary_tokens(preflight)),
-    );
-    headers
+    if include_vary {
+        headers.insert(
+            "vary".to_string(),
+            merge_vary_tokens(None, cors_vary_tokens(preflight)),
+        );
+    }
 }
 
 fn cors_vary_tokens(preflight: bool) -> &'static [&'static str] {

@@ -2101,7 +2101,7 @@ pub struct RequestMirror {
     mirror_hostname: Option<String>,
     /// Bresenham phase accumulator in `0..SAMPLE_PERIOD` for evenly spaced
     /// deterministic percentage sampling. Reset to `0` on construction/reload.
-    sample_phase: AtomicU64,
+    sample_phase: crossbeam_utils::CachePadded<AtomicU64>,
     /// Bounds concurrent mirror tasks to prevent unbounded background work.
     mirror_in_flight: Arc<tokio::sync::Semaphore>,
     /// Aggregate retained request-body bytes across in-flight mirror tasks.
@@ -2360,7 +2360,7 @@ impl RequestMirror {
             mirror_hostname,
             // Phase 0 defers the first selection until the accumulator crosses
             // SAMPLE_PERIOD — construction/reload never opens with a mirrored prefix.
-            sample_phase: AtomicU64::new(0),
+            sample_phase: crossbeam_utils::CachePadded::new(AtomicU64::new(0)),
             // `max_in_flight` is range-checked above, so `Semaphore::new` cannot
             // panic on an out-of-range permit count.
             mirror_in_flight: Arc::new(tokio::sync::Semaphore::new(max_in_flight)),
@@ -2381,7 +2381,8 @@ impl RequestMirror {
     // This accessor exists for the external sampling contract tests. The
     // production request path updates the atomic directly in `should_mirror`.
     pub(crate) fn sample_phase_for_test(&self) -> u64 {
-        self.sample_phase.load(Ordering::Relaxed)
+        let count = self.sample_phase.load(Ordering::Relaxed);
+        ((u128::from(count) * u128::from(self.sample_threshold)) % u128::from(SAMPLE_PERIOD)) as u64
     }
 
     /// Current retained request-body budget usage for external tests.
@@ -2560,28 +2561,14 @@ impl RequestMirror {
             return true;
         }
 
-        // Lock-free Bresenham: keep phase in [0, SAMPLE_PERIOD). Successful
-        // updates always store `next < SAMPLE_PERIOD`, and `threshold` is at
-        // most 999, so `current + threshold` stays far below u64::MAX and
-        // cannot overflow or panic.
-        let mut current = self.sample_phase.load(Ordering::Relaxed);
-        loop {
-            let sum = current + threshold;
-            let (selected, next) = if sum >= SAMPLE_PERIOD {
-                (true, sum - SAMPLE_PERIOD)
-            } else {
-                (false, sum)
-            };
-            match self.sample_phase.compare_exchange_weak(
-                current,
-                next,
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => return selected,
-                Err(observed) => current = observed,
-            }
-        }
+        // Wait-free Bresenham via monotonic `fetch_add(1)` on a cache-line-padded
+        // counter: `phase(n) = (n * threshold) % SAMPLE_PERIOD`, so sample `n`
+        // fires iff `phase(n) + threshold >= SAMPLE_PERIOD`. Produces the exact
+        // same deterministic periodic sequence as the CAS accumulator with zero
+        // retry loops under multi-core contention.
+        let n = self.sample_phase.fetch_add(1, Ordering::Relaxed);
+        let phase = ((u128::from(n) * u128::from(threshold)) % u128::from(SAMPLE_PERIOD)) as u64;
+        phase + threshold >= SAMPLE_PERIOD
     }
 
     /// External-test probe for the real state-advancing sampler without

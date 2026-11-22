@@ -350,7 +350,7 @@ pub struct RateLimiting {
     default_limit: DynamicRateLimitOp,
     consumer_overrides: HashMap<String, DynamicRateLimitOp>,
     limiter: RateLimitBackend<String, DynamicHttpRateLimitAlgorithm>,
-    request_counter: AtomicU64,
+    request_counter: crossbeam_utils::CachePadded<AtomicU64>,
     epoch_base: Instant,
     last_periodic_sweep_secs: AtomicU64,
 }
@@ -499,7 +499,7 @@ impl RateLimiting {
             default_limit: parsed_limits.default_limit,
             consumer_overrides: parsed_limits.consumer_overrides,
             limiter,
-            request_counter: AtomicU64::new(0),
+            request_counter: crossbeam_utils::CachePadded::new(AtomicU64::new(0)),
             epoch_base: Instant::now(),
             last_periodic_sweep_secs: AtomicU64::new(0),
         })
@@ -662,18 +662,24 @@ impl RateLimiting {
     }
 
     fn maybe_evict_stale_entries(&self) {
-        self.maybe_evict_stale_entries_at(Instant::now());
-    }
-
-    fn maybe_evict_stale_entries_at(&self, now: Instant) {
-        // Sample every 1024 requests before any tracked_keys_count /
-        // cleanup work so the hot path avoids capacity bookkeeping on every
-        // request. Entry counts are atomic (not DashMap::len()).
+        // Sample every 1024 requests BEFORE taking `Instant::now()` so the hot
+        // path avoids a clock read and capacity bookkeeping on 1023/1024 requests.
         let request = self.request_counter.fetch_add(1, Ordering::Relaxed);
         if !request.is_multiple_of(EVICTION_CHECK_INTERVAL_REQUESTS) {
             return;
         }
+        self.evict_stale_entries_sampled_at(Instant::now());
+    }
 
+    fn maybe_evict_stale_entries_at(&self, now: Instant) {
+        let request = self.request_counter.fetch_add(1, Ordering::Relaxed);
+        if !request.is_multiple_of(EVICTION_CHECK_INTERVAL_REQUESTS) {
+            return;
+        }
+        self.evict_stale_entries_sampled_at(now);
+    }
+
+    fn evict_stale_entries_sampled_at(&self, now: Instant) {
         let len = self.limiter.tracked_keys_count();
         if len == 0 {
             return;
@@ -978,12 +984,7 @@ impl RateLimiting {
         self.maybe_evict_stale_entries();
         let decision = self
             .limiter
-            .check_with_redis_key_and_local_capacity_attributed(
-                key.clone(),
-                || key.clone(),
-                limit_op,
-                self.max_state_entries,
-            )
+            .check_same_key_with_local_capacity_attributed(key, limit_op, self.max_state_entries)
             .await;
         let Some(outcome) = decision.outcome else {
             // A capacity denial carries no budget of its own, and a composed
@@ -1210,12 +1211,7 @@ impl RateLimiting {
         // through the failure policy while that signal still reads available).
         let decision = self
             .limiter
-            .check_with_redis_key_and_local_capacity_attributed(
-                key.clone(),
-                || key.clone(),
-                limit_op,
-                self.max_state_entries,
-            )
+            .check_same_key_with_local_capacity_attributed(key, limit_op, self.max_state_entries)
             .await;
         let Some(outcome) = decision.outcome else {
             if decision.local_fallback {
@@ -1270,9 +1266,12 @@ impl Plugin for RateLimiting {
     }
 
     fn lifecycle_hooks(&self) -> crate::plugins::PluginHooks {
-        crate::plugins::PluginHooks::ON_REQUEST_RECEIVED
-            | crate::plugins::PluginHooks::BEFORE_PROXY
-            | crate::plugins::PluginHooks::AFTER_PROXY
+        let mut hooks =
+            crate::plugins::PluginHooks::BEFORE_PROXY | crate::plugins::PluginHooks::AFTER_PROXY;
+        if self.mcp_tool_calls.is_none() && self.limit_by == LimitBy::Ip {
+            hooks |= crate::plugins::PluginHooks::ON_REQUEST_RECEIVED;
+        }
+        hooks
     }
 
     fn supported_protocols(&self) -> &'static [super::ProxyProtocol] {
