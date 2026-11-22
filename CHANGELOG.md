@@ -190,15 +190,16 @@ gateways, control planes, custom plugins, charts or contract consumers.
 - Fixed GHSA-49cr-v28q-9hgp: `a2a_gateway`, `ai_semantic_firewall`,
   `ai_prompt_shield` (all scan modes) and `ai_rate_limiter` now screen governed
   JSON bodies for duplicate object member names with the shared `json_dup_keys`
-  scanner before evaluating policy, so a duplicate-member body is no longer
-  judged on one member while a first-key-wins backend acts on another.
-  `ai_rate_limiter` refuses such a body while `model_limits` is non-empty;
-  with an empty or omitted `model_limits` it treats the body as an
+  scanner before evaluating policy, so policy is no longer evaluated on one
+  occurrence of a member while a first-key-wins backend acts on another.
+  The behavior below is what each plugin does when it meets such a body at
+  admission; final-body re-checks after a transform depend on the instance's
+  configuration. `ai_rate_limiter` refuses it while `model_limits` is
+  non-empty; with an empty or omitted `model_limits` it treats the body as an
   uninspectable request and checks the applicable budget without estimating
-  tokens from it. At arrival, `a2a_gateway` refuses it under a deny-capable
-  policy or with Agent Card rewriting on for the `jsonrpc` binding, and
-  otherwise leaves it unclassified; a classified request whose final body a
-  transform makes ambiguous is refused regardless. `ai_prompt_shield` refuses it unless `action: warn`, which
+  tokens from it. `a2a_gateway` refuses it under a deny-capable policy or with
+  Agent Card rewriting on for the `jsonrpc` binding, and otherwise leaves it
+  unclassified. `ai_prompt_shield` refuses it unless `action: warn`, which
   records `ambiguous_json`. `ai_semantic_firewall` treats it as uninspectable
   and refuses it unless `fail_on_uninspectable_body: false`, `on_error: allow`
   or `warn`, or `mode: dry_run` lets it through.
