@@ -2925,21 +2925,32 @@ impl AiTranscriptAudit {
     /// entry-count gate would let the leak the bound exists to stop pass
     /// through untouched. Every scan is bounded by [`MAX_STAGING_ENTRIES`].
     fn sweep_staging(&self) {
-        if self.staging.is_empty() {
-            return;
-        }
+        // Check the relaxed atomic cooldown FIRST so high-RPS requests do not
+        // acquire every DashMap shard lock via `self.staging.is_empty()` on
+        // every request.
         let now_seconds = process_monotonic_seconds();
         let next = self.next_staging_sweep_at.load(Ordering::Relaxed);
-        if now_seconds < next
-            || self
-                .next_staging_sweep_at
-                .compare_exchange(
-                    next,
-                    now_seconds.saturating_add(self.staging_sweep_interval_secs),
-                    Ordering::AcqRel,
-                    Ordering::Relaxed,
-                )
-                .is_err()
+        if now_seconds < next {
+            return;
+        }
+        if self.staging.is_empty() {
+            let _ = self.next_staging_sweep_at.compare_exchange(
+                next,
+                now_seconds.saturating_add(self.staging_sweep_interval_secs),
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            );
+            return;
+        }
+        if self
+            .next_staging_sweep_at
+            .compare_exchange(
+                next,
+                now_seconds.saturating_add(self.staging_sweep_interval_secs),
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            )
+            .is_err()
         {
             return;
         }

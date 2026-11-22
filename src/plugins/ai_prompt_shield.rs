@@ -657,6 +657,8 @@ pub struct AiPromptShield {
     max_scan_bytes: usize,
     /// True when action is Redact — enables transform_request_body.
     needs_body_transform: bool,
+    /// Monotonic per-instance id for private request-state witness entries.
+    instance_id: u64,
     /// Instance-specific metadata marker for compressed-body deferral.
     deferred_compressed_marker: String,
 }
@@ -1032,6 +1034,7 @@ impl AiPromptShield {
             exclude_roles,
             max_scan_bytes,
             needs_body_transform,
+            instance_id: marker_id,
             deferred_compressed_marker,
         })
     }
@@ -2516,13 +2519,22 @@ impl Plugin for AiPromptShield {
             },
         };
 
+        let clean_body_digest = if detected.is_empty() {
+            Some(crate::fips::approved::Sha256::digest(body.as_bytes()))
+        } else {
+            None
+        };
+
         // `body` borrow released — safe to mutate ctx.metadata now.
         if is_streaming_request {
             ctx.metadata
                 .insert("ai_request_streaming".to_string(), "true".to_string());
         }
 
-        if detected.is_empty() {
+        if let Some(digest) = clean_body_digest {
+            ctx.plugin_state_mut()
+                .ai_prompt_shield_clean_hashes
+                .insert(self.instance_id, digest);
             return PluginResult::Continue;
         }
 
@@ -2864,6 +2876,21 @@ impl Plugin for AiPromptShield {
 
         if body.len() > self.max_scan_bytes {
             return self.handle_oversize_body(ctx, body.len());
+        }
+
+        // Fast path: if `before_proxy` already scanned these exact bytes and
+        // proved them clean (zero PII matches, valid UTF-8, unambiguous JSON),
+        // skip the duplicate duplicate-key scan, JSON DOM parse, and RegexSet
+        // walk in the final-body phase.
+        if !deferred
+            && let Some(expected) = ctx.plugin_state_opt_mut().and_then(|state| {
+                state
+                    .ai_prompt_shield_clean_hashes
+                    .remove(&self.instance_id)
+            })
+            && expected == crate::fips::approved::Sha256::digest(body)
+        {
+            return PluginResult::Continue;
         }
 
         let Ok(body_text) = std::str::from_utf8(body) else {

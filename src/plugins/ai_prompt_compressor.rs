@@ -862,6 +862,13 @@ impl AiPromptCompressor {
         if body.len() > HARD_MAX_SCAN_BYTES {
             return None;
         }
+        // For small-to-medium prompts (<= 64 KiB), inline SHA-256 finishes in
+        // microseconds without copying `body`, contending on the global
+        // semaphore, or hopping through `tokio::task::spawn_blocking`.
+        const INLINE_DIGEST_MAX_BYTES: usize = 64 * 1024;
+        if body.len() <= INLINE_DIGEST_MAX_BYTES {
+            return Some(Sha256::digest(body));
+        }
         let permit = Arc::clone(&COMPRESSION_BUDGET).try_acquire_owned().ok()?;
         let body = body.to_vec();
         tokio::task::spawn_blocking(move || {

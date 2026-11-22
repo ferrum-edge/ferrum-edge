@@ -4245,6 +4245,14 @@ pub(crate) struct PluginRequestState {
     /// markers (a hash over the raw request body including tool-call arguments),
     /// so they remain off `metadata` too.
     pub(crate) ai_tool_governor_request_hashes: HashMap<u64, String>,
+    /// Per-`ai_request_guard`-instance SHA-256 digest of `(path, body)` validated
+    /// in `before_proxy` (when no token mutation occurred), allowing
+    /// `on_final_request_body_with_context` to skip re-parsing an unchanged body.
+    pub(crate) ai_request_guard_validated_hashes: HashMap<u64, [u8; 32]>,
+    /// Per-`ai_prompt_shield`-instance SHA-256 digest of a clean request body
+    /// scanned in `before_proxy`, allowing `on_final_request_body_with_context`
+    /// to skip re-parsing and re-scanning an unchanged body.
+    pub(crate) ai_prompt_shield_clean_hashes: HashMap<u64, [u8; 32]>,
     /// Per-instance buffered `redact_args` rewrites computed during governance
     /// amplification preflight and consumed by the response-body transform.
     /// Keys are digests of `(tool name, raw args)`; aggregate value bytes are

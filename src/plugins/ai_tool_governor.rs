@@ -3697,6 +3697,18 @@ impl Plugin for AiToolGovernor {
 
         let inspectable =
             !has_non_identity_content_encoding(headers) && body.len() <= MAX_PARSE_BYTES;
+        // Fast path: if `before_proxy` already parsed, stream-classified, and
+        // governed these exact bytes, skip the duplicate duplicate-key scan and
+        // `serde_json::Value` DOM parse completely.
+        let precomputed_final_hash = if governs_request && inspectable {
+            let hash = sha256_hex_bytes(body);
+            if self.request_hash(ctx) == Some(hash.as_str()) {
+                return PluginResult::Continue;
+            }
+            Some(hash)
+        } else {
+            None
+        };
         // Screen the FINAL backend-visible bytes for duplicate object member
         // names, sharing the verdict with the other governed plugins running in
         // this stage. Ambiguity makes the body uninspectable: these are the
@@ -3775,7 +3787,7 @@ impl Plugin for AiToolGovernor {
 
         // Unchanged since `before_proxy` governed it: nothing new to check, and
         // re-governing would risk a duplicate approval webhook.
-        let final_hash = sha256_hex_bytes(body);
+        let final_hash = precomputed_final_hash.unwrap_or_else(|| sha256_hex_bytes(body));
         if self.request_hash(ctx) == Some(final_hash.as_str()) {
             return PluginResult::Continue;
         }
