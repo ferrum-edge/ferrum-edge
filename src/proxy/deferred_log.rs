@@ -172,9 +172,10 @@ pub async fn run_response_stream_termination_hooks(
     crate::plugins::wait_for_response_stream_inspector(ctx).await;
     for deferred in [false, true] {
         for plugin in plugins.iter().filter(|plugin| {
-            plugin
+            (plugin
                 .lifecycle_hooks()
                 .contains(crate::plugins::PluginHooks::ON_RESPONSE_STREAM_TERMINATED)
+                || !crate::plugins::is_builtin_plugin(plugin.as_ref()))
                 && plugin.defers_response_stream_termination_until_after_peers() == deferred
         }) {
             plugin

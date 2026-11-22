@@ -557,7 +557,9 @@ fn deferred_response_header_lane_matches_materialized_wire_headers() {
     );
 }
 
-struct CustomFinalHeaderPolicyPlugin;
+struct CustomFinalHeaderPolicyPlugin {
+    stream_terminated_called: Arc<std::sync::atomic::AtomicBool>,
+}
 
 #[async_trait]
 impl Plugin for CustomFinalHeaderPolicyPlugin {
@@ -589,15 +591,32 @@ impl Plugin for CustomFinalHeaderPolicyPlugin {
             PluginResult::Continue
         }
     }
+
+    async fn on_response_stream_terminated(
+        &self,
+        _ctx: &mut RequestContext,
+        _response_status: u16,
+        _outcome: &ferrum_edge::proxy::deferred_log::BodyOutcome,
+    ) {
+        self.stream_terminated_called
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
 }
 
 #[tokio::test]
 async fn custom_plugin_with_none_lifecycle_hooks_retains_after_proxy_phase() {
-    let plugins: Vec<Arc<dyn Plugin>> = vec![Arc::new(CustomFinalHeaderPolicyPlugin)];
+    let stream_terminated_called = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let plugins: Vec<Arc<dyn Plugin>> = vec![Arc::new(CustomFinalHeaderPolicyPlugin {
+        stream_terminated_called: Arc::clone(&stream_terminated_called),
+    })];
     let caps = plugin_capabilities_for_plugins_for_test(&plugins);
     assert!(
         caps.has(PluginCapabilities::HAS_AFTER_PROXY_HOOK),
         "custom plugins must retain HAS_AFTER_PROXY_HOOK even when lifecycle_hooks() returns NONE"
+    );
+    assert!(
+        caps.has(PluginCapabilities::HAS_TERMINAL_SUMMARY_CONSUMER),
+        "custom plugins must retain HAS_TERMINAL_SUMMARY_CONSUMER even when lifecycle_hooks() returns NONE"
     );
     assert!(
         !caps.has(PluginCapabilities::SUPPORTS_REQUEST_HEADER_PASSTHROUGH),
@@ -615,4 +634,16 @@ async fn custom_plugin_with_none_lifecycle_hooks_retains_after_proxy_phase() {
             .await
             .expect("custom final response-header policy must reject forbidden response header");
     assert_eq!(reject.0, 451);
+
+    ferrum_edge::proxy::deferred_log::run_response_stream_termination_hooks(
+        &plugins,
+        &mut ctx,
+        200,
+        &ferrum_edge::proxy::deferred_log::BodyOutcome::success(128),
+    )
+    .await;
+    assert!(
+        stream_terminated_called.load(std::sync::atomic::Ordering::SeqCst),
+        "custom plugin on_response_stream_terminated must still run when lifecycle_hooks() returns NONE"
+    );
 }

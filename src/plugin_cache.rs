@@ -6017,9 +6017,11 @@ impl PluginCapabilities {
     /// At least one plugin in the view consumes a terminal `TransactionSummary`
     /// or response-stream completion (`PluginHooks::LOG`,
     /// `PluginHooks::ON_RESPONSE_STREAM_TERMINATED`,
-    /// `requires_response_stream_hooks()`, or `uses_mesh_request_key()`).
-    /// When unset (e.g. a `key_auth`-only chain), the request path uses the
-    /// compact runtime-metrics terminal instead of building a full
+    /// `requires_response_stream_hooks()`, `uses_mesh_request_key()`, or any
+    /// non-built-in/custom plugin, which may override
+    /// `on_response_stream_terminated` without declaring the new hook bit).
+    /// When unset (e.g. a built-in `key_auth`-only chain), the request path
+    /// uses the compact runtime-metrics terminal instead of building a full
     /// `TransactionSummary` and spawning a deferred logging task.
     pub const HAS_TERMINAL_SUMMARY_CONSUMER: u32 = 1 << 26;
     /// Every plugin in a non-empty view supports `RequestHeaderPassthrough`
@@ -6352,6 +6354,7 @@ fn build_phase_data(plugins: &[Arc<dyn Plugin>]) -> PluginPhaseData {
         if hooks.contains(crate::plugins::PluginHooks::LOG)
             || hooks.contains(crate::plugins::PluginHooks::ON_RESPONSE_STREAM_TERMINATED)
             || p.uses_mesh_request_key()
+            || !crate::plugins::is_builtin_plugin(p.as_ref())
         {
             caps |= PluginCapabilities::HAS_TERMINAL_SUMMARY_CONSUMER;
         }
