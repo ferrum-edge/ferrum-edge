@@ -39541,6 +39541,7 @@ async fn handle_proxy_request_inner(
         owned_proxy_headers = Some(cloned);
     } else if capabilities.has(PluginCapabilities::HAS_BEFORE_PROXY_HOOK)
         || ctx.route_override_path.is_some()
+        || ctx.route_owns_request_assertion_headers()
         || (!plugins.is_empty()
             && (grpc_web_request
                 || ctx.mesh_direction.is_some()

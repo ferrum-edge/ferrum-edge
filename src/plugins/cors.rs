@@ -788,7 +788,8 @@ struct CorsTokenSet {
 }
 
 impl CorsTokenSet {
-    fn from_parts(values: Vec<String>, kind: CorsTokenKind, wildcard: bool) -> Self {
+    fn new(values: Vec<String>, kind: CorsTokenKind, allow_credentials: bool) -> Self {
+        let wildcard = !allow_credentials && values.iter().any(|value| value == "*");
         let joined = if values.is_empty() {
             None
         } else {
@@ -818,11 +819,6 @@ impl CorsTokenSet {
         }
     }
 
-    fn new(values: Vec<String>, kind: CorsTokenKind, allow_credentials: bool) -> Self {
-        let wildcard = !allow_credentials && values.iter().any(|value| value == "*");
-        Self::from_parts(values, kind, wildcard)
-    }
-
     fn allows(&self, candidate: &str) -> bool {
         self.kind.contains(&self.values, candidate)
             || (self.wildcard && self.kind.wildcard_covers(candidate))
@@ -842,14 +838,41 @@ impl CorsTokenSet {
         } else {
             self.wildcard || other.wildcard
         };
-        Self::from_parts(values, self.kind, wildcard)
+        // Defer serialization for request-time composed sets: the union is used
+        // only for membership checks and rejected preflights emit neither list.
+        Self {
+            values: Arc::new(values),
+            joined: None,
+            joined_without_star: None,
+            kind: self.kind,
+            wildcard,
+        }
     }
 
-    fn response_value(&self, allow_credentials: bool) -> Option<&str> {
+    fn response_value(&self, allow_credentials: bool) -> Option<std::borrow::Cow<'_, str>> {
+        if self.values.is_empty() {
+            return None;
+        }
         if self.wildcard || allow_credentials {
-            self.joined.as_deref()
+            if let Some(joined) = self.joined.as_deref() {
+                return Some(std::borrow::Cow::Borrowed(joined));
+            }
+            return Some(std::borrow::Cow::Owned(self.values.join(", ")));
+        }
+        if let Some(joined) = self.joined_without_star.as_deref() {
+            return Some(std::borrow::Cow::Borrowed(joined));
+        }
+        let mut out = String::new();
+        for value in self.values.iter().filter(|value| *value != "*") {
+            if !out.is_empty() {
+                out.push_str(", ");
+            }
+            out.push_str(value);
+        }
+        if out.is_empty() {
+            None
         } else {
-            self.joined_without_star.as_deref()
+            Some(std::borrow::Cow::Owned(out))
         }
     }
 }
@@ -1826,7 +1849,7 @@ fn write_cors_headers_into(
     {
         headers.insert(
             "access-control-expose-headers".to_string(),
-            exposed.to_string(),
+            exposed.into_owned(),
         );
     }
     if preflight {
@@ -1837,7 +1860,7 @@ fn write_cors_headers_into(
         {
             headers.insert(
                 "access-control-allow-methods".to_string(),
-                methods.to_string(),
+                methods.into_owned(),
             );
         }
         if let Some(allowed) = state
@@ -1847,7 +1870,7 @@ fn write_cors_headers_into(
         {
             headers.insert(
                 "access-control-allow-headers".to_string(),
-                allowed.to_string(),
+                allowed.into_owned(),
             );
         }
         if let Some(Some(max_age)) = state.max_age {

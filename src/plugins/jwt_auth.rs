@@ -63,12 +63,12 @@ enum UnverifiedClaimLookup {
 }
 
 /// Extract a single string claim from an unverified JWT payload without
-/// allocating a full `serde_json::Value` DOM tree. Preserves `insecure_decode`
-/// structural validation (3 dot-separated segments, valid JWT header, valid
-/// JSON object payload).
+/// materializing the outer `serde_json::Map` or non-target key strings.
+/// Preserves `insecure_decode` structural validation (3 dot-separated segments,
+/// valid JWT header, strict `serde_json::Value` validation of every claim).
 fn extract_unverified_string_claim(token: &str, claim_field: &str) -> UnverifiedClaimLookup {
     use base64::Engine as _;
-    use serde::de::{DeserializeSeed, Deserializer, IgnoredAny, MapAccess, Visitor};
+    use serde::de::{DeserializeSeed, Deserializer, MapAccess, Visitor};
 
     struct SingleStringClaimSeed<'a>(&'a str);
 
@@ -91,11 +91,9 @@ fn extract_unverified_string_claim(token: &str, claim_field: &str) -> Unverified
                 fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
                     let mut found = None;
                     while let Some(key) = map.next_key::<std::borrow::Cow<'de, str>>()? {
+                        let val: serde_json::Value = map.next_value()?;
                         if key.as_ref() == self.0 {
-                            let val: serde_json::Value = map.next_value()?;
                             found = val.as_str().map(str::to_owned);
-                        } else {
-                            let _: IgnoredAny = map.next_value()?;
                         }
                     }
                     Ok(found)

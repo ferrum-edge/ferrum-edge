@@ -1466,13 +1466,17 @@ impl UncacheablePredictor {
             let Some((oldest_key, oldest_seq)) = order.pop_front() else {
                 break;
             };
-            if self
-                .keys
-                .remove_if(&oldest_key, |_, live_seq| *live_seq == oldest_seq)
-                .is_some()
-            {
-                self.count.fetch_sub(1, Ordering::AcqRel);
-            }
+            // Decrement `count` inside the `remove_if` predicate while the
+            // shard write guard is held so no concurrent insert can observe a
+            // stale over-capacity count between removal and decrement.
+            let _ = self.keys.remove_if(&oldest_key, |_, live_seq| {
+                if *live_seq == oldest_seq {
+                    self.count.fetch_sub(1, Ordering::AcqRel);
+                    true
+                } else {
+                    false
+                }
+            });
         }
         // Superseded slots accumulate only when the same key is re-marked.
         // Compact them in one amortized pass rather than searching on insert.
@@ -1491,9 +1495,10 @@ impl UncacheablePredictor {
         if self.count.load(Ordering::Acquire) == 0 {
             return;
         }
-        if self.keys.remove(key).is_some() {
+        let _ = self.keys.remove_if(key, |_, _| {
             self.count.fetch_sub(1, Ordering::AcqRel);
-        }
+            true
+        });
     }
 }
 
