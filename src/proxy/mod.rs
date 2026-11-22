@@ -29236,10 +29236,10 @@ pub(crate) async fn run_after_proxy_hooks(
                 // Snapshot the complete phase, including the chain-level route
                 // finalization above. Recording before finalization would omit
                 // route removals/appends from buffered gRPC trailer policy and
-                // deadline provenance. Skip when the plugin did not run
-                // `after_proxy` and did not finalize route headers: the header
-                // map cannot have changed.
-                if ran_hook || finalized_route {
+                // deadline provenance. A plugin with deterministic initial
+                // response-header policy can still mutate the buffered gRPC
+                // map even without an `after_proxy` hook, so keep that case.
+                if ran_hook || finalized_route || plugin.is_initial_response_header_policy() {
                     ctx.record_buffered_initial_response_header_plugin(
                         plugin.as_ref(),
                         response_headers,

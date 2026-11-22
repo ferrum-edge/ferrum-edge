@@ -721,7 +721,7 @@ impl WorkerGuard {
             return completed;
         }
         self.shutdown_started = true;
-        self.state.accepting.store(false, Ordering::Release);
+        self.state.accepting.store(false, Ordering::SeqCst);
         if let Some(join) = &self.join {
             join.thread().unpark();
         }

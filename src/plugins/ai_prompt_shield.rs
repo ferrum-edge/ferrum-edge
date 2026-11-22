@@ -2533,7 +2533,11 @@ impl Plugin for AiPromptShield {
         };
 
         // `body` borrow released — safe to mutate ctx.metadata now.
-        if is_streaming_request {
+        // In `mcp_arguments` mode, defer publishing `ai_request_streaming` to
+        // `on_final_request_body_with_context` (via the private witness or the
+        // re-parsed final body) so a later body transform changing `stream`
+        // from `true` to `false` cannot leave a stale streaming marker behind.
+        if is_streaming_request && self.scan_mode != ScanMode::McpArguments {
             ctx.metadata
                 .insert("ai_request_streaming".to_string(), "true".to_string());
         }
@@ -2541,7 +2545,7 @@ impl Plugin for AiPromptShield {
         if let Some(digest) = clean_body_digest {
             ctx.plugin_state_mut()
                 .ai_prompt_shield_clean_hashes
-                .insert(self.instance_id, digest);
+                .insert(self.instance_id, (digest, is_streaming_request));
             return PluginResult::Continue;
         }
 
@@ -2890,13 +2894,17 @@ impl Plugin for AiPromptShield {
         // skip the duplicate duplicate-key scan, JSON DOM parse, and RegexSet
         // walk in the final-body phase.
         if !deferred
-            && let Some(expected) = ctx.plugin_state_opt_mut().and_then(|state| {
+            && let Some((expected, is_streaming)) = ctx.plugin_state_opt_mut().and_then(|state| {
                 state
                     .ai_prompt_shield_clean_hashes
                     .remove(&self.instance_id)
             })
             && expected == crate::fips::approved::Sha256::digest(body)
         {
+            if is_streaming {
+                ctx.metadata
+                    .insert("ai_request_streaming".to_string(), "true".to_string());
+            }
             return PluginResult::Continue;
         }
 

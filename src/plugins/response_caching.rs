@@ -1452,7 +1452,10 @@ impl UncacheablePredictor {
                 occupied.insert(seq);
             }
             dashmap::mapref::entry::Entry::Vacant(vacant) => {
-                vacant.insert(seq);
+                // Keep the `RefMut` shard write guard alive across `fetch_add`
+                // so no concurrent remover can observe the new key and decrement
+                // `count` before the increment lands.
+                let _guard = vacant.insert(seq);
                 self.count.fetch_add(1, Ordering::AcqRel);
             }
         }

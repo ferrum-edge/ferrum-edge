@@ -701,7 +701,8 @@ async fn generalized_passthrough_builtins_match_materialized_behavior() {
             "exp": 9_999_999_999u64,
             "nbf": 0u64,
         }),
-        &jsonwebtoken::EncodingKey::from_secret(b"test-jwt-secret-0123456789abcdefghij"),
+        &jsonwebtoken::EncodingKey::from_secret(b"test-jwt-secret-0123456789abcdefghij")
+            .expect("jwt encoding key"),
     )
     .expect("jwt encodes");
     let auth_header = format!("Bearer {token}");
@@ -906,8 +907,30 @@ async fn generalized_passthrough_builtins_match_materialized_behavior() {
     ));
     assert!(pt_acl.headers.is_empty());
 
+    let (mut mat_acl_anon, mut pt_acl_anon) =
+        make_passthrough_pair("127.0.0.1", block(&[("host", b"api.example.com")]));
+    assert!(matches!(
+        acl_plugin.authorize(&mut mat_acl_anon).await,
+        PluginResult::Reject {
+            status_code: 401,
+            ..
+        }
+    ));
+    assert!(matches!(
+        acl_plugin.authorize(&mut pt_acl_anon).await,
+        PluginResult::Reject {
+            status_code: 401,
+            ..
+        }
+    ));
+    assert!(pt_acl_anon.headers.is_empty());
+
+    let mut other_consumer = create_test_consumer();
+    other_consumer.username = "otheruser".to_string();
     let (mut mat_acl_deny, mut pt_acl_deny) =
         make_passthrough_pair("127.0.0.1", block(&[("host", b"api.example.com")]));
+    mat_acl_deny.identified_consumer = Some(Arc::new(other_consumer.clone()));
+    pt_acl_deny.identified_consumer = Some(Arc::new(other_consumer));
     assert!(matches!(
         acl_plugin.authorize(&mut mat_acl_deny).await,
         PluginResult::Reject {
@@ -936,18 +959,14 @@ async fn generalized_passthrough_builtins_match_materialized_behavior() {
         upstream_target: None,
         protocol: ProxyProtocol::Http,
     };
-    let (mut mat_ac, mut pt_ac) =
+    let (mat_ac, pt_ac) =
         make_passthrough_pair("127.0.0.1", block(&[("host", b"api.example.com")]));
     assert!(matches!(
-        ac_plugin
-            .on_backend_admission(&mut mat_ac, &admission_ctx)
-            .await,
+        ac_plugin.try_backend_admission(&mat_ac, &admission_ctx),
         BackendAdmissionDecision::Admit(_)
     ));
     assert!(matches!(
-        ac_plugin
-            .on_backend_admission(&mut pt_ac, &admission_ctx)
-            .await,
+        ac_plugin.try_backend_admission(&pt_ac, &admission_ctx),
         BackendAdmissionDecision::Admit(_)
     ));
     assert!(pt_ac.headers.is_empty());

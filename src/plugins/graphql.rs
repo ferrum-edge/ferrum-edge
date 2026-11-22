@@ -1799,89 +1799,10 @@ const GRAPHQL_ENVELOPE_MEMBERS: [&str; 4] = ["query", "operationName", "variable
 /// second pass over the same bytes for the member audit.
 enum GraphqlEnvelope {
     Object {
-        query: Option<String>,
-        operation_name: Option<String>,
+        members: serde_json::Map<String, Value>,
         repeats_a_member: bool,
     },
     NotAnObject,
-}
-
-/// Deserialize a JSON value that may or may not be a string, retaining only
-/// string values and skipping any other JSON structure (objects, arrays,
-/// numbers, booleans, null) without allocating a `serde_json::Value` DOM.
-struct OptionalJsonString(Option<String>);
-
-impl<'de> serde::Deserialize<'de> for OptionalJsonString {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        struct OptionalJsonStringVisitor;
-
-        impl<'de> serde::de::Visitor<'de> for OptionalJsonStringVisitor {
-            type Value = OptionalJsonString;
-
-            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                formatter.write_str("any JSON value")
-            }
-
-            fn visit_str<E>(self, v: &str) -> Result<Self::Value, E> {
-                Ok(OptionalJsonString(Some(v.to_owned())))
-            }
-
-            fn visit_string<E>(self, v: String) -> Result<Self::Value, E> {
-                Ok(OptionalJsonString(Some(v)))
-            }
-
-            fn visit_bool<E>(self, _: bool) -> Result<Self::Value, E> {
-                Ok(OptionalJsonString(None))
-            }
-
-            fn visit_i64<E>(self, _: i64) -> Result<Self::Value, E> {
-                Ok(OptionalJsonString(None))
-            }
-
-            fn visit_u64<E>(self, _: u64) -> Result<Self::Value, E> {
-                Ok(OptionalJsonString(None))
-            }
-
-            fn visit_f64<E>(self, _: f64) -> Result<Self::Value, E> {
-                Ok(OptionalJsonString(None))
-            }
-
-            fn visit_unit<E>(self) -> Result<Self::Value, E> {
-                Ok(OptionalJsonString(None))
-            }
-
-            fn visit_none<E>(self) -> Result<Self::Value, E> {
-                Ok(OptionalJsonString(None))
-            }
-
-            fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
-            where
-                A: serde::de::SeqAccess<'de>,
-            {
-                while seq
-                    .next_element::<crate::util::json_dup_keys::SerdeJsonAccept>()?
-                    .is_some()
-                {}
-                Ok(OptionalJsonString(None))
-            }
-
-            fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
-            where
-                A: serde::de::MapAccess<'de>,
-            {
-                while map
-                    .next_entry::<crate::util::json_dup_keys::SerdeJsonAccept, crate::util::json_dup_keys::SerdeJsonAccept>()?
-                    .is_some()
-                {}
-                Ok(OptionalJsonString(None))
-            }
-        }
-
-        deserializer.deserialize_any(OptionalJsonStringVisitor)
-    }
 }
 
 impl<'de> serde::Deserialize<'de> for GraphqlEnvelope {
@@ -1908,29 +1829,19 @@ impl<'de> serde::de::Visitor<'de> for GraphqlEnvelopeVisitor {
     {
         let mut seen = [false; GRAPHQL_ENVELOPE_MEMBERS.len()];
         let mut repeats_a_member = false;
-        let mut query = None;
-        let mut operation_name = None;
-        while let Some(key) = map.next_key::<std::borrow::Cow<'de, str>>()? {
+        let mut members = serde_json::Map::new();
+        while let Some(key) = map.next_key::<String>()? {
+            let value = map.next_value::<Value>()?;
             if let Some(index) = GRAPHQL_ENVELOPE_MEMBERS
                 .iter()
                 .position(|member| member.eq_ignore_ascii_case(&key))
             {
                 repeats_a_member |= std::mem::replace(&mut seen[index], true);
             }
-            if key == "query" {
-                query = map.next_value::<OptionalJsonString>()?.0;
-            } else if key == "operationName" {
-                operation_name = map.next_value::<OptionalJsonString>()?.0;
-            } else {
-                // Skip `variables`, `extensions`, and unknown fields without
-                // building a `serde_json::Value` DOM while preserving strict
-                // `Value` acceptance (UTF-8, paired surrogates, recursion limit).
-                let _ = map.next_value::<crate::util::json_dup_keys::SerdeJsonAccept>()?;
-            }
+            members.insert(key, value);
         }
         Ok(GraphqlEnvelope::Object {
-            query,
-            operation_name,
+            members,
             repeats_a_member,
         })
     }
@@ -1939,10 +1850,7 @@ impl<'de> serde::de::Visitor<'de> for GraphqlEnvelopeVisitor {
     where
         A: serde::de::SeqAccess<'de>,
     {
-        while seq
-            .next_element::<crate::util::json_dup_keys::SerdeJsonAccept>()?
-            .is_some()
-        {}
+        while seq.next_element::<serde::de::IgnoredAny>()?.is_some() {}
         Ok(GraphqlEnvelope::NotAnObject)
     }
 
@@ -2009,13 +1917,12 @@ impl GraphqlPlugin {
         ctx: &mut RequestContext,
         body: &[u8],
     ) -> PluginResult {
-        let (query, operation_name, repeats_a_member) = match serde_json::from_slice(body) {
+        let (members, repeats_a_member) = match serde_json::from_slice(body) {
             Ok(GraphqlEnvelope::Object {
-                query,
-                operation_name,
+                members,
                 repeats_a_member,
-            }) => (query, operation_name, repeats_a_member),
-            Ok(GraphqlEnvelope::NotAnObject) => (None, None, false),
+            }) => (Some(members), repeats_a_member),
+            Ok(GraphqlEnvelope::NotAnObject) => (None, false),
             Err(_) => {
                 debug!("graphql: request body is not valid JSON");
                 return reject_uninspectable_transport(
@@ -2025,7 +1932,11 @@ impl GraphqlPlugin {
             }
         };
 
-        let query = match query.as_deref() {
+        let query = match members
+            .as_ref()
+            .and_then(|members| members.get("query"))
+            .and_then(|q| q.as_str())
+        {
             Some(q) if !q.is_empty() => q,
             _ => {
                 // Batch arrays, APQ hash-only envelopes, empty/missing query.
@@ -2048,7 +1959,10 @@ impl GraphqlPlugin {
             );
         }
 
-        let operation_name = operation_name.as_deref();
+        let operation_name = members
+            .as_ref()
+            .and_then(|members| members.get("operationName"))
+            .and_then(|n| n.as_str());
 
         // Parse the GraphQL query and select the operation to analyze. The
         // parser rejects spec-invalid documents (e.g. multiple operations

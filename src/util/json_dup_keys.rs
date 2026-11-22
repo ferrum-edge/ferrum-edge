@@ -353,14 +353,13 @@ pub fn slice_ambiguity_with(bytes: &[u8], limits: &JsonScanLimits) -> Option<&'s
 /// surrogates, trailing-data rejection, and the default recursion limit.
 /// `IgnoredAny` is intentionally not used: its `ignore_value` path accepts
 /// lone surrogates / non-UTF-8 bytes and does not apply the recursion limit.
-pub(crate) fn serde_json_accepts(bytes: &[u8]) -> bool {
+fn serde_json_accepts(bytes: &[u8]) -> bool {
     serde_json::from_slice::<SerdeJsonAccept>(bytes).is_ok()
 }
 
-/// Non-materializing strict JSON discard sink. Accepts exactly when a `Value`
-/// parse would (enforcing UTF-8, paired surrogates, and `serde_json`'s default
-/// recursion limit), then discards every visited node.
-pub(crate) struct SerdeJsonAccept;
+/// Rejection-path confirmation sink. Accepts exactly when a `Value` parse
+/// would, then discards every visited node.
+struct SerdeJsonAccept;
 
 impl<'de> serde::Deserialize<'de> for SerdeJsonAccept {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>

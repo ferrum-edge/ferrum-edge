@@ -538,17 +538,23 @@ impl ResponseMock {
             })
         });
 
-        let regex = if !self.regex_rule_indices.is_empty() {
+        let regex = if let Some(&first_regex_idx) = self.regex_rule_indices.first()
+            && exact.is_none_or(|candidate| first_regex_idx < candidate)
+        {
             if let Some(set) = self.regex_set.as_ref() {
-                set.matches(path)
-                    .into_iter()
-                    .filter_map(|pattern_idx| self.regex_rule_indices.get(pattern_idx).copied())
-                    .take_while(|&index| exact.is_none_or(|candidate| index < candidate))
-                    .find(|&index| {
-                        self.rules
-                            .get(index)
-                            .is_some_and(|rule| rule.matches_request(method, ctx))
-                    })
+                if !set.is_match(path) {
+                    None
+                } else {
+                    set.matches(path)
+                        .into_iter()
+                        .filter_map(|pattern_idx| self.regex_rule_indices.get(pattern_idx).copied())
+                        .take_while(|&index| exact.is_none_or(|candidate| index < candidate))
+                        .find(|&index| {
+                            self.rules
+                                .get(index)
+                                .is_some_and(|rule| rule.matches_request(method, ctx))
+                        })
+                }
             } else {
                 self.regex_rule_indices
                     .iter()

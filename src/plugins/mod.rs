@@ -4249,10 +4249,11 @@ pub(crate) struct PluginRequestState {
     /// in `before_proxy` (when no token mutation occurred), allowing
     /// `on_final_request_body_with_context` to skip re-parsing an unchanged body.
     pub(crate) ai_request_guard_validated_hashes: HashMap<u64, [u8; 32]>,
-    /// Per-`ai_prompt_shield`-instance SHA-256 digest of a clean request body
-    /// scanned in `before_proxy`, allowing `on_final_request_body_with_context`
-    /// to skip re-parsing and re-scanning an unchanged body.
-    pub(crate) ai_prompt_shield_clean_hashes: HashMap<u64, [u8; 32]>,
+    /// Per-`ai_prompt_shield`-instance `(SHA-256 digest, is_streaming)`
+    /// witness for a clean request body scanned in `before_proxy`, allowing
+    /// `on_final_request_body_with_context` to skip re-parsing and re-scanning
+    /// an unchanged body while preserving the `ai_request_streaming` hint.
+    pub(crate) ai_prompt_shield_clean_hashes: HashMap<u64, ([u8; 32], bool)>,
     /// Per-instance buffered `redact_args` rewrites computed during governance
     /// amplification preflight and consumed by the response-body transform.
     /// Keys are digests of `(tool name, raw args)`; aggregate value bytes are

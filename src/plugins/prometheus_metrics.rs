@@ -554,13 +554,9 @@ pub struct TimestampedCounter {
 
 impl TimestampedCounter {
     fn new(epoch: Instant) -> Self {
-        Self::new_at(epoch.elapsed().as_nanos() as u64)
-    }
-
-    fn new_at(now_nanos: u64) -> Self {
         Self {
             value: CachePadded::new(AtomicU64::new(0)),
-            last_updated: CachePadded::new(AtomicU64::new(now_nanos)),
+            last_updated: CachePadded::new(AtomicU64::new(epoch.elapsed().as_nanos() as u64)),
         }
     }
 
@@ -578,7 +574,7 @@ impl TimestampedCounter {
 
     fn add_at(&self, value: u64, now_nanos: u64) {
         self.value.fetch_add(value, Ordering::Relaxed);
-        self.last_updated.store(now_nanos, Ordering::Relaxed);
+        self.last_updated.fetch_max(now_nanos, Ordering::Relaxed);
     }
 
     fn saturating_add(&self, value: u64, epoch: Instant) {
@@ -588,7 +584,7 @@ impl TimestampedCounter {
                 Some(current.saturating_add(value))
             });
         self.last_updated
-            .store(epoch.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            .fetch_max(epoch.elapsed().as_nanos() as u64, Ordering::Relaxed);
     }
 
     fn nanos_since_update(&self, epoch: Instant) -> u64 {
@@ -760,10 +756,6 @@ pub struct HistogramBuckets {
 
 impl HistogramBuckets {
     fn with_layout(boundaries: Arc<[f64]>, epoch: Instant) -> Self {
-        Self::with_layout_at(boundaries, epoch.elapsed().as_nanos() as u64)
-    }
-
-    fn with_layout_at(boundaries: Arc<[f64]>, now_nanos: u64) -> Self {
         let counts = boundaries
             .iter()
             .map(|_| CachePadded::new(AtomicU64::new(0)))
@@ -773,7 +765,7 @@ impl HistogramBuckets {
             counts,
             sum: CachePadded::new(AtomicU64::new(0)),
             count: CachePadded::new(AtomicU64::new(0)),
-            last_updated: CachePadded::new(AtomicU64::new(now_nanos)),
+            last_updated: CachePadded::new(AtomicU64::new(epoch.elapsed().as_nanos() as u64)),
         }
     }
 
@@ -820,14 +812,14 @@ impl HistogramBuckets {
     }
 
     /// Istio-aligned byte histogram buckets for REQUEST_SIZE / RESPONSE_SIZE.
-    fn new_bytes_at(now_nanos: u64) -> Self {
-        Self::with_layout_at(
+    fn new_bytes(epoch: Instant) -> Self {
+        Self::with_layout(
             Arc::from(vec![
                 1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0, 128.0, 256.0, 512.0, 1024.0, 2048.0, 4096.0,
                 8192.0, 16384.0, 32768.0, 65536.0, 131072.0, 262144.0, 524288.0, 1048576.0,
                 2097152.0, 4194304.0, 8388608.0,
             ]),
-            now_nanos,
+            epoch,
         )
     }
 
@@ -841,7 +833,7 @@ impl HistogramBuckets {
 
     fn observe_at(&self, value: f64, now_nanos: u64) {
         self.count.fetch_add(1, Ordering::Relaxed);
-        self.last_updated.store(now_nanos, Ordering::Relaxed);
+        self.last_updated.fetch_max(now_nanos, Ordering::Relaxed);
         // Add to sum (using u64 bit representation of f64)
         loop {
             let old = self.sum.load(Ordering::Relaxed);
@@ -1842,7 +1834,7 @@ impl MetricsRegistry {
             prometheus_helpers::MeshMetricFamily::TcpOpenedConnections,
             &self.mesh_tcp_opened_counter,
             key,
-            || TimestampedCounter::new_at(now_nanos),
+            || TimestampedCounter::new(self.epoch),
             |counter| counter.increment_at(now_nanos),
         );
         self.maybe_invalidate_cache();
@@ -1879,7 +1871,7 @@ impl MetricsRegistry {
                 prometheus_helpers::MeshMetricFamily::TcpClosedConnections,
                 &self.mesh_tcp_closed_counter,
                 key,
-                || TimestampedCounter::new_at(now_nanos),
+                || TimestampedCounter::new(self.epoch),
                 |counter| counter.increment_at(now_nanos),
             );
         }
@@ -1900,7 +1892,7 @@ impl MetricsRegistry {
                 prometheus_helpers::MeshMetricFamily::TcpSentBytes,
                 &self.mesh_tcp_sent_bytes_counter,
                 key,
-                || TimestampedCounter::new_at(now_nanos),
+                || TimestampedCounter::new(self.epoch),
                 |counter| counter.add_at(bytes, now_nanos),
             );
         }
@@ -1920,7 +1912,7 @@ impl MetricsRegistry {
                 prometheus_helpers::MeshMetricFamily::TcpReceivedBytes,
                 &self.mesh_tcp_received_bytes_counter,
                 key,
-                || TimestampedCounter::new_at(now_nanos),
+                || TimestampedCounter::new(self.epoch),
                 |counter| counter.add_at(bytes, now_nanos),
             );
         }
@@ -3038,7 +3030,7 @@ impl MetricsRegistry {
         Self::update_series(
             &self.request_counter,
             counter_key,
-            || TimestampedCounter::new_at(now_nanos),
+            || TimestampedCounter::new(self.epoch),
             |counter| counter.increment_at(now_nanos),
         );
 
@@ -3144,7 +3136,7 @@ impl MetricsRegistry {
                     prometheus_helpers::MeshMetricFamily::RequestCount,
                     &self.mesh_request_counter,
                     count_key,
-                    || TimestampedCounter::new_at(now_nanos),
+                    || TimestampedCounter::new(self.epoch),
                     |counter| counter.increment_at(now_nanos),
                 );
             }
@@ -3180,7 +3172,7 @@ impl MetricsRegistry {
                     prometheus_helpers::MeshMetricFamily::RequestSize,
                     &self.mesh_request_bytes_buckets,
                     size_key,
-                    || HistogramBuckets::new_bytes_at(now_nanos),
+                    || HistogramBuckets::new_bytes(self.epoch),
                     |buckets| buckets.observe_at(bytes, now_nanos),
                 );
             }
@@ -3201,7 +3193,7 @@ impl MetricsRegistry {
                     prometheus_helpers::MeshMetricFamily::ResponseSize,
                     &self.mesh_response_bytes_buckets,
                     size_key,
-                    || HistogramBuckets::new_bytes_at(now_nanos),
+                    || HistogramBuckets::new_bytes(self.epoch),
                     |buckets| buckets.observe_at(bytes, now_nanos),
                 );
             }
@@ -3222,7 +3214,7 @@ impl MetricsRegistry {
                         prometheus_helpers::MeshMetricFamily::GrpcRequestMessages,
                         &self.mesh_grpc_request_messages_counter,
                         key,
-                        || TimestampedCounter::new_at(now_nanos),
+                        || TimestampedCounter::new(self.epoch),
                         |counter| counter.add_at(messages, now_nanos),
                     );
                 }
@@ -3242,7 +3234,7 @@ impl MetricsRegistry {
                         prometheus_helpers::MeshMetricFamily::GrpcResponseMessages,
                         &self.mesh_grpc_response_messages_counter,
                         key,
-                        || TimestampedCounter::new_at(now_nanos),
+                        || TimestampedCounter::new(self.epoch),
                         |counter| counter.add_at(messages, now_nanos),
                     );
                 }
@@ -3259,7 +3251,7 @@ impl MetricsRegistry {
             Self::update_series(
                 &self.client_disconnect_counter,
                 key,
-                || TimestampedCounter::new_at(now_nanos),
+                || TimestampedCounter::new(self.epoch),
                 |counter| counter.increment_at(now_nanos),
             );
         }
@@ -3427,7 +3419,7 @@ impl MetricsRegistry {
                 let current = self.current_duration_layout(DurationLayoutKind::Request);
                 if !Arc::ptr_eq(&entry.get().boundaries, &current) {
                     let _superseded =
-                        entry.insert(HistogramBuckets::with_layout_at(current, now_nanos));
+                        entry.insert(HistogramBuckets::with_layout(current, self.epoch));
                 }
                 entry.get().observe_at(value, now_nanos);
             }
@@ -3437,7 +3429,7 @@ impl MetricsRegistry {
                     return;
                 }
                 let current = self.current_duration_layout(DurationLayoutKind::Request);
-                let histogram = HistogramBuckets::with_layout_at(current, now_nanos);
+                let histogram = HistogramBuckets::with_layout(current, self.epoch);
                 histogram.observe_at(value, now_nanos);
                 entry.insert(histogram);
             }
@@ -3524,13 +3516,13 @@ impl MetricsRegistry {
                 let current = self.current_duration_layout(kind);
                 if !Arc::ptr_eq(&entry.get().boundaries, &current) {
                     let _superseded =
-                        entry.insert(HistogramBuckets::with_layout_at(current, now_nanos));
+                        entry.insert(HistogramBuckets::with_layout(current, self.epoch));
                 }
                 entry.get().observe_at(value, now_nanos);
             }
             Entry::Vacant(entry) => {
                 let histogram =
-                    HistogramBuckets::with_layout_at(self.current_duration_layout(kind), now_nanos);
+                    HistogramBuckets::with_layout(self.current_duration_layout(kind), self.epoch);
                 histogram.observe_at(value, now_nanos);
                 entry.insert(histogram);
             }
@@ -3607,7 +3599,7 @@ impl MetricsRegistry {
             return;
         }
         map.entry(Arc::clone(proxy_id))
-            .or_insert_with(|| TimestampedCounter::new_at(now_nanos))
+            .or_insert_with(|| TimestampedCounter::new(self.epoch))
             .add_at(value, now_nanos);
     }
 
