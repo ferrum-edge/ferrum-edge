@@ -33,8 +33,9 @@ deploying a build from `main`.
 
 ## Upgrading to 0.9.21
 
-0.9.21 was prepared on 2026-11-21 UTC from `main` and follows published
-0.9.20 directly. It collects security-advisory fixes, mesh VirtualService and
+0.9.21 was published on 2026-11-22 UTC from commit
+`f9915358c8032214f4034a17c28cdf72d14006c3` and follows published 0.9.20
+directly; see the [publication record](releases/v0.9.21-publication.md). It collects security-advisory fixes, mesh VirtualService and
 DestinationRule data-plane work, and the removal of configuration that nothing
 read. Many sections below refuse configuration or traffic that 0.9.20
 accepted, so review every section before upgrading. The `V001` baseline
@@ -43,8 +44,9 @@ or SQLite database that applied the 0.9.20 baseline is refused on
 migration-history grounds; rebuild it as described in
 [Build-Out database upgrade](#build-out-database-upgrade-postgresql-mysql-sqlite-mongodb).
 CP/DP must run the same build, and the ConfigSync revision is now `6`. The
-matching `contracts-edge-0.9.21` release must be cut from the verified release
-commit; move downstream contract pins when each consumer adopts 0.9.21.
+matching `contracts-edge-0.9.21` release has not been cut yet; it pairs with
+this release commit. Move downstream contract pins once it is published and
+each consumer adopts 0.9.21.
 
 ### `;`-aliased query tokens are refused by `jwt_auth`, `jwks_auth`, and `oauth2_introspection` (GHSA-c259-vchc-3vgr)
 
