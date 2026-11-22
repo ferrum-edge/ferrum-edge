@@ -40,8 +40,9 @@ migrate="$(docker create --network none \
   -e 'FERRUM_DB_URL=sqlite:////data/ferrum.db?mode=rwc' \
   "$image" run)"
 runtime_user="$(docker inspect --format '{{.Config.User}}' "$migrate")"
+# distroless :nonroot reports a bare numeric UID ("65532"); its primary group is 65532.
 case "$runtime_user" in
-  65532:65532|nonroot:nonroot) ;;
+  65532|65532:65532|nonroot|nonroot:nonroot) ;;
   *) fail "expected default UID/GID 65532:65532, got $runtime_user" ;;
 esac
 docker start "$migrate" >/dev/null
