@@ -1253,7 +1253,10 @@ impl HmacPrebufferState {
     /// Remove and return **this owner's** record, leaving every other owner's
     /// record untouched.
     fn take(&mut self, owner: HmacPrebufferOwner) -> Option<CachedHmacAuthorization> {
-        let mut staged = self.lock();
+        let staged = self
+            .staged
+            .get_mut()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let index = staged.iter().position(|(existing, _)| *existing == owner)?;
         Some(staged.remove(index).1)
     }
@@ -1862,18 +1865,16 @@ impl HmacAuth {
         // list), then padding with a throwaway key. Rounds never short-circuit,
         // so neither an unknown username nor the number of rotated secrets
         // shows in the response timing. Only a configured secret can match.
-        let rounds = consumer
+        let hmac_entries = consumer
             .as_ref()
             .and_then(|consumer| consumer.credentials.get("hmac_auth"))
             .and_then(Value::as_array)
-            .map_or(0, Vec::len)
-            .max(self.verification_rounds);
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+        let rounds = hmac_entries.len().max(self.verification_rounds);
         for round in 0..rounds {
-            let configured_secret = consumer
-                .as_ref()
-                .and_then(|consumer| consumer.credentials.get("hmac_auth"))
-                .and_then(Value::as_array)
-                .and_then(|entries| entries.get(round))
+            let configured_secret = hmac_entries
+                .get(round)
                 .filter(|entry| entry.is_object())
                 .and_then(|entry| entry.get("secret"))
                 .and_then(Value::as_str);

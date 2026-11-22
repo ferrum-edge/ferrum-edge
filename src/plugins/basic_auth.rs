@@ -126,16 +126,8 @@ impl BasicAuth {
         })
     }
 
-    /// Verify a password against a stored hash.
-    ///
-    /// Supports `hmac_sha256:<hex>` — HMAC-SHA256 with the server secret.
-    fn verify_password(&self, password: &str, stored_hash: &str) -> bool {
-        let Ok(mut mac) = HmacSha256::new_from_slice(&self.hmac_secret) else {
-            warn!("basic_auth: failed to create HMAC instance");
-            return false;
-        };
-        mac.update(password.as_bytes());
-        let computed = mac.finalize().into_bytes();
+    /// Verify a precomputed password HMAC against a stored `hmac_sha256:<hex>` hash.
+    fn verify_computed_hash(computed: &[u8], stored_hash: &str) -> bool {
         let Some(hex_hash) = stored_hash.strip_prefix("hmac_sha256:") else {
             return false;
         };
@@ -144,7 +136,7 @@ impl BasicAuth {
             return false;
         }
 
-        constant_time_eq(&computed, &expected)
+        constant_time_eq(computed, &expected)
     }
 
     fn verify_credential_with_round_observer<F>(
@@ -161,24 +153,31 @@ impl BasicAuth {
         };
 
         let consumer = consumer_index.find_by_username(&username);
+        let basicauth_entries = consumer
+            .as_ref()
+            .and_then(|consumer| consumer.credentials.get("basicauth"))
+            .and_then(Value::as_array);
+        let Ok(mut mac) = HmacSha256::new_from_slice(&self.hmac_secret) else {
+            warn!("basic_auth: failed to create HMAC instance");
+            return VerifyOutcome::VerificationFailed(r#"{"error":"Invalid credentials"}"#.into());
+        };
+        mac.update(password.as_bytes());
+        let computed = mac.finalize().into_bytes();
         let mut password_matched = false;
 
         for round in 0..self.verification_rounds {
             observe_round();
             // Fixed indexed access avoids collecting a username-dependent
             // number of entries before the padded verification work begins.
-            let configured_hash = consumer
-                .as_ref()
-                .and_then(|consumer| consumer.credentials.get("basicauth"))
-                .and_then(Value::as_array)
+            let configured_hash = basicauth_entries
                 .and_then(|entries| entries.get(round))
                 .and_then(|entry| entry.get("password_hash"))
                 .and_then(Value::as_str);
-            let round_matched = self.verify_password(
-                &password,
+            let round_matched = Self::verify_computed_hash(
+                &computed,
                 configured_hash.unwrap_or(&self.dummy_password_hash),
             );
-            // Always execute the padded HMAC round, but only a configured
+            // Always execute the padded comparison round, but only a configured
             // credential is allowed to establish identity. The random dummy
             // material is timing padding, never a process-local master password.
             password_matched |= configured_hash.is_some() & round_matched;
@@ -364,7 +363,15 @@ auth_flow::impl_auth_plugin!(
         crate::plugins::PluginResult::Continue
     }
 
+    fn supports_request_header_passthrough(&self) -> bool {
+        !self.hide_credentials
+    }
+
     fn lifecycle_hooks(&self) -> crate::plugins::PluginHooks {
-        crate::plugins::PluginHooks::BEFORE_PROXY
+        if self.hide_credentials {
+            crate::plugins::PluginHooks::BEFORE_PROXY
+        } else {
+            crate::plugins::PluginHooks::NONE
+        }
     }
 );

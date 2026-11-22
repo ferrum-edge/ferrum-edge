@@ -5972,7 +5972,11 @@ impl Plugin for SoapWsSecurity {
     }
 
     fn lifecycle_hooks(&self) -> crate::plugins::PluginHooks {
-        crate::plugins::PluginHooks::BEFORE_PROXY
+        if self.establishes_identity() {
+            crate::plugins::PluginHooks::NONE
+        } else {
+            crate::plugins::PluginHooks::BEFORE_PROXY
+        }
     }
 
     fn supported_protocols(&self) -> &'static [super::ProxyProtocol] {

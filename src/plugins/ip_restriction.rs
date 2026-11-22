@@ -265,6 +265,10 @@ impl Plugin for IpRestriction {
         crate::plugins::PluginHooks::ON_REQUEST_RECEIVED
     }
 
+    fn supports_request_header_passthrough(&self) -> bool {
+        true
+    }
+
     fn supported_protocols(&self) -> &'static [super::ProxyProtocol] {
         super::ALL_PROTOCOLS
     }

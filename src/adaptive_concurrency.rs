@@ -479,14 +479,14 @@ impl AdaptiveConcurrencyLimiter {
     ) -> Result<Arc<AdaptiveConcurrencyPermit>, AdaptiveConcurrencyLimitExceeded> {
         let generation = self.policy.active_generation.load(Ordering::Acquire);
         let lb_generation = self.policy.active_lb_generation.load(Ordering::Acquire);
-        self.try_acquire_for_generation(proxy, target, config, generation, lb_generation)
+        self.try_acquire_for_generation(proxy, target, &config, generation, lb_generation)
     }
 
     pub(crate) fn try_acquire_for_generation(
         &self,
         proxy: &Proxy,
         target: Option<&UpstreamTarget>,
-        request_config: Arc<AdaptiveConcurrencyConfig>,
+        request_config: &Arc<AdaptiveConcurrencyConfig>,
         generation: u64,
         lb_generation: u64,
     ) -> Result<Arc<AdaptiveConcurrencyPermit>, AdaptiveConcurrencyLimitExceeded> {
@@ -495,8 +495,7 @@ impl AdaptiveConcurrencyLimiter {
             // ownership. Structural publication can then detach this entire
             // space without an old admission repopulating the replacement map.
             let tracking_space = self.tracking_space.load();
-            let (config, config_generation) =
-                self.admission_config(generation, Arc::clone(&request_config));
+            let (config, config_generation) = self.admission_config(generation, request_config);
             self.ensure_policy_generation_admitted(generation, lb_generation)?;
             let (state, tracked) = self.target_state(&tracking_space, proxy, target, &config);
 
@@ -646,7 +645,7 @@ impl AdaptiveConcurrencyLimiter {
     fn admission_config(
         &self,
         generation: u64,
-        config: Arc<AdaptiveConcurrencyConfig>,
+        config: &Arc<AdaptiveConcurrencyConfig>,
     ) -> (Arc<AdaptiveConcurrencyConfig>, u64) {
         let active = self.policy.active_config.load();
         match active
@@ -654,7 +653,7 @@ impl AdaptiveConcurrencyLimiter {
             .filter(|active| active.generation > generation)
         {
             Some(active) => (Arc::clone(&active.config), active.generation),
-            None => (config, generation),
+            None => (Arc::clone(config), generation),
         }
     }
 

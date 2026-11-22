@@ -1712,8 +1712,21 @@ impl super::Plugin for Oauth2Introspection {
         super::priority::OAUTH2_INTROSPECTION
     }
 
+    fn supports_request_header_passthrough(&self) -> bool {
+        !self.requires_decoded_query_params()
+            && !self.modifies_request_headers()
+            && !self
+                .request_headers_to_redact()
+                .iter()
+                .any(|name| name.eq_ignore_ascii_case("host"))
+    }
+
     fn lifecycle_hooks(&self) -> crate::plugins::PluginHooks {
-        crate::plugins::PluginHooks::BEFORE_PROXY
+        if self.modifies_request_headers() {
+            crate::plugins::PluginHooks::BEFORE_PROXY
+        } else {
+            crate::plugins::PluginHooks::NONE
+        }
     }
 
     fn supported_protocols(&self) -> &'static [super::ProxyProtocol] {
@@ -1786,29 +1799,31 @@ impl super::Plugin for Oauth2Introspection {
         ctx: &mut RequestContext,
         headers: &mut HashMap<String, String>,
     ) -> PluginResult {
-        let strip_authorization = ctx
-            .metadata
-            .remove(STRIP_AUTHORIZATION_METADATA_KEY)
-            .is_some();
-        let strip_headers: Vec<String> = ctx
-            .metadata
-            .keys()
-            .filter_map(|key| key.strip_prefix(STRIP_HEADER_METADATA_PREFIX))
-            .map(ToOwned::to_owned)
-            .collect();
-        if strip_authorization || !strip_headers.is_empty() {
-            headers.retain(|name, _| {
-                let strip_current = (strip_authorization
-                    && name.eq_ignore_ascii_case("authorization"))
-                    || strip_headers
-                        .iter()
-                        .any(|header| name.eq_ignore_ascii_case(header));
-                !strip_current
-            });
-        }
-        for header in strip_headers {
-            ctx.metadata
-                .remove(&format!("{STRIP_HEADER_METADATA_PREFIX}{header}"));
+        if self.strip_authorization_on_success {
+            let strip_authorization = ctx
+                .metadata
+                .remove(STRIP_AUTHORIZATION_METADATA_KEY)
+                .is_some();
+            let strip_headers: Vec<String> = ctx
+                .metadata
+                .keys()
+                .filter_map(|key| key.strip_prefix(STRIP_HEADER_METADATA_PREFIX))
+                .map(ToOwned::to_owned)
+                .collect();
+            if strip_authorization || !strip_headers.is_empty() {
+                headers.retain(|name, _| {
+                    let strip_current = (strip_authorization
+                        && name.eq_ignore_ascii_case("authorization"))
+                        || strip_headers
+                            .iter()
+                            .any(|header| name.eq_ignore_ascii_case(header));
+                    !strip_current
+                });
+            }
+            for header in strip_headers {
+                ctx.metadata
+                    .remove(&format!("{STRIP_HEADER_METADATA_PREFIX}{header}"));
+            }
         }
         apply_claim_headers_from_context(ctx, headers, &self.claim_header_destinations);
         PluginResult::Continue

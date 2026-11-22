@@ -2104,9 +2104,12 @@ impl OidcRelyingParty {
         // value, but the conversion is shared: `None` means "no bound", never
         // "expired" (issue #5420).
         let credential_deadline = credential_deadline_from_unix_seconds(credential_valid_until, 0);
-        let outcome = self
-            .resolve_identity(&payload.claims, consumer_index)
-            .with_credential_deadline(credential_deadline);
+        let outcome = if refresh.refreshed {
+            self.resolve_identity(&payload.claims, consumer_index)
+        } else {
+            preflight_outcome
+        }
+        .with_credential_deadline(credential_deadline);
         let mut attempt = AuthenticationAttempt::new();
         if authentication_attempt_can_commit(ctx, &outcome, true) {
             if let Some(cookie) = rolling_cookie {
@@ -3366,9 +3369,12 @@ impl super::Plugin for OidcRelyingParty {
         super::priority::OIDC_RELYING_PARTY
     }
     fn lifecycle_hooks(&self) -> crate::plugins::PluginHooks {
-        crate::plugins::PluginHooks::ON_REQUEST_RECEIVED
-            | crate::plugins::PluginHooks::BEFORE_PROXY
-            | crate::plugins::PluginHooks::AFTER_PROXY
+        let mut hooks = crate::plugins::PluginHooks::ON_REQUEST_RECEIVED
+            | crate::plugins::PluginHooks::AFTER_PROXY;
+        if self.modifies_request_headers() {
+            hooks |= crate::plugins::PluginHooks::BEFORE_PROXY;
+        }
+        hooks
     }
     fn supported_protocols(&self) -> &'static [super::ProxyProtocol] {
         crate::plugins::HTTP_FAMILY_PROTOCOLS

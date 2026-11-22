@@ -203,6 +203,12 @@ fn key_for_header_kid<'a>(
 }
 
 pub fn peek_unverified_issuer(token: &str) -> Option<String> {
+    #[derive(serde::Deserialize)]
+    struct UnverifiedIssPayload<'a> {
+        #[serde(default, borrow)]
+        iss: Option<std::borrow::Cow<'a, str>>,
+    }
+
     let mut parts = token.split('.');
     let _header = parts.next()?;
     let payload_segment = parts.next()?;
@@ -214,11 +220,8 @@ pub fn peek_unverified_issuer(token: &str) -> Option<String> {
     let payload_bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
         .decode(payload_segment)
         .ok()?;
-    let payload: Value = serde_json::from_slice(&payload_bytes).ok()?;
-    payload
-        .get("iss")
-        .and_then(|v| v.as_str())
-        .map(ToOwned::to_owned)
+    let payload: UnverifiedIssPayload<'_> = serde_json::from_slice(&payload_bytes).ok()?;
+    payload.iss.map(std::borrow::Cow::into_owned)
 }
 
 fn build_validation(algorithm: Algorithm, params: &JwtVerifyParams<'_>) -> Validation {

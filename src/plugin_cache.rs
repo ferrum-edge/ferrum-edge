@@ -6368,12 +6368,19 @@ fn build_phase_data(plugins: &[Arc<dyn Plugin>]) -> PluginPhaseData {
         // Multiple instances (and a global plus a proxy-scoped instance) compose
         // to their minimum; a zero/disabled instance contributes nothing rather
         // than relaxing a sibling's active bound (`GHSA-xrfj-852f-645j`).
-        // Only registered built-in `key_auth` instances may elide `before_proxy`
-        // into the passthrough strip overlay; custom plugins (including an
-        // impostor reporting `name() == "key_auth"`) always stay on the
-        // materialized path so their `before_proxy` rejections can never be
-        // skipped.
-        if !(is_builtin_named(p, "key_auth") && p.supports_request_header_passthrough()) {
+        // Only registered built-in plugins whose request-header reads and
+        // assertions are audited for the wire passthrough lane may keep
+        // `SUPPORTS_REQUEST_HEADER_PASSTHROUGH` active; custom plugins (including
+        // an impostor reporting a built-in name) always stay on the materialized
+        // path so their hooks can never be skipped. Built-ins with a
+        // `BEFORE_PROXY` hook are excluded unless `key_auth` (whose `before_proxy`
+        // only strips `request_headers_to_redact()`, elided into the passthrough
+        // strip overlay).
+        let passthrough_builtin_eligible = crate::plugins::is_builtin_plugin(p.as_ref())
+            && p.supports_request_header_passthrough()
+            && (!hooks.contains(crate::plugins::PluginHooks::BEFORE_PROXY)
+                || is_builtin_named(p, "key_auth"));
+        if !passthrough_builtin_eligible {
             supports_request_header_passthrough = false;
         } else if p.modifies_request_headers() {
             for name in p.request_headers_to_redact() {
@@ -6415,13 +6422,10 @@ fn build_phase_data(plugins: &[Arc<dyn Plugin>]) -> PluginPhaseData {
         | PluginCapabilities::DISPATCHES_FINALIZED_REQUEST_EGRESS
         | PluginCapabilities::ENFORCES_FINAL_BACKEND_HEADER_POLICY
         | PluginCapabilities::HAS_QUERY_READING_TRIGGER
-        | PluginCapabilities::HAS_ON_REQUEST_RECEIVED_HOOK
         | PluginCapabilities::HAS_AFTER_PROXY_HOOK
         | PluginCapabilities::HAS_TERMINAL_SUMMARY_CONSUMER;
     if supports_request_header_passthrough
         && (caps & passthrough_blocked_caps) == 0
-        && authorize.is_empty()
-        && backend_admission.is_empty()
         && backend_path.is_empty()
         && grpc_deadline.is_empty()
         && initial_response_header_policy_plugins.is_empty()

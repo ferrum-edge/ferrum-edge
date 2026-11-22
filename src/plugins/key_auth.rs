@@ -418,6 +418,10 @@ auth_flow::impl_auth_plugin!(
     }
 
     fn lifecycle_hooks(&self) -> crate::plugins::PluginHooks {
-        crate::plugins::PluginHooks::BEFORE_PROXY
+        if self.hide_credentials {
+            crate::plugins::PluginHooks::BEFORE_PROXY
+        } else {
+            crate::plugins::PluginHooks::NONE
+        }
     }
 );

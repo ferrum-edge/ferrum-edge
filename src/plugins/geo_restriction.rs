@@ -672,6 +672,10 @@ impl Plugin for GeoRestriction {
         crate::plugins::PluginHooks::ON_REQUEST_RECEIVED
     }
 
+    fn supports_request_header_passthrough(&self) -> bool {
+        true
+    }
+
     fn supported_protocols(&self) -> &'static [super::ProxyProtocol] {
         super::ALL_PROTOCOLS
     }
@@ -736,8 +740,10 @@ impl Plugin for GeoRestriction {
             && let Some(code) = country
         {
             ctx.set_backend_geo_country(code.bytes());
-            ctx.headers
-                .insert(GEO_COUNTRY_HEADER.to_string(), code.into_string());
+            if !ctx.request_header_passthrough_active() {
+                ctx.headers
+                    .insert(GEO_COUNTRY_HEADER.to_string(), code.into_string());
+            }
         }
 
         result
