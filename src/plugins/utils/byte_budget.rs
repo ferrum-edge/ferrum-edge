@@ -34,19 +34,19 @@ pub const PROCESS_MAX_RETAINED_BYTES_MAX: usize = 2_147_483_648;
 /// the same binary depend on.
 #[derive(Debug)]
 pub struct RetainedByteCeiling {
-    used: AtomicUsize,
+    used: crossbeam_utils::CachePadded<AtomicUsize>,
     max: AtomicUsize,
     rejections: AtomicU64,
-    high_water: AtomicUsize,
+    high_water: crossbeam_utils::CachePadded<AtomicUsize>,
 }
 
 impl RetainedByteCeiling {
     pub const fn new(max_bytes: usize) -> Self {
         Self {
-            used: AtomicUsize::new(0),
+            used: crossbeam_utils::CachePadded::new(AtomicUsize::new(0)),
             max: AtomicUsize::new(max_bytes),
             rejections: AtomicU64::new(0),
-            high_water: AtomicUsize::new(0),
+            high_water: crossbeam_utils::CachePadded::new(AtomicUsize::new(0)),
         }
     }
 
@@ -100,8 +100,10 @@ impl RetainedByteCeiling {
                 used.checked_add(bytes).filter(|next| *next <= max)
             }) {
             Ok(previous) => {
-                self.high_water
-                    .fetch_max(previous.saturating_add(bytes), Ordering::AcqRel);
+                let next = previous.saturating_add(bytes);
+                if next > self.high_water.load(Ordering::Relaxed) {
+                    self.high_water.fetch_max(next, Ordering::AcqRel);
+                }
                 Some(ProcessByteReservation {
                     ceiling: self,
                     bytes: AtomicUsize::new(bytes),

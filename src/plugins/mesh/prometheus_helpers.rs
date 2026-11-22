@@ -2404,13 +2404,25 @@ pub(crate) fn mesh_metric_disabled(summary: &TransactionSummary, family: MeshMet
 /// `workload_metrics` to a finalized mesh key. The compact plan is parsed in
 /// place without JSON parsing, CEL text reparsing, or a lock on the request-log
 /// path. Expression opcodes evaluate against the metric-phase attribute context.
+#[cfg(test)]
 pub(crate) fn mesh_request_key_for_family(
     summary: &TransactionSummary,
     base: &MeshRequestKey,
     family: MeshMetricFamily,
 ) -> MeshRequestKey {
+    mesh_request_key_for_family_cow(summary, base, family).into_owned()
+}
+
+/// Borrowing variant of [`mesh_request_key_for_family`]: returns `Cow::Borrowed`
+/// when no per-family metric tag override applies (the common path), avoiding
+/// 14 `Arc<str>` atomic clones per family on warm series hits.
+pub(crate) fn mesh_request_key_for_family_cow<'a>(
+    summary: &TransactionSummary,
+    base: &'a MeshRequestKey,
+    family: MeshMetricFamily,
+) -> std::borrow::Cow<'a, MeshRequestKey> {
     let Some(plan) = summary.metadata.get(family.override_metadata_key()) else {
-        return base.clone();
+        return std::borrow::Cow::Borrowed(base);
     };
     let mut key = base.clone();
     let extras = MetricTagCelExtras {
@@ -2422,7 +2434,7 @@ pub(crate) fn mesh_request_key_for_family(
     };
     apply_metric_override_plan(&mut key, base, plan, extras);
     normalize_removed_labels(&mut key);
-    key
+    std::borrow::Cow::Owned(key)
 }
 
 /// Collapse every removed label onto one shared sentinel value so the derived
@@ -3049,13 +3061,13 @@ pub(crate) fn mesh_metric_disabled_metadata<MS: std::hash::BuildHasher>(
         })
 }
 
-pub(crate) fn mesh_request_key_for_family_from_metadata<MS: std::hash::BuildHasher>(
+pub(crate) fn mesh_request_key_for_family_from_metadata_cow<'a, MS: std::hash::BuildHasher>(
     metadata: &HashMap<String, String, MS>,
-    base: &MeshRequestKey,
+    base: &'a MeshRequestKey,
     family: MeshMetricFamily,
-) -> MeshRequestKey {
+) -> std::borrow::Cow<'a, MeshRequestKey> {
     let Some(plan) = metadata.get(family.override_metadata_key()) else {
-        return base.clone();
+        return std::borrow::Cow::Borrowed(base);
     };
     let mut key = base.clone();
     let extras = MetricTagCelExtras {
@@ -3073,7 +3085,7 @@ pub(crate) fn mesh_request_key_for_family_from_metadata<MS: std::hash::BuildHash
         key.removed_labels |= TCP_FAMILY_REMOVED_LABELS;
     }
     normalize_removed_labels(&mut key);
-    key
+    std::borrow::Cow::Owned(key)
 }
 
 /// True when both metric plugins actually observed a mesh TCP connection.

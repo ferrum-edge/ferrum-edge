@@ -1491,7 +1491,11 @@ impl Plugin for WorkloadMetrics {
         // labels and trace context; before_proxy refreshes the same metadata
         // after route selection for accepted requests.
         let headers = std::mem::take(&mut ctx.headers);
-        let probe = TraceHeaderProbe::scan(&headers);
+        let probe = if self.trace_context_enabled() {
+            TraceHeaderProbe::scan(&headers)
+        } else {
+            TraceHeaderProbe::content_type_only(&headers)
+        };
         let captured_traceparent = probe.has_valid_traceparent();
         let captured_b3 = probe.has_b3_trace_context() || probe.b3_sampling_decision().is_some();
         let captured_tracestate = probe.tracestate.is_some();
@@ -1527,7 +1531,11 @@ impl Plugin for WorkloadMetrics {
         // One trace-header scan serves both the reconciliation and the stamp;
         // the map is re-scanned only when the reconciliation stripped headers.
         let reconciliation = {
-            let probe = TraceHeaderProbe::scan(headers);
+            let probe = if self.trace_context_enabled() {
+                TraceHeaderProbe::scan(headers)
+            } else {
+                TraceHeaderProbe::content_type_only(headers)
+            };
             let reconciliation = self.reconcile_captured_trace_headers(ctx, &probe);
             if !reconciliation.strips_headers() {
                 self.annotate_backend_http_context(ctx, headers, &probe);
@@ -3247,6 +3255,22 @@ impl<'a> TraceHeaderProbe<'a> {
         "x-b3-sampled",
         "content-type",
     ];
+
+    /// Fast path when trace-context propagation is disabled: only `content-type`
+    /// is needed for HTTP/gRPC protocol classification, avoiding an O(8 * H)
+    /// scan over every request header.
+    fn content_type_only(headers: &'a HashMap<String, String>) -> Self {
+        let content_type = headers.get("content-type").map(String::as_str).or_else(|| {
+            headers
+                .iter()
+                .find(|(name, _)| name.eq_ignore_ascii_case("content-type"))
+                .map(|(_, value)| value.as_str())
+        });
+        Self {
+            content_type,
+            ..Self::default()
+        }
+    }
 
     fn scan(headers: &'a HashMap<String, String>) -> Self {
         let mut exact: [Option<&'a str>; 8] = [None; 8];

@@ -36,7 +36,6 @@ use tokio::sync::{mpsc, watch};
 use tokio::time::Duration;
 use tracing::{debug, warn};
 use url::{Host, Url};
-use uuid::Uuid;
 
 use crate::modes::mesh::config::TracingProvider;
 use crate::observability_delivery::DeliveryWorkerControl;
@@ -798,11 +797,11 @@ impl OtelTracing {
     }
 
     pub(crate) fn generate_trace_id() -> String {
-        hex_encode(Uuid::new_v4().as_bytes())
+        super::utils::fast_id::fast_trace_id_hex()
     }
 
     pub(crate) fn generate_span_id() -> String {
-        hex_encode(&Uuid::new_v4().as_bytes()[..8])
+        super::utils::fast_id::fast_span_id_hex()
     }
 
     fn decide_root_sampled(&self) -> bool {
@@ -3936,16 +3935,6 @@ fn unique_header_value_case_insensitive<'a>(
     Ok(value)
 }
 
-fn hex_encode(bytes: &[u8]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut output = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        output.push(HEX[(byte >> 4) as usize] as char);
-        output.push(HEX[(byte & 0x0f) as usize] as char);
-    }
-    output
-}
-
 fn otlp_attribute(key: &str, value: &str) -> Value {
     serde_json::json!({
         "key": key,
@@ -4032,8 +4021,7 @@ fn sample_ratio(ratio: f64) -> bool {
     if ratio >= 1.0 {
         return true;
     }
-    let random = Uuid::new_v4().as_u128() as f64 / (u128::MAX as f64);
-    random < ratio
+    super::utils::fast_id::fast_unit_f64() < ratio
 }
 
 /// Mesh trace attributes with every value bounded by `max_attribute_bytes`.

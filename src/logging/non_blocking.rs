@@ -163,10 +163,11 @@ struct SinkState {
     options: NonBlockingOptions,
     accepting: AtomicBool,
     healthy: AtomicBool,
-    outstanding_records: AtomicUsize,
-    reserved_bytes: AtomicUsize,
-    queued_bytes: AtomicUsize,
-    accepted_records: AtomicU64,
+    outstanding_records: crossbeam_utils::CachePadded<AtomicUsize>,
+    reserved_bytes: crossbeam_utils::CachePadded<AtomicUsize>,
+    queued_bytes: crossbeam_utils::CachePadded<AtomicUsize>,
+    accepted_records: crossbeam_utils::CachePadded<AtomicU64>,
+    worker_parked: crossbeam_utils::CachePadded<AtomicBool>,
     saturation_dropped: AtomicU64,
     oversized_dropped: AtomicU64,
     closed_dropped: AtomicU64,
@@ -263,7 +264,14 @@ impl SinkState {
     }
 
     fn wake_worker(&self) {
-        if let Some(worker) = self.worker_thread.get() {
+        // Dekker wakeup protocol paired with `run_worker`'s `SeqCst` store to
+        // `worker_parked` before checking the queue: only issue `unpark()` when
+        // the worker has actually published that it is parking, eliminating a
+        // futex/unpark syscall on every enqueued log record while busy.
+        if self.worker_parked.load(Ordering::SeqCst)
+            && self.worker_parked.swap(false, Ordering::AcqRel)
+            && let Some(worker) = self.worker_thread.get()
+        {
             worker.unpark();
         }
     }
@@ -370,10 +378,11 @@ impl NonBlockingSink {
             options,
             accepting: AtomicBool::new(true),
             healthy: AtomicBool::new(true),
-            outstanding_records: AtomicUsize::new(0),
-            reserved_bytes: AtomicUsize::new(0),
-            queued_bytes: AtomicUsize::new(0),
-            accepted_records: AtomicU64::new(0),
+            outstanding_records: crossbeam_utils::CachePadded::new(AtomicUsize::new(0)),
+            reserved_bytes: crossbeam_utils::CachePadded::new(AtomicUsize::new(0)),
+            queued_bytes: crossbeam_utils::CachePadded::new(AtomicUsize::new(0)),
+            accepted_records: crossbeam_utils::CachePadded::new(AtomicU64::new(0)),
+            worker_parked: crossbeam_utils::CachePadded::new(AtomicBool::new(false)),
             saturation_dropped: AtomicU64::new(0),
             oversized_dropped: AtomicU64::new(0),
             closed_dropped: AtomicU64::new(0),
@@ -754,10 +763,19 @@ where
         {
             break;
         }
-        // submit(), shutdown(), and the final abandoned reservation all unpark
-        // this worker. Thread park tokens make the queue-empty/check/park
-        // sequence safe when a wake arrives immediately before park().
+        // Publish `worker_parked = true` with SeqCst before re-checking queue
+        // and shutdown state, matching `wake_worker()`'s SeqCst load after
+        // pushing/closing so no wakeup can be lost.
+        state.worker_parked.store(true, Ordering::SeqCst);
+        if !queue.is_empty()
+            || (!state.accepting.load(Ordering::Acquire)
+                && state.outstanding_records.load(Ordering::Acquire) == 0)
+        {
+            state.worker_parked.store(false, Ordering::Relaxed);
+            continue;
+        }
         std::thread::park();
+        state.worker_parked.store(false, Ordering::Relaxed);
     }
 
     if let Err(error) = writer.flush() {

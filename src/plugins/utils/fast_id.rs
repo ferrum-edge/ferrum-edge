@@ -152,3 +152,11 @@ pub fn fast_trace_id_hex() -> String {
 pub fn fast_span_id_hex() -> String {
     encode_hex_lower_8(&fast_span_id_bytes())
 }
+
+/// Generate a uniform random `f64` in `[0.0, 1.0)` from 53 random bits using
+/// the per-thread OS-seeded PRNG (zero syscalls on the hot path).
+#[inline]
+pub fn fast_unit_f64() -> f64 {
+    let bits = with_rng(Xoshiro256PlusPlus::next_u64) >> 11;
+    (bits as f64) * (1.0 / ((1u64 << 53) as f64))
+}

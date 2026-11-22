@@ -237,10 +237,17 @@ fn validate_reserved_tag_key(key: &str, context: &str) -> Result<(), String> {
 /// the line protocol (`,`, `|`, `#`, `:`), every Unicode control character, and
 /// whitespace. Replaces disallowed chars with `_` so the tag remains parseable,
 /// and caps the result at `max_len` bytes (on a char boundary).
-fn sanitize_tag_value_with_cap(input: &str, max_len: usize) -> String {
+fn sanitize_tag_value_cow(input: &str, max_len: usize) -> std::borrow::Cow<'_, str> {
     let trimmed = input.trim();
     if trimmed.is_empty() {
-        return "none".to_string();
+        return std::borrow::Cow::Borrowed("none");
+    }
+    if trimmed.len() <= max_len
+        && trimmed
+            .bytes()
+            .all(|b| b.is_ascii_graphic() && !matches!(b, b',' | b'|' | b'#' | b':'))
+    {
+        return std::borrow::Cow::Borrowed(trimmed);
     }
     let mut out = String::with_capacity(trimmed.len().min(max_len));
     for c in trimmed.chars() {
@@ -255,10 +262,14 @@ fn sanitize_tag_value_with_cap(input: &str, max_len: usize) -> String {
         }
     }
     if out.is_empty() {
-        "none".to_string()
+        std::borrow::Cow::Borrowed("none")
     } else {
-        out
+        std::borrow::Cow::Owned(out)
     }
+}
+
+fn sanitize_tag_value_with_cap(input: &str, max_len: usize) -> String {
+    sanitize_tag_value_cow(input, max_len).into_owned()
 }
 
 /// Sanitize a request-derived tag value (proxy name, protocol, …).
@@ -925,7 +936,7 @@ pub fn format_http_metrics(
         .as_deref()
         .or(summary.proxy_id.as_deref())
         .unwrap_or("none");
-    let proxy_tag = sanitize_tag_value(proxy_raw);
+    let proxy_tag = sanitize_tag_value_cow(proxy_raw, MAX_TAG_VALUE_LEN);
     let body_outcome = http_body_outcome(summary);
     let body_error = summary
         .body_error_class
@@ -1008,9 +1019,9 @@ pub fn format_stream_metrics(
     buf: &mut dyn fmt::Write,
 ) {
     let effective_schema = schema.filter(|s| s.applies_to_stream());
-    let protocol = sanitize_tag_value(&summary.protocol);
+    let protocol = sanitize_tag_value_cow(&summary.protocol, MAX_TAG_VALUE_LEN);
     let proxy_raw = summary.proxy_name.as_deref().unwrap_or(&summary.proxy_id);
-    let proxy_tag = sanitize_tag_value(proxy_raw);
+    let proxy_tag = sanitize_tag_value_cow(proxy_raw, MAX_TAG_VALUE_LEN);
     let has_error = if summary.connection_error.is_some() {
         "true"
     } else {
@@ -1101,7 +1112,7 @@ pub fn format_ws_metrics(
 ) {
     let effective_schema = schema.filter(|s| s.applies_to_websocket_disconnect());
     let proxy_raw = ctx.proxy_name.as_deref().unwrap_or(&ctx.proxy_id);
-    let proxy_tag = sanitize_tag_value(proxy_raw);
+    let proxy_tag = sanitize_tag_value_cow(proxy_raw, MAX_TAG_VALUE_LEN);
     let result = if ctx.error_class.is_some() {
         "error"
     } else {

@@ -1390,16 +1390,16 @@ pub struct ChargebackRegistry {
     /// Entry-key slots reserved before a new billing row is published. Reserved
     /// atomically so concurrent cold-path inserts cannot publish state above
     /// `max_entries`.
-    reserved_entries: AtomicUsize,
+    reserved_entries: crossbeam_utils::CachePadded<AtomicUsize>,
     /// Retained bytes reserved by every live entry, ordinary and aggregate.
-    retained_bytes: AtomicUsize,
+    retained_bytes: crossbeam_utils::CachePadded<AtomicUsize>,
     /// Charges that were admitted to the fixed-cardinality aggregate row
     /// because the retained-entry budget was exhausted. Billable state is
     /// preserved; only per-identity attribution is lost.
-    identity_overflow_total: AtomicU64,
+    identity_overflow_total: crossbeam_utils::CachePadded<AtomicU64>,
     /// Charges that could not be retained at all because even the aggregate row
     /// could not reserve bytes. This is real billing loss and is exported.
-    dropped_charges_total: AtomicU64,
+    dropped_charges_total: crossbeam_utils::CachePadded<AtomicU64>,
     /// Rate limiter for admission warnings (nanos since `epoch`).
     last_admission_warn_at: AtomicU64,
 }
@@ -1448,10 +1448,10 @@ impl ChargebackRegistry {
             cleanup_task_started: AtomicBool::new(false),
             max_entries: AtomicUsize::new(DEFAULT_MAX_ENTRIES),
             max_retained_bytes: AtomicUsize::new(DEFAULT_MAX_RETAINED_BYTES),
-            reserved_entries: AtomicUsize::new(0),
-            retained_bytes: AtomicUsize::new(0),
-            identity_overflow_total: AtomicU64::new(0),
-            dropped_charges_total: AtomicU64::new(0),
+            reserved_entries: crossbeam_utils::CachePadded::new(AtomicUsize::new(0)),
+            retained_bytes: crossbeam_utils::CachePadded::new(AtomicUsize::new(0)),
+            identity_overflow_total: crossbeam_utils::CachePadded::new(AtomicU64::new(0)),
+            dropped_charges_total: crossbeam_utils::CachePadded::new(AtomicU64::new(0)),
             last_admission_warn_at: AtomicU64::new(NO_ADMISSION_WARN_NANOS),
         }
     }
