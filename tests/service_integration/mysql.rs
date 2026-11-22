@@ -659,3 +659,146 @@ async fn mysql_byte_exact_identity_accepts_unicode_and_space_variants() {
     .expect("count consumers");
     assert_eq!(count, 4);
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn mysql_utc_timestamp_roundtrips_byte_identically_with_chrono_and_legacy_rows() {
+    use ferrum_edge::time_compat::UtcTimestamp;
+
+    let fixture = match start_mysql().await {
+        Ok(fixture) => fixture,
+        Err(error) => {
+            fail_in_ci_else_skip(
+                "mysql_utc_timestamp_roundtrips_byte_identically_with_chrono_and_legacy_rows",
+                "MySQL 8.4",
+                &error,
+            );
+            return;
+        }
+    };
+
+    let mysql_pool = sqlx::MySqlPool::connect(&fixture.url)
+        .await
+        .expect("connect typed MySqlPool");
+
+    sqlx::query(
+        "CREATE TABLE ts_compat_parity (
+            id INT PRIMARY KEY,
+            ts_compat TIMESTAMP(6) NOT NULL,
+            ts_chrono TIMESTAMP(6) NOT NULL,
+            dt_compat DATETIME(6) NOT NULL,
+            dt_chrono DATETIME(6) NOT NULL,
+            vc_compat VARCHAR(64) NOT NULL,
+            vc_chrono VARCHAR(64) NOT NULL
+        )",
+    )
+    .execute(&mysql_pool)
+    .await
+    .expect("create ts_compat_parity table");
+
+    let samples = [
+        (946_684_800_i64, 0_u32),     // 2000-01-01T00:00:00Z (midnight, len 4)
+        (1_767_323_045, 0),           // 2026-01-02T03:04:05Z (whole sec, len 7)
+        (1_767_323_045, 123_000_000), // millisecond precision (len 11)
+        (1_767_323_045, 123_456_000), // microsecond precision (len 11)
+        (1_767_323_045, 123_456_789), // sub-microsecond truncation parity
+    ];
+
+    for (idx, (secs, nanos)) in samples.into_iter().enumerate() {
+        let ts = UtcTimestamp::from_unix_timestamp_nanos(secs, nanos).expect("UtcTimestamp");
+        let ch = chrono::DateTime::<chrono::Utc>::from_timestamp(secs, nanos).expect("chrono");
+
+        sqlx::query(
+            "INSERT INTO ts_compat_parity
+                (id, ts_compat, ts_chrono, dt_compat, dt_chrono, vc_compat, vc_chrono)
+             VALUES (?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(idx as i32)
+        .bind(ts)
+        .bind(ch)
+        .bind(ts)
+        .bind(ch)
+        .bind(ts.to_rfc3339())
+        .bind(ch.to_rfc3339())
+        .execute(&mysql_pool)
+        .await
+        .expect("insert mysql parity row");
+
+        let row = sqlx::query(
+            "SELECT
+                CAST(ts_compat AS CHAR),
+                CAST(ts_chrono AS CHAR),
+                CAST(dt_compat AS CHAR),
+                CAST(dt_chrono AS CHAR),
+                ts_compat,
+                ts_chrono,
+                dt_compat,
+                dt_chrono,
+                vc_compat,
+                vc_chrono
+             FROM ts_compat_parity WHERE id = ?",
+        )
+        .bind(idx as i32)
+        .fetch_one(&mysql_pool)
+        .await
+        .expect("select mysql parity row");
+
+        let ts_compat_str: String = row.try_get(0).expect("ts_compat text");
+        let ts_chrono_str: String = row.try_get(1).expect("ts_chrono text");
+        let dt_compat_str: String = row.try_get(2).expect("dt_compat text");
+        let dt_chrono_str: String = row.try_get(3).expect("dt_chrono text");
+        assert_eq!(ts_compat_str.as_bytes(), ts_chrono_str.as_bytes());
+        assert_eq!(dt_compat_str.as_bytes(), dt_chrono_str.as_bytes());
+
+        let expected_micro =
+            UtcTimestamp::from_unix_timestamp_nanos(secs, (nanos / 1_000) * 1_000).unwrap();
+        let decoded_ts_from_chrono: UtcTimestamp = row
+            .try_get(5)
+            .expect("decode UtcTimestamp from chrono TIMESTAMP");
+        let decoded_dt_from_chrono: UtcTimestamp = row
+            .try_get(7)
+            .expect("decode UtcTimestamp from chrono DATETIME");
+        let decoded_vc_from_compat: UtcTimestamp = row
+            .try_get(8)
+            .expect("decode UtcTimestamp from compat VARCHAR");
+        let decoded_vc_from_chrono: UtcTimestamp = row
+            .try_get(9)
+            .expect("decode UtcTimestamp from legacy VARCHAR");
+        let chrono_from_compat_ts: chrono::DateTime<chrono::Utc> = row
+            .try_get(4)
+            .expect("decode chrono from UtcTimestamp TIMESTAMP");
+        let chrono_from_compat_dt: chrono::DateTime<chrono::Utc> = row
+            .try_get(6)
+            .expect("decode chrono from UtcTimestamp DATETIME");
+
+        assert_eq!(decoded_ts_from_chrono, expected_micro);
+        assert_eq!(decoded_dt_from_chrono, expected_micro);
+        assert_eq!(decoded_vc_from_compat, ts);
+        assert_eq!(decoded_vc_from_chrono, ts);
+        assert_eq!(
+            chrono_from_compat_ts.timestamp(),
+            expected_micro.unix_timestamp()
+        );
+        assert_eq!(
+            chrono_from_compat_ts.timestamp_subsec_nanos(),
+            expected_micro.subsec_nanos()
+        );
+        assert_eq!(
+            chrono_from_compat_dt.timestamp(),
+            expected_micro.unix_timestamp()
+        );
+        assert_eq!(
+            chrono_from_compat_dt.timestamp_subsec_nanos(),
+            expected_micro.subsec_nanos()
+        );
+    }
+
+    // Legacy space-separated VARCHAR row read into UtcTimestamp.
+    let legacy_row = sqlx::query("SELECT CAST('2026-01-02 03:04:05' AS CHAR(64))")
+        .fetch_one(&mysql_pool)
+        .await
+        .expect("select legacy MySQL text row");
+    let legacy_ts: UtcTimestamp = legacy_row
+        .try_get(0)
+        .expect("decode legacy MySQL VARCHAR timestamp");
+    assert_eq!(legacy_ts.to_rfc3339_z(), "2026-01-02T03:04:05Z");
+}
