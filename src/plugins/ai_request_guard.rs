@@ -512,6 +512,8 @@ pub struct AiRequestGuard {
     needs_body_transform: bool,
     /// True when any configured policy needs the request body to be inspected.
     requires_request_body: bool,
+    /// Monotonic per-instance id for private request-state witness entries.
+    instance_id: u64,
     /// Instance-specific metadata key recording that the request entered the
     /// guard's JSON POST scope. The final-body hook consumes it after validating
     /// the backend-visible representation.
@@ -683,6 +685,7 @@ impl AiRequestGuard {
             fail_on_uninspectable_body,
             needs_body_transform,
             requires_request_body,
+            instance_id,
             final_inspection_marker,
         })
     }
@@ -2542,6 +2545,10 @@ impl Plugin for AiRequestGuard {
         "ai_request_guard"
     }
 
+    fn is_authorize_plugin(&self) -> bool {
+        false
+    }
+
     fn priority(&self) -> u16 {
         super::priority::AI_REQUEST_GUARD
     }
@@ -2707,6 +2714,13 @@ impl Plugin for AiRequestGuard {
         // (e.g. ai_federation) see the modified body if they short-circuit
         // before the transform_request_body phase runs.
         let mutation = self.apply_token_mutations(&mut json);
+        let unchanged_validated_digest = if !mutation.modified()
+            && for_each_request_document(&json, |request| self.validate_final_caps(request)).is_ok()
+        {
+            Some(request_guard_body_digest(&ctx.path, body.as_bytes()))
+        } else {
+            None
+        };
         if mutation.modified()
             && let Ok(new_body) = serde_json::to_string(&json)
         {
@@ -2719,6 +2733,11 @@ impl Plugin for AiRequestGuard {
         // violation after admission.
         ctx.metadata
             .insert(self.final_inspection_marker.clone(), "true".to_string());
+        if let Some(digest) = unchanged_validated_digest {
+            ctx.plugin_state_mut()
+                .ai_request_guard_validated_hashes
+                .insert(self.instance_id, digest);
+        }
 
         PluginResult::Continue
     }
@@ -2785,6 +2804,18 @@ impl Plugin for AiRequestGuard {
             });
         }
 
+        // Fast path: if `before_proxy` already validated these exact `(path, body)`
+        // bytes without requiring any token mutation, skip the duplicate
+        // duplicate-key scan, JSON DOM parse, and policy walk.
+        if let Some(expected) = ctx.plugin_state_opt_mut().and_then(|state| {
+            state
+                .ai_request_guard_validated_hashes
+                .remove(&self.instance_id)
+        }) && expected == request_guard_body_digest(&ctx.path, body)
+        {
+            return PluginResult::Continue;
+        }
+
         // The backend receives exactly these bytes, so they must be one
         // unambiguous document (see the matching screen in `before_proxy`).
         if let Some(reason) = ctx.json_scan_memo.ambiguity(body) {
@@ -2845,6 +2876,14 @@ impl Plugin for AiRequestGuard {
         // unsupported context-free paths must leave the body unchanged.
         None
     }
+}
+
+fn request_guard_body_digest(path: &str, body: &[u8]) -> [u8; 32] {
+    let mut hasher = crate::fips::approved::Sha256::new();
+    hasher.update((path.len() as u64).to_le_bytes());
+    hasher.update(path.as_bytes());
+    hasher.update(body);
+    hasher.finalize()
 }
 
 fn optional_string<'a>(config: &'a Value, field: &'static str) -> Result<Option<&'a str>, String> {

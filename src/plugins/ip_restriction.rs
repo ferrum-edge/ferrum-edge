@@ -253,12 +253,20 @@ impl Plugin for IpRestriction {
         "ip_restriction"
     }
 
+    fn is_authorize_plugin(&self) -> bool {
+        false
+    }
+
     fn priority(&self) -> u16 {
         super::priority::IP_RESTRICTION
     }
 
     fn lifecycle_hooks(&self) -> crate::plugins::PluginHooks {
         crate::plugins::PluginHooks::ON_REQUEST_RECEIVED
+    }
+
+    fn supports_request_header_passthrough(&self) -> bool {
+        true
     }
 
     fn supported_protocols(&self) -> &'static [super::ProxyProtocol] {

@@ -4245,6 +4245,15 @@ pub(crate) struct PluginRequestState {
     /// markers (a hash over the raw request body including tool-call arguments),
     /// so they remain off `metadata` too.
     pub(crate) ai_tool_governor_request_hashes: HashMap<u64, String>,
+    /// Per-`ai_request_guard`-instance SHA-256 digest of `(path, body)` validated
+    /// in `before_proxy` (when no token mutation occurred), allowing
+    /// `on_final_request_body_with_context` to skip re-parsing an unchanged body.
+    pub(crate) ai_request_guard_validated_hashes: HashMap<u64, [u8; 32]>,
+    /// Per-`ai_prompt_shield`-instance `(SHA-256 digest, is_streaming)`
+    /// witness for a clean request body scanned in `before_proxy`, allowing
+    /// `on_final_request_body_with_context` to skip re-parsing and re-scanning
+    /// an unchanged body while preserving the `ai_request_streaming` hint.
+    pub(crate) ai_prompt_shield_clean_hashes: HashMap<u64, ([u8; 32], bool)>,
     /// Per-instance buffered `redact_args` rewrites computed during governance
     /// amplification preflight and consumed by the response-body transform.
     /// Keys are digests of `(tool name, raw args)`; aggregate value bytes are
@@ -11881,6 +11890,12 @@ impl std::ops::BitOr for PluginHooks {
     }
 }
 
+impl std::ops::BitOrAssign for PluginHooks {
+    fn bitor_assign(&mut self, rhs: Self) {
+        *self = self.union(rhs);
+    }
+}
+
 /// Reduce every backend-equivalence class (ASCII case-insensitive, `_` read
 /// as `-`) of the owned request header `names` in `headers` to at most ONE
 /// entry: the current install of an admitted owning instance
@@ -12204,12 +12219,13 @@ pub trait Plugin: Any + Send + Sync {
     }
 
     /// Returns `true` when this built-in plugin never reads `ctx.headers`
-    /// (inspecting `ctx.raw_headers` instead), does not mutate query
-    /// parameters, never rejects in `before_proxy`, and its only `before_proxy`
-    /// header mutation (when `modifies_request_headers()` is `true`) is
-    /// stripping `request_headers_to_redact()`. `PluginCache` only honors this
-    /// elision for registered built-in `key_auth`; custom plugins always run
-    /// `before_proxy` on the materialized path.
+    /// (inspecting `ctx.raw_headers` / `ctx.effective_request_header` instead),
+    /// does not mutate query parameters, and has no `BEFORE_PROXY` hook (with
+    /// the sole exception of registered built-in `key_auth`, whose
+    /// `before_proxy` only strips `request_headers_to_redact()`, elided into
+    /// the passthrough strip overlay). `PluginCache` honors this only for
+    /// registered built-in plugins (`is_builtin_plugin`); custom plugins always
+    /// run on the materialized path.
     fn supports_request_header_passthrough(&self) -> bool {
         false
     }

@@ -1381,6 +1381,11 @@ impl Waf {
         subject: ScanSubject<'_>,
         url: Field<'_>,
     ) {
+        // Every encoding special matches `%`-prefixed sequences; skip all three
+        // marker scans and any `url_for_rule` rebuild when `%` is absent.
+        if memchr::memchr(b'%', value.as_bytes()).is_none() {
+            return;
+        }
         if let Some(rule_index) = self.specials.encoding {
             let judged = self.url_for_rule(rule_index, value, url);
             if decode::has_double_encoded_marker(&judged) || decode::has_percent_null_byte(&judged)
@@ -1471,7 +1476,7 @@ impl Waf {
         residual_encoding: bool,
         subject: ScanSubject<'_>,
     ) {
-        let percent_markers_present = text.as_bytes().contains(&b'%');
+        let percent_markers_present = memchr::memchr(b'%', text.as_bytes()).is_some();
         if let Some(rule_index) = self.specials.encoding {
             let flagged = residual_encoding
                 || (percent_markers_present
@@ -1782,41 +1787,47 @@ fn contains_luhn_candidate(value: &str) -> bool {
     //   window and again at the run's terminating boundary we check every
     //   valid card length (13..=19) anchored at the window's start and
     //   end, catching cards padded on either side.
-    let mut digits: Vec<u8> = Vec::with_capacity(19);
+    let mut digits = [0u8; 20];
+    let mut digits_len = 0usize;
     let mut overflowed_run = false;
     let mut run_digits_seen = 0usize;
     let mut run_scan_suppressed = false;
-    for ch in value.chars() {
-        if ch.is_ascii_digit() {
+    // ASCII digits and separators (` `, `-`, `.`) are all single bytes < 0x80,
+    // which never collide with UTF-8 multi-byte sequences; iterating bytes avoids
+    // UTF-8 decoding and the stack `[u8; 20]` eliminates a heap `Vec` per field.
+    for &byte in value.as_bytes() {
+        if byte.is_ascii_digit() {
             run_digits_seen += 1;
             if run_digits_seen > MAX_LUHN_DIGIT_RUN_SCAN {
-                if !run_scan_suppressed && check_run(&digits, overflowed_run) {
+                if !run_scan_suppressed && check_run(&digits[..digits_len], overflowed_run) {
                     return true;
                 }
                 run_scan_suppressed = true;
                 continue;
             }
-            digits.push(ch as u8 - b'0');
-            if digits.len() > 19 {
+            digits[digits_len] = byte - b'0';
+            digits_len += 1;
+            if digits_len > 19 {
                 if check_card_substrings(&digits[..19]) {
                     return true;
                 }
-                digits.remove(0);
+                digits.copy_within(1..20, 0);
+                digits_len = 19;
                 overflowed_run = true;
             }
-        } else if matches!(ch, ' ' | '-' | '.') {
+        } else if matches!(byte, b' ' | b'-' | b'.') {
             continue;
         } else {
-            if !run_scan_suppressed && check_run(&digits, overflowed_run) {
+            if !run_scan_suppressed && check_run(&digits[..digits_len], overflowed_run) {
                 return true;
             }
-            digits.clear();
+            digits_len = 0;
             overflowed_run = false;
             run_digits_seen = 0;
             run_scan_suppressed = false;
         }
     }
-    !run_scan_suppressed && check_run(&digits, overflowed_run)
+    !run_scan_suppressed && check_run(&digits[..digits_len], overflowed_run)
 }
 
 fn check_run(digits: &[u8], overflowed: bool) -> bool {

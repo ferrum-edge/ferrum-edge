@@ -233,12 +233,21 @@ impl Plugin for RequestSizeLimiting {
         "request_size_limiting"
     }
 
+    fn is_authorize_plugin(&self) -> bool {
+        false
+    }
+
     fn priority(&self) -> u16 {
         super::priority::REQUEST_SIZE_LIMITING
     }
 
     fn lifecycle_hooks(&self) -> crate::plugins::PluginHooks {
-        crate::plugins::PluginHooks::ON_REQUEST_RECEIVED | crate::plugins::PluginHooks::BEFORE_PROXY
+        if self.is_enabled() {
+            crate::plugins::PluginHooks::ON_REQUEST_RECEIVED
+                | crate::plugins::PluginHooks::BEFORE_PROXY
+        } else {
+            crate::plugins::PluginHooks::NONE
+        }
     }
 
     /// This plugin's enforcement decision is taken in the final request-body

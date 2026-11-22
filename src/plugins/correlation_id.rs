@@ -9,8 +9,8 @@ use async_trait::async_trait;
 use http::header::HeaderName;
 use serde_json::Value;
 use std::collections::HashMap;
-use uuid::Uuid;
 
+use super::utils::fast_id::fast_uuid_v4_string;
 use super::{Plugin, PluginResult, RequestContext};
 
 pub(crate) const INSTANCE_METADATA_PREFIX: &str = "correlation_id.instance.";
@@ -281,6 +281,10 @@ impl Plugin for CorrelationId {
         "correlation_id"
     }
 
+    fn is_authorize_plugin(&self) -> bool {
+        false
+    }
+
     fn correlation_id_header_name(&self) -> Option<&str> {
         Some(&self.header_name)
     }
@@ -290,9 +294,12 @@ impl Plugin for CorrelationId {
     }
 
     fn lifecycle_hooks(&self) -> crate::plugins::PluginHooks {
-        crate::plugins::PluginHooks::ON_REQUEST_RECEIVED
-            | crate::plugins::PluginHooks::BEFORE_PROXY
-            | crate::plugins::PluginHooks::AFTER_PROXY
+        let mut hooks = crate::plugins::PluginHooks::ON_REQUEST_RECEIVED
+            | crate::plugins::PluginHooks::BEFORE_PROXY;
+        if self.echo_downstream {
+            hooks |= crate::plugins::PluginHooks::AFTER_PROXY;
+        }
+        hooks
     }
 
     fn supported_protocols(&self) -> &'static [super::ProxyProtocol] {
@@ -311,7 +318,7 @@ impl Plugin for CorrelationId {
         &self,
         ctx: &mut super::StreamConnectionContext,
     ) -> super::PluginResult {
-        let id = Uuid::new_v4().to_string();
+        let id = fast_uuid_v4_string();
         ctx.publish_correlation_id(&self.instance_metadata_key, &self.header_name, id, true);
         super::PluginResult::Continue
     }
@@ -340,7 +347,7 @@ impl Plugin for CorrelationId {
         let (request_id, generated) = match preserved {
             Some(existing) => (existing, false),
             None => {
-                let id = Uuid::new_v4().to_string();
+                let id = fast_uuid_v4_string();
                 set_header_value(&mut ctx.headers, &self.header_name, &id);
                 (id, true)
             }

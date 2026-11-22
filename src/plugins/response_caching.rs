@@ -1399,6 +1399,10 @@ struct UncacheablePredictor {
     /// Keys known to be uncacheable, mapped to the insertion sequence that owns
     /// the matching queue slot.
     keys: DashMap<String, u64>,
+    /// Live entry count mirrored atomically so `is_predicted_cacheable` can
+    /// skip the `DashMap` probe when empty and `mark_uncacheable` avoids
+    /// calling all-shard `DashMap::len()` inside the global `order` mutex.
+    count: AtomicUsize,
     /// Insertion order. A slot is authoritative only while its sequence still
     /// matches the live map entry, so re-marking a key simply supersedes its
     /// older slot instead of requiring a queue search.
@@ -1415,6 +1419,7 @@ impl UncacheablePredictor {
                 (max_entries / 4).min(PREDICTOR_INITIAL_CAPACITY_MAX),
                 shard_amount,
             ),
+            count: AtomicUsize::new(0),
             order: Mutex::new(VecDeque::with_capacity(
                 max_entries.min(PREDICTOR_INITIAL_CAPACITY_MAX),
             )),
@@ -1431,7 +1436,7 @@ impl UncacheablePredictor {
 
     /// Returns true if this key is predicted to be cacheable (not in the uncacheable set).
     fn is_predicted_cacheable(&self, key: &str) -> bool {
-        !self.keys.contains_key(key)
+        self.count.load(Ordering::Acquire) == 0 || !self.keys.contains_key(key)
     }
 
     /// Mark a key as uncacheable, evicting the oldest live entries when the
@@ -1439,16 +1444,39 @@ impl UncacheablePredictor {
     /// per call, and each appended slot is popped at most once.
     fn mark_uncacheable(&self, key: &str) {
         let seq = self.next_seq.fetch_add(1, Ordering::Relaxed);
-        self.keys.insert(key.to_string(), seq);
+        // Increment `count` while holding the shard write guard so a newly
+        // inserted entry can never become visible to a concurrent remover
+        // before its increment is accounted for (preventing underflow/wrap).
+        match self.keys.entry(key.to_string()) {
+            dashmap::mapref::entry::Entry::Occupied(mut occupied) => {
+                occupied.insert(seq);
+            }
+            dashmap::mapref::entry::Entry::Vacant(vacant) => {
+                // Keep the `RefMut` shard write guard alive across `fetch_add`
+                // so no concurrent remover can observe the new key and decrement
+                // `count` before the increment lands.
+                let _guard = vacant.insert(seq);
+                self.count.fetch_add(1, Ordering::AcqRel);
+            }
+        }
 
         let mut order = self.order_guard();
         order.push_back((key.to_string(), seq));
-        while self.keys.len() > self.max_entries {
+        while self.count.load(Ordering::Acquire) > self.max_entries {
             let Some((oldest_key, oldest_seq)) = order.pop_front() else {
                 break;
             };
-            self.keys
-                .remove_if(&oldest_key, |_, live_seq| *live_seq == oldest_seq);
+            // Decrement `count` inside the `remove_if` predicate while the
+            // shard write guard is held so no concurrent insert can observe a
+            // stale over-capacity count between removal and decrement.
+            let _ = self.keys.remove_if(&oldest_key, |_, live_seq| {
+                if *live_seq == oldest_seq {
+                    self.count.fetch_sub(1, Ordering::AcqRel);
+                    true
+                } else {
+                    false
+                }
+            });
         }
         // Superseded slots accumulate only when the same key is re-marked.
         // Compact them in one amortized pass rather than searching on insert.
@@ -1464,7 +1492,13 @@ impl UncacheablePredictor {
     /// Remove a key from the uncacheable set (it became cacheable). The stale
     /// queue slot is reclaimed by the next capacity pop or compaction.
     fn mark_cacheable(&self, key: &str) {
-        self.keys.remove(key);
+        if self.count.load(Ordering::Acquire) == 0 {
+            return;
+        }
+        let _ = self.keys.remove_if(key, |_, _| {
+            self.count.fetch_sub(1, Ordering::AcqRel);
+            true
+        });
     }
 }
 
@@ -1551,8 +1585,12 @@ pub struct ResponseCaching {
     /// means a later edit cannot leave the two copies disagreeing about the
     /// partition contract.
     config: ResponseCachingConfig,
+    /// Pre-merged, sorted default Vary header list (`config.vary_by_headers`
+    /// plus `SENSITIVE_VARY_HEADERS`), shared via `Arc` so lookups without a
+    /// `vary_index` override never clone, merge, or sort per request.
+    default_lookup_vary_headers: Arc<Vec<String>>,
     cache: Arc<DashMap<String, CacheEntry>>,
-    vary_index: Arc<DashMap<String, Vec<String>>>,
+    vary_index: Arc<DashMap<String, Arc<Vec<String>>>>,
     total_size: Arc<AtomicUsize>,
     /// Single publication mutex. Holds the bounded maintenance metadata so
     /// admission, eviction, and invalidation never take a second lock and never
@@ -1600,6 +1638,12 @@ impl ResponseCaching {
         let shard_amount = crate::util::sharding::pool_shard_amount(pool_shard_amount);
         let instance_id = NEXT_RESPONSE_CACHING_INSTANCE_ID.fetch_add(1, Ordering::Relaxed);
         let predictor_size = config.max_entries / 10; // 10% of cache size
+        let mut default_vary = config.vary_by_headers.clone();
+        for sensitive in SENSITIVE_VARY_HEADERS {
+            merge_vary_header(&mut default_vary, sensitive);
+        }
+        default_vary.sort();
+        let default_lookup_vary_headers = Arc::new(default_vary);
         Ok(Self {
             instance_id,
             meta_base_key: staging_metadata_key(instance_id, CACHE_BASE_KEY_SUFFIX),
@@ -1631,6 +1675,7 @@ impl ResponseCaching {
                 CACHE_FINAL_HEADER_DECISION_SUFFIX,
             ),
             config,
+            default_lookup_vary_headers,
             cache: Arc::new(DashMap::with_shard_amount(shard_amount)),
             vary_index: Arc::new(DashMap::with_shard_amount(shard_amount)),
             total_size: Arc::new(AtomicUsize::new(0)),
@@ -2057,7 +2102,7 @@ impl ResponseCaching {
         let _guard = self.accounting_guard();
         self.vary_index
             .iter()
-            .map(|entry| (entry.key().clone(), entry.value().clone()))
+            .map(|entry| (entry.key().clone(), (**entry.value()).clone()))
             .collect()
     }
 
@@ -2231,13 +2276,13 @@ impl ResponseCaching {
     fn extend_base_key_with_vary(
         &self,
         ctx: &RequestContext,
-        base_key: String,
+        base_key: &str,
         vary_headers: &[String],
         request_headers: &HashMap<String, String>,
         cache_key_ready_headers: Option<&HashSet<String>>,
     ) -> String {
         if vary_headers.is_empty() {
-            return base_key;
+            return base_key.to_owned();
         }
 
         let mut hasher = PartitionHasher::new(RESPONSE_CACHING_VARY_DOMAIN);
@@ -2270,8 +2315,8 @@ impl ResponseCaching {
         }
 
         let vary_digest = hasher.hex();
-        let mut cache_key = base_key;
-        cache_key.reserve(1 + vary_digest.len());
+        let mut cache_key = String::with_capacity(base_key.len() + 1 + vary_digest.len());
+        cache_key.push_str(base_key);
         cache_key.push(CACHE_KEY_VARY_SEPARATOR);
         cache_key.push_str(&vary_digest);
         cache_key
@@ -2319,11 +2364,11 @@ impl ResponseCaching {
         status < 400
     }
 
-    fn cache_lookup_vary_headers(&self, base_key: &str) -> Vec<String> {
+    fn cache_lookup_vary_headers(&self, base_key: &str) -> Arc<Vec<String>> {
         self.vary_index
             .get(base_key)
-            .map(|headers| headers.clone())
-            .unwrap_or_else(|| self.config.vary_by_headers.clone())
+            .map(|headers| Arc::clone(headers.value()))
+            .unwrap_or_else(|| Arc::clone(&self.default_lookup_vary_headers))
     }
 
     fn merge_mandatory_sensitive_vary_headers(&self, vary_headers: &mut Vec<String>) -> bool {
@@ -2338,14 +2383,17 @@ impl ResponseCaching {
     }
 
     fn merge_existing_vary_headers(&self, base_key: &str, vary_headers: &mut Vec<String>) -> bool {
-        let Some(existing_headers) = self.vary_index.get(base_key).map(|headers| headers.clone())
+        let Some(existing_headers) = self
+            .vary_index
+            .get(base_key)
+            .map(|headers| Arc::clone(headers.value()))
         else {
             return false;
         };
 
         let mut added = false;
-        for header in existing_headers {
-            added |= merge_vary_header(vary_headers, &header);
+        for header in existing_headers.iter() {
+            added |= merge_vary_header(vary_headers, header);
         }
         if added {
             vary_headers.sort();
@@ -2663,7 +2711,7 @@ impl ResponseCaching {
                 self.merge_mandatory_sensitive_vary_headers(&mut vary_headers);
                 let response_key = self.extend_base_key_with_vary(
                     ctx,
-                    base_key.to_string(),
+                    base_key,
                     &vary_headers,
                     &lookup_headers.headers,
                     Some(&lookup_headers.cache_key_ready_headers),
@@ -3404,6 +3452,10 @@ impl Plugin for ResponseCaching {
         "response_caching"
     }
 
+    fn is_authorize_plugin(&self) -> bool {
+        false
+    }
+
     // Every short-circuit is a cached origin representation (HIT or
     // REVALIDATED), never a rejection of this plugin's own.
     fn rejects_with_origin_response(&self) -> bool {
@@ -3708,20 +3760,12 @@ impl Plugin for ResponseCaching {
                 return PluginResult::Continue;
             }
         };
-        // Request time for response-delay accounting is taken here, before
-        // origin contact, exactly as before; it is only *staged* once this
-        // request is known to reach the origin (see `stage_store_inputs`).
-        let request_time = self.now_monotonic();
-
-        let mut vary_headers = self.cache_lookup_vary_headers(&base_key);
-        // Every internal key and every retained response uses the same fixed
-        // credential/session presence tuple. Ferrum's caller partition is not
-        // visible to downstream shared caches, so only adding a Vary name when
-        // the current request carries it would let an anonymous response omit
-        // `Vary` and be replayed downstream to a credentialed request.
-        self.merge_mandatory_sensitive_vary_headers(&mut vary_headers);
+        // Both `vary_index` entries and `default_lookup_vary_headers` already
+        // carry the sorted union with `SENSITIVE_VARY_HEADERS`, avoiding any
+        // per-lookup `Vec<String>` clone, merge, or sort.
+        let vary_headers = self.cache_lookup_vary_headers(&base_key);
         let cache_key =
-            self.extend_base_key_with_vary(ctx, base_key.clone(), &vary_headers, headers, None);
+            self.extend_base_key_with_vary(ctx, &base_key, &vary_headers, headers, None);
 
         // Client request directives are honored only under `respect_no_cache`;
         // otherwise the whole request `Cache-Control` value is a bound key
@@ -3755,6 +3799,7 @@ impl Plugin for ResponseCaching {
                 // publishes the downstream Vary contract on it. Pending unsafe
                 // invalidation (if any) is retained — the request contacts the
                 // origin.
+                let request_time = self.now_monotonic();
                 self.stage_store_inputs(ctx, headers, base_key, cache_key, request_time);
                 self.set_cache_status(ctx, "BYPASS");
                 return PluginResult::Continue;
@@ -3877,6 +3922,7 @@ impl Plugin for ResponseCaching {
             }
         }
 
+        let request_time = self.now_monotonic();
         self.stage_store_inputs(ctx, headers, base_key, cache_key, request_time);
         self.set_cache_status(ctx, "MISS");
         PluginResult::Continue
@@ -4196,10 +4242,10 @@ impl Plugin for ResponseCaching {
             let previous_vary_headers = self
                 .vary_index
                 .get(&base_key)
-                .map(|headers| headers.clone());
+                .map(|headers| Arc::clone(headers.value()));
             if let Some(existing_headers) = &previous_vary_headers {
                 let mut added = false;
-                for header in existing_headers {
+                for header in existing_headers.iter() {
                     added |= merge_vary_header(&mut vary_headers, header);
                 }
                 if added {
@@ -4214,14 +4260,14 @@ impl Plugin for ResponseCaching {
             // behind the wider index.
             if previous_vary_headers
                 .as_ref()
-                .is_some_and(|previous| previous != &vary_headers)
+                .is_some_and(|previous| previous.as_slice() != vary_headers.as_slice())
             {
                 self.invalidate_base_key_locked(maintenance, &base_key);
             }
 
             let cache_key = self.extend_base_key_with_vary(
                 ctx,
-                base_key.clone(),
+                &base_key,
                 &vary_headers,
                 &lookup_headers.headers,
                 Some(&lookup_headers.cache_key_ready_headers),
@@ -4301,7 +4347,7 @@ impl Plugin for ResponseCaching {
             }
 
             self.insert_entry_locked(maintenance, &base_key, cache_key.clone(), entry);
-            self.vary_index.insert(base_key, vary_headers);
+            self.vary_index.insert(base_key, Arc::new(vary_headers));
             self.evict_if_needed_locked(maintenance);
             (cache_key, entry_size)
         };

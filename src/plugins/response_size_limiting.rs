@@ -158,12 +158,20 @@ impl Plugin for ResponseSizeLimiting {
         "response_size_limiting"
     }
 
+    fn is_authorize_plugin(&self) -> bool {
+        false
+    }
+
     fn priority(&self) -> u16 {
         super::priority::RESPONSE_SIZE_LIMITING
     }
 
     fn lifecycle_hooks(&self) -> crate::plugins::PluginHooks {
-        crate::plugins::PluginHooks::AFTER_PROXY
+        if self.is_enabled() {
+            crate::plugins::PluginHooks::AFTER_PROXY
+        } else {
+            crate::plugins::PluginHooks::NONE
+        }
     }
 
     fn supported_protocols(&self) -> &'static [super::ProxyProtocol] {

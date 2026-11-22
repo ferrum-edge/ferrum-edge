@@ -555,12 +555,20 @@ impl Plugin for SpiffeIdentity {
         "spiffe_identity"
     }
 
+    fn is_authorize_plugin(&self) -> bool {
+        false
+    }
+
     fn priority(&self) -> u16 {
         priority::SPIFFE_IDENTITY
     }
 
     fn lifecycle_hooks(&self) -> crate::plugins::PluginHooks {
-        crate::plugins::PluginHooks::ON_REQUEST_RECEIVED | crate::plugins::PluginHooks::BEFORE_PROXY
+        let mut hooks = crate::plugins::PluginHooks::ON_REQUEST_RECEIVED;
+        if self.forward_identity {
+            hooks |= crate::plugins::PluginHooks::BEFORE_PROXY;
+        }
+        hooks
     }
 
     fn supported_protocols(&self) -> &'static [ProxyProtocol] {

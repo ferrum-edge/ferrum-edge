@@ -128,7 +128,7 @@ fn global_rejection_warn() -> &'static AtomicLogRateLimiter {
 }
 
 pub struct UdpRateLimiting {
-    check_counter: AtomicU64,
+    check_counter: crossbeam_utils::CachePadded<AtomicU64>,
     epoch_base: Instant,
     last_eviction_secs: AtomicU64,
     rejection_warn: AtomicLogRateLimiter,
@@ -244,7 +244,7 @@ impl UdpRateLimiting {
         let epoch_base = Instant::now();
 
         Ok(Self {
-            check_counter: AtomicU64::new(0),
+            check_counter: crossbeam_utils::CachePadded::new(AtomicU64::new(0)),
             epoch_base,
             last_eviction_secs: AtomicU64::new(0),
             rejection_warn: AtomicLogRateLimiter::new(),
@@ -492,7 +492,14 @@ impl UdpRateLimiting {
     }
 
     fn maybe_evict(&self) -> bool {
-        self.maybe_evict_at(Instant::now())
+        let count = self.check_counter.fetch_add(1, Ordering::Relaxed);
+        let len = self.limiter.tracked_keys_count();
+        let at_capacity = len >= MAX_STATE_ENTRIES;
+        let periodic = count > 0 && count.is_multiple_of(EVICTION_CHECK_INTERVAL) && len > 0;
+        if !at_capacity && !periodic {
+            return false;
+        }
+        self.evict_with_cap_sampled(Instant::now(), MAX_STATE_ENTRIES, at_capacity, periodic)
     }
 
     fn maybe_evict_at(&self, now: Instant) -> bool {
@@ -502,13 +509,21 @@ impl UdpRateLimiting {
     fn maybe_evict_at_with_cap(&self, now: Instant, max_entries: usize) -> bool {
         let count = self.check_counter.fetch_add(1, Ordering::Relaxed);
         let len = self.limiter.tracked_keys_count();
-        // Atomic admission reservation never lets the map grow PAST
-        // `max_entries`, so "full" — not "over" — is the reachable pressure
-        // state. Testing `len > max_entries` here left a map filled with
-        // expired clients closed to every new client until the next sampled
-        // sweep, up to 100,000 hooks later.
         let at_capacity = len >= max_entries;
         let periodic = count > 0 && count.is_multiple_of(EVICTION_CHECK_INTERVAL) && len > 0;
+        if !at_capacity && !periodic {
+            return false;
+        }
+        self.evict_with_cap_sampled(now, max_entries, at_capacity, periodic)
+    }
+
+    fn evict_with_cap_sampled(
+        &self,
+        now: Instant,
+        max_entries: usize,
+        at_capacity: bool,
+        periodic: bool,
+    ) -> bool {
         let now_secs = now.saturating_duration_since(self.epoch_base).as_secs();
 
         // Keep capacity pressure visible for every at-cap observation, even
@@ -564,6 +579,10 @@ impl Plugin for UdpRateLimiting {
 
     fn name(&self) -> &str {
         "udp_rate_limiting"
+    }
+
+    fn is_authorize_plugin(&self) -> bool {
+        false
     }
 
     fn priority(&self) -> u16 {

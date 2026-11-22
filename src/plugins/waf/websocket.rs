@@ -518,6 +518,10 @@ impl Plugin for WafWsSession {
         self.waf.name()
     }
 
+    fn is_authorize_plugin(&self) -> bool {
+        false
+    }
+
     fn priority(&self) -> u16 {
         self.waf.priority()
     }
@@ -588,7 +592,7 @@ impl Plugin for WafWsSession {
         // (and the message slice) is held across the budget yield.
         let outcome = self
             .waf
-            .run_body_scan_with_budget(|| {
+            .run_body_scan_with_budget_for_len(payload.len(), || {
                 let subject = ScanSubject::WebSocketSession(&self.policy);
                 match governed {
                     BodyDirection::Request => self

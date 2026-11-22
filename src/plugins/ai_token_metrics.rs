@@ -737,6 +737,10 @@ impl Plugin for AiTokenMetrics {
         "ai_token_metrics"
     }
 
+    fn is_authorize_plugin(&self) -> bool {
+        false
+    }
+
     fn priority(&self) -> u16 {
         super::priority::AI_TOKEN_METRICS
     }

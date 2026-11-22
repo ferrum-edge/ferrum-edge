@@ -112,7 +112,7 @@ impl WsLimitBy {
 pub struct WsRateLimiting {
     close_reason: String,
     limit_by: WsLimitBy,
-    frame_counter: AtomicU64,
+    frame_counter: crossbeam_utils::CachePadded<AtomicU64>,
     redis_instance_id: String,
     limiter: RateLimitBackend<WsRateLimitKey, WsFrameRateAlgorithm>,
     epoch_base: Instant,
@@ -227,7 +227,7 @@ impl WsRateLimiting {
         Ok(Self {
             close_reason,
             limit_by,
-            frame_counter: AtomicU64::new(0),
+            frame_counter: crossbeam_utils::CachePadded::new(AtomicU64::new(0)),
             redis_instance_id: Uuid::new_v4().simple().to_string(),
             limiter: RateLimitBackend::from_plugin_config_with_policy_identity(
                 "ws_rate_limiting",
@@ -492,7 +492,15 @@ impl WsRateLimiting {
     }
 
     fn maybe_evict(&self) -> bool {
-        self.maybe_evict_at(Instant::now())
+        let count = self.frame_counter.fetch_add(1, Ordering::Relaxed);
+        let tracked_keys = self.limiter.tracked_keys_count();
+        let at_capacity = tracked_keys >= MAX_STATE_ENTRIES;
+        let periodic =
+            count > 0 && count.is_multiple_of(EVICTION_CHECK_INTERVAL) && tracked_keys > 0;
+        if !at_capacity && !periodic {
+            return false;
+        }
+        self.evict_sampled(Instant::now(), at_capacity, periodic)
     }
 
     /// Unbound charge on the shared instance.
@@ -529,13 +537,16 @@ impl WsRateLimiting {
     fn maybe_evict_at(&self, now: Instant) -> bool {
         let count = self.frame_counter.fetch_add(1, Ordering::Relaxed);
         let tracked_keys = self.limiter.tracked_keys_count();
-        // Pressure starts AT the cap. Atomic admission reservation never lets
-        // the map grow past `MAX_STATE_ENTRIES`, so a strict `>` was
-        // unreachable and a map filled with idle entries kept refusing every
-        // previously unseen key until a traffic-count-sampled sweep happened to
-        // run.
         let at_capacity = tracked_keys >= MAX_STATE_ENTRIES;
+        let periodic =
+            count > 0 && count.is_multiple_of(EVICTION_CHECK_INTERVAL) && tracked_keys > 0;
+        if !at_capacity && !periodic {
+            return false;
+        }
+        self.evict_sampled(now, at_capacity, periodic)
+    }
 
+    fn evict_sampled(&self, now: Instant, at_capacity: bool, periodic: bool) -> bool {
         // Capacity pressure reclaims idle keys, single-flighted by the same
         // once-per-cooldown CAS gate `udp_rate_limiting` uses, so concurrent
         // frames cannot each run a full retain while the map is at the cap.
@@ -557,8 +568,6 @@ impl WsRateLimiting {
             return true;
         }
 
-        let periodic =
-            count > 0 && count.is_multiple_of(EVICTION_CHECK_INTERVAL) && tracked_keys > 0;
         if periodic {
             let now_secs = now.saturating_duration_since(self.epoch_base).as_secs();
             let last_sweep = self.last_periodic_sweep_secs.load(Ordering::Relaxed);
@@ -614,6 +623,10 @@ impl Plugin for WsRateLimiting {
 
     fn name(&self) -> &str {
         "ws_rate_limiting"
+    }
+
+    fn is_authorize_plugin(&self) -> bool {
+        false
     }
 
     fn priority(&self) -> u16 {
@@ -729,6 +742,10 @@ struct WsRateLimitingSession {
 impl Plugin for WsRateLimitingSession {
     fn name(&self) -> &str {
         "ws_rate_limiting"
+    }
+
+    fn is_authorize_plugin(&self) -> bool {
+        false
     }
 
     fn priority(&self) -> u16 {

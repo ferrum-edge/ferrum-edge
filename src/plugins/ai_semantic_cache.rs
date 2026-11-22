@@ -5081,6 +5081,10 @@ impl Plugin for AiSemanticCache {
         "ai_semantic_cache"
     }
 
+    fn is_authorize_plugin(&self) -> bool {
+        false
+    }
+
     // Every short-circuit is a cached provider response (a cache HIT), never
     // a rejection of this plugin's own.
     fn rejects_with_origin_response(&self) -> bool {

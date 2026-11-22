@@ -657,6 +657,8 @@ pub struct AiPromptShield {
     max_scan_bytes: usize,
     /// True when action is Redact — enables transform_request_body.
     needs_body_transform: bool,
+    /// Monotonic per-instance id for private request-state witness entries.
+    instance_id: u64,
     /// Instance-specific metadata marker for compressed-body deferral.
     deferred_compressed_marker: String,
 }
@@ -1032,6 +1034,7 @@ impl AiPromptShield {
             exclude_roles,
             max_scan_bytes,
             needs_body_transform,
+            instance_id: marker_id,
             deferred_compressed_marker,
         })
     }
@@ -2320,6 +2323,10 @@ impl Plugin for AiPromptShield {
         "ai_prompt_shield"
     }
 
+    fn is_authorize_plugin(&self) -> bool {
+        false
+    }
+
     fn priority(&self) -> u16 {
         super::priority::AI_PROMPT_SHIELD
     }
@@ -2502,7 +2509,14 @@ impl Plugin for AiPromptShield {
             // budget (GHSA-f2jp-59r9-fp64), and a lenient upstream parser
             // accepts what serde refuses.
             ScanMode::McpArguments => match serde_json::from_str::<Value>(body) {
-                Ok(json) => (self.detect_pii_mcp_arguments(&json), false, Some(json)),
+                Ok(json) => {
+                    let is_streaming = json.get("stream").and_then(|s| s.as_bool()) == Some(true);
+                    (
+                        self.detect_pii_mcp_arguments(&json),
+                        is_streaming,
+                        Some(json),
+                    )
+                }
                 Err(_) => {
                     if mcp_body_may_carry_tool_call(body.as_bytes()) {
                         return self.handle_unparseable_mcp_body(ctx);
@@ -2512,13 +2526,26 @@ impl Plugin for AiPromptShield {
             },
         };
 
+        let clean_body_digest = if detected.is_empty() {
+            Some(crate::fips::approved::Sha256::digest(body.as_bytes()))
+        } else {
+            None
+        };
+
         // `body` borrow released — safe to mutate ctx.metadata now.
-        if is_streaming_request {
+        // In `mcp_arguments` mode, defer publishing `ai_request_streaming` to
+        // `on_final_request_body_with_context` (via the private witness or the
+        // re-parsed final body) so a later body transform changing `stream`
+        // from `true` to `false` cannot leave a stale streaming marker behind.
+        if is_streaming_request && self.scan_mode != ScanMode::McpArguments {
             ctx.metadata
                 .insert("ai_request_streaming".to_string(), "true".to_string());
         }
 
-        if detected.is_empty() {
+        if let Some(digest) = clean_body_digest {
+            ctx.plugin_state_mut()
+                .ai_prompt_shield_clean_hashes
+                .insert(self.instance_id, (digest, is_streaming_request));
             return PluginResult::Continue;
         }
 
@@ -2860,6 +2887,25 @@ impl Plugin for AiPromptShield {
 
         if body.len() > self.max_scan_bytes {
             return self.handle_oversize_body(ctx, body.len());
+        }
+
+        // Fast path: if `before_proxy` already scanned these exact bytes and
+        // proved them clean (zero PII matches, valid UTF-8, unambiguous JSON),
+        // skip the duplicate duplicate-key scan, JSON DOM parse, and RegexSet
+        // walk in the final-body phase.
+        if !deferred
+            && let Some((expected, is_streaming)) = ctx.plugin_state_opt_mut().and_then(|state| {
+                state
+                    .ai_prompt_shield_clean_hashes
+                    .remove(&self.instance_id)
+            })
+            && expected == crate::fips::approved::Sha256::digest(body)
+        {
+            if is_streaming {
+                ctx.metadata
+                    .insert("ai_request_streaming".to_string(), "true".to_string());
+            }
+            return PluginResult::Continue;
         }
 
         let Ok(body_text) = std::str::from_utf8(body) else {

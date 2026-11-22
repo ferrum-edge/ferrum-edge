@@ -1353,7 +1353,16 @@ impl JwksAuth {
         token: &str,
         provider_indices: &[usize],
     ) -> CandidateProviders {
-        let unverified_issuer = peek_unverified_issuer(token);
+        let any_pinned = provider_indices.iter().any(|&idx| {
+            self.providers
+                .get(idx)
+                .is_some_and(|prov| prov.issuer.is_some())
+        });
+        let unverified_issuer = if any_pinned {
+            peek_unverified_issuer(token)
+        } else {
+            None
+        };
         let mut candidates = CandidateProviders::default();
         let mut seen: u64 = 0;
         for pinned_pass in [true, false] {
@@ -2033,6 +2042,10 @@ impl super::Plugin for JwksAuth {
         "jwks_auth"
     }
 
+    fn is_authorize_plugin(&self) -> bool {
+        false
+    }
+
     fn is_auth_plugin(&self) -> bool {
         true
     }
@@ -2045,8 +2058,22 @@ impl super::Plugin for JwksAuth {
         super::priority::JWKS_AUTH
     }
 
+    fn supports_request_header_passthrough(&self) -> bool {
+        !self.providers.iter().any(|provider| provider.require_dpop)
+            && !self.requires_decoded_query_params()
+            && !self.modifies_request_headers()
+            && !self
+                .request_headers_to_redact()
+                .iter()
+                .any(|name| name.eq_ignore_ascii_case("host"))
+    }
+
     fn lifecycle_hooks(&self) -> crate::plugins::PluginHooks {
-        crate::plugins::PluginHooks::BEFORE_PROXY
+        if self.modifies_request_headers() {
+            crate::plugins::PluginHooks::BEFORE_PROXY
+        } else {
+            crate::plugins::PluginHooks::NONE
+        }
     }
 
     fn authentication_challenge(&self) -> Option<&'static str> {
@@ -2223,30 +2250,36 @@ impl super::Plugin for JwksAuth {
         ctx: &mut RequestContext,
         headers: &mut std::collections::HashMap<String, String>,
     ) -> PluginResult {
-        let strip_authorization = ctx
-            .metadata
-            .remove(STRIP_AUTHORIZATION_METADATA_KEY)
-            .is_some();
-        let strip_headers: Vec<String> = ctx
-            .metadata
-            .keys()
-            .filter_map(|key| key.strip_prefix(STRIP_HEADER_METADATA_PREFIX))
-            .map(ToOwned::to_owned)
-            .collect();
+        let any_strips_token = self
+            .providers
+            .iter()
+            .any(|provider| !provider.forward_original_token);
+        if any_strips_token {
+            let strip_authorization = ctx
+                .metadata
+                .remove(STRIP_AUTHORIZATION_METADATA_KEY)
+                .is_some();
+            let strip_headers: Vec<String> = ctx
+                .metadata
+                .keys()
+                .filter_map(|key| key.strip_prefix(STRIP_HEADER_METADATA_PREFIX))
+                .map(ToOwned::to_owned)
+                .collect();
 
-        if strip_authorization || !strip_headers.is_empty() {
-            headers.retain(|name, _| {
-                let strip_current = (strip_authorization
-                    && name.eq_ignore_ascii_case("authorization"))
-                    || strip_headers
-                        .iter()
-                        .any(|header| name.eq_ignore_ascii_case(header));
-                !strip_current
-            });
-        }
-        for header in strip_headers {
-            ctx.metadata
-                .remove(&format!("{STRIP_HEADER_METADATA_PREFIX}{header}"));
+            if strip_authorization || !strip_headers.is_empty() {
+                headers.retain(|name, _| {
+                    let strip_current = (strip_authorization
+                        && name.eq_ignore_ascii_case("authorization"))
+                        || strip_headers
+                            .iter()
+                            .any(|header| name.eq_ignore_ascii_case(header));
+                    !strip_current
+                });
+            }
+            for header in strip_headers {
+                ctx.metadata
+                    .remove(&format!("{STRIP_HEADER_METADATA_PREFIX}{header}"));
+            }
         }
         apply_claim_headers_from_context(ctx, headers, &self.claim_header_destinations);
         PluginResult::Continue

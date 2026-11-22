@@ -1049,17 +1049,31 @@ impl Waf {
     /// attacker-influenceable with a cheap request flood, and `scan_budget_ms`
     /// is the operator's sizing knob for `O(active_rules × max_scan_bytes)` —
     /// the only term they can actually size.
+    #[cfg(test)]
     async fn run_body_scan_with_budget<F>(&self, scan: F) -> ScanOutcome
     where
         F: FnOnce() -> ScanOutcome,
     {
+        self.run_body_scan_with_budget_for_len(usize::MAX, scan)
+            .await
+    }
+
+    async fn run_body_scan_with_budget_for_len<F>(&self, body_len: usize, scan: F) -> ScanOutcome
+    where
+        F: FnOnce() -> ScanOutcome,
+    {
+        // Only yield cooperatively before scanning large bodies (>= 16 KiB).
+        // Unconditional `yield_now()` on small JSON/WebSocket payloads forces a
+        // full Tokio scheduler park/reschedule round-trip on every request even
+        // when the scan itself finishes in single-digit microseconds.
+        const BODY_SCAN_YIELD_THRESHOLD_BYTES: usize = 16 * 1024;
+
         if self.config.scan_budget_ms == 0 {
             return scan();
         }
-        // Yield before the (synchronous, uninterruptible) scan so a runtime
-        // worker shared with other connections gets a scheduling point here
-        // rather than only after the scan returns.
-        tokio::task::yield_now().await;
+        if body_len >= BODY_SCAN_YIELD_THRESHOLD_BYTES {
+            tokio::task::yield_now().await;
+        }
         let start = std::time::Instant::now();
         let mut outcome = scan();
         if start.elapsed() >= Duration::from_millis(self.config.scan_budget_ms) {
@@ -1748,17 +1762,42 @@ impl Waf {
 ///
 /// Used only to answer "did anything change since this instance last scanned?" —
 /// it is never logged, exported, or compared against attacker-supplied input.
+///
+/// Canonical order-independent, non-cancelling FIPS SHA-256 over sorted,
+/// length-prefixed `(ascii-lowercased name, value)` pairs. Sorts borrowed
+/// `(&str, &str)` pairs and lowercases names into a small stack buffer,
+/// eliminating `N` per-header `String` allocations while preserving the exact
+/// cryptographic digest.
 fn response_header_map_digest(headers: &HashMap<String, String>) -> [u8; 32] {
-    let mut canonical: Vec<(String, &str)> = headers
+    let mut canonical: Vec<(&str, &str)> = headers
         .iter()
-        .map(|(name, value)| (name.to_ascii_lowercase(), value.as_str()))
+        .map(|(name, value)| (name.as_str(), value.as_str()))
         .collect();
-    canonical.sort_unstable();
+    canonical.sort_unstable_by(|(a_name, a_val), (b_name, b_val)| {
+        a_name
+            .bytes()
+            .map(|b| b.to_ascii_lowercase())
+            .cmp(b_name.bytes().map(|b| b.to_ascii_lowercase()))
+            .then_with(|| a_val.cmp(b_val))
+    });
     let mut hasher = crate::fips::approved::Sha256::new();
     hasher.update((canonical.len() as u64).to_le_bytes());
+    let mut lower_buf = [0u8; 64];
     for (name, value) in &canonical {
         hasher.update((name.len() as u64).to_le_bytes());
-        hasher.update(name.as_bytes());
+        if name.bytes().all(|b| !b.is_ascii_uppercase()) {
+            hasher.update(name.as_bytes());
+        } else {
+            let mut rest = name.as_bytes();
+            while !rest.is_empty() {
+                let chunk_len = rest.len().min(lower_buf.len());
+                for (dst, &src) in lower_buf[..chunk_len].iter_mut().zip(&rest[..chunk_len]) {
+                    *dst = src.to_ascii_lowercase();
+                }
+                hasher.update(&lower_buf[..chunk_len]);
+                rest = &rest[chunk_len..];
+            }
+        }
         hasher.update((value.len() as u64).to_le_bytes());
         hasher.update(value.as_bytes());
     }
@@ -1783,7 +1822,11 @@ impl Plugin for Waf {
     }
 
     fn lifecycle_hooks(&self) -> crate::plugins::PluginHooks {
-        crate::plugins::PluginHooks::AFTER_PROXY
+        if self.active {
+            crate::plugins::PluginHooks::AFTER_PROXY
+        } else {
+            crate::plugins::PluginHooks::NONE
+        }
     }
 
     /// WAF body rules decide in the final request-body phase, over the exact
@@ -2216,7 +2259,7 @@ impl Plugin for Waf {
         // (`finish_grpc_body`).
         let grpc_messages = grpc::split_messages(body, content_type, truncated);
         let mut outcome = self
-            .run_body_scan_with_budget(|| {
+            .run_body_scan_with_budget_for_len(body.len(), || {
                 self.run_request_body_scan(
                     ctx,
                     body,
@@ -2562,7 +2605,7 @@ impl Plugin for Waf {
         // they were.
         let grpc_messages = grpc::split_messages(body, scope_content_type, truncated);
         let mut outcome = self
-            .run_body_scan_with_budget(|| {
+            .run_body_scan_with_budget_for_len(body.len(), || {
                 self.run_response_body_scan(ctx, body, scope_content_type, grpc_messages.as_ref())
             })
             .await;

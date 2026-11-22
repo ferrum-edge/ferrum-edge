@@ -242,6 +242,10 @@ impl Plugin for WsMessageSizeLimiting {
         "ws_message_size_limiting"
     }
 
+    fn is_authorize_plugin(&self) -> bool {
+        false
+    }
+
     fn priority(&self) -> u16 {
         super::priority::WS_MESSAGE_SIZE_LIMITING
     }

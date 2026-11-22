@@ -4394,12 +4394,20 @@ impl Plugin for BodyValidator {
         "body_validator"
     }
 
+    fn is_authorize_plugin(&self) -> bool {
+        false
+    }
+
     fn priority(&self) -> u16 {
         super::priority::BODY_VALIDATOR
     }
 
     fn lifecycle_hooks(&self) -> crate::plugins::PluginHooks {
-        crate::plugins::PluginHooks::BEFORE_PROXY | crate::plugins::PluginHooks::AFTER_PROXY
+        let mut hooks = crate::plugins::PluginHooks::BEFORE_PROXY;
+        if self.has_response_validation {
+            hooks |= crate::plugins::PluginHooks::AFTER_PROXY;
+        }
+        hooks
     }
 
     /// This plugin's enforcement decision is taken in the final request-body

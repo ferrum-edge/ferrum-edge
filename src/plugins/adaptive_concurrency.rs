@@ -90,6 +90,10 @@ impl Plugin for AdaptiveConcurrency {
         crate::plugins::PluginHooks::NONE
     }
 
+    fn supports_request_header_passthrough(&self) -> bool {
+        true
+    }
+
     fn supported_protocols(&self) -> &'static [ProxyProtocol] {
         HTTP_FAMILY_PROTOCOLS
     }
@@ -125,7 +129,7 @@ impl Plugin for AdaptiveConcurrency {
         match self.limiter.try_acquire_for_generation(
             admission.proxy,
             admission.upstream_target,
-            Arc::clone(&self.config),
+            &self.config,
             self.policy_generation,
             ctx.lb_generation,
         ) {

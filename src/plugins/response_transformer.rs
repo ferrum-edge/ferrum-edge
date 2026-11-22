@@ -145,7 +145,6 @@ use async_trait::async_trait;
 use http::header::{HeaderName, HeaderValue};
 use serde_json::Value;
 use std::collections::HashMap;
-use std::collections::hash_map::Entry;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tracing::debug;
 
@@ -417,7 +416,7 @@ impl ResponseTransformer {
             match rule.operation {
                 HeaderOp::Add => {
                     if let Some(value) = rule.value.as_ref()
-                        && let Entry::Vacant(slot) = response_headers.entry(rule.key.clone())
+                        && !response_headers.contains_key(&rule.key)
                     {
                         // A static `add` only ever fires into an ABSENT slot, so
                         // the whole inserted value is gateway-authored. Record it
@@ -430,7 +429,7 @@ impl ResponseTransformer {
                         if emit_debug {
                             debug!("response_transformer: added header {}", rule.key);
                         }
-                        slot.insert(value.clone());
+                        response_headers.insert(rule.key.clone(), value.clone());
                         if let Some(sink) = fired_write_keys.as_mut() {
                             sink.push(rule.key.clone());
                         }
@@ -438,7 +437,14 @@ impl ResponseTransformer {
                 }
                 HeaderOp::Update => {
                     if let Some(value) = rule.value.as_ref() {
-                        response_headers.insert(rule.key.clone(), value.clone());
+                        if let Some(existing) = response_headers.get_mut(&rule.key) {
+                            if existing != value {
+                                existing.clear();
+                                existing.push_str(value);
+                            }
+                        } else {
+                            response_headers.insert(rule.key.clone(), value.clone());
+                        }
                         if emit_debug {
                             debug!("response_transformer: set header {}", rule.key);
                         }
@@ -958,6 +964,10 @@ fn media_type_admits_body_rules(
 impl Plugin for ResponseTransformer {
     fn name(&self) -> &str {
         "response_transformer"
+    }
+
+    fn is_authorize_plugin(&self) -> bool {
+        false
     }
 
     fn priority(&self) -> u16 {

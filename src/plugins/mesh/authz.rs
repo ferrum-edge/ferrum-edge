@@ -4723,7 +4723,14 @@ impl Plugin for MeshAuthz {
     }
 
     fn lifecycle_hooks(&self) -> crate::plugins::PluginHooks {
-        crate::plugins::PluginHooks::BEFORE_PROXY | crate::plugins::PluginHooks::AFTER_PROXY
+        let mut hooks = crate::plugins::PluginHooks::NONE;
+        if !self.ext_authz_upstream_allow_headers.is_empty() {
+            hooks |= crate::plugins::PluginHooks::BEFORE_PROXY;
+        }
+        if self.ext_authz_mutates_downstream {
+            hooks |= crate::plugins::PluginHooks::AFTER_PROXY;
+        }
+        hooks
     }
 
     fn supported_protocols(&self) -> &'static [ProxyProtocol] {

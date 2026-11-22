@@ -821,6 +821,10 @@ impl Plugin for WsFrameLogging {
         "ws_frame_logging"
     }
 
+    fn is_authorize_plugin(&self) -> bool {
+        false
+    }
+
     fn priority(&self) -> u16 {
         super::priority::WS_FRAME_LOGGING
     }

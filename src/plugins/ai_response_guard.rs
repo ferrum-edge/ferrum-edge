@@ -4386,6 +4386,10 @@ impl Plugin for AiResponseGuard {
         "ai_response_guard"
     }
 
+    fn is_authorize_plugin(&self) -> bool {
+        false
+    }
+
     fn priority(&self) -> u16 {
         super::priority::AI_RESPONSE_GUARD
     }

@@ -593,6 +593,10 @@ impl Plugin for FaultInjectionPlugin {
         "fault_injection"
     }
 
+    fn is_authorize_plugin(&self) -> bool {
+        false
+    }
+
     fn priority(&self) -> u16 {
         super::priority::FAULT_INJECTION
     }
@@ -606,7 +610,7 @@ impl Plugin for FaultInjectionPlugin {
     }
 
     fn requires_udp_datagram_hooks(&self) -> bool {
-        true
+        self.request_match.is_none()
     }
 
     fn defer_before_proxy_until_backend_path_resolved(&self) -> bool {

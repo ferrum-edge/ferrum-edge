@@ -561,13 +561,20 @@ impl TimestampedCounter {
     }
 
     fn increment(&self, epoch: Instant) {
-        self.add(1, epoch);
+        self.add_at(1, epoch.elapsed().as_nanos() as u64);
+    }
+
+    fn increment_at(&self, now_nanos: u64) {
+        self.add_at(1, now_nanos);
     }
 
     fn add(&self, value: u64, epoch: Instant) {
+        self.add_at(value, epoch.elapsed().as_nanos() as u64);
+    }
+
+    fn add_at(&self, value: u64, now_nanos: u64) {
         self.value.fetch_add(value, Ordering::Relaxed);
-        self.last_updated
-            .store(epoch.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        self.last_updated.fetch_max(now_nanos, Ordering::Relaxed);
     }
 
     fn saturating_add(&self, value: u64, epoch: Instant) {
@@ -577,7 +584,7 @@ impl TimestampedCounter {
                 Some(current.saturating_add(value))
             });
         self.last_updated
-            .store(epoch.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            .fetch_max(epoch.elapsed().as_nanos() as u64, Ordering::Relaxed);
     }
 
     fn nanos_since_update(&self, epoch: Instant) -> u64 {
@@ -806,12 +813,12 @@ impl HistogramBuckets {
 
     /// Istio-aligned byte histogram buckets for REQUEST_SIZE / RESPONSE_SIZE.
     fn new_bytes(epoch: Instant) -> Self {
-        Self::new_with_boundaries(
-            vec![
+        Self::with_layout(
+            Arc::from(vec![
                 1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0, 128.0, 256.0, 512.0, 1024.0, 2048.0, 4096.0,
                 8192.0, 16384.0, 32768.0, 65536.0, 131072.0, 262144.0, 524288.0, 1048576.0,
                 2097152.0, 4194304.0, 8388608.0,
-            ],
+            ]),
             epoch,
         )
     }
@@ -821,9 +828,12 @@ impl HistogramBuckets {
     }
 
     fn observe(&self, value: f64, epoch: Instant) {
+        self.observe_at(value, epoch.elapsed().as_nanos() as u64);
+    }
+
+    fn observe_at(&self, value: f64, now_nanos: u64) {
         self.count.fetch_add(1, Ordering::Relaxed);
-        self.last_updated
-            .store(epoch.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        self.last_updated.fetch_max(now_nanos, Ordering::Relaxed);
         // Add to sum (using u64 bit representation of f64)
         loop {
             let old = self.sum.load(Ordering::Relaxed);
@@ -1814,18 +1824,18 @@ impl MetricsRegistry {
         ) {
             return;
         }
-        let key = prometheus_helpers::mesh_request_key_for_family_from_metadata(
+        let key = prometheus_helpers::mesh_request_key_for_family_from_metadata_cow(
             metadata,
             &base,
             prometheus_helpers::MeshMetricFamily::TcpOpenedConnections,
         );
-        let epoch = self.epoch;
+        let now_nanos = self.epoch.elapsed().as_nanos() as u64;
         self.update_mesh_series(
             prometheus_helpers::MeshMetricFamily::TcpOpenedConnections,
             &self.mesh_tcp_opened_counter,
             key,
-            || TimestampedCounter::new(epoch),
-            |counter| counter.increment(epoch),
+            || TimestampedCounter::new(self.epoch),
+            |counter| counter.increment_at(now_nanos),
         );
         self.maybe_invalidate_cache();
     }
@@ -1847,34 +1857,33 @@ impl MetricsRegistry {
         if !prometheus_helpers::is_mesh_tcp_protocol(base.request_protocol.as_ref()) {
             return;
         }
+        let now_nanos = self.epoch.elapsed().as_nanos() as u64;
         if !prometheus_helpers::mesh_metric_disabled_metadata(
             &summary.metadata,
             prometheus_helpers::MeshMetricFamily::TcpClosedConnections,
         ) {
-            let key = prometheus_helpers::mesh_request_key_for_family_from_metadata(
+            let key = prometheus_helpers::mesh_request_key_for_family_from_metadata_cow(
                 &summary.metadata,
                 &base,
                 prometheus_helpers::MeshMetricFamily::TcpClosedConnections,
             );
-            let epoch = self.epoch;
             self.update_mesh_series(
                 prometheus_helpers::MeshMetricFamily::TcpClosedConnections,
                 &self.mesh_tcp_closed_counter,
                 key,
-                || TimestampedCounter::new(epoch),
-                |counter| counter.increment(epoch),
+                || TimestampedCounter::new(self.epoch),
+                |counter| counter.increment_at(now_nanos),
             );
         }
         if !prometheus_helpers::mesh_metric_disabled_metadata(
             &summary.metadata,
             prometheus_helpers::MeshMetricFamily::TcpSentBytes,
         ) {
-            let key = prometheus_helpers::mesh_request_key_for_family_from_metadata(
+            let key = prometheus_helpers::mesh_request_key_for_family_from_metadata_cow(
                 &summary.metadata,
                 &base,
                 prometheus_helpers::MeshMetricFamily::TcpSentBytes,
             );
-            let epoch = self.epoch;
             // Istio Telemetry defines TCP_SENT_BYTES as response bytes.
             // StreamTransactionSummary uses Ferrum's gateway-perspective
             // names, where bytes_received is backend->client.
@@ -1883,20 +1892,19 @@ impl MetricsRegistry {
                 prometheus_helpers::MeshMetricFamily::TcpSentBytes,
                 &self.mesh_tcp_sent_bytes_counter,
                 key,
-                || TimestampedCounter::new(epoch),
-                |counter| counter.add(bytes, epoch),
+                || TimestampedCounter::new(self.epoch),
+                |counter| counter.add_at(bytes, now_nanos),
             );
         }
         if !prometheus_helpers::mesh_metric_disabled_metadata(
             &summary.metadata,
             prometheus_helpers::MeshMetricFamily::TcpReceivedBytes,
         ) {
-            let key = prometheus_helpers::mesh_request_key_for_family_from_metadata(
+            let key = prometheus_helpers::mesh_request_key_for_family_from_metadata_cow(
                 &summary.metadata,
                 &base,
                 prometheus_helpers::MeshMetricFamily::TcpReceivedBytes,
             );
-            let epoch = self.epoch;
             // Istio Telemetry defines TCP_RECEIVED_BYTES as request bytes.
             // StreamTransactionSummary.bytes_sent is client->backend.
             let bytes = summary.bytes_sent;
@@ -1904,8 +1912,8 @@ impl MetricsRegistry {
                 prometheus_helpers::MeshMetricFamily::TcpReceivedBytes,
                 &self.mesh_tcp_received_bytes_counter,
                 key,
-                || TimestampedCounter::new(epoch),
-                |counter| counter.add(bytes, epoch),
+                || TimestampedCounter::new(self.epoch),
+                |counter| counter.add_at(bytes, now_nanos),
             );
         }
     }
@@ -2993,17 +3001,22 @@ impl MetricsRegistry {
             return;
         }
         let epoch = self.epoch;
+        // Sample the monotonic clock ONCE for every counter/histogram series
+        // touched by this transaction instead of calling `Instant::now()` 6–12
+        // times per request.
+        let now_nanos = epoch.elapsed().as_nanos() as u64;
         let proxy_key: &str = summary.proxy_id.as_deref().unwrap_or("unknown");
 
         // The request-duration histogram is recorded for every transaction, so
         // its map key is the shared `proxy_id` for every other per-proxy family
         // below (no per-transaction `Arc<str>` allocation once established).
-        let proxy_id = self.observe_proxy_duration(
+        let proxy_id = self.observe_proxy_duration_at(
             &self.request_duration_buckets,
             proxy_key,
             DurationLayoutKind::Request,
             &layouts.request,
             summary.latency_total_ms,
+            now_nanos,
         );
 
         // Increment request counter (composite key — no format!() allocation)
@@ -3017,20 +3030,21 @@ impl MetricsRegistry {
         Self::update_series(
             &self.request_counter,
             counter_key,
-            || TimestampedCounter::new(epoch),
-            |counter| counter.increment(epoch),
+            || TimestampedCounter::new(self.epoch),
+            |counter| counter.increment_at(now_nanos),
         );
 
         // Guard against sentinel value (-1.0) used for streaming responses
         // where total backend latency is unknown at log time.
         if summary.latency_backend_total_ms >= 0.0 {
-            self.observe_duration(
+            self.observe_duration_at(
                 &self.backend_duration_buckets,
                 proxy_key,
                 || Arc::clone(&proxy_id),
                 DurationLayoutKind::Request,
                 &layouts.request,
                 summary.latency_backend_total_ms,
+                now_nanos,
             );
         }
 
@@ -3038,30 +3052,33 @@ impl MetricsRegistry {
         // unknown backend total emit LATENCY_UNKNOWN_MS rather than inventing
         // overhead from TTFB (issue #2532).
         if summary.latency_gateway_overhead_ms >= 0.0 {
-            self.observe_duration(
+            self.observe_duration_at(
                 &self.gateway_overhead_buckets,
                 proxy_key,
                 || Arc::clone(&proxy_id),
                 DurationLayoutKind::Request,
                 &layouts.request,
                 summary.latency_gateway_overhead_ms,
+                now_nanos,
             );
         }
 
         // Per-proxy HTTP-family body bandwidth. Recorded for mesh and non-mesh
         // traffic alike; the mesh size histograms below are a separate,
         // identity-labelled view of the same bytes.
-        self.add_proxy_counter(
+        self.add_proxy_counter_at(
             &self.request_body_bytes_counter,
             proxy_key,
             &proxy_id,
             summary.bytes_sent,
+            now_nanos,
         );
-        self.add_proxy_counter(
+        self.add_proxy_counter_at(
             &self.response_body_bytes_counter,
             proxy_key,
             &proxy_id,
             summary.bytes_received,
+            now_nanos,
         );
 
         if let Some(usage) = summary.ai_usage_export.as_ref()
@@ -3110,54 +3127,53 @@ impl MetricsRegistry {
                 summary,
                 prometheus_helpers::MeshMetricFamily::RequestCount,
             ) {
-                let count_key = prometheus_helpers::mesh_request_key_for_family(
+                let count_key = prometheus_helpers::mesh_request_key_for_family_cow(
                     summary,
                     mesh_key,
                     prometheus_helpers::MeshMetricFamily::RequestCount,
                 );
-                let epoch = self.epoch;
                 self.update_mesh_series(
                     prometheus_helpers::MeshMetricFamily::RequestCount,
                     &self.mesh_request_counter,
                     count_key,
-                    || TimestampedCounter::new(epoch),
-                    |counter| counter.increment(epoch),
+                    || TimestampedCounter::new(self.epoch),
+                    |counter| counter.increment_at(now_nanos),
                 );
             }
             if !prometheus_helpers::mesh_metric_disabled(
                 summary,
                 prometheus_helpers::MeshMetricFamily::RequestDuration,
             ) {
-                let duration_key = prometheus_helpers::mesh_request_key_for_family(
+                let duration_key = prometheus_helpers::mesh_request_key_for_family_cow(
                     summary,
                     mesh_key,
                     prometheus_helpers::MeshMetricFamily::RequestDuration,
                 );
-                self.observe_mesh_duration_series(
+                self.observe_mesh_duration_series_at(
                     prometheus_helpers::MeshMetricFamily::RequestDuration,
                     &self.mesh_request_duration_buckets,
                     duration_key,
                     &layouts.request,
                     summary.latency_total_ms,
+                    now_nanos,
                 );
             }
             if !prometheus_helpers::mesh_metric_disabled(
                 summary,
                 prometheus_helpers::MeshMetricFamily::RequestSize,
             ) {
-                let size_key = prometheus_helpers::mesh_request_key_for_family(
+                let size_key = prometheus_helpers::mesh_request_key_for_family_cow(
                     summary,
                     mesh_key,
                     prometheus_helpers::MeshMetricFamily::RequestSize,
                 );
-                let epoch = self.epoch;
                 let bytes = summary.bytes_sent as f64;
                 self.update_mesh_series(
                     prometheus_helpers::MeshMetricFamily::RequestSize,
                     &self.mesh_request_bytes_buckets,
                     size_key,
-                    || HistogramBuckets::new_bytes(epoch),
-                    |buckets| buckets.observe(bytes, epoch),
+                    || HistogramBuckets::new_bytes(self.epoch),
+                    |buckets| buckets.observe_at(bytes, now_nanos),
                 );
             }
             if !prometheus_helpers::mesh_metric_disabled(
@@ -3167,19 +3183,18 @@ impl MetricsRegistry {
                 // Record observed response bytes even when the body did not
                 // complete; deferred logging already finalizes the transferred
                 // count. Incomplete streams still contribute authoritative size.
-                let size_key = prometheus_helpers::mesh_request_key_for_family(
+                let size_key = prometheus_helpers::mesh_request_key_for_family_cow(
                     summary,
                     mesh_key,
                     prometheus_helpers::MeshMetricFamily::ResponseSize,
                 );
-                let epoch = self.epoch;
                 let bytes = summary.bytes_received as f64;
                 self.update_mesh_series(
                     prometheus_helpers::MeshMetricFamily::ResponseSize,
                     &self.mesh_response_bytes_buckets,
                     size_key,
-                    || HistogramBuckets::new_bytes(epoch),
-                    |buckets| buckets.observe(bytes, epoch),
+                    || HistogramBuckets::new_bytes(self.epoch),
+                    |buckets| buckets.observe_at(bytes, now_nanos),
                 );
             }
             if prometheus_helpers::is_mesh_grpc_protocol(mesh_key.request_protocol.as_ref()) {
@@ -3189,19 +3204,18 @@ impl MetricsRegistry {
                         prometheus_helpers::MeshMetricFamily::GrpcRequestMessages,
                     )
                 {
-                    let key = prometheus_helpers::mesh_request_key_for_family(
+                    let key = prometheus_helpers::mesh_request_key_for_family_cow(
                         summary,
                         mesh_key,
                         prometheus_helpers::MeshMetricFamily::GrpcRequestMessages,
                     );
-                    let epoch = self.epoch;
                     let messages = summary.grpc_request_messages;
                     self.update_mesh_series(
                         prometheus_helpers::MeshMetricFamily::GrpcRequestMessages,
                         &self.mesh_grpc_request_messages_counter,
                         key,
-                        || TimestampedCounter::new(epoch),
-                        |counter| counter.add(messages, epoch),
+                        || TimestampedCounter::new(self.epoch),
+                        |counter| counter.add_at(messages, now_nanos),
                     );
                 }
                 if summary.grpc_response_messages > 0
@@ -3210,19 +3224,18 @@ impl MetricsRegistry {
                         prometheus_helpers::MeshMetricFamily::GrpcResponseMessages,
                     )
                 {
-                    let key = prometheus_helpers::mesh_request_key_for_family(
+                    let key = prometheus_helpers::mesh_request_key_for_family_cow(
                         summary,
                         mesh_key,
                         prometheus_helpers::MeshMetricFamily::GrpcResponseMessages,
                     );
-                    let epoch = self.epoch;
                     let messages = summary.grpc_response_messages;
                     self.update_mesh_series(
                         prometheus_helpers::MeshMetricFamily::GrpcResponseMessages,
                         &self.mesh_grpc_response_messages_counter,
                         key,
-                        || TimestampedCounter::new(epoch),
-                        |counter| counter.add(messages, epoch),
+                        || TimestampedCounter::new(self.epoch),
+                        |counter| counter.add_at(messages, now_nanos),
                     );
                 }
             }
@@ -3238,8 +3251,8 @@ impl MetricsRegistry {
             Self::update_series(
                 &self.client_disconnect_counter,
                 key,
-                || TimestampedCounter::new(epoch),
-                |counter| counter.increment(epoch),
+                || TimestampedCounter::new(self.epoch),
+                |counter| counter.increment_at(now_nanos),
             );
         }
 
@@ -3341,20 +3354,20 @@ impl MetricsRegistry {
         &self,
         family: prometheus_helpers::MeshMetricFamily,
         map: &DashMap<MeshRequestKey, V>,
-        key: MeshRequestKey,
+        key: std::borrow::Cow<'_, MeshRequestKey>,
         create: impl FnOnce() -> V,
         update: impl FnOnce(&V) -> R,
     ) -> Option<R> {
         use dashmap::mapref::entry::Entry;
         // Established series update under a shared read guard so concurrent
         // recorders of one hot series do not serialize on the shard write
-        // lock. The guard spans `update`, so eviction cannot remove the entry
-        // mid-update. Only a miss takes the exclusive `entry()` path, which
-        // re-checks occupancy before reserving budget.
-        if let Some(existing) = map.get(&key) {
+        // lock. Borrowing `&MeshRequestKey` avoids cloning its 14 `Arc<str>`
+        // labels on every warm hit. Only a miss takes the exclusive `entry()`
+        // path, which re-checks occupancy before reserving budget.
+        if let Some(existing) = map.get(key.as_ref()) {
             return Some(update(existing.value()));
         }
-        match map.entry(key) {
+        match map.entry(key.into_owned()) {
             Entry::Occupied(entry) => Some(update(entry.get())),
             Entry::Vacant(entry) => {
                 if !self.try_reserve_mesh_series(family) {
@@ -3385,29 +3398,30 @@ impl MetricsRegistry {
     /// retained key whose histogram predates it is reset in place (keeping its
     /// reserved budget slot), and a current-layout histogram is never replaced
     /// by a stale capture.
-    fn observe_mesh_duration_series(
+    fn observe_mesh_duration_series_at(
         &self,
         family: prometheus_helpers::MeshMetricFamily,
         map: &DashMap<MeshRequestKey, HistogramBuckets>,
-        key: MeshRequestKey,
+        key: std::borrow::Cow<'_, MeshRequestKey>,
         captured: &Arc<[f64]>,
         value: f64,
+        now_nanos: u64,
     ) {
         use dashmap::mapref::entry::Entry;
-        if let Some(existing) = map.get(&key)
+        if let Some(existing) = map.get(key.as_ref())
             && Arc::ptr_eq(&existing.boundaries, captured)
         {
-            existing.observe(value, self.epoch);
+            existing.observe_at(value, now_nanos);
             return;
         }
-        match map.entry(key) {
+        match map.entry(key.into_owned()) {
             Entry::Occupied(mut entry) => {
                 let current = self.current_duration_layout(DurationLayoutKind::Request);
                 if !Arc::ptr_eq(&entry.get().boundaries, &current) {
                     let _superseded =
                         entry.insert(HistogramBuckets::with_layout(current, self.epoch));
                 }
-                entry.get().observe(value, self.epoch);
+                entry.get().observe_at(value, now_nanos);
             }
             Entry::Vacant(entry) => {
                 if !self.try_reserve_mesh_series(family) {
@@ -3416,7 +3430,7 @@ impl MetricsRegistry {
                 }
                 let current = self.current_duration_layout(DurationLayoutKind::Request);
                 let histogram = HistogramBuckets::with_layout(current, self.epoch);
-                histogram.observe(value, self.epoch);
+                histogram.observe_at(value, now_nanos);
                 entry.insert(histogram);
             }
         }
@@ -3465,11 +3479,36 @@ impl MetricsRegistry {
         K: Eq + std::hash::Hash + std::borrow::Borrow<Q>,
         Q: Eq + std::hash::Hash + ?Sized,
     {
+        self.observe_duration_at(
+            map,
+            lookup,
+            owned_key,
+            kind,
+            captured,
+            value,
+            self.epoch.elapsed().as_nanos() as u64,
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn observe_duration_at<K, Q>(
+        &self,
+        map: &DashMap<K, HistogramBuckets>,
+        lookup: &Q,
+        owned_key: impl FnOnce() -> K,
+        kind: DurationLayoutKind,
+        captured: &Arc<[f64]>,
+        value: f64,
+        now_nanos: u64,
+    ) where
+        K: Eq + std::hash::Hash + std::borrow::Borrow<Q>,
+        Q: Eq + std::hash::Hash + ?Sized,
+    {
         use dashmap::mapref::entry::Entry;
         if let Some(existing) = map.get(lookup)
             && Arc::ptr_eq(&existing.boundaries, captured)
         {
-            existing.observe(value, self.epoch);
+            existing.observe_at(value, now_nanos);
             return;
         }
         match map.entry(owned_key()) {
@@ -3479,12 +3518,12 @@ impl MetricsRegistry {
                     let _superseded =
                         entry.insert(HistogramBuckets::with_layout(current, self.epoch));
                 }
-                entry.get().observe(value, self.epoch);
+                entry.get().observe_at(value, now_nanos);
             }
             Entry::Vacant(entry) => {
                 let histogram =
                     HistogramBuckets::with_layout(self.current_duration_layout(kind), self.epoch);
-                histogram.observe(value, self.epoch);
+                histogram.observe_at(value, now_nanos);
                 entry.insert(histogram);
             }
         }
@@ -3504,43 +3543,64 @@ impl MetricsRegistry {
         captured: &Arc<[f64]>,
         value: f64,
     ) -> Arc<str> {
+        self.observe_proxy_duration_at(
+            map,
+            proxy_key,
+            kind,
+            captured,
+            value,
+            self.epoch.elapsed().as_nanos() as u64,
+        )
+    }
+
+    fn observe_proxy_duration_at(
+        &self,
+        map: &DashMap<Arc<str>, HistogramBuckets>,
+        proxy_key: &str,
+        kind: DurationLayoutKind,
+        captured: &Arc<[f64]>,
+        value: f64,
+        now_nanos: u64,
+    ) -> Arc<str> {
         let proxy_id = match map.get(proxy_key) {
             Some(existing) => {
                 let proxy_id = Arc::clone(existing.key());
                 if Arc::ptr_eq(&existing.boundaries, captured) {
-                    existing.observe(value, self.epoch);
+                    existing.observe_at(value, now_nanos);
                     return proxy_id;
                 }
                 proxy_id
             }
             None => Arc::from(proxy_key),
         };
-        self.observe_duration(
+        self.observe_duration_at(
             map,
             proxy_key,
             || Arc::clone(&proxy_id),
             kind,
             captured,
             value,
+            now_nanos,
         );
         proxy_id
     }
 
     /// Add `value` to a per-proxy counter, allocating the key only on a miss.
-    fn add_proxy_counter(
+    fn add_proxy_counter_at(
         &self,
         map: &DashMap<Arc<str>, TimestampedCounter>,
         proxy_key: &str,
         proxy_id: &Arc<str>,
         value: u64,
+        now_nanos: u64,
     ) {
         if let Some(existing) = map.get(proxy_key) {
-            existing.add(value, self.epoch);
+            existing.add_at(value, now_nanos);
             return;
         }
         map.entry(Arc::clone(proxy_id))
             .or_insert_with(|| TimestampedCounter::new(self.epoch))
-            .add(value, self.epoch);
+            .add_at(value, now_nanos);
     }
 
     /// Invalidate the render cache only if it's older than the configured
@@ -7458,6 +7518,10 @@ impl PrometheusMetrics {
 impl Plugin for PrometheusMetrics {
     fn name(&self) -> &str {
         "prometheus_metrics"
+    }
+
+    fn is_authorize_plugin(&self) -> bool {
+        false
     }
 
     fn uses_mesh_request_key(&self) -> bool {

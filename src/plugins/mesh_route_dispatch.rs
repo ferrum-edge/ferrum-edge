@@ -2847,6 +2847,10 @@ impl Plugin for MeshRouteDispatch {
         "mesh_route_dispatch"
     }
 
+    fn is_authorize_plugin(&self) -> bool {
+        false
+    }
+
     fn priority(&self) -> u16 {
         priority::MESH_ROUTE_DISPATCH
     }

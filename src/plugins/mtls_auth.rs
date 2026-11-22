@@ -1233,6 +1233,10 @@ auth_flow::impl_auth_plugin!(
         }
     }
 
+    fn supports_request_header_passthrough(&self) -> bool {
+        true
+    }
+
     fn lifecycle_hooks(&self) -> crate::plugins::PluginHooks {
         crate::plugins::PluginHooks::NONE
     }

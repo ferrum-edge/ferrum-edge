@@ -1516,21 +1516,42 @@ impl CompressionPlugin {
         permit: OwnedSemaphorePermit,
         ceiling: usize,
     ) -> Option<Vec<u8>> {
+        // Compress small response bodies inline when the configured codec and
+        // level are fast, avoiding an owned `Vec<u8>` copy and a
+        // `tokio::task::spawn_blocking` handoff. Slow high-quality levels
+        // (e.g. Brotli quality 5..=11, Gzip 7..=9, Zstd 4+) stay on the
+        // blocking pool so they cannot stall Tokio worker threads.
+        const INLINE_COMPRESS_MAX_BYTES: usize = 16 * 1024;
+
         let gzip_level = self.config.gzip_level;
         let brotli_quality = self.config.brotli_quality;
         let zstd_level = self.config.zstd_level;
-        let data = body.to_vec();
         let encoding_owned = algo.content_encoding();
+        let fast_inline_codec = match algo {
+            Algorithm::Gzip => gzip_level <= 6,
+            Algorithm::Brotli => brotli_quality <= 4,
+            Algorithm::Zstd => zstd_level <= 3,
+        };
 
-        let result = tokio::task::spawn_blocking(move || {
+        let result = if body.len() <= INLINE_COMPRESS_MAX_BYTES && fast_inline_codec {
             let _permit = permit;
-            match algo {
-                Algorithm::Gzip => compress_gzip_blocking(&data, gzip_level, ceiling),
-                Algorithm::Brotli => compress_brotli_blocking(&data, brotli_quality, ceiling),
-                Algorithm::Zstd => compress_zstd_blocking(&data, zstd_level, ceiling),
-            }
-        })
-        .await;
+            Ok(match algo {
+                Algorithm::Gzip => compress_gzip_blocking(body, gzip_level, ceiling),
+                Algorithm::Brotli => compress_brotli_blocking(body, brotli_quality, ceiling),
+                Algorithm::Zstd => compress_zstd_blocking(body, zstd_level, ceiling),
+            })
+        } else {
+            let data = body.to_vec();
+            tokio::task::spawn_blocking(move || {
+                let _permit = permit;
+                match algo {
+                    Algorithm::Gzip => compress_gzip_blocking(&data, gzip_level, ceiling),
+                    Algorithm::Brotli => compress_brotli_blocking(&data, brotli_quality, ceiling),
+                    Algorithm::Zstd => compress_zstd_blocking(&data, zstd_level, ceiling),
+                }
+            })
+            .await
+        };
 
         match result {
             Ok(Ok(compressed)) => {
@@ -2137,6 +2158,10 @@ fn ensure_cache_control_no_transform(headers: &mut HashMap<String, String>) {
 impl Plugin for CompressionPlugin {
     fn name(&self) -> &str {
         "compression"
+    }
+
+    fn is_authorize_plugin(&self) -> bool {
+        false
     }
 
     fn priority(&self) -> u16 {

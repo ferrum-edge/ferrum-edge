@@ -671,6 +671,10 @@ impl Plugin for AccessControl {
         crate::plugins::PluginHooks::NONE
     }
 
+    fn supports_request_header_passthrough(&self) -> bool {
+        true
+    }
+
     fn supported_protocols(&self) -> &'static [super::ProxyProtocol] {
         super::HTTP_FAMILY_AND_STREAM_PROTOCOLS
     }

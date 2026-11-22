@@ -6368,12 +6368,19 @@ fn build_phase_data(plugins: &[Arc<dyn Plugin>]) -> PluginPhaseData {
         // Multiple instances (and a global plus a proxy-scoped instance) compose
         // to their minimum; a zero/disabled instance contributes nothing rather
         // than relaxing a sibling's active bound (`GHSA-xrfj-852f-645j`).
-        // Only registered built-in `key_auth` instances may elide `before_proxy`
-        // into the passthrough strip overlay; custom plugins (including an
-        // impostor reporting `name() == "key_auth"`) always stay on the
-        // materialized path so their `before_proxy` rejections can never be
-        // skipped.
-        if !(is_builtin_named(p, "key_auth") && p.supports_request_header_passthrough()) {
+        // Only registered built-in plugins whose request-header reads and
+        // assertions are audited for the wire passthrough lane may keep
+        // `SUPPORTS_REQUEST_HEADER_PASSTHROUGH` active; custom plugins (including
+        // an impostor reporting a built-in name) always stay on the materialized
+        // path so their hooks can never be skipped. Built-ins with a
+        // `BEFORE_PROXY` hook are excluded unless `key_auth` (whose `before_proxy`
+        // only strips `request_headers_to_redact()`, elided into the passthrough
+        // strip overlay).
+        let passthrough_builtin_eligible = crate::plugins::is_builtin_plugin(p.as_ref())
+            && p.supports_request_header_passthrough()
+            && (!hooks.contains(crate::plugins::PluginHooks::BEFORE_PROXY)
+                || is_builtin_named(p, "key_auth"));
+        if !passthrough_builtin_eligible {
             supports_request_header_passthrough = false;
         } else if p.modifies_request_headers() {
             for name in p.request_headers_to_redact() {
@@ -6415,13 +6422,10 @@ fn build_phase_data(plugins: &[Arc<dyn Plugin>]) -> PluginPhaseData {
         | PluginCapabilities::DISPATCHES_FINALIZED_REQUEST_EGRESS
         | PluginCapabilities::ENFORCES_FINAL_BACKEND_HEADER_POLICY
         | PluginCapabilities::HAS_QUERY_READING_TRIGGER
-        | PluginCapabilities::HAS_ON_REQUEST_RECEIVED_HOOK
         | PluginCapabilities::HAS_AFTER_PROXY_HOOK
         | PluginCapabilities::HAS_TERMINAL_SUMMARY_CONSUMER;
     if supports_request_header_passthrough
         && (caps & passthrough_blocked_caps) == 0
-        && authorize.is_empty()
-        && backend_admission.is_empty()
         && backend_path.is_empty()
         && grpc_deadline.is_empty()
         && initial_response_header_policy_plugins.is_empty()
@@ -6600,6 +6604,12 @@ struct ProtocolEntry {
     /// [`udp_datagram_policy_digest`] of `plugins`, computed once when the
     /// entry is built. `Some` only for the UDP view.
     udp_datagram_policy_digest: Option<UdpDatagramPolicyDigest>,
+    /// Proxy-wide flags precomputed from the full merged proxy (or global)
+    /// chain so `request_view()` resolves everything in a single map lookup.
+    requires_response_body_buffering: bool,
+    requires_request_body_buffering: bool,
+    requires_ws_frame_hooks: bool,
+    uses_openai_auth_error_envelope: bool,
 }
 
 /// The shared handle every protocol map stores and every request view holds.
@@ -6638,6 +6648,10 @@ impl ProtocolEntry {
                     response_presentation_policy_digest: None,
                 },
                 udp_datagram_policy_digest: None,
+                requires_response_body_buffering: false,
+                requires_request_body_buffering: false,
+                requires_ws_frame_hooks: false,
+                uses_openai_auth_error_envelope: false,
             })
         });
         Arc::clone(&EMPTY)
@@ -6809,6 +6823,14 @@ fn build_protocol_entry(
         plugins: filtered,
         phase,
         udp_datagram_policy_digest,
+        requires_response_body_buffering: plugins
+            .iter()
+            .any(|p| p.requires_response_body_buffering()),
+        requires_request_body_buffering: plugins
+            .iter()
+            .any(|p| p.requires_request_body_buffering()),
+        requires_ws_frame_hooks: plugins.iter().any(|p| p.requires_websocket_framing()),
+        uses_openai_auth_error_envelope: proxy_has_openai_auth_error_envelope_plugin(plugins),
     })
 }
 
@@ -6848,6 +6870,14 @@ fn build_grpc_web_protocol_entry(plugins: &[Arc<dyn Plugin>]) -> SharedProtocolE
         plugins: composed,
         phase,
         udp_datagram_policy_digest: None,
+        requires_response_body_buffering: plugins
+            .iter()
+            .any(|p| p.requires_response_body_buffering()),
+        requires_request_body_buffering: plugins
+            .iter()
+            .any(|p| p.requires_request_body_buffering()),
+        requires_ws_frame_hooks: plugins.iter().any(|p| p.requires_websocket_framing()),
+        uses_openai_auth_error_envelope: proxy_has_openai_auth_error_envelope_plugin(plugins),
     })
 }
 
@@ -7678,29 +7708,8 @@ impl PluginCacheInner {
             let entry = self
                 .protocol_entry(proxy_key, protocol)
                 .map_or_else(ProtocolEntry::empty_shared, Arc::clone);
-            self.request_view_from_entry(proxy_key, entry)
+            PluginCacheRequestView { entry }
         })
-    }
-
-    /// The request view for a resolved [`ProtocolEntry`], shared by
-    /// [`Self::request_view`] and [`Self::grpc_web_request_view`].
-    ///
-    /// The view holds the entry itself, so the per-request cost is one `Arc`
-    /// increment (and one decrement when the view drops) plus the four
-    /// per-proxy flag lookups — not one increment per phase list (issue
-    /// #7207).
-    fn request_view_from_entry(
-        &self,
-        proxy_key: &str,
-        entry: SharedProtocolEntry,
-    ) -> PluginCacheRequestView {
-        PluginCacheRequestView {
-            entry,
-            requires_response_body_buffering: self.requires_response_body_buffering(proxy_key),
-            requires_request_body_buffering: self.requires_request_body_buffering(proxy_key),
-            requires_ws_frame_hooks: self.requires_ws_frame_hooks(proxy_key),
-            uses_openai_auth_error_envelope: self.uses_openai_auth_error_envelope(proxy_key),
-        }
     }
 
     pub(crate) fn grpc_web_request_view(
@@ -7717,7 +7726,9 @@ impl PluginCacheInner {
                 .grpc_web_proxy
                 .get(proxy_key)
                 .unwrap_or(&self.protocol_snapshot.grpc_web_global);
-            self.request_view_from_entry(proxy_key, Arc::clone(entry))
+            PluginCacheRequestView {
+                entry: Arc::clone(entry),
+            }
         })
     }
 }
@@ -7726,18 +7737,15 @@ impl PluginCacheInner {
 ///
 /// Built from one cache generation near the start of request handling. It
 /// holds that generation's resolved [`ProtocolEntry`] for the pair — one
-/// shared, immutable snapshot of the filtered plugin list and its phase data —
-/// plus four per-proxy flags. Building or cloning a view is therefore one
-/// `Arc` increment, never a per-phase-list fan-out of reference-count writes
-/// on shared cache lines (issue #7207). Only that one entry stays pinned
-/// across plugin/backend awaits, not the full plugin-cache snapshot.
+/// shared, immutable snapshot of the filtered plugin list, its phase data,
+/// and the four proxy-wide flags. Building or cloning a view is therefore a
+/// single HashMap lookup and one `Arc` increment, never a per-phase-list
+/// fan-out of reference-count writes on shared cache lines (issue #7207).
+/// Only that one entry stays pinned across plugin/backend awaits, not the
+/// full plugin-cache snapshot.
 #[derive(Clone)]
 pub struct PluginCacheRequestView {
     entry: SharedProtocolEntry,
-    requires_response_body_buffering: bool,
-    requires_request_body_buffering: bool,
-    requires_ws_frame_hooks: bool,
-    uses_openai_auth_error_envelope: bool,
 }
 
 impl PluginCacheRequestView {
@@ -7789,6 +7797,18 @@ impl PluginCacheRequestView {
         ctx.route_may_rewrite_response_stream = Some(self.requires_response_stream_hooks());
     }
 
+    /// Whether any protocol-compatible plugin is configured on this route.
+    #[inline]
+    pub fn has_plugins(&self) -> bool {
+        !self.entry.plugins.is_empty()
+    }
+
+    /// Borrow pre-resolved protocol-filtered plugins without bumping an `Arc`.
+    #[inline]
+    pub fn plugins_slice(&self) -> &[Arc<dyn Plugin>] {
+        self.entry.plugins.as_slice()
+    }
+
     /// Get pre-resolved protocol-filtered plugins from this request view.
     pub fn plugins(&self) -> Arc<Vec<Arc<dyn Plugin>>> {
         Arc::clone(&self.entry.plugins)
@@ -7799,14 +7819,32 @@ impl PluginCacheRequestView {
         self.entry.phase.grpc_deadline_plugins.as_slice()
     }
 
+    /// Borrow pre-computed auth plugins without bumping an `Arc`.
+    #[inline]
+    pub fn auth_plugins_slice(&self) -> &[Arc<dyn Plugin>] {
+        self.entry.phase.auth_plugins.as_slice()
+    }
+
     /// Get pre-computed auth plugins from this request view.
     pub fn auth_plugins(&self) -> Arc<Vec<Arc<dyn Plugin>>> {
         Arc::clone(&self.entry.phase.auth_plugins)
     }
 
+    /// Borrow pre-computed authorization plugins without bumping an `Arc`.
+    #[inline]
+    pub fn authorize_plugins_slice(&self) -> &[Arc<dyn Plugin>] {
+        self.entry.phase.authorize_plugins.as_slice()
+    }
+
     /// Get pre-computed authorization plugins from this request view.
     pub fn authorize_plugins(&self) -> Arc<Vec<Arc<dyn Plugin>>> {
         Arc::clone(&self.entry.phase.authorize_plugins)
+    }
+
+    /// Borrow pre-computed backend admission plugins without bumping an `Arc`.
+    #[inline]
+    pub fn backend_admission_plugins_slice(&self) -> &[Arc<dyn Plugin>] {
+        self.entry.phase.backend_admission_plugins.as_slice()
     }
 
     /// Get pre-computed backend admission plugins from this request view.
@@ -7828,9 +7866,21 @@ impl PluginCacheRequestView {
         }
     }
 
+    /// Borrow credential-bearing request headers without bumping an `Arc`.
+    #[inline]
+    pub fn request_headers_to_redact_slice(&self) -> &[String] {
+        self.entry.phase.request_headers_to_redact.as_slice()
+    }
+
     /// Get credential-bearing request headers precomputed for safe downstream views.
     pub fn request_headers_to_redact(&self) -> Arc<Vec<String>> {
         Arc::clone(&self.entry.phase.request_headers_to_redact)
+    }
+
+    /// Borrow late request-trailer strip headers without bumping an `Arc`.
+    #[inline]
+    pub fn request_trailer_strip_headers_slice(&self) -> &[String] {
+        self.entry.phase.request_trailer_strip_headers.as_slice()
     }
 
     /// Get the names every late request-trailer boundary strips on this route:
@@ -7846,9 +7896,24 @@ impl PluginCacheRequestView {
         !self.entry.phase.owned_request_assertion_headers.is_empty()
     }
 
+    /// Borrow gateway-assertion request headers without bumping an `Arc`.
+    #[inline]
+    pub fn owned_request_assertion_headers_slice(&self) -> &[String] {
+        self.entry.phase.owned_request_assertion_headers.as_slice()
+    }
+
     /// Every gateway-assertion request header a plugin on this route owns.
     pub fn owned_request_assertion_headers(&self) -> Arc<Vec<String>> {
         Arc::clone(&self.entry.phase.owned_request_assertion_headers)
+    }
+
+    /// Borrow the pre-filtered deterministic initial-response header policy chain.
+    #[inline]
+    pub fn initial_response_header_policy_plugins_slice(&self) -> &[Arc<dyn Plugin>] {
+        self.entry
+            .phase
+            .initial_response_header_policy_plugins
+            .as_slice()
     }
 
     /// Get the pre-filtered deterministic initial-response header policy chain.
@@ -7943,24 +8008,28 @@ impl PluginCacheRequestView {
     }
 
     /// Check response-body buffering requirement from this request view.
+    #[inline]
     pub fn requires_response_body_buffering(&self) -> bool {
-        self.requires_response_body_buffering
+        self.entry.requires_response_body_buffering
     }
 
     /// Check request-body buffering requirement from this request view.
+    #[inline]
     pub fn requires_request_body_buffering(&self) -> bool {
-        self.requires_request_body_buffering
+        self.entry.requires_request_body_buffering
     }
 
     /// Check parsed WebSocket relay requirement from this request view.
+    #[inline]
     pub fn requires_ws_frame_hooks(&self) -> bool {
-        self.requires_ws_frame_hooks
+        self.entry.requires_ws_frame_hooks
     }
 
     /// Whether authentication rejects on this proxy should use the OpenAI
     /// nested error envelope.
+    #[inline]
     pub fn uses_openai_auth_error_envelope(&self) -> bool {
-        self.uses_openai_auth_error_envelope
+        self.entry.uses_openai_auth_error_envelope
     }
 
     /// Check whether any protocol-compatible plugin opted into response-stream

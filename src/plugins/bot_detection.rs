@@ -301,9 +301,15 @@ fn user_agent_view(ctx: &RequestContext) -> UserAgentView<'_> {
     if ctx.has_raw_headers() {
         let mut saw_line = false;
         let mut saw_value = false;
+        let mut single_line: Option<&str> = None;
         for line in ctx.raw_header_value_bytes(USER_AGENT) {
-            if std::str::from_utf8(line).is_err() {
+            let Ok(text) = std::str::from_utf8(line) else {
                 return UserAgentView::Unreadable;
+            };
+            if !saw_line {
+                single_line = Some(text);
+            } else {
+                single_line = None;
             }
             saw_line = true;
             saw_value |= !is_blank_field_value(line);
@@ -312,6 +318,15 @@ fn user_agent_view(ctx: &RequestContext) -> UserAgentView<'_> {
         // check on the folded value below would not recognize as blank.
         if saw_line && !saw_value {
             return UserAgentView::Missing;
+        }
+        // On the request-header passthrough lane `ctx.headers` is unmaterialized
+        // and the wire block is guaranteed single-line UTF-8 with no prior
+        // plugin removals, so return the borrowed wire value directly.
+        if ctx.request_header_passthrough_active() {
+            return match single_line {
+                Some(ua) if saw_value => UserAgentView::Present(ua),
+                _ => UserAgentView::Missing,
+            };
         }
     }
     match ctx.headers.get(USER_AGENT) {
@@ -335,8 +350,16 @@ impl Plugin for BotDetection {
         "bot_detection"
     }
 
+    fn is_authorize_plugin(&self) -> bool {
+        false
+    }
+
     fn priority(&self) -> u16 {
         BOT_DETECTION_PRIORITY
+    }
+
+    fn supports_request_header_passthrough(&self) -> bool {
+        true
     }
 
     fn lifecycle_hooks(&self) -> crate::plugins::PluginHooks {

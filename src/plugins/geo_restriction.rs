@@ -650,6 +650,10 @@ impl Plugin for GeoRestriction {
         "geo_restriction"
     }
 
+    fn is_authorize_plugin(&self) -> bool {
+        false
+    }
+
     fn country_mmdb_snapshot(&self) -> Option<&CountryMmdbSnapshot> {
         self.reader.as_deref()
     }
@@ -666,6 +670,10 @@ impl Plugin for GeoRestriction {
 
     fn lifecycle_hooks(&self) -> crate::plugins::PluginHooks {
         crate::plugins::PluginHooks::ON_REQUEST_RECEIVED
+    }
+
+    fn supports_request_header_passthrough(&self) -> bool {
+        true
     }
 
     fn supported_protocols(&self) -> &'static [super::ProxyProtocol] {
@@ -732,8 +740,10 @@ impl Plugin for GeoRestriction {
             && let Some(code) = country
         {
             ctx.set_backend_geo_country(code.bytes());
-            ctx.headers
-                .insert(GEO_COUNTRY_HEADER.to_string(), code.into_string());
+            if !ctx.request_header_passthrough_active() {
+                ctx.headers
+                    .insert(GEO_COUNTRY_HEADER.to_string(), code.into_string());
+            }
         }
 
         result

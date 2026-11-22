@@ -297,6 +297,40 @@ async fn every_registered_builtin_reports_a_narrow_declaration_at_runtime() {
                  in BUILTINS_IMPLEMENTING_EVERY_GATED_HOOK"
             );
         }
+        const AUTHORIZING_BUILTINS: &[&str] = &[
+            "access_control",
+            "mesh_authz",
+            "opa",
+            "rate_limiting",
+            "request_mirror",
+            "waf",
+        ];
+        if !AUTHORIZING_BUILTINS.contains(&name) {
+            assert!(
+                !plugin.is_authorize_plugin(),
+                "{name} does not override authorize() and must override \
+                 `fn is_authorize_plugin(&self) -> bool {{ false }}` so request dispatch \
+                 skips boxing a no-op authorize() future"
+            );
+        }
+    }
+}
+
+#[test]
+fn every_non_authorizing_builtin_impl_overrides_is_authorize_plugin() {
+    for block in production_plugin_impl_blocks() {
+        if !block.requires_declaration || block.label.ends_with("impl_auth_plugin!") {
+            continue;
+        }
+        let methods = block_method_names(&block);
+        if !methods.contains("authorize") {
+            assert!(
+                methods.contains("is_authorize_plugin"),
+                "{}: built-in Plugin impl does not override `authorize()` and must override \
+                 `is_authorize_plugin() -> false`",
+                block.label
+            );
+        }
     }
 }
 

@@ -521,8 +521,21 @@ auth_flow::impl_auth_plugin!(
         matches!(self.token_lookup, TokenLookup::Query(_))
     }
 
+    fn supports_request_header_passthrough(&self) -> bool {
+        !self.hide_credentials
+            && !self.requires_decoded_query_params()
+            && !matches!(
+                &self.token_lookup,
+                TokenLookup::Header { lower_name, .. } if lower_name == "host"
+            )
+    }
+
     fn lifecycle_hooks(&self) -> crate::plugins::PluginHooks {
-        crate::plugins::PluginHooks::BEFORE_PROXY
+        if self.hide_credentials {
+            crate::plugins::PluginHooks::BEFORE_PROXY
+        } else {
+            crate::plugins::PluginHooks::NONE
+        }
     }
 );
 

@@ -2055,7 +2055,8 @@ fn the_capacity_refusal_is_attributed_from_the_decision_not_from_availability() 
         .expect("the next method ends the body");
 
     assert!(
-        body.contains("check_with_redis_key_and_local_capacity_attributed("),
+        body.contains("check_same_key_with_local_capacity_attributed(")
+            || body.contains("check_with_redis_key_and_local_capacity_attributed("),
         "admission must ask for the decision's provenance"
     );
     assert!(

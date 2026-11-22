@@ -538,9 +538,10 @@ impl ResponseMock {
             })
         });
 
-        let regex_may_match = !self.regex_rule_indices.is_empty()
-            && self.regex_set.as_ref().is_none_or(|set| set.is_match(path));
-        let regex = if regex_may_match {
+        let regex = if let Some(&first_regex_idx) = self.regex_rule_indices.first()
+            && exact.is_none_or(|candidate| first_regex_idx < candidate)
+            && self.regex_set.as_ref().is_none_or(|set| set.is_match(path))
+        {
             self.regex_rule_indices
                 .iter()
                 .copied()
@@ -749,6 +750,10 @@ fn json_reject(status_code: u16, body: &'static [u8]) -> PluginResult {
 impl Plugin for ResponseMock {
     fn name(&self) -> &str {
         "response_mock"
+    }
+
+    fn is_authorize_plugin(&self) -> bool {
+        false
     }
 
     fn priority(&self) -> u16 {

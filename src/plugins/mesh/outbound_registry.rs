@@ -645,6 +645,10 @@ impl Plugin for OutboundRegistry {
         "mesh_outbound_registry"
     }
 
+    fn is_authorize_plugin(&self) -> bool {
+        false
+    }
+
     fn priority(&self) -> u16 {
         priority::MESH_OUTBOUND_REGISTRY
     }
