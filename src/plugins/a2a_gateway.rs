@@ -1835,7 +1835,9 @@ impl Plugin for A2aGateway {
     }
 
     fn lifecycle_hooks(&self) -> crate::plugins::PluginHooks {
-        crate::plugins::PluginHooks::BEFORE_PROXY | crate::plugins::PluginHooks::AFTER_PROXY
+        crate::plugins::PluginHooks::BEFORE_PROXY
+            | crate::plugins::PluginHooks::AFTER_PROXY
+            | crate::plugins::PluginHooks::ON_RESPONSE_STREAM_TERMINATED
     }
 
     fn supported_protocols(&self) -> &'static [super::ProxyProtocol] {

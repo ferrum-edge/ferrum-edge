@@ -742,7 +742,7 @@ impl Plugin for AiTokenMetrics {
     }
 
     fn lifecycle_hooks(&self) -> crate::plugins::PluginHooks {
-        crate::plugins::PluginHooks::NONE
+        crate::plugins::PluginHooks::ON_RESPONSE_STREAM_TERMINATED
     }
 
     fn supported_protocols(&self) -> &'static [super::ProxyProtocol] {

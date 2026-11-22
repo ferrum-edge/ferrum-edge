@@ -4888,6 +4888,7 @@ impl Plugin for AiTranscriptAudit {
         crate::plugins::PluginHooks::BEFORE_PROXY
             | crate::plugins::PluginHooks::AFTER_PROXY
             | crate::plugins::PluginHooks::LOG
+            | crate::plugins::PluginHooks::ON_RESPONSE_STREAM_TERMINATED
     }
 
     fn supported_protocols(&self) -> &'static [ProxyProtocol] {

@@ -4942,20 +4942,35 @@ async fn a_buffered_collect_reports_the_earlier_protocol_bound_even_when_both_ha
 #[test]
 fn every_streaming_h1h2_upload_installs_the_gateway_owned_pump() {
     // reqwest size-limited, reqwest unlimited, the direct HTTP/1.1 pool
-    // (#5588), HBONE, Unix, mesh mTLS, direct-H2 — plus the two definitions.
+    // (#5588, using the inline-auth variant), HBONE, Unix, mesh mTLS,
+    // direct-H2 — plus the definitions.
     assert_eq!(
         PROXY_SOURCE
             .matches("install_streaming_upload_authorization(")
             .count(),
-        8,
+        7,
         "an H1/H2 streaming upload lost its gateway-owned lifecycle"
+    );
+    assert_eq!(
+        PROXY_SOURCE
+            .matches("install_streaming_upload_authorization_inline_for_direct_h1(")
+            .count(),
+        2,
+        "the direct HTTP/1.1 size-limited upload lost its gateway-owned lifecycle"
     );
     assert_eq!(
         PROXY_SOURCE
             .matches("install_counting_upload_authorization(")
             .count(),
-        3,
-        "the unlimited-size reqwest or direct HTTP/1.1 upload lost its gateway-owned lifecycle"
+        2,
+        "the unlimited-size reqwest upload lost its gateway-owned lifecycle"
+    );
+    assert_eq!(
+        PROXY_SOURCE
+            .matches("install_counting_upload_authorization_inline_for_direct_h1(")
+            .count(),
+        2,
+        "the unlimited-size direct HTTP/1.1 upload lost its gateway-owned lifecycle"
     );
     // Native gRPC keeps its own body type, so it installs the pump directly on
     // the shared upload source rather than through the H1/H2 adapters. An
@@ -5518,11 +5533,11 @@ fn the_precommit_authorization_terminal_is_applied_out_of_line() {
         "fn request_authorization_termination(",
         "\n}\n",
     );
-    assert!(decision.contains("ctx.authorization_termination_latch.observed()"));
+    assert!(decision.contains("ctx.observed_authorization_termination()"));
     assert!(decision.contains("expired_authorization(plan)?"));
     assert!(decision.contains("record_once(elapsed, family)"));
     let observed = decision
-        .find("ctx.authorization_termination_latch.observed()")
+        .find("ctx.observed_authorization_termination()")
         .unwrap();
     let expiry = decision.find("expired_authorization(plan)?").unwrap();
     let record = decision.find("record_once(elapsed, family)").unwrap();

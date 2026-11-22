@@ -21,12 +21,18 @@
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::hash::BuildHasher;
+use std::sync::Arc;
 
 use http::header::{HeaderMap, HeaderName, HeaderValue};
 
 use crate::proxy::hop_limit::{PROXY_HOPS_HEADER, proxy_hops_literal};
 
 static HOST_HEADER_NAME: HeaderName = http::header::HOST;
+static CONSUMER_USERNAME_HEADER: HeaderName = HeaderName::from_static("x-consumer-username");
+static CONSUMER_CUSTOM_ID_HEADER: HeaderName = HeaderName::from_static("x-consumer-custom-id");
+static AUTHENTICATED_IDENTITY_HEADER: HeaderName =
+    HeaderName::from_static("x-authenticated-identity");
+static GEO_COUNTRY_HEADER: HeaderName = HeaderName::from_static("x-geo-country");
 
 /// Single-name request-header lookup shared by the materialized map and the
 /// passthrough view, for helpers that read only a few named fields.
@@ -94,6 +100,14 @@ pub(crate) struct RequestHeaderPassthrough {
     host_backfill: Option<HeaderValue>,
     /// The `X-Ferrum-Hops` count re-asserted before dispatch, once known.
     proxy_hops: Option<u8>,
+    /// Lowercase wire header names stripped by passthrough-safe auth plugins
+    /// (`hide_credentials`, e.g. `apikey`). Shared from `PluginPhaseData`.
+    stripped_headers: Option<Arc<Vec<String>>>,
+    /// Gateway-asserted headers injected at the dispatch boundary
+    /// (`x-consumer-username`, `x-consumer-custom-id`,
+    /// `x-authenticated-identity`, `x-geo-country`). Fixed inline slots so no
+    /// per-request heap `Vec` or `HashMap` is allocated.
+    injected_assertions: [Option<(&'static HeaderName, HeaderValue)>; 4],
 }
 
 impl RequestHeaderPassthrough {
@@ -116,11 +130,55 @@ impl RequestHeaderPassthrough {
         Some(Self {
             host_backfill,
             proxy_hops: None,
+            stripped_headers: None,
+            injected_assertions: [None, None, None, None],
         })
     }
 
     pub(crate) fn set_proxy_hops(&mut self, hops: Option<u8>) {
         self.proxy_hops = hops;
+    }
+
+    pub(crate) fn set_stripped_headers(&mut self, stripped: Arc<Vec<String>>) {
+        if !stripped.is_empty() {
+            self.stripped_headers = Some(stripped);
+        }
+    }
+
+    /// Record gateway-asserted headers (`x-consumer-username`,
+    /// `x-consumer-custom-id`, `x-authenticated-identity`, `x-geo-country`)
+    /// directly in the passthrough overlay. Returns `false` (leaving `self`
+    /// unmodified) if any value is not representable as an unchanged wire
+    /// `HeaderValue`, in which case the caller falls back to materialization.
+    pub(crate) fn try_set_gateway_assertions(
+        &mut self,
+        username: Option<&str>,
+        custom_id: Option<&str>,
+        identity: Option<&str>,
+        geo_country: Option<&str>,
+    ) -> bool {
+        let mut slots: [Option<(&'static HeaderName, HeaderValue)>; 4] = [None, None, None, None];
+        let mut idx = 0usize;
+        let pairs: [(&'static HeaderName, Option<&str>); 4] = [
+            (&CONSUMER_USERNAME_HEADER, username),
+            (&CONSUMER_CUSTOM_ID_HEADER, username.and(custom_id)),
+            (&AUTHENTICATED_IDENTITY_HEADER, identity),
+            (&GEO_COUNTRY_HEADER, geo_country),
+        ];
+        for (name, val) in pairs {
+            if let Some(val) = val {
+                let Ok(header_val) = HeaderValue::from_str(val) else {
+                    return false;
+                };
+                if !value_forwards_unchanged(&header_val) {
+                    return false;
+                }
+                slots[idx] = Some((name, header_val));
+                idx += 1;
+            }
+        }
+        self.injected_assertions = slots;
+        true
     }
 
     pub(crate) fn view<'a>(&'a self, raw: &'a HeaderMap) -> PassthroughRequestHeaders<'a> {
@@ -131,17 +189,30 @@ impl RequestHeaderPassthrough {
                 .as_ref()
                 .filter(|_| !raw.contains_key(http::header::HOST)),
             proxy_hops: self.proxy_hops,
+            stripped_headers: self.stripped_headers.as_deref().map_or(&[], Vec::as_slice),
+            injected_assertions: &self.injected_assertions,
         }
     }
 
-    /// Apply the backfill and hop re-assertion to a map just materialized from
-    /// the same raw block, leaving it identical to the eagerly built map.
+    /// Apply the backfill, hop re-assertion, stripped credentials, and
+    /// gateway-asserted headers to a map just materialized from the same raw
+    /// block, leaving it identical to the eagerly built map.
     pub(crate) fn apply_to_materialized(&self, headers: &mut HashMap<String, String>) {
         if let Some(host) = self.host_backfill.as_ref()
             && !headers.contains_key("host")
             && let Some(text) = wire_text(host)
         {
             headers.insert("host".to_owned(), text.to_owned());
+        }
+        if let Some(stripped) = self.stripped_headers.as_deref() {
+            for name in stripped {
+                headers.remove(name);
+            }
+        }
+        for (name, value) in self.injected_assertions.iter().flatten() {
+            if let Some(text) = wire_text(value) {
+                headers.insert(name.as_str().to_owned(), text.to_owned());
+            }
         }
         crate::proxy::hop_limit::reassert_outbound_proxy_hops_in_map(self.proxy_hops, headers);
     }
@@ -153,9 +224,16 @@ pub(crate) struct PassthroughRequestHeaders<'a> {
     raw: &'a HeaderMap,
     host_backfill: Option<&'a HeaderValue>,
     proxy_hops: Option<u8>,
+    stripped_headers: &'a [String],
+    injected_assertions: &'a [Option<(&'static HeaderName, HeaderValue)>; 4],
 }
 
 impl<'a> PassthroughRequestHeaders<'a> {
+    #[inline]
+    fn is_stripped(self, name: &str) -> bool {
+        !self.stripped_headers.is_empty() && self.stripped_headers.iter().any(|s| s == name)
+    }
+
     fn get(self, name: &str) -> Option<&'a str> {
         // Materialized keys are the lowercase wire names, so a mixed-case
         // lookup misses there; `HeaderMap` would normalize it and hit.
@@ -167,6 +245,14 @@ impl<'a> PassthroughRequestHeaders<'a> {
         {
             return Some(proxy_hops_literal(hops));
         }
+        for (injected_name, injected_value) in self.injected_assertions.iter().flatten() {
+            if injected_name.as_str() == name {
+                return wire_text(injected_value);
+            }
+        }
+        if self.is_stripped(name) {
+            return None;
+        }
         let raw: &'a HeaderMap = self.raw;
         match raw.get(name) {
             Some(value) => wire_text(value),
@@ -177,7 +263,20 @@ impl<'a> PassthroughRequestHeaders<'a> {
 
     fn len(self) -> usize {
         let hops_added = self.proxy_hops.is_some() && !self.raw.contains_key(PROXY_HOPS_HEADER);
-        self.raw.len() + usize::from(self.host_backfill.is_some()) + usize::from(hops_added)
+        let stripped_present = self
+            .stripped_headers
+            .iter()
+            .filter(|name| self.raw.contains_key(name.as_str()))
+            .count();
+        let injected = self
+            .injected_assertions
+            .iter()
+            .filter(|slot| slot.is_some())
+            .count();
+        self.raw.len().saturating_sub(stripped_present)
+            + usize::from(self.host_backfill.is_some() && !self.is_stripped("host"))
+            + usize::from(hops_added)
+            + injected
     }
 
     fn entries(self) -> PassthroughEntries<'a> {
@@ -229,6 +328,9 @@ impl<'a> Iterator for PassthroughEntries<'a> {
     fn next(&mut self) -> Option<Self::Item> {
         if self.tail == 0 {
             for (name, value) in self.raw.by_ref() {
+                if self.view.is_stripped(name.as_str()) {
+                    continue;
+                }
                 let Some(text) = wire_text(value) else {
                     continue;
                 };
@@ -255,7 +357,8 @@ impl<'a> Iterator for PassthroughEntries<'a> {
         }
         if self.tail == 1 {
             self.tail = 2;
-            if let Some(host) = self.view.host_backfill
+            if !self.view.is_stripped("host")
+                && let Some(host) = self.view.host_backfill
                 && let Some(text) = wire_text(host)
             {
                 return Some(RequestHeaderEntry {
@@ -274,6 +377,19 @@ impl<'a> Iterator for PassthroughEntries<'a> {
                     name: PROXY_HOPS_HEADER,
                     value: proxy_hops_literal(hops),
                     wire: None,
+                });
+            }
+        }
+        while self.tail >= 3 && self.tail < 7 {
+            let slot_idx = (self.tail - 3) as usize;
+            self.tail += 1;
+            if let Some((name, value)) = self.view.injected_assertions[slot_idx].as_ref()
+                && let Some(text) = wire_text(value)
+            {
+                return Some(RequestHeaderEntry {
+                    name: name.as_str(),
+                    value: text,
+                    wire: Some((name, value)),
                 });
             }
         }

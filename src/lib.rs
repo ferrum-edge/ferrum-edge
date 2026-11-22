@@ -10258,6 +10258,12 @@ pub mod _test_support {
         .await;
     }
 
+    pub fn plugin_capabilities_for_plugins_for_test(
+        plugins: &[Arc<dyn Plugin>],
+    ) -> crate::PluginCapabilities {
+        crate::plugin_cache::plugin_capabilities_for_plugins_for_test(plugins)
+    }
+
     pub async fn run_after_proxy_hooks_for_test(
         plugins: &[Arc<dyn Plugin>],
         ctx: &mut crate::plugins::RequestContext,
@@ -18789,6 +18795,220 @@ pub mod _test_support {
             eager_outbound,
             view_outbound,
         })
+    }
+
+    /// Drive `raw` through both the eager path and the passthrough lane WITH
+    /// stripped credential headers and gateway-asserted headers (`key_auth`
+    /// passthrough overlay). Returns `None` if either the block is ineligible
+    /// or any gateway-assertion value cannot forward unchanged.
+    #[allow(clippy::too_many_arguments)]
+    pub fn request_header_passthrough_overlay_probe_for_test(
+        raw: http::HeaderMap,
+        authority: Option<&str>,
+        proxy_hops: Option<u8>,
+        stripped_headers: &[&str],
+        username: Option<&str>,
+        custom_id: Option<&str>,
+        identity: Option<&str>,
+        geo_country: Option<&str>,
+        probe_names: &[&str],
+    ) -> Option<RequestHeaderPassthroughProbe> {
+        use crate::proxy::request_headers::{RequestHeaderLookup, RequestHeaders};
+
+        fn new_ctx() -> crate::plugins::RequestContext {
+            crate::plugins::RequestContext::new(
+                "127.0.0.1".to_string(),
+                "GET".to_string(),
+                "/".to_string(),
+            )
+        }
+        fn sorted(map: &http::HeaderMap) -> Vec<(String, Vec<u8>)> {
+            let mut out: Vec<(String, Vec<u8>)> = map
+                .iter()
+                .map(|(name, value)| (name.as_str().to_owned(), value.as_bytes().to_vec()))
+                .collect();
+            out.sort();
+            out
+        }
+
+        let mut eager_ctx = new_ctx();
+        eager_ctx.set_raw_headers(raw.clone());
+        eager_ctx.materialize_headers();
+        let mut eager = std::mem::take(&mut eager_ctx.headers);
+        if !eager.contains_key("host")
+            && let Some(authority) = authority
+        {
+            eager.insert("host".to_string(), authority.to_string());
+        }
+        for name in stripped_headers {
+            eager.remove(*name);
+        }
+        if let Some(u) = username {
+            eager.insert("x-consumer-username".to_string(), u.to_string());
+            if let Some(c) = custom_id {
+                eager.insert("x-consumer-custom-id".to_string(), c.to_string());
+            }
+        }
+        if let Some(id) = identity {
+            eager.insert("x-authenticated-identity".to_string(), id.to_string());
+        }
+        if let Some(geo) = geo_country {
+            eager.insert("x-geo-country".to_string(), geo.to_string());
+        }
+        crate::proxy::hop_limit::reassert_outbound_proxy_hops_in_map(proxy_hops, &mut eager);
+
+        let mut ctx = new_ctx();
+        ctx.set_raw_headers(raw);
+        if !ctx.try_begin_request_header_passthrough(authority) {
+            return None;
+        }
+        ctx.set_request_header_passthrough_proxy_hops(proxy_hops);
+        if !stripped_headers.is_empty() {
+            ctx.set_request_header_passthrough_stripped_headers(std::sync::Arc::new(
+                stripped_headers.iter().map(|s| (*s).to_string()).collect(),
+            ));
+        }
+        if !ctx.try_set_request_header_passthrough_gateway_assertions(
+            username,
+            custom_id,
+            identity,
+            geo_country,
+        ) {
+            return None;
+        }
+        let view = ctx.request_headers_view(None);
+        let view_map = view.to_map().into_owned();
+        let lookups_match = eager
+            .keys()
+            .map(String::as_str)
+            .chain(stripped_headers.iter().copied())
+            .chain(probe_names.iter().copied())
+            .all(|name| {
+                let expected = eager.get(name).map(String::as_str);
+                view.get(name) == expected
+                    && view.request_header(name) == expected
+                    && ctx.effective_request_header(name) == expected
+            });
+        let len_matches = view.len() == eager.len() && view.entries().count() == eager.len();
+        let connection_listed_matches = view.connection_listed()
+            == crate::proxy::headers::parse_connection_listed_from_str_map(&eager);
+        let eager_outbound = sorted(&crate::proxy::outbound_request_headers_for_test(
+            RequestHeaders::Materialized(&eager),
+        ));
+        let view_outbound = sorted(&crate::proxy::outbound_request_headers_for_test(view));
+        ctx.end_request_header_passthrough();
+        Some(RequestHeaderPassthroughProbe {
+            eager,
+            view_map,
+            rematerialized: ctx.headers.clone(),
+            lookups_match,
+            len_matches,
+            connection_listed_matches,
+            eager_outbound,
+            view_outbound,
+        })
+    }
+
+    /// Sorted wire `(lowercase-name, raw-bytes)` pairs used by header-parity tests.
+    pub type WireHeaderList = Vec<(String, Vec<u8>)>;
+
+    /// Compare the deferred `HeaderMap` streaming response-header lane against
+    /// the materialized `HashMap` round-trip. Returns `None` when
+    /// `response_headers_passthrough_eligible` rejects `raw`.
+    pub fn response_header_passthrough_parity_for_test(
+        raw: http::HeaderMap,
+        status: u16,
+        via: Option<&str>,
+        alt_svc: Option<&str>,
+    ) -> Option<(WireHeaderList, WireHeaderList)> {
+        use crate::proxy::headers::{
+            ClientResponseFraming, apply_sanitized_response_headers,
+            response_headers_passthrough_eligible, sanitize_client_response_header_map_for_wire,
+            strip_gateway_owned_diagnostic_response_headers,
+        };
+
+        if !response_headers_passthrough_eligible(&raw) {
+            return None;
+        }
+
+        fn sorted(map: &http::HeaderMap) -> Vec<(String, Vec<u8>)> {
+            let mut out: Vec<(String, Vec<u8>)> = map
+                .iter()
+                .map(|(name, value)| (name.as_str().to_owned(), value.as_bytes().to_vec()))
+                .collect();
+            out.sort();
+            out
+        }
+
+        let framing = ClientResponseFraming::Streaming;
+
+        let mut map = std::collections::HashMap::new();
+        crate::proxy::collect_hyper_response_headers(&raw, &mut map);
+        strip_gateway_owned_diagnostic_response_headers(&mut map);
+        let mut builder = http::Response::builder().status(status);
+        builder = apply_sanitized_response_headers(builder, &mut map, framing);
+        if let Some(alt_svc) = alt_svc
+            && let Ok(value) = http::HeaderValue::from_str(alt_svc)
+        {
+            builder = builder.header(http::header::ALT_SVC, value);
+        }
+        if let Some(via) = via
+            && let Ok(value) = http::HeaderValue::from_str(via)
+        {
+            builder = builder.header(http::header::VIA, value);
+        }
+        let materialized_resp = builder
+            .body(())
+            .expect("materialized response builder must succeed");
+
+        let mut deferred = raw;
+        sanitize_client_response_header_map_for_wire(&mut deferred, framing);
+        if let Some(alt_svc) = alt_svc
+            && let Ok(value) = http::HeaderValue::from_str(alt_svc)
+        {
+            deferred.append(http::header::ALT_SVC, value);
+        }
+        if let Some(via) = via
+            && let Ok(value) = http::HeaderValue::from_str(via)
+        {
+            deferred.append(http::header::VIA, value);
+        }
+
+        Some((sorted(materialized_resp.headers()), sorted(&deferred)))
+    }
+
+    /// Compare `preserved_response_content_length` (materialized map) against
+    /// `preserved_response_content_length_from_header_map` (deferred lane) for
+    /// the same backend header block and status.
+    pub fn preserved_response_content_length_parity_for_test(
+        raw: http::HeaderMap,
+        status: u16,
+    ) -> (Option<u64>, Option<u64>) {
+        let mut map = std::collections::HashMap::new();
+        crate::proxy::collect_hyper_response_headers(&raw, &mut map);
+        let materialized = crate::proxy::headers::preserved_response_content_length(&map, status);
+        let deferred =
+            crate::proxy::headers::preserved_response_content_length_from_header_map(&raw, status);
+        (materialized, deferred)
+    }
+
+    /// Prove that cloning a `RequestContext` before its lazy
+    /// `StreamAuthTerminationLatch` is initialized still shares the exact same
+    /// underlying `Arc`-backed handle.
+    pub fn cloned_request_context_shares_lazy_auth_latch_for_test() -> bool {
+        use crate::proxy::auth_lifetime::{StreamAuthProtocolFamily, StreamAuthTermination};
+
+        let ctx = crate::plugins::RequestContext::new(
+            "127.0.0.1".to_string(),
+            "GET".to_string(),
+            "/".to_string(),
+        );
+        let cloned = ctx.clone();
+        let _ = cloned.authorization_termination_latch().record_once(
+            StreamAuthTermination::CredentialExpired,
+            StreamAuthProtocolFamily::Http,
+        );
+        ctx.observed_authorization_termination() == Some(StreamAuthTermination::CredentialExpired)
     }
 
     /// Canonical declared `Content-Length` from a comma-folded header map.
