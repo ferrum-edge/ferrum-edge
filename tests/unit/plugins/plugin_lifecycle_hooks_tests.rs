@@ -34,17 +34,39 @@ const GATED_HOOKS: &[(&str, &str)] = &[
     ("on_request_received", "ON_REQUEST_RECEIVED"),
     ("before_proxy", "BEFORE_PROXY"),
     ("after_proxy", "AFTER_PROXY"),
+    ("observe_origin_http_response_status", "AFTER_PROXY"),
+    ("enforces_origin_response_header_policy", "AFTER_PROXY"),
+    ("on_final_response_headers", "AFTER_PROXY"),
+    (
+        "enforces_final_client_visible_response_headers",
+        "AFTER_PROXY",
+    ),
+    ("finalize_client_visible_response_headers", "AFTER_PROXY"),
+    (
+        "participates_in_route_response_header_finalization",
+        "AFTER_PROXY",
+    ),
+    ("may_enforce_response_body_policy", "AFTER_PROXY"),
     ("log", "LOG"),
     ("log_with_mesh_key", "LOG"),
+    (
+        "on_response_stream_terminated",
+        "ON_RESPONSE_STREAM_TERMINATED",
+    ),
 ];
 
-const ALL_FLAGS: &[&str] = &["ON_REQUEST_RECEIVED", "BEFORE_PROXY", "AFTER_PROXY", "LOG"];
+const ALL_FLAGS: &[&str] = &[
+    "ON_REQUEST_RECEIVED",
+    "BEFORE_PROXY",
+    "AFTER_PROXY",
+    "LOG",
+    "ON_RESPONSE_STREAM_TERMINATED",
+];
 
-/// Registered built-ins whose implementation overrides all four hooks, so a
+/// Registered built-ins whose implementation overrides every gated hook, so a
 /// runtime `PluginHooks::ALL` is their exact declaration rather than a
 /// missing one.
-const BUILTINS_IMPLEMENTING_EVERY_GATED_HOOK: &[&str] =
-    &["otel_tracing", "transaction_debugger", "workload_metrics"];
+const BUILTINS_IMPLEMENTING_EVERY_GATED_HOOK: &[&str] = &[];
 
 struct PluginImplBlock {
     label: String,
@@ -371,6 +393,7 @@ fn a_plugin_without_a_declaration_keeps_every_hook() {
         PluginHooks::BEFORE_PROXY,
         PluginHooks::AFTER_PROXY,
         PluginHooks::LOG,
+        PluginHooks::ON_RESPONSE_STREAM_TERMINATED,
     ] {
         assert!(PluginHooks::ALL.contains(flag));
         assert!(!PluginHooks::NONE.contains(flag));

@@ -2454,6 +2454,41 @@ impl From<&RequestContext> for HboneReuseContext {
     }
 }
 
+/// Lazily-allocated shared handle (`OnceLock<T>`).
+///
+/// Hot-path requests that never touch an `Arc`-backed latch pay zero heap
+/// allocations, while cloning initializes the cell on `&self` first so both
+/// the original and every clone share the exact same handle (preserving
+/// `T::clone` sharing semantics).
+#[derive(Debug)]
+pub(crate) struct LazyShared<T>(std::sync::OnceLock<T>);
+
+impl<T> LazyShared<T> {
+    #[inline]
+    pub(crate) const fn new() -> Self {
+        Self(std::sync::OnceLock::new())
+    }
+
+    #[inline]
+    pub(crate) fn get(&self) -> Option<&T> {
+        self.0.get()
+    }
+
+    #[inline]
+    pub(crate) fn get_or_init(&self, f: impl FnOnce() -> T) -> &T {
+        self.0.get_or_init(f)
+    }
+}
+
+impl<T: Clone + Default> Clone for LazyShared<T> {
+    fn clone(&self) -> Self {
+        let value = self.0.get_or_init(T::default).clone();
+        let out = std::sync::OnceLock::new();
+        let _ = out.set(value);
+        Self(out)
+    }
+}
+
 /// Context passed through the plugin pipeline for a single request.
 ///
 /// Headers and query parameters are lazily materialized to avoid per-request
@@ -2673,7 +2708,7 @@ pub struct RequestContext {
     /// request path reads it back to decide the pre-commitment terminal.
     /// Carries the bounded class only, never credential material.
     pub(crate) authorization_termination_latch:
-        crate::proxy::auth_lifetime::StreamAuthTerminationLatch,
+        LazyShared<crate::proxy::auth_lifetime::StreamAuthTerminationLatch>,
     /// Transport-level close signal for the client connection this request
     /// arrived on (issue #3815).
     ///
@@ -4838,8 +4873,7 @@ impl RequestContext {
             auth_method: None,
             credential_deadline_at: None,
             authorization_termination: None,
-            authorization_termination_latch:
-                crate::proxy::auth_lifetime::StreamAuthTerminationLatch::default(),
+            authorization_termination_latch: LazyShared::new(),
             authorization_connection_closer: None,
             websocket_shutdown_rx: None,
             client_trust_session: None,
@@ -4950,7 +4984,8 @@ impl RequestContext {
             peer_spiffe_certificate_principal: false,
             plugin_http_call_ns: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             reject_hook_execution_ns: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            proven_client_upload_abort: Default::default(),
+            proven_client_upload_abort: crate::proxy::upload_pump::ProvenClientUploadAbort::default(
+            ),
             mirror_result_rxs: Vec::new(),
             request_mirror_admissions: request_mirror::RequestMirrorAdmissions::default(),
             hmac_prebuffer_state: hmac_auth::HmacPrebufferState::default(),
@@ -5360,9 +5395,22 @@ impl RequestContext {
     ) -> bool {
         let won = self
             .authorization_termination_latch
+            .get_or_init(crate::proxy::auth_lifetime::StreamAuthTerminationLatch::default)
             .record_once(termination, family);
         self.latch_authorization_termination(termination);
         won
+    }
+
+    /// Observe whether an authorization termination has already been recorded on
+    /// this request's latch without allocating a latch on unauthenticated
+    /// requests.
+    #[inline]
+    pub(crate) fn observed_authorization_termination(
+        &self,
+    ) -> Option<crate::proxy::auth_lifetime::StreamAuthTermination> {
+        self.authorization_termination_latch
+            .get()
+            .and_then(crate::proxy::auth_lifetime::StreamAuthTerminationLatch::observed)
     }
 
     /// Clone this request's shared authorization-lifetime termination latch for
@@ -5370,7 +5418,9 @@ impl RequestContext {
     pub(crate) fn authorization_termination_latch(
         &self,
     ) -> crate::proxy::auth_lifetime::StreamAuthTerminationLatch {
-        self.authorization_termination_latch.clone()
+        self.authorization_termination_latch
+            .get_or_init(crate::proxy::auth_lifetime::StreamAuthTerminationLatch::default)
+            .clone()
     }
 
     /// Record that a dispatcher proved the client abandoned its upload before
@@ -5383,6 +5433,7 @@ impl RequestContext {
     /// backend response head (issue #6776). Not derived from the
     /// `ClientDisconnect` class, which authorization and client-deadline
     /// terminals also carry.
+    #[inline]
     pub(crate) fn proven_client_upload_abort(&self) -> bool {
         self.proven_client_upload_abort.observed()
     }
@@ -7668,6 +7719,57 @@ impl RequestContext {
     pub(crate) fn set_request_header_passthrough_proxy_hops(&mut self, hops: Option<u8>) {
         if let Some(passthrough) = self.request_header_passthrough.as_mut() {
             passthrough.set_proxy_hops(hops);
+        }
+    }
+
+    /// Record wire credential header names stripped by passthrough-safe auth
+    /// plugins (`hide_credentials`) on a passthrough request.
+    #[inline]
+    pub(crate) fn set_request_header_passthrough_stripped_headers(
+        &mut self,
+        stripped: Arc<Vec<String>>,
+    ) {
+        if let Some(passthrough) = self.request_header_passthrough.as_mut() {
+            passthrough.set_stripped_headers(stripped);
+        }
+    }
+
+    #[inline]
+    pub(crate) fn try_set_request_header_passthrough_gateway_assertions(
+        &mut self,
+        username: Option<&str>,
+        custom_id: Option<&str>,
+        identity: Option<&str>,
+        geo_country: Option<&str>,
+    ) -> bool {
+        match self.request_header_passthrough.as_mut() {
+            Some(passthrough) => {
+                passthrough.try_set_gateway_assertions(username, custom_id, identity, geo_country)
+            }
+            None => false,
+        }
+    }
+
+    /// Apply gateway-asserted headers (`x-consumer-username`,
+    /// `x-consumer-custom-id`, `x-authenticated-identity`, `x-geo-country`)
+    /// directly onto the active passthrough overlay without materializing
+    /// `ctx.headers`. Returns `false` if any value is not representable as an
+    /// unchanged wire `HeaderValue`, signaling the caller to fall back to
+    /// `end_request_header_passthrough()`.
+    #[inline]
+    pub(crate) fn try_apply_request_header_passthrough_gateway_assertions(&mut self) -> bool {
+        let username = self.backend_consumer_username().map(str::to_owned);
+        let custom_id = self.backend_consumer_custom_id().map(str::to_owned);
+        let identity = self.backend_authenticated_identity().map(str::to_owned);
+        let geo_country = self.backend_geo_country().map(str::to_owned);
+        match self.request_header_passthrough.as_mut() {
+            Some(passthrough) => passthrough.try_set_gateway_assertions(
+                username.as_deref(),
+                custom_id.as_deref(),
+                identity.as_deref(),
+                geo_country.as_deref(),
+            ),
+            None => false,
         }
     }
 
@@ -11748,9 +11850,15 @@ impl PluginHooks {
     /// [`Plugin::log`] or [`Plugin::log_with_mesh_key`] (whose default calls
     /// `log`).
     pub const LOG: Self = Self(1 << 3);
+    /// [`Plugin::on_response_stream_terminated`].
+    pub const ON_RESPONSE_STREAM_TERMINATED: Self = Self(1 << 4);
     /// Every hook: the default for custom and undeclared plugins.
     pub const ALL: Self = Self(
-        Self::ON_REQUEST_RECEIVED.0 | Self::BEFORE_PROXY.0 | Self::AFTER_PROXY.0 | Self::LOG.0,
+        Self::ON_REQUEST_RECEIVED.0
+            | Self::BEFORE_PROXY.0
+            | Self::AFTER_PROXY.0
+            | Self::LOG.0
+            | Self::ON_RESPONSE_STREAM_TERMINATED.0,
     );
 
     /// The union of two declarations, usable in `const` context.
@@ -12092,6 +12200,17 @@ pub trait Plugin: Any + Send + Sync {
     /// `authenticate`, `authorize`, or the pre-`before_proxy` body
     /// normalization must be declared too (issue #6008).
     fn modifies_request_headers(&self) -> bool {
+        false
+    }
+
+    /// Returns `true` when this built-in plugin never reads `ctx.headers`
+    /// (inspecting `ctx.raw_headers` instead), does not mutate query
+    /// parameters, never rejects in `before_proxy`, and its only `before_proxy`
+    /// header mutation (when `modifies_request_headers()` is `true`) is
+    /// stripping `request_headers_to_redact()`. `PluginCache` only honors this
+    /// elision for registered built-in `key_auth`; custom plugins always run
+    /// `before_proxy` on the materialized path.
+    fn supports_request_header_passthrough(&self) -> bool {
         false
     }
 
@@ -13113,7 +13232,9 @@ pub trait Plugin: Any + Send + Sync {
     ///
     /// Proxy core records the status on [`RequestContext`] as private typed
     /// provenance and then invokes this hook for every plugin in configured
-    /// order. Default is a no-op. Plugins whose success-boundary side effects
+    /// order during the `after_proxy` phase (plugins overriding this must
+    /// declare [`PluginHooks::AFTER_PROXY`] in [`Self::lifecycle_hooks`]).
+    /// Default is a no-op. Plugins whose success-boundary side effects
     /// must not depend on later hooks presenting the origin status to the
     /// client (for example cache invalidation) override this.
     fn observe_origin_http_response_status(&self, _ctx: &mut RequestContext, _status: u16) {}
@@ -13121,7 +13242,9 @@ pub trait Plugin: Any + Send + Sync {
     /// Returns `true` when this plugin bounds what the ORIGIN contributed to the
     /// response header map for this request.
     ///
-    /// Checked once per response before the first `after_proxy` hook runs, so a
+    /// Checked once per response before the first `after_proxy` hook runs
+    /// (plugins overriding this must declare [`PluginHooks::AFTER_PROXY`] in
+    /// [`Self::lifecycle_hooks`]), so a
     /// plugin that repointed the request at a third-party destination can reduce
     /// that destination's metadata without also discarding gateway decorations
     /// (CORS, tracing, correlation, rate-limit headers) that later hooks add.

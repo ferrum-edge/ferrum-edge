@@ -1717,6 +1717,13 @@ impl Plugin for PluginInstanceWrapper {
     fn modifies_request_headers(&self) -> bool {
         self.inner.modifies_request_headers()
     }
+    fn supports_request_header_passthrough(&self) -> bool {
+        if self.trigger.is_some() {
+            false
+        } else {
+            self.inner.supports_request_header_passthrough()
+        }
+    }
     fn participates_in_route_request_header_finalization(&self) -> bool {
         self.inner
             .participates_in_route_request_header_finalization()
@@ -5997,6 +6004,32 @@ impl PluginCapabilities {
     /// (issue #6793). Set only when proven, so a view built without consulting
     /// its plugins, or from an empty plugin list, keeps the eager projection.
     pub const MESH_LABEL_PROJECTION_DEFERRABLE: u32 = 1 << 22;
+    /// At least one plugin in the view declares `PluginHooks::ON_REQUEST_RECEIVED`.
+    pub const HAS_ON_REQUEST_RECEIVED_HOOK: u32 = 1 << 23;
+    /// At least one plugin in the view declares `PluginHooks::BEFORE_PROXY`.
+    pub const HAS_BEFORE_PROXY_HOOK: u32 = 1 << 24;
+    /// At least one plugin in the view may participate in `run_after_proxy_hooks`
+    /// (`PluginHooks::AFTER_PROXY`, route response-header finalization, or any
+    /// non-built-in/custom plugin, which may override auxiliary response-header
+    /// trait hooks such as `enforces_final_client_visible_response_headers` or
+    /// `on_final_response_headers` without declaring `PluginHooks::AFTER_PROXY`).
+    pub const HAS_AFTER_PROXY_HOOK: u32 = 1 << 25;
+    /// At least one plugin in the view consumes a terminal `TransactionSummary`
+    /// or response-stream completion (`PluginHooks::LOG`,
+    /// `PluginHooks::ON_RESPONSE_STREAM_TERMINATED`,
+    /// `requires_response_stream_hooks()`, `uses_mesh_request_key()`, or any
+    /// non-built-in/custom plugin, which may override
+    /// `on_response_stream_terminated` without declaring the new hook bit).
+    /// When unset (e.g. a built-in `key_auth`-only chain), the request path
+    /// uses the compact runtime-metrics terminal instead of building a full
+    /// `TransactionSummary` and spawning a deferred logging task.
+    pub const HAS_TERMINAL_SUMMARY_CONSUMER: u32 = 1 << 26;
+    /// Every plugin in a non-empty view supports `RequestHeaderPassthrough`
+    /// (reads `ctx.raw_headers`, performs no query/body/response/logging hooks,
+    /// and its only `before_proxy` mutation is stripping declared credential
+    /// header names), allowing authenticated chains like header-only `key_auth`
+    /// to avoid materializing and cloning `HashMap<String, String>`.
+    pub const SUPPORTS_REQUEST_HEADER_PASSTHROUGH: u32 = 1 << 27;
 
     // Bit 31 is the LAST bit of the `u32` backing store. A thirty-third flag
     // must widen `PluginCapabilities` (to `u64`) rather than shift further;
@@ -6041,6 +6074,9 @@ pub struct PluginPhaseData {
     pub backend_path_plugins: Arc<Vec<Arc<dyn Plugin>>>,
     /// Credential-bearing request header names used by safe downstream views.
     pub request_headers_to_redact: Arc<Vec<String>>,
+    /// Lowercase wire header names stripped by passthrough-safe auth plugins
+    /// (`hide_credentials`) when `SUPPORTS_REQUEST_HEADER_PASSTHROUGH` is set.
+    pub passthrough_strip_request_headers: Arc<Vec<String>>,
     /// Route-configured names every late request-trailer boundary strips:
     /// the credential locations above plus every request header a plugin on
     /// the route owns as a gateway assertion
@@ -6126,6 +6162,14 @@ pub struct PluginPhaseData {
     pub response_presentation_policy_digest: Option<[u8; 32]>,
 }
 
+/// Test-only helper exposing the precomputed `PluginCapabilities` for an
+/// arbitrary plugin slice (including custom test plugins).
+pub(crate) fn plugin_capabilities_for_plugins_for_test(
+    plugins: &[Arc<dyn Plugin>],
+) -> PluginCapabilities {
+    build_phase_data(plugins).capabilities
+}
+
 /// Build `PluginPhaseData` from a protocol-filtered plugin list.
 fn build_phase_data(plugins: &[Arc<dyn Plugin>]) -> PluginPhaseData {
     let mut caps = 0u32;
@@ -6135,6 +6179,8 @@ fn build_phase_data(plugins: &[Arc<dyn Plugin>]) -> PluginPhaseData {
     let mut backend_admission = Vec::new();
     let mut backend_path = Vec::new();
     let mut request_headers_to_redact = Vec::new();
+    let mut passthrough_strip_request_headers: Vec<String> = Vec::new();
+    let mut supports_request_header_passthrough = !plugins.is_empty();
     let mut owned_request_assertion_headers: Vec<String> = Vec::new();
     let mut initial_response_header_policy_plugins = Vec::new();
     let mut initial_response_header_policy_names = Vec::new();
@@ -6290,6 +6336,27 @@ fn build_phase_data(plugins: &[Arc<dyn Plugin>]) -> PluginPhaseData {
         }
         if p.requires_response_stream_hooks() {
             caps |= PluginCapabilities::HAS_RESPONSE_STREAM_HOOKS;
+            caps |= PluginCapabilities::HAS_TERMINAL_SUMMARY_CONSUMER;
+        }
+        let hooks = p.lifecycle_hooks();
+        if hooks.contains(crate::plugins::PluginHooks::ON_REQUEST_RECEIVED) {
+            caps |= PluginCapabilities::HAS_ON_REQUEST_RECEIVED_HOOK;
+        }
+        if hooks.contains(crate::plugins::PluginHooks::BEFORE_PROXY) {
+            caps |= PluginCapabilities::HAS_BEFORE_PROXY_HOOK;
+        }
+        if hooks.contains(crate::plugins::PluginHooks::AFTER_PROXY)
+            || p.participates_in_route_response_header_finalization()
+            || !crate::plugins::is_builtin_plugin(p.as_ref())
+        {
+            caps |= PluginCapabilities::HAS_AFTER_PROXY_HOOK;
+        }
+        if hooks.contains(crate::plugins::PluginHooks::LOG)
+            || hooks.contains(crate::plugins::PluginHooks::ON_RESPONSE_STREAM_TERMINATED)
+            || p.uses_mesh_request_key()
+            || !crate::plugins::is_builtin_plugin(p.as_ref())
+        {
+            caps |= PluginCapabilities::HAS_TERMINAL_SUMMARY_CONSUMER;
         }
         if p.answers_cors_preflights() {
             caps |= PluginCapabilities::ANSWERS_CORS_PREFLIGHTS;
@@ -6301,6 +6368,21 @@ fn build_phase_data(plugins: &[Arc<dyn Plugin>]) -> PluginPhaseData {
         // Multiple instances (and a global plus a proxy-scoped instance) compose
         // to their minimum; a zero/disabled instance contributes nothing rather
         // than relaxing a sibling's active bound (`GHSA-xrfj-852f-645j`).
+        // Only registered built-in `key_auth` instances may elide `before_proxy`
+        // into the passthrough strip overlay; custom plugins (including an
+        // impostor reporting `name() == "key_auth"`) always stay on the
+        // materialized path so their `before_proxy` rejections can never be
+        // skipped.
+        if !(is_builtin_named(p, "key_auth") && p.supports_request_header_passthrough()) {
+            supports_request_header_passthrough = false;
+        } else if p.modifies_request_headers() {
+            for name in p.request_headers_to_redact() {
+                let lower = name.to_ascii_lowercase();
+                if !passthrough_strip_request_headers.contains(&lower) {
+                    passthrough_strip_request_headers.push(lower);
+                }
+            }
+        }
         if let Some(limit) = p.enforced_request_body_limit().filter(|limit| *limit > 0) {
             enforced_request_body_limit =
                 Some(enforced_request_body_limit.map_or(limit, |current: u64| current.min(limit)));
@@ -6318,6 +6400,35 @@ fn build_phase_data(plugins: &[Arc<dyn Plugin>]) -> PluginPhaseData {
         // policy pass, which every H1/H2 and H3 ladder runs at each point the
         // outbound map is complete.
         caps |= PluginCapabilities::ENFORCES_FINAL_BACKEND_HEADER_POLICY;
+    }
+    let passthrough_blocked_caps = PluginCapabilities::MODIFIES_REQUEST_BODY
+        | PluginCapabilities::HAS_BODY_BEFORE_BEFORE_PROXY
+        | PluginCapabilities::HAS_BODY_BEFORE_AUTHENTICATE
+        | PluginCapabilities::NEEDS_FINAL_REQUEST_BODY_CONTEXT
+        | PluginCapabilities::HAS_RESPONSE_COMMITTED_HOOK
+        | PluginCapabilities::HAS_RESPONSE_STREAM_HOOKS
+        | PluginCapabilities::HAS_BODY_BEFORE_AUTHORIZE
+        | PluginCapabilities::HAS_BACKEND_PATH_PLUGINS
+        | PluginCapabilities::HAS_DEFERRED_ROUTING_HEADER_HOOKS
+        | PluginCapabilities::FINAL_BODY_BEFORE_BACKEND_DISPATCH
+        | PluginCapabilities::NORMALIZES_BUFFERED_REQUEST_BODY_BEFORE_BEFORE_PROXY
+        | PluginCapabilities::DISPATCHES_FINALIZED_REQUEST_EGRESS
+        | PluginCapabilities::ENFORCES_FINAL_BACKEND_HEADER_POLICY
+        | PluginCapabilities::HAS_QUERY_READING_TRIGGER
+        | PluginCapabilities::HAS_ON_REQUEST_RECEIVED_HOOK
+        | PluginCapabilities::HAS_AFTER_PROXY_HOOK
+        | PluginCapabilities::HAS_TERMINAL_SUMMARY_CONSUMER;
+    if supports_request_header_passthrough
+        && (caps & passthrough_blocked_caps) == 0
+        && authorize.is_empty()
+        && backend_admission.is_empty()
+        && backend_path.is_empty()
+        && grpc_deadline.is_empty()
+        && initial_response_header_policy_plugins.is_empty()
+    {
+        caps |= PluginCapabilities::SUPPORTS_REQUEST_HEADER_PASSTHROUGH;
+    } else {
+        passthrough_strip_request_headers.clear();
     }
     let mut request_trailer_strip_headers = request_headers_to_redact.clone();
     for header in &owned_request_assertion_headers {
@@ -6337,6 +6448,7 @@ fn build_phase_data(plugins: &[Arc<dyn Plugin>]) -> PluginPhaseData {
         backend_admission_plugins: Arc::new(backend_admission),
         backend_path_plugins: Arc::new(backend_path),
         request_headers_to_redact: Arc::new(request_headers_to_redact),
+        passthrough_strip_request_headers: Arc::new(passthrough_strip_request_headers),
         request_trailer_strip_headers: Arc::new(request_trailer_strip_headers),
         owned_request_assertion_headers: Arc::new(owned_request_assertion_headers),
         initial_response_header_policy_plugins: Arc::new(initial_response_header_policy_plugins),
@@ -6512,6 +6624,7 @@ impl ProtocolEntry {
                     backend_admission_plugins: Arc::new(Vec::new()),
                     backend_path_plugins: Arc::new(Vec::new()),
                     request_headers_to_redact: Arc::new(Vec::new()),
+                    passthrough_strip_request_headers: Arc::new(Vec::new()),
                     request_trailer_strip_headers: Arc::new(Vec::new()),
                     owned_request_assertion_headers: Arc::new(Vec::new()),
                     initial_response_header_policy_plugins: Arc::new(Vec::new()),
@@ -7760,6 +7873,10 @@ impl PluginCacheRequestView {
     /// streaming HTTP/2 arm). One `Arc` bump, no per-request allocation.
     pub fn response_trailer_policy_names_shared(&self) -> Arc<Vec<String>> {
         Arc::clone(&self.entry.phase.response_trailer_policy_names)
+    }
+
+    pub fn passthrough_strip_request_headers_shared(&self) -> Arc<Vec<String>> {
+        Arc::clone(&self.entry.phase.passthrough_strip_request_headers)
     }
 
     /// Case-insensitive ASCII prefixes whose response-header policy also binds

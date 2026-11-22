@@ -1803,7 +1803,7 @@ fn canonical_content_length_matches(value: &str, expected: u64) -> bool {
 /// that says "omitted" paired with a framing repair that says "body allowed"
 /// preserves exactly the plugin-authored length this boundary exists to remove.
 #[inline]
-fn status_forbids_response_body(status: u16) -> bool {
+pub(crate) fn status_forbids_response_body(status: u16) -> bool {
     crate::plugins::utils::synthetic_response::status_forbids_response_body(status)
 }
 
@@ -1966,6 +1966,29 @@ pub fn preserved_response_content_length(
         found = trimmed.parse::<u64>().ok();
     }
     found
+}
+
+/// `http::HeaderMap` counterpart to [`preserved_response_content_length`] for
+/// the deferred streaming response-header lane. Applies the exact same
+/// single-header, `is_wire_valid_content_length` predicate so comma-folded
+/// values (`"42, 42"`), signed values, or duplicates return `None` identically.
+pub(crate) fn preserved_response_content_length_from_header_map(
+    headers: &http::HeaderMap,
+    status: u16,
+) -> Option<u64> {
+    if status_forbids_response_body(status) {
+        return None;
+    }
+    let mut iter = headers.get_all(http::header::CONTENT_LENGTH).iter();
+    let first = iter.next()?;
+    if iter.next().is_some() {
+        return None;
+    }
+    let trimmed = first.to_str().ok()?.trim();
+    if !is_wire_valid_content_length(trimmed) {
+        return None;
+    }
+    trimmed.parse::<u64>().ok()
 }
 
 fn set_content_length_header(headers: &mut std::collections::HashMap<String, String>, len: u64) {
@@ -2545,6 +2568,111 @@ pub fn apply_sanitized_response_headers(
 ) -> http::response::Builder {
     sanitize_client_response_headers_for_wire(headers, framing);
     apply_response_headers(builder, headers)
+}
+
+/// Whether a backend `http::HeaderMap` can bypass the `HashMap<String, String>`
+/// round-trip on the streaming response-header passthrough path with 1:1 wire
+/// parity: every header name occurs once (or is `set-cookie`) and every value
+/// is visible ASCII/HTAB that `HeaderValue::from_str` accepts unchanged.
+#[inline]
+pub(crate) fn response_headers_passthrough_eligible(headers: &http::HeaderMap) -> bool {
+    if headers.contains_key(http::header::CONNECTION) {
+        // Any Connection nomination beyond `keep-alive` / `close` can strip
+        // fields (`content-length`, `content-type`, custom headers) during
+        // collection before the rest of the response pipeline inspects them;
+        // materialize so header lookups stay 1:1 with the standard path.
+        for value in headers.get_all(http::header::CONNECTION) {
+            let Ok(text) = value.to_str() else {
+                return false;
+            };
+            for token in text.split(',') {
+                let trimmed = token.trim();
+                if !trimmed.is_empty()
+                    && !trimmed.eq_ignore_ascii_case("keep-alive")
+                    && !trimmed.eq_ignore_ascii_case("close")
+                {
+                    return false;
+                }
+            }
+        }
+    }
+    let unique_or_set_cookie = headers.len() == headers.keys_len()
+        || headers.keys().all(|name| {
+            name == http::header::SET_COOKIE || headers.get_all(name).iter().nth(1).is_none()
+        });
+    unique_or_set_cookie
+        && headers.values().all(|value| {
+            value
+                .as_bytes()
+                .iter()
+                .all(|&b| b == b'\t' || (0x20..0x7f).contains(&b))
+        })
+}
+
+/// In-place `http::HeaderMap` counterpart to
+/// `strip_gateway_owned_diagnostic_response_headers` +
+/// `sanitize_client_response_headers_for_wire` for the streaming
+/// response-header passthrough path.
+///
+/// `http::HeaderMap` already normalizes header names to lowercase ASCII, so
+/// removing each closed-set name is O(1) with zero heap allocations on the
+/// common path.
+pub(crate) fn sanitize_client_response_header_map_for_wire(
+    headers: &mut http::HeaderMap,
+    framing: ClientResponseFraming,
+) {
+    if headers.contains_key(http::header::CONNECTION) {
+        let listed = parse_connection_listed_headers(headers);
+        for name in listed {
+            headers.remove(name);
+        }
+    }
+    const STATIC_STRIP_NAMES: [http::HeaderName; 11] = [
+        http::header::CONNECTION,
+        http::HeaderName::from_static("keep-alive"),
+        http::header::PROXY_AUTHENTICATE,
+        http::HeaderName::from_static("proxy-connection"),
+        http::header::TE,
+        http::header::TRAILER,
+        http::header::TRANSFER_ENCODING,
+        http::header::UPGRADE,
+        http::HeaderName::from_static("x-gateway-error"),
+        http::HeaderName::from_static("x-gateway-upstream-status"),
+        http::HeaderName::from_static("x-ferrum-diagnostic-ref"),
+    ];
+    for name in &STATIC_STRIP_NAMES {
+        headers.remove(name);
+    }
+    if headers
+        .keys()
+        .any(|name| is_internal_response_control_header(name.as_str()))
+    {
+        let internal: Vec<http::HeaderName> = headers
+            .keys()
+            .filter(|name| is_internal_response_control_header(name.as_str()))
+            .cloned()
+            .collect();
+        for name in internal {
+            headers.remove(name);
+        }
+    }
+    match framing {
+        ClientResponseFraming::ExactBody { status, len } => {
+            if status_forbids_response_body(status) {
+                headers.remove(http::header::CONTENT_LENGTH);
+            } else if let Ok(val) = http::HeaderValue::from_str(&len.to_string()) {
+                headers.insert(http::header::CONTENT_LENGTH, val);
+            }
+        }
+        ClientResponseFraming::Head { status } => {
+            if status_forbids_response_body(status) {
+                headers.remove(http::header::CONTENT_LENGTH);
+            }
+        }
+        ClientResponseFraming::Streaming | ClientResponseFraming::TrailersOnly => {
+            headers.remove(http::header::CONTENT_LENGTH);
+        }
+    }
 }
 
 /// Append a cookie to the proxy's newline-separated multi-value representation.
