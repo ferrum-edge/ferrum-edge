@@ -3543,6 +3543,24 @@ impl MetricsRegistry {
     /// so its key doubles as the shared `Arc<str>` for the caller's remaining
     /// per-proxy families: the established-series path clones a refcount
     /// instead of allocating a fresh `Arc<str>` per transaction.
+    fn observe_proxy_duration(
+        &self,
+        map: &DashMap<Arc<str>, HistogramBuckets>,
+        proxy_key: &str,
+        kind: DurationLayoutKind,
+        captured: &Arc<[f64]>,
+        value: f64,
+    ) -> Arc<str> {
+        self.observe_proxy_duration_at(
+            map,
+            proxy_key,
+            kind,
+            captured,
+            value,
+            self.epoch.elapsed().as_nanos() as u64,
+        )
+    }
+
     fn observe_proxy_duration_at(
         &self,
         map: &DashMap<Arc<str>, HistogramBuckets>,

@@ -11889,6 +11889,12 @@ impl std::ops::BitOr for PluginHooks {
     }
 }
 
+impl std::ops::BitOrAssign for PluginHooks {
+    fn bitor_assign(&mut self, rhs: Self) {
+        *self = self.union(rhs);
+    }
+}
+
 /// Reduce every backend-equivalence class (ASCII case-insensitive, `_` read
 /// as `-`) of the owned request header `names` in `headers` to at most ONE
 /// entry: the current install of an admitted owning instance
