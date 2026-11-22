@@ -359,10 +359,18 @@ impl AuthorizationTerminalOwner {
     /// Atomically claim this response for an inner gateway deadline terminal
     /// (such as an earlier route request deadline) without consulting the
     /// authorization clock. Returns `true` iff this call won the CAS from
-    /// `Open`; returns `false` if authorization expiry (or another terminal)
-    /// already claimed ownership.
+    /// `Open`; returns `false` if authorization expiry or an already-queued
+    /// upstream completion/error already claimed ownership.
     pub(crate) fn claim_inner_terminal(&self) -> bool {
-        self.claim(TERMINAL_INNER_COMPLETION) == AuthorizationTerminalOwnership::InnerCompletion
+        self.0
+            .claimed
+            .compare_exchange(
+                TERMINAL_OPEN,
+                TERMINAL_INNER_COMPLETION,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
     }
 
     /// Claim this response for the authorization bound, returning the winner.

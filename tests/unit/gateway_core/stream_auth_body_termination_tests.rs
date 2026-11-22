@@ -1688,3 +1688,100 @@ fn cloned_request_context_shares_lazy_authorization_latch() {
         "cloning RequestContext before latch init must still share the authorization latch"
     );
 }
+
+struct ChannelBody(tokio::sync::mpsc::Receiver<Result<Frame<Bytes>, ProxyBodyError>>);
+
+impl http_body::Body for ChannelBody {
+    type Data = Bytes;
+    type Error = ProxyBodyError;
+
+    fn poll_frame(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        self.0.poll_recv(cx)
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn pump_claimed_terminal_before_route_deadline_is_not_overwritten_by_route_timeout() {
+    // 1. Clean EOF claimed by the authorization pump before the route deadline.
+    {
+        let latch = StreamAuthTerminationLatch::default();
+        let closer = AuthorizationConnectionCloser::new();
+        let (tx, rx) = tokio::sync::mpsc::channel(4);
+        let inner = proxy_body_streaming_for_test(Box::pin(ChannelBody(rx)));
+        let route_timed =
+            ferrum_edge::_test_support::proxy_body_with_route_request_deadline_for_test(
+                inner,
+                tokio::time::Instant::now() + Duration::from_secs(5),
+            );
+        let mut body = wrapped_body(
+            route_timed,
+            future_deadline(
+                Duration::from_secs(60),
+                StreamAuthTermination::CredentialExpired,
+            ),
+            &latch,
+            &closer,
+        );
+
+        // Close upstream cleanly before the 5s route deadline and let the pump
+        // claim InnerCompletion and queue PumpItem::End.
+        drop(tx);
+        for _ in 0..4 {
+            tokio::task::yield_now().await;
+        }
+
+        // Downstream polls only AFTER the 5s route deadline has elapsed.
+        tokio::time::sleep(Duration::from_secs(6)).await;
+        assert!(
+            body.frame().await.is_none(),
+            "clean EOF already claimed before the route deadline must not be overwritten by route timeout"
+        );
+        assert_eq!(latch.observed(), None);
+    }
+
+    // 2. Upstream error claimed by the authorization pump before the route deadline.
+    {
+        let latch = StreamAuthTerminationLatch::default();
+        let closer = AuthorizationConnectionCloser::new();
+        let (tx, rx) = tokio::sync::mpsc::channel(4);
+        let inner = proxy_body_streaming_for_test(Box::pin(ChannelBody(rx)));
+        let route_timed =
+            ferrum_edge::_test_support::proxy_body_with_route_request_deadline_for_test(
+                inner,
+                tokio::time::Instant::now() + Duration::from_secs(5),
+            );
+        let mut body = wrapped_body(
+            route_timed,
+            future_deadline(
+                Duration::from_secs(60),
+                StreamAuthTermination::CredentialExpired,
+            ),
+            &latch,
+            &closer,
+        );
+
+        tx.send(Err(
+            Box::new(std::io::Error::other("upstream reset")) as ProxyBodyError
+        ))
+        .await
+        .expect("channel open");
+        for _ in 0..4 {
+            tokio::task::yield_now().await;
+        }
+
+        tokio::time::sleep(Duration::from_secs(6)).await;
+        let err = body
+            .frame()
+            .await
+            .expect("upstream error must still be delivered")
+            .expect_err("expected upstream error, not clean EOF");
+        assert!(
+            err.to_string().contains("upstream reset"),
+            "expected queued upstream error, got: {err}"
+        );
+        assert_eq!(latch.observed(), None);
+    }
+}
