@@ -404,6 +404,10 @@ auth_flow::impl_auth_plugin!(
         crate::plugins::PluginResult::Continue
     }
 
+    fn is_authorize_plugin(&self) -> bool {
+        false
+    }
+
     fn requires_decoded_query_params(&self) -> bool {
         self.locations
             .iter()

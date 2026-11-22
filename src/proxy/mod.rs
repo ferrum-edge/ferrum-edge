@@ -5629,17 +5629,6 @@ fn project_log_metadata(
     ctx: &RequestContext,
     mut metadata: crate::plugins::MetadataMap,
 ) -> crate::plugins::MetadataMap {
-    if !metadata.contains_key("ferrum.frontend_scheme") {
-        metadata.insert(
-            "ferrum.frontend_scheme".to_string(),
-            if ctx.request_is_secure {
-                "https"
-            } else {
-                "http"
-            }
-            .to_string(),
-        );
-    }
     // Detached uploads publish through the shared latch. Import its bounded
     // class even when no response relay copied it into the request context.
     if let Some(termination) = ctx.observed_authorization_termination() {
@@ -37818,6 +37807,12 @@ async fn handle_proxy_request_inner(
                         epoch.plugin_cache.unrouted_transaction_log_plugins()
                     {
                         ctx.materialize_headers();
+                        if !ctx.metadata.contains_key("ferrum.frontend_scheme") {
+                            ctx.metadata.insert(
+                                "ferrum.frontend_scheme".to_string(),
+                                request_scheme.to_string(),
+                            );
+                        }
                         // Boxed: keep the logging future's state off the
                         // request handler's (worker-stack) state machine.
                         Box::pin(log_unrouted_request(
@@ -37972,6 +37967,22 @@ async fn handle_proxy_request_inner(
         if !passthrough {
             materialize_routed_request_headers(&mut ctx, req.uri().authority());
         }
+    }
+    // Populate `ferrum.frontend_scheme` before early route rejections (400/405)
+    // and plugin hooks when a non-passthrough plugin chain is configured (only
+    // `oidc_relying_party`, `mesh_route_dispatch`, `jwks_auth`, and logging
+    // plugins read it). Skipping it on plugin-free and passthrough-auth chains
+    // avoids a HashMap + 2 String allocations per request on the hot path.
+    if !plugin_cache_view.plugins().is_empty()
+        && !plugin_cache_view
+            .capabilities()
+            .has(PluginCapabilities::SUPPORTS_REQUEST_HEADER_PASSTHROUGH)
+        && !ctx.metadata.contains_key("ferrum.frontend_scheme")
+    {
+        ctx.metadata.insert(
+            "ferrum.frontend_scheme".to_string(),
+            request_scheme.to_string(),
+        );
     }
     // Publish this route's effective client-facing body ceilings on the context
     // before any body is forwarded, retained, or collected. Every streaming
@@ -38374,20 +38385,6 @@ async fn handle_proxy_request_inner(
     // Pre-computed capability bitset and phase-specific plugin lists — avoids
     // per-request `iter().filter().collect()` and `iter().any()` scans.
     let capabilities = plugin_cache_view.capabilities();
-    // Populate `ferrum.frontend_scheme` only when a non-passthrough plugin
-    // chain will execute (only `oidc_relying_party`, `mesh_route_dispatch`,
-    // `jwks_auth`, and logging/debugging plugins read it). Skipping it on
-    // plugin-free and passthrough-auth chains avoids a HashMap + 2 String
-    // allocations per request on the hot path.
-    if !plugins.is_empty()
-        && !capabilities.has(PluginCapabilities::SUPPORTS_REQUEST_HEADER_PASSTHROUGH)
-        && !ctx.metadata.contains_key("ferrum.frontend_scheme")
-    {
-        ctx.metadata.insert(
-            "ferrum.frontend_scheme".to_string(),
-            request_scheme.to_string(),
-        );
-    }
     let backend_path_plugins = plugin_cache_view.backend_path_plugins();
     let backend_path_is_policy_bound = !backend_path_plugins.is_empty();
     let mut client_request_body = ClientRequestBody::Streaming(Box::new(req));
@@ -52876,11 +52873,12 @@ async fn proxy_to_backend(
     //
     // Every ordinary host still fails closed here. Retry dispatch repeats the
     // same target-effective preflight before entering any direct or mesh pool.
-    let (resolved_ip_addr, resolved_ip) = if unix_target.is_some()
+    let mut resolved_ip_addr: Option<std::net::IpAddr> = None;
+    let resolved_ip = if unix_target.is_some()
         || (dispatch_hbone
             && upstream_target.is_some_and(is_synthetic_cross_cluster_hbone_dispatch_target))
     {
-        (None, None)
+        None
     } else {
         // Resolve backend IP from DNS cache (O(1) cached lookup, <1μs).
         // When `dns_override` is set, this returns the override IP for the
@@ -52916,7 +52914,10 @@ async fn proxy_to_backend(
             || !request_ctx.mirror_result_rxs.is_empty()
             || request_ctx.diagnostic_slot().is_some();
         match resolved_ip_result {
-            Ok(ip) => (Some(ip), need_resolved_ip_string.then(|| ip.to_string())),
+            Ok(ip) => {
+                resolved_ip_addr = Some(ip);
+                need_resolved_ip_string.then(|| ip.to_string())
+            }
             Err(error) => {
                 return backend_dns_resolution_failed_dispatch_result(effective_host, &error);
             }
