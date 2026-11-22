@@ -52,6 +52,18 @@ const POSTGRES_EPOCH: OffsetDateTime = match Date::from_calendar_date(2000, Mont
     Err(_) => panic!("2000-01-01 is a valid Gregorian date"),
 };
 
+/// Minimum UTC year accepted by [`UtcTimestamp`].
+///
+/// Matches `time`'s default (non-`large-dates`) lower bound regardless of Cargo
+/// feature unification (e.g. `bson` enabling `time/large-dates`).
+const MIN_SUPPORTED_YEAR: i32 = -9999;
+
+/// Maximum UTC year accepted by [`UtcTimestamp`].
+///
+/// Matches `time`'s default (non-`large-dates`) upper bound and RFC 3339's
+/// 4-digit year range (`<= 9999`) regardless of Cargo feature unification.
+const MAX_SUPPORTED_YEAR: i32 = 9999;
+
 /// Fractional-second precision modes matching `chrono::SecondsFormat`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SecondsFormat {
@@ -106,14 +118,25 @@ impl UtcTimestamp {
         Self(OffsetDateTime::now_utc())
     }
 
+    /// Validate that a UTC [`OffsetDateTime`] stays within the
+    /// feature-independent `MIN_SUPPORTED_YEAR..=MAX_SUPPORTED_YEAR` range.
+    #[inline]
+    fn from_validated_utc(dt: OffsetDateTime) -> Result<Self, TimestampError> {
+        if !(MIN_SUPPORTED_YEAR..=MAX_SUPPORTED_YEAR).contains(&dt.year()) {
+            return Err(TimestampError::OutOfRange);
+        }
+        Ok(Self(dt))
+    }
+
     /// Normalize an [`OffsetDateTime`] to UTC, returning
     /// [`TimestampError::OutOfRange`] if the UTC conversion would overflow
-    /// `time`'s supported year range.
+    /// [`UtcTimestamp`]'s supported year range (`-9999..=9999`).
     #[inline]
     pub fn try_from_offset_date_time(dt: OffsetDateTime) -> Result<Self, TimestampError> {
-        dt.checked_to_offset(UtcOffset::UTC)
-            .map(Self)
-            .ok_or(TimestampError::OutOfRange)
+        let utc = dt
+            .checked_to_offset(UtcOffset::UTC)
+            .ok_or(TimestampError::OutOfRange)?;
+        Self::from_validated_utc(utc)
     }
 
     /// Construct from a UTC [`Date`] and [`Time`].
@@ -137,9 +160,9 @@ impl UtcTimestamp {
     /// Construct from whole Unix epoch seconds.
     #[inline]
     pub fn from_unix_timestamp(secs: i64) -> Result<Self, TimestampError> {
-        OffsetDateTime::from_unix_timestamp(secs)
-            .map(Self)
-            .map_err(|_| TimestampError::OutOfRange)
+        let dt =
+            OffsetDateTime::from_unix_timestamp(secs).map_err(|_| TimestampError::OutOfRange)?;
+        Self::from_validated_utc(dt)
     }
 
     /// Construct from Unix epoch seconds plus non-negative subsecond
@@ -154,9 +177,9 @@ impl UtcTimestamp {
             .checked_mul(1_000_000_000)
             .and_then(|base| base.checked_add(i128::from(nanos)))
             .ok_or(TimestampError::OutOfRange)?;
-        OffsetDateTime::from_unix_timestamp_nanos(total)
-            .map(Self)
-            .map_err(|_| TimestampError::OutOfRange)
+        let dt = OffsetDateTime::from_unix_timestamp_nanos(total)
+            .map_err(|_| TimestampError::OutOfRange)?;
+        Self::from_validated_utc(dt)
     }
 
     /// Construct from a [`SystemTime`] without panicking on out-of-range values.
@@ -217,13 +240,17 @@ impl UtcTimestamp {
     /// Add a signed duration, returning `None` on overflow.
     #[inline]
     pub fn checked_add(self, duration: SignedDuration) -> Option<Self> {
-        self.0.checked_add(duration).map(Self)
+        self.0
+            .checked_add(duration)
+            .and_then(|dt| Self::from_validated_utc(dt).ok())
     }
 
     /// Subtract a signed duration, returning `None` on overflow.
     #[inline]
     pub fn checked_sub(self, duration: SignedDuration) -> Option<Self> {
-        self.0.checked_sub(duration).map(Self)
+        self.0
+            .checked_sub(duration)
+            .and_then(|dt| Self::from_validated_utc(dt).ok())
     }
 
     /// Format as RFC 3339 with `SecondsFormat::AutoSi` and `+00:00`, matching
@@ -316,10 +343,10 @@ impl UtcTimestamp {
     /// Construct from PostgreSQL binary `TIMESTAMPTZ` / `TIMESTAMP`
     /// microseconds since `2000-01-01T00:00:00Z`.
     pub fn from_postgres_micros(micros: i64) -> Result<Self, TimestampError> {
-        POSTGRES_EPOCH
+        let dt = POSTGRES_EPOCH
             .checked_add(SignedDuration::microseconds(micros))
-            .map(Self)
-            .ok_or(TimestampError::OutOfRange)
+            .ok_or(TimestampError::OutOfRange)?;
+        Self::from_validated_utc(dt)
     }
 
     /// Decode a PostgreSQL binary `TIMESTAMPTZ` / `TIMESTAMP` payload (8-byte
@@ -369,6 +396,9 @@ impl UtcTimestamp {
         }
 
         let year = i32::from(u16::from_le_bytes([payload[0], payload[1]]));
+        if year > MAX_SUPPORTED_YEAR {
+            return Err(TimestampError::OutOfRange);
+        }
         let month = Month::try_from(payload[2]).map_err(|_| TimestampError::InvalidComponent)?;
         let day = payload[3];
         let date = Date::from_calendar_date(year, month, day)
@@ -394,7 +424,7 @@ impl UtcTimestamp {
             return Err(TimestampError::InvalidFormat);
         };
 
-        Ok(Self::from_utc_date_time(date, time))
+        Self::from_validated_utc(PlainDateTime::new(date, time).assume_utc())
     }
 
     #[inline]
@@ -557,7 +587,7 @@ pub fn parse_mysql_datetime_text(s: &str) -> Result<UtcTimestamp, TimestampError
     if !rest.is_empty() {
         return Err(TimestampError::InvalidFormat);
     }
-    Ok(UtcTimestamp::from_utc_date_time(date, time))
+    assemble_utc(date, time, UtcOffset::UTC)
 }
 
 fn parse_flexible_sql_datetime(s: &str) -> Result<UtcTimestamp, TimestampError> {
@@ -863,7 +893,10 @@ impl Encode<'_, MySql> for UtcTimestamp {
     }
 
     fn size_hint(&self) -> usize {
-        usize::from(self.mysql_binary_encoded_len()) + 1
+        // Match `sqlx-mysql`'s `Encode<MySql> for chrono::DateTime<Utc>`, which
+        // uses `Encode::size_hint`'s default `mem::size_of_val(self)` (12 bytes,
+        // matching the maximum 1-byte length prefix + 11-byte binary wire form).
+        12
     }
 }
 

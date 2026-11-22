@@ -10,8 +10,10 @@ use ferrum_edge::time_compat::{
     parse_mysql_datetime_text, parse_postgres_datetime_text, parse_rfc3339,
     parse_sqlite_datetime_text,
 };
+use sqlx::any::AnyPoolOptions;
+use sqlx::encode::IsNull;
 use sqlx::postgres::{PgArgumentBuffer, PgHasArrayType};
-use sqlx::{AnyPool, Encode, MySql, Postgres, Row, Sqlite, SqlitePool, Type};
+use sqlx::{Encode, MySql, Postgres, Row, Sqlite, SqlitePool, Type};
 use time::{Date, Month, SignedDuration, Time, UtcOffset};
 
 /// Representative instants covering whole seconds, ms/us/ns AutoSi buckets,
@@ -178,15 +180,31 @@ fn parse_rejects_malformed_and_overflow_inputs_without_panicking() {
         "2026-01-02T00:00:60Z",
         "2026-01-02T00:00:00+24:00",
         "2026-01-02T00:00:00-00:60",
-        // Overflowing `time`'s supported year range during offset-to-UTC conversion:
+        // Overflowing supported year range (`-9999..=9999`) directly or during
+        // offset-to-UTC conversion:
         "9999-12-31T23:30:00-05:00",
         "-9999-01-01T00:30:00+05:00",
+        "+10000-01-01T00:00:00Z",
+        "-10000-01-01T00:00:00Z",
     ] {
         assert!(
             parse_rfc3339(bad).is_err(),
             "parse_rfc3339 unexpectedly accepted {bad:?}"
         );
     }
+
+    let max_year_end = UtcTimestamp::parse_from_rfc3339("9999-12-31T23:59:59Z").unwrap();
+    assert!(
+        max_year_end
+            .checked_add(SignedDuration::seconds(1))
+            .is_none()
+    );
+    let min_year_start = UtcTimestamp::parse_from_rfc3339("-9999-01-01T00:00:00Z").unwrap();
+    assert!(
+        min_year_start
+            .checked_sub(SignedDuration::seconds(1))
+            .is_none()
+    );
 
     assert_eq!(
         UtcTimestamp::from_unix_timestamp_nanos(0, 1_000_000_000),
@@ -198,6 +216,10 @@ fn parse_rejects_malformed_and_overflow_inputs_without_panicking() {
     assert!(UtcTimestamp::decode_mysql_binary(&[0]).is_err());
     assert!(UtcTimestamp::decode_mysql_binary(&[4, 0xea, 0x07]).is_err());
     assert!(UtcTimestamp::decode_mysql_binary(&[5, 0xea, 0x07, 1, 2, 3]).is_err());
+    assert_eq!(
+        UtcTimestamp::decode_mysql_binary(&[4, 0x10, 0x27, 1, 1]),
+        Err(TimestampError::OutOfRange)
+    );
     assert!(UtcTimestamp::decode_postgres_binary(&[0u8; 7]).is_err());
 }
 
@@ -430,10 +452,18 @@ fn mysql_binary_wire_encoding_matches_chrono_byte_for_byte_and_decodes_legacy_fo
         let mut compat_buf = Vec::new();
         let mut chrono_buf = Vec::new();
 
-        <UtcTimestamp as Encode<'_, MySql>>::encode_by_ref(&ts, &mut compat_buf)
+        let compat_null = <UtcTimestamp as Encode<'_, MySql>>::encode_by_ref(&ts, &mut compat_buf)
             .expect("encode UtcTimestamp for MySQL");
-        <DateTime<Utc> as Encode<'_, MySql>>::encode_by_ref(&ch, &mut chrono_buf)
+        let chrono_null = <DateTime<Utc> as Encode<'_, MySql>>::encode_by_ref(&ch, &mut chrono_buf)
             .expect("encode chrono DateTime for MySQL");
+        assert!(
+            matches!(compat_null, IsNull::No),
+            "UtcTimestamp MySQL encode returned IsNull::Yes for ({secs}, {nanos})"
+        );
+        assert!(
+            matches!(chrono_null, IsNull::No),
+            "chrono MySQL encode returned IsNull::Yes for ({secs}, {nanos})"
+        );
 
         assert_eq!(
             compat_buf, chrono_buf,
@@ -525,10 +555,20 @@ fn postgres_binary_and_text_wire_formats_match_chrono_byte_for_byte() {
         let mut compat_buf = PgArgumentBuffer::default();
         let mut chrono_buf = PgArgumentBuffer::default();
 
-        <UtcTimestamp as Encode<'_, Postgres>>::encode_by_ref(&ts, &mut compat_buf)
-            .expect("encode UtcTimestamp for Postgres");
-        <DateTime<Utc> as Encode<'_, Postgres>>::encode_by_ref(&ch, &mut chrono_buf)
-            .expect("encode chrono DateTime for Postgres");
+        let compat_null =
+            <UtcTimestamp as Encode<'_, Postgres>>::encode_by_ref(&ts, &mut compat_buf)
+                .expect("encode UtcTimestamp for Postgres");
+        let chrono_null =
+            <DateTime<Utc> as Encode<'_, Postgres>>::encode_by_ref(&ch, &mut chrono_buf)
+                .expect("encode chrono DateTime for Postgres");
+        assert!(
+            matches!(compat_null, IsNull::No),
+            "UtcTimestamp Postgres encode returned IsNull::Yes for ({secs}, {nanos})"
+        );
+        assert!(
+            matches!(chrono_null, IsNull::No),
+            "chrono Postgres encode returned IsNull::Yes for ({secs}, {nanos})"
+        );
 
         assert_eq!(
             compat_buf.as_slice(),
@@ -597,7 +637,11 @@ fn postgres_binary_and_text_wire_formats_match_chrono_byte_for_byte() {
 #[tokio::test]
 async fn sqlx_any_roundtrip_matches_chrono_to_rfc3339_and_reads_legacy_rows() {
     sqlx::any::install_default_drivers();
-    let pool = AnyPool::connect("sqlite::memory:")
+    // SQLite `:memory:` creates an isolated database per connection; limit the
+    // AnyPool to 1 connection so DDL and DML share the same in-memory database.
+    let pool = AnyPoolOptions::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
         .await
         .expect("connect in-memory AnyPool");
 
