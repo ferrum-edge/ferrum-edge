@@ -2509,7 +2509,14 @@ impl Plugin for AiPromptShield {
             // budget (GHSA-f2jp-59r9-fp64), and a lenient upstream parser
             // accepts what serde refuses.
             ScanMode::McpArguments => match serde_json::from_str::<Value>(body) {
-                Ok(json) => (self.detect_pii_mcp_arguments(&json), false, Some(json)),
+                Ok(json) => {
+                    let is_streaming = json.get("stream").and_then(|s| s.as_bool()) == Some(true);
+                    (
+                        self.detect_pii_mcp_arguments(&json),
+                        is_streaming,
+                        Some(json),
+                    )
+                }
                 Err(_) => {
                     if mcp_body_may_carry_tool_call(body.as_bytes()) {
                         return self.handle_unparseable_mcp_body(ctx);

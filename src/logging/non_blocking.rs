@@ -251,15 +251,19 @@ impl SinkState {
     fn release_record_slot(&self) {
         let became_idle = self
             .outstanding_records
-            .try_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
                 current.checked_sub(1)
             })
             .is_ok_and(|previous| previous == 1);
         // A producer can reserve and then abandon a record while shutdown is
-        // waiting. Wake the worker when that final reservation disappears so
-        // plain park() cannot strand the drain.
-        if became_idle && !self.accepting.load(Ordering::Acquire) {
-            self.wake_worker();
+        // waiting. Unconditionally unpark the worker when that final
+        // reservation disappears during shutdown so plain park() cannot strand
+        // the drain even under weak acquire/release ordering (RCpc / LDAPR).
+        if became_idle
+            && !self.accepting.load(Ordering::SeqCst)
+            && let Some(worker) = self.worker_thread.get()
+        {
+            worker.unpark();
         }
     }
 
@@ -768,8 +772,8 @@ where
         // pushing/closing so no wakeup can be lost.
         state.worker_parked.store(true, Ordering::SeqCst);
         if !queue.is_empty()
-            || (!state.accepting.load(Ordering::Acquire)
-                && state.outstanding_records.load(Ordering::Acquire) == 0)
+            || (!state.accepting.load(Ordering::SeqCst)
+                && state.outstanding_records.load(Ordering::SeqCst) == 0)
         {
             state.worker_parked.store(false, Ordering::Relaxed);
             continue;

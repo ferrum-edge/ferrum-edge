@@ -1436,7 +1436,7 @@ impl UncacheablePredictor {
 
     /// Returns true if this key is predicted to be cacheable (not in the uncacheable set).
     fn is_predicted_cacheable(&self, key: &str) -> bool {
-        self.count.load(Ordering::Relaxed) == 0 || !self.keys.contains_key(key)
+        self.count.load(Ordering::Acquire) == 0 || !self.keys.contains_key(key)
     }
 
     /// Mark a key as uncacheable, evicting the oldest live entries when the
@@ -1444,13 +1444,22 @@ impl UncacheablePredictor {
     /// per call, and each appended slot is popped at most once.
     fn mark_uncacheable(&self, key: &str) {
         let seq = self.next_seq.fetch_add(1, Ordering::Relaxed);
-        if self.keys.insert(key.to_string(), seq).is_none() {
-            self.count.fetch_add(1, Ordering::Relaxed);
+        // Increment `count` while holding the shard write guard so a newly
+        // inserted entry can never become visible to a concurrent remover
+        // before its increment is accounted for (preventing underflow/wrap).
+        match self.keys.entry(key.to_string()) {
+            dashmap::mapref::entry::Entry::Occupied(mut occupied) => {
+                occupied.insert(seq);
+            }
+            dashmap::mapref::entry::Entry::Vacant(vacant) => {
+                vacant.insert(seq);
+                self.count.fetch_add(1, Ordering::AcqRel);
+            }
         }
 
         let mut order = self.order_guard();
         order.push_back((key.to_string(), seq));
-        while self.count.load(Ordering::Relaxed) > self.max_entries {
+        while self.count.load(Ordering::Acquire) > self.max_entries {
             let Some((oldest_key, oldest_seq)) = order.pop_front() else {
                 break;
             };
@@ -1459,7 +1468,7 @@ impl UncacheablePredictor {
                 .remove_if(&oldest_key, |_, live_seq| *live_seq == oldest_seq)
                 .is_some()
             {
-                self.count.fetch_sub(1, Ordering::Relaxed);
+                self.count.fetch_sub(1, Ordering::AcqRel);
             }
         }
         // Superseded slots accumulate only when the same key is re-marked.
@@ -1476,11 +1485,11 @@ impl UncacheablePredictor {
     /// Remove a key from the uncacheable set (it became cacheable). The stale
     /// queue slot is reclaimed by the next capacity pop or compaction.
     fn mark_cacheable(&self, key: &str) {
-        if self.count.load(Ordering::Relaxed) == 0 {
+        if self.count.load(Ordering::Acquire) == 0 {
             return;
         }
         if self.keys.remove(key).is_some() {
-            self.count.fetch_sub(1, Ordering::Relaxed);
+            self.count.fetch_sub(1, Ordering::AcqRel);
         }
     }
 }
@@ -3743,11 +3752,6 @@ impl Plugin for ResponseCaching {
                 return PluginResult::Continue;
             }
         };
-        // Request time for response-delay accounting is taken here, before
-        // origin contact, exactly as before; it is only *staged* once this
-        // request is known to reach the origin (see `stage_store_inputs`).
-        let request_time = self.now_monotonic();
-
         // Both `vary_index` entries and `default_lookup_vary_headers` already
         // carry the sorted union with `SENSITIVE_VARY_HEADERS`, avoiding any
         // per-lookup `Vec<String>` clone, merge, or sort.
@@ -3787,6 +3791,7 @@ impl Plugin for ResponseCaching {
                 // publishes the downstream Vary contract on it. Pending unsafe
                 // invalidation (if any) is retained — the request contacts the
                 // origin.
+                let request_time = self.now_monotonic();
                 self.stage_store_inputs(ctx, headers, base_key, cache_key, request_time);
                 self.set_cache_status(ctx, "BYPASS");
                 return PluginResult::Continue;
@@ -3817,7 +3822,7 @@ impl Plugin for ResponseCaching {
         }
 
         if let Some(entry) = self.cache.get(&cache_key) {
-            let now = request_time;
+            let now = self.now_monotonic();
             let current_age = entry.current_age(now);
             // Provenance gate, ahead of freshness: a stored entry is replayed
             // as a finalized representation with presentation transforms
@@ -3909,6 +3914,7 @@ impl Plugin for ResponseCaching {
             }
         }
 
+        let request_time = self.now_monotonic();
         self.stage_store_inputs(ctx, headers, base_key, cache_key, request_time);
         self.set_cache_status(ctx, "MISS");
         PluginResult::Continue

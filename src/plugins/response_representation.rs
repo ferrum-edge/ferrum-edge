@@ -724,8 +724,10 @@ fn document_is_parseable(content_type: Option<&str>, body: &[u8]) -> bool {
     if content_type.is_some_and(|value| !is_json_content_type(value)) {
         return true;
     }
-    // Validate JSON syntax without materializing a full `serde_json::Value` DOM.
-    serde_json::from_slice::<serde::de::IgnoredAny>(body).is_ok()
+    // Validate JSON syntax with exact `serde_json::Value` acceptance parity
+    // (UTF-8, paired surrogates, trailing-data rejection, recursion limit)
+    // without materializing a DOM tree.
+    crate::util::json_dup_keys::serde_json_accepts(body)
 }
 
 /// Evaluate the shared representation gate for one buffered response.

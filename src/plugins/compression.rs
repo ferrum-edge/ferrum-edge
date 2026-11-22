@@ -1516,18 +1516,24 @@ impl CompressionPlugin {
         permit: OwnedSemaphorePermit,
         ceiling: usize,
     ) -> Option<Vec<u8>> {
-        // Compress small response bodies inline without copying `body` into an
-        // owned `Vec<u8>` or paying a `tokio::task::spawn_blocking` thread-pool
-        // wakeup/handoff (for typical <= 16 KiB API payloads, inline gzip/zstd
-        // takes ~10-40 us, less than a thread-pool round-trip).
+        // Compress small response bodies inline when the configured codec and
+        // level are fast, avoiding an owned `Vec<u8>` copy and a
+        // `tokio::task::spawn_blocking` handoff. Slow high-quality levels
+        // (e.g. Brotli quality 5..=11, Gzip 7..=9, Zstd 4+) stay on the
+        // blocking pool so they cannot stall Tokio worker threads.
         const INLINE_COMPRESS_MAX_BYTES: usize = 16 * 1024;
 
         let gzip_level = self.config.gzip_level;
         let brotli_quality = self.config.brotli_quality;
         let zstd_level = self.config.zstd_level;
         let encoding_owned = algo.content_encoding();
+        let fast_inline_codec = match algo {
+            Algorithm::Gzip => gzip_level <= 6,
+            Algorithm::Brotli => brotli_quality <= 4,
+            Algorithm::Zstd => zstd_level <= 3,
+        };
 
-        let result = if body.len() <= INLINE_COMPRESS_MAX_BYTES {
+        let result = if body.len() <= INLINE_COMPRESS_MAX_BYTES && fast_inline_codec {
             let _permit = permit;
             Ok(match algo {
                 Algorithm::Gzip => compress_gzip_blocking(body, gzip_level, ceiling),

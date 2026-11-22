@@ -5904,8 +5904,9 @@ impl Plugin for AiSemanticCache {
             }
         };
         let body = decoded.as_ref();
-        // Validate JSON syntax without materializing a full `serde_json::Value` DOM.
-        if serde_json::from_slice::<serde::de::IgnoredAny>(body).is_err() {
+        // Validate JSON syntax with exact `serde_json::Value` acceptance parity
+        // without materializing a DOM tree.
+        if !crate::util::json_dup_keys::serde_json_accepts(body) {
             debug!("ai_semantic_cache: skipping syntactically invalid JSON response");
             return PluginResult::Continue;
         }

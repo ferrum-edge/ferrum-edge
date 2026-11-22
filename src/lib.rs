@@ -18797,6 +18797,24 @@ pub mod _test_support {
         })
     }
 
+    /// Attach `raw` and enter the request-header passthrough lane on `ctx`,
+    /// leaving `ctx.headers` empty and unmaterialized just as `handle_proxy_request_inner`
+    /// does for passthrough-eligible plugin chains.
+    pub fn begin_request_header_passthrough_for_test(
+        ctx: &mut crate::plugins::RequestContext,
+        raw: http::HeaderMap,
+        authority: Option<&str>,
+    ) -> bool {
+        ctx.set_raw_headers(raw);
+        ctx.try_begin_request_header_passthrough(authority)
+    }
+
+    /// End the request-header passthrough lane on `ctx` and materialize the
+    /// effective request header map (including strips and gateway assertions).
+    pub fn end_request_header_passthrough_for_test(ctx: &mut crate::plugins::RequestContext) {
+        ctx.end_request_header_passthrough();
+    }
+
     /// Drive `raw` through both the eager path and the passthrough lane WITH
     /// stripped credential headers and gateway-asserted headers (`key_auth`
     /// passthrough overlay). Returns `None` if either the block is ineligible

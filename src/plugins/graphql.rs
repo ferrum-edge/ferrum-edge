@@ -1861,7 +1861,10 @@ impl<'de> serde::Deserialize<'de> for OptionalJsonString {
             where
                 A: serde::de::SeqAccess<'de>,
             {
-                while seq.next_element::<serde::de::IgnoredAny>()?.is_some() {}
+                while seq
+                    .next_element::<crate::util::json_dup_keys::SerdeJsonAccept>()?
+                    .is_some()
+                {}
                 Ok(OptionalJsonString(None))
             }
 
@@ -1870,7 +1873,7 @@ impl<'de> serde::Deserialize<'de> for OptionalJsonString {
                 A: serde::de::MapAccess<'de>,
             {
                 while map
-                    .next_entry::<serde::de::IgnoredAny, serde::de::IgnoredAny>()?
+                    .next_entry::<crate::util::json_dup_keys::SerdeJsonAccept, crate::util::json_dup_keys::SerdeJsonAccept>()?
                     .is_some()
                 {}
                 Ok(OptionalJsonString(None))
@@ -1920,8 +1923,9 @@ impl<'de> serde::de::Visitor<'de> for GraphqlEnvelopeVisitor {
                 operation_name = map.next_value::<OptionalJsonString>()?.0;
             } else {
                 // Skip `variables`, `extensions`, and unknown fields without
-                // building a `serde_json::Value` DOM while still validating JSON.
-                let _ = map.next_value::<serde::de::IgnoredAny>()?;
+                // building a `serde_json::Value` DOM while preserving strict
+                // `Value` acceptance (UTF-8, paired surrogates, recursion limit).
+                let _ = map.next_value::<crate::util::json_dup_keys::SerdeJsonAccept>()?;
             }
         }
         Ok(GraphqlEnvelope::Object {
@@ -1935,7 +1939,10 @@ impl<'de> serde::de::Visitor<'de> for GraphqlEnvelopeVisitor {
     where
         A: serde::de::SeqAccess<'de>,
     {
-        while seq.next_element::<serde::de::IgnoredAny>()?.is_some() {}
+        while seq
+            .next_element::<crate::util::json_dup_keys::SerdeJsonAccept>()?
+            .is_some()
+        {}
         Ok(GraphqlEnvelope::NotAnObject)
     }
 

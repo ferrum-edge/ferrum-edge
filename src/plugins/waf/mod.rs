@@ -1762,77 +1762,46 @@ impl Waf {
 ///
 /// Used only to answer "did anything change since this instance last scanned?" —
 /// it is never logged, exported, or compared against attacker-supplied input.
-/// Order-independent, non-cancelling 256-bit multiset fingerprint of response
-/// headers. Uses four independent keyed `ahash` lanes summed modulo `2^64`
-/// across `(ascii-lowercased name, value)` pairs with the entry count mixed in.
 ///
-/// Unlike XOR, wrapping addition never self-cancels duplicate canonical pairs
-/// (e.g. `X-Foo` and `x-foo` with the same value double the lane sums rather
-/// than cancelling to zero), and computing it directly over the map avoids the
-/// per-response `Vec` + N lowercase `String` allocations, sort, and SHA-256.
+/// Canonical order-independent, non-cancelling FIPS SHA-256 over sorted,
+/// length-prefixed `(ascii-lowercased name, value)` pairs. Sorts borrowed
+/// `(&str, &str)` pairs and lowercases names into a small stack buffer,
+/// eliminating `N` per-header `String` allocations while preserving the exact
+/// cryptographic digest.
 fn response_header_map_digest(headers: &HashMap<String, String>) -> [u8; 32] {
-    use std::hash::{BuildHasher, Hasher};
-
-    const SEEDS: [[u64; 4]; 4] = [
-        [
-            0x243f_6a88_85a3_08d3,
-            0x1319_8a2e_0370_7344,
-            0xa409_3822_299f_31d0,
-            0x082e_fa98_ec4e_6c89,
-        ],
-        [
-            0x4528_21e6_38d0_1377,
-            0xbe54_66cf_34e9_0c6c,
-            0xc0ac_29b7_c97c_50dd,
-            0x3f84_d5b5_b547_0917,
-        ],
-        [
-            0x9216_d5d9_8979_fb1b,
-            0xd131_0ba6_98df_b5ac,
-            0x2ffd_72db_d01a_dfb7,
-            0xb8e1_afed_6a26_7e96,
-        ],
-        [
-            0xba7c_9045_f12c_7f99,
-            0x24a1_9947_b391_6cf7,
-            0x0801_f2e2_858e_fc16,
-            0x6369_20d8_7157_4e69,
-        ],
-    ];
-
-    let mut acc = [
-        (headers.len() as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15),
-        (headers.len() as u64).wrapping_mul(0xbf58_476d_1ce4_e5b9),
-        (headers.len() as u64).wrapping_mul(0x94d0_49bb_1331_11eb),
-        (headers.len() as u64).wrapping_mul(0x517c_c1b7_2722_0a95),
-    ];
-
-    let states = [
-        ahash::RandomState::with_seeds(SEEDS[0][0], SEEDS[0][1], SEEDS[0][2], SEEDS[0][3]),
-        ahash::RandomState::with_seeds(SEEDS[1][0], SEEDS[1][1], SEEDS[1][2], SEEDS[1][3]),
-        ahash::RandomState::with_seeds(SEEDS[2][0], SEEDS[2][1], SEEDS[2][2], SEEDS[2][3]),
-        ahash::RandomState::with_seeds(SEEDS[3][0], SEEDS[3][1], SEEDS[3][2], SEEDS[3][3]),
-    ];
-
-    for (name, value) in headers {
-        for (lane, state) in states.iter().enumerate() {
-            let mut hasher = state.build_hasher();
-            hasher.write_usize(name.len());
-            for &b in name.as_bytes() {
-                hasher.write_u8(b.to_ascii_lowercase());
+    let mut canonical: Vec<(&str, &str)> = headers
+        .iter()
+        .map(|(name, value)| (name.as_str(), value.as_str()))
+        .collect();
+    canonical.sort_unstable_by(|(a_name, a_val), (b_name, b_val)| {
+        a_name
+            .bytes()
+            .map(|b| b.to_ascii_lowercase())
+            .cmp(b_name.bytes().map(|b| b.to_ascii_lowercase()))
+            .then_with(|| a_val.cmp(b_val))
+    });
+    let mut hasher = crate::fips::approved::Sha256::new();
+    hasher.update((canonical.len() as u64).to_le_bytes());
+    let mut lower_buf = [0u8; 64];
+    for (name, value) in &canonical {
+        hasher.update((name.len() as u64).to_le_bytes());
+        if name.bytes().all(|b| !b.is_ascii_uppercase()) {
+            hasher.update(name.as_bytes());
+        } else {
+            let mut rest = name.as_bytes();
+            while !rest.is_empty() {
+                let chunk_len = rest.len().min(lower_buf.len());
+                for (dst, &src) in lower_buf[..chunk_len].iter_mut().zip(&rest[..chunk_len]) {
+                    *dst = src.to_ascii_lowercase();
+                }
+                hasher.update(&lower_buf[..chunk_len]);
+                rest = &rest[chunk_len..];
             }
-            hasher.write_usize(value.len());
-            hasher.write(value.as_bytes());
-            acc[lane] = acc[lane].wrapping_add(hasher.finish());
         }
+        hasher.update((value.len() as u64).to_le_bytes());
+        hasher.update(value.as_bytes());
     }
-
-    let mut out = [0u8; 32];
-    out[0..8].copy_from_slice(&acc[0].to_le_bytes());
-    out[8..16].copy_from_slice(&acc[1].to_le_bytes());
-    out[16..24].copy_from_slice(&acc[2].to_le_bytes());
-    out[24..32].copy_from_slice(&acc[3].to_le_bytes());
-    out
+    hasher.finalize()
 }
 
 #[async_trait]

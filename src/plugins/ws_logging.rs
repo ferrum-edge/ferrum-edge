@@ -207,7 +207,7 @@ const CREDENTIAL_QUERY_PARAM_MARKERS: &[&str] = &[
 /// into an `Arc<str>`. Keeping that reservation with the payload bounds both
 /// the transient assembly peak and every retry, even while new records queue.
 struct QueuedEntry {
-    json: String,
+    json: Box<str>,
     _lease: Arc<WsByteLease>,
 }
 
@@ -997,10 +997,8 @@ impl WsLogging {
             decrement_outstanding(&self.outstanding_count, 1);
             return;
         }
-        let retained_bytes = retained_charge_for_serialized_len(writer.bytes.len());
-        lease.shrink_to(retained_bytes);
         let json = match String::from_utf8(writer.bytes) {
-            Ok(line) => line,
+            Ok(line) => line.into_boxed_str(),
             Err(error) => {
                 budget.record_drop(SinkLossReason::SinkError, "serialized entry was not UTF-8");
                 warn!(
@@ -1010,6 +1008,8 @@ impl WsLogging {
                 return;
             }
         };
+        let retained_bytes = retained_charge_for_serialized_len(json.len());
+        lease.shrink_to(retained_bytes);
         permit.send(QueuedEntry {
             json,
             _lease: lease,
@@ -1026,7 +1026,7 @@ fn serialize_under_byte_budget<T>(
     max_entry_bytes: usize,
     value: &T,
     kind: &str,
-) -> Option<(String, Arc<WsByteLease>)>
+) -> Option<(Box<str>, Arc<WsByteLease>)>
 where
     T: serde::Serialize,
 {
@@ -1045,10 +1045,13 @@ where
         }
         return None;
     }
-    let retained_bytes = retained_charge_for_serialized_len(writer.bytes.len());
-    lease.shrink_to(retained_bytes);
     match String::from_utf8(writer.bytes) {
-        Ok(line) => Some((line, lease)),
+        Ok(line) => {
+            let line = line.into_boxed_str();
+            let retained_bytes = retained_charge_for_serialized_len(line.len());
+            lease.shrink_to(retained_bytes);
+            Some((line, lease))
+        }
         Err(error) => {
             byte_budget.record_drop(SinkLossReason::SinkError, "serialized entry was not UTF-8");
             warn!("WebSocket logging: serialized {kind} was not UTF-8: {error}");
