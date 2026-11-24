@@ -1,4 +1,4 @@
-//! Generated from the Public Suffix List bundled with `psl` 2.1.255
+//! Generated from the Public Suffix List bundled with `psl` 2.1.261
 //! (`data/rules.txt`). Do not edit by hand: regenerate with
 //! `python3 scripts/generate_cors_psl_ancestors.py`.
 //!
@@ -197,6 +197,7 @@ pub(crate) const PSL_SUFFIX_ANCESTORS: &[&str] = &[
     "databricksapps.us",
     "datadetect.com",
     "dev.thingdust.io",
+    "devs.ai",
     "disrec.thingdust.io",
     "dogado.eu",
     "dualstack.af-south-1.amazonaws.com",
@@ -239,6 +240,7 @@ pub(crate) const PSL_SUFFIX_ANCESTORS: &[&str] = &[
     "emf.camp",
     "encoway.cloud",
     "enscaled.us",
+    "enter.pro",
     "eu-central-1.amazonaws.com",
     "eu-central-1.amazoncognito.com",
     "eu-central-1.on.aws",
